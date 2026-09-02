@@ -167,9 +167,9 @@ impl MessageProcessor {
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
         let is_terminal_event = event.payload.is_terminal();
-        let awaits_origin_thread_delivery = match event.payload.run_id() {
+        let awaits_occurrence_thread_delivery = match event.payload.run_id() {
             Some(run_id) => {
-                self.task_run_awaits_origin_thread_delivery(&task_response, run_id)
+                self.task_run_awaits_occurrence_thread_delivery(&task_response, run_id)
                     .await?
             }
             None => false,
@@ -188,12 +188,12 @@ impl MessageProcessor {
                 .await
         };
         let refresh_parent_anchor = !is_progress_event
-            && !awaits_origin_thread_delivery
+            && !awaits_occurrence_thread_delivery
             && should_refresh_parent_task_anchor(&task_response, &event.payload);
         if refresh_parent_anchor {
             self.refresh_parent_task_anchor(&task_response).await?;
         }
-        if !awaits_origin_thread_delivery
+        if !awaits_occurrence_thread_delivery
             && let Some(notification) = timeline_changed.as_ref()
             && task_response.task.created_by_turn_id.as_deref()
                 != Some(notification.turn_id.as_str())
@@ -1010,6 +1010,16 @@ impl MessageProcessor {
         response: &TaskGetResponse,
         run_id: &str,
     ) -> Option<(String, String)> {
+        // The occurrence Turn is the authoritative presentation address and is
+        // committed before child launch. Resolve it directly so progress and
+        // pre-child failures do not depend on child lineage.
+        if let Ok(Some((thread_id, workspace_id))) = self.crud_store.get_turn_location(run_id).await
+            && workspace_id == response.task.workspace_id
+            && let Ok(Some((_, turn))) = self.crud_store.get_turn(thread_id.as_str(), run_id).await
+            && turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+        {
+            return Some((thread_id, run_id.to_owned()));
+        }
         if let Ok(Some(binding)) = self
             .crud_store
             .get_task_run_primary_thread_binding(run_id)

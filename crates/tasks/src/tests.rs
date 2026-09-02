@@ -3684,6 +3684,7 @@ async fn due_trigger_materialization_rolls_back_run_when_occurrence_contract_is_
         action_idempotency_key: format!("task:{task_id}:{}", run.id),
         route_id: None,
         result_return_route_id: None,
+        delivery_plan: None,
         terminal_reason: None,
     };
 

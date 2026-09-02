@@ -3482,24 +3482,66 @@ impl TaskService {
             .delivery
             .validate()
             .map_err(|error| anyhow!("task delivery authority is invalid: {error:?}"))?;
-        if !contract.delivery.enabled {
-            bail!("task delivery is disabled by its durable actor contract");
-        }
-        let destination_matches = match delivery.mode {
-            TaskDeliveryMode::Thread => {
+        let occurrence = self
+            .store
+            .get_task_occurrence_contract_by_run(delivery.run_id.as_str())
+            .await?
+            .context("task delivery has no durable occurrence contract")?;
+        let task = self
+            .store
+            .get_task(delivery.task_id.as_str())
+            .await?
+            .context("task delivery has no Task")?;
+        let frozen_policy = occurrence.delivery_plan.as_ref().map(|plan| &plan.policy);
+        let destination_matches = match (delivery.mode, frozen_policy) {
+            (TaskDeliveryMode::Thread, Some(policy)) => {
+                delivery.target_thread_id == policy.thread_id
+            }
+            (TaskDeliveryMode::UserNotification, Some(_)) => {
+                delivery.target_user_id
+                    == contract.delivery.destination_user_id.clone().or_else(|| {
+                        (task.task.owner_kind == pioneer_protocol::TaskOwnerKind::User)
+                            .then(|| task.task.owner_id.clone())
+                            .flatten()
+                    })
+            }
+            (TaskDeliveryMode::Webhook, Some(policy)) => {
+                delivery.webhook_url_fingerprint
+                    == policy
+                        .webhook_url
+                        .as_deref()
+                        .map(crate::actor_contract::delivery_target_fingerprint)
+            }
+            (TaskDeliveryMode::None, Some(_)) => false,
+            // Legacy occurrences predate frozen routing and retain the original
+            // immutable actor-contract check.
+            (TaskDeliveryMode::Thread, None) => {
                 delivery.target_thread_id == contract.delivery.destination_thread_id
             }
-            TaskDeliveryMode::UserNotification => {
+            (TaskDeliveryMode::UserNotification, None) => {
                 delivery.target_user_id == contract.delivery.destination_user_id
             }
-            TaskDeliveryMode::Webhook => {
+            (TaskDeliveryMode::Webhook, None) => {
                 delivery.webhook_url_fingerprint
                     == contract.delivery.destination_webhook_url_fingerprint
             }
-            TaskDeliveryMode::None => false,
+            (TaskDeliveryMode::None, None) => false,
         };
         if !destination_matches {
-            bail!("task delivery destination no longer matches its durable route");
+            bail!("task delivery destination differs from its frozen occurrence route");
+        }
+        if contract.delivery.route_id.is_some()
+            && match delivery.mode {
+                TaskDeliveryMode::Thread => {
+                    delivery.target_thread_id != contract.delivery.destination_thread_id
+                }
+                TaskDeliveryMode::UserNotification => {
+                    delivery.target_user_id != contract.delivery.destination_user_id
+                }
+                TaskDeliveryMode::Webhook | TaskDeliveryMode::None => true,
+            }
+        {
+            bail!("task delivery attempts to reuse a route for another destination");
         }
         Ok(())
     }

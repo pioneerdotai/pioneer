@@ -737,8 +737,26 @@ impl TaskExecutionHandle {
                     task_response.task.id
                 )
             })?;
+        let occurrence = self
+            .store
+            .get_task_occurrence_contract_by_run(self.run_id.as_str())
+            .await?
+            .with_context(|| {
+                format!(
+                    "Task run `{}` has no durable occurrence contract",
+                    self.run_id
+                )
+            })?;
+        // New occurrences freeze their normalized policy before dispatch.
+        // The fallback is only for rows created before routing version 1.
+        let delivery_policy = occurrence
+            .delivery_plan
+            .as_ref()
+            .map(|plan| &plan.policy)
+            .or(task_response.task.delivery_policy.as_ref());
         let Some(delivery) = delivery_for_terminal_run(
             &task_response,
+            delivery_policy,
             self.run_id.as_str(),
             event_timestamp_secs,
             result_snapshot,
@@ -976,13 +994,14 @@ fn retry_delay_seconds(
 
 fn delivery_for_terminal_run(
     task_response: &TaskGetResponse,
+    policy: Option<&pioneer_protocol::TaskDeliveryPolicy>,
     run_id: &str,
     event_timestamp_secs: i64,
     result_snapshot: Option<TaskResult>,
     error_snapshot: Option<TaskError>,
     exact_notification_recipient: Option<&str>,
 ) -> Option<pioneer_protocol::TaskDelivery> {
-    let policy = task_response.task.delivery_policy.as_ref()?;
+    let policy = policy?;
     if policy.mode == TaskDeliveryMode::None {
         return None;
     }

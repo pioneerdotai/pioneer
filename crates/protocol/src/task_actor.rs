@@ -7,7 +7,7 @@
 
 use crate::{
     AgentExecutionProfileProjection, AgentIdentityProjection, AgentLaunchSelection,
-    AgentPresentationSnapshot, PersistedActorRef,
+    AgentPresentationSnapshot, PersistedActorRef, TaskDeliveryMode, TaskDeliveryPolicy,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -553,6 +553,64 @@ pub enum TaskOccurrenceStatus {
     Cancelled,
 }
 
+/// Immutable delivery and presentation decision for one logical occurrence.
+///
+/// The Task policy may be edited while a run is in flight. Keeping the
+/// normalized policy beside the occurrence guarantees that retries, result
+/// delivery and the visible lifecycle card continue to use the same target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskOccurrenceDeliveryPlan {
+    pub routing_version: u32,
+    pub policy: TaskDeliveryPolicy,
+    /// Thread that owns the TaskRun lifecycle card. Thread delivery uses the
+    /// exact normalized delivery target; non-thread delivery has no target and
+    /// therefore leaves this absent for the executor to use its local fallback.
+    pub presentation_thread_id: Option<String>,
+}
+
+impl TaskOccurrenceDeliveryPlan {
+    pub fn from_normalized_policy(policy: TaskDeliveryPolicy) -> Self {
+        let presentation_thread_id = (policy.mode == TaskDeliveryMode::Thread)
+            .then(|| policy.thread_id.clone())
+            .flatten();
+        Self {
+            routing_version: 1,
+            policy,
+            presentation_thread_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), TaskActorContractError> {
+        if self.routing_version != 1 {
+            return Err(TaskActorContractError::InvalidRevision);
+        }
+        match self.policy.mode {
+            TaskDeliveryMode::Thread => {
+                let target = self
+                    .policy
+                    .thread_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(TaskActorContractError::MissingDeliveryDestination)?;
+                if self.policy.thread_target.is_none()
+                    || self.presentation_thread_id.as_deref() != Some(target)
+                {
+                    return Err(TaskActorContractError::InvalidDeliveryDestination);
+                }
+            }
+            TaskDeliveryMode::None
+            | TaskDeliveryMode::UserNotification
+            | TaskDeliveryMode::Webhook => {
+                if self.presentation_thread_id.is_some() {
+                    return Err(TaskActorContractError::UnexpectedDeliveryAuthority);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskOccurrenceContract {
@@ -571,6 +629,10 @@ pub struct TaskOccurrenceContract {
     pub action_idempotency_key: String,
     pub route_id: Option<String>,
     pub result_return_route_id: Option<String>,
+    /// Absent only on occurrences created before routing version 1 existed.
+    /// New occurrences always persist this snapshot before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_plan: Option<TaskOccurrenceDeliveryPlan>,
     pub terminal_reason: Option<String>,
 }
 
@@ -601,6 +663,9 @@ impl TaskOccurrenceContract {
         }
         if self.agent_execution_id.is_some() && self.work_graph_root_execution_id.is_none() {
             return Err(TaskActorContractError::MissingOccurrenceGraphRoot);
+        }
+        if let Some(plan) = self.delivery_plan.as_ref() {
+            plan.validate()?;
         }
         Ok(())
     }
@@ -922,6 +987,7 @@ mod tests {
             action_idempotency_key: "task:occurrence-key".to_owned(),
             route_id: None,
             result_return_route_id: None,
+            delivery_plan: None,
             terminal_reason: Some("temporary saturation".to_owned()),
         };
         let retry = occurrence.retry(2).unwrap();
@@ -970,6 +1036,7 @@ mod tests {
             action_idempotency_key: "task:recurring:3".to_owned(),
             route_id: None,
             result_return_route_id: None,
+            delivery_plan: None,
             terminal_reason: None,
         };
         let next = occurrence
@@ -1010,6 +1077,7 @@ mod tests {
             action_idempotency_key: "task:recurring:max".to_owned(),
             route_id: None,
             result_return_route_id: None,
+            delivery_plan: None,
             terminal_reason: None,
         };
 

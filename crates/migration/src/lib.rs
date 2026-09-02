@@ -57,6 +57,7 @@ mod m20260820_000003_agent_authorship_and_scheduling;
 mod m20260822_000001_patch_history;
 mod m20260828_000001_incremental_read_model_repair;
 mod m20260829_000001_native_terminal_effect_outbox;
+mod m20260902_000001_task_occurrence_delivery_plan;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -115,6 +116,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260822_000001_patch_history::Migration),
             Box::new(m20260828_000001_incremental_read_model_repair::Migration),
             Box::new(m20260829_000001_native_terminal_effect_outbox::Migration),
+            Box::new(m20260902_000001_task_occurrence_delivery_plan::Migration),
         ]
     }
 }

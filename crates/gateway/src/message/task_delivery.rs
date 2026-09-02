@@ -269,7 +269,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn task_run_awaits_origin_thread_delivery(
+    pub(super) async fn task_run_awaits_occurrence_thread_delivery(
         &self,
         task_response: &TaskGetResponse,
         run_id: &str,
@@ -298,10 +298,14 @@ impl MessageProcessor {
                 limit: Some(100),
             })
             .await?;
+        let occurrence_thread_id = self
+            .crud_store
+            .get_turn_location(run_id)
+            .await?
+            .map(|(thread_id, _)| thread_id);
         Ok(deliveries.deliveries.iter().any(|delivery| {
             delivery.mode == TaskDeliveryMode::Thread
-                && delivery.thread_target
-                    == Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
+                && delivery.target_thread_id == occurrence_thread_id
         }))
     }
 
@@ -376,19 +380,10 @@ impl MessageProcessor {
                     .await
             }
             TaskDeliveryMode::Thread => {
-                let turn_id = match delivery
+                delivery
                     .thread_target
-                    .context("thread delivery has no thread_target")?
-                {
-                    pioneer_protocol::TaskDeliveryThreadTarget::OriginThread => {
-                        self.deliver_to_origin_thread(&delivery).await?
-                    }
-                    pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread
-                    | pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot
-                    | pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => {
-                        self.deliver_to_thread(&delivery).await?
-                    }
-                };
+                    .context("thread delivery has no thread_target")?;
+                let turn_id = self.deliver_to_occurrence_thread(&delivery).await?;
                 self.complete_delivery(delivery, attempt, Some(turn_id), None, None, None)
                     .await
             }
@@ -802,14 +797,14 @@ impl MessageProcessor {
         Ok(notification)
     }
 
-    async fn deliver_to_origin_thread(&self, delivery: &TaskDelivery) -> Result<String> {
+    async fn deliver_to_occurrence_thread(&self, delivery: &TaskDelivery) -> Result<String> {
         let thread_id = delivery
             .target_thread_id
             .as_deref()
-            .ok_or_else(|| anyhow!("origin thread delivery has no target_thread_id"))?;
+            .ok_or_else(|| anyhow!("thread delivery has no target_thread_id"))?;
 
         if let Some(parent_turn_id) = self
-            .lineage_parent_turn_for_origin_delivery(delivery, thread_id)
+            .lineage_occurrence_turn_for_delivery(delivery, thread_id)
             .await?
         {
             let agent_action = self
@@ -836,7 +831,7 @@ impl MessageProcessor {
         self.deliver_to_thread(delivery).await
     }
 
-    pub(super) async fn lineage_parent_turn_for_origin_delivery(
+    pub(super) async fn lineage_occurrence_turn_for_delivery(
         &self,
         delivery: &TaskDelivery,
         target_thread_id: &str,

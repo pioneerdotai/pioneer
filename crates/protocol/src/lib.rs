@@ -390,7 +390,7 @@ pub use task::{
 pub use task_actor::{
     TaskActorContract, TaskActorContractError, TaskDeliveryActorContract,
     TaskDerivedChildLaunchGrant, TaskDerivedChildLaunchGrantMigrationError, TaskOccurrenceContract,
-    TaskOccurrenceStatus, TaskReviewerIntent,
+    TaskOccurrenceDeliveryPlan, TaskOccurrenceStatus, TaskReviewerIntent,
     migrate_task_derived_child_launch_grant_json_to_current,
 };
 pub use thread::{

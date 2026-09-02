@@ -28588,6 +28588,7 @@ mod tests {
                     action_idempotency_key: format!("task:{task_id}:{run_id}"),
                     route_id: None,
                     result_return_route_id: None,
+                    delivery_plan: None,
                     terminal_reason: None,
                 },
                 timestamp,

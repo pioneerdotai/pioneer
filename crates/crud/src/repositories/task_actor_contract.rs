@@ -122,6 +122,7 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
         action_idempotency_key: Set(contract.action_idempotency_key.clone()),
         route_id: Set(contract.route_id.clone()),
         result_return_route_id: Set(contract.result_return_route_id.clone()),
+        delivery_plan_json: Set(optional_typed_json_to_db(&contract.delivery_plan)?),
         terminal_reason: Set(contract.terminal_reason.clone()),
         created_at: Set(unix_to_datetime(now)),
         updated_at: Set(unix_to_datetime(now)),
@@ -143,6 +144,7 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
                 task_occurrence_contract::Column::ActionIdempotencyKey,
                 task_occurrence_contract::Column::RouteId,
                 task_occurrence_contract::Column::ResultReturnRouteId,
+                task_occurrence_contract::Column::DeliveryPlanJson,
                 task_occurrence_contract::Column::TerminalReason,
                 task_occurrence_contract::Column::UpdatedAt,
             ])
@@ -262,6 +264,7 @@ fn validate_occurrence_update(
         || persisted.action_idempotency_key != candidate.action_idempotency_key
         || persisted.route_id != candidate.route_id
         || persisted.result_return_route_id != candidate.result_return_route_id
+        || persisted.delivery_plan != candidate.delivery_plan
     {
         bail!(
             "task occurrence contract `{}` attempts to rewrite immutable actor/action facts",
@@ -695,6 +698,11 @@ pub(super) fn task_occurrence_contract_from_model(
         action_idempotency_key: row.action_idempotency_key,
         route_id: row.route_id,
         result_return_route_id: row.result_return_route_id,
+        delivery_plan: row
+            .delivery_plan_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
         terminal_reason: row.terminal_reason,
     };
     contract

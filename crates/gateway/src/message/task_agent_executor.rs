@@ -6125,8 +6125,12 @@ impl TaskExecutor for TaskAgentExecutor {
 
 #[derive(Debug, Clone)]
 pub(super) struct TaskParentRuntimeContext {
+    /// Conversation/security parent used by Native and CLI execution.
     pub(super) parent_thread_id: String,
     pub(super) parent_turn_id: Option<String>,
+    /// Thread that owns the visible TaskRun occurrence card. This may differ
+    /// from the execution parent when delivery is routed to another thread.
+    pub(super) presentation_thread_id: String,
     /// Collaboration capsule that owns the occurrence conversation and local
     /// control. This differs from `root_thread_id` only for an explicitly
     /// routed Task; the latter remains the immutable source admission root.
@@ -6427,6 +6431,7 @@ async fn resolve_parent_context(
     }
 
     Ok(TaskParentRuntimeContext {
+        presentation_thread_id: parent_thread_id.clone(),
         parent_thread_id,
         parent_turn_id: task.created_by_turn_id.clone(),
         home_root_thread_id,
@@ -6597,6 +6602,24 @@ async fn ensure_task_run_occurrence_context(
     let Some(origin) = task_run_occurrence_origin(task_response, run) else {
         return Ok(parent);
     };
+    let occurrence = processor
+        .crud_store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await?
+        .with_context(|| format!("Task run `{}` has no durable occurrence contract", run.id))?;
+    let presentation_thread_id = occurrence
+        .delivery_plan
+        .as_ref()
+        .and_then(|plan| plan.presentation_thread_id.clone())
+        .unwrap_or_else(|| parent.parent_thread_id.clone());
+    if presentation_thread_id != parent.parent_thread_id {
+        validate_task_occurrence_presentation_thread(
+            processor,
+            &task_response.task,
+            presentation_thread_id.as_str(),
+        )
+        .await?;
+    }
     let effective_model = effective_task_child_model(&task_response.task, agent_spec)?;
     let occurrence_security_snapshot = resolve_task_child_execution_security_snapshot(
         processor,
@@ -6630,7 +6653,7 @@ async fn ensure_task_run_occurrence_context(
     ensure_task_run_occurrence_turn(
         processor,
         &task_response.task,
-        parent.parent_thread_id.as_str(),
+        presentation_thread_id.as_str(),
         run,
         execution,
         origin,
@@ -6642,12 +6665,47 @@ async fn ensure_task_run_occurrence_context(
     ensure_task_run_occurrence_anchor(
         processor,
         task_response,
-        parent.parent_thread_id.as_str(),
+        presentation_thread_id.as_str(),
         run.id.as_str(),
     )
     .await?;
     parent.parent_turn_id = Some(run.id.clone());
+    parent.presentation_thread_id = presentation_thread_id;
     Ok(parent)
+}
+
+async fn validate_task_occurrence_presentation_thread(
+    processor: &Arc<MessageProcessor>,
+    task: &Task,
+    presentation_thread_id: &str,
+) -> Result<()> {
+    let target = processor
+        .crud_store
+        .get_thread_model(presentation_thread_id)
+        .await?
+        .with_context(|| {
+            format!("Task occurrence presentation thread `{presentation_thread_id}` is unavailable")
+        })?;
+    if target.workspace_id != task.workspace_id {
+        bail!("Task occurrence presentation thread left its admitted workspace");
+    }
+    let actor_contract = processor
+        .crud_store
+        .get_task_actor_contract(task.id.as_str())
+        .await?
+        .context("Agent Task is missing its durable actor contract")?;
+    // Unrouted targets were authorized and normalized by Gateway when the
+    // Task policy was admitted. A routed cross-capsule target additionally
+    // remains pinned to the immutable route destination.
+    if actor_contract.delivery.route_id.is_none() {
+        return Ok(());
+    }
+    if actor_contract.delivery.route_id.is_some()
+        && actor_contract.delivery.destination_thread_id.as_deref() == Some(presentation_thread_id)
+    {
+        return Ok(());
+    }
+    bail!("Task occurrence presentation target differs from its admitted delivery route")
 }
 
 fn task_run_occurrence_origin(
@@ -7320,7 +7378,7 @@ fn lineage_from_task_run_turn(
         root_thread_id: parent.home_root_thread_id.clone(),
         depth: agent_spec.depth,
         origin_kind: Some("task_run".to_owned()),
-        created_by_thread_id: Some(parent.parent_thread_id.clone()),
+        created_by_thread_id: Some(parent.presentation_thread_id.clone()),
         created_by_turn_id: parent.parent_turn_id.clone(),
         created_at,
     }
@@ -9909,6 +9967,7 @@ mod tests {
         let parent = TaskParentRuntimeContext {
             parent_thread_id: "thread-parent".to_owned(),
             parent_turn_id: Some("turn-parent".to_owned()),
+            presentation_thread_id: "thread-parent".to_owned(),
             home_root_thread_id: "thread-parent".to_owned(),
             root_thread_id: "thread-parent".to_owned(),
         };
@@ -10689,6 +10748,10 @@ mod tests {
             &processor,
             task.workspace_id.as_str(),
             &TaskParentRuntimeContext {
+                presentation_thread_id: lineage
+                    .created_by_thread_id
+                    .clone()
+                    .unwrap_or_else(|| lineage.parent_thread_id.clone()),
                 parent_thread_id: lineage.parent_thread_id,
                 parent_turn_id: lineage.created_by_turn_id,
                 home_root_thread_id: lineage.root_thread_id.clone(),

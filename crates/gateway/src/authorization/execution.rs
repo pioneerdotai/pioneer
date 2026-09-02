@@ -1748,6 +1748,32 @@ impl ExecutionAuthorizationContext {
                     .await?
             }
         };
+        // A Task occurrence is a user-visible projection of the run.  Its
+        // execution authority still derives from the source capsule, while
+        // its Turn may intentionally live in a different delivery thread.
+        // Do not classify that projection as an execution child merely
+        // because the presentation thread is outside the source root.
+        if matches!(
+            initiator,
+            pioneer_protocol::PersistedActorRef::AgentExecution(_)
+        ) && turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+            && matches!(
+                turn.origin,
+                pioneer_protocol::TurnOrigin::AttachedTask
+                    | pioneer_protocol::TurnOrigin::DetachedTask
+                    | pioneer_protocol::TurnOrigin::ScheduledTask
+            )
+            && let Some(occurrence) = store
+                .get_task_occurrence_contract_by_run(turn.id.as_str())
+                .await?
+            && occurrence
+                .delivery_plan
+                .as_ref()
+                .and_then(|plan| plan.presentation_thread_id.as_deref())
+                == Some(scope.thread_id.as_str())
+        {
+            return Ok(ancestor_turn_id);
+        }
         if scope.thread_id == self.root_thread_id {
             if scope.thread.access_class == PersistedThreadAccessClass::Internal {
                 bail!("execution authority root points at an internal child thread");
@@ -1922,12 +1948,19 @@ impl ExecutionAuthorizationContext {
                     .get_task_actor_contract(run.task_id.as_str())
                     .await?
                     .context("agent-authored Task occurrence has no exact actor contract")?;
-                let occurrence_thread_id = actor_contract
-                    .execution_destination_thread_id
-                    .as_deref()
+                let occurrence = store
+                    .get_task_occurrence_contract_by_run(run.id.as_str())
+                    .await?
+                    .context("agent-authored Task occurrence has no occurrence contract")?;
+                let occurrence_thread_id = occurrence
+                    .delivery_plan
+                    .as_ref()
+                    .and_then(|plan| plan.presentation_thread_id.as_deref())
+                    .or(actor_contract.execution_destination_thread_id.as_deref())
                     .or(task.created_by_thread_id.as_deref());
                 if task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
                     || task.workspace_id != self.workspace_id
+                    || occurrence.task_id != task.id
                     || occurrence_thread_id != Some(scope.thread_id.as_str())
                 {
                     bail!("agent-authored Task occurrence differs from its durable Task");

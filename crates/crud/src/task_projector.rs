@@ -1133,35 +1133,61 @@ pub(crate) async fn prepare_task_delivery_authority<C: ConnectionTrait>(
         .delivery
         .validate()
         .map_err(|error| anyhow::anyhow!("Task delivery actor contract is invalid: {error:?}"))?;
-    if contract.workspace_id != delivery.workspace_id || !contract.delivery.enabled {
+    if contract.workspace_id != delivery.workspace_id {
         anyhow::bail!("Task delivery differs from its immutable actor contract");
-    }
-    let exact_destination = match delivery.mode {
-        TaskDeliveryMode::Thread => {
-            delivery.target_thread_id == contract.delivery.destination_thread_id
-        }
-        TaskDeliveryMode::UserNotification => {
-            delivery.target_user_id == contract.delivery.destination_user_id
-        }
-        TaskDeliveryMode::Webhook => {
-            delivery.webhook_url_fingerprint
-                == contract.delivery.destination_webhook_url_fingerprint
-        }
-        TaskDeliveryMode::None => false,
-    };
-    if !exact_destination {
-        anyhow::bail!("Task delivery rewrites its immutable destination");
     }
     let task = task::find_task_by_id(db, &delivery.task_id)
         .await?
         .context("Task delivery has no Task")?;
-    let author = if task.executor_kind == "agent" && delivery.error_snapshot.is_none() {
-        let occurrence = task_actor_contract::find_task_occurrence_by_run_id(db, &delivery.run_id)
-            .await?
-            .context("Agent Task delivery has no exact occurrence")?;
-        if occurrence.task_id != delivery.task_id {
-            anyhow::bail!("Agent Task delivery occurrence belongs to another Task");
+    let occurrence = task_actor_contract::find_task_occurrence_by_run_id(db, &delivery.run_id)
+        .await?
+        .context("Task delivery has no exact occurrence")?;
+    if occurrence.task_id != delivery.task_id {
+        anyhow::bail!("Task delivery occurrence belongs to another Task");
+    }
+    let exact_destination = match (delivery.mode, occurrence.delivery_plan.as_ref()) {
+        (TaskDeliveryMode::Thread, Some(plan)) => {
+            delivery.target_thread_id == plan.policy.thread_id
         }
+        (TaskDeliveryMode::UserNotification, Some(_)) => {
+            delivery.target_user_id
+                == contract.delivery.destination_user_id.clone().or_else(|| {
+                    (task.owner_kind == "user")
+                        .then(|| task.owner_id.clone())
+                        .flatten()
+                })
+        }
+        (TaskDeliveryMode::Webhook, Some(plan)) => delivery.webhook_url == plan.policy.webhook_url,
+        (TaskDeliveryMode::None, Some(_)) => false,
+        (TaskDeliveryMode::Thread, None) => {
+            delivery.target_thread_id == contract.delivery.destination_thread_id
+        }
+        (TaskDeliveryMode::UserNotification, None) => {
+            delivery.target_user_id == contract.delivery.destination_user_id
+        }
+        (TaskDeliveryMode::Webhook, None) => {
+            delivery.webhook_url_fingerprint
+                == contract.delivery.destination_webhook_url_fingerprint
+        }
+        (TaskDeliveryMode::None, None) => false,
+    };
+    if !exact_destination {
+        anyhow::bail!("Task delivery rewrites its frozen occurrence destination");
+    }
+    if contract.delivery.route_id.is_some()
+        && match delivery.mode {
+            TaskDeliveryMode::Thread => {
+                delivery.target_thread_id != contract.delivery.destination_thread_id
+            }
+            TaskDeliveryMode::UserNotification => {
+                delivery.target_user_id != contract.delivery.destination_user_id
+            }
+            TaskDeliveryMode::Webhook | TaskDeliveryMode::None => true,
+        }
+    {
+        anyhow::bail!("Task delivery attempts to reuse a route for another destination");
+    }
+    let author = if task.executor_kind == "agent" && delivery.error_snapshot.is_none() {
         let execution_id = occurrence
             .agent_execution_id
             .context("Agent Task result has no exact execution author")?;

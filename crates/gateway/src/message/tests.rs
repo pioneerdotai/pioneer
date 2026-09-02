@@ -19003,9 +19003,9 @@ async fn exhausted_window_does_not_create_candidate_until_child_turn_completes_i
 }
 
 #[test]
-fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn() {
+fn scheduled_task_agent_run_routes_occurrence_to_exact_delivery_thread() {
     run_standard_stack_message_test(
-        "scheduled Task Agent occurrence turn",
+        "scheduled Task Agent exact-thread occurrence turn",
         scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl(),
     );
 }
@@ -19102,6 +19102,15 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         .await
         .expect("creation turn completion should persist");
 
+    let presentation_thread_id = "thr_scheduled_task_delivery_target";
+    materialize_artifact_api_thread(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        presentation_thread_id,
+        "turn_scheduled_task_delivery_target",
+    )
+    .await;
+
     let due_at = created_at.saturating_add(1);
     let mut params = test_task_create_params(
         workspace_id.as_str(),
@@ -19122,6 +19131,14 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         on_parent_cancel: TaskParentTerminalAction::KeepRunning,
         on_parent_failure: TaskParentTerminalAction::KeepRunning,
         completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+    });
+    params.delivery_policy = Some(TaskDeliveryPolicy {
+        mode: TaskDeliveryMode::Thread,
+        thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
+        thread_id: Some(presentation_thread_id.to_owned()),
+        webhook_url: None,
+        include_result: true,
+        format: TaskDeliveryFormat::FullResult,
     });
     if let Some(agent_spec) = params.agent_spec.as_mut() {
         agent_spec.prompt.instructions =
@@ -19182,6 +19199,11 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         .expect("scheduled task execution query should succeed")
         .expect("scheduled task execution should exist");
     assert_eq!(lineage.parent_thread_id, parent_thread_id);
+    assert_eq!(
+        lineage.created_by_thread_id.as_deref(),
+        Some(presentation_thread_id),
+        "visible occurrence lineage must point at the delivery thread"
+    );
     assert_eq!(lineage.created_by_turn_id.as_deref(), Some(run.id.as_str()));
     assert_ne!(
         lineage.created_by_turn_id.as_deref(),
@@ -19230,15 +19252,23 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
     );
 
     let (_, occurrence_turn) = crud_store
-        .get_turn(parent_thread_id, run.id.as_str())
+        .get_turn(presentation_thread_id, run.id.as_str())
         .await
         .expect("occurrence turn lookup should succeed")
         .expect("occurrence turn should exist");
     assert_eq!(occurrence_turn.turn_kind, TurnKind::TaskRun);
     assert_eq!(occurrence_turn.origin, TurnOrigin::ScheduledTask);
     assert_eq!(occurrence_turn.status, TurnStatus::Completed);
+    assert!(
+        crud_store
+            .get_turn(parent_thread_id, run.id.as_str())
+            .await
+            .expect("source occurrence lookup should succeed")
+            .is_none(),
+        "execution parent must not receive a duplicate TaskRun card"
+    );
     let occurrence_items = crud_store
-        .get_turn_item_events(parent_thread_id, run.id.as_str())
+        .get_turn_item_events(presentation_thread_id, run.id.as_str())
         .await
         .expect("occurrence turn items should load")
         .expect("occurrence turn item stream should exist");
@@ -19256,7 +19286,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         "occurrence turn should persist a parent-visible task anchor for desktop reload"
     );
     let projected_blocks = thread_timeline_block::Entity::find()
-        .filter(thread_timeline_block::Column::ThreadId.eq(parent_thread_id))
+        .filter(thread_timeline_block::Column::ThreadId.eq(presentation_thread_id))
         .filter(thread_timeline_block::Column::TurnId.eq(run.id.as_str()))
         .all(&crud_store.database_connection())
         .await
@@ -19286,8 +19316,8 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         .expect("scheduled run progress should have a parent timeline target");
     assert_eq!(
         progress_target,
-        (parent_thread_id.to_owned(), run.id.clone()),
-        "live scheduled run progress must patch the occurrence turn, not the creation turn"
+        (presentation_thread_id.to_owned(), run.id.clone()),
+        "live scheduled run progress must patch the delivery-thread occurrence turn"
     );
 
     let (_, old_creation_turn) = crud_store
@@ -24772,7 +24802,7 @@ async fn task_delivery_reuses_pre_child_occurrence_without_lineage() {
     };
     assert_eq!(
         processor
-            .lineage_parent_turn_for_origin_delivery(&delivery, thread_id)
+            .lineage_occurrence_turn_for_delivery(&delivery, thread_id)
             .await
             .expect("origin delivery target should resolve"),
         Some(run_id.to_owned()),
@@ -60683,6 +60713,7 @@ struct TestChildRuntimeAnchor {
     child_thread_id: String,
     child_turn_id: String,
     parent_thread_id: String,
+    created_by_thread_id: Option<String>,
     created_by_turn_id: Option<String>,
 }
 
@@ -60709,6 +60740,7 @@ async fn wait_for_child_lineage_for_run(
                 child_thread_id: lineage.child_thread_id,
                 child_turn_id: task_run_turn.turn_id,
                 parent_thread_id: lineage.parent_thread_id,
+                created_by_thread_id: lineage.created_by_thread_id,
                 created_by_turn_id: lineage.created_by_turn_id,
             };
         }

@@ -3,8 +3,8 @@
 use anyhow::{Result, anyhow, bail};
 use pioneer_protocol::{
     PersistedActorRef, Task, TaskActorContract, TaskAgentReviewMode, TaskAgentSpec,
-    TaskDeliveryActorContract, TaskDeliveryMode, TaskOccurrenceContract, TaskOccurrenceStatus,
-    TaskReviewerIntent,
+    TaskDeliveryActorContract, TaskDeliveryMode, TaskOccurrenceContract,
+    TaskOccurrenceDeliveryPlan, TaskOccurrenceStatus, TaskReviewerIntent,
 };
 use sha2::{Digest, Sha256};
 
@@ -227,6 +227,10 @@ pub fn build_occurrence_contract(
         action_idempotency_key: format!("task:{}:{}", task.id, run_id),
         route_id: actor_contract.execution_route_id.clone(),
         result_return_route_id: actor_contract.delivery.route_id.clone(),
+        delivery_plan: task
+            .delivery_policy
+            .clone()
+            .map(TaskOccurrenceDeliveryPlan::from_normalized_policy),
         terminal_reason: None,
     };
     contract
@@ -382,5 +386,136 @@ mod tests {
         );
         assert!(contract.delivery.destination_thread_id.is_none());
         assert!(contract.delivery.destination_user_id.is_none());
+    }
+
+    #[test]
+    fn occurrence_presentation_follows_every_normalized_delivery_mode() {
+        let mut task = task();
+        let actor_contract =
+            build_task_actor_contract(&task, None, &TaskCreateContext::default(), 1).unwrap();
+
+        for target in [
+            pioneer_protocol::TaskDeliveryThreadTarget::OriginThread,
+            pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread,
+            pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot,
+            pioneer_protocol::TaskDeliveryThreadTarget::ExactThread,
+        ] {
+            task.delivery_policy = Some(TaskDeliveryPolicy {
+                mode: TaskDeliveryMode::Thread,
+                thread_target: Some(target),
+                thread_id: Some("THREAD1234567890123".to_owned()),
+                webhook_url: None,
+                include_result: true,
+                format: TaskDeliveryFormat::FullResult,
+            });
+            let occurrence = build_occurrence_contract(
+                &task,
+                &actor_contract,
+                "RUN12345678901234567",
+                None,
+                "occurrence",
+                1,
+                1,
+            )
+            .unwrap();
+            let plan = occurrence.delivery_plan.unwrap();
+            assert_eq!(plan.policy.thread_target, Some(target));
+            assert_eq!(
+                plan.presentation_thread_id.as_deref(),
+                Some("THREAD1234567890123")
+            );
+        }
+
+        for mode in [
+            TaskDeliveryMode::None,
+            TaskDeliveryMode::UserNotification,
+            TaskDeliveryMode::Webhook,
+        ] {
+            task.delivery_policy = Some(TaskDeliveryPolicy {
+                mode,
+                thread_target: None,
+                thread_id: None,
+                webhook_url: (mode == TaskDeliveryMode::Webhook)
+                    .then(|| "https://hooks.example.test/result".to_owned()),
+                include_result: true,
+                format: TaskDeliveryFormat::Summary,
+            });
+            let occurrence = build_occurrence_contract(
+                &task,
+                &actor_contract,
+                "RUN12345678901234567",
+                None,
+                "occurrence",
+                1,
+                1,
+            )
+            .unwrap();
+            assert!(
+                occurrence
+                    .delivery_plan
+                    .unwrap()
+                    .presentation_thread_id
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn delivery_update_affects_future_occurrences_not_inflight_retries() {
+        let mut task = task();
+        let actor_contract =
+            build_task_actor_contract(&task, None, &TaskCreateContext::default(), 1).unwrap();
+        let policy = |thread_id: &str| TaskDeliveryPolicy {
+            mode: TaskDeliveryMode::Thread,
+            thread_target: Some(pioneer_protocol::TaskDeliveryThreadTarget::ExactThread),
+            thread_id: Some(thread_id.to_owned()),
+            webhook_url: None,
+            include_result: true,
+            format: TaskDeliveryFormat::FullResult,
+        };
+
+        task.delivery_policy = Some(policy("THREAD_A_1234567890"));
+        let first = build_occurrence_contract(
+            &task,
+            &actor_contract,
+            "RUN12345678901234567",
+            None,
+            "first",
+            1,
+            1,
+        )
+        .unwrap();
+        let retry = first.retry(1).unwrap();
+
+        task.delivery_policy = Some(policy("THREAD_B_1234567890"));
+        let second = build_occurrence_contract(
+            &task,
+            &actor_contract,
+            "RUN22345678901234567",
+            None,
+            "second",
+            2,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            first.delivery_plan, retry.delivery_plan,
+            "retry must keep the original occurrence destination"
+        );
+        assert_eq!(
+            first
+                .delivery_plan
+                .as_ref()
+                .and_then(|plan| plan.presentation_thread_id.as_deref()),
+            Some("THREAD_A_1234567890")
+        );
+        assert_eq!(
+            second
+                .delivery_plan
+                .as_ref()
+                .and_then(|plan| plan.presentation_thread_id.as_deref()),
+            Some("THREAD_B_1234567890")
+        );
     }
 }
