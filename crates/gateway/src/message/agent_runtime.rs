@@ -1150,7 +1150,7 @@ impl MessageProcessor {
                         );
                     }
                     if let Some(turn_id) = terminal_turn_id.as_deref() {
-                        self.execution_leases.finish(turn_id).await;
+                        self.retire_execution_progress_state(turn_id).await;
                     }
                     if let (Some(thread_id), Some(turn_id)) =
                         (thread_id.as_deref(), turn_id.as_deref())
@@ -3211,6 +3211,19 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                let mut progress_items = self.progress_items.lock().await;
+                if self
+                    .execution_progress_is_current_cached(notification.turn_id.as_str())
+                    .await
+                    .unwrap_or(false)
+                {
+                    progress_items.remember_item(
+                        notification.turn_id.as_str(),
+                        item_id.as_str(),
+                        notification.item.item_type(),
+                        Some(event_timestamp),
+                    );
+                }
                 debug!(
                     thread_id = notification.thread_id,
                     turn_id = notification.turn_id,
@@ -3268,6 +3281,10 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                self.progress_items
+                    .lock()
+                    .await
+                    .forget_item(notification.turn_id.as_str(), notification.item.item_id());
                 // This tiny in-process projection participates in the
                 // completion guard and therefore must be visible before the
                 // agent receives the canonical commit ACK. Network, artifact,
@@ -3303,6 +3320,10 @@ impl MessageProcessor {
                     .await;
                     return false;
                 }
+                self.progress_items
+                    .lock()
+                    .await
+                    .forget_item(notification.turn_id.as_str(), notification.item.item_id());
                 true
             }),
             AgentDurableEvent::ItemToolRetryScheduled { notification } => {
@@ -3868,6 +3889,60 @@ impl MessageProcessor {
         }
     }
 
+    async fn progress_item_type(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        now_unix: i64,
+    ) -> anyhow::Result<Option<TurnItemType>> {
+        {
+            let progress_items = self.progress_items.lock().await;
+            if let Some(item_type) = progress_items.item_type(turn_id, item_id) {
+                return Ok(Some(item_type));
+            }
+            if progress_items.missing_item_type_is_fresh(turn_id, item_id, now_unix) {
+                return Ok(None);
+            }
+        }
+        let item_type = self.crud_store.get_turn_item_type(turn_id, item_id).await?;
+        let mut progress_items = self.progress_items.lock().await;
+        if !self.execution_progress_is_current_cached(turn_id).await? {
+            return Ok(None);
+        }
+        match item_type {
+            Some(item_type) => {
+                progress_items.remember_item(turn_id, item_id, item_type, None);
+            }
+            None => progress_items.remember_missing_item_type(turn_id, item_id, now_unix),
+        }
+        Ok(item_type)
+    }
+
+    async fn heartbeat_progress_item_from_delta(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+        now_unix: i64,
+    ) -> anyhow::Result<()> {
+        let claim = self
+            .progress_items
+            .lock()
+            .await
+            .claim_delta_heartbeat(turn_id, item_id, now_unix);
+        let Some(claim) = claim else {
+            return Ok(());
+        };
+        let result = self
+            .timeout_supervisor
+            .heartbeat_item_attempt(turn_id, item_id, claim.item_type, now_unix)
+            .await;
+        self.progress_items
+            .lock()
+            .await
+            .finish_heartbeat_claim(&claim, result.is_ok());
+        result
+    }
+
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
         let turn_id = match &event {
             AgentProgressEvent::ItemDelta { notification } => notification.turn_id.as_str(),
@@ -3875,7 +3950,7 @@ impl MessageProcessor {
             | AgentProgressEvent::ToolOutputDelta { turn_id, .. }
             | AgentProgressEvent::TaskProgress { turn_id, .. } => turn_id.as_str(),
         };
-        if self.guard_execution_commit(turn_id).await.is_err() {
+        if self.guard_execution_progress(turn_id).await.is_err() {
             return;
         }
         match event {
@@ -3884,7 +3959,7 @@ impl MessageProcessor {
                 self.enrich_item_delta_markdown(&mut notification).await;
                 let event_timestamp = now_timestamp_secs();
                 let delta_method = Self::item_delta_event_method(notification.stream);
-                self.send_notification_to_thread_subscribers(
+                self.send_progress_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
                     delta_method,
                     &notification,
@@ -3892,10 +3967,10 @@ impl MessageProcessor {
                 .await;
 
                 let item_type = match self
-                    .crud_store
-                    .get_turn_item_type(
+                    .progress_item_type(
                         notification.turn_id.as_str(),
                         notification.item_id.as_str(),
+                        event_timestamp,
                     )
                     .await
                 {
@@ -3918,13 +3993,11 @@ impl MessageProcessor {
                         .await;
                 }
 
-                if let Some(item_type) = item_type
+                if item_type.is_some()
                     && let Err(error) = self
-                        .timeout_supervisor
-                        .heartbeat_item_attempt(
+                        .heartbeat_progress_item_from_delta(
                             notification.turn_id.as_str(),
                             notification.item_id.as_str(),
-                            item_type,
                             event_timestamp,
                         )
                         .await
@@ -3977,6 +4050,20 @@ impl MessageProcessor {
                         error = %format!("{error:#}"),
                         "failed to heartbeat item attempt from agent heartbeat"
                     );
+                } else {
+                    let mut progress_items = self.progress_items.lock().await;
+                    if self
+                        .execution_progress_is_current_cached(turn_id.as_str())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        progress_items.remember_item(
+                            turn_id.as_str(),
+                            item_id.as_str(),
+                            item_type,
+                            Some(event_timestamp),
+                        );
+                    }
                 }
             }
             AgentProgressEvent::ToolOutputDelta { .. }
@@ -6382,7 +6469,7 @@ impl MessageProcessor {
         parent_delta.turn_id = target.parent_turn_id;
 
         let delta_method = Self::item_delta_event_method(parent_delta.stream);
-        self.send_notification_to_thread_subscribers(
+        self.send_progress_notification_to_thread_subscribers(
             parent_delta.thread_id.as_str(),
             delta_method,
             &parent_delta,
@@ -6431,6 +6518,7 @@ impl MessageProcessor {
             .await
         {
             if current_turn.status == TurnStatus::Completed {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 let notification = TurnCompletedNotification {
                     workspace_id,
                     thread_id: thread_id.clone(),
@@ -6460,6 +6548,7 @@ impl MessageProcessor {
                 return committed;
             }
             if current_turn.status != TurnStatus::InProgress {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
         }
@@ -6680,6 +6769,7 @@ impl MessageProcessor {
         turn: &pioneer_protocol::Turn,
         terminal_status: &str,
     ) {
+        self.retire_execution_progress_state(turn.id.as_str()).await;
         let database = self.crud_store.database_connection();
         let responding_execution_id =
             match pioneer_crud::load_agent_turn_response(&database, turn.id.as_str()).await {
@@ -7164,6 +7254,7 @@ impl MessageProcessor {
                 return true;
             }
             if current_turn.status != TurnStatus::InProgress {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
             true
@@ -7406,6 +7497,7 @@ impl MessageProcessor {
             return true;
         }
         if current_turn.status != TurnStatus::InProgress {
+            self.retire_execution_progress_state(turn_id.as_str()).await;
             return false;
         }
 
@@ -7533,6 +7625,7 @@ impl MessageProcessor {
         turn_id: &str,
         reason: Option<&str>,
     ) {
+        self.retire_execution_progress_state(turn_id).await;
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(
                 turn_id,
@@ -7651,6 +7744,7 @@ impl MessageProcessor {
             .await
         {
             if current_turn.status == TurnStatus::Interrupted {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 let notification = TurnFailedNotification {
                     workspace_id,
                     thread_id: thread_id.clone(),
@@ -7693,6 +7787,7 @@ impl MessageProcessor {
                 return true;
             }
             if current_turn.status != TurnStatus::InProgress {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
         }
@@ -7737,6 +7832,7 @@ impl MessageProcessor {
                     .await
                     && current_turn.status == TurnStatus::Interrupted
                 {
+                    self.retire_execution_progress_state(turn_id.as_str()).await;
                     return true;
                 }
                 warn!(
@@ -7935,6 +8031,7 @@ impl MessageProcessor {
             .await
         {
             if current_turn.status == TurnStatus::Failed {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 let notification = TurnFailedNotification {
                     workspace_id,
                     thread_id: thread_id.clone(),
@@ -7959,6 +8056,7 @@ impl MessageProcessor {
                     });
             }
             if current_turn.status != TurnStatus::InProgress {
+                self.retire_execution_progress_state(turn_id.as_str()).await;
                 return false;
             }
         }

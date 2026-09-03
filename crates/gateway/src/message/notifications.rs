@@ -1210,6 +1210,39 @@ impl MessageProcessor {
         .await;
     }
 
+    /// Progress payloads are already bounded and coalesced before reaching the
+    /// Gateway. They still require one current authorization check immediately
+    /// before delivery, but serializing the same in-memory payload does not
+    /// justify the two earlier duplicate database reauthorizations used by the
+    /// general durable-notification path.
+    pub(crate) async fn send_progress_notification_to_thread_subscribers<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+    ) {
+        let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+        if subscribers.is_empty() {
+            return;
+        }
+        let candidate_connection_ids = subscribers
+            .into_iter()
+            .map(|subscriber| subscriber.connection_id)
+            .collect();
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let subscribers = self
+            .thread_manager
+            .subscribed_connections_for_candidates(thread_id, candidate_connection_ids)
+            .await;
+        let connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, subscribers)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
     pub(crate) async fn send_notification_to_authorized_thread_connections<T: Serialize>(
         &self,
         thread_id: &str,

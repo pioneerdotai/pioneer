@@ -232,6 +232,38 @@ impl ExecutionLeaseRegistry {
         })
     }
 
+    /// Returns `Ok(true)` only when the already-projected continuation lease
+    /// is sufficient to admit a lossy progress fragment without storage I/O.
+    /// Missing and stale leases return `Ok(false)` so the caller can restore
+    /// or reproject through the full durable guard. A current fenced lease is
+    /// an authoritative denial and must never be treated as a cache miss.
+    pub(crate) async fn guard_progress_cached(
+        &self,
+        execution_id: &str,
+        current_policy_generation: u64,
+    ) -> Result<bool> {
+        if execution_id.trim().is_empty() || execution_id != execution_id.trim() {
+            bail!("execution lease requires an exact execution id");
+        }
+        let leases = self.leases.read().await;
+        let Some(lease) = leases.get(execution_id) else {
+            return Ok(false);
+        };
+        if lease.projected_policy_generation != current_policy_generation {
+            return Ok(false);
+        }
+        if lease.state != ExecutionLeaseState::Active
+            || !lease.immutable_actions.contains(&lease.continuation_action)
+            || !lease.projected_actions.contains(&lease.continuation_action)
+        {
+            bail!(
+                "execution lease is fenced for action `{}`",
+                lease.continuation_action.safe_name()
+            );
+        }
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn revalidate_for_turn(
         &self,
@@ -813,6 +845,75 @@ mod tests {
             .register(&store, "V00000000000000000010", &supervised_context, 2)
             .await
             .expect("equal current role cap keeps the execution active");
+    }
+
+    #[tokio::test]
+    async fn progress_cache_admits_only_current_active_continuation_lease() {
+        let harness = IsolatedEpic4Harness::new()
+            .await
+            .expect("isolated authorization fixture");
+        let store = CrudStore::new(harness.database.clone());
+        let member = principal(
+            MEMBER_A_ID,
+            PrincipalKind::User,
+            Some(RoleKey::member()),
+            "D00000000000000000001",
+            "S00000000000000000001",
+        );
+        let supervised = pioneer_protocol::compile_turn_permission_profile(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let context = ExecutionAuthorizationContext::for_test(
+            &member,
+            WORKSPACE_RED_ID,
+            THREAD_RED_PRIVATE_A_ID,
+            &supervised,
+            None,
+        );
+        let registry = ExecutionLeaseRegistry::default();
+        let execution_id = "V00000000000000000010";
+        registry
+            .register(&store, execution_id, &context, 7)
+            .await
+            .expect("register current execution lease");
+
+        assert!(
+            registry
+                .guard_progress_cached(execution_id, 7)
+                .await
+                .expect("current progress lease should validate")
+        );
+        assert!(
+            !registry
+                .guard_progress_cached(execution_id, 8)
+                .await
+                .expect("stale progress lease should request durable reprojection")
+        );
+
+        registry
+            .leases
+            .write()
+            .await
+            .get_mut(execution_id)
+            .expect("registered lease")
+            .state = ExecutionLeaseState::Fenced;
+        assert!(
+            registry
+                .guard_progress_cached(execution_id, 7)
+                .await
+                .expect_err("a current fenced lease must fail closed")
+                .to_string()
+                .contains("fenced")
+        );
+
+        registry.finish(execution_id).await;
+        assert!(
+            !registry
+                .guard_progress_cached(execution_id, 7)
+                .await
+                .expect("a missing lease should request durable restoration")
+        );
     }
 
     #[tokio::test]

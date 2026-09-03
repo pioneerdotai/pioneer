@@ -337,6 +337,9 @@ where
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
 pub(super) const TURN_EXECUTION_OWNER_LEASE_SECONDS: i64 = 15;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
+const PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS: i64 = 5;
+const PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS: i64 = 1;
+const PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY: usize = 1_024;
 const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
 const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
@@ -490,6 +493,7 @@ pub struct MessageProcessor {
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
+    progress_items: Arc<Mutex<ProgressItemRegistry>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
@@ -598,6 +602,171 @@ struct AgentMarkdownBufferStats {
     delta_count: AtomicU64,
     cumulative_parse_input_bytes: AtomicU64,
     cumulative_parse_duration_ns: AtomicU64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProgressItemKey {
+    turn_id: String,
+    item_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProgressItemState {
+    item_type: TurnItemType,
+    last_persisted_heartbeat_at: Option<i64>,
+    pending_heartbeat_claim: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgressHeartbeatClaim {
+    key: ProgressItemKey,
+    claim_id: u64,
+    item_type: TurnItemType,
+    previous_heartbeat_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct ProgressItemRegistry {
+    items: HashMap<ProgressItemKey, ProgressItemState>,
+    missing_item_types: HashMap<ProgressItemKey, i64>,
+    next_heartbeat_claim: u64,
+}
+
+impl ProgressItemRegistry {
+    fn item_type(&self, turn_id: &str, item_id: &str) -> Option<TurnItemType> {
+        self.items
+            .get(&ProgressItemKey {
+                turn_id: turn_id.to_owned(),
+                item_id: item_id.to_owned(),
+            })
+            .map(|state| state.item_type)
+    }
+
+    fn remember_item(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        item_type: TurnItemType,
+        persisted_heartbeat_at: Option<i64>,
+    ) {
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        self.missing_item_types.remove(&key);
+        let state = self.items.entry(key).or_insert(ProgressItemState {
+            item_type,
+            last_persisted_heartbeat_at: persisted_heartbeat_at,
+            pending_heartbeat_claim: None,
+        });
+        state.item_type = item_type;
+        if let Some(persisted_heartbeat_at) = persisted_heartbeat_at {
+            state.last_persisted_heartbeat_at = Some(
+                state
+                    .last_persisted_heartbeat_at
+                    .map_or(persisted_heartbeat_at, |current| {
+                        current.max(persisted_heartbeat_at)
+                    }),
+            );
+            state.pending_heartbeat_claim = None;
+        }
+    }
+
+    fn missing_item_type_is_fresh(&self, turn_id: &str, item_id: &str, now_unix: i64) -> bool {
+        self.missing_item_types
+            .get(&ProgressItemKey {
+                turn_id: turn_id.to_owned(),
+                item_id: item_id.to_owned(),
+            })
+            .is_some_and(|last_lookup_at| {
+                now_unix.saturating_sub(*last_lookup_at) < PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS
+            })
+    }
+
+    fn remember_missing_item_type(&mut self, turn_id: &str, item_id: &str, now_unix: i64) {
+        self.missing_item_types.retain(|_, last_lookup_at| {
+            now_unix.saturating_sub(*last_lookup_at) < PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS
+        });
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        if !self.missing_item_types.contains_key(&key)
+            && self.missing_item_types.len() >= PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY
+            && let Some(oldest) = self
+                .missing_item_types
+                .iter()
+                .min_by_key(|(_, last_lookup_at)| **last_lookup_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.missing_item_types.remove(&oldest);
+        }
+        self.missing_item_types.insert(key, now_unix);
+    }
+
+    fn claim_delta_heartbeat(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        now_unix: i64,
+    ) -> Option<ProgressHeartbeatClaim> {
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        let state = self.items.get(&key)?;
+        if state.pending_heartbeat_claim.is_some()
+            || state.last_persisted_heartbeat_at.is_some_and(|last| {
+                now_unix.saturating_sub(last) < PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS
+            })
+        {
+            return None;
+        }
+        let previous_heartbeat_at = state.last_persisted_heartbeat_at;
+        let item_type = state.item_type;
+        self.next_heartbeat_claim = self.next_heartbeat_claim.wrapping_add(1).max(1);
+        let claim_id = self.next_heartbeat_claim;
+        let state = self
+            .items
+            .get_mut(&key)
+            .expect("progress item must remain present while claiming heartbeat");
+        state.last_persisted_heartbeat_at = Some(now_unix);
+        state.pending_heartbeat_claim = Some(claim_id);
+        Some(ProgressHeartbeatClaim {
+            key,
+            claim_id,
+            item_type,
+            previous_heartbeat_at,
+        })
+    }
+
+    fn finish_heartbeat_claim(&mut self, claim: &ProgressHeartbeatClaim, persisted: bool) {
+        let Some(state) = self.items.get_mut(&claim.key) else {
+            return;
+        };
+        if state.pending_heartbeat_claim != Some(claim.claim_id) {
+            return;
+        }
+        state.pending_heartbeat_claim = None;
+        if !persisted {
+            state.last_persisted_heartbeat_at = claim.previous_heartbeat_at;
+        }
+    }
+
+    fn forget_item(&mut self, turn_id: &str, item_id: &str) {
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        self.items.remove(&key);
+        self.missing_item_types.remove(&key);
+    }
+
+    fn forget_turn(&mut self, turn_id: &str) {
+        self.items.retain(|key, _| key.turn_id != turn_id);
+        self.missing_item_types
+            .retain(|key, _| key.turn_id != turn_id);
+    }
 }
 
 impl AgentMarkdownBufferStats {
@@ -899,6 +1068,7 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
@@ -1695,6 +1865,14 @@ impl MessageProcessor {
         self.authorization_invalidation_hub.current_revision().await
     }
 
+    pub(crate) async fn initialize_authorization_generation(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .authorization_invalidation_hub
+            .current_generation_for_maintenance()
+            .await?
+            .get())
+    }
+
     pub(crate) async fn register_execution_lease(
         &self,
         turn_id: &str,
@@ -1728,6 +1906,28 @@ impl MessageProcessor {
             .await?;
         self.guard_execution_side_effect(turn_id, context.continuation_action())
             .await
+    }
+
+    async fn execution_progress_is_current_cached(&self, turn_id: &str) -> anyhow::Result<bool> {
+        let generation = self.current_authorization_revision().await?;
+        self.execution_leases
+            .guard_progress_cached(turn_id, generation)
+            .await
+    }
+
+    async fn guard_execution_progress(&self, turn_id: &str) -> anyhow::Result<()> {
+        if self.execution_progress_is_current_cached(turn_id).await? {
+            return Ok(());
+        }
+        self.guard_execution_commit(turn_id).await.map(drop)
+    }
+
+    async fn retire_execution_progress_state(&self, turn_id: &str) {
+        // Cache writers hold `progress_items` while rechecking this lease.
+        // Retiring the lease first therefore makes the subsequent cache clear
+        // a barrier: no in-flight progress can reinsert state behind it.
+        self.execution_leases.finish(turn_id).await;
+        self.progress_items.lock().await.forget_turn(turn_id);
     }
 
     pub(crate) async fn validate_task_execution_admission_seed(
@@ -4055,6 +4255,7 @@ impl MessageProcessor {
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),

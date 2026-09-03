@@ -1,6 +1,6 @@
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
-    ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
+    ProgressItemRegistry, ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
     record_resilience_worker_error, record_resilience_worker_poll_error,
 };
 use crate::bootstrap::bootstrap;
@@ -67,9 +67,10 @@ use pioneer_crud::{
     global_agent_memory_scope_key,
 };
 use pioneer_entity::{
-    cli_runtime_pending_request, thread, thread_lineage, thread_sandox_policy,
-    thread_timeline_block, turn, turn_event_projection_state, turn_input, turn_item,
-    turn_item_attempt, turn_status_history, turn_work_item_projection, turn_work_projection,
+    authorization_policy_state, cli_runtime_pending_request, thread, thread_lineage,
+    thread_sandox_policy, thread_timeline_block, turn, turn_event_projection_state, turn_input,
+    turn_item, turn_item_attempt, turn_status_history, turn_work_item_projection,
+    turn_work_projection,
 };
 use pioneer_hooks::{
     HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
@@ -7641,6 +7642,84 @@ fn item_delta_event_method_maps_generic_to_agent_message_delta() {
     );
 }
 
+#[test]
+fn progress_item_registry_rate_limits_and_rolls_back_delta_heartbeats() {
+    let mut registry = ProgressItemRegistry::default();
+    registry.remember_missing_item_type("turn-progress", "missing-item", 100);
+    assert!(registry.missing_item_type_is_fresh("turn-progress", "missing-item", 100));
+    assert!(!registry.missing_item_type_is_fresh("turn-progress", "missing-item", 101));
+    registry.remember_item(
+        "turn-progress",
+        "item-progress",
+        TurnItemType::Reasoning,
+        Some(100),
+    );
+    registry.remember_item(
+        "turn-progress",
+        "missing-item",
+        TurnItemType::AgentMessage,
+        None,
+    );
+    assert!(!registry.missing_item_type_is_fresh("turn-progress", "missing-item", 100));
+    assert_eq!(
+        registry.item_type("turn-progress", "item-progress"),
+        Some(TurnItemType::Reasoning)
+    );
+    assert!(
+        registry
+            .claim_delta_heartbeat("turn-progress", "item-progress", 104)
+            .is_none()
+    );
+
+    let failed = registry
+        .claim_delta_heartbeat("turn-progress", "item-progress", 105)
+        .expect("heartbeat should become due after the cadence");
+    assert!(
+        registry
+            .claim_delta_heartbeat("turn-progress", "item-progress", 110)
+            .is_none(),
+        "an in-flight heartbeat must not be duplicated"
+    );
+    registry.finish_heartbeat_claim(&failed, false);
+
+    let persisted = registry
+        .claim_delta_heartbeat("turn-progress", "item-progress", 105)
+        .expect("a failed heartbeat must become retryable");
+    registry.finish_heartbeat_claim(&persisted, true);
+    assert!(
+        registry
+            .claim_delta_heartbeat("turn-progress", "item-progress", 109)
+            .is_none()
+    );
+    assert!(
+        registry
+            .claim_delta_heartbeat("turn-progress", "item-progress", 110)
+            .is_some()
+    );
+
+    registry.forget_turn("turn-progress");
+    assert_eq!(registry.item_type("turn-progress", "item-progress"), None);
+
+    for index in 0..=super::PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY {
+        registry.remember_missing_item_type(
+            "turn-progress",
+            format!("missing-{index}").as_str(),
+            200,
+        );
+    }
+    assert_eq!(
+        registry.missing_item_types.len(),
+        super::PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY,
+        "untrusted missing item ids must not grow the retry cache without bound"
+    );
+    registry.remember_missing_item_type("turn-progress", "fresh-miss", 202);
+    assert_eq!(
+        registry.missing_item_types.len(),
+        1,
+        "expired negative lookups should be reclaimed"
+    );
+}
+
 struct ProgressDeltaHarness {
     processor: MessageProcessor,
     crud_store: Arc<CrudStore>,
@@ -8000,6 +8079,139 @@ async fn many_assistant_progress_deltas_do_not_create_persisted_delta_rows() {
 
     let payloads = turn_item_payloads(&harness).await;
     assert_no_persisted_item_delta(payloads.as_slice());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_progress_does_not_write_the_policy_generation_row() {
+    let harness = setup_progress_delta_harness(
+        "policyhotpath",
+        TurnItem::AgentMessage {
+            id: "item_progress_policy_hot_path".to_owned(),
+            text: String::new(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        false,
+    )
+    .await;
+
+    harness
+        .processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "warm",
+                ItemDeltaStream::AgentMessage,
+            ),
+        })
+        .await;
+    harness
+        .crud_store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE authorization_policy_state \
+             SET updated_at = '2000-01-01 00:00:00+00:00' \
+             WHERE singleton_id = 1",
+        )
+        .await
+        .expect("install policy-generation write sentinel");
+
+    for _ in 0..32 {
+        harness
+            .processor
+            .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                notification: progress_delta_notification(
+                    &harness,
+                    "x",
+                    ItemDeltaStream::AgentMessage,
+                ),
+            })
+            .await;
+    }
+
+    let policy_state = authorization_policy_state::Entity::find_by_id(1)
+        .one(&harness.crud_store.database_connection())
+        .await
+        .expect("policy generation row should load")
+        .expect("policy generation singleton should exist");
+    assert_eq!(
+        policy_state.updated_at.timestamp(),
+        946_684_800,
+        "progress generation reads must not perform write-on-read initialization"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_progress_state_drops_the_item_cache_and_execution_lease() {
+    let harness = setup_progress_delta_harness(
+        "progressretire",
+        TurnItem::AgentMessage {
+            id: "item_progress_retire".to_owned(),
+            text: String::new(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+        false,
+    )
+    .await;
+
+    harness
+        .processor
+        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+            notification: progress_delta_notification(
+                &harness,
+                "warm",
+                ItemDeltaStream::AgentMessage,
+            ),
+        })
+        .await;
+    let generation = harness
+        .processor
+        .current_authorization_revision()
+        .await
+        .expect("authorization generation should load");
+    assert!(
+        harness
+            .processor
+            .execution_leases
+            .guard_progress_cached(harness.turn_id.as_str(), generation)
+            .await
+            .expect("warmed progress lease should validate")
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_items
+            .lock()
+            .await
+            .item_type(harness.turn_id.as_str(), harness.item_id.as_str()),
+        Some(TurnItemType::AgentMessage)
+    );
+
+    harness
+        .processor
+        .retire_execution_progress_state(harness.turn_id.as_str())
+        .await;
+
+    assert!(
+        !harness
+            .processor
+            .execution_leases
+            .guard_progress_cached(harness.turn_id.as_str(), generation)
+            .await
+            .expect("retired progress lease should be absent")
+    );
+    assert_eq!(
+        harness
+            .processor
+            .progress_items
+            .lock()
+            .await
+            .item_type(harness.turn_id.as_str(), harness.item_id.as_str()),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14239,6 +14451,30 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
     );
 
     processor
+        .send_progress_notification_to_thread_subscribers(
+            THREAD_ID,
+            "test/private-progress-current-acl",
+            &json!({"private": true}),
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut allowed_rx, "test/private-progress-current-acl")
+            .await
+            .method,
+        "test/private-progress-current-acl"
+    );
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/private-progress-current-acl")
+            .await
+            .method,
+        "test/private-progress-current-acl"
+    );
+    assert!(
+        denied_rx.try_recv().is_err(),
+        "the single final progress authorization must reject a stale subscriber"
+    );
+
+    processor
         .send_voice_session_result_notification(
             allowed_connection_id,
             THREAD_ID,
@@ -14279,6 +14515,23 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         )
         .await
         .expect("remove private-thread membership");
+    processor
+        .send_progress_notification_to_thread_subscribers(
+            THREAD_ID,
+            "test/private-progress-after-revoke",
+            &json!({"private": true}),
+        )
+        .await;
+    assert_eq!(
+        recv_notification_by_method(&mut superuser_rx, "test/private-progress-after-revoke")
+            .await
+            .method,
+        "test/private-progress-after-revoke"
+    );
+    assert!(
+        allowed_rx.try_recv().is_err(),
+        "progress delivery must observe an ACL revoke even before subscriber eviction"
+    );
     processor
         .send_notification_to_reauthorized_thread_connections(
             THREAD_ID,

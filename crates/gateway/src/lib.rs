@@ -806,6 +806,10 @@ async fn run_gateway_until_shutdown_inner(
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
+    message_processor
+        .initialize_authorization_generation()
+        .await
+        .context("failed to initialize durable authorization policy generation")?;
     services_initialize_stage.succeed();
     let services_prepare_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ServicesPrepare);
