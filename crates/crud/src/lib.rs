@@ -1479,6 +1479,7 @@ pub struct TurnProjectionStreamStateRecord {
     pub last_error: Option<String>,
     pub quarantined_at_unix: Option<i64>,
     pub restored_at_unix: Option<i64>,
+    pub updated_at_unix_micros: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -5733,6 +5734,19 @@ impl CrudStore {
         filter: CliRuntimePendingRequestListFilter,
     ) -> Result<Vec<CliRuntimePendingRequestRecord>> {
         cli_runtime_binding::list_pending_requests(&self.connection, filter).await
+    }
+
+    pub async fn list_open_cli_runtime_pending_requests_for_descendant_threads(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+    ) -> Result<Vec<CliRuntimePendingRequestRecord>> {
+        cli_runtime_binding::list_open_pending_requests_for_descendant_threads(
+            &self.connection,
+            workspace_id,
+            thread_id,
+        )
+        .await
     }
 
     pub async fn resolve_cli_runtime_pending_request(
@@ -25175,6 +25189,7 @@ WHERE id IN (SELECT event_id FROM candidates)
             last_error: state.last_error,
             quarantined_at_unix: state.quarantined_at.map(|value| value.timestamp()),
             restored_at_unix: state.restored_at.map(|value| value.timestamp()),
+            updated_at_unix_micros: state.updated_at.timestamp_micros(),
         }))
     }
 
@@ -28299,7 +28314,8 @@ mod tests {
     };
     use crate::convention::ATTEMPT_STATUS_COMPLETED;
     use crate::repositories::{
-        native_terminal_effect_outbox, read_model_repair, thread, turn, turn_finalization,
+        cli_runtime_binding, native_terminal_effect_outbox, read_model_repair, thread, turn,
+        turn_finalization,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -34147,6 +34163,104 @@ mod tests {
             .await
             .expect("answered request list should succeed");
         assert_eq!(answered_rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn descendant_pending_requests_are_loaded_by_one_bounded_subtree_query() {
+        let store = test_store_with_workspace("ws_descendant_pending").await;
+        let created_at = unix_to_datetime(1_700_020_200);
+        let lineage_rows = [
+            ("child_a", "root_a", 1),
+            ("grandchild_a", "child_a", 2),
+            ("unrelated_child", "unrelated_root", 1),
+        ]
+        .into_iter()
+        .map(|(child_thread_id, parent_thread_id, depth)| {
+            pioneer_entity::thread_lineage::ActiveModel {
+                child_thread_id: Set(child_thread_id.to_owned()),
+                parent_thread_id: Set(parent_thread_id.to_owned()),
+                root_thread_id: Set(if child_thread_id == "unrelated_child" {
+                    "unrelated_root".to_owned()
+                } else {
+                    "root_a".to_owned()
+                }),
+                depth: Set(depth),
+                created_at: Set(created_at),
+                origin_kind: Set(None),
+                created_by_thread_id: Set(None),
+                created_by_turn_id: Set(None),
+            }
+        })
+        .collect::<Vec<_>>();
+        pioneer_entity::thread_lineage::Entity::insert_many(lineage_rows)
+            .exec(&store.connection)
+            .await
+            .expect("lineage fixtures should insert");
+
+        let request =
+            |request_id: &str, workspace_id: &str, thread_id: &str| NewCliRuntimePendingRequest {
+                request_id: request_id.to_owned(),
+                runtime_id: "codex".to_owned(),
+                runtime_kind: "codex".to_owned(),
+                workspace_id: workspace_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: Some(format!("turn_{thread_id}")),
+                native_thread_id: None,
+                native_turn_id: None,
+                native_item_id: None,
+                request_kind: "command_approval".to_owned(),
+                payload_json: "{}".to_owned(),
+                created_at,
+                updated_at: created_at,
+            };
+        for pending in [
+            request("request_child", "ws_descendant_pending", "child_a"),
+            request(
+                "request_grandchild",
+                "ws_descendant_pending",
+                "grandchild_a",
+            ),
+            request(
+                "request_unrelated",
+                "ws_descendant_pending",
+                "unrelated_child",
+            ),
+            request("request_other_workspace", "ws_other", "child_a"),
+        ] {
+            cli_runtime_binding::create_pending_request(&store.connection, pending)
+                .await
+                .expect("pending request fixture should insert");
+        }
+
+        let root_requests = store
+            .list_open_cli_runtime_pending_requests_for_descendant_threads(
+                "ws_descendant_pending",
+                "root_a",
+            )
+            .await
+            .expect("root subtree query should succeed");
+        assert_eq!(
+            root_requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["request_child", "request_grandchild"]
+        );
+
+        let child_requests = store
+            .list_open_cli_runtime_pending_requests_for_descendant_threads(
+                "ws_descendant_pending",
+                "child_a",
+            )
+            .await
+            .expect("nested subtree query should succeed");
+        assert_eq!(
+            child_requests
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["request_grandchild"]
+        );
     }
 
     #[tokio::test]

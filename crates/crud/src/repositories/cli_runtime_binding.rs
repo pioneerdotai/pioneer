@@ -7,7 +7,7 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -1604,6 +1604,63 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list CLI runtime pending requests")?
+        .into_iter()
+        .map(pending_request_record_from_model)
+        .collect()
+}
+
+/// Loads open requests for the complete descendant-thread subtree in one
+/// bounded query. The recursive relation is traversed by SQLite rather than by
+/// issuing one pending-request query per descendant.
+pub async fn list_open_pending_requests_for_descendant_threads<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<Vec<CliRuntimePendingRequestRecord>> {
+    let limit = i64::try_from(CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX)
+        .context("pending request page limit exceeds SQLite integer range")?;
+    let statement = Statement::from_sql_and_values(
+        db.get_database_backend(),
+        r#"
+WITH RECURSIVE descendant_threads(thread_id) AS (
+    SELECT child_thread_id
+    FROM thread_lineage
+    WHERE parent_thread_id = ?
+    UNION
+    SELECT lineage.child_thread_id
+    FROM thread_lineage AS lineage
+    INNER JOIN descendant_threads AS descendant
+        ON lineage.parent_thread_id = descendant.thread_id
+)
+SELECT pending.*
+FROM cli_runtime_pending_request AS pending
+INNER JOIN descendant_threads AS descendant
+    ON descendant.thread_id = pending.thread_id
+WHERE pending.workspace_id = ?
+  AND pending.status IN (?, ?, ?, ?)
+ORDER BY pending.created_at ASC, pending.request_id ASC
+LIMIT ?
+"#,
+        [
+            thread_id.into(),
+            workspace_id.into(),
+            CliRuntimePendingRequestStatus::Pending.as_str().into(),
+            CliRuntimePendingRequestStatus::ResponseAccepted
+                .as_str()
+                .into(),
+            CliRuntimePendingRequestStatus::Delivering.as_str().into(),
+            CliRuntimePendingRequestStatus::DeliveryFailed
+                .as_str()
+                .into(),
+            limit.into(),
+        ],
+    );
+
+    cli_runtime_pending_request::Entity::find()
+        .from_raw_sql(statement)
+        .all(db)
+        .await
+        .context("failed to list open CLI runtime pending requests for descendant threads")?
         .into_iter()
         .map(pending_request_record_from_model)
         .collect()

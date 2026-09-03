@@ -10,6 +10,13 @@ use pioneer_protocol::{
     TurnWorkStateChangedNotification, TurnWorkTombstone,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnWorkProjectionAvailability {
+    Present,
+    Absent,
+    Failed,
+}
+
 impl MessageProcessor {
     pub(super) async fn notify_semantic_timeline_item_changed(
         &self,
@@ -51,7 +58,6 @@ impl MessageProcessor {
                     removed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
                 } else {
                     notify_work_state = true;
-                    changed_block_ids.push(work_block_id(turn_id));
                     if classification.visibility == ProjectionVisibility::Visible {
                         changed_work_item_ids.push(work_item_projection_id(turn_id, item_id));
                     } else {
@@ -97,8 +103,14 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
-        self.notify_semantic_turn_work_state_changed(workspace_id, thread_id, turn_id)
-            .await;
+        if self
+            .notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, true)
+            .await
+            == TurnWorkProjectionAvailability::Absent
+        {
+            self.notify_semantic_turn_work_removed(workspace_id, thread_id, turn_id)
+                .await;
+        }
     }
 
     pub(super) async fn notify_semantic_user_message_changed(
@@ -149,13 +161,6 @@ impl MessageProcessor {
         turn_id: &str,
         item_id: &str,
     ) {
-        self.notify_semantic_timeline_blocks_changed(
-            workspace_id,
-            thread_id,
-            vec![work_block_id(turn_id)],
-            Vec::new(),
-        )
-        .await;
         self.notify_semantic_turn_work_items_changed(
             workspace_id,
             thread_id,
@@ -455,7 +460,8 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
-        self.notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, true)
+        let _ = self
+            .notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, true)
             .await;
     }
 
@@ -465,8 +471,14 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
     ) {
-        self.notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, false)
-            .await;
+        if self
+            .notify_semantic_turn_work_state_changed_inner(workspace_id, thread_id, turn_id, false)
+            .await
+            == TurnWorkProjectionAvailability::Absent
+        {
+            self.notify_semantic_turn_work_removed(workspace_id, thread_id, turn_id)
+                .await;
+        }
     }
 
     async fn notify_semantic_turn_work_state_changed_inner(
@@ -475,45 +487,10 @@ impl MessageProcessor {
         thread_id: &str,
         turn_id: &str,
         notify_block_change: bool,
-    ) {
+    ) -> TurnWorkProjectionAvailability {
         let projection = match self.crud_store.get_turn_work_projection(turn_id).await {
             Ok(Some(projection)) => projection,
-            Ok(None) => {
-                let source_high_watermark = match self
-                    .crud_store
-                    .get_turn_event_projection_stream_state(turn_id)
-                    .await
-                {
-                    Ok(state) => state
-                        .map(|state| state.projected_through_sequence)
-                        .unwrap_or_default(),
-                    Err(error) => {
-                        warn!(
-                            thread_id,
-                            turn_id,
-                            error = %format!("{error:#}"),
-                            "failed to load turn work tombstone revision"
-                        );
-                        return;
-                    }
-                };
-                let block_id = work_block_id(turn_id);
-                self.notify_semantic_timeline_blocks_changed_with_tombstones(
-                    workspace_id,
-                    thread_id,
-                    Vec::new(),
-                    vec![block_id.clone()],
-                    vec![TurnWorkTombstone {
-                        turn_id: turn_id.to_owned(),
-                        block_id,
-                        source_high_watermark,
-                        projection_updated_at_unix_micros: pioneer_crud::utc_now()
-                            .timestamp_micros(),
-                    }],
-                )
-                .await;
-                return;
-            }
+            Ok(None) => return TurnWorkProjectionAvailability::Absent,
             Err(error) => {
                 warn!(
                     thread_id,
@@ -521,7 +498,7 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to load turn work projection for semantic state notification"
                 );
-                return;
+                return TurnWorkProjectionAvailability::Failed;
             }
         };
         if notify_block_change {
@@ -544,7 +521,7 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to build turn work block for semantic state notification"
                 );
-                return;
+                return TurnWorkProjectionAvailability::Failed;
             }
         };
 
@@ -561,6 +538,53 @@ impl MessageProcessor {
             thread_id,
             events::TURN_WORK_STATE_CHANGED,
             &payload,
+        )
+        .await;
+        TurnWorkProjectionAvailability::Present
+    }
+
+    async fn notify_semantic_turn_work_removed(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) {
+        let stream_state = match self
+            .crud_store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    thread_id,
+                    turn_id,
+                    error = %format!("{error:#}"),
+                    "failed to load turn work tombstone revision"
+                );
+                return;
+            }
+        };
+        let (source_high_watermark, projection_updated_at_unix_micros) = stream_state
+            .map(|state| {
+                (
+                    state.projected_through_sequence,
+                    state.updated_at_unix_micros,
+                )
+            })
+            .unwrap_or_default();
+        let block_id = work_block_id(turn_id);
+        self.notify_semantic_timeline_blocks_changed_with_tombstones(
+            workspace_id,
+            thread_id,
+            Vec::new(),
+            vec![block_id.clone()],
+            vec![TurnWorkTombstone {
+                turn_id: turn_id.to_owned(),
+                block_id,
+                source_high_watermark,
+                projection_updated_at_unix_micros,
+            }],
         )
         .await;
     }

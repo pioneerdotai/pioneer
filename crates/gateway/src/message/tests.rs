@@ -46656,24 +46656,8 @@ async fn live_semantic_timeline_projects_running_item_without_backfill() {
         .await;
 
     let _item_started = recv_notification_by_method(&mut harness.rx, events::ITEM_STARTED).await;
-    let blocks_changed =
-        recv_notification_by_method(&mut harness.rx, events::THREAD_TIMELINE_BLOCKS_CHANGED).await;
-    let blocks_changed: pioneer_protocol::ThreadTimelineBlocksChangedNotification =
-        serde_json::from_value(
-            blocks_changed
-                .params
-                .expect("timeline blocks notification should include params"),
-        )
-        .expect("timeline blocks notification should decode");
-    assert_eq!(blocks_changed.thread_id, harness.thread_id);
-    assert_eq!(
-        blocks_changed.changed_block_ids,
-        vec![pioneer_crud::work_block_id(harness.turn_id.as_str())]
-    );
-    assert!(blocks_changed.removed_block_ids.is_empty());
-
-    let items_changed =
-        recv_notification_by_method(&mut harness.rx, events::TURN_WORK_ITEMS_CHANGED).await;
+    let items_changed = recv_next_notification(&mut harness.rx).await;
+    assert_eq!(items_changed.method, events::TURN_WORK_ITEMS_CHANGED);
     let items_changed: pioneer_protocol::TurnWorkItemsChangedNotification = serde_json::from_value(
         items_changed
             .params
@@ -46691,8 +46675,8 @@ async fn live_semantic_timeline_projects_running_item_without_backfill() {
     );
     assert!(items_changed.removed_work_item_ids.is_empty());
 
-    let state_changed =
-        recv_notification_by_method(&mut harness.rx, events::TURN_WORK_STATE_CHANGED).await;
+    let state_changed = recv_next_notification(&mut harness.rx).await;
+    assert_eq!(state_changed.method, events::TURN_WORK_STATE_CHANGED);
     let state_changed: pioneer_protocol::TurnWorkStateChangedNotification = serde_json::from_value(
         state_changed
             .params
@@ -47471,6 +47455,24 @@ async fn live_semantic_timeline_grandchild_pending_request_projects_to_every_anc
     );
     assert_eq!(approval.4.title.as_deref(), Some("Run grandchild command"));
 
+    let root_thread_id = harness.thread_id.clone();
+    let historical_page = request_live_thread_timeline_page_for_thread_at_anchor(
+        &mut harness,
+        "grandchild-approval-root-history",
+        root_thread_id.as_str(),
+        json!({ "kind": "oldest" }),
+    )
+    .await;
+    assert!(historical_page.blocks.iter().all(|block| {
+        !matches!(
+            &block.kind,
+            pioneer_protocol::TimelineBlockKind::PendingRequest {
+                request_id: projected_request_id,
+                ..
+            } if projected_request_id == request_id
+        )
+    }));
+
     let child_page = request_live_thread_timeline_page_for_thread(
         &mut harness,
         "grandchild-approval-child-page",
@@ -47925,6 +47927,21 @@ async fn request_live_thread_timeline_page_for_thread(
     suffix: &str,
     thread_id: &str,
 ) -> pioneer_protocol::ThreadTimelinePageResponse {
+    request_live_thread_timeline_page_for_thread_at_anchor(
+        harness,
+        suffix,
+        thread_id,
+        json!({ "kind": "newest" }),
+    )
+    .await
+}
+
+async fn request_live_thread_timeline_page_for_thread_at_anchor(
+    harness: &mut LiveSemanticTimelineHarness,
+    suffix: &str,
+    thread_id: &str,
+    anchor: JsonValue,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
     let request_id = generate_test_request_id("semlive", suffix);
     let request = json!({
         "jsonrpc": "2.0",
@@ -47932,7 +47949,7 @@ async fn request_live_thread_timeline_page_for_thread(
         "method": "thread/timeline/page",
         "params": {
             "threadId": thread_id,
-            "anchor": { "kind": "oldest" },
+            "anchor": anchor,
             "limit": 20
         }
     });
@@ -61195,6 +61212,18 @@ async fn recv_notification_by_method(
     method: &str,
 ) -> JsonRpcNotification {
     recv_notification_by_method_timeout(rx, method, Duration::from_secs(2)).await
+}
+
+async fn recv_next_notification(rx: &mut mpsc::Receiver<Message>) -> JsonRpcNotification {
+    let payload =
+        recv_text_timeout_context(rx, Duration::from_secs(2), "next json-rpc notification").await;
+    let value: serde_json::Value =
+        serde_json::from_str(&payload).expect("json-rpc payload should decode");
+    assert!(
+        value.get("id").is_none(),
+        "expected a notification: {value}"
+    );
+    serde_json::from_value(value).expect("json-rpc notification should decode")
 }
 
 async fn recv_notification_by_method_timeout(

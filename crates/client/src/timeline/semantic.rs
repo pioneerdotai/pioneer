@@ -1011,7 +1011,6 @@ pub fn apply_thread_timeline_page(
 ) -> bool {
     let thread_id = page.thread_id.clone();
     let thread = state.thread_mut(thread_id);
-    let before = thread.clone();
     page.blocks.retain(|block| match &block.kind {
         TimelineBlockKind::TurnWork { work } => {
             !thread
@@ -1032,17 +1031,19 @@ pub fn apply_thread_timeline_page(
                 .flatten()
         })
         .collect::<HashSet<_>>();
+    let mut changed = false;
     if merge_mode == TopLevelPageMergeMode::Reset {
-        thread.detached_task_run_turn_ids.clear();
+        let previous = std::mem::take(&mut thread.detached_task_run_turn_ids);
+        changed |= previous != detached_turn_ids;
     }
-    thread
-        .detached_task_run_turn_ids
-        .extend(detached_turn_ids.iter().cloned());
-    apply_top_level_page(&mut thread.top_level, page, merge_mode);
+    for turn_id in &detached_turn_ids {
+        changed |= thread.detached_task_run_turn_ids.insert(turn_id.clone());
+    }
+    changed |= apply_top_level_page(&mut thread.top_level, page, merge_mode);
     for turn_id in detached_turn_ids {
-        remove_turn_work_state(thread, turn_id.as_str());
+        changed |= remove_turn_work_state(thread, turn_id.as_str());
     }
-    before != *thread
+    changed
 }
 
 pub fn apply_top_level_page(
@@ -1050,33 +1051,45 @@ pub fn apply_top_level_page(
     page: ThreadTimelinePageResponse,
     merge_mode: TopLevelPageMergeMode,
 ) -> bool {
-    let before = cache.clone();
-    let was_empty = cache.ordered_block_ids.is_empty();
-
     if merge_mode == TopLevelPageMergeMode::Reset {
-        cache.blocks_by_id.clear();
-        cache.ordered_block_ids.clear();
-        cache.stale_block_ids.clear();
+        let previous = std::mem::take(cache);
+        for incoming in page.blocks {
+            let block = newest_top_level_block(
+                previous.blocks_by_id.get(incoming.block_id.as_str()),
+                incoming,
+            );
+            cache.blocks_by_id.insert(block.block_id.clone(), block);
+        }
+        sort_top_level_blocks(cache);
+        cache.loaded_range = (&page.page).into();
+        cache.request_status = TimelineRequestStatus::Ready;
+        return previous != *cache;
     }
 
+    let was_empty = cache.ordered_block_ids.is_empty();
+    let mut changed = false;
+    let mut blocks_changed = false;
     for incoming in page.blocks {
-        let existing = cache
-            .blocks_by_id
-            .get(incoming.block_id.as_str())
-            .or_else(|| {
-                (merge_mode == TopLevelPageMergeMode::Reset)
-                    .then(|| before.blocks_by_id.get(incoming.block_id.as_str()))
-                    .flatten()
-            });
+        let existing = cache.blocks_by_id.get(incoming.block_id.as_str());
         let block = newest_top_level_block(existing, incoming);
-        cache.stale_block_ids.remove(block.block_id.as_str());
-        cache.blocks_by_id.insert(block.block_id.clone(), block);
+        let block_id = block.block_id.clone();
+        if existing != Some(&block) {
+            cache.blocks_by_id.insert(block_id.clone(), block);
+            changed = true;
+            blocks_changed = true;
+        }
+        changed |= cache.stale_block_ids.remove(block_id.as_str());
     }
-    sort_top_level_blocks(cache);
+    if blocks_changed {
+        sort_top_level_blocks(cache);
+    }
+    let previous_loaded_range = cache.loaded_range.clone();
     merge_top_level_loaded_range(cache, &page.page, merge_mode, was_empty);
+    changed |= cache.loaded_range != previous_loaded_range;
+    changed |= cache.request_status != TimelineRequestStatus::Ready;
     cache.request_status = TimelineRequestStatus::Ready;
 
-    before != *cache
+    changed
 }
 
 pub fn apply_thread_timeline_blocks_changed(
@@ -1084,11 +1097,16 @@ pub fn apply_thread_timeline_blocks_changed(
     notification: ThreadTimelineBlocksChangedNotification,
 ) -> bool {
     let thread = state.thread_mut(notification.thread_id);
-    let before = thread.clone();
+    let mut changed = false;
+    let mut removed_top_level_block = false;
 
     for block_id in notification.removed_block_ids {
-        thread.top_level.blocks_by_id.remove(block_id.as_str());
-        thread.top_level.stale_block_ids.remove(block_id.as_str());
+        removed_top_level_block |= thread
+            .top_level
+            .blocks_by_id
+            .remove(block_id.as_str())
+            .is_some();
+        changed |= thread.top_level.stale_block_ids.remove(block_id.as_str());
     }
     let mut tombstoned_block_ids = HashSet::new();
     for tombstone in notification.turn_work_tombstones {
@@ -1096,21 +1114,22 @@ pub fn apply_thread_timeline_blocks_changed(
             tombstone.source_high_watermark,
             tombstone.projection_updated_at_unix_micros,
         );
-        let cached_revision = thread
+        if thread
             .turn_work_tombstone_revisions
             .get(tombstone.turn_id.as_str())
-            .copied()
-            .unwrap_or_default();
-        if incoming_revision < cached_revision {
+            .is_some_and(|cached_revision| incoming_revision <= *cached_revision)
+        {
             continue;
         }
         tombstoned_block_ids.insert(tombstone.block_id);
         thread
             .turn_work_tombstone_revisions
             .insert(tombstone.turn_id.clone(), incoming_revision);
-        remove_turn_work_state(thread, tombstone.turn_id.as_str());
+        changed = true;
+        changed |= remove_turn_work_state(thread, tombstone.turn_id.as_str());
     }
-    if !thread.top_level.ordered_block_ids.is_empty() {
+    if removed_top_level_block {
+        changed = true;
         thread
             .top_level
             .ordered_block_ids
@@ -1118,12 +1137,13 @@ pub fn apply_thread_timeline_blocks_changed(
     }
     for block_id in notification.changed_block_ids {
         if !tombstoned_block_ids.contains(block_id.as_str()) {
-            thread.top_level.stale_block_ids.insert(block_id);
+            changed |= thread.top_level.stale_block_ids.insert(block_id);
         }
     }
+    changed |= thread.top_level.request_status != TimelineRequestStatus::Ready;
     thread.top_level.request_status = TimelineRequestStatus::Ready;
 
-    before != *thread
+    changed
 }
 
 pub fn apply_semantic_timeline_live_update(
@@ -2094,20 +2114,19 @@ pub fn apply_turn_work_page(
         page.projection_updated_at_unix_micros,
     );
     let thread = state.thread_mut(thread_id);
-    let before = thread.clone();
     if page.work.is_none() {
         let cached_revision = thread
             .turn_work_tombstone_revisions
             .get(turn_id.as_str())
-            .copied()
-            .unwrap_or_default();
-        if incoming_revision >= cached_revision {
+            .copied();
+        if cached_revision.is_none_or(|cached_revision| incoming_revision > cached_revision) {
             thread
                 .turn_work_tombstone_revisions
                 .insert(turn_id.clone(), incoming_revision);
             remove_turn_work_state(thread, turn_id.as_str());
+            return true;
         }
-        return before != *thread;
+        return false;
     }
     if thread
         .suppressed_optimistic_turn_work_ids
@@ -2117,15 +2136,16 @@ pub fn apply_turn_work_page(
             .get(turn_id.as_str())
             .is_some_and(|tombstone_revision| incoming_revision <= *tombstone_revision)
     {
-        remove_turn_work_state(thread, turn_id.as_str());
-        return before != *thread;
+        return remove_turn_work_state(thread, turn_id.as_str());
     }
-    thread
+    let tombstone_removed = thread
         .turn_work_tombstone_revisions
-        .remove(turn_id.as_str());
+        .remove(turn_id.as_str())
+        .is_some();
+    let range_existed = thread.work_ranges_by_turn.contains_key(turn_id.as_str());
     let range = thread.work_range_mut(turn_id);
-    apply_work_range_page(range, page, merge_mode);
-    before != *thread
+    let page_changed = apply_work_range_page(range, page, merge_mode);
+    tombstone_removed || !range_existed || page_changed
 }
 
 pub fn apply_work_range_page(
@@ -2207,9 +2227,16 @@ pub fn apply_work_items_get_response(
     range: &mut TurnWorkRangeCache,
     response: TurnWorkItemsGetResponse,
 ) -> bool {
-    let before = range.clone();
-    range.thread_id = response.thread_id;
-    range.turn_id = response.turn_id;
+    let mut changed = false;
+    let mut items_changed = false;
+    if range.thread_id != response.thread_id {
+        range.thread_id = response.thread_id;
+        changed = true;
+    }
+    if range.turn_id != response.turn_id {
+        range.turn_id = response.turn_id;
+        changed = true;
+    }
     let response_revision = (
         response.source_high_watermark,
         response.projection_updated_at_unix_micros,
@@ -2220,40 +2247,56 @@ pub fn apply_work_items_get_response(
     );
 
     for item in response.items {
-        merge_turn_work_item(range, item);
+        let item_changed = merge_turn_work_item(range, item);
+        changed |= item_changed;
+        items_changed |= item_changed;
     }
     if response_revision >= cached_revision {
         for work_item_id in response.removed_work_item_ids {
-            range.items_by_id.remove(work_item_id.as_str());
-            range.stale_work_item_ids.remove(work_item_id.as_str());
+            let item_removed = range.items_by_id.remove(work_item_id.as_str()).is_some();
+            changed |= item_removed;
+            items_changed |= item_removed;
+            changed |= range.stale_work_item_ids.remove(work_item_id.as_str());
         }
-        range.source_high_watermark = response.source_high_watermark;
-        range.projection_updated_at_unix_micros = response.projection_updated_at_unix_micros;
+        if range.source_high_watermark != response.source_high_watermark {
+            range.source_high_watermark = response.source_high_watermark;
+            changed = true;
+        }
+        if range.projection_updated_at_unix_micros != response.projection_updated_at_unix_micros {
+            range.projection_updated_at_unix_micros = response.projection_updated_at_unix_micros;
+            changed = true;
+        }
     }
-    range
-        .ordered_item_ids
-        .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
-    sort_work_items(range);
+    if items_changed {
+        range
+            .ordered_item_ids
+            .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
+        sort_work_items(range);
+    }
+    changed |= range.request_status != TimelineRequestStatus::Ready;
     range.request_status = TimelineRequestStatus::Ready;
 
-    before != *range
+    changed
 }
 
-fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) {
+fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) -> bool {
     if let Some(existing) = range.items_by_id.get(item.work_item_id.as_str())
         && !incoming_work_item_is_newer(existing, &item)
     {
-        range.stale_work_item_ids.remove(item.work_item_id.as_str());
-        return;
+        return range.stale_work_item_ids.remove(item.work_item_id.as_str());
     }
 
-    remove_existing_work_items_for_item_id(
+    let mut changed = remove_existing_work_items_for_item_id(
         range,
         item.item_id.as_str(),
         item.work_item_id.as_str(),
     );
-    range.stale_work_item_ids.remove(item.work_item_id.as_str());
-    range.items_by_id.insert(item.work_item_id.clone(), item);
+    changed |= range.stale_work_item_ids.remove(item.work_item_id.as_str());
+    if range.items_by_id.get(item.work_item_id.as_str()) != Some(&item) {
+        range.items_by_id.insert(item.work_item_id.clone(), item);
+        changed = true;
+    }
+    changed
 }
 
 fn incoming_work_item_is_newer(existing: &TurnWorkItem, incoming: &TurnWorkItem) -> bool {
@@ -2315,20 +2358,25 @@ fn remove_existing_work_items_for_item_id(
     range: &mut TurnWorkRangeCache,
     item_id: &str,
     keep_work_item_id: &str,
-) {
+) -> bool {
     let duplicate_ids = range
         .items_by_id
         .values()
         .filter(|item| item.item_id == item_id && item.work_item_id != keep_work_item_id)
         .map(|item| item.work_item_id.clone())
         .collect::<Vec<_>>();
+    let mut changed = false;
     for duplicate_id in duplicate_ids {
         range.items_by_id.remove(duplicate_id.as_str());
         range.stale_work_item_ids.remove(duplicate_id.as_str());
+        changed = true;
     }
-    range
-        .ordered_item_ids
-        .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
+    if changed {
+        range
+            .ordered_item_ids
+            .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
+    }
+    changed
 }
 
 pub fn apply_turn_work_items_changed(
@@ -2337,23 +2385,26 @@ pub fn apply_turn_work_items_changed(
 ) -> bool {
     let thread = state.thread_mut(notification.thread_id);
     let range = thread.work_range_mut(notification.turn_id);
-    let before = range.clone();
+    let mut changed = false;
+    let mut removed_item = false;
 
     for work_item_id in notification.removed_work_item_ids {
-        range.items_by_id.remove(work_item_id.as_str());
-        range.stale_work_item_ids.remove(work_item_id.as_str());
+        removed_item |= range.items_by_id.remove(work_item_id.as_str()).is_some();
+        changed |= range.stale_work_item_ids.remove(work_item_id.as_str());
     }
-    if !range.ordered_item_ids.is_empty() {
+    if removed_item {
+        changed = true;
         range
             .ordered_item_ids
             .retain(|work_item_id| range.items_by_id.contains_key(work_item_id));
     }
     for work_item_id in notification.changed_work_item_ids {
-        range.stale_work_item_ids.insert(work_item_id);
+        changed |= range.stale_work_item_ids.insert(work_item_id);
     }
+    changed |= range.request_status != TimelineRequestStatus::Ready;
     range.request_status = TimelineRequestStatus::Ready;
 
-    before != *range
+    changed
 }
 
 pub fn apply_turn_work_state_changed(
@@ -2361,7 +2412,6 @@ pub fn apply_turn_work_state_changed(
     notification: TurnWorkStateChangedNotification,
 ) -> bool {
     let thread = state.thread_mut(notification.thread_id);
-    let before = thread.clone();
     let turn_id = notification.turn_id;
     let mut work = notification.work;
     let incoming_revision = (
@@ -2377,37 +2427,52 @@ pub fn apply_turn_work_state_changed(
             .get(turn_id.as_str())
             .is_some_and(|tombstone_revision| incoming_revision <= *tombstone_revision)
     {
-        remove_turn_work_state(thread, turn_id.as_str());
-        return before != *thread;
+        return remove_turn_work_state(thread, turn_id.as_str());
     }
-    thread
+    let mut changed = thread
         .turn_work_tombstone_revisions
-        .remove(turn_id.as_str());
+        .remove(turn_id.as_str())
+        .is_some();
 
+    let range_existed = thread.work_ranges_by_turn.contains_key(turn_id.as_str());
     let range = thread.work_range_mut(turn_id.as_str());
+    changed |= !range_existed;
     if incoming_revision
         < (
             range.source_high_watermark,
             range.projection_updated_at_unix_micros,
         )
     {
-        return false;
+        return changed;
     }
     if let Some(existing_work) = range.work.as_ref() {
         preserve_newer_agent_work_graph(existing_work, &mut work);
     }
-    range.work = Some(work.clone());
-    range.source_high_watermark = notification.source_high_watermark;
-    range.projection_updated_at_unix_micros = notification.projection_updated_at_unix_micros;
-    for block in thread.top_level.blocks_by_id.values_mut() {
-        if let TimelineBlockKind::TurnWork { work: block_work } = &mut block.kind
-            && block_work.turn_id == turn_id
-        {
-            *block_work = work.clone();
-        }
+    if range.work.as_ref() != Some(&work) {
+        range.work = Some(work.clone());
+        changed = true;
+    }
+    if range.source_high_watermark != notification.source_high_watermark {
+        range.source_high_watermark = notification.source_high_watermark;
+        changed = true;
+    }
+    if range.projection_updated_at_unix_micros != notification.projection_updated_at_unix_micros {
+        range.projection_updated_at_unix_micros = notification.projection_updated_at_unix_micros;
+        changed = true;
+    }
+    if let Some(block) = thread
+        .top_level
+        .blocks_by_id
+        .get_mut(work_block_id(turn_id.as_str()).as_str())
+        && let TimelineBlockKind::TurnWork { work: block_work } = &mut block.kind
+        && block_work.turn_id == turn_id
+        && block_work != &work
+    {
+        *block_work = work.clone();
+        changed = true;
     }
 
-    before != *thread
+    changed
 }
 
 fn set_turn_work_expanded(
@@ -2618,8 +2683,12 @@ fn user_block_id(turn_id: &str) -> String {
     format!("turn:{turn_id}:user")
 }
 
-fn work_block_id(turn_id: &str) -> String {
+pub fn semantic_turn_work_block_id(turn_id: &str) -> String {
     format!("turn:{turn_id}:work")
+}
+
+fn work_block_id(turn_id: &str) -> String {
+    semantic_turn_work_block_id(turn_id)
 }
 
 fn detached_task_run_block_id(turn_id: &str, item_id: &str) -> String {
@@ -2985,22 +3054,28 @@ fn upsert_detached_task_run_block(
     upsert_top_level_block(thread, block);
 }
 
-fn remove_turn_work_state(thread: &mut ThreadSemanticTimelineState, turn_id: &str) {
-    thread.work_ranges_by_turn.remove(turn_id);
-    thread
+fn remove_turn_work_state(thread: &mut ThreadSemanticTimelineState, turn_id: &str) -> bool {
+    let mut changed = thread.work_ranges_by_turn.remove(turn_id).is_some();
+    let removed_work_block = thread
         .top_level
         .blocks_by_id
-        .remove(work_block_id(turn_id).as_str());
-    thread
+        .remove(work_block_id(turn_id).as_str())
+        .is_some();
+    let removed_terminal_block = thread
         .top_level
         .blocks_by_id
-        .remove(terminal_state_block_id(turn_id).as_str());
-    thread
-        .top_level
-        .ordered_block_ids
-        .retain(|block_id| thread.top_level.blocks_by_id.contains_key(block_id));
-    thread.expansion.clear_turn_work_override(turn_id);
-    sort_top_level_blocks(&mut thread.top_level);
+        .remove(terminal_state_block_id(turn_id).as_str())
+        .is_some();
+    changed |= removed_work_block || removed_terminal_block;
+    changed |= thread.expansion.expanded_turn_work.remove(turn_id);
+    changed |= thread.expansion.collapsed_turn_work.remove(turn_id);
+    if removed_work_block || removed_terminal_block {
+        thread
+            .top_level
+            .ordered_block_ids
+            .retain(|block_id| thread.top_level.blocks_by_id.contains_key(block_id));
+    }
+    changed
 }
 
 fn reconcile_task_attachment_marker(
@@ -5117,6 +5192,35 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_turn_work_tombstone_is_a_noop() {
+        let mut state = SemanticTimelineState::default();
+        let notification = ThreadTimelineBlocksChangedNotification {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            changed_block_ids: Vec::new(),
+            removed_block_ids: vec!["turn:turn_a:work".to_owned()],
+            turn_work_tombstones: vec![pioneer_protocol::TurnWorkTombstone {
+                turn_id: "turn_a".to_owned(),
+                block_id: "turn:turn_a:work".to_owned(),
+                source_high_watermark: 20,
+                projection_updated_at_unix_micros: 200,
+            }],
+            before_cursor: None,
+            after_cursor: None,
+            reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+        };
+
+        assert!(apply_thread_timeline_blocks_changed(
+            &mut state,
+            notification.clone(),
+        ));
+        assert!(!apply_thread_timeline_blocks_changed(
+            &mut state,
+            notification,
+        ));
+    }
+
+    #[test]
     fn adjacent_top_level_pages_merge_without_duplicates_and_sort_by_server_key() {
         let mut state = SemanticTimelineState::default();
         let newer = thread_page(vec![
@@ -5180,6 +5284,30 @@ mod tests {
         ));
         let thread = state.thread("thread_a").expect("thread cache should exist");
         assert_eq!(thread.top_level.stale_block_ids(), vec!["block_b"]);
+    }
+
+    #[test]
+    fn duplicate_block_change_does_not_retrigger_reconciliation() {
+        let mut state = SemanticTimelineState::default();
+        let notification = ThreadTimelineBlocksChangedNotification {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            changed_block_ids: vec!["block_a".to_owned()],
+            removed_block_ids: Vec::new(),
+            turn_work_tombstones: Vec::new(),
+            before_cursor: None,
+            after_cursor: None,
+            reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+        };
+
+        assert!(apply_thread_timeline_blocks_changed(
+            &mut state,
+            notification.clone(),
+        ));
+        assert!(!apply_thread_timeline_blocks_changed(
+            &mut state,
+            notification,
+        ));
     }
 
     #[test]
@@ -5614,9 +5742,10 @@ mod tests {
     #[test]
     fn turn_work_state_changed_updates_cached_range_and_top_level_block() {
         let mut state = SemanticTimelineState::default();
+        let block_id = work_block_id("turn_a");
         assert!(apply_thread_timeline_page(
             &mut state,
-            thread_page(vec![turn_work_block("thread_a", "block_work", "002")]),
+            thread_page(vec![turn_work_block("thread_a", block_id.as_str(), "002")]),
             TopLevelPageMergeMode::Reset
         ));
         assert!(apply_turn_work_page(
@@ -5628,18 +5757,20 @@ mod tests {
         let mut updated_work = work_block("turn_a");
         updated_work.state = TurnWorkState::WaitingForApproval;
         updated_work.visible_work_count = 10;
+        let notification = TurnWorkStateChangedNotification {
+            workspace_id: "workspace_a".to_owned(),
+            thread_id: "thread_a".to_owned(),
+            turn_id: "turn_a".to_owned(),
+            source_high_watermark: 2,
+            projection_updated_at_unix_micros: 2,
+            work: updated_work,
+            reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+        };
         assert!(apply_turn_work_state_changed(
             &mut state,
-            TurnWorkStateChangedNotification {
-                workspace_id: "workspace_a".to_owned(),
-                thread_id: "thread_a".to_owned(),
-                turn_id: "turn_a".to_owned(),
-                source_high_watermark: 2,
-                projection_updated_at_unix_micros: 2,
-                work: updated_work,
-                reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
-            }
+            notification.clone(),
         ));
+        assert!(!apply_turn_work_state_changed(&mut state, notification));
 
         let thread = state.thread("thread_a").expect("thread cache should exist");
         let range = thread
@@ -5651,7 +5782,7 @@ mod tests {
         );
         let block = thread
             .top_level
-            .block("block_work")
+            .block(block_id.as_str())
             .expect("top-level work block should exist");
         assert!(matches!(
             &block.kind,

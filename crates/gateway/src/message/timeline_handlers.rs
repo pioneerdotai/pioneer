@@ -9,17 +9,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::{
     BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_DETACHED_TASK_RUN,
     BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM, BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE,
-    CliRuntimePendingRequestListFilter, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION,
-    ThreadTimelineApprovalScope, WORK_VISIBILITY_VISIBLE, approval_block_id,
+    ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineApprovalScope,
+    WORK_VISIBILITY_VISIBLE, approval_block_id,
 };
 use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work_projection};
 use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
-    TaskThreadLineage, ThreadReadParams, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TimelineBlock, TimelineBlockKind, TimelinePageInfo, TimelineReplySummary, Turn, TurnItem,
-    TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsGetParams,
-    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation,
-    TurnWorkState, UserInput, UserMessageAttachment,
+    ThreadReadParams, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock,
+    TimelineBlockKind, TimelinePageInfo, TimelineReplySummary, Turn, TurnItem, TurnWorkBlock,
+    TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState, UserInput,
+    UserMessageAttachment,
 };
 
 const TURN_WORK_ITEMS_GET_MAX_IDS: usize = 200;
@@ -302,6 +302,7 @@ impl MessageProcessor {
                 return;
             }
         };
+        let include_descendant_pending = matches!(&anchor, ResolvedTimelineAnchor::Newest);
 
         let trace = pioneer_observability::GatewayOperationTrace::start(
             pioneer_observability::GatewayOperation::ThreadTimelinePage,
@@ -517,33 +518,35 @@ impl MessageProcessor {
         let descendant_pending_stage = trace.stage(
             pioneer_observability::GatewayOperationStage::ThreadTimelineDescendantPendingLoad,
         );
-        let descendant_pending_blocks = match self
-            .descendant_pending_request_blocks(
-                workspace_id.as_str(),
-                requested_thread_id.as_str(),
-                Some(&approval_scope),
-            )
-            .await
-        {
-            Ok(blocks) => {
-                descendant_pending_stage.succeed();
-                blocks
-            }
-            Err(error) => {
-                drop(descendant_pending_stage);
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load descendant pending approvals: {error:#}"),
-                    ),
+        let descendant_pending_blocks = if include_descendant_pending {
+            match self
+                .descendant_pending_request_blocks(
+                    workspace_id.as_str(),
+                    requested_thread_id.as_str(),
+                    Some(&approval_scope),
                 )
-                .await;
-                trace.finish_failure();
-                return;
+                .await
+            {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    drop(descendant_pending_stage);
+                    self.send_error(
+                        connection_id,
+                        timeline_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to load descendant pending approvals: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    trace.finish_failure();
+                    return;
+                }
             }
+        } else {
+            Vec::new()
         };
+        descendant_pending_stage.succeed();
         trace.record_items(
             pioneer_observability::GatewayOperationItemKind::ThreadTimelineDescendantPendingBlocks,
             u64::try_from(descendant_pending_blocks.len()).unwrap_or(u64::MAX),
@@ -715,13 +718,18 @@ impl MessageProcessor {
         };
 
         let Some(work_projection) = work_projection else {
-            let source_high_watermark = match self
+            let (source_high_watermark, projection_updated_at_unix_micros) = match self
                 .crud_store
                 .get_turn_event_projection_stream_state(params.turn_id.as_str())
                 .await
             {
                 Ok(state) => state
-                    .map(|state| state.projected_through_sequence)
+                    .map(|state| {
+                        (
+                            state.projected_through_sequence,
+                            state.updated_at_unix_micros,
+                        )
+                    })
                     .unwrap_or_default(),
                 Err(error) => {
                     self.send_error(
@@ -746,7 +754,7 @@ impl MessageProcessor {
                 turn_id: params.turn_id,
                 projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
                 source_high_watermark,
-                projection_updated_at_unix_micros: pioneer_crud::utc_now().timestamp_micros(),
+                projection_updated_at_unix_micros,
                 work: None,
                 items: Vec::new(),
                 page: TimelinePageInfo::default(),
@@ -1849,37 +1857,22 @@ impl MessageProcessor {
         if approval_scope.is_some_and(|scope| !scope.can_observe_agent_requests) {
             return Ok(Vec::new());
         }
-        let descendant_thread_ids = self.descendant_task_thread_ids(thread_id).await?;
-        if descendant_thread_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
+        let requests = self
+            .crud_store
+            .list_open_cli_runtime_pending_requests_for_descendant_threads(workspace_id, thread_id)
+            .await?;
         let mut blocks = Vec::new();
-        for descendant_thread_id in descendant_thread_ids {
-            let requests = self
-                .crud_store
-                .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
-                    workspace_id: Some(workspace_id.to_owned()),
-                    thread_id: Some(descendant_thread_id.clone()),
-                    open_only: true,
-                    ..Default::default()
-                })
-                .await?;
-            for request in requests {
-                if cli_runtime_pending_request_visible_to_scope(&request, approval_scope) {
-                    let author = match request.turn_id.as_deref() {
-                        Some(turn_id) => {
-                            self.timeline_agent_author_for_turn(
-                                descendant_thread_id.as_str(),
-                                turn_id,
-                            )
+        for request in requests {
+            if cli_runtime_pending_request_visible_to_scope(&request, approval_scope) {
+                let author = match request.turn_id.as_deref() {
+                    Some(turn_id) => {
+                        self.timeline_agent_author_for_turn(request.thread_id.as_str(), turn_id)
                             .await?
-                        }
-                        None => None,
-                    };
-                    if let Some(block) = pending_request_proxy_block(request, author)? {
-                        blocks.push(block);
                     }
+                    None => None,
+                };
+                if let Some(block) = pending_request_proxy_block(request, author)? {
+                    blocks.push(block);
                 }
             }
         }
@@ -1889,39 +1882,6 @@ impl MessageProcessor {
                 .then_with(|| left.block_id.cmp(&right.block_id))
         });
         Ok(blocks)
-    }
-
-    async fn descendant_task_thread_ids(&self, thread_id: &str) -> Result<Vec<String>> {
-        let root_thread_id = self
-            .crud_store
-            .get_task_thread_lineage(thread_id)
-            .await?
-            .map(|lineage| lineage.root_thread_id)
-            .unwrap_or_else(|| thread_id.to_owned());
-        let lineage_rows = self
-            .crud_store
-            .list_task_thread_lineage_by_root_thread(root_thread_id.as_str())
-            .await?;
-        if lineage_rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let parent_by_child = parent_by_child_thread_id(lineage_rows.as_slice());
-        let mut descendants = Vec::new();
-        let mut seen = HashSet::<String>::new();
-        for lineage in lineage_rows {
-            if lineage.child_thread_id != thread_id
-                && timeline_lineage_descends_from(
-                    lineage.child_thread_id.as_str(),
-                    thread_id,
-                    &parent_by_child,
-                )
-                && seen.insert(lineage.child_thread_id.clone())
-            {
-                descendants.push(lineage.child_thread_id);
-            }
-        }
-        Ok(descendants)
     }
 
     async fn thread_timeline_block_from_row(
@@ -2661,38 +2621,6 @@ fn pending_request_proxy_sort_key(
         turn_id,
         record.request_id
     )
-}
-
-fn parent_by_child_thread_id(lineage_rows: &[TaskThreadLineage]) -> HashMap<String, String> {
-    let mut parent_by_child = HashMap::new();
-    for lineage in lineage_rows {
-        parent_by_child.insert(
-            lineage.child_thread_id.clone(),
-            lineage.parent_thread_id.clone(),
-        );
-    }
-    parent_by_child
-}
-
-fn timeline_lineage_descends_from(
-    child_thread_id: &str,
-    ancestor_thread_id: &str,
-    parent_by_child: &HashMap<String, String>,
-) -> bool {
-    let mut current = child_thread_id;
-    for _ in 0..=parent_by_child.len() {
-        let Some(parent) = parent_by_child.get(current) else {
-            return false;
-        };
-        if parent == ancestor_thread_id {
-            return true;
-        }
-        if parent == current {
-            return false;
-        }
-        current = parent.as_str();
-    }
-    false
 }
 
 fn append_timeline_blocks_dedup(blocks: &mut Vec<TimelineBlock>, extra: Vec<TimelineBlock>) {

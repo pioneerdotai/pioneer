@@ -1906,12 +1906,6 @@ impl MessageProcessor {
                     None,
                 )
                 .await;
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
             }
         }
     }
@@ -2874,12 +2868,6 @@ impl MessageProcessor {
             }
         }
 
-        self.notify_parent_timeline_changed_for_child_turn(
-            payload.thread_id(),
-            payload.turn_id(),
-            Some(payload.workspace_id()),
-        )
-        .await;
         Ok(())
     }
 
@@ -3924,13 +3912,6 @@ impl MessageProcessor {
                         None
                     }
                 };
-
-                self.notify_parent_timeline_changed_for_child_turn(
-                    notification.thread_id.as_str(),
-                    notification.turn_id.as_str(),
-                    Some(notification.workspace_id.as_str()),
-                )
-                .await;
 
                 if matches!(item_type, Some(TurnItemType::Reasoning)) {
                     self.forward_child_reasoning_delta_to_parent_turn(&notification)
@@ -6385,46 +6366,6 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) fn notify_parent_timeline_changed_for_child_turn(
-        &self,
-        child_thread_id: &str,
-        child_turn_id: &str,
-        workspace_id: Option<&str>,
-    ) -> MessageFuture<'static, ()> {
-        let processor = self.clone();
-        let child_thread_id = child_thread_id.to_owned();
-        let child_turn_id = child_turn_id.to_owned();
-        let workspace_id = workspace_id.map(str::to_owned);
-        message_future(async move {
-            let handle = tokio::spawn(async move {
-                let Some(target) = processor
-                    .parent_timeline_target_for_child_turn(
-                        child_thread_id.as_str(),
-                        child_turn_id.as_str(),
-                        workspace_id.as_deref(),
-                    )
-                    .await
-                else {
-                    return;
-                };
-
-                processor
-                    .notify_semantic_timeline_turn_state_changed(
-                        target.workspace_id.as_str(),
-                        target.parent_thread_id.as_str(),
-                        target.parent_turn_id.as_str(),
-                    )
-                    .await;
-            });
-            if let Err(error) = handle.await {
-                warn!(
-                    error = %error,
-                    "parent timeline changed notification task failed"
-                );
-            }
-        })
-    }
-
     async fn forward_child_reasoning_delta_to_parent_turn(
         &self,
         notification: &pioneer_protocol::ItemDeltaNotification,
@@ -7572,13 +7513,6 @@ impl MessageProcessor {
             turn_blocked.turn.id.as_str(),
         )
         .await;
-        self.notify_parent_timeline_changed_for_child_turn(
-            turn_blocked.thread_id.as_str(),
-            turn_blocked.turn.id.as_str(),
-            Some(turn_blocked.workspace_id.as_str()),
-        )
-        .await;
-
         true
     }
 

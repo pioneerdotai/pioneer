@@ -35,16 +35,17 @@ use pioneer_client::{
         render_fingerprint::render_fingerprint_hex,
         rows::TimelineRow,
         semantic::{
-            DEFAULT_TOP_LEVEL_PAGE_LIMIT, DEFAULT_TURN_WORK_PAGE_LIMIT, SemanticTimelineCachePatch,
-            SemanticTimelineLiveUpdate, SemanticTimelineState, TopLevelPageMergeMode,
-            WorkPageMergeMode, apply_conversation_event_to_semantic_timeline,
+            DEFAULT_TOP_LEVEL_PAGE_LIMIT, SemanticTimelineCachePatch, SemanticTimelineLiveUpdate,
+            SemanticTimelineState, TopLevelPageMergeMode, WorkPageMergeMode,
+            apply_conversation_event_to_semantic_timeline,
             apply_conversation_event_to_semantic_timeline_with_patch,
             apply_local_composer_event_to_semantic_timeline_with_patch,
-            apply_semantic_timeline_live_update_with_patch,
+            apply_semantic_timeline_live_update,
             apply_thread_timeline_page as apply_semantic_thread_timeline_page,
             apply_turn_work_items_get_response as apply_semantic_turn_work_items_get_response,
             apply_turn_work_page as apply_semantic_turn_work_page, expand_turn_work,
             flatten_semantic_timeline, remove_thread_semantic_timeline,
+            semantic_turn_work_block_id,
         },
         semantic_render::{SEMANTIC_TURN_WORK_GROUP_PREFIX, render_semantic_timeline_rows},
     },
@@ -62,7 +63,7 @@ use pioneer_protocol::{
     AccessChangeKind, AccessChangedNotification, AgentExecutionBackend, GatewayNotification,
     PrincipalId, RuntimeSummary, Thread, ThreadGetParams, ThreadMode, ThreadTimelinePageParams,
     ThreadTimelinePageResponse, TimelinePageAnchor, TurnWorkItemsGetParams,
-    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    TurnWorkItemsGetResponse, TurnWorkPageResponse,
 };
 use pioneer_protocol::{ThreadComposerExecutionMode, TurnPermissionMode};
 use serde::{Deserialize, Serialize};
@@ -324,16 +325,21 @@ enum SemanticTimelineReconcileRequest {
         thread_id: String,
         merge_mode: TopLevelPageMergeMode,
     },
-    TurnWorkNewest {
-        thread_id: String,
-        turn_id: String,
-        merge_mode: WorkPageMergeMode,
-    },
     TurnWorkItems {
         thread_id: String,
         turn_id: String,
         work_item_ids: Vec<String>,
     },
+}
+
+#[derive(Default)]
+struct SemanticTimelinePatchTargets {
+    workspace_id: String,
+    thread_id: String,
+    changed_block_ids: HashSet<String>,
+    removed_block_ids: HashSet<String>,
+    changed_work_item_ids: HashMap<String, HashSet<String>>,
+    removed_work_item_ids: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -1414,18 +1420,24 @@ impl ClientFfiActiveThreadState {
                 // Desktop performs the same reconciliation in its semantic request controller;
                 // the FFI boundary must own it for mobile instead of relying on screen-local caches.
                 let reconcile_requests = semantic_timeline_reconcile_requests(&update);
-                let patch = {
+                let patch_targets = semantic_timeline_patch_targets(&update);
+                let changed = {
                     let mut inner = self
                         .inner
                         .lock()
                         .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
-                    apply_semantic_timeline_live_update_with_patch(
-                        &mut inner.semantic_timelines,
-                        update,
-                    )
+                    apply_semantic_timeline_live_update(&mut inner.semantic_timelines, update)
                 };
-                self.reconcile_semantic_timeline(runtime, reconcile_requests);
-                patch
+                if changed {
+                    self.reconcile_semantic_timeline(runtime, reconcile_requests);
+                    self.semantic_timeline_patch_for_targets(patch_targets)?
+                } else {
+                    SemanticTimelineCachePatch {
+                        workspace_id: patch_targets.workspace_id,
+                        thread_id: patch_targets.thread_id,
+                        ..Default::default()
+                    }
+                }
             }
             ClientRuntimeNotification::CLIRuntimePendingRequests(reduction)
             | ClientRuntimeNotification::PendingRequests { reduction } => {
@@ -1648,24 +1660,6 @@ impl ClientFfiActiveThreadState {
                     };
                     let _ = self.apply_thread_timeline_page(page, merge_mode);
                 }
-                SemanticTimelineReconcileRequest::TurnWorkNewest {
-                    thread_id,
-                    turn_id,
-                    merge_mode,
-                } => {
-                    let Ok(page) = ws_commands::turn_work_page(
-                        &runtime.ws_command_sender(),
-                        TurnWorkPageParams {
-                            thread_id,
-                            turn_id,
-                            anchor: TimelinePageAnchor::Newest,
-                            limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
-                        },
-                    ) else {
-                        continue;
-                    };
-                    let _ = self.apply_turn_work_page(page, merge_mode);
-                }
                 SemanticTimelineReconcileRequest::TurnWorkItems {
                     thread_id,
                     turn_id,
@@ -1685,6 +1679,97 @@ impl ClientFfiActiveThreadState {
                 }
             }
         }
+    }
+
+    fn semantic_timeline_patch_for_targets(
+        &self,
+        targets: SemanticTimelinePatchTargets,
+    ) -> anyhow::Result<SemanticTimelineCachePatch> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active thread lock is poisoned"))?;
+        let thread = inner.semantic_timelines.thread(targets.thread_id.as_str());
+
+        let mut changed_blocks = Vec::new();
+        let mut removed_block_ids = Vec::new();
+        for block_id in &targets.changed_block_ids {
+            let block =
+                thread.and_then(|thread| thread.top_level.blocks_by_id.get(block_id.as_str()));
+            let block_is_reconciled = thread.is_some_and(|thread| {
+                !thread.top_level.stale_block_ids.contains(block_id.as_str())
+            });
+            if block_is_reconciled && let Some(block) = block {
+                changed_blocks.push(block.clone());
+            }
+        }
+        for block_id in targets.removed_block_ids {
+            if thread.is_none_or(|thread| {
+                !thread
+                    .top_level
+                    .blocks_by_id
+                    .contains_key(block_id.as_str())
+            }) {
+                removed_block_ids.push(block_id);
+            }
+        }
+
+        let mut changed_work_items = Vec::new();
+        for (turn_id, work_item_ids) in &targets.changed_work_item_ids {
+            let range = thread.and_then(|thread| thread.work_range(turn_id.as_str()));
+            for work_item_id in work_item_ids {
+                let item = range.and_then(|range| range.items_by_id.get(work_item_id.as_str()));
+                let item_is_reconciled = range.is_some_and(|range| {
+                    !range.stale_work_item_ids.contains(work_item_id.as_str())
+                });
+                if item_is_reconciled && let Some(item) = item {
+                    changed_work_items.push(item.clone());
+                }
+            }
+        }
+
+        let mut removed_work_items = Vec::new();
+        for (turn_id, work_item_ids) in targets.removed_work_item_ids {
+            let range = thread.and_then(|thread| thread.work_range(turn_id.as_str()));
+            for work_item_id in work_item_ids {
+                if range.is_none_or(|range| !range.items_by_id.contains_key(work_item_id.as_str()))
+                {
+                    removed_work_items.push(
+                        pioneer_client::timeline::semantic::SemanticTimelineRemovedWorkItem {
+                            turn_id: turn_id.clone(),
+                            work_item_id,
+                        },
+                    );
+                }
+            }
+        }
+
+        changed_blocks.sort_by(|left, right| {
+            left.sort_key
+                .cmp(&right.sort_key)
+                .then_with(|| left.block_id.cmp(&right.block_id))
+        });
+        removed_block_ids.sort();
+        changed_work_items.sort_by(|left, right| {
+            left.turn_id
+                .cmp(&right.turn_id)
+                .then_with(|| left.order_key.cmp(&right.order_key))
+                .then_with(|| left.work_item_id.cmp(&right.work_item_id))
+        });
+        removed_work_items.sort_by(|left, right| {
+            left.turn_id
+                .cmp(&right.turn_id)
+                .then_with(|| left.work_item_id.cmp(&right.work_item_id))
+        });
+
+        Ok(SemanticTimelineCachePatch {
+            workspace_id: targets.workspace_id,
+            thread_id: targets.thread_id,
+            changed_blocks,
+            removed_block_ids,
+            changed_work_items,
+            removed_work_items,
+        })
     }
 
     fn apply_turn_start_send_reduction(
@@ -1734,17 +1819,21 @@ fn semantic_timeline_reconcile_requests(
 ) -> Vec<SemanticTimelineReconcileRequest> {
     match update {
         SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification) => {
-            vec![SemanticTimelineReconcileRequest::ThreadNewest {
-                thread_id: notification.thread_id.clone(),
-                merge_mode: TopLevelPageMergeMode::Merge,
-            }]
+            if notification.changed_block_ids.is_empty() {
+                Vec::new()
+            } else {
+                vec![SemanticTimelineReconcileRequest::ThreadNewest {
+                    thread_id: notification.thread_id.clone(),
+                    merge_mode: TopLevelPageMergeMode::Merge,
+                }]
+            }
         }
         SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification) => {
             let mut work_item_ids = notification.changed_work_item_ids.clone();
             work_item_ids.sort();
             work_item_ids.dedup();
 
-            let mut requests = Vec::with_capacity(2);
+            let mut requests = Vec::with_capacity(1);
             if !work_item_ids.is_empty() {
                 requests.push(SemanticTimelineReconcileRequest::TurnWorkItems {
                     thread_id: notification.thread_id.clone(),
@@ -1752,19 +1841,60 @@ fn semantic_timeline_reconcile_requests(
                     work_item_ids,
                 });
             }
-            requests.push(SemanticTimelineReconcileRequest::TurnWorkNewest {
-                thread_id: notification.thread_id.clone(),
-                turn_id: notification.turn_id.clone(),
-                merge_mode: WorkPageMergeMode::MergeAfter,
-            });
             requests
         }
-        SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification) => {
-            vec![SemanticTimelineReconcileRequest::TurnWorkNewest {
+        SemanticTimelineLiveUpdate::TurnWorkStateChanged(_) => Vec::new(),
+    }
+}
+
+fn semantic_timeline_patch_targets(
+    update: &SemanticTimelineLiveUpdate,
+) -> SemanticTimelinePatchTargets {
+    match update {
+        SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification) => {
+            let mut removed_block_ids = notification
+                .removed_block_ids
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            removed_block_ids.extend(
+                notification
+                    .turn_work_tombstones
+                    .iter()
+                    .map(|tombstone| tombstone.block_id.clone()),
+            );
+            SemanticTimelinePatchTargets {
+                workspace_id: notification.workspace_id.clone(),
                 thread_id: notification.thread_id.clone(),
-                turn_id: notification.turn_id.clone(),
-                merge_mode: WorkPageMergeMode::MergeAfter,
-            }]
+                changed_block_ids: notification.changed_block_ids.iter().cloned().collect(),
+                removed_block_ids,
+                ..Default::default()
+            }
+        }
+        SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification) => {
+            SemanticTimelinePatchTargets {
+                workspace_id: notification.workspace_id.clone(),
+                thread_id: notification.thread_id.clone(),
+                changed_work_item_ids: HashMap::from([(
+                    notification.turn_id.clone(),
+                    notification.changed_work_item_ids.iter().cloned().collect(),
+                )]),
+                removed_work_item_ids: HashMap::from([(
+                    notification.turn_id.clone(),
+                    notification.removed_work_item_ids.iter().cloned().collect(),
+                )]),
+                ..Default::default()
+            }
+        }
+        SemanticTimelineLiveUpdate::TurnWorkStateChanged(notification) => {
+            SemanticTimelinePatchTargets {
+                workspace_id: notification.workspace_id.clone(),
+                thread_id: notification.thread_id.clone(),
+                changed_block_ids: HashSet::from([semantic_turn_work_block_id(
+                    notification.turn_id.as_str(),
+                )]),
+                ..Default::default()
+            }
         }
     }
 }
@@ -2870,6 +3000,31 @@ mod tests {
     }
 
     #[test]
+    fn semantic_block_removal_is_self_contained_and_needs_no_rpc() {
+        let requests = semantic_timeline_reconcile_requests(
+            &SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(
+                ThreadTimelineBlocksChangedNotification {
+                    workspace_id: "ws_a".to_owned(),
+                    thread_id: "parent_thread".to_owned(),
+                    changed_block_ids: Vec::new(),
+                    removed_block_ids: vec!["turn:parent_turn:work".to_owned()],
+                    turn_work_tombstones: vec![pioneer_protocol::TurnWorkTombstone {
+                        turn_id: "parent_turn".to_owned(),
+                        block_id: "turn:parent_turn:work".to_owned(),
+                        source_high_watermark: 10,
+                        projection_updated_at_unix_micros: 20,
+                    }],
+                    before_cursor: None,
+                    after_cursor: None,
+                    reason: TimelineChangeReason::LiveEvent,
+                },
+            ),
+        );
+
+        assert!(requests.is_empty());
+    }
+
+    #[test]
     fn permission_notifications_preserve_their_exact_thread_and_workspace_scope() {
         let cli =
             GatewayNotification::CLIRuntimeRequestOpened(CLIRuntimeRequestOpenedNotification {
@@ -2935,7 +3090,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_work_change_reconciles_parent_item_and_work_state() {
+    fn semantic_work_change_reconciles_only_changed_items() {
         let requests = semantic_timeline_reconcile_requests(
             &SemanticTimelineLiveUpdate::TurnWorkItemsChanged(TurnWorkItemsChangedNotification {
                 workspace_id: "ws_a".to_owned(),
@@ -2951,23 +3106,16 @@ mod tests {
 
         assert_eq!(
             requests,
-            vec![
-                SemanticTimelineReconcileRequest::TurnWorkItems {
-                    thread_id: "parent_thread".to_owned(),
-                    turn_id: "parent_turn".to_owned(),
-                    work_item_ids: vec!["task_anchor".to_owned()],
-                },
-                SemanticTimelineReconcileRequest::TurnWorkNewest {
-                    thread_id: "parent_thread".to_owned(),
-                    turn_id: "parent_turn".to_owned(),
-                    merge_mode: WorkPageMergeMode::MergeAfter,
-                },
-            ]
+            vec![SemanticTimelineReconcileRequest::TurnWorkItems {
+                thread_id: "parent_thread".to_owned(),
+                turn_id: "parent_turn".to_owned(),
+                work_item_ids: vec!["task_anchor".to_owned()],
+            }]
         );
     }
 
     #[test]
-    fn semantic_work_state_reconciliation_preserves_loaded_work_range() {
+    fn semantic_work_state_is_self_contained_and_needs_no_rpc() {
         let requests = semantic_timeline_reconcile_requests(
             &SemanticTimelineLiveUpdate::TurnWorkStateChanged(TurnWorkStateChangedNotification {
                 workspace_id: "ws_a".to_owned(),
@@ -2998,14 +3146,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(
-            requests,
-            vec![SemanticTimelineReconcileRequest::TurnWorkNewest {
-                thread_id: "parent_thread".to_owned(),
-                turn_id: "parent_turn".to_owned(),
-                merge_mode: WorkPageMergeMode::MergeAfter,
-            }]
-        );
+        assert!(requests.is_empty());
     }
 
     #[test]
