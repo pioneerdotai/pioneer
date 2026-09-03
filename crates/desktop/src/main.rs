@@ -111,13 +111,39 @@ fn main() {
     }
     let initial_urls = invitation_urls_from_args(args);
 
-    let startup = pioneer_observability::DesktopStartupTrace::start();
     pioneer_observability::set_telemetry_enabled(false);
+    let startup = pioneer_observability::DesktopStartupTrace::start();
 
     let config_stage = startup.stage(pioneer_observability::DesktopStartupStage::ConfigLoad);
     let startup_config = AppConfig::load().ok();
     if startup_config.is_some() {
         config_stage.succeed();
+    }
+
+    if let Some(config) = startup_config.as_ref() {
+        match config.runtime_home_dir().and_then(|runtime_home| {
+            updater::relaunch::claim_post_update_receipt(
+                runtime_home.as_path(),
+                updater::desktop_current_version(),
+            )
+            .map_err(Into::into)
+        }) {
+            Ok(Some(receipt)) => {
+                startup.set_post_update_context(pioneer_observability::DesktopPostUpdateContext {
+                    attempt_id: receipt.attempt_id,
+                    from_version: receipt.from_version,
+                    to_version: receipt.to_version,
+                    platform: receipt.platform,
+                    process_exit_wait: receipt.process_exit_wait,
+                    apply_duration: receipt.apply_duration,
+                    relaunch_duration: receipt.relaunch_duration,
+                    total_duration: receipt.total_duration,
+                    claimed_at: receipt.claimed_at,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("failed to claim desktop update receipt: {error:#}"),
+        }
     }
 
     let consent_stage = startup.stage(pioneer_observability::DesktopStartupStage::ConsentLoad);
@@ -146,6 +172,8 @@ fn main() {
         .is_ok()
         {
             observability_stage.succeed();
+            startup.emit_post_update_handoff();
+            startup.schedule_post_update_stall_checkpoint(Duration::from_secs(30));
         }
     }
 

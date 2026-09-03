@@ -92,6 +92,7 @@ impl GatewayRuntime {
                     service_name.as_str(),
                     listen_addr.as_str(),
                     &self.timings,
+                    Some(trace),
                 )
             },
         )?;
@@ -196,7 +197,7 @@ impl GatewayRuntime {
         let service_name = self.config.gateway.service_name.as_str();
         let listen_addr = self.config.gateway.listen_addr.as_str();
         let mut warnings =
-            ensure_managed_gateway_up_to_date(service_name, listen_addr, &self.timings)?;
+            ensure_managed_gateway_up_to_date(service_name, listen_addr, &self.timings, None)?;
 
         let tcp_reachable = is_local_gateway_reachable(listen_addr, self.timings.connect_timeout)?;
         let service_active = is_configured_service_active(service_name)?;

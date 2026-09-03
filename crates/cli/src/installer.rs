@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 const INSTALLER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -81,6 +81,16 @@ pub struct InstallReport {
     pub rollback_performed: bool,
     pub error_code: Option<String>,
     pub warnings: Vec<InstallWarning>,
+    #[serde(default)]
+    pub stage_timings: Vec<InstallStageTiming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallStageTiming {
+    pub stage: String,
+    pub started_after_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +222,8 @@ enum DownloadAttemptFailure {
 }
 
 pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
+    let install_started = Instant::now();
+    let mut stage_timings = Vec::new();
     let config = AppConfig::load().context("failed to load app config for install/update")?;
 
     let source = resolve_install_source(&options)
@@ -268,6 +280,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     let should_start = !options.no_start && (options.force_start || !existing || was_active);
     let mut warnings: Vec<InstallWarning> = Vec::new();
     if was_active {
+        let stage_started = Instant::now();
         run_gateway_command(
             &target_binary,
             &["stop"],
@@ -275,6 +288,11 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             false,
             "stop",
         )?;
+        stage_timings.push(successful_stage_timing(
+            "service.stop",
+            install_started,
+            stage_started,
+        ));
     }
 
     if rollback_binary.exists() {
@@ -348,6 +366,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     warnings.extend(link_result.warnings);
 
     if should_start {
+        let stage_started = Instant::now();
         match run_gateway_start_command(&target_binary, &options.managed_by) {
             Ok(start_warnings) => warnings.extend(start_warnings),
             Err(error) => {
@@ -362,7 +381,13 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 bail!("failed to start gateway after update: {error:#}; update rolled back");
             }
         };
+        stage_timings.push(successful_stage_timing(
+            "service.start",
+            install_started,
+            stage_started,
+        ));
 
+        let stage_started = Instant::now();
         if !wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
             let _ = run_gateway_command(
                 &target_binary,
@@ -381,6 +406,11 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             );
             bail!("gateway failed health check after update; update rolled back");
         }
+        stage_timings.push(successful_stage_timing(
+            "health.wait",
+            install_started,
+            stage_started,
+        ));
     }
 
     if let Err(error) = persist_install_state(
@@ -434,7 +464,25 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         rollback_performed: false,
         error_code: None,
         warnings,
+        stage_timings,
     })
+}
+
+fn successful_stage_timing(
+    stage: &'static str,
+    install_started: Instant,
+    stage_started: Instant,
+) -> InstallStageTiming {
+    InstallStageTiming {
+        stage: stage.to_owned(),
+        started_after_ms: duration_millis(stage_started.duration_since(install_started)),
+        duration_ms: duration_millis(stage_started.elapsed()),
+        outcome: "ok".to_owned(),
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn resolve_install_source(options: &InstallOptions) -> Result<ResolvedInstallSource> {

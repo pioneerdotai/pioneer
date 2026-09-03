@@ -435,6 +435,7 @@ fn print_install_failure_json(
         "rollback_performed": rolled_back,
         "error_code": error_code,
         "warnings": [],
+        "stage_timings": [],
         "error": error_text,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);

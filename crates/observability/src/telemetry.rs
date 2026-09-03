@@ -1,4 +1,4 @@
-use crate::metrics::{GatewayMetrics, StartupMetrics};
+use crate::metrics::{DesktopUpdateMetrics, GatewayMetrics, StartupMetrics};
 use crate::performance::{DesktopTimelineMetrics, GatewayMarkdownMetrics};
 use anyhow::{Context, Result, bail};
 use opentelemetry::KeyValue;
@@ -97,6 +97,7 @@ pub(crate) struct ObservabilityState {
     tracer_provider: SdkTracerProvider,
     pub(crate) tracer: SdkTracer,
     pub(crate) startup_metrics: StartupMetrics,
+    pub(crate) desktop_update_metrics: Option<DesktopUpdateMetrics>,
     pub(crate) gateway_metrics: Option<GatewayMetrics>,
     pub(crate) gateway_markdown_metrics: Option<GatewayMarkdownMetrics>,
     pub(crate) desktop_timeline_metrics: Option<DesktopTimelineMetrics>,
@@ -171,6 +172,8 @@ pub fn init_otlp_observability_for(
         .then(|| GatewayMarkdownMetrics::new(&meter));
     let desktop_timeline_metrics = crate::performance::target_supports_desktop_timeline(target)
         .then(|| DesktopTimelineMetrics::new(&meter));
+    let desktop_update_metrics =
+        (target == TelemetryTarget::Desktop).then(|| DesktopUpdateMetrics::new(&meter));
     let gateway_metrics = (target == TelemetryTarget::Gateway).then(|| GatewayMetrics::new(meter));
     let tracer = tracer_provider.tracer(target.instrumentation_name());
 
@@ -181,6 +184,7 @@ pub fn init_otlp_observability_for(
             tracer_provider,
             tracer,
             startup_metrics,
+            desktop_update_metrics,
             gateway_metrics,
             gateway_markdown_metrics,
             desktop_timeline_metrics,

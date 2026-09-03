@@ -2,6 +2,7 @@ pub(crate) mod download;
 pub(crate) mod manifest;
 pub(crate) mod plan;
 pub(crate) mod platform;
+pub(crate) mod relaunch;
 pub(crate) mod release;
 pub(crate) mod state;
 

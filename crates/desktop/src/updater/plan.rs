@@ -1,8 +1,6 @@
-use super::{
-    download::DESKTOP_UPDATES_DIR,
-    manifest::{DESKTOP_UPDATE_PRODUCT, DESKTOP_UPDATE_SCHEMA_VERSION},
-};
+use super::{download::DESKTOP_UPDATES_DIR, manifest::DESKTOP_UPDATE_PRODUCT};
 use anyhow::{Context as _, Result, anyhow, bail};
+use pioneer_protocol::generate_id;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -13,6 +11,8 @@ use std::{
 
 pub(crate) const DESKTOP_UPDATE_STAGING_DIR: &str = "staging";
 pub(crate) const DESKTOP_UPDATE_PLAN_FILE: &str = "plan.json";
+pub(crate) const DESKTOP_UPDATE_PLAN_SCHEMA_VERSION: u32 = 2;
+pub(crate) const DESKTOP_UPDATE_ATTEMPT_ID_LEN: usize = 21;
 pub(crate) const DESKTOP_UPDATE_HELPER_NAME: &str = "pioneer-app-updater";
 #[cfg(windows)]
 pub(crate) const DESKTOP_UPDATE_HELPER_EXE_NAME: &str = "pioneer-app-updater.exe";
@@ -36,6 +36,8 @@ pub(crate) struct DesktopUpdatePlanInput {
 pub(crate) struct DesktopUpdateApplyPlan {
     pub(crate) schema_version: u32,
     pub(crate) product: String,
+    pub(crate) attempt_id: String,
+    pub(crate) relaunch_requested_at_unix_ms: u64,
     pub(crate) target_version: String,
     pub(crate) current_version: String,
     pub(crate) tag: String,
@@ -68,15 +70,22 @@ pub(crate) fn prepare_desktop_update_apply(
     let appimage_path = current_appimage_path();
     let install_root_path = resolve_install_root_path(&current_exe_path, appimage_path.as_deref())?;
     let bundled_helper_path = resolve_helper_sidecar_path(&current_exe_path)?;
+    let attempt_id = generate_id(DESKTOP_UPDATE_ATTEMPT_ID_LEN);
+    let relaunch_requested_at_unix_ms = current_unix_timestamp_ms();
     let staging_dir = runtime_home
         .join(DESKTOP_UPDATES_DIR)
         .join(DESKTOP_UPDATE_STAGING_DIR)
-        .join(update_plan_staging_id(input.target_version.as_str()));
+        .join(update_plan_staging_id(
+            input.target_version.as_str(),
+            attempt_id.as_str(),
+        ));
     let plan_path = staging_dir.join(DESKTOP_UPDATE_PLAN_FILE);
 
     let plan = DesktopUpdateApplyPlan {
-        schema_version: DESKTOP_UPDATE_SCHEMA_VERSION,
+        schema_version: DESKTOP_UPDATE_PLAN_SCHEMA_VERSION,
         product: DESKTOP_UPDATE_PRODUCT.to_owned(),
+        attempt_id,
+        relaunch_requested_at_unix_ms,
         target_version: input.target_version,
         current_version: input.current_version,
         tag: input.tag,
@@ -266,17 +275,18 @@ fn write_plan_file_atomic(path: &Path, plan: &DesktopUpdateApplyPlan) -> Result<
     })
 }
 
-fn update_plan_staging_id(target_version: &str) -> String {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-
+fn update_plan_staging_id(target_version: &str, attempt_id: &str) -> String {
     format!(
-        "v{}-{}-{timestamp_ms}",
+        "v{}-{attempt_id}",
         sanitize_staging_component(target_version),
-        std::process::id()
     )
+}
+
+fn current_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn sanitize_staging_component(value: &str) -> String {
@@ -299,7 +309,7 @@ fn sanitize_staging_component(value: &str) -> String {
 }
 
 pub(crate) fn assert_valid_plan_for_desktop(plan: &DesktopUpdateApplyPlan) -> Result<()> {
-    if plan.schema_version != DESKTOP_UPDATE_SCHEMA_VERSION {
+    if plan.schema_version != DESKTOP_UPDATE_PLAN_SCHEMA_VERSION {
         bail!(
             "unsupported desktop update plan schema {}",
             plan.schema_version
@@ -308,7 +318,10 @@ pub(crate) fn assert_valid_plan_for_desktop(plan: &DesktopUpdateApplyPlan) -> Re
     if plan.product != DESKTOP_UPDATE_PRODUCT {
         bail!("unsupported desktop update plan product `{}`", plan.product);
     }
-    if plan.target_version.trim().is_empty()
+    if plan.attempt_id.len() != DESKTOP_UPDATE_ATTEMPT_ID_LEN
+        || !plan.attempt_id.chars().all(|ch| ch.is_ascii_alphanumeric())
+        || plan.relaunch_requested_at_unix_ms == 0
+        || plan.target_version.trim().is_empty()
         || plan.current_version.trim().is_empty()
         || plan.tag.trim().is_empty()
         || plan.os.trim().is_empty()
@@ -328,9 +341,9 @@ pub(crate) fn assert_valid_plan_for_desktop(plan: &DesktopUpdateApplyPlan) -> Re
 #[cfg(test)]
 mod tests {
     use super::{
-        DESKTOP_UPDATE_HELPER_EXE_NAME, DesktopUpdateApplyPlan, assert_valid_plan_for_desktop,
-        prepare_helper_sidecar_launch_path, resolve_helper_sidecar_path,
-        resolve_install_root_path_for_os, sanitize_staging_component,
+        DESKTOP_UPDATE_HELPER_EXE_NAME, DESKTOP_UPDATE_PLAN_SCHEMA_VERSION, DesktopUpdateApplyPlan,
+        assert_valid_plan_for_desktop, prepare_helper_sidecar_launch_path,
+        resolve_helper_sidecar_path, resolve_install_root_path_for_os, sanitize_staging_component,
     };
     use std::path::{Path, PathBuf};
 
@@ -406,8 +419,10 @@ mod tests {
     #[test]
     fn valid_plan_matches_desktop_contract() {
         let plan = DesktopUpdateApplyPlan {
-            schema_version: 1,
+            schema_version: DESKTOP_UPDATE_PLAN_SCHEMA_VERSION,
             product: "pioneer-desktop".to_owned(),
+            attempt_id: "A1b2C3d4E5f6G7h8I9j0K".to_owned(),
+            relaunch_requested_at_unix_ms: 1_789_100_000_000,
             target_version: "0.26.0".to_owned(),
             current_version: "0.25.0".to_owned(),
             tag: "v0.26.0".to_owned(),

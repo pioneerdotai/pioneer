@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::info;
 use zeroize::Zeroizing;
 
@@ -21,6 +21,7 @@ const DESKTOP_MANAGED_BY: &str = "desktop";
 enum StartAttempt {
     Started {
         warnings: Vec<GatewayInstallWarning>,
+        stage_timings: Vec<GatewayInstallStageTiming>,
     },
     ProgramNotFound,
 }
@@ -49,6 +50,23 @@ pub(crate) struct GatewayInstallWarning {
 struct InstallCommandOutput {
     #[serde(default)]
     warnings: Vec<InstallWarningEntry>,
+    #[serde(default)]
+    stage_timings: Vec<InstallStageTimingOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallStageTimingOutput {
+    stage: String,
+    started_after_ms: u64,
+    duration_ms: u64,
+    outcome: String,
+}
+
+struct GatewayInstallStageTiming {
+    stage: String,
+    started_at: SystemTime,
+    duration: Duration,
+    succeeded: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +90,7 @@ pub(crate) fn start_gateway_service(
             service_name,
             listen_addr,
             timings,
+            None,
         )?
     {
         return Ok(warnings);
@@ -84,6 +103,7 @@ pub(crate) fn start_gateway_service(
             service_name,
             listen_addr,
             timings,
+            None,
         )?
     {
         return Ok(warnings);
@@ -96,6 +116,7 @@ pub(crate) fn start_gateway_service(
             service_name,
             listen_addr,
             timings,
+            None,
         )?
     {
         return Ok(warnings);
@@ -107,6 +128,7 @@ pub(crate) fn start_gateway_service(
         service_name,
         listen_addr,
         timings,
+        None,
     )? {
         return Ok(warnings);
     }
@@ -118,6 +140,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
     service_name: &str,
     listen_addr: &str,
     timings: &GatewayTimings,
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
 ) -> Result<Vec<GatewayInstallWarning>> {
     ensure_desktop_command_config_is_safe()?;
 
@@ -128,6 +151,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
             service_name,
             listen_addr,
             timings,
+            startup_trace,
         )?
     {
         return Ok(warnings);
@@ -140,6 +164,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
             service_name,
             listen_addr,
             timings,
+            startup_trace,
         )?
     {
         return Ok(warnings);
@@ -152,6 +177,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
             service_name,
             listen_addr,
             timings,
+            startup_trace,
         )?
     {
         return Ok(warnings);
@@ -163,6 +189,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
         service_name,
         listen_addr,
         timings,
+        startup_trace,
     )? {
         return Ok(warnings);
     }
@@ -207,6 +234,7 @@ fn try_start_with_launcher(
     service_name: &str,
     listen_addr: &str,
     timings: &GatewayTimings,
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
 ) -> Result<Option<Vec<GatewayInstallWarning>>> {
     let command_label = render_command(&command);
     let command_warnings = match try_start_with_command(command) {
@@ -218,7 +246,13 @@ fn try_start_with_launcher(
             );
             return Ok(None);
         }
-        Ok(StartAttempt::Started { warnings }) => warnings,
+        Ok(StartAttempt::Started {
+            warnings,
+            stage_timings,
+        }) => {
+            record_gateway_install_stage_timings(startup_trace, stage_timings);
+            warnings
+        }
         Err(error) => {
             info!(
                 launcher,
@@ -524,6 +558,7 @@ fn default_pioneer_command_file_name() -> String {
 
 fn try_start_with_command(mut command: Command) -> Result<StartAttempt> {
     let command_label = render_command(&command);
+    let command_started_at = SystemTime::now();
 
     let output = match command.output() {
         Ok(output) => output,
@@ -542,8 +577,10 @@ fn try_start_with_command(mut command: Command) -> Result<StartAttempt> {
     };
 
     if output.status.success() {
+        let (warnings, stage_timings) = extract_install_output(&output, command_started_at);
         return Ok(StartAttempt::Started {
-            warnings: extract_install_warnings(&output),
+            warnings,
+            stage_timings,
         });
     }
 
@@ -557,11 +594,38 @@ fn try_start_with_command(mut command: Command) -> Result<StartAttempt> {
     )
 }
 
-fn extract_install_warnings(output: &Output) -> Vec<GatewayInstallWarning> {
+fn extract_install_output(
+    output: &Output,
+    command_started_at: SystemTime,
+) -> (Vec<GatewayInstallWarning>, Vec<GatewayInstallStageTiming>) {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    parse_install_warnings_json(stdout.as_str())
+    parse_install_command_output(stdout.as_str(), command_started_at)
 }
 
+fn parse_install_command_output(
+    stdout: &str,
+    command_started_at: SystemTime,
+) -> (Vec<GatewayInstallWarning>, Vec<GatewayInstallStageTiming>) {
+    let Ok(parsed) = serde_json::from_str::<InstallCommandOutput>(stdout) else {
+        return (Vec::new(), Vec::new());
+    };
+    let warnings = normalize_install_warnings(parsed.warnings);
+    let stage_timings = parsed
+        .stage_timings
+        .into_iter()
+        .map(|timing| GatewayInstallStageTiming {
+            stage: timing.stage,
+            started_at: command_started_at
+                .checked_add(Duration::from_millis(timing.started_after_ms))
+                .unwrap_or(command_started_at),
+            duration: Duration::from_millis(timing.duration_ms),
+            succeeded: timing.outcome == "ok",
+        })
+        .collect();
+    (warnings, stage_timings)
+}
+
+#[cfg(test)]
 fn parse_install_warnings_json(stdout: &str) -> Vec<GatewayInstallWarning> {
     if stdout.trim().is_empty() {
         return Vec::new();
@@ -571,8 +635,11 @@ fn parse_install_warnings_json(stdout: &str) -> Vec<GatewayInstallWarning> {
         return Vec::new();
     };
 
-    parsed
-        .warnings
+    normalize_install_warnings(parsed.warnings)
+}
+
+fn normalize_install_warnings(warnings: Vec<InstallWarningEntry>) -> Vec<GatewayInstallWarning> {
+    warnings
         .into_iter()
         .map(|warning| match warning {
             InstallWarningEntry::Structured(warning) => GatewayInstallWarning {
@@ -586,6 +653,24 @@ fn parse_install_warnings_json(stdout: &str) -> Vec<GatewayInstallWarning> {
         })
         .filter(|warning| !warning.code.is_empty() || !warning.message.is_empty())
         .collect()
+}
+
+fn record_gateway_install_stage_timings(
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
+    timings: Vec<GatewayInstallStageTiming>,
+) {
+    let Some(trace) = startup_trace else {
+        return;
+    };
+    for timing in timings {
+        let stage = match timing.stage.as_str() {
+            "service.stop" => pioneer_observability::DesktopPostUpdateStage::GatewayServiceStop,
+            "service.start" => pioneer_observability::DesktopPostUpdateStage::GatewayServiceStart,
+            "health.wait" => pioneer_observability::DesktopPostUpdateStage::GatewayHealthWait,
+            _ => continue,
+        };
+        trace.record_post_update_stage(stage, timing.started_at, timing.duration, timing.succeeded);
+    }
 }
 
 fn try_create_pending_device_session_with_command(
@@ -714,10 +799,12 @@ mod tests {
         BundledGatewayBootstrap, DESKTOP_MANAGED_BY, DeviceCreateAttempt, absolutize_config_path,
         desktop_command_config_path, make_bundled_gateway_install_command_from_bundle,
         make_pioneer_device_create_command, make_pioneer_start_command,
-        parse_install_warnings_json, try_create_pending_device_session_with_command,
+        parse_install_command_output, parse_install_warnings_json,
+        try_create_pending_device_session_with_command,
     };
     use std::ffi::OsStr;
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn relative_explicit_config_is_pinned_before_a_child_changes_directory() {
@@ -843,6 +930,29 @@ mod tests {
         assert_eq!(warnings.len(), 2);
         assert_eq!(warnings[0].code, "path_update_skipped");
         assert_eq!(warnings[0].message, "profile update failed");
+    }
+
+    #[test]
+    fn parses_bounded_gateway_update_stage_timings() {
+        let command_started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let (_, timings) = parse_install_command_output(
+            r#"{
+                "stage_timings":[
+                    {"stage":"service.stop","started_after_ms":10,"duration_ms":20,"outcome":"ok"},
+                    {"stage":"health.wait","started_after_ms":30,"duration_ms":40,"outcome":"ok"}
+                ]
+            }"#,
+            command_started_at,
+        );
+
+        assert_eq!(timings.len(), 2);
+        assert_eq!(timings[0].stage, "service.stop");
+        assert_eq!(timings[0].duration, Duration::from_millis(20));
+        assert_eq!(
+            timings[0].started_at,
+            command_started_at + Duration::from_millis(10)
+        );
+        assert!(timings[0].succeeded);
     }
 
     fn command_args(command: &std::process::Command) -> Vec<String> {

@@ -2,8 +2,8 @@ use super::PioneerDesktop;
 use gpui::{Context, Window};
 use pioneer_client::state::client_state::GatewayConnectionState;
 use pioneer_observability::{
-    DesktopGatewayConnectFailureClass, DesktopStartupOutcome, DesktopStartupStage,
-    DesktopStartupStageGuard, DesktopStartupTrace,
+    DesktopGatewayConnectFailureClass, DesktopPostUpdateStage, DesktopPostUpdateStageGuard,
+    DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +22,7 @@ pub(super) struct DesktopStartupCoordinator {
     gateway_session_attempt_number: u32,
     gateway_session_backoff: Option<DesktopStartupStageGuard>,
     gateway_session_identity_verify: Option<DesktopStartupStageGuard>,
+    post_update_gateway_session: Option<DesktopPostUpdateStageGuard>,
     readiness_to_render: Option<DesktopStartupStageGuard>,
     frame_scheduled: bool,
     finalized: bool,
@@ -38,6 +39,7 @@ impl DesktopStartupCoordinator {
             gateway_session_attempt_number: 0,
             gateway_session_backoff: None,
             gateway_session_identity_verify: None,
+            post_update_gateway_session: None,
             readiness_to_render: None,
             frame_scheduled: false,
             finalized: false,
@@ -53,6 +55,13 @@ impl DesktopStartupCoordinator {
             return;
         }
         self.active.insert(stage, self.trace.stage(stage));
+        if stage == DesktopStartupStage::GatewaySessionConnect
+            && self.post_update_gateway_session.is_none()
+        {
+            self.post_update_gateway_session = self
+                .trace
+                .post_update_stage(DesktopPostUpdateStage::GatewaySessionConnect);
+        }
     }
 
     pub(super) fn succeed(&mut self, stage: DesktopStartupStage) {
@@ -60,12 +69,20 @@ impl DesktopStartupCoordinator {
             guard.succeed();
             self.completed.insert(stage);
         }
+        if stage == DesktopStartupStage::GatewaySessionConnect
+            && let Some(post_update_stage) = self.post_update_gateway_session.take()
+        {
+            post_update_stage.succeed();
+        }
     }
 
     pub(super) fn fail(&mut self, stage: DesktopStartupStage) {
         if self.active.remove(&stage).is_some() {
             self.completed.insert(stage);
             self.failed.insert(stage);
+        }
+        if stage == DesktopStartupStage::GatewaySessionConnect {
+            drop(self.post_update_gateway_session.take());
         }
     }
 
@@ -110,6 +127,9 @@ impl DesktopStartupCoordinator {
         }
         self.cancel_gateway_session_diagnostics();
         if let Some(stage) = self.readiness_to_render.take() {
+            stage.cancel();
+        }
+        if let Some(stage) = self.post_update_gateway_session.take() {
             stage.cancel();
         }
     }

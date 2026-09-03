@@ -1,4 +1,7 @@
-use crate::{plan::DesktopUpdatePlan, platform::PlatformApplyOutcome};
+use crate::{
+    plan::DesktopUpdatePlan,
+    platform::{PlatformApplyOutcome, PlatformRelaunch},
+};
 use anyhow::{Context as _, Result, anyhow, bail};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -30,13 +33,14 @@ pub fn apply(plan: &DesktopUpdatePlan, plan_path: &Path) -> Result<PlatformApply
     let rollback_path = rollback_path_for_install_root(install_root);
     replace_app_bundle(install_root, staged_app.as_path(), rollback_path.as_path())?;
 
-    Command::new("open")
-        .arg(install_root)
-        .spawn()
-        .with_context(|| format!("failed to launch updated app `{}`", install_root.display()))?;
-
     let _ = fs::remove_dir_all(rollback_path.as_path());
-    Ok(PlatformApplyOutcome::default())
+    Ok(PlatformApplyOutcome {
+        result_details: None,
+        relaunch: Some(PlatformRelaunch::new(
+            "open",
+            [install_root.as_os_str().to_owned()],
+        )),
+    })
 }
 
 fn replace_app_bundle(install_root: &Path, staged_app: &Path, rollback_path: &Path) -> Result<()> {

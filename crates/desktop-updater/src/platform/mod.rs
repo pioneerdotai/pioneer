@@ -1,7 +1,11 @@
 use crate::plan::DesktopUpdatePlan;
-use anyhow::Result;
+use anyhow::{Context as _, Result, anyhow};
 use serde_json::Value;
-use std::path::Path;
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -10,9 +14,42 @@ mod macos;
 #[cfg(windows)]
 mod windows;
 
+#[derive(Debug, Clone)]
+pub struct PlatformRelaunch {
+    program: PathBuf,
+    args: Vec<OsString>,
+}
+
+impl PlatformRelaunch {
+    pub fn new(program: impl Into<PathBuf>, args: impl IntoIterator<Item = OsString>) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PlatformApplyOutcome {
     pub result_details: Option<Value>,
+    pub relaunch: Option<PlatformRelaunch>,
+}
+
+pub fn relaunch(outcome: &PlatformApplyOutcome) -> Result<()> {
+    let relaunch = outcome
+        .relaunch
+        .as_ref()
+        .ok_or_else(|| anyhow!("desktop update platform did not provide a relaunch command"))?;
+    Command::new(relaunch.program.as_path())
+        .args(relaunch.args.iter())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch updated desktop application `{}`",
+                relaunch.program.display()
+            )
+        })?;
+    Ok(())
 }
 
 pub fn apply_validated_plan(

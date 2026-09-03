@@ -400,6 +400,42 @@ pub(crate) struct StartupMetrics {
     pub(crate) failures: Counter<u64>,
 }
 
+pub(crate) struct DesktopUpdateMetrics {
+    pub(crate) apply_duration: Histogram<f64>,
+    pub(crate) relaunch_duration: Histogram<f64>,
+    pub(crate) failures: Counter<u64>,
+}
+
+impl DesktopUpdateMetrics {
+    pub(crate) fn new(meter: &Meter) -> Self {
+        let apply_duration = meter
+            .f64_histogram("pioneer.desktop.update.apply.duration")
+            .with_description("Time spent replacing the installed Desktop application")
+            .with_unit("ms")
+            .with_boundaries(startup_duration_boundaries())
+            .build();
+        let relaunch_duration = meter
+            .f64_histogram("pioneer.desktop.update.relaunch.duration")
+            .with_description(
+                "Time from a durable applied receipt until the new Desktop process claims it",
+            )
+            .with_unit("ms")
+            .with_boundaries(startup_duration_boundaries())
+            .build();
+        let failures = meter
+            .u64_counter("pioneer.desktop.update.failures")
+            .with_description("Number of confirmed Desktop update startups that failed or stalled")
+            .with_unit("{failure}")
+            .build();
+
+        Self {
+            apply_duration,
+            relaunch_duration,
+            failures,
+        }
+    }
+}
+
 impl StartupMetrics {
     pub(crate) fn new(
         meter: &Meter,

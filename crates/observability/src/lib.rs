@@ -55,7 +55,8 @@ pub use performance::{
     record_desktop_timeline_stage, record_gateway_markdown_message, record_gateway_markdown_stage,
 };
 pub use startup::{
-    DesktopGatewayConnectFailureClass, DesktopStartupOutcome, DesktopStartupStage,
+    DesktopGatewayConnectFailureClass, DesktopPostUpdateContext, DesktopPostUpdateStage,
+    DesktopPostUpdateStageGuard, DesktopStartupOutcome, DesktopStartupStage,
     DesktopStartupStageGuard, DesktopStartupTrace, GatewayStartupStage, GatewayStartupStageGuard,
     GatewayStartupTrace, MobileStartupOutcome, MobileStartupReport, MobileStartupStage,
     MobileStartupStageTiming, record_mobile_startup,

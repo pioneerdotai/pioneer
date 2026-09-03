@@ -9,14 +9,17 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 pub const PLAN_PRODUCT: &str = "pioneer-desktop";
+pub const PLAN_ATTEMPT_ID_LEN: usize = 21;
 const SHA256_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopUpdatePlan {
     pub schema_version: u32,
     pub product: String,
+    pub attempt_id: String,
+    pub relaunch_requested_at_unix_ms: u64,
     pub target_version: String,
     pub current_version: String,
     pub tag: String,
@@ -168,6 +171,16 @@ pub fn validate_plan_shape(plan: &DesktopUpdatePlan) -> Result<(), PlanValidatio
         return Err(PlanValidationError::new(
             PlanValidationErrorCode::WrongProduct,
             "unsupported desktop update plan product",
+        ));
+    }
+
+    if plan.attempt_id.len() != PLAN_ATTEMPT_ID_LEN
+        || !plan.attempt_id.chars().all(|ch| ch.is_ascii_alphanumeric())
+        || plan.relaunch_requested_at_unix_ms == 0
+    {
+        return Err(PlanValidationError::new(
+            PlanValidationErrorCode::EmptyField,
+            "desktop update plan has an invalid attempt identity",
         ));
     }
 
@@ -453,7 +466,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let asset_path = write_asset(temp_dir.path(), b"asset");
         let mut plan = valid_plan(asset_path.clone(), sha256_file(&asset_path).unwrap());
-        plan.schema_version = 2;
+        plan.schema_version = PLAN_SCHEMA_VERSION + 1;
 
         let error = validate_plan(plan).unwrap_err();
 
@@ -641,6 +654,8 @@ mod tests {
         DesktopUpdatePlan {
             schema_version: PLAN_SCHEMA_VERSION,
             product: PLAN_PRODUCT.to_owned(),
+            attempt_id: "A1b2C3d4E5f6G7h8I9j0K".to_owned(),
+            relaunch_requested_at_unix_ms: 1_789_100_000_000,
             target_version: "0.26.0".to_owned(),
             current_version: "0.25.0".to_owned(),
             tag: "v0.26.0".to_owned(),

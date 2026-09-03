@@ -1,4 +1,7 @@
-use crate::{plan::DesktopUpdatePlan, platform::PlatformApplyOutcome};
+use crate::{
+    plan::DesktopUpdatePlan,
+    platform::{PlatformApplyOutcome, PlatformRelaunch},
+};
 use anyhow::{Context as _, Result, bail};
 use serde_json::json;
 use std::{
@@ -28,19 +31,11 @@ pub fn apply(plan: &DesktopUpdatePlan, _plan_path: &Path) -> Result<PlatformAppl
     }
 
     let relaunch_path = installed_desktop_exe_path(plan);
-    Command::new(relaunch_path.as_path())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to relaunch installed Pioneer desktop `{}`",
-                relaunch_path.display()
-            )
-        })?;
-
     Ok(PlatformApplyOutcome {
         result_details: Some(json!({
             "installer_exit_code": status.code(),
         })),
+        relaunch: Some(PlatformRelaunch::new(relaunch_path, [])),
     })
 }
 
@@ -102,6 +97,8 @@ mod tests {
         DesktopUpdatePlan {
             schema_version: PLAN_SCHEMA_VERSION,
             product: PLAN_PRODUCT.to_owned(),
+            attempt_id: "A1b2C3d4E5f6G7h8I9j0K".to_owned(),
+            relaunch_requested_at_unix_ms: 1_789_100_000_000,
             target_version: "0.26.0".to_owned(),
             current_version: "0.25.0".to_owned(),
             tag: "v0.26.0".to_owned(),

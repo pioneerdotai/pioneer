@@ -3,6 +3,7 @@ use opentelemetry::trace::{
     Span as _, SpanBuilder, SpanKind, Status, TraceContextExt, Tracer as _,
 };
 use opentelemetry::{Context, KeyValue};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -164,6 +165,42 @@ impl DesktopStartupStage {
             Self::OperationalFrame => "ui.operational_frame",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopPostUpdateStage {
+    GatewayVersionCheck,
+    GatewayInstallerExecute,
+    GatewayServiceStop,
+    GatewayServiceStart,
+    GatewayHealthWait,
+    GatewaySessionConnect,
+}
+
+impl DesktopPostUpdateStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GatewayVersionCheck => "desktop_update.gateway.version_check",
+            Self::GatewayInstallerExecute => "desktop_update.gateway.installer.execute",
+            Self::GatewayServiceStop => "desktop_update.gateway.service.stop",
+            Self::GatewayServiceStart => "desktop_update.gateway.service.start",
+            Self::GatewayHealthWait => "desktop_update.gateway.health.wait",
+            Self::GatewaySessionConnect => "desktop_update.gateway.session.connect",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopPostUpdateContext {
+    pub attempt_id: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub platform: String,
+    pub process_exit_wait: Duration,
+    pub apply_duration: Duration,
+    pub relaunch_duration: Duration,
+    pub total_duration: Duration,
+    pub claimed_at: SystemTime,
 }
 
 /// Stable, low-cardinality classification for a failed Desktop Gateway
@@ -378,6 +415,8 @@ pub fn record_mobile_startup(report: MobileStartupReport) {
         started_at: report.started_at,
         elapsed: report.duration,
         stages,
+        post_update: None,
+        record_post_update_failure: false,
         outcome: report.outcome.as_str(),
         failed: report.outcome.failed(),
     });
@@ -436,6 +475,11 @@ struct StartupState {
     started_at: SystemTime,
     started_instant: Instant,
     stages: Vec<StageRecord>,
+    post_update: Option<DesktopPostUpdateContext>,
+    post_update_stages: HashSet<&'static str>,
+    post_update_handoff_emitted: bool,
+    post_update_stall_scheduled: bool,
+    post_update_failure_emitted: bool,
     finalized: bool,
 }
 
@@ -455,6 +499,11 @@ impl StartupTimeline {
                 started_at: SystemTime::now(),
                 started_instant: Instant::now(),
                 stages: Vec::new(),
+                post_update: None,
+                post_update_stages: HashSet::new(),
+                post_update_handoff_emitted: false,
+                post_update_stall_scheduled: false,
+                post_update_failure_emitted: false,
                 finalized: false,
             })),
         }
@@ -468,6 +517,17 @@ impl StartupTimeline {
         }
     }
 
+    fn set_post_update_context(&self, context: DesktopPostUpdateContext) {
+        let mut state = self.lock();
+        if !state.finalized {
+            state.post_update = Some(context);
+        }
+    }
+
+    fn is_post_update(&self) -> bool {
+        self.lock().post_update.is_some()
+    }
+
     fn stage(&self, name: &'static str) -> StartupStageGuard {
         StartupStageGuard {
             timeline: self.clone(),
@@ -477,6 +537,41 @@ impl StartupTimeline {
             diagnostics: StageDiagnostics::default(),
             finished: false,
         }
+    }
+
+    fn post_update_stage(&self, name: &'static str) -> Option<StartupStageGuard> {
+        let mut state = self.lock();
+        if state.finalized || state.post_update.is_none() || !state.post_update_stages.insert(name)
+        {
+            return None;
+        }
+        drop(state);
+        Some(self.stage(name))
+    }
+
+    fn record_post_update_stage(
+        &self,
+        name: &'static str,
+        started_at: SystemTime,
+        elapsed: Duration,
+        succeeded: bool,
+    ) {
+        let mut state = self.lock();
+        if state.finalized || state.post_update.is_none() || !state.post_update_stages.insert(name)
+        {
+            return;
+        }
+        state.stages.push(StageRecord {
+            name,
+            started_at,
+            elapsed,
+            outcome: if succeeded {
+                StageOutcome::Ok
+            } else {
+                StageOutcome::Error
+            },
+            diagnostics: StageDiagnostics::default(),
+        });
     }
 
     fn finish(
@@ -492,6 +587,11 @@ impl StartupTimeline {
                 return;
             }
             state.finalized = true;
+            let record_post_update_failure =
+                failed && state.post_update.is_some() && !state.post_update_failure_emitted;
+            if record_post_update_failure {
+                state.post_update_failure_emitted = true;
+            }
             StartupSnapshot {
                 target,
                 root_name,
@@ -499,12 +599,83 @@ impl StartupTimeline {
                 started_at: state.started_at,
                 elapsed: state.started_instant.elapsed(),
                 stages: state.stages.clone(),
+                post_update: state.post_update.clone(),
+                record_post_update_failure,
                 outcome,
                 failed,
             }
         };
 
         emit_startup_observability(&snapshot);
+    }
+
+    fn emit_post_update_handoff(&self) {
+        let snapshot = {
+            let mut state = self.lock();
+            if state.post_update_handoff_emitted {
+                return;
+            }
+            let Some(context) = state.post_update.clone() else {
+                return;
+            };
+            let Some(consent_generation) = state.consent_generation else {
+                return;
+            };
+            state.post_update_handoff_emitted = true;
+            PostUpdateHandoffSnapshot {
+                consent_generation: Some(consent_generation),
+                context,
+            }
+        };
+        emit_post_update_handoff(&snapshot);
+    }
+
+    fn schedule_post_update_stall_checkpoint(&self, delay: Duration) {
+        {
+            let mut state = self.lock();
+            if state.finalized
+                || state.post_update.is_none()
+                || state.consent_generation.is_none()
+                || state.post_update_stall_scheduled
+            {
+                return;
+            }
+            state.post_update_stall_scheduled = true;
+        }
+
+        let timeline = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            timeline.emit_post_update_stall_checkpoint();
+        });
+    }
+
+    fn emit_post_update_stall_checkpoint(&self) {
+        let snapshot = {
+            let mut state = self.lock();
+            if state.finalized || state.post_update_failure_emitted {
+                return;
+            }
+            let Some(context) = state.post_update.clone() else {
+                return;
+            };
+            let Some(consent_generation) = state.consent_generation else {
+                return;
+            };
+            state.post_update_failure_emitted = true;
+            PostUpdateStallSnapshot {
+                consent_generation: Some(consent_generation),
+                context,
+                started_at: state.started_at,
+                elapsed: state.started_instant.elapsed(),
+                last_completed_stage: state
+                    .stages
+                    .last()
+                    .map(|stage| stage.name)
+                    .unwrap_or("none"),
+            }
+        };
+        emit_post_update_stall(&snapshot);
     }
 
     fn record_stage(
@@ -646,6 +817,35 @@ impl DesktopStartupTrace {
         DesktopStartupStageGuard(self.timeline.stage(stage.as_str()))
     }
 
+    pub fn set_post_update_context(&self, context: DesktopPostUpdateContext) {
+        self.timeline.set_post_update_context(context);
+    }
+
+    pub fn is_post_update(&self) -> bool {
+        self.timeline.is_post_update()
+    }
+
+    #[must_use = "a post-update stage must be completed when it exists"]
+    pub fn post_update_stage(
+        &self,
+        stage: DesktopPostUpdateStage,
+    ) -> Option<DesktopPostUpdateStageGuard> {
+        self.timeline
+            .post_update_stage(stage.as_str())
+            .map(DesktopPostUpdateStageGuard)
+    }
+
+    pub fn record_post_update_stage(
+        &self,
+        stage: DesktopPostUpdateStage,
+        started_at: SystemTime,
+        elapsed: Duration,
+        succeeded: bool,
+    ) {
+        self.timeline
+            .record_post_update_stage(stage.as_str(), started_at, elapsed, succeeded);
+    }
+
     #[must_use = "the Gateway connection attempt must be completed"]
     pub fn gateway_session_attempt(&self, attempt: u32) -> DesktopStartupStageGuard {
         let mut guard = self
@@ -672,6 +872,14 @@ impl DesktopStartupTrace {
     /// Binds early startup timings to the persisted consent decision.
     pub fn bind_consent(&self) {
         self.timeline.bind_consent();
+    }
+
+    pub fn emit_post_update_handoff(&self) {
+        self.timeline.emit_post_update_handoff();
+    }
+
+    pub fn schedule_post_update_stall_checkpoint(&self, delay: Duration) {
+        self.timeline.schedule_post_update_stall_checkpoint(delay);
     }
 
     pub fn finish(&self, outcome: DesktopStartupOutcome) {
@@ -702,6 +910,19 @@ impl DesktopStartupStageGuard {
     }
 }
 
+#[must_use = "a post-update stage must be marked successful; dropping it records a failure"]
+pub struct DesktopPostUpdateStageGuard(StartupStageGuard);
+
+impl DesktopPostUpdateStageGuard {
+    pub fn succeed(self) {
+        self.0.succeed();
+    }
+
+    pub fn cancel(self) {
+        self.0.cancel();
+    }
+}
+
 struct StartupSnapshot {
     target: TelemetryTarget,
     root_name: &'static str,
@@ -709,6 +930,8 @@ struct StartupSnapshot {
     started_at: SystemTime,
     elapsed: Duration,
     stages: Vec<StageRecord>,
+    post_update: Option<DesktopPostUpdateContext>,
+    record_post_update_failure: bool,
     outcome: &'static str,
     failed: bool,
 }
@@ -740,22 +963,44 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
     } else {
         "none"
     };
-    let root_attributes = [
+    let startup_type = if snapshot.post_update.is_some() {
+        "post_update"
+    } else {
+        "cold"
+    };
+    let metric_root_attributes = [
         KeyValue::new("outcome", snapshot.outcome),
         KeyValue::new("startup.failed_stage", failed_stage),
-        KeyValue::new("startup.type", "cold"),
+        KeyValue::new("startup.type", startup_type),
     ];
-    state
-        .startup_metrics
-        .duration
-        .record(snapshot.elapsed.as_secs_f64() * 1_000.0, &root_attributes);
+    state.startup_metrics.duration.record(
+        snapshot.elapsed.as_secs_f64() * 1_000.0,
+        &metric_root_attributes,
+    );
     if snapshot.failed {
-        state.startup_metrics.failures.add(1, &root_attributes);
+        state
+            .startup_metrics
+            .failures
+            .add(1, &metric_root_attributes);
+    }
+    if snapshot.record_post_update_failure
+        && let (Some(metrics), Some(context)) =
+            (&state.desktop_update_metrics, &snapshot.post_update)
+    {
+        metrics.failures.add(
+            1,
+            &[
+                KeyValue::new("stage", failed_stage),
+                KeyValue::new("outcome", "error"),
+                KeyValue::new("os", context.platform.clone()),
+            ],
+        );
     }
     for stage in &snapshot.stages {
         let mut metric_attributes = vec![
             KeyValue::new("startup.stage", stage.name),
             KeyValue::new("outcome", stage.outcome.as_str()),
+            KeyValue::new("startup.type", startup_type),
         ];
         if let Some(failure_class) = stage.diagnostics.failure_class {
             metric_attributes.push(KeyValue::new("failure.class", failure_class));
@@ -766,10 +1011,14 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
             .record(stage.elapsed.as_secs_f64() * 1_000.0, &metric_attributes);
     }
 
+    let mut span_root_attributes = metric_root_attributes.to_vec();
+    if let Some(context) = &snapshot.post_update {
+        span_root_attributes.extend(post_update_trace_attributes(context));
+    }
     let root_builder = SpanBuilder::from_name(snapshot.root_name)
         .with_kind(SpanKind::Internal)
         .with_start_time(snapshot.started_at)
-        .with_attributes(root_attributes);
+        .with_attributes(span_root_attributes);
     let root_span = state.tracer.build(root_builder);
     let root_context = Context::new().with_span(root_span);
 
@@ -811,6 +1060,161 @@ fn emit_startup_observability(snapshot: &StartupSnapshot) {
         .end_with_timestamp(end_timestamp(snapshot.started_at, snapshot.elapsed));
 }
 
+struct PostUpdateHandoffSnapshot {
+    consent_generation: Option<u64>,
+    context: DesktopPostUpdateContext,
+}
+
+struct PostUpdateStallSnapshot {
+    consent_generation: Option<u64>,
+    context: DesktopPostUpdateContext,
+    started_at: SystemTime,
+    elapsed: Duration,
+    last_completed_stage: &'static str,
+}
+
+fn emit_post_update_handoff(snapshot: &PostUpdateHandoffSnapshot) {
+    if !super::telemetry_sample_allowed(snapshot.consent_generation) {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    if state.target != TelemetryTarget::Desktop {
+        return;
+    }
+    let Some(metrics) = &state.desktop_update_metrics else {
+        return;
+    };
+
+    let metric_attributes = [
+        KeyValue::new("outcome", "ok"),
+        KeyValue::new("os", snapshot.context.platform.clone()),
+    ];
+    metrics.apply_duration.record(
+        snapshot.context.apply_duration.as_secs_f64() * 1_000.0,
+        &metric_attributes,
+    );
+    metrics.relaunch_duration.record(
+        snapshot.context.relaunch_duration.as_secs_f64() * 1_000.0,
+        &metric_attributes,
+    );
+
+    let ended_at = snapshot.context.claimed_at;
+    let started_at = ended_at
+        .checked_sub(snapshot.context.total_duration)
+        .unwrap_or(ended_at);
+    let root_builder = SpanBuilder::from_name("desktop.update.handoff")
+        .with_kind(SpanKind::Internal)
+        .with_start_time(started_at)
+        .with_attributes(post_update_trace_attributes(&snapshot.context));
+    let root_span = state.tracer.build(root_builder);
+    let root_context = Context::new().with_span(root_span);
+
+    emit_post_update_handoff_stage(
+        state,
+        &root_context,
+        "desktop.update.process_exit.wait",
+        started_at,
+        snapshot.context.process_exit_wait,
+    );
+    let apply_started_at = started_at
+        .checked_add(snapshot.context.process_exit_wait)
+        .unwrap_or(started_at);
+    emit_post_update_handoff_stage(
+        state,
+        &root_context,
+        "desktop.update.apply",
+        apply_started_at,
+        snapshot.context.apply_duration,
+    );
+    let relaunch_started_at = ended_at
+        .checked_sub(snapshot.context.relaunch_duration)
+        .unwrap_or(ended_at);
+    emit_post_update_handoff_stage(
+        state,
+        &root_context,
+        "desktop.update.relaunch",
+        relaunch_started_at,
+        snapshot.context.relaunch_duration,
+    );
+
+    root_context.span().set_status(Status::Ok);
+    root_context.span().end_with_timestamp(ended_at);
+}
+
+fn emit_post_update_handoff_stage(
+    state: &super::telemetry::ObservabilityState,
+    root_context: &Context,
+    name: &'static str,
+    started_at: SystemTime,
+    elapsed: Duration,
+) {
+    let builder = SpanBuilder::from_name(name)
+        .with_kind(SpanKind::Internal)
+        .with_start_time(started_at)
+        .with_attributes([KeyValue::new("outcome", "ok")]);
+    let mut span = state.tracer.build_with_context(builder, root_context);
+    span.set_status(Status::Ok);
+    span.end_with_timestamp(end_timestamp(started_at, elapsed));
+}
+
+fn emit_post_update_stall(snapshot: &PostUpdateStallSnapshot) {
+    if !super::telemetry_sample_allowed(snapshot.consent_generation) {
+        return;
+    }
+    let Some(state) = super::telemetry::state() else {
+        return;
+    };
+    if state.target != TelemetryTarget::Desktop {
+        return;
+    }
+    let Some(metrics) = &state.desktop_update_metrics else {
+        return;
+    };
+
+    metrics.failures.add(
+        1,
+        &[
+            KeyValue::new("stage", snapshot.last_completed_stage),
+            KeyValue::new("outcome", "stalled"),
+            KeyValue::new("os", snapshot.context.platform.clone()),
+        ],
+    );
+    let mut attributes = post_update_trace_attributes(&snapshot.context);
+    attributes.extend([
+        KeyValue::new("startup.type", "post_update"),
+        KeyValue::new(
+            "startup.last_completed_stage",
+            snapshot.last_completed_stage,
+        ),
+        KeyValue::new(
+            "startup.elapsed_ms",
+            i64::try_from(snapshot.elapsed.as_millis()).unwrap_or(i64::MAX),
+        ),
+    ]);
+    let builder = SpanBuilder::from_name("desktop.update.stalled")
+        .with_kind(SpanKind::Internal)
+        .with_start_time(snapshot.started_at)
+        .with_attributes(attributes);
+    let mut span = state.tracer.build(builder);
+    span.set_status(Status::Error {
+        description: std::borrow::Cow::Borrowed(
+            "post-update startup exceeded the diagnostic threshold",
+        ),
+    });
+    span.end_with_timestamp(end_timestamp(snapshot.started_at, snapshot.elapsed));
+}
+
+fn post_update_trace_attributes(context: &DesktopPostUpdateContext) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("update.attempt_id", context.attempt_id.clone()),
+        KeyValue::new("update.from_version", context.from_version.clone()),
+        KeyValue::new("update.to_version", context.to_version.clone()),
+        KeyValue::new("update.platform", context.platform.clone()),
+    ]
+}
+
 fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
     started_at
         .checked_add(elapsed)
@@ -820,10 +1224,11 @@ fn end_timestamp(started_at: SystemTime, elapsed: Duration) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopGatewayConnectFailureClass, DesktopStartupOutcome, DesktopStartupStage,
-        DesktopStartupTrace, GatewayStartupStage, GatewayStartupTrace, MobileStartupOutcome,
-        MobileStartupStage, StageOutcome,
+        DesktopGatewayConnectFailureClass, DesktopPostUpdateContext, DesktopPostUpdateStage,
+        DesktopStartupOutcome, DesktopStartupStage, DesktopStartupTrace, GatewayStartupStage,
+        GatewayStartupTrace, MobileStartupOutcome, MobileStartupStage, StageOutcome,
     };
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn successful_and_dropped_gateway_stages_have_bounded_outcomes() {
@@ -970,5 +1375,73 @@ mod tests {
         );
         assert_eq!(state.stages[1].diagnostics.reconnect_attempt, Some(1));
         assert_eq!(state.stages[1].diagnostics.backoff_delay_ms, Some(500));
+    }
+
+    #[test]
+    fn ordinary_startup_cannot_create_post_update_stages() {
+        let trace = DesktopStartupTrace::start();
+
+        trace.emit_post_update_handoff();
+        trace.schedule_post_update_stall_checkpoint(Duration::ZERO);
+
+        assert!(!trace.is_post_update());
+        assert!(
+            trace
+                .post_update_stage(DesktopPostUpdateStage::GatewayVersionCheck)
+                .is_none()
+        );
+        let state = trace.timeline.lock();
+        assert!(state.stages.is_empty());
+        assert!(!state.post_update_handoff_emitted);
+        assert!(!state.post_update_stall_scheduled);
+    }
+
+    #[test]
+    fn post_update_handoff_waits_for_bound_consent() {
+        let trace = DesktopStartupTrace::start();
+        trace.set_post_update_context(post_update_context());
+
+        trace.emit_post_update_handoff();
+        trace.schedule_post_update_stall_checkpoint(Duration::ZERO);
+
+        let state = trace.timeline.lock();
+        assert!(!state.post_update_handoff_emitted);
+        assert!(!state.post_update_stall_scheduled);
+    }
+
+    #[test]
+    fn confirmed_post_update_stage_is_recorded_once() {
+        let trace = DesktopStartupTrace::start();
+        trace.set_post_update_context(post_update_context());
+
+        trace
+            .post_update_stage(DesktopPostUpdateStage::GatewayVersionCheck)
+            .unwrap()
+            .succeed();
+
+        assert!(trace.is_post_update());
+        assert!(
+            trace
+                .post_update_stage(DesktopPostUpdateStage::GatewayVersionCheck)
+                .is_none()
+        );
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(state.stages[0].name, "desktop_update.gateway.version_check");
+        assert_eq!(state.stages[0].outcome, StageOutcome::Ok);
+    }
+
+    fn post_update_context() -> DesktopPostUpdateContext {
+        DesktopPostUpdateContext {
+            attempt_id: "A1b2C3d4E5f6G7h8I9j0K".to_owned(),
+            from_version: "0.25.0".to_owned(),
+            to_version: "0.26.0".to_owned(),
+            platform: "macos".to_owned(),
+            process_exit_wait: Duration::from_millis(50),
+            apply_duration: Duration::from_millis(500),
+            relaunch_duration: Duration::from_millis(100),
+            total_duration: Duration::from_millis(650),
+            claimed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+        }
     }
 }
