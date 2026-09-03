@@ -1503,7 +1503,7 @@ pub enum TurnProjectionStreamHealth {
 pub struct TurnProjectionStreamStateRecord {
     pub thread_id: String,
     pub turn_id: String,
-    /// Shadow observation only; projection receipts remain authoritative.
+    /// Authoritative highest contiguous projected event sequence for this Turn.
     pub projected_through_sequence: i64,
     pub health: TurnProjectionStreamHealth,
     pub blocking_event_id: Option<String>,
@@ -11691,9 +11691,8 @@ impl CrudStore {
                 }
 
                 // Existing durable events necessarily precede the two events
-                // this transaction is about to append. Waiting for their
-                // authoritative projection is normal causal backpressure, not
-                // a failed finalization or a process-fatal storage error.
+                // this transaction is about to append. The per-Turn watermark
+                // is the authority for whether that prefix is fully projected.
                 if turn_event_projection_state::has_unprojected_event(
                     &transaction,
                     turn_id.as_str(),
@@ -24735,14 +24734,14 @@ WHERE id IN (SELECT event_id FROM candidates)
         let appended_event =
             turn_event::append_prepared_event(transaction, event, created_at).await?;
         if !appended_event.was_inserted {
-            let state = turn_event_projection_state::find_by_event_id(
+            if turn_event_projection_state::is_projected(
                 transaction,
                 appended_event.id.as_str(),
+                appended_event.turn_id.as_str(),
+                appended_event.sequence,
             )
-            .await?;
-            if state.as_ref().is_some_and(|state| {
-                state.status == turn_event_projection_state::PROJECTION_STATUS_PROJECTED
-            }) {
+            .await?
+            {
                 return Ok(());
             }
             anyhow::bail!(
@@ -24768,7 +24767,7 @@ WHERE id IN (SELECT event_id FROM candidates)
             turn_event_delivery::insert_pending_for_event(transaction, &appended_event, created_at)
                 .await?;
         }
-        if turn_event_projection_state::has_unprojected_predecessor(
+        if !turn_event_projection_state::is_next_projection_sequence(
             transaction,
             appended_event.turn_id.as_str(),
             appended_event.sequence,
@@ -24776,7 +24775,7 @@ WHERE id IN (SELECT event_id FROM candidates)
         .await?
         {
             anyhow::bail!(
-                "turn event projection `{}` is waiting for an earlier event in turn `{}`",
+                "turn event projection `{}` is not the next sequence after the authoritative watermark for turn `{}`",
                 appended_event.id,
                 appended_event.turn_id
             );
@@ -24877,14 +24876,13 @@ WHERE id IN (SELECT event_id FROM candidates)
             };
 
         if !appended_event.was_inserted {
-            let state = turn_event_projection_state::find_by_event_id(
+            let projected = turn_event_projection_state::is_projected(
                 &transaction,
                 appended_event.id.as_str(),
+                appended_event.turn_id.as_str(),
+                appended_event.sequence,
             )
             .await?;
-            let projected = state.as_ref().is_some_and(|state| {
-                state.status == turn_event_projection_state::PROJECTION_STATUS_PROJECTED
-            });
             transaction
                 .rollback()
                 .await
@@ -24969,8 +24967,8 @@ WHERE id IN (SELECT event_id FROM candidates)
             .await
             .context("failed to begin turn event projection transaction")?;
 
-        let has_unprojected_predecessor =
-            match turn_event_projection_state::has_unprojected_predecessor(
+        let is_next_projection_sequence =
+            match turn_event_projection_state::is_next_projection_sequence(
                 &transaction,
                 appended_event.turn_id.as_str(),
                 appended_event.sequence,
@@ -24983,7 +24981,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                     return Err(error);
                 }
             };
-        if has_unprojected_predecessor {
+        if !is_next_projection_sequence {
             let _ = transaction.rollback().await;
             return Ok(TurnEventProjectionOutcome::DeferredByPredecessor);
         }
@@ -25445,7 +25443,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                                 .observed_projected_through_sequence,
                             stored_projected_through_sequence = observation
                                 .stored_projected_through_sequence,
-                            "shadow projection watermark differs from authoritative projection receipts"
+                            "authoritative projection watermark differs from retained projection receipts"
                         );
                     }
                 }
@@ -25611,10 +25609,9 @@ WHERE id IN (SELECT event_id FROM candidates)
         let mut summary = TurnProjectionReplaySummary::default();
         let mut remaining = limit;
 
-        // `claim_due` returns at most the causal head of each Turn. Refill the
-        // batch after projecting those heads so one healthy stream can still
-        // make full use of the replay budget without letting a poisoned stream
-        // monopolize it.
+        // `claim_due` returns at most the immediate watermark successor of
+        // each Turn. Refill after projecting those events so one healthy stream
+        // can still use the replay budget without monopolizing the first batch.
         while remaining > 0 {
             let claimed = self
                 .run_serialized_write(|| {
@@ -37025,6 +37022,28 @@ mod tests {
             .exec(&store.connection)
             .await
             .expect("first turn projection should become replayable");
+        set_turn_projection_watermark(store, turn_id, 0).await;
+    }
+
+    async fn set_turn_projection_watermark(
+        store: &CrudStore,
+        turn_id: &str,
+        projected_through_sequence: i64,
+    ) {
+        let updated = pioneer_entity::turn_event_projection_stream_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_stream_state::Column::ProjectedThroughSequence,
+                Expr::value(projected_through_sequence),
+            )
+            .filter(
+                pioneer_entity::turn_event_projection_stream_state::Column::TurnId
+                    .eq(turn_id.to_owned()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("projection watermark fixture should update")
+            .rows_affected;
+        assert_eq!(updated, 1, "projection stream fixture must exist");
     }
 
     fn sample_task(timestamp: i64) -> Task {
@@ -38607,12 +38626,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_watermark_does_not_replace_projection_receipt_authority() {
+    async fn projection_watermark_is_authoritative_and_retains_receipts() {
         let store = test_store_with_workspace("ws_projection_watermark_shadow").await;
         let timestamp = 1_700_000_000;
+        let workspace_id = "ws_projection_watermark_shadow";
         let thread_id = "thr_projection_watermark_shadow";
         let turn_id = "turn_projection_watermark_shadow";
-        let thread = sample_thread("ws_projection_watermark_shadow", thread_id, timestamp);
+        let thread = sample_thread(workspace_id, thread_id, timestamp);
         let turn = sample_turn(turn_id);
 
         store
@@ -38654,7 +38674,7 @@ mod tests {
             .expect("projection stream should exist");
         assert_eq!(stream.projected_through_sequence, 1);
 
-        let error = store
+        store
             .materialize_turn_start(
                 &thread,
                 SandboxMode::FullAccess,
@@ -38663,13 +38683,7 @@ mod tests {
                 pioneer_protocol::PersistedActorRef::System,
             )
             .await
-            .expect_err(
-                "shadow watermark must not satisfy idempotency without a projected receipt",
-            );
-        assert!(
-            format!("{error:#}").contains("authoritative projection is incomplete"),
-            "unexpected idempotency error: {error:#}"
-        );
+            .expect("authoritative watermark should satisfy idempotency");
 
         let receipt = pioneer_entity::turn_event_projection_state::Entity::find_by_id(event.id)
             .one(&store.connection)
@@ -38679,6 +38693,244 @@ mod tests {
         assert_eq!(
             receipt.status,
             crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+        );
+        assert!(
+            !crate::repositories::turn_event_projection_state::has_unprojected_event(
+                &store.connection,
+                turn_id,
+            )
+            .await
+            .expect("watermark completion should query"),
+            "a stale retained receipt must not make a fully projected Turn incomplete"
+        );
+
+        store
+            .materialize_native_agent_turn_event(
+                CanonicalTurnEventPayload::ItemStarted(ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: safe_web_fetch_item("call_watermark_authority"),
+                }),
+                timestamp + 1,
+                None,
+            )
+            .await
+            .expect("watermark should allow its immediate successor despite stale receipt state");
+
+        let stream = store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should exist");
+        assert_eq!(stream.projected_through_sequence, 2);
+        let receipts = pioneer_entity::turn_event_projection_state::Entity::find()
+            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn_id))
+            .order_by_asc(pioneer_entity::turn_event_projection_state::Column::Sequence)
+            .all(&store.connection)
+            .await
+            .expect("projection receipts should query");
+        assert_eq!(receipts.len(), 2, "phase two must not delete receipts");
+        assert_eq!(
+            receipts[0].status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED
+        );
+        assert_eq!(
+            receipts[1].status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_receipt_transition_rolls_back_when_watermark_cas_fails() {
+        let store = test_store_with_workspace("ws_projection_watermark_atomic").await;
+        let timestamp = 1_700_000_000;
+        let thread_id = "thr_projection_watermark_atomic";
+        let turn_id = "turn_projection_watermark_atomic";
+        let event_id = "evt_watermark_atomic";
+        let claim_token = "claim_watermark_atomic";
+
+        store
+            .materialize_turn_start(
+                &sample_thread("ws_projection_watermark_atomic", thread_id, timestamp),
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+        crate::repositories::turn_event_projection_state::insert_claimed(
+            &store.connection,
+            crate::repositories::turn_event_projection_state::NewTurnEventProjectionState {
+                event_id: event_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                sequence: 2,
+                projection_context_json: "{}".to_owned(),
+                claim_token: claim_token.to_owned(),
+                claim_expires_at: unix_to_datetime(timestamp + 60),
+                created_at: unix_to_datetime(timestamp + 1),
+            },
+        )
+        .await
+        .expect("projection receipt fixture should insert");
+        set_turn_projection_watermark(&store, turn_id, 0).await;
+
+        let transaction = store
+            .connection
+            .begin()
+            .await
+            .expect("projection transaction should begin");
+        let error = crate::repositories::turn_event_projection_state::mark_projected_claimed(
+            &transaction,
+            event_id,
+            turn_id,
+            2,
+            claim_token,
+            unix_to_datetime(timestamp + 2),
+        )
+        .await
+        .expect_err("watermark gap must reject projection completion");
+        assert!(
+            format!("{error:#}").contains("did not advance atomically"),
+            "unexpected watermark CAS error: {error:#}"
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("failed projection transaction should roll back");
+
+        let receipt = pioneer_entity::turn_event_projection_state::Entity::find_by_id(event_id)
+            .one(&store.connection)
+            .await
+            .expect("projection receipt should query")
+            .expect("projection receipt must remain present");
+        assert_eq!(
+            receipt.status,
+            crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTING,
+            "receipt transition must roll back with the failed watermark CAS"
+        );
+        let stream = store
+            .get_turn_event_projection_stream_state(turn_id)
+            .await
+            .expect("projection stream should query")
+            .expect("projection stream should remain present");
+        assert_eq!(stream.projected_through_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn projection_replay_claims_only_the_immediate_watermark_successor() {
+        let store = test_store_with_workspace("ws_projection_watermark_claim").await;
+        let timestamp = 1_700_000_000;
+        let thread_id = "thr_projection_wm_claim";
+        let turn_id = "turn_projection_wm_claim";
+
+        store
+            .materialize_turn_start(
+                &sample_thread("ws_projection_watermark_claim", thread_id, timestamp),
+                SandboxMode::FullAccess,
+                &sample_turn(turn_id),
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                Expr::value(
+                    crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
+                ),
+            )
+            .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn_id))
+            .filter(pioneer_entity::turn_event_projection_state::Column::Sequence.eq(1))
+            .exec(&store.connection)
+            .await
+            .expect("retained predecessor receipt should become stale");
+
+        for (event_id, sequence, claim_token) in [
+            ("evt_wm_claim_2", 2, "claim_wm_2"),
+            ("evt_wm_claim_3", 3, "claim_wm_3"),
+        ] {
+            crate::repositories::turn_event_projection_state::insert_claimed(
+                &store.connection,
+                crate::repositories::turn_event_projection_state::NewTurnEventProjectionState {
+                    event_id: event_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    sequence,
+                    projection_context_json: "{}".to_owned(),
+                    claim_token: claim_token.to_owned(),
+                    claim_expires_at: unix_to_datetime(timestamp + 60),
+                    created_at: unix_to_datetime(timestamp + sequence),
+                },
+            )
+            .await
+            .expect("projection receipt fixture should insert");
+            assert!(
+                crate::repositories::turn_event_projection_state::release_claim_as_pending(
+                    &store.connection,
+                    event_id,
+                    claim_token,
+                    unix_to_datetime(timestamp + 1),
+                    unix_to_datetime(timestamp + 1),
+                )
+                .await
+                .expect("projection receipt fixture should become pending")
+            );
+        }
+
+        let first_claim = crate::repositories::turn_event_projection_state::claim_due(
+            &store.connection,
+            unix_to_datetime(timestamp + 10),
+            unix_to_datetime(timestamp + 70),
+            10,
+        )
+        .await
+        .expect("first watermark successor should claim");
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(first_claim[0].state.sequence, 2);
+
+        let transaction = store
+            .connection
+            .begin()
+            .await
+            .expect("projection transaction should begin");
+        assert!(
+            crate::repositories::turn_event_projection_state::mark_projected_claimed(
+                &transaction,
+                first_claim[0].state.event_id.as_str(),
+                turn_id,
+                2,
+                first_claim[0].claim_token.as_str(),
+                unix_to_datetime(timestamp + 11),
+            )
+            .await
+            .expect("first watermark successor should complete")
+        );
+        transaction
+            .commit()
+            .await
+            .expect("first watermark successor should commit");
+
+        let second_claim = crate::repositories::turn_event_projection_state::claim_due(
+            &store.connection,
+            unix_to_datetime(timestamp + 12),
+            unix_to_datetime(timestamp + 72),
+            10,
+        )
+        .await
+        .expect("second watermark successor should claim");
+        assert_eq!(second_claim.len(), 1);
+        assert_eq!(second_claim[0].state.sequence, 3);
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn_id),)
+                .count(&store.connection)
+                .await
+                .expect("retained projection receipts should count"),
+            3
         );
     }
 
@@ -38748,6 +39000,7 @@ mod tests {
             .exec(&store.connection)
             .await
             .expect("projection state should be marked failed");
+        set_turn_projection_watermark(&store, turn_id, 0).await;
 
         let deadlines = TurnItemAttemptDeadlines {
             lease_expires_at_unix: Some(timestamp + 121),
@@ -38987,6 +39240,8 @@ mod tests {
                 .await
                 .expect("projection head should become replayable");
         }
+        set_turn_projection_watermark(&store, poisoned_turn_id, 0).await;
+        set_turn_projection_watermark(&store, healthy_turn_id, 0).await;
 
         for (thread_id, turn_id, item_id) in [
             (poisoned_thread_id, poisoned_turn_id, poisoned_item_id),

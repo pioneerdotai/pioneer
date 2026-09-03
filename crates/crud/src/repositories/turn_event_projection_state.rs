@@ -7,8 +7,8 @@ use pioneer_protocol::generate_id;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 
 pub const PROJECTION_STATUS_PENDING: &str = "pending";
@@ -322,6 +322,45 @@ pub async fn find_by_event_id<C: ConnectionTrait>(
         })
 }
 
+/// Uses the per-Turn contiguous projection watermark as the completion
+/// authority while retaining the legacy receipt as an observation surface.
+pub async fn is_projected<C: ConnectionTrait>(
+    db: &C,
+    event_id: &str,
+    turn_id: &str,
+    sequence: i64,
+) -> Result<bool> {
+    if sequence <= 0 {
+        anyhow::bail!(
+            "turn event projection `{event_id}` has invalid sequence `{sequence}` for Turn `{turn_id}`"
+        );
+    }
+
+    let stream = super::turn_event_projection_stream_state::find(db, turn_id)
+        .await?
+        .with_context(|| format!("projection stream state for Turn `{turn_id}` is missing"))?;
+    let projected_by_watermark = sequence <= stream.projected_through_sequence;
+    let receipt = find_by_event_id(db, event_id).await?;
+    let projected_by_receipt = receipt.as_ref().is_some_and(|receipt| {
+        receipt.turn_id == turn_id
+            && receipt.sequence == sequence
+            && receipt.status == PROJECTION_STATUS_PROJECTED
+    });
+
+    if projected_by_watermark != projected_by_receipt {
+        tracing::warn!(
+            event_id,
+            turn_id,
+            sequence,
+            projected_through_sequence = stream.projected_through_sequence,
+            receipt_status = ?receipt.as_ref().map(|receipt| receipt.status.as_str()),
+            "authoritative projection watermark differs from retained projection receipt"
+        );
+    }
+
+    Ok(projected_by_watermark)
+}
+
 pub async fn claim_due<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
@@ -337,24 +376,15 @@ pub async fn claim_due<C: ConnectionTrait>(
     let expired_projecting = Condition::all()
         .add(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_PROJECTING))
         .add(turn_event_projection_state::Column::ClaimExpiresAt.lte(now));
-    // Claim only the causal head of each Turn stream. Without this predicate,
-    // every successor behind one exhausted record remains due and can occupy
-    // the whole global batch forever. Healthy Turn streams must remain
-    // independently replayable even when another stream requires operator
-    // repair.
-    let is_causal_head = sea_orm::sea_query::Expr::cust(
-        "NOT EXISTS (\
-            SELECT 1 FROM turn_event_projection_state AS predecessor \
-            WHERE predecessor.turn_id = turn_event_projection_state.turn_id \
-              AND predecessor.sequence < turn_event_projection_state.sequence \
-              AND predecessor.status <> 'projected'\
-        )",
-    );
-    let stream_is_healthy = sea_orm::sea_query::Expr::cust(
-        "NOT EXISTS (\
+    // The watermark is the causal authority. Exactly one event per healthy
+    // Turn can be claimable: the immediate successor of its projected prefix.
+    let is_next_for_healthy_stream = sea_orm::sea_query::Expr::cust(
+        "EXISTS (\
             SELECT 1 FROM turn_event_projection_stream_state AS stream_state \
             WHERE stream_state.turn_id = turn_event_projection_state.turn_id \
-              AND stream_state.status = 'quarantined'\
+              AND stream_state.status = 'healthy' \
+              AND turn_event_projection_state.sequence = \
+                  stream_state.projected_through_sequence + 1\
         )",
     );
 
@@ -364,8 +394,7 @@ pub async fn claim_due<C: ConnectionTrait>(
                 .add(due_pending_or_failed.clone())
                 .add(expired_projecting.clone()),
         )
-        .filter(is_causal_head)
-        .filter(stream_is_healthy.clone())
+        .filter(is_next_for_healthy_stream.clone())
         .order_by_asc(turn_event_projection_state::Column::NextRunAt)
         .order_by_asc(turn_event_projection_state::Column::TurnId)
         .order_by_asc(turn_event_projection_state::Column::Sequence)
@@ -401,7 +430,7 @@ pub async fn claim_due<C: ConnectionTrait>(
             )
             .filter(turn_event_projection_state::Column::EventId.eq(candidate.event_id.clone()))
             .filter(claimable)
-            .filter(stream_is_healthy.clone())
+            .filter(is_next_for_healthy_stream.clone())
             .exec(db)
             .await
             .with_context(|| {
@@ -425,12 +454,20 @@ pub async fn claim_due<C: ConnectionTrait>(
     Ok(claimed)
 }
 
-pub async fn has_unprojected_predecessor<C: ConnectionTrait>(
+pub async fn is_next_projection_sequence<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     sequence: i64,
 ) -> Result<bool> {
-    let count = turn_event_projection_state::Entity::find()
+    if sequence <= 0 {
+        anyhow::bail!("projection sequence `{sequence}` is invalid for Turn `{turn_id}`");
+    }
+
+    let stream = super::turn_event_projection_stream_state::find(db, turn_id)
+        .await?
+        .with_context(|| format!("projection stream state for Turn `{turn_id}` is missing"))?;
+    let is_next_by_watermark = stream.projected_through_sequence == sequence - 1;
+    let incomplete_predecessor_receipts = turn_event_projection_state::Entity::find()
         .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_event_projection_state::Column::Sequence.lt(sequence))
         .filter(turn_event_projection_state::Column::Status.ne(PROJECTION_STATUS_PROJECTED))
@@ -441,15 +478,40 @@ pub async fn has_unprojected_predecessor<C: ConnectionTrait>(
                 "failed to check turn event projection predecessors for turn `{turn_id}` sequence `{sequence}`"
             )
         })?;
+    let is_next_by_receipts = incomplete_predecessor_receipts == 0;
 
-    Ok(count > 0)
+    if is_next_by_watermark != is_next_by_receipts {
+        tracing::warn!(
+            turn_id,
+            sequence,
+            projected_through_sequence = stream.projected_through_sequence,
+            incomplete_predecessor_receipts,
+            "authoritative projection watermark differs from retained predecessor receipts"
+        );
+    }
+
+    Ok(is_next_by_watermark)
 }
 
-/// Returns whether this Turn already owns any durable event whose authoritative
-/// projection is incomplete. Every existing event is a causal predecessor of a
-/// finalization event that has not been appended yet.
+/// Returns whether the canonical Turn event log extends beyond the
+/// authoritative projection watermark. Retained receipts are compared only to
+/// keep the phase-two rollout observable.
 pub async fn has_unprojected_event<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
-    let count = turn_event_projection_state::Entity::find()
+    let max_sequence = super::turn_event::max_sequence_for_turn(db, turn_id).await?;
+    if max_sequence == 0 {
+        return Ok(false);
+    }
+    let stream = super::turn_event_projection_stream_state::find(db, turn_id)
+        .await?
+        .with_context(|| format!("projection stream state for Turn `{turn_id}` is missing"))?;
+    if stream.projected_through_sequence > max_sequence {
+        anyhow::bail!(
+            "projection watermark `{}` is ahead of canonical sequence `{max_sequence}` for Turn `{turn_id}`",
+            stream.projected_through_sequence
+        );
+    }
+
+    let incomplete_receipts = turn_event_projection_state::Entity::find()
         .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_event_projection_state::Column::Status.ne(PROJECTION_STATUS_PROJECTED))
         .count(db)
@@ -457,18 +519,36 @@ pub async fn has_unprojected_event<C: ConnectionTrait>(db: &C, turn_id: &str) ->
         .with_context(|| {
             format!("failed to check incomplete turn event projections for turn `{turn_id}`")
         })?;
+    let has_unprojected_by_watermark = stream.projected_through_sequence < max_sequence;
+    let has_unprojected_by_receipts = incomplete_receipts > 0;
 
-    Ok(count > 0)
+    if has_unprojected_by_watermark != has_unprojected_by_receipts {
+        tracing::warn!(
+            turn_id,
+            max_sequence,
+            projected_through_sequence = stream.projected_through_sequence,
+            incomplete_receipts,
+            "authoritative projection watermark differs from retained projection receipts"
+        );
+    }
+
+    Ok(has_unprojected_by_watermark)
 }
 
-pub async fn mark_projected_claimed<C: ConnectionTrait>(
-    db: &C,
+pub async fn mark_projected_claimed(
+    db: &DatabaseTransaction,
     event_id: &str,
     turn_id: &str,
     sequence: i64,
     claim_token: &str,
     projected_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
+    if sequence <= 0 {
+        anyhow::bail!(
+            "turn event projection `{event_id}` has invalid sequence `{sequence}` for Turn `{turn_id}`"
+        );
+    }
+
     let affected = turn_event_projection_state::Entity::update_many()
         .col_expr(
             turn_event_projection_state::Column::Status,
@@ -495,6 +575,8 @@ pub async fn mark_projected_claimed<C: ConnectionTrait>(
             sea_orm::sea_query::Expr::value(projected_at),
         )
         .filter(turn_event_projection_state::Column::EventId.eq(event_id.to_owned()))
+        .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event_projection_state::Column::Sequence.eq(sequence))
         .filter(turn_event_projection_state::Column::Status.eq(PROJECTION_STATUS_PROJECTING))
         .filter(turn_event_projection_state::Column::ClaimToken.eq(claim_token.to_owned()))
         .exec(db)
@@ -503,40 +585,31 @@ pub async fn mark_projected_claimed<C: ConnectionTrait>(
         .rows_affected
         > 0;
 
-    if affected {
-        // Observation-only rollout: receipts remain authoritative. This shadow
-        // value advances only across an already projected contiguous prefix.
-        match super::turn_event_projection_stream_state::advance_projected_through(
+    if affected
+        && !super::turn_event_projection_stream_state::advance_projected_through(
             db,
             turn_id,
-            sequence.saturating_sub(1),
+            sequence - 1,
             sequence,
             projected_at,
         )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                event_id,
-                turn_id,
-                sequence,
-                "shadow projection watermark did not advance; projection receipts remain authoritative"
-            ),
-            Err(error) => tracing::warn!(
-                event_id,
-                turn_id,
-                sequence,
-                error = %format!("{error:#}"),
-                "shadow projection watermark update failed; projection receipts remain authoritative"
-            ),
-        }
+        .await?
+    {
+        let stored_sequence = super::turn_event_projection_stream_state::find(db, turn_id)
+            .await?
+            .map(|stream| stream.projected_through_sequence);
+        anyhow::bail!(
+            "projection watermark for Turn `{turn_id}` did not advance atomically from `{}` through `{sequence}` while completing event `{event_id}`; stored watermark: {stored_sequence:?}",
+            sequence - 1
+        );
     }
 
     Ok(affected)
 }
 
-/// Reconciles the shadow watermark with the contiguous canonical prefix whose
-/// projection receipts are all `projected`. It never mutates those receipts.
+/// Initializes or observes the watermark against the contiguous canonical
+/// prefix whose retained projection receipts are all `projected`. It never
+/// mutates those receipts.
 pub async fn backfill_projected_watermark<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

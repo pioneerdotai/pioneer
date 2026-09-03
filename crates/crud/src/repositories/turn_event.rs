@@ -385,7 +385,7 @@ pub async fn latest_event_for_turn<C: ConnectionTrait>(
         .transpose()
 }
 
-async fn next_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {
+pub async fn max_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {
     let max_sequence = db
         .query_one(
             &Query::select()
@@ -406,7 +406,11 @@ async fn next_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Re
         })
         .unwrap_or(0);
 
-    Ok(max_sequence + 1)
+    Ok(max_sequence)
+}
+
+async fn next_sequence_for_turn<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<i64> {
+    Ok(max_sequence_for_turn(db, turn_id).await? + 1)
 }
 
 pub async fn list_events_for_turn<C: ConnectionTrait>(
