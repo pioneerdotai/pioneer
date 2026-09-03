@@ -70,6 +70,27 @@ pub(super) const AGENT_ACTION_OUTBOX_COMPACTION_FORMAT: &str = "agent_action_out
 const ACTION_TIMELINE_TARGET_TURN_INPUT: &str = "turn_input";
 const ACTION_TIMELINE_TARGET_TURN_ITEM: &str = "turn_item";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTaskDeliveryCommitError {
+    OccurrenceActorMismatch,
+    OccurrenceTerminalStatusMismatch,
+}
+
+impl std::fmt::Display for TerminalTaskDeliveryCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OccurrenceActorMismatch => {
+                formatter.write_str("terminal Task delivery occurrence actor mismatch")
+            }
+            Self::OccurrenceTerminalStatusMismatch => {
+                formatter.write_str("terminal Task delivery occurrence status mismatch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TerminalTaskDeliveryCommitError {}
+
 fn agent_work_resource_limits_are_bounded(
     max_concurrency: i64,
     max_queue_depth: i64,
@@ -4099,9 +4120,11 @@ async fn revalidate_terminal_task_delivery_action(
         .context("terminal Task delivery has no occurrence contract")?;
     if occurrence.task_id != parent_task_id
         || occurrence.agent_execution_id.as_deref() != Some(execution.id.as_str())
-        || occurrence.status != "delivered"
     {
-        bail!("terminal Task delivery differs from its exact occurrence actor");
+        return Err(TerminalTaskDeliveryCommitError::OccurrenceActorMismatch.into());
+    }
+    if occurrence.status != "delivered" {
+        return Err(TerminalTaskDeliveryCommitError::OccurrenceTerminalStatusMismatch.into());
     }
     let task_execution = task_run_execution::Entity::find_by_id(execution.id.clone())
         .one(db)

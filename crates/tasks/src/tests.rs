@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::{
     ArtifactBindingTargetRecord, CrudStore, IngestArtifactMetadataRecord, NewArtifactBlobRecord,
-    TaskEventAppendStatus,
+    TaskEventAppendStatus, TaskOccurrenceTerminalRepairOutcome,
 };
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
@@ -40,7 +40,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use tokio::time::{Duration, timeout};
 
 const TEST_WORKSPACE_ID: &str = "ws_tasks";
@@ -3443,6 +3443,336 @@ async fn execution_repository_tracks_claim_running_heartbeat_and_terminal_state(
     assert_eq!(terminal.completed_at, Some(run.created_at + 3));
     assert_eq!(terminal.lease_until, None);
     assert_eq!(terminal.result, Some(result));
+}
+
+#[tokio::test]
+async fn recovery_with_a_live_lease_leaves_occurrence_running() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate run");
+    let store = runtime.service().store();
+    store
+        .claim_task_run_for_dispatch(run.id.as_str(), run.created_at)
+        .await
+        .expect("run claim should work")
+        .expect("run should be claimable");
+    let live_execution = store
+        .claim_task_run_execution_for_dispatch(
+            run.id.as_str(),
+            TaskExecutorKind::System,
+            "live-worker",
+            run.created_at,
+            run.created_at + 60,
+        )
+        .await
+        .expect("dispatch execution claim should work")
+        .expect("dispatch execution should claim");
+
+    assert!(
+        store
+            .claim_task_run_execution_for_recovery(
+                run.id.as_str(),
+                TaskExecutorKind::System,
+                "recovery-worker",
+                run.created_at + 1,
+                run.created_at + 61,
+            )
+            .await
+            .expect("recovery claim should be evaluated")
+            .is_none(),
+        "a live lease must reject recovery ownership"
+    );
+
+    let occurrence = store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await
+        .expect("occurrence should load")
+        .expect("occurrence should exist");
+    assert_eq!(occurrence.status, TaskOccurrenceStatus::Running);
+    let execution = store
+        .load_execution_for_run(run.id.as_str())
+        .await
+        .expect("execution should load")
+        .expect("execution should exist");
+    assert_eq!(execution.id, live_execution.id);
+    assert_eq!(execution.worker_id.as_deref(), Some("live-worker"));
+}
+
+#[tokio::test]
+async fn terminal_occurrence_rejects_a_stale_recovery_writer() {
+    let runtime = runtime().await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::Immediate),
+        )
+        .await
+        .expect("task should create");
+    let run = response.run.expect("immediate run");
+    let store = runtime.service().store();
+    store
+        .claim_task_run_for_dispatch(run.id.as_str(), run.created_at)
+        .await
+        .expect("run claim should work")
+        .expect("run should be claimable");
+    let execution = store
+        .claim_task_run_execution_for_dispatch(
+            run.id.as_str(),
+            TaskExecutorKind::System,
+            "terminal-worker",
+            run.created_at,
+            run.created_at + 60,
+        )
+        .await
+        .expect("execution claim should work")
+        .expect("execution should claim");
+
+    let stale_reader_ready = Arc::new(Barrier::new(2));
+    let terminal_committed = Arc::new(Barrier::new(2));
+    let stale_store = store.clone();
+    let stale_run_id = run.id.clone();
+    let stale_write_at = run.created_at + 1;
+    let stale_reader_ready_task = stale_reader_ready.clone();
+    let terminal_committed_task = terminal_committed.clone();
+    let stale_writer = tokio::spawn(async move {
+        let mut stale_occurrence = stale_store
+            .get_task_occurrence_contract_by_run(stale_run_id.as_str())
+            .await?
+            .expect("occurrence should exist before terminalization");
+        stale_occurrence.status = TaskOccurrenceStatus::Recovering;
+        stale_reader_ready_task.wait().await;
+        terminal_committed_task.wait().await;
+        stale_store
+            .upsert_task_occurrence_contract(&stale_occurrence, stale_write_at)
+            .await
+    });
+
+    stale_reader_ready.wait().await;
+    let result = TaskResult {
+        summary: Some("terminal result".to_owned()),
+        data: None,
+        artifacts: Vec::new(),
+        completed_by_run_id: Some(run.id.clone()),
+    };
+    store
+        .mark_execution_terminal(
+            execution.id.as_str(),
+            TaskRunExecutionStatus::Succeeded,
+            run.created_at + 2,
+            Some(&result),
+            None,
+        )
+        .await
+        .expect("terminal transition should commit")
+        .expect("execution should become terminal");
+    terminal_committed.wait().await;
+
+    let error = stale_writer
+        .await
+        .expect("stale writer task should join")
+        .expect_err("stale recovery write must be rejected");
+    assert!(format!("{error:#}").contains("leave terminal status"));
+    let occurrence = store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await
+        .expect("occurrence should load")
+        .expect("occurrence should exist");
+    assert_eq!(occurrence.status, TaskOccurrenceStatus::Delivered);
+    let database = store.database_connection();
+    let terminal_row = pioneer_entity::task_occurrence_contract::Entity::find_by_id(
+        occurrence.occurrence_id.clone(),
+    )
+    .one(&database)
+    .await
+    .expect("terminal occurrence row should load")
+    .expect("terminal occurrence row should exist");
+    store
+        .upsert_task_occurrence_contract(&occurrence, run.created_at.saturating_sub(100))
+        .await
+        .expect("idempotent terminal replay should succeed");
+    let replayed_row = pioneer_entity::task_occurrence_contract::Entity::find_by_id(
+        occurrence.occurrence_id.clone(),
+    )
+    .one(&database)
+    .await
+    .expect("replayed occurrence row should load")
+    .expect("replayed occurrence row should exist");
+    assert_eq!(replayed_row.updated_at, terminal_row.updated_at);
+}
+
+#[tokio::test]
+async fn reconciliation_repairs_only_an_exact_terminal_occurrence_mismatch() {
+    let runtime = runtime().await;
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    let response = runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 1,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .expect("scheduled task should create");
+    assert_eq!(
+        runtime
+            .process_due_once(1)
+            .await
+            .expect("scheduled run should execute"),
+        1
+    );
+    let task = runtime
+        .service()
+        .get_task(pioneer_protocol::TaskGetParams {
+            task_id: response.task.id,
+        })
+        .await
+        .expect("task should load");
+    let run = task.runs.first().expect("terminal run should exist");
+    assert_eq!(run.status, TaskRunStatus::Succeeded);
+    let store = runtime.service().store();
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_occurrence_contract SET status = 'recovering' WHERE run_id = ?",
+            [run.id.clone().into()],
+        ))
+        .await
+        .expect("test fixture should inject the historical mismatch");
+    let mismatches = store
+        .list_terminal_task_occurrence_mismatches(10)
+        .await
+        .expect("mismatches should list");
+    assert_eq!(mismatches.len(), 1);
+    assert_eq!(mismatches[0].run_id, run.id);
+    assert_eq!(mismatches[0].expected_occurrence_status, "delivered");
+
+    runtime
+        .start()
+        .await
+        .expect("startup reconciliation should repair the occurrence");
+    let occurrence = store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await
+        .expect("occurrence should load")
+        .expect("occurrence should exist");
+    assert_eq!(occurrence.status, TaskOccurrenceStatus::Delivered);
+    assert!(
+        store
+            .list_terminal_task_occurrence_mismatches(10)
+            .await
+            .expect("repaired mismatch should list")
+            .is_empty()
+    );
+
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_occurrence_contract SET status = 'recovering' WHERE run_id = ?",
+            [run.id.clone().into()],
+        ))
+        .await
+        .expect("test fixture should restore a projection mismatch");
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task_run_execution SET status = 'failed' WHERE task_run_id = ?",
+            [run.id.clone().into()],
+        ))
+        .await
+        .expect("test fixture should make terminal authorities ambiguous");
+    assert!(
+        store
+            .list_terminal_task_occurrence_mismatches(10)
+            .await
+            .expect("ambiguous mismatch scan should succeed")
+            .is_empty(),
+        "automatic repair must exclude disagreeing terminal authorities"
+    );
+    assert_eq!(
+        store
+            .compare_and_repair_terminal_task_occurrence(run.id.as_str(), run.completed_at.unwrap())
+            .await
+            .expect("ambiguous repair should fail closed"),
+        TaskOccurrenceTerminalRepairOutcome::NotRepairable
+    );
+    let occurrence = store
+        .get_task_occurrence_contract_by_run(run.id.as_str())
+        .await
+        .expect("ambiguous occurrence should load")
+        .expect("ambiguous occurrence should exist");
+    assert_eq!(occurrence.status, TaskOccurrenceStatus::Recovering);
+}
+
+#[tokio::test]
+async fn terminal_occurrence_scan_cursor_advances_past_unrepairable_rows() {
+    let runtime = runtime().await;
+    let store = runtime.service().store();
+    store
+        .database_connection()
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            r#"WITH RECURSIVE sequence(value) AS (
+                   SELECT 0
+                   UNION ALL
+                   SELECT value + 1 FROM sequence WHERE value < 128
+               )
+               INSERT INTO task_occurrence_contract (
+                   occurrence_id,
+                   task_id,
+                   run_id,
+                   occurrence_key,
+                   execution_generation,
+                   status,
+                   retry_attempt,
+                   action_idempotency_key
+               )
+               SELECT printf('A%020d', value),
+                      printf('B%020d', value),
+                      printf('C%020d', value),
+                      printf('unrepairable-%d', value),
+                      1,
+                      'recovering',
+                      0,
+                      printf('unrepairable-action-%d', value)
+               FROM sequence"#
+                .to_owned(),
+        ))
+        .await
+        .expect("test fixture should insert unrepairable occurrence rows");
+
+    let first_page = store
+        .scan_terminal_task_occurrence_mismatches(None, 128)
+        .await
+        .expect("first bounded occurrence page should scan");
+    assert_eq!(first_page.scanned_occurrences, 128);
+    assert!(first_page.mismatches.is_empty());
+    let cursor = first_page
+        .next_cursor
+        .expect("a remaining occurrence should retain the scan cursor");
+
+    let second_page = store
+        .scan_terminal_task_occurrence_mismatches(Some(cursor.as_str()), 128)
+        .await
+        .expect("second bounded occurrence page should scan");
+    assert_eq!(second_page.scanned_occurrences, 1);
+    assert!(second_page.mismatches.is_empty());
+    assert_eq!(second_page.next_cursor, None);
 }
 
 #[tokio::test]

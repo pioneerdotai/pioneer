@@ -339,21 +339,19 @@ impl MessageProcessor {
                 }),
             )
             .await;
-            let execution_result = match execution_result {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(anyhow!("task delivery execution task failed: {error}")),
-                Err(_) => Err(anyhow!(
-                    "task delivery execution exceeded its 60 second lease"
-                )),
+            let failure_class = match execution_result {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(error))) => Some(task_delivery_execution_failure_class(&error)),
+                Ok(Err(_)) => Some("task_delivery_worker_join_failed"),
+                Err(_) => Some("task_delivery_execution_timed_out"),
             };
-            if let Err(error) = execution_result {
+            if let Some(failure_class) = failure_class {
                 let failed_at = now_timestamp_secs();
-                let _ = error;
                 task_service
                     .fail_delivery(
                         delivery,
                         attempt,
-                        "task_delivery_execution_failed".to_owned(),
+                        failure_class.to_owned(),
                         None,
                         None,
                         failed_at,
@@ -1330,6 +1328,47 @@ impl MessageProcessor {
             "childTurnId": child_anchor.child_turn_id,
             "occurredAt": delivery.updated_at,
         }))
+    }
+}
+
+fn task_delivery_execution_failure_class(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        match cause.downcast_ref::<pioneer_crud::TerminalTaskDeliveryCommitError>() {
+            Some(pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceActorMismatch) => {
+                return "task_delivery_occurrence_actor_mismatch";
+            }
+            Some(
+                pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceTerminalStatusMismatch,
+            ) => return "task_delivery_occurrence_terminal_mismatch",
+            None => {}
+        }
+    }
+    "task_delivery_execution_failed"
+}
+
+#[cfg(test)]
+mod delivery_failure_class_tests {
+    use super::task_delivery_execution_failure_class;
+
+    #[test]
+    fn occurrence_mismatch_keeps_a_safe_low_cardinality_failure_class() {
+        let error = anyhow::Error::new(
+            pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceTerminalStatusMismatch,
+        )
+        .context("projection commit failed");
+
+        assert_eq!(
+            task_delivery_execution_failure_class(&error),
+            "task_delivery_occurrence_terminal_mismatch"
+        );
+
+        let actor_error = anyhow::Error::new(
+            pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceActorMismatch,
+        );
+        assert_eq!(
+            task_delivery_execution_failure_class(&actor_error),
+            "task_delivery_occurrence_actor_mismatch"
+        );
     }
 }
 

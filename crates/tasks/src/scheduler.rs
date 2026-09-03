@@ -795,16 +795,13 @@ impl TaskScheduler {
             );
             return Ok(false);
         };
-        let execution = self
-            .store
-            .reserve_execution_for_run(run.id.as_str(), run.executor_kind, claimed_at)
-            .await?;
         let worker_id = format!("task-worker-{}", generate_id(ID_LEN));
         let lease_until = claimed_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
         let Some(execution) = self
             .store
-            .claim_execution_at(
-                execution.id.as_str(),
+            .claim_task_run_execution_for_dispatch(
+                run.id.as_str(),
+                run.executor_kind,
                 worker_id.as_str(),
                 claimed_at,
                 lease_until,
@@ -814,25 +811,10 @@ impl TaskScheduler {
             debug!(
                 task_id = %run.task_id,
                 run_id = %run.id,
-                execution_id = %execution.id,
-                "task run dispatch skipped because execution is terminal"
+                "task run dispatch skipped because execution or occurrence is no longer claimable"
             );
             return Ok(false);
         };
-        let mut occurrence = self
-            .store
-            .get_task_occurrence_contract_by_run(run.id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "claimed Task run `{}` has no durable occurrence contract",
-                    run.id
-                )
-            })?;
-        occurrence.status = pioneer_protocol::TaskOccurrenceStatus::Running;
-        self.store
-            .upsert_task_occurrence_contract(&occurrence, claimed_at)
-            .await?;
         let context = TaskExecutionContext {
             workspace_id,
             task_id: run.task_id.clone(),

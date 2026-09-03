@@ -6,9 +6,10 @@ use pioneer_protocol::{
     PersistedActorRef, TaskActorContract, TaskOccurrenceContract, TaskOccurrenceStatus,
     TaskResultReviewerRef,
 };
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    Set, Statement,
 };
 
 use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
@@ -95,12 +96,20 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
     contract
         .validate()
         .map_err(|error| anyhow!("invalid task occurrence contract: {error:?}"))?;
-    if let Some(persisted) =
-        find_task_occurrence_contract(db, contract.occurrence_id.as_str()).await?
-    {
+    let requested_at = unix_to_datetime(now);
+    let persisted_row =
+        task_occurrence_contract::Entity::find_by_id(contract.occurrence_id.clone())
+            .one(db)
+            .await
+            .context("failed to load task occurrence contract before upsert")?;
+    let updated_at = if let Some(row) = persisted_row.as_ref() {
+        let persisted = task_occurrence_contract_from_model(row.clone())?;
         validate_occurrence_update(&persisted, contract)?;
-    }
-    task_occurrence_contract::Entity::insert(task_occurrence_contract::ActiveModel {
+        std::cmp::max(row.updated_at, requested_at)
+    } else {
+        requested_at
+    };
+    let result = task_occurrence_contract::Entity::insert(task_occurrence_contract::ActiveModel {
         occurrence_id: Set(contract.occurrence_id.clone()),
         task_id: Set(contract.task_id.clone()),
         run_id: Set(contract.run_id.clone()),
@@ -124,8 +133,8 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
         result_return_route_id: Set(contract.result_return_route_id.clone()),
         delivery_plan_json: Set(optional_typed_json_to_db(&contract.delivery_plan)?),
         terminal_reason: Set(contract.terminal_reason.clone()),
-        created_at: Set(unix_to_datetime(now)),
-        updated_at: Set(unix_to_datetime(now)),
+        created_at: Set(requested_at),
+        updated_at: Set(updated_at),
     })
     .on_conflict(
         OnConflict::column(task_occurrence_contract::Column::OccurrenceId)
@@ -146,14 +155,272 @@ pub async fn upsert_task_occurrence_contract<C: ConnectionTrait>(
                 task_occurrence_contract::Column::ResultReturnRouteId,
                 task_occurrence_contract::Column::DeliveryPlanJson,
                 task_occurrence_contract::Column::TerminalReason,
-                task_occurrence_contract::Column::UpdatedAt,
             ])
+            .value(
+                task_occurrence_contract::Column::UpdatedAt,
+                Expr::cust("MAX(task_occurrence_contract.updated_at, excluded.updated_at)"),
+            )
+            .action_and_where(Expr::cust(
+                "excluded.retry_attempt > task_occurrence_contract.retry_attempt \
+                 OR (excluded.retry_attempt = task_occurrence_contract.retry_attempt \
+                     AND (task_occurrence_contract.status NOT IN ('delivered', 'failed', 'cancelled') \
+                         OR excluded.status = task_occurrence_contract.status))",
+            ))
             .to_owned(),
     )
-    .exec(db)
+    .exec_without_returning(db)
     .await
     .context("failed to upsert task occurrence contract")?;
+    if result == 0 {
+        bail!(
+            "task occurrence contract `{}` lost its status/retry fence",
+            contract.occurrence_id
+        );
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTaskOccurrenceMismatch {
+    pub task_id: String,
+    pub run_id: String,
+    pub execution_id: String,
+    pub run_status: String,
+    pub execution_status: String,
+    pub occurrence_status: String,
+    pub expected_occurrence_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTaskOccurrenceMismatchPage {
+    pub mismatches: Vec<TerminalTaskOccurrenceMismatch>,
+    pub scanned_occurrences: usize,
+    pub next_cursor: Option<String>,
+}
+
+const TERMINAL_OCCURRENCE_SCAN_HARD_LIMIT: u64 = 512;
+
+/// Scans a bounded primary-key page, then checks only those occurrence ids for
+/// an exact terminal authority chain. The cursor advances across poison or
+/// ambiguous rows, so either can be skipped without starving later records.
+pub async fn scan_terminal_task_occurrence_mismatches<C: ConnectionTrait>(
+    db: &C,
+    after_occurrence_id: Option<&str>,
+    limit: u64,
+) -> Result<TerminalTaskOccurrenceMismatchPage> {
+    if limit == 0 {
+        return Ok(TerminalTaskOccurrenceMismatchPage {
+            mismatches: Vec::new(),
+            scanned_occurrences: 0,
+            next_cursor: None,
+        });
+    }
+    let scan_limit = limit.min(TERMINAL_OCCURRENCE_SCAN_HARD_LIMIT);
+    let mut occurrence_query = task_occurrence_contract::Entity::find()
+        .select_only()
+        .column(task_occurrence_contract::Column::OccurrenceId)
+        .order_by_asc(task_occurrence_contract::Column::OccurrenceId)
+        .limit(scan_limit.saturating_add(1));
+    if let Some(after_occurrence_id) = after_occurrence_id {
+        occurrence_query = occurrence_query.filter(
+            task_occurrence_contract::Column::OccurrenceId.gt(after_occurrence_id.to_owned()),
+        );
+    }
+    let mut occurrence_ids = occurrence_query
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to scan bounded Task occurrence page")?;
+    let page_size = usize::try_from(scan_limit).expect("hard scan limit fits usize");
+    let next_cursor = if occurrence_ids.len() > page_size {
+        occurrence_ids.truncate(page_size);
+        occurrence_ids.last().cloned()
+    } else {
+        None
+    };
+    let scanned_occurrences = occurrence_ids.len();
+    let mismatches = list_terminal_task_occurrence_mismatches_for_ids(db, &occurrence_ids).await?;
+    Ok(TerminalTaskOccurrenceMismatchPage {
+        mismatches,
+        scanned_occurrences,
+        next_cursor,
+    })
+}
+
+/// Completes an explicit diagnostic scan through bounded primary-key pages.
+/// Periodic maintenance must call `scan_terminal_task_occurrence_mismatches`
+/// once per quantum and retain its cursor instead of using this full scan.
+pub async fn list_terminal_task_occurrence_mismatches<C: ConnectionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<Vec<TerminalTaskOccurrenceMismatch>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut after_occurrence_id = None;
+    let mut mismatches = Vec::new();
+    loop {
+        let page = scan_terminal_task_occurrence_mismatches(
+            db,
+            after_occurrence_id.as_deref(),
+            TERMINAL_OCCURRENCE_SCAN_HARD_LIMIT,
+        )
+        .await?;
+        mismatches.extend(page.mismatches);
+        if u64::try_from(mismatches.len()).unwrap_or(u64::MAX) >= limit {
+            mismatches.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            break;
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        after_occurrence_id = Some(next_cursor);
+    }
+    Ok(mismatches)
+}
+
+async fn list_terminal_task_occurrence_mismatches_for_ids<C: ConnectionTrait>(
+    db: &C,
+    occurrence_ids: &[String],
+) -> Result<Vec<TerminalTaskOccurrenceMismatch>> {
+    if occurrence_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; occurrence_ids.len()].join(", ");
+    let sql = format!(
+        r#"SELECT occurrence.task_id AS task_id,
+                  occurrence.run_id AS run_id,
+                  run_execution.id AS execution_id,
+                  run.status AS run_status,
+                  run_execution.status AS execution_status,
+                  occurrence.status AS occurrence_status,
+                  CASE run.status
+                      WHEN 'succeeded' THEN 'delivered'
+                      WHEN 'cancelled' THEN 'cancelled'
+                      ELSE 'failed'
+                  END AS expected_occurrence_status
+           FROM task_occurrence_contract occurrence
+           INNER JOIN task_run run ON run.id = occurrence.run_id
+           INNER JOIN task task_row ON task_row.id = run.task_id
+           INNER JOIN task_run_execution run_execution
+                   ON run_execution.task_run_id = run.id
+           LEFT JOIN agent_execution agent ON agent.id = run_execution.id
+           WHERE occurrence.occurrence_id IN ({placeholders})
+             AND occurrence.task_id = run.task_id
+             AND task_row.executor_kind = run.executor_kind
+             AND run_execution.task_id = run.task_id
+             AND run_execution.executor_kind = run.executor_kind
+             AND run.completed_at IS NOT NULL
+             AND run_execution.completed_at IS NOT NULL
+             AND ((run.status = 'succeeded' AND run_execution.status = 'succeeded')
+               OR (run.status = 'failed' AND run_execution.status = 'failed')
+               OR (run.status = 'blocked' AND run_execution.status = 'blocked')
+               OR (run.status = 'timed_out' AND run_execution.status = 'timed_out')
+               OR (run.status = 'cancelled' AND run_execution.status = 'cancelled'))
+             AND ((run_execution.executor_kind = 'agent'
+                   AND occurrence.agent_execution_id = run_execution.id
+                   AND agent.id = run_execution.id
+                   AND agent.workspace_id = task_row.workspace_id
+                   AND agent.parent_task_id = run.task_id
+                   AND agent.execution_generation = occurrence.execution_generation
+                   AND agent.status = run_execution.status
+                   AND agent.finished_at IS NOT NULL
+                   AND occurrence.work_graph_root_execution_id = agent.work_graph_root_execution_id
+                   AND occurrence.root_resource_scope_id = agent.work_graph_root_execution_id)
+               OR (run_execution.executor_kind = 'system'
+                   AND occurrence.agent_execution_id IS NULL
+                   AND occurrence.work_graph_root_execution_id IS NULL
+                   AND occurrence.root_resource_scope_id IS NULL))
+             AND occurrence.status <> CASE run.status
+                     WHEN 'succeeded' THEN 'delivered'
+                     WHEN 'cancelled' THEN 'cancelled'
+                     ELSE 'failed'
+                 END
+           ORDER BY occurrence.occurrence_id ASC"#,
+    );
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            occurrence_ids
+                .iter()
+                .cloned()
+                .map(sea_orm::Value::from)
+                .collect::<Vec<_>>(),
+        ))
+        .await
+        .context("failed to list terminal Task occurrence mismatches")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(TerminalTaskOccurrenceMismatch {
+                task_id: row.try_get("", "task_id")?,
+                run_id: row.try_get("", "run_id")?,
+                execution_id: row.try_get("", "execution_id")?,
+                run_status: row.try_get("", "run_status")?,
+                execution_status: row.try_get("", "execution_status")?,
+                occurrence_status: row.try_get("", "occurrence_status")?,
+                expected_occurrence_status: row.try_get("", "expected_occurrence_status")?,
+            })
+        })
+        .collect()
+}
+
+/// Explicit repair path for an occurrence whose exact terminal authorities
+/// were revalidated by the caller in the same transaction. The optimistic
+/// fence prevents a concurrent retry or actor rebinding from being repaired.
+pub(crate) async fn repair_terminal_task_occurrence_status<C: ConnectionTrait>(
+    db: &C,
+    current: &task_occurrence_contract::Model,
+    expected_status: TaskOccurrenceStatus,
+    now: i64,
+) -> Result<bool> {
+    if !is_terminal_task_occurrence_status(&expected_status) {
+        bail!("terminal Task occurrence repair requires a terminal status");
+    }
+    let mut update = task_occurrence_contract::Entity::update_many()
+        .filter(task_occurrence_contract::Column::OccurrenceId.eq(current.occurrence_id.clone()))
+        .filter(task_occurrence_contract::Column::TaskId.eq(current.task_id.clone()))
+        .filter(task_occurrence_contract::Column::RunId.eq(current.run_id.clone()))
+        .filter(
+            task_occurrence_contract::Column::ExecutionGeneration.eq(current.execution_generation),
+        )
+        .filter(task_occurrence_contract::Column::RetryAttempt.eq(current.retry_attempt))
+        .filter(task_occurrence_contract::Column::Status.eq(current.status.clone()))
+        .filter(
+            task_occurrence_contract::Column::ActionIdempotencyKey
+                .eq(current.action_idempotency_key.clone()),
+        )
+        .filter(task_occurrence_contract::Column::UpdatedAt.eq(current.updated_at))
+        .col_expr(
+            task_occurrence_contract::Column::Status,
+            Expr::value(task_occurrence_status_to_db(&expected_status)),
+        )
+        .col_expr(
+            task_occurrence_contract::Column::UpdatedAt,
+            Expr::value(unix_to_datetime(now)),
+        );
+    update = match current.agent_execution_id.as_ref() {
+        Some(execution_id) => update
+            .filter(task_occurrence_contract::Column::AgentExecutionId.eq(execution_id.clone())),
+        None => update.filter(task_occurrence_contract::Column::AgentExecutionId.is_null()),
+    };
+    update = match current.work_graph_root_execution_id.as_ref() {
+        Some(root_execution_id) => update.filter(
+            task_occurrence_contract::Column::WorkGraphRootExecutionId
+                .eq(root_execution_id.clone()),
+        ),
+        None => update.filter(task_occurrence_contract::Column::WorkGraphRootExecutionId.is_null()),
+    };
+    update = match current.root_resource_scope_id.as_ref() {
+        Some(scope_id) => update
+            .filter(task_occurrence_contract::Column::RootResourceScopeId.eq(scope_id.clone())),
+        None => update.filter(task_occurrence_contract::Column::RootResourceScopeId.is_null()),
+    };
+    let result = update
+        .exec(db)
+        .await
+        .context("failed to repair terminal Task occurrence status")?;
+    Ok(result.rows_affected == 1)
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +544,15 @@ fn validate_occurrence_update(
             candidate.occurrence_id
         );
     }
+    if candidate.retry_attempt == persisted.retry_attempt
+        && is_terminal_task_occurrence_status(&persisted.status)
+        && candidate.status != persisted.status
+    {
+        bail!(
+            "task occurrence contract `{}` attempts to leave terminal status without a newer retry",
+            candidate.occurrence_id
+        );
+    }
     if persisted.run_id != candidate.run_id && candidate.retry_attempt <= persisted.retry_attempt {
         bail!(
             "task occurrence contract `{}` can change run only for a newer retry",
@@ -303,6 +579,28 @@ fn validate_occurrence_update(
         }
     }
     Ok(())
+}
+
+pub(crate) const fn is_terminal_task_occurrence_status(status: &TaskOccurrenceStatus) -> bool {
+    matches!(
+        status,
+        TaskOccurrenceStatus::Delivered
+            | TaskOccurrenceStatus::Failed
+            | TaskOccurrenceStatus::Cancelled
+    )
+}
+
+pub(crate) const fn task_occurrence_status_to_db(status: &TaskOccurrenceStatus) -> &'static str {
+    match status {
+        TaskOccurrenceStatus::Dormant => "dormant",
+        TaskOccurrenceStatus::Queued => "queued",
+        TaskOccurrenceStatus::Recovering => "recovering",
+        TaskOccurrenceStatus::Running => "running",
+        TaskOccurrenceStatus::WaitingReview => "waiting_review",
+        TaskOccurrenceStatus::Delivered => "delivered",
+        TaskOccurrenceStatus::Failed => "failed",
+        TaskOccurrenceStatus::Cancelled => "cancelled",
+    }
 }
 
 pub async fn find_task_occurrence_contract<C: ConnectionTrait>(
@@ -666,7 +964,7 @@ fn task_actor_contract_from_current_model(
     Ok(contract)
 }
 
-pub(super) fn task_occurrence_contract_from_model(
+pub(crate) fn task_occurrence_contract_from_model(
     row: task_occurrence_contract::Model,
 ) -> Result<TaskOccurrenceContract> {
     let status = match row.status.as_str() {

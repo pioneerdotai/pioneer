@@ -29,31 +29,31 @@ pub use repositories::agent_domain::{
     AgentTurnResponseInput, AgentWorkGraphCancellationTarget, AgentWorkGraphProjectionTarget,
     NativeAgentConfigInput, PresentationSnapshotInput, PromotedAgentExecution,
     SOURCE_CLI_RUNTIME_INSTANCE, SOURCE_EPHEMERAL, SOURCE_NATIVE_AGENT,
-    acquire_agent_running_permit, agent_delegation_route_projection,
-    agent_execution_grant_fingerprint, agent_presentation_snapshot_from_rows,
-    cancel_agent_work_graph, canonical_agent_id, claim_actor_nickname, claim_agent_action_outbox,
-    commit_agent_action, commit_agent_delivery_action, commit_agent_execution_graph,
-    commit_agent_thread_creation, commit_native_agent_config_mutation,
-    compact_terminal_agent_action_ledger, defer_agent_action_outbox_for_permit,
-    defer_agent_action_outbox_for_runtime, enqueue_agent_execution, ensure_agent_identity,
-    ensure_native_agent_config, ensure_root_resource_scope, finalize_agent_execution,
-    heartbeat_agent_execution, insert_agent_action_idempotent, insert_agent_delegation_route,
-    insert_agent_execution, insert_agent_execution_grant, insert_agent_resource_state,
-    insert_agent_turn_response, insert_presentation_snapshot, list_active_agent_identities,
-    list_agent_delegation_routes, list_agent_delegation_routes_for_source,
-    load_active_agent_identity, load_active_agent_identity_by_source, load_agent_action,
-    load_agent_action_outbox, load_agent_action_receipt,
-    load_agent_action_timeline_projections_for_targets, load_agent_delegation_route,
-    load_agent_execution, load_agent_execution_grant, load_agent_execution_resource_state,
-    load_agent_identity, load_agent_identity_by_source, load_agent_presentation_snapshot,
-    load_agent_turn_response, load_agent_turn_responses_for_turns,
-    load_agent_work_graph_projection_for_turn, load_agent_work_graph_projection_target,
-    load_current_agent_authors_for_executions, load_current_agent_presentation_snapshot,
-    load_native_agent_config, load_native_agent_config_by_system_key,
-    mark_agent_action_outbox_delivered, mark_agent_action_outbox_failed,
-    promote_queued_agent_executions, record_agent_execution_progress,
-    reopen_agent_execution_for_retry, revoke_agent_delegation_route,
-    upgrade_agent_execution_grant_model_to_current, utc_now,
+    TerminalTaskDeliveryCommitError, acquire_agent_running_permit,
+    agent_delegation_route_projection, agent_execution_grant_fingerprint,
+    agent_presentation_snapshot_from_rows, cancel_agent_work_graph, canonical_agent_id,
+    claim_actor_nickname, claim_agent_action_outbox, commit_agent_action,
+    commit_agent_delivery_action, commit_agent_execution_graph, commit_agent_thread_creation,
+    commit_native_agent_config_mutation, compact_terminal_agent_action_ledger,
+    defer_agent_action_outbox_for_permit, defer_agent_action_outbox_for_runtime,
+    enqueue_agent_execution, ensure_agent_identity, ensure_native_agent_config,
+    ensure_root_resource_scope, finalize_agent_execution, heartbeat_agent_execution,
+    insert_agent_action_idempotent, insert_agent_delegation_route, insert_agent_execution,
+    insert_agent_execution_grant, insert_agent_resource_state, insert_agent_turn_response,
+    insert_presentation_snapshot, list_active_agent_identities, list_agent_delegation_routes,
+    list_agent_delegation_routes_for_source, load_active_agent_identity,
+    load_active_agent_identity_by_source, load_agent_action, load_agent_action_outbox,
+    load_agent_action_receipt, load_agent_action_timeline_projections_for_targets,
+    load_agent_delegation_route, load_agent_execution, load_agent_execution_grant,
+    load_agent_execution_resource_state, load_agent_identity, load_agent_identity_by_source,
+    load_agent_presentation_snapshot, load_agent_turn_response,
+    load_agent_turn_responses_for_turns, load_agent_work_graph_projection_for_turn,
+    load_agent_work_graph_projection_target, load_current_agent_authors_for_executions,
+    load_current_agent_presentation_snapshot, load_native_agent_config,
+    load_native_agent_config_by_system_key, mark_agent_action_outbox_delivered,
+    mark_agent_action_outbox_failed, promote_queued_agent_executions,
+    record_agent_execution_progress, reopen_agent_execution_for_retry,
+    revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
     wake_agent_action_outbox_for_execution,
 };
 pub use repositories::agent_identity_catalog::{
@@ -151,9 +151,11 @@ pub use repositories::principal_avatar::{
 };
 pub use repositories::task::TaskRootAccessFilter;
 pub use repositories::task_actor_contract::{
-    find_task_actor_contract, find_task_occurrence_by_run_id, find_task_occurrence_contract,
-    list_task_occurrences, upgrade_task_actor_contract_model_to_current,
-    upsert_task_actor_contract, upsert_task_occurrence_contract,
+    TerminalTaskOccurrenceMismatch, TerminalTaskOccurrenceMismatchPage, find_task_actor_contract,
+    find_task_occurrence_by_run_id, find_task_occurrence_contract, list_task_occurrences,
+    list_terminal_task_occurrence_mismatches, scan_terminal_task_occurrence_mismatches,
+    upgrade_task_actor_contract_model_to_current, upsert_task_actor_contract,
+    upsert_task_occurrence_contract,
 };
 pub use repositories::thread::{
     advance_thread_read_cursor, find_thread_read_cursor, thread_read_cursor_from_model,
@@ -222,18 +224,19 @@ use crate::convention::{
     recovery_action_to_db, recovery_job_status_from_db, recovery_trigger_from_db,
     task_concurrency_conflict_policy_from_db, task_delivery_attempt_status_from_db,
     task_delivery_mode_from_db, task_delivery_status_from_db, task_delivery_thread_target_from_db,
-    task_executor_kind_from_db, task_owner_kind_from_db, task_owner_kind_to_db,
-    task_result_candidate_status_from_db, task_result_review_decision_from_db,
-    task_result_review_event_kind_from_db, task_result_reviewer_kind_from_db,
-    task_run_execution_status_from_db, task_run_execution_status_to_db, task_run_status_from_db,
-    task_run_status_to_db, task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db,
-    task_run_turn_status_from_db, task_run_turn_status_to_db, task_status_from_db,
-    task_status_to_db, task_trigger_kind_from_db, task_trigger_status_from_db,
-    task_write_lock_scope_kind_from_db, task_write_lock_status_from_db, thread_mode_from_db,
-    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, thread_status_from_db,
-    turn_item_execution_class_from_db, turn_item_type_from_db, turn_item_type_to_db,
-    turn_kind_from_db, turn_kind_to_db, turn_origin_from_db, turn_permission_mode_from_db,
-    turn_permission_profile_source_from_db, turn_status_from_db, turn_status_to_db,
+    task_executor_kind_from_db, task_executor_kind_to_db, task_owner_kind_from_db,
+    task_owner_kind_to_db, task_result_candidate_status_from_db,
+    task_result_review_decision_from_db, task_result_review_event_kind_from_db,
+    task_result_reviewer_kind_from_db, task_run_execution_status_from_db,
+    task_run_execution_status_to_db, task_run_status_from_db, task_run_status_to_db,
+    task_run_thread_binding_kind_from_db, task_run_turn_kind_from_db, task_run_turn_status_from_db,
+    task_run_turn_status_to_db, task_status_from_db, task_status_to_db, task_trigger_kind_from_db,
+    task_trigger_status_from_db, task_write_lock_scope_kind_from_db,
+    task_write_lock_status_from_db, thread_mode_from_db, thread_origin_kind_from_db,
+    thread_sidebar_visibility_from_db, thread_status_from_db, turn_item_execution_class_from_db,
+    turn_item_type_from_db, turn_item_type_to_db, turn_kind_from_db, turn_kind_to_db,
+    turn_origin_from_db, turn_permission_mode_from_db, turn_permission_profile_source_from_db,
+    turn_status_from_db, turn_status_to_db,
 };
 use crate::events::{TurnEventPayload, TurnStartedEventPayload};
 use crate::projector::TurnProjector;
@@ -768,6 +771,7 @@ pub struct TaskReviewInvariantWriteLockRecord {
 pub struct TaskRuntimeInvariantSnapshot {
     pub task_events: Vec<TaskRuntimeInvariantEventRecord>,
     pub delivered_task_results: Vec<TaskRuntimeInvariantDeliveryRecord>,
+    pub terminal_occurrence_mismatches: Vec<TerminalTaskOccurrenceMismatch>,
     pub in_progress_turns: Vec<TaskRuntimeInvariantTurnRecord>,
     pub stale_turn_item_attempts: Vec<TaskRuntimeInvariantStaleAttemptRecord>,
 }
@@ -1307,6 +1311,28 @@ pub struct TaskRunChildAnchor {
     pub child_turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskExecutionOccurrenceClaimMode {
+    Dispatch,
+    Recovery,
+}
+
+impl TaskExecutionOccurrenceClaimMode {
+    fn accepts_run_status(self, status: &str) -> bool {
+        match self {
+            Self::Dispatch => matches!(status, "starting"),
+            Self::Recovery => matches!(status, "starting" | "running"),
+        }
+    }
+
+    const fn occurrence_status(self) -> pioneer_protocol::TaskOccurrenceStatus {
+        match self {
+            Self::Dispatch => pioneer_protocol::TaskOccurrenceStatus::Running,
+            Self::Recovery => pioneer_protocol::TaskOccurrenceStatus::Recovering,
+        }
+    }
+}
+
 fn memory_candidate_status_event_kind(status: MemoryCandidateStatus) -> &'static str {
     match status {
         MemoryCandidateStatus::Approved => MEMORY_EVENT_CANDIDATE_APPROVED,
@@ -1380,6 +1406,66 @@ async fn reserve_execution_for_run_in_connection<C: ConnectionTrait>(
         .await?
         .context("task run execution missing after reservation")?;
     task_run_execution_from_db_model(execution)
+}
+
+fn exact_terminal_occurrence_status(
+    task: &pioneer_entity::task::Model,
+    run: &pioneer_entity::task_run::Model,
+    execution: &pioneer_entity::task_run_execution::Model,
+    occurrence: &pioneer_entity::task_occurrence_contract::Model,
+    agent_execution: Option<&pioneer_entity::agent_execution::Model>,
+) -> Option<pioneer_protocol::TaskOccurrenceStatus> {
+    if task.id != run.task_id
+        || task.executor_kind != run.executor_kind
+        || occurrence.task_id != run.task_id
+        || occurrence.run_id != run.id
+        || execution.task_id != run.task_id
+        || execution.task_run_id != run.id
+        || execution.executor_kind != run.executor_kind
+        || run.completed_at.is_none()
+        || execution.completed_at.is_none()
+    {
+        return None;
+    }
+
+    let expected = match (run.status.as_str(), execution.status.as_str()) {
+        ("succeeded", "succeeded") => pioneer_protocol::TaskOccurrenceStatus::Delivered,
+        ("failed", "failed") | ("blocked", "blocked") | ("timed_out", "timed_out") => {
+            pioneer_protocol::TaskOccurrenceStatus::Failed
+        }
+        ("cancelled", "cancelled") => pioneer_protocol::TaskOccurrenceStatus::Cancelled,
+        _ => return None,
+    };
+
+    match execution.executor_kind.as_str() {
+        "agent" => {
+            let agent_execution = agent_execution?;
+            if occurrence.agent_execution_id.as_deref() != Some(execution.id.as_str())
+                || agent_execution.id != execution.id
+                || agent_execution.workspace_id != task.workspace_id
+                || agent_execution.parent_task_id.as_deref() != Some(run.task_id.as_str())
+                || occurrence.execution_generation != agent_execution.execution_generation
+                || agent_execution.status != execution.status
+                || agent_execution.finished_at.is_none()
+                || occurrence.work_graph_root_execution_id.as_deref()
+                    != Some(agent_execution.work_graph_root_execution_id.as_str())
+                || occurrence.root_resource_scope_id.as_deref()
+                    != Some(agent_execution.work_graph_root_execution_id.as_str())
+            {
+                return None;
+            }
+        }
+        "system" => {
+            if occurrence.agent_execution_id.is_some()
+                || occurrence.work_graph_root_execution_id.is_some()
+                || occurrence.root_resource_scope_id.is_some()
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(expected)
 }
 
 /// A single turn's conversation content: user input + assistant reply.
@@ -2327,6 +2413,16 @@ pub enum TaskRunOccurrenceTerminalizationOutcome {
     AlreadyConsistent,
     NotFound,
     InvalidBinding,
+}
+
+/// Result of reconciling a Task occurrence contract with an exact, agreeing
+/// terminal TaskRun/TaskRunExecution/AgentExecution authority chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOccurrenceTerminalRepairOutcome {
+    Changed,
+    AlreadyConsistent,
+    NotFound,
+    NotRepairable,
 }
 
 #[derive(Debug, Clone)]
@@ -13167,6 +13263,367 @@ impl CrudStore {
         }
     }
 
+    pub async fn claim_task_run_execution_for_dispatch(
+        &self,
+        run_id: &str,
+        executor_kind: TaskExecutorKind,
+        worker_id: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.claim_task_run_execution_with_occurrence(
+            run_id,
+            executor_kind,
+            worker_id,
+            now,
+            lease_until,
+            TaskExecutionOccurrenceClaimMode::Dispatch,
+        )
+        .await
+    }
+
+    pub async fn claim_task_run_execution_for_recovery(
+        &self,
+        run_id: &str,
+        executor_kind: TaskExecutorKind,
+        worker_id: &str,
+        now: i64,
+        lease_until: i64,
+    ) -> Result<Option<TaskRunExecution>> {
+        self.claim_task_run_execution_with_occurrence(
+            run_id,
+            executor_kind,
+            worker_id,
+            now,
+            lease_until,
+            TaskExecutionOccurrenceClaimMode::Recovery,
+        )
+        .await
+    }
+
+    async fn claim_task_run_execution_with_occurrence(
+        &self,
+        run_id: &str,
+        executor_kind: TaskExecutorKind,
+        worker_id: &str,
+        now: i64,
+        lease_until: i64,
+        mode: TaskExecutionOccurrenceClaimMode,
+    ) -> Result<Option<TaskRunExecution>> {
+        let run_id = run_id.to_owned();
+        let worker_id = worker_id.to_owned();
+        self.run_serialized_write(|| {
+            self.claim_task_run_execution_with_occurrence_once(
+                run_id.clone(),
+                executor_kind,
+                worker_id.clone(),
+                now,
+                lease_until,
+                mode,
+            )
+        })
+        .await
+    }
+
+    async fn claim_task_run_execution_with_occurrence_once(
+        &self,
+        run_id: String,
+        executor_kind: TaskExecutorKind,
+        worker_id: String,
+        now: i64,
+        lease_until: i64,
+        mode: TaskExecutionOccurrenceClaimMode,
+    ) -> Result<Option<TaskRunExecution>> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin Task execution/occurrence claim transaction")?;
+        let result = async {
+            let Some(run) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
+                return Ok(None);
+            };
+            if !mode.accepts_run_status(run.status.as_str())
+                || run.executor_kind != task_executor_kind_to_db(executor_kind)
+            {
+                return Ok(None);
+            }
+            let Some(mut occurrence) =
+                repositories::task_actor_contract::find_task_occurrence_by_run_id(
+                    &transaction,
+                    run_id.as_str(),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            if occurrence.task_id != run.task_id
+                || occurrence.run_id != run.id
+                || repositories::task_actor_contract::is_terminal_task_occurrence_status(
+                    &occurrence.status,
+                )
+            {
+                return Ok(None);
+            }
+
+            let execution = reserve_execution_for_run_in_connection(
+                &transaction,
+                run_id.clone(),
+                executor_kind,
+                now,
+            )
+            .await?;
+            if occurrence
+                .agent_execution_id
+                .as_deref()
+                .is_some_and(|execution_id| execution_id != execution.id)
+            {
+                return Ok(None);
+            }
+            let Some(execution) = task_run_execution::claim_execution(
+                &transaction,
+                execution.id.as_str(),
+                worker_id.as_str(),
+                unix_to_datetime(now),
+                unix_to_datetime(lease_until),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            occurrence.status = mode.occurrence_status();
+            repositories::task_actor_contract::upsert_task_occurrence_contract(
+                &transaction,
+                &occurrence,
+                now,
+            )
+            .await?;
+            task_run_execution_from_db_model(execution).map(Some)
+        }
+        .await;
+        match result {
+            Ok(Some(execution)) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit Task execution/occurrence claim transaction")?;
+                Ok(Some(execution))
+            }
+            Ok(None) => {
+                transaction
+                    .rollback()
+                    .await
+                    .context("failed to roll back rejected Task execution/occurrence claim")?;
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Revalidates a queued or waiting-review run and synchronizes its
+    /// non-terminal occurrence in the same short transaction. A stale active
+    /// snapshot can never reopen a terminal occurrence.
+    pub async fn revalidate_and_sync_active_task_occurrence(
+        &self,
+        run_id: &str,
+        expected_run_status: TaskRunStatus,
+        now: i64,
+    ) -> Result<bool> {
+        let expected_run_status_db = task_run_status_to_db(expected_run_status).to_owned();
+        let desired_occurrence_status = match expected_run_status {
+            TaskRunStatus::Queued => pioneer_protocol::TaskOccurrenceStatus::Queued,
+            TaskRunStatus::WaitingReview => pioneer_protocol::TaskOccurrenceStatus::WaitingReview,
+            _ => bail!("active Task occurrence sync requires queued or waiting-review status"),
+        };
+        let run_id = run_id.to_owned();
+        self.run_serialized_write(|| {
+            let run_id = run_id.clone();
+            let expected_run_status_db = expected_run_status_db.clone();
+            let desired_occurrence_status = desired_occurrence_status.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin active Task occurrence sync transaction")?;
+                let result = async {
+                    let Some(run) = task_run::find_run_by_id(&transaction, run_id.as_str()).await?
+                    else {
+                        return Ok(false);
+                    };
+                    if run.status != expected_run_status_db {
+                        return Ok(false);
+                    }
+                    let Some(mut occurrence) =
+                        repositories::task_actor_contract::find_task_occurrence_by_run_id(
+                            &transaction,
+                            run_id.as_str(),
+                        )
+                        .await?
+                    else {
+                        return Ok(false);
+                    };
+                    if occurrence.task_id != run.task_id
+                        || occurrence.run_id != run.id
+                        || repositories::task_actor_contract::is_terminal_task_occurrence_status(
+                            &occurrence.status,
+                        )
+                    {
+                        return Ok(false);
+                    }
+                    if occurrence.status != desired_occurrence_status {
+                        occurrence.status = desired_occurrence_status.clone();
+                        repositories::task_actor_contract::upsert_task_occurrence_contract(
+                            &transaction,
+                            &occurrence,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Ok(true)
+                }
+                .await;
+                match result {
+                    Ok(revalidated) => {
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit active Task occurrence sync transaction")?;
+                        Ok(revalidated)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn list_terminal_task_occurrence_mismatches(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<TerminalTaskOccurrenceMismatch>> {
+        repositories::task_actor_contract::list_terminal_task_occurrence_mismatches(
+            &self.connection,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn scan_terminal_task_occurrence_mismatches(
+        &self,
+        after_occurrence_id: Option<&str>,
+        limit: u64,
+    ) -> Result<TerminalTaskOccurrenceMismatchPage> {
+        repositories::task_actor_contract::scan_terminal_task_occurrence_mismatches(
+            &self.connection,
+            after_occurrence_id,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn compare_and_repair_terminal_task_occurrence(
+        &self,
+        run_id: &str,
+        now: i64,
+    ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
+        let run_id = run_id.to_owned();
+        self.run_serialized_write(|| {
+            self.compare_and_repair_terminal_task_occurrence_once(run_id.clone(), now)
+        })
+        .await
+    }
+
+    async fn compare_and_repair_terminal_task_occurrence_once(
+        &self,
+        run_id: String,
+        now: i64,
+    ) -> Result<TaskOccurrenceTerminalRepairOutcome> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("failed to begin terminal Task occurrence repair transaction")?;
+        let result = async {
+            let Some(run) = task_run::find_run_by_id(&transaction, run_id.as_str()).await? else {
+                return Ok(TaskOccurrenceTerminalRepairOutcome::NotFound);
+            };
+            let Some(execution) =
+                task_run_execution::find_execution_by_run(&transaction, run_id.as_str()).await?
+            else {
+                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
+            };
+            let Some(occurrence_model) = pioneer_entity::task_occurrence_contract::Entity::find()
+                .filter(pioneer_entity::task_occurrence_contract::Column::RunId.eq(run_id.clone()))
+                .one(&transaction)
+                .await?
+            else {
+                return Ok(TaskOccurrenceTerminalRepairOutcome::NotFound);
+            };
+            let repair_at = now.max(occurrence_model.updated_at.timestamp());
+            let Some(task) =
+                task_repository::find_task_by_id(&transaction, run.task_id.as_str()).await?
+            else {
+                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
+            };
+            let agent_execution = if execution.executor_kind == "agent" {
+                pioneer_entity::agent_execution::Entity::find_by_id(execution.id.clone())
+                    .one(&transaction)
+                    .await
+                    .context("failed to revalidate terminal AgentExecution for occurrence repair")?
+            } else {
+                None
+            };
+            let Some(expected_status) = exact_terminal_occurrence_status(
+                &task,
+                &run,
+                &execution,
+                &occurrence_model,
+                agent_execution.as_ref(),
+            ) else {
+                return Ok(TaskOccurrenceTerminalRepairOutcome::NotRepairable);
+            };
+            if occurrence_model.status
+                == repositories::task_actor_contract::task_occurrence_status_to_db(&expected_status)
+            {
+                return Ok(TaskOccurrenceTerminalRepairOutcome::AlreadyConsistent);
+            }
+            let repaired =
+                repositories::task_actor_contract::repair_terminal_task_occurrence_status(
+                    &transaction,
+                    &occurrence_model,
+                    expected_status,
+                    repair_at,
+                )
+                .await?;
+            Ok(if repaired {
+                TaskOccurrenceTerminalRepairOutcome::Changed
+            } else {
+                TaskOccurrenceTerminalRepairOutcome::NotRepairable
+            })
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit terminal Task occurrence repair transaction")?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn reserve_execution_for_run(
         &self,
         run_id: &str,
@@ -14083,6 +14540,13 @@ impl CrudStore {
             })
             .collect::<Vec<_>>();
 
+        let terminal_occurrence_mismatches =
+            repositories::task_actor_contract::list_terminal_task_occurrence_mismatches(
+                &self.connection,
+                u64::MAX,
+            )
+            .await?;
+
         let in_progress_turns = pioneer_entity::turn::Entity::find()
             .filter(pioneer_entity::turn::Column::Status.eq("in_progress"))
             .order_by_asc(pioneer_entity::turn::Column::UpdatedAt)
@@ -14143,6 +14607,7 @@ impl CrudStore {
         Ok(TaskRuntimeInvariantSnapshot {
             task_events,
             delivered_task_results,
+            terminal_occurrence_mismatches,
             in_progress_turns,
             stale_turn_item_attempts,
         })
