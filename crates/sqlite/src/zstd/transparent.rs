@@ -647,9 +647,15 @@ struct TodoInfo {
 
 struct IncrementalMaintenanceArgs {
     end_limit: Instant,
-    target_db_load: f32,
     time_limit: f64,
 }
+/// Legacy SQL maintenance entry point retained for sqlite-zstd compatibility.
+///
+/// Pioneer Gateway does not call this function: its maintenance reads bounded
+/// rows, compresses outside SQLite, and commits with a short CAS transaction.
+/// Keep this path free of deliberate sleeps and post-update whole-table scans
+/// so an external compatibility caller cannot make an already long statement
+/// even worse while holding a SQLite connection.
 pub fn zstd_incremental_maintenance<'a>(ctx: &Context) -> Result<ToSqlOutput<'a>, anyhow::Error> {
     let args = {
         let arg_time_limit_seconds = 0;
@@ -658,7 +664,7 @@ pub fn zstd_incremental_maintenance<'a>(ctx: &Context) -> Result<ToSqlOutput<'a>
             .get(arg_time_limit_seconds)
             .context("could not get time limit argument")?;
         let time_limit = time_limit.unwrap_or(100000000.0);
-        let target_db_load: f32 = ctx
+        let _target_db_load: f32 = ctx
             .get(arg_target_db_load)
             .context("could not get target db load argument")?;
         if !(0.0..=1e100).contains(&time_limit) {
@@ -667,7 +673,6 @@ pub fn zstd_incremental_maintenance<'a>(ctx: &Context) -> Result<ToSqlOutput<'a>
         let end_limit = Instant::now() + Duration::from_secs_f64(time_limit);
         IncrementalMaintenanceArgs {
             end_limit,
-            target_db_load,
             time_limit,
         }
     };
@@ -820,7 +825,6 @@ fn maintenance_for_todo(
         chunk_size
     );
     loop {
-        let update_start = Instant::now();
         let q = &format!(
             "update {tbl} set {datacol} = zstd_compress_col({datacol}, :lvl, :dict, :compact), {dictcol} = :dict where rowid in (select rowid from {tbl} where {dictcol} is null and :dictchoice = ({chooser}) limit :chunksize)",
             tbl = esc_names.compressed_tablename,
@@ -847,44 +851,18 @@ fn maintenance_for_todo(
         if Instant::now() > args.end_limit {
             break;
         }
-        let elapsed = update_start.elapsed();
-        if elapsed.div_f32(args.target_db_load) > elapsed {
-            let sleep_duration = elapsed.div_f32(args.target_db_load) - elapsed;
-            if sleep_duration > Duration::from_millis(1) {
-                log::debug!(
-                    "Sleeping {}s to keep write load at {}",
-                    sleep_duration.as_secs_f32(),
-                    args.target_db_load
-                );
-                std::thread::sleep(sleep_duration);
-            }
-        }
 
         if updated == 0 {
             break;
         }
     }
 
-    let (total_size_after, total_count_after): (i64, i64) = db.query_row(
-        &format!(
-            "select sum(length({datacol})), count(*) from {tbl} where {dictcol} = ?",
-            tbl = esc_names.compressed_tablename,
-            datacol = esc_names.data_colname,
-            dictcol = esc_names.dict_colname
-        ),
-        params![dict_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
     if dict_is_new {
         log::info!(
-            "Compressed {} rows with dict_choice={} (dict_id={}). Total size of entries before: {}, afterwards: {}, (average: before={}, after={})",
+            "Compressed {} rows with new dict_choice={} (dict_id={}); bounded Gateway maintenance reports batch-local sizes separately",
             total_updated,
             dict_choice,
             dict_id,
-            pretty_bytes(todo.total_bytes),
-            pretty_bytes(total_size_after),
-            pretty_bytes(avg_sample_bytes),
-            pretty_bytes(total_size_after / total_count_after),
         );
     }
     Ok(total_updated)

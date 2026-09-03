@@ -5,18 +5,32 @@ use pioneer_crud::{
     upsert_projection_meta,
 };
 use pioneer_sqlite::SqliteDatabase;
-use sea_orm::{ConnectionTrait, Statement, entity::prelude::DateTimeWithTimeZone};
+use sea_orm::{
+    ConnectionTrait, Statement, TransactionTrait, entity::prelude::DateTimeWithTimeZone,
+};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
-pub(crate) const STARTUP_MAINTENANCE_SECONDS: f64 = 60.0;
-pub(crate) const STARTUP_TARGET_DB_LOAD: f64 = 1.0;
 pub(crate) const PERIODIC_MAINTENANCE_INTERVAL_SECONDS: u64 = 300;
+pub(crate) const PERIODIC_BACKLOG_RECHECK_MILLIS: u64 = 250;
 pub(crate) const PERIODIC_MAINTENANCE_SECONDS: f64 = 10.0;
+#[cfg(test)]
 pub(crate) const PERIODIC_MAINTENANCE_SLICE_SECONDS: f64 = 0.25;
 pub(crate) const PERIODIC_TARGET_DB_LOAD: f64 = 0.25;
 
-#[derive(Debug, Clone, Copy)]
+// A batch is bounded before payload bytes enter memory. A single oversized
+// row is still admitted so it cannot starve forever; Pioneer already bounds
+// individual persisted payloads at their domain ingress.
+const COMPRESSION_BATCH_MAX_ROWS: usize = 32;
+const COMPRESSION_BATCH_MAX_SOURCE_BYTES: usize = 1024 * 1024;
+const DICTIONARY_SAMPLE_MAX_ROWS: usize = 2048;
+const DICTIONARY_SAMPLE_MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const DICTIONARY_MIN_SOURCE_BYTES: usize = 500_000;
+const DICTIONARY_MIN_SAMPLE_ROWS: usize = 8;
+const DICTIONARY_MIN_BYTES: usize = 5_000;
+const DICTIONARY_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ZstdColumnConfig {
     pub(crate) projection_key: &'static str,
     pub(crate) projection_version: i64,
@@ -25,6 +39,8 @@ pub(crate) struct ZstdColumnConfig {
     pub(crate) backing_table: &'static str,
     pub(crate) dict_column: &'static str,
     pub(crate) dict_chooser: &'static str,
+    pub(crate) dictionary_key: &'static str,
+    pub(crate) compression_level: i32,
     pub(crate) count_source: ZstdColumnCountSource,
 }
 
@@ -34,7 +50,7 @@ impl ZstdColumnConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ZstdColumnCountSource {
     TurnEvent,
     TurnItem,
@@ -48,6 +64,8 @@ pub(crate) const TURN_EVENT_PAYLOAD: ZstdColumnConfig = ZstdColumnConfig {
     backing_table: "_turn_event_zstd",
     dict_column: "_payload_dict",
     dict_chooser: "'turn_event.payload'",
+    dictionary_key: "turn_event.payload",
+    compression_level: 19,
     count_source: ZstdColumnCountSource::TurnEvent,
 };
 
@@ -59,6 +77,8 @@ pub(crate) const TURN_ITEM_PAYLOAD: ZstdColumnConfig = ZstdColumnConfig {
     backing_table: "_turn_item_zstd",
     dict_column: "_payload_dict",
     dict_chooser: "'turn_item.payload'",
+    dictionary_key: "turn_item.payload",
+    compression_level: 19,
     count_source: ZstdColumnCountSource::TurnItem,
 };
 
@@ -75,6 +95,9 @@ pub(crate) struct ZstdColumnCompressionSummary {
     pub(crate) total_rows: u64,
     pub(crate) pending_before: u64,
     pub(crate) pending_after: u64,
+    pub(crate) compressed_rows: u64,
+    pub(crate) stale_rows: u64,
+    pub(crate) source_bytes: u64,
     pub(crate) maintenance_more_pending: bool,
     /// Exact row counts are intentionally collected only by explicit test and
     /// diagnostic entry points. Production cooperative maintenance must not
@@ -90,11 +113,58 @@ pub(crate) struct ZstdPeriodicMaintenanceOutcome {
     pub(crate) cancelled: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CooperativeMaintenanceOutcome {
-    more_pending: bool,
     deferred: bool,
     cancelled: bool,
+    columns: Vec<(ZstdColumnConfig, ColumnMaintenanceProgress)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ColumnMaintenanceProgress {
+    observed_rows: u64,
+    applied_rows: u64,
+    stale_rows: u64,
+    source_bytes: u64,
+    more_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPayloadRow {
+    rowid: i64,
+    id: String,
+    payload: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompressionDictionary {
+    id: i64,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct PreparedPayloadRow {
+    rowid: i64,
+    id: String,
+    original_payload: String,
+    compressed_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CompressionBatchOutcome {
+    observed_rows: u64,
+    applied_rows: u64,
+    stale_rows: u64,
+    source_bytes: u64,
+    more_pending: bool,
+}
+
+#[derive(Debug)]
+struct DictionaryResolution {
+    dictionary: Option<CompressionDictionary>,
+    observed_rows: u64,
+    source_bytes: u64,
+    more_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,31 +189,19 @@ pub(crate) async fn run_startup_once(
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
 ) -> Result<ZstdColumnCompressionSummary> {
-    let db = crud_store.database_connection();
-    verify_sqlite_zstd_registered(&db).await?;
-
-    let ensure = ensure_compression_enabled(&db, config, RowInspection::Exact).await?;
-    if ensure.skipped_empty {
-        return Ok(summary_without_maintenance(config, ensure));
-    }
-
-    let pending_before = pending_uncompressed_rows(&db, config).await?;
-    let maintenance_more_pending =
-        run_maintenance(&db, maintenance_seconds, target_db_load).await?;
-    let pending_after = pending_uncompressed_rows(&db, config).await?;
-
-    Ok(ZstdColumnCompressionSummary {
-        table: config.table,
-        column: config.column,
-        enabled_now: ensure.enabled_now,
-        already_enabled: ensure.was_enabled,
-        skipped_empty: ensure.skipped_empty,
-        total_rows: ensure.total_rows,
-        pending_before,
-        pending_after,
-        maintenance_more_pending,
-        counts_exact: ensure.counts_exact,
-    })
+    run_periodic_maintenance(
+        crud_store,
+        std::slice::from_ref(&config),
+        maintenance_seconds,
+        target_db_load,
+        None,
+        RowInspection::Exact,
+    )
+    .await?
+    .summaries
+    .into_iter()
+    .next()
+    .context("zstd maintenance returned no column summary")
 }
 
 #[cfg(test)]
@@ -180,6 +238,34 @@ pub(crate) async fn run_cooperative_maintenance_cycle(
         RowInspection::Bounded,
     )
     .await
+}
+
+/// Installs or verifies transparent-column schema only. Historical payload
+/// compression is deliberately excluded from Gateway readiness and is left
+/// to the post-startup maintenance worker.
+pub(crate) async fn ensure_compression_schema(
+    crud_store: &CrudStore,
+    configs: &[ZstdColumnConfig],
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<ZstdColumnCompressionSummary>> {
+    let crud_store = crud_store.with_maintenance_access();
+    let db = crud_store.database_connection();
+    verify_sqlite_zstd_registered(&db).await?;
+
+    let mut summaries = Vec::with_capacity(configs.len());
+    for config in configs {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let ensure = crud_store
+            .run_background_database_quantum(|| {
+                let db = db.clone();
+                async move { ensure_compression_enabled(&db, *config, RowInspection::Bounded).await }
+            })
+            .await?;
+        summaries.push(summary_without_maintenance(*config, ensure));
+    }
+    Ok(summaries)
 }
 
 async fn run_periodic_maintenance(
@@ -221,13 +307,17 @@ async fn run_periodic_maintenance(
         })
         .await?;
 
-    let should_run_maintenance = before
+    let enabled_configs = before
         .iter()
-        .any(|(_, ensure, _)| ensure.was_enabled || ensure.enabled_now);
-    let maintenance = if should_run_maintenance {
+        .filter_map(|(config, ensure, _)| {
+            (ensure.was_enabled || ensure.enabled_now).then_some(*config)
+        })
+        .collect::<Vec<_>>();
+    let maintenance = if !enabled_configs.is_empty() {
         run_cooperative_maintenance(
             crud_store,
             &db,
+            enabled_configs.as_slice(),
             maintenance_seconds,
             target_db_load,
             cancellation,
@@ -246,10 +336,19 @@ async fn run_periodic_maintenance(
     }
 
     let mut summaries = Vec::with_capacity(before.len());
-    for (config, ensure, pending_before) in before {
+    for (config, ensure, exact_pending_before) in before {
+        let progress = maintenance
+            .columns
+            .iter()
+            .find_map(|(candidate, progress)| (*candidate == config).then_some(*progress))
+            .unwrap_or_default();
+        let pending_before = match row_inspection {
+            RowInspection::Exact => exact_pending_before,
+            RowInspection::Bounded => progress.observed_rows,
+        };
         let pending_after = match row_inspection {
             RowInspection::Exact => pending_uncompressed_rows(&db, config).await?,
-            RowInspection::Bounded => 0,
+            RowInspection::Bounded => progress.observed_rows.saturating_sub(progress.applied_rows),
         };
         summaries.push(ZstdColumnCompressionSummary {
             table: config.table,
@@ -260,7 +359,10 @@ async fn run_periodic_maintenance(
             total_rows: ensure.total_rows,
             pending_before,
             pending_after,
-            maintenance_more_pending: maintenance.more_pending,
+            compressed_rows: progress.applied_rows,
+            stale_rows: progress.stale_rows,
+            source_bytes: progress.source_bytes,
+            maintenance_more_pending: progress.more_pending,
             counts_exact: ensure.counts_exact,
         });
     }
@@ -275,72 +377,556 @@ async fn run_periodic_maintenance(
 async fn run_cooperative_maintenance(
     crud_store: &CrudStore,
     db: &SqliteDatabase,
+    configs: &[ZstdColumnConfig],
     maintenance_seconds: Option<f64>,
     target_db_load: f64,
     cancellation: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<CooperativeMaintenanceOutcome> {
-    let Some(total_seconds) = maintenance_seconds else {
-        let more_pending = crud_store
-            .run_background_database_quantum(|| {
-                let db = db.clone();
-                async move { run_maintenance(&db, None, target_db_load).await }
-            })
-            .await?;
-        return Ok(CooperativeMaintenanceOutcome {
-            more_pending,
-            deferred: false,
-            cancelled: false,
-        });
-    };
+    if !target_db_load.is_finite() || !(0.0 < target_db_load && target_db_load <= 1.0) {
+        anyhow::bail!("zstd maintenance target DB load must be in (0, 1]");
+    }
 
-    let budget = Duration::from_secs_f64(total_seconds.max(0.0));
-    let deadline = Instant::now() + budget;
-    let mut more_pending = true;
-    while more_pending {
-        if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+    let deadline = maintenance_seconds
+        .map(|seconds| Instant::now() + Duration::from_secs_f64(seconds.max(0.0)));
+    let mut columns = configs
+        .iter()
+        .copied()
+        .map(|config| (config, ColumnMaintenanceProgress::default()))
+        .collect::<Vec<_>>();
+    let mut active = vec![true; configs.len()];
+
+    loop {
+        let mut attempted = false;
+        let mut made_progress = false;
+        for (index, config) in configs.iter().copied().enumerate() {
+            if !active[index] {
+                continue;
+            }
+            if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Ok(CooperativeMaintenanceOutcome {
+                    deferred: false,
+                    cancelled: true,
+                    columns,
+                });
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(CooperativeMaintenanceOutcome {
+                    deferred: false,
+                    cancelled: false,
+                    columns,
+                });
+            }
+
+            attempted = true;
+            let started_at = Instant::now();
+            let batch = run_one_compression_batch(crud_store, db, config, cancellation).await?;
+            let progress = &mut columns[index].1;
+            progress.observed_rows = progress.observed_rows.saturating_add(batch.observed_rows);
+            progress.applied_rows = progress.applied_rows.saturating_add(batch.applied_rows);
+            progress.stale_rows = progress.stale_rows.saturating_add(batch.stale_rows);
+            progress.source_bytes = progress.source_bytes.saturating_add(batch.source_bytes);
+            progress.more_pending = batch.more_pending;
+            // A batch that could not make progress (for example because a
+            // dictionary does not yet have enough bounded training input, or
+            // every CAS became stale) remains pending but is not retried in a
+            // tight loop during the same maintenance cycle.
+            active[index] = batch.more_pending && batch.applied_rows != 0;
+            made_progress |= batch.applied_rows != 0;
+
+            if batch.more_pending {
+                pause_after_batch(started_at.elapsed(), target_db_load, deadline, cancellation)
+                    .await?;
+            }
+        }
+
+        if !active.iter().any(|active| *active) || !attempted || !made_progress {
             return Ok(CooperativeMaintenanceOutcome {
-                more_pending: true,
                 deferred: false,
-                cancelled: true,
+                cancelled: false,
+                columns,
             });
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+    }
+}
+
+async fn run_one_compression_batch(
+    crud_store: &CrudStore,
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<CompressionBatchOutcome> {
+    let dictionary = resolve_compression_dictionary(crud_store, db, config).await?;
+    let Some(dictionary) = dictionary.dictionary else {
+        return Ok(CompressionBatchOutcome {
+            observed_rows: dictionary.observed_rows,
+            source_bytes: dictionary.source_bytes,
+            more_pending: dictionary.more_pending,
+            ..Default::default()
+        });
+    };
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(CompressionBatchOutcome {
+            more_pending: true,
+            ..Default::default()
+        });
+    }
+
+    let rows = crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            async move {
+                load_pending_payload_rows(
+                    &db,
+                    config,
+                    COMPRESSION_BATCH_MAX_ROWS,
+                    COMPRESSION_BATCH_MAX_SOURCE_BYTES,
+                )
+                .await
+            }
+        })
+        .await?;
+    if rows.is_empty() {
+        return Ok(CompressionBatchOutcome::default());
+    }
+    let observed_rows = rows.len() as u64;
+    let source_bytes = rows.iter().map(|row| row.payload.len() as u64).sum::<u64>();
+    let dictionary_id = dictionary.id;
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_payload_rows(rows, config.compression_level, dictionary.bytes.as_deref())
+    })
+    .await
+    .context("zstd payload compression worker failed to join")??;
+
+    if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Ok(CompressionBatchOutcome {
+            observed_rows,
+            source_bytes,
+            more_pending: true,
+            ..Default::default()
+        });
+    }
+    let (applied_rows, stale_rows) = crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            let prepared = &prepared;
+            async move { apply_prepared_payload_rows(&db, config, dictionary_id, prepared).await }
+        })
+        .await?;
+    let more_pending = crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            async move { has_pending_uncompressed_rows(&db, config).await }
+        })
+        .await?;
+
+    Ok(CompressionBatchOutcome {
+        observed_rows,
+        applied_rows,
+        stale_rows,
+        source_bytes,
+        more_pending,
+    })
+}
+
+async fn resolve_compression_dictionary(
+    crud_store: &CrudStore,
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+) -> Result<DictionaryResolution> {
+    if let Some(dictionary) = crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            async move { load_compression_dictionary(&db, config).await }
+        })
+        .await?
+    {
+        return Ok(DictionaryResolution {
+            dictionary: Some(dictionary),
+            observed_rows: 0,
+            source_bytes: 0,
+            more_pending: true,
+        });
+    }
+
+    let sample = crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            async move {
+                load_pending_payload_rows(
+                    &db,
+                    config,
+                    DICTIONARY_SAMPLE_MAX_ROWS,
+                    DICTIONARY_SAMPLE_MAX_SOURCE_BYTES,
+                )
+                .await
+            }
+        })
+        .await?;
+    if sample.is_empty() {
+        return Ok(DictionaryResolution {
+            dictionary: None,
+            observed_rows: 0,
+            source_bytes: 0,
+            more_pending: false,
+        });
+    }
+    let sample_rows = sample.len();
+    let sample_bytes = sample.iter().map(|row| row.payload.len()).sum::<usize>();
+    if sample_rows < DICTIONARY_MIN_SAMPLE_ROWS {
+        return Ok(DictionaryResolution {
+            dictionary: Some(CompressionDictionary {
+                id: -1,
+                bytes: None,
+            }),
+            observed_rows: sample_rows as u64,
+            source_bytes: sample_bytes as u64,
+            more_pending: true,
+        });
+    }
+    if sample_bytes < DICTIONARY_MIN_SOURCE_BYTES && sample_rows < DICTIONARY_SAMPLE_MAX_ROWS {
+        return Ok(DictionaryResolution {
+            dictionary: None,
+            observed_rows: sample_rows as u64,
+            source_bytes: sample_bytes as u64,
+            more_pending: true,
+        });
+    }
+
+    let wanted_size = (sample_bytes / 100).clamp(DICTIONARY_MIN_BYTES, DICTIONARY_MAX_BYTES);
+    let samples = sample
+        .into_iter()
+        .map(|row| row.payload.into_bytes())
+        .collect::<Vec<_>>();
+    let trained = tokio::task::spawn_blocking(move || {
+        pioneer_sqlite::zstd::train_dictionary(samples.as_slice(), wanted_size)
+    })
+    .await
+    .context("zstd dictionary training worker failed to join")?;
+    let candidate = match trained {
+        Ok(candidate) => candidate,
+        Err(_) => {
+            tracing::warn!(
+                table = config.table,
+                column = config.column,
+                "bounded zstd dictionary training failed; compressing this batch without a dictionary"
+            );
+            return Ok(DictionaryResolution {
+                dictionary: Some(CompressionDictionary {
+                    id: -1,
+                    bytes: None,
+                }),
+                observed_rows: sample_rows as u64,
+                source_bytes: sample_bytes as u64,
+                more_pending: true,
+            });
+        }
+    };
+    let dictionary = crud_store
+        .run_background_database_quantum(|| {
+            let db = db.clone();
+            let candidate = candidate.clone();
+            async move { persist_compression_dictionary(&db, config, candidate).await }
+        })
+        .await?;
+    Ok(DictionaryResolution {
+        dictionary: Some(dictionary),
+        observed_rows: sample_rows as u64,
+        source_bytes: sample_bytes as u64,
+        more_pending: true,
+    })
+}
+
+fn prepare_payload_rows(
+    rows: Vec<PendingPayloadRow>,
+    compression_level: i32,
+    dictionary: Option<&[u8]>,
+) -> Result<Vec<PreparedPayloadRow>> {
+    rows.into_iter()
+        .map(|row| {
+            let compressed_payload = pioneer_sqlite::zstd::compress_column_value(
+                row.payload.as_bytes(),
+                compression_level,
+                dictionary,
+            )
+            .context("failed to compress bounded zstd payload row")?;
+            Ok(PreparedPayloadRow {
+                rowid: row.rowid,
+                id: row.id,
+                original_payload: row.payload,
+                compressed_payload,
+            })
+        })
+        .collect()
+}
+
+async fn load_pending_payload_rows(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+    max_rows: usize,
+    max_source_bytes: usize,
+) -> Result<Vec<PendingPayloadRow>> {
+    #[derive(Debug)]
+    struct Candidate {
+        rowid: i64,
+        payload_bytes: usize,
+    }
+
+    let candidate_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "SELECT rowid AS zstd_rowid, length({column}) AS payload_bytes \
+                 FROM {table} WHERE {dict_column} IS NULL \
+                 ORDER BY rowid LIMIT ?",
+                column = config.column,
+                table = config.backing_table,
+                dict_column = config.dict_column,
+            ),
+            [(max_rows.saturating_add(1) as i64).into()],
+        ))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect bounded zstd batch for {}",
+                config.label()
+            )
+        })?;
+
+    let mut candidates = Vec::with_capacity(max_rows.min(candidate_rows.len()));
+    let mut admitted_bytes = 0usize;
+    for row in candidate_rows.into_iter().take(max_rows) {
+        let payload_bytes = row
+            .try_get::<i64>("", "payload_bytes")
+            .context("failed to decode bounded zstd payload length")?
+            .max(0) as usize;
+        if !candidates.is_empty() && admitted_bytes.saturating_add(payload_bytes) > max_source_bytes
+        {
             break;
         }
-        let slice_seconds = remaining
-            .as_secs_f64()
-            .min(PERIODIC_MAINTENANCE_SLICE_SECONDS);
-        let slice_more_pending = crud_store
-            .run_background_database_quantum(|| {
-                let db = db.clone();
-                async move { run_maintenance(&db, Some(slice_seconds), target_db_load).await }
+        admitted_bytes = admitted_bytes.saturating_add(payload_bytes);
+        candidates.push(Candidate {
+            rowid: row
+                .try_get::<i64>("", "zstd_rowid")
+                .context("failed to decode bounded zstd rowid")?,
+            payload_bytes,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let selected_values = std::iter::repeat_n("(?, ?)", candidates.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut values = Vec::with_capacity(candidates.len() * 2);
+    for candidate in &candidates {
+        values.push(candidate.rowid.into());
+        values.push((candidate.payload_bytes as i64).into());
+    }
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "WITH selected(zstd_rowid, payload_bytes) AS (VALUES {selected_values}) \
+                 SELECT target.rowid AS zstd_rowid, target.id AS id, \
+                        target.{column} AS payload \
+                 FROM {table} AS target \
+                 JOIN selected ON selected.zstd_rowid = target.rowid \
+                              AND selected.payload_bytes = length(target.{column}) \
+                 WHERE target.{dict_column} IS NULL ORDER BY target.rowid",
+                column = config.column,
+                table = config.backing_table,
+                dict_column = config.dict_column,
+            ),
+            values,
+        ))
+        .await
+        .with_context(|| format!("failed to load bounded zstd batch for {}", config.label()))?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PendingPayloadRow {
+                rowid: row
+                    .try_get::<i64>("", "zstd_rowid")
+                    .context("failed to decode bounded zstd rowid")?,
+                id: row
+                    .try_get::<String>("", "id")
+                    .context("failed to decode bounded zstd row id")?,
+                payload: row
+                    .try_get::<String>("", "payload")
+                    .context("failed to decode bounded zstd payload")?,
             })
-            .await?;
-        more_pending = slice_more_pending;
-        if more_pending {
-            if let Some(cancellation) = cancellation {
-                tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        return Ok(CooperativeMaintenanceOutcome {
-                            more_pending: true,
-                            deferred: false,
-                            cancelled: true,
-                        });
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
-                }
-            } else {
-                tokio::task::yield_now().await;
+        })
+        .collect()
+}
+
+async fn load_compression_dictionary(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+) -> Result<Option<CompressionDictionary>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT id, dict FROM _zstd_dicts WHERE chooser_key = ? LIMIT 1",
+            [config.dictionary_key.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to load zstd dictionary for {}", config.label()))?;
+    row.map(|row| {
+        Ok(CompressionDictionary {
+            id: row
+                .try_get::<i64>("", "id")
+                .context("failed to decode zstd dictionary id")?,
+            bytes: Some(
+                row.try_get::<Vec<u8>>("", "dict")
+                    .context("failed to decode zstd dictionary")?,
+            ),
+        })
+    })
+    .transpose()
+}
+
+async fn persist_compression_dictionary(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+    candidate: Vec<u8>,
+) -> Result<CompressionDictionary> {
+    let transaction = db.begin().await.with_context(|| {
+        format!(
+            "failed to begin zstd dictionary commit for {}",
+            config.label()
+        )
+    })?;
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "INSERT INTO _zstd_dicts (chooser_key, dict) VALUES (?, ?) \
+             ON CONFLICT(chooser_key) DO NOTHING",
+            [config.dictionary_key.into(), candidate.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to commit zstd dictionary for {}", config.label()))?;
+    let row = transaction
+        .query_one_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "SELECT id, dict FROM _zstd_dicts WHERE chooser_key = ? LIMIT 1",
+            [config.dictionary_key.into()],
+        ))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to revalidate zstd dictionary for {}",
+                config.label()
+            )
+        })?
+        .context("persisted zstd dictionary was not found")?;
+    let dictionary = CompressionDictionary {
+        id: row
+            .try_get::<i64>("", "id")
+            .context("failed to decode persisted zstd dictionary id")?,
+        bytes: Some(
+            row.try_get::<Vec<u8>>("", "dict")
+                .context("failed to decode persisted zstd dictionary")?,
+        ),
+    };
+    transaction.commit().await.with_context(|| {
+        format!(
+            "failed to finish zstd dictionary commit for {}",
+            config.label()
+        )
+    })?;
+    Ok(dictionary)
+}
+
+async fn apply_prepared_payload_rows(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+    dictionary_id: i64,
+    rows: &[PreparedPayloadRow],
+) -> Result<(u64, u64)> {
+    let transaction = db
+        .begin()
+        .await
+        .with_context(|| format!("failed to begin bounded zstd commit for {}", config.label()))?;
+    let mut applied = 0u64;
+    let mut stale = 0u64;
+    for row in rows {
+        let result = transaction
+            .execute_raw(Statement::from_sql_and_values(
+                transaction.get_database_backend(),
+                format!(
+                    "UPDATE {table} SET {column} = ?, {dict_column} = ? \
+                     WHERE rowid = ? AND id = ? AND {dict_column} IS NULL \
+                       AND {column} = ?",
+                    table = config.backing_table,
+                    column = config.column,
+                    dict_column = config.dict_column,
+                ),
+                [
+                    row.compressed_payload.clone().into(),
+                    dictionary_id.into(),
+                    row.rowid.into(),
+                    row.id.clone().into(),
+                    row.original_payload.clone().into(),
+                ],
+            ))
+            .await
+            .with_context(|| format!("failed to apply bounded zstd row for {}", config.label()))?;
+        match result.rows_affected() {
+            0 => stale = stale.saturating_add(1),
+            1 => applied = applied.saturating_add(1),
+            affected => {
+                anyhow::bail!("bounded zstd CAS affected {affected} rows for a single primary key")
             }
         }
     }
+    transaction
+        .commit()
+        .await
+        .with_context(|| format!("failed to commit bounded zstd batch for {}", config.label()))?;
+    Ok((applied, stale))
+}
 
-    Ok(CooperativeMaintenanceOutcome {
-        more_pending,
-        deferred: false,
-        cancelled: false,
-    })
+async fn has_pending_uncompressed_rows(
+    db: &SqliteDatabase,
+    config: ZstdColumnConfig,
+) -> Result<bool> {
+    query_i64(
+        db,
+        format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IS NULL LIMIT 1) AS value",
+            config.backing_table, config.dict_column
+        )
+        .as_str(),
+        "failed to inspect pending sqlite-zstd rows",
+    )
+    .await
+    .map(|value| value != 0)
+}
+
+async fn pause_after_batch(
+    elapsed: Duration,
+    target_db_load: f64,
+    deadline: Option<Instant>,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<()> {
+    let desired_total = elapsed.div_f64(target_db_load);
+    let mut pause = desired_total.saturating_sub(elapsed);
+    if let Some(deadline) = deadline {
+        pause = pause.min(deadline.saturating_duration_since(Instant::now()));
+    }
+    if pause.is_zero() {
+        tokio::task::yield_now().await;
+        return Ok(());
+    }
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            _ = cancellation.cancelled() => {}
+            _ = tokio::time::sleep(pause) => {}
+        }
+    } else {
+        tokio::time::sleep(pause).await;
+    }
+    Ok(())
 }
 
 async fn ensure_compression_enabled(
@@ -385,7 +971,6 @@ async fn ensure_compression_enabled(
     })
 }
 
-#[cfg(test)]
 fn summary_without_maintenance(
     config: ZstdColumnConfig,
     ensure: EnsureCompressionResult,
@@ -399,6 +984,9 @@ fn summary_without_maintenance(
         total_rows: ensure.total_rows,
         pending_before: 0,
         pending_after: 0,
+        compressed_rows: 0,
+        stale_rows: 0,
+        source_bytes: 0,
         maintenance_more_pending: false,
         counts_exact: ensure.counts_exact,
     }
@@ -450,7 +1038,7 @@ async fn enable_transparent_compression(
     let sqlite_zstd_config = json!({
         "table": config.table,
         "column": config.column,
-        "compression_level": 19,
+        "compression_level": config.compression_level,
         "dict_chooser": config.dict_chooser
     });
     db.query_one_write_raw(Statement::from_sql_and_values(
@@ -466,26 +1054,6 @@ async fn enable_transparent_compression(
         )
     })?;
     Ok(())
-}
-
-async fn run_maintenance(
-    db: &SqliteDatabase,
-    maintenance_seconds: Option<f64>,
-    target_db_load: f64,
-) -> Result<bool> {
-    let sql = match maintenance_seconds {
-        Some(seconds) => {
-            format!("SELECT zstd_incremental_maintenance({seconds}, {target_db_load}) AS value")
-        }
-        None => format!("SELECT zstd_incremental_maintenance(NULL, {target_db_load}) AS value"),
-    };
-    let result = query_i64_on_writer(
-        &db.maintenance(),
-        sql.as_str(),
-        "failed to run sqlite-zstd maintenance",
-    )
-    .await?;
-    Ok(result != 0)
 }
 
 async fn pending_uncompressed_rows(db: &SqliteDatabase, config: ZstdColumnConfig) -> Result<u64> {
@@ -543,23 +1111,6 @@ where
         .context("query unexpectedly returned no rows")?;
     row.try_get::<i64>("", "value")
         .with_context(|| format!("{error_context}: failed to decode value"))
-}
-
-async fn query_i64_on_writer(
-    db: &SqliteDatabase,
-    sql: &str,
-    error_context: &'static str,
-) -> Result<i64> {
-    let row = db
-        .query_one_write_raw(Statement::from_string(
-            db.get_database_backend(),
-            sql.to_owned(),
-        ))
-        .await
-        .with_context(|| error_context.to_owned())?
-        .context(error_context)?;
-    row.try_get::<i64>("", "value")
-        .with_context(|| error_context.to_owned())
 }
 
 async fn mark_compression_backfilling<C>(db: &C, config: ZstdColumnConfig) -> Result<()>
@@ -683,8 +1234,11 @@ fn now_datetime() -> DateTimeWithTimeZone {
 #[cfg(test)]
 mod tests {
     use super::{
+        COMPRESSION_BATCH_MAX_ROWS, COMPRESSION_BATCH_MAX_SOURCE_BYTES,
         PERIODIC_MAINTENANCE_SLICE_SECONDS, TURN_EVENT_PAYLOAD, TURN_ITEM_PAYLOAD,
-        ZSTD_PAYLOAD_COLUMNS, run_periodic_maintenance_once, run_startup_once,
+        ZSTD_PAYLOAD_COLUMNS, apply_prepared_payload_rows, ensure_compression_schema,
+        load_compression_dictionary, load_pending_payload_rows, prepare_payload_rows,
+        run_periodic_maintenance_once, run_startup_once,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{CrudStore, find_projection_meta};
@@ -694,6 +1248,62 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn startup_schema_enables_transparent_reads_without_compressing_the_backlog() {
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd auto-extension should register");
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        insert_turn_events(&connection, 120).await;
+
+        let store = CrudStore::new(connection.clone());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let summaries = ensure_compression_schema(
+            &store,
+            std::slice::from_ref(&TURN_EVENT_PAYLOAD),
+            &cancellation,
+        )
+        .await
+        .expect("startup should install only transparent schema");
+
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].enabled_now);
+        let pending = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM _turn_event_zstd WHERE _payload_dict IS NULL",
+        )
+        .await;
+        let readable = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM turn_event WHERE json_valid(payload)",
+        )
+        .await;
+        assert_eq!(pending, 120, "startup must not compress historical rows");
+        assert_eq!(
+            readable, 120,
+            "raw rows must remain readable through the view"
+        );
+
+        let maintenance_db = store.with_maintenance_access().database_connection();
+        let batch = load_pending_payload_rows(
+            &maintenance_db,
+            TURN_EVENT_PAYLOAD,
+            COMPRESSION_BATCH_MAX_ROWS,
+            COMPRESSION_BATCH_MAX_SOURCE_BYTES,
+        )
+        .await
+        .expect("bounded maintenance read should work");
+        assert_eq!(batch.len(), COMPRESSION_BATCH_MAX_ROWS);
+        assert!(
+            batch.iter().map(|row| row.payload.len()).sum::<usize>()
+                <= COMPRESSION_BATCH_MAX_SOURCE_BYTES
+        );
+    }
 
     #[tokio::test]
     async fn startup_compression_converts_turn_event_payload_to_zstd_view_and_preserves_reads() {
@@ -1001,6 +1611,99 @@ mod tests {
             .expect("meta should exist");
         assert_eq!(meta.status, pioneer_crud::PROJECTION_META_STATUS_COMPLETE);
         assert_eq!(meta.source_turn_item_count, before_rows);
+    }
+
+    #[tokio::test]
+    async fn bounded_zstd_cas_never_overwrites_a_concurrent_turn_item_update() {
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .expect("sqlite-zstd auto-extension should register");
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        insert_turn_items(&connection, 120).await;
+
+        let store = CrudStore::new(connection.clone());
+        run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
+            .await
+            .expect("initial compression should create a dictionary");
+        upsert_agent_message_turn_item(
+            &connection,
+            "turn_item_zstd",
+            "item_0",
+            "payload prepared before race",
+        )
+        .await
+        .expect("first update should work");
+
+        let maintenance_db = store.with_maintenance_access().database_connection();
+        let rows = load_pending_payload_rows(
+            &maintenance_db,
+            TURN_ITEM_PAYLOAD,
+            COMPRESSION_BATCH_MAX_ROWS,
+            COMPRESSION_BATCH_MAX_SOURCE_BYTES,
+        )
+        .await
+        .expect("pending row should load");
+        assert_eq!(rows.len(), 1);
+        let dictionary = load_compression_dictionary(&maintenance_db, TURN_ITEM_PAYLOAD)
+            .await
+            .expect("dictionary lookup should work")
+            .expect("dictionary should exist");
+        let dictionary_id = dictionary.id;
+        let prepared = prepare_payload_rows(
+            rows,
+            TURN_ITEM_PAYLOAD.compression_level,
+            dictionary.bytes.as_deref(),
+        )
+        .expect("payload preparation should work");
+
+        upsert_agent_message_turn_item(
+            &connection,
+            "turn_item_zstd",
+            "item_0",
+            "payload committed during race",
+        )
+        .await
+        .expect("concurrent update should work");
+        let (applied, stale) = apply_prepared_payload_rows(
+            &maintenance_db,
+            TURN_ITEM_PAYLOAD,
+            dictionary_id,
+            prepared.as_slice(),
+        )
+        .await
+        .expect("stale maintenance commit should be harmless");
+        assert_eq!(applied, 0);
+        assert_eq!(stale, 1);
+        let pending = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE id = 'turn_item_zstd_item_0' AND _payload_dict IS NULL",
+        )
+        .await;
+        assert_eq!(pending, 1);
+
+        let item = store
+            .get_turn_item("turn_item_zstd", "item_0")
+            .await
+            .expect("turn_item read should work")
+            .expect("turn_item should exist");
+        let TurnItem::AgentMessage { text, .. } = item else {
+            panic!("expected agent message item");
+        };
+        assert!(text.contains("payload committed during race"));
+
+        run_startup_once(&store, TURN_ITEM_PAYLOAD, None, 1.0)
+            .await
+            .expect("next bounded cycle should compress the current value");
+        let pending_after_retry = query_i64(
+            &connection,
+            "SELECT COUNT(*) AS value FROM _turn_item_zstd WHERE id = 'turn_item_zstd_item_0' AND _payload_dict IS NULL",
+        )
+        .await;
+        assert_eq!(pending_after_retry, 0);
     }
 
     #[tokio::test]

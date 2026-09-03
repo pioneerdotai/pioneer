@@ -85,6 +85,37 @@ fn zstd_compress_fn_tail<'a>(
     input_value: &[u8],
     encoder: Result<Compressor, std::io::Error>,
 ) -> anyhow::Result<ToSqlOutput<'a>> {
+    Ok(ToSqlOutput::Owned(Value::Blob(compress_with_encoder(
+        compact,
+        input_value,
+        encoder,
+    )?)))
+}
+
+/// Compresses one value in the compact format used by transparent zstd
+/// columns, without requiring or retaining a SQLite connection.
+///
+/// Gateway maintenance deliberately calls this helper after releasing its
+/// bounded reader batch and before acquiring the serialized writer. Keeping
+/// the format implementation shared with `zstd_compress_col` guarantees that
+/// old and newly compressed rows remain readable through the same view.
+pub fn compress_column_value(
+    input_value: &[u8],
+    level: i32,
+    dictionary: Option<&[u8]>,
+) -> anyhow::Result<Vec<u8>> {
+    let encoder = match dictionary {
+        Some(dictionary) => Compressor::with_dictionary(level, dictionary),
+        None => Compressor::new(level),
+    };
+    compress_with_encoder(true, input_value, encoder)
+}
+
+fn compress_with_encoder(
+    compact: bool,
+    input_value: &[u8],
+    encoder: Result<Compressor, std::io::Error>,
+) -> anyhow::Result<Vec<u8>> {
     let mut encoder = encoder.context("creating zstd encoder")?;
     {
         // pledge source size (benchmarking shows this doesn't help any tho)
@@ -106,7 +137,7 @@ fn zstd_compress_fn_tail<'a>(
         .compress(input_value)
         .context("writing data to zstd encoder")?;
 
-    Ok(ToSqlOutput::Owned(Value::Blob(res)))
+    Ok(res)
 }
 
 pub(crate) fn zstd_decompress_fn<'a>(
@@ -212,5 +243,31 @@ fn zstd_decompress_inner<'a>(
         )))
     } else {
         Ok(ToSqlOutput::Owned(Value::Blob(vec)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compress_column_value;
+    use rusqlite::{Connection, params};
+
+    #[test]
+    fn pure_compactor_matches_the_transparent_column_wire_format() {
+        let database = Connection::open_in_memory().expect("open sqlite memory database");
+        crate::zstd::load(&database).expect("register sqlite-zstd functions");
+        let input = format!(
+            "bounded payload {}",
+            "whose compact representation remains compatible ".repeat(128)
+        );
+        let compressed =
+            compress_column_value(input.as_bytes(), 19, None).expect("compress payload");
+        let decompressed: String = database
+            .query_row(
+                "SELECT zstd_decompress(?1, 1, -1, 1)",
+                params![compressed],
+                |row| row.get(0),
+            )
+            .expect("decompress compact payload through SQLite function");
+        assert_eq!(decompressed, input);
     }
 }
