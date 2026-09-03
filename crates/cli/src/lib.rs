@@ -144,9 +144,9 @@ fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
         }
         Some("start") => {
             let json_output = parse_optional_json_flag(args)?;
-            let warnings = service::start_gateway_service()?;
+            let report = service::start_gateway_service()?;
             if json_output {
-                print_start_report(warnings)
+                print_start_report(report)
             } else {
                 Ok(())
             }
@@ -468,8 +468,8 @@ fn install_error_code(command: installer::InstallCommand, error_text: &str) -> &
     }
 }
 
-fn print_start_report(warnings: Vec<service::GatewayServiceWarning>) -> Result<()> {
-    let status = service::gateway_service_status()?;
+fn print_start_report(mut report: service::GatewayServiceStartReport) -> Result<()> {
+    let status = report.observe("service.status.probe", service::gateway_service_status)?;
     let payload = json!({
         "phase": "started",
         "installed_version": env!("CARGO_PKG_VERSION"),
@@ -477,7 +477,8 @@ fn print_start_report(warnings: Vec<service::GatewayServiceWarning>) -> Result<(
         "gateway_reachable": status.gateway_reachable,
         "rollback_performed": false,
         "error_code": serde_json::Value::Null,
-        "warnings": warnings,
+        "warnings": report.warnings,
+        "stage_timings": report.stage_timings,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())

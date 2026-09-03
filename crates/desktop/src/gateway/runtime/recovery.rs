@@ -168,6 +168,7 @@ impl GatewayRuntime {
                                 service_name.as_str(),
                                 listen_addr.as_str(),
                                 &self.timings,
+                                Some(trace),
                             )
                         },
                     )?
@@ -236,6 +237,7 @@ impl GatewayRuntime {
                 service_name,
                 listen_addr,
                 &self.timings,
+                None,
             )?);
         }
 

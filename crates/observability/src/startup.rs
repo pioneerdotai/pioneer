@@ -97,6 +97,38 @@ pub enum DesktopStartupStage {
     GatewayRuntimeReachabilityCheck,
     GatewayRuntimeServiceStatusCheck,
     GatewayRuntimeServiceStart,
+    GatewayLauncherCommand,
+    GatewayLauncherReadinessWait,
+    GatewayLauncherServiceStatusCheck,
+    GatewayInstallerConfigLoad,
+    GatewayInstallerSourceResolve,
+    GatewayInstallerPathsPrepare,
+    GatewayInstallerAssetVerify,
+    GatewayInstallerAssetUnpack,
+    GatewayInstallerCurrentInspect,
+    GatewayInstallerConfigBackup,
+    GatewayInstallerBinaryReplace,
+    GatewayInstallerBinaryVersionProbe,
+    GatewayInstallerCommandLinkEnsure,
+    GatewayInstallerStatePersist,
+    GatewayInstallerCleanup,
+    GatewayInstallerPostStatusProbe,
+    GatewayServiceStop,
+    GatewayServiceCommand,
+    GatewayServiceConfigLoad,
+    GatewayServiceSettingsLoad,
+    GatewayServicePersistencePrepare,
+    GatewayServiceDefinitionPrepare,
+    GatewayServicePreviousRemove,
+    GatewayServiceManagerReload,
+    GatewayServiceManagerEnable,
+    GatewayServiceManagerEnableActivate,
+    GatewayServiceManagerRegister,
+    GatewayServiceManagerActivate,
+    GatewayServiceManagerRegisterActivate,
+    GatewayServiceStatePersist,
+    GatewayServiceStatusProbe,
+    GatewayHealthWait,
     GatewayRuntimeSessionEnsure,
     GatewayRuntimeConnectionPrepare,
     GatewaySessionConnect,
@@ -142,6 +174,48 @@ impl DesktopStartupStage {
             Self::GatewayRuntimeReachabilityCheck => "gateway_runtime.reachability_check",
             Self::GatewayRuntimeServiceStatusCheck => "gateway_runtime.service_status_check",
             Self::GatewayRuntimeServiceStart => "gateway_runtime.service_start",
+            Self::GatewayLauncherCommand => "gateway_runtime.launcher.command",
+            Self::GatewayLauncherReadinessWait => "gateway_runtime.launcher.readiness_wait",
+            Self::GatewayLauncherServiceStatusCheck => {
+                "gateway_runtime.launcher.service_status_check"
+            }
+            Self::GatewayInstallerConfigLoad => "gateway_runtime.installer.config.load",
+            Self::GatewayInstallerSourceResolve => "gateway_runtime.installer.source.resolve",
+            Self::GatewayInstallerPathsPrepare => "gateway_runtime.installer.paths.prepare",
+            Self::GatewayInstallerAssetVerify => "gateway_runtime.installer.asset.verify",
+            Self::GatewayInstallerAssetUnpack => "gateway_runtime.installer.asset.unpack",
+            Self::GatewayInstallerCurrentInspect => "gateway_runtime.installer.current.inspect",
+            Self::GatewayInstallerConfigBackup => "gateway_runtime.installer.config.backup",
+            Self::GatewayInstallerBinaryReplace => "gateway_runtime.installer.binary.replace",
+            Self::GatewayInstallerBinaryVersionProbe => {
+                "gateway_runtime.installer.binary.version_probe"
+            }
+            Self::GatewayInstallerCommandLinkEnsure => {
+                "gateway_runtime.installer.command_link.ensure"
+            }
+            Self::GatewayInstallerStatePersist => "gateway_runtime.installer.state.persist",
+            Self::GatewayInstallerCleanup => "gateway_runtime.installer.cleanup",
+            Self::GatewayInstallerPostStatusProbe => "gateway_runtime.installer.post_status.probe",
+            Self::GatewayServiceStop => "gateway_runtime.service.stop",
+            Self::GatewayServiceCommand => "gateway_runtime.service.command",
+            Self::GatewayServiceConfigLoad => "gateway_runtime.service.config.load",
+            Self::GatewayServiceSettingsLoad => "gateway_runtime.service.settings.load",
+            Self::GatewayServicePersistencePrepare => "gateway_runtime.service.persistence.prepare",
+            Self::GatewayServiceDefinitionPrepare => "gateway_runtime.service.definition.prepare",
+            Self::GatewayServicePreviousRemove => "gateway_runtime.service.previous.remove",
+            Self::GatewayServiceManagerReload => "gateway_runtime.service.manager.reload",
+            Self::GatewayServiceManagerEnable => "gateway_runtime.service.manager.enable",
+            Self::GatewayServiceManagerEnableActivate => {
+                "gateway_runtime.service.manager.enable_activate"
+            }
+            Self::GatewayServiceManagerRegister => "gateway_runtime.service.manager.register",
+            Self::GatewayServiceManagerActivate => "gateway_runtime.service.manager.activate",
+            Self::GatewayServiceManagerRegisterActivate => {
+                "gateway_runtime.service.manager.register_activate"
+            }
+            Self::GatewayServiceStatePersist => "gateway_runtime.service.state.persist",
+            Self::GatewayServiceStatusProbe => "gateway_runtime.service.status.probe",
+            Self::GatewayHealthWait => "gateway_runtime.health.wait",
             Self::GatewayRuntimeSessionEnsure => "gateway_runtime.session_ensure",
             Self::GatewayRuntimeConnectionPrepare => "gateway_runtime.connection_prepare",
             Self::GatewaySessionConnect => "gateway_session.connect",
@@ -574,6 +648,30 @@ impl StartupTimeline {
         });
     }
 
+    fn record_completed_stage(
+        &self,
+        name: &'static str,
+        started_at: SystemTime,
+        elapsed: Duration,
+        succeeded: bool,
+    ) {
+        let mut state = self.lock();
+        if state.finalized {
+            return;
+        }
+        state.stages.push(StageRecord {
+            name,
+            started_at,
+            elapsed,
+            outcome: if succeeded {
+                StageOutcome::Ok
+            } else {
+                StageOutcome::Error
+            },
+            diagnostics: StageDiagnostics::default(),
+        });
+    }
+
     fn finish(
         &self,
         target: TelemetryTarget,
@@ -844,6 +942,17 @@ impl DesktopStartupTrace {
     ) {
         self.timeline
             .record_post_update_stage(stage.as_str(), started_at, elapsed, succeeded);
+    }
+
+    pub fn record_completed_stage(
+        &self,
+        stage: DesktopStartupStage,
+        started_at: SystemTime,
+        elapsed: Duration,
+        succeeded: bool,
+    ) {
+        self.timeline
+            .record_completed_stage(stage.as_str(), started_at, elapsed, succeeded);
     }
 
     #[must_use = "the Gateway connection attempt must be completed"]
@@ -1319,6 +1428,14 @@ mod tests {
             "gateway_runtime.service_start"
         );
         assert_eq!(
+            DesktopStartupStage::GatewayInstallerAssetUnpack.as_str(),
+            "gateway_runtime.installer.asset.unpack"
+        );
+        assert_eq!(
+            DesktopStartupStage::GatewayServiceManagerActivate.as_str(),
+            "gateway_runtime.service.manager.activate"
+        );
+        assert_eq!(
             MobileStartupStage::AuthorizationRefreshRequest.as_str(),
             "authorization.refresh.request"
         );
@@ -1394,6 +1511,27 @@ mod tests {
         assert!(state.stages.is_empty());
         assert!(!state.post_update_handoff_emitted);
         assert!(!state.post_update_stall_scheduled);
+    }
+
+    #[test]
+    fn ordinary_startup_records_completed_gateway_service_stages() {
+        let trace = DesktopStartupTrace::start();
+
+        trace.record_completed_stage(
+            DesktopStartupStage::GatewayServiceManagerActivate,
+            SystemTime::UNIX_EPOCH,
+            Duration::from_millis(25),
+            true,
+        );
+
+        assert!(!trace.is_post_update());
+        let state = trace.timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(
+            state.stages[0].name,
+            "gateway_runtime.service.manager.activate"
+        );
+        assert_eq!(state.stages[0].outcome, StageOutcome::Ok);
     }
 
     #[test]

@@ -2,6 +2,9 @@ use crate::gateway::connectivity::is_local_gateway_accepting_sessions;
 use crate::gateway::timings::GatewayTimings;
 use anyhow::{Context, Result, bail};
 use pioneer_config::AppConfig;
+use pioneer_observability::{
+    DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace, DesktopStartupStage,
+};
 use pioneer_protocol::normalize_device_activation_code;
 use serde::Deserialize;
 use std::ffi::OsStr;
@@ -80,7 +83,30 @@ pub(crate) fn start_gateway_service(
     service_name: &str,
     listen_addr: &str,
     timings: &GatewayTimings,
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
 ) -> Result<Vec<GatewayInstallWarning>> {
+    let mut lifecycle_trace = startup_trace
+        .is_none()
+        .then(|| DesktopGatewayLifecycleTrace::start(DesktopGatewayLifecycleOperation::Start));
+    let result = start_gateway_service_inner(
+        service_name,
+        listen_addr,
+        timings,
+        startup_trace,
+        lifecycle_trace.as_mut(),
+    );
+    finish_gateway_lifecycle_trace(lifecycle_trace, result.is_ok());
+    result
+}
+
+fn start_gateway_service_inner(
+    service_name: &str,
+    listen_addr: &str,
+    timings: &GatewayTimings,
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
+    lifecycle_trace: Option<&mut DesktopGatewayLifecycleTrace>,
+) -> Result<Vec<GatewayInstallWarning>> {
+    let mut lifecycle_trace = lifecycle_trace;
     ensure_desktop_command_config_is_safe()?;
 
     if let Some(command) = make_bundled_gateway_install_command("install", true)
@@ -90,7 +116,8 @@ pub(crate) fn start_gateway_service(
             service_name,
             listen_addr,
             timings,
-            None,
+            startup_trace,
+            lifecycle_trace.as_deref_mut(),
         )?
     {
         return Ok(warnings);
@@ -103,7 +130,8 @@ pub(crate) fn start_gateway_service(
             service_name,
             listen_addr,
             timings,
-            None,
+            startup_trace,
+            lifecycle_trace.as_deref_mut(),
         )?
     {
         return Ok(warnings);
@@ -116,7 +144,8 @@ pub(crate) fn start_gateway_service(
             service_name,
             listen_addr,
             timings,
-            None,
+            startup_trace,
+            lifecycle_trace.as_deref_mut(),
         )?
     {
         return Ok(warnings);
@@ -128,7 +157,8 @@ pub(crate) fn start_gateway_service(
         service_name,
         listen_addr,
         timings,
-        None,
+        startup_trace,
+        lifecycle_trace.as_deref_mut(),
     )? {
         return Ok(warnings);
     }
@@ -142,6 +172,28 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
     timings: &GatewayTimings,
     startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
 ) -> Result<Vec<GatewayInstallWarning>> {
+    let mut lifecycle_trace = startup_trace
+        .is_none()
+        .then(|| DesktopGatewayLifecycleTrace::start(DesktopGatewayLifecycleOperation::Update));
+    let result = update_gateway_service_from_desktop_binary_inner(
+        service_name,
+        listen_addr,
+        timings,
+        startup_trace,
+        lifecycle_trace.as_mut(),
+    );
+    finish_gateway_lifecycle_trace(lifecycle_trace, result.is_ok());
+    result
+}
+
+fn update_gateway_service_from_desktop_binary_inner(
+    service_name: &str,
+    listen_addr: &str,
+    timings: &GatewayTimings,
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
+    lifecycle_trace: Option<&mut DesktopGatewayLifecycleTrace>,
+) -> Result<Vec<GatewayInstallWarning>> {
+    let mut lifecycle_trace = lifecycle_trace;
     ensure_desktop_command_config_is_safe()?;
 
     if let Some(command) = make_bundled_gateway_install_command("update", false)
@@ -152,6 +204,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
             listen_addr,
             timings,
             startup_trace,
+            lifecycle_trace.as_deref_mut(),
         )?
     {
         return Ok(warnings);
@@ -165,6 +218,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
             listen_addr,
             timings,
             startup_trace,
+            lifecycle_trace.as_deref_mut(),
         )?
     {
         return Ok(warnings);
@@ -178,6 +232,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
             listen_addr,
             timings,
             startup_trace,
+            lifecycle_trace.as_deref_mut(),
         )?
     {
         return Ok(warnings);
@@ -190,6 +245,7 @@ pub(crate) fn update_gateway_service_from_desktop_binary(
         listen_addr,
         timings,
         startup_trace,
+        lifecycle_trace.as_deref_mut(),
     )? {
         return Ok(warnings);
     }
@@ -235,8 +291,12 @@ fn try_start_with_launcher(
     listen_addr: &str,
     timings: &GatewayTimings,
     startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
+    lifecycle_trace: Option<&mut DesktopGatewayLifecycleTrace>,
 ) -> Result<Option<Vec<GatewayInstallWarning>>> {
+    let mut lifecycle_trace = lifecycle_trace;
     let command_label = render_command(&command);
+    let command_started_at = SystemTime::now();
+    let command_started = Instant::now();
     let command_warnings = match try_start_with_command(command) {
         Ok(StartAttempt::ProgramNotFound) => {
             info!(
@@ -250,10 +310,30 @@ fn try_start_with_launcher(
             warnings,
             stage_timings,
         }) => {
-            record_gateway_install_stage_timings(startup_trace, stage_timings);
+            record_gateway_lifecycle_stage(
+                startup_trace,
+                lifecycle_trace.as_deref_mut(),
+                DesktopStartupStage::GatewayLauncherCommand,
+                command_started_at,
+                command_started.elapsed(),
+                true,
+            );
+            record_gateway_install_stage_timings(
+                startup_trace,
+                lifecycle_trace.as_deref_mut(),
+                stage_timings,
+            );
             warnings
         }
         Err(error) => {
+            record_gateway_lifecycle_stage(
+                startup_trace,
+                lifecycle_trace.as_deref_mut(),
+                DesktopStartupStage::GatewayLauncherCommand,
+                command_started_at,
+                command_started.elapsed(),
+                false,
+            );
             info!(
                 launcher,
                 command = %command_label,
@@ -264,9 +344,36 @@ fn try_start_with_launcher(
         }
     };
 
-    if wait_for_gateway_service(listen_addr, timings).is_ok()
-        && is_configured_service_active(service_name)?
-    {
+    let wait_started_at = SystemTime::now();
+    let wait_started = Instant::now();
+    let gateway_ready = wait_for_gateway_service(listen_addr, timings).is_ok();
+    record_gateway_lifecycle_stage(
+        startup_trace,
+        lifecycle_trace.as_deref_mut(),
+        DesktopStartupStage::GatewayLauncherReadinessWait,
+        wait_started_at,
+        wait_started.elapsed(),
+        gateway_ready,
+    );
+
+    let service_active = if gateway_ready {
+        let status_started_at = SystemTime::now();
+        let status_started = Instant::now();
+        let result = is_configured_service_active(service_name);
+        record_gateway_lifecycle_stage(
+            startup_trace,
+            lifecycle_trace.as_deref_mut(),
+            DesktopStartupStage::GatewayLauncherServiceStatusCheck,
+            status_started_at,
+            status_started.elapsed(),
+            result.as_ref().is_ok_and(|active| *active),
+        );
+        result?
+    } else {
+        false
+    };
+
+    if gateway_ready && service_active {
         info!(
             launcher,
             command = %command_label,
@@ -283,6 +390,36 @@ fn try_start_with_launcher(
         message = %t!("logs.gateway.launcher_did_not_reach_service")
     );
     Ok(None)
+}
+
+fn finish_gateway_lifecycle_trace(
+    lifecycle_trace: Option<DesktopGatewayLifecycleTrace>,
+    succeeded: bool,
+) {
+    let Some(trace) = lifecycle_trace else {
+        return;
+    };
+    if succeeded {
+        trace.finish_success();
+    } else {
+        trace.finish_failure();
+    }
+}
+
+fn record_gateway_lifecycle_stage(
+    startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
+    lifecycle_trace: Option<&mut DesktopGatewayLifecycleTrace>,
+    stage: DesktopStartupStage,
+    started_at: SystemTime,
+    duration: Duration,
+    succeeded: bool,
+) {
+    if let Some(trace) = startup_trace {
+        trace.record_completed_stage(stage, started_at, duration, succeeded);
+    }
+    if let Some(trace) = lifecycle_trace {
+        trace.record_stage(stage, started_at, duration, succeeded);
+    }
 }
 
 pub(crate) fn wait_for_gateway_service(listen_addr: &str, timings: &GatewayTimings) -> Result<()> {
@@ -657,20 +794,85 @@ fn normalize_install_warnings(warnings: Vec<InstallWarningEntry>) -> Vec<Gateway
 
 fn record_gateway_install_stage_timings(
     startup_trace: Option<&pioneer_observability::DesktopStartupTrace>,
+    lifecycle_trace: Option<&mut DesktopGatewayLifecycleTrace>,
     timings: Vec<GatewayInstallStageTiming>,
 ) {
-    let Some(trace) = startup_trace else {
-        return;
-    };
+    let mut lifecycle_trace = lifecycle_trace;
     for timing in timings {
-        let stage = match timing.stage.as_str() {
-            "service.stop" => pioneer_observability::DesktopPostUpdateStage::GatewayServiceStop,
-            "service.start" => pioneer_observability::DesktopPostUpdateStage::GatewayServiceStart,
-            "health.wait" => pioneer_observability::DesktopPostUpdateStage::GatewayHealthWait,
-            _ => continue,
+        let Some(stage) = desktop_startup_stage_for_gateway_timing(timing.stage.as_str()) else {
+            continue;
         };
-        trace.record_post_update_stage(stage, timing.started_at, timing.duration, timing.succeeded);
+        record_gateway_lifecycle_stage(
+            startup_trace,
+            lifecycle_trace.as_deref_mut(),
+            stage,
+            timing.started_at,
+            timing.duration,
+            timing.succeeded,
+        );
+
+        let post_update_stage = match timing.stage.as_str() {
+            "service.stop" => {
+                Some(pioneer_observability::DesktopPostUpdateStage::GatewayServiceStop)
+            }
+            "service.start" => {
+                Some(pioneer_observability::DesktopPostUpdateStage::GatewayServiceStart)
+            }
+            "health.wait" => Some(pioneer_observability::DesktopPostUpdateStage::GatewayHealthWait),
+            _ => None,
+        };
+        if let (Some(trace), Some(post_update_stage)) = (startup_trace, post_update_stage) {
+            trace.record_post_update_stage(
+                post_update_stage,
+                timing.started_at,
+                timing.duration,
+                timing.succeeded,
+            );
+        }
     }
+}
+
+fn desktop_startup_stage_for_gateway_timing(
+    stage: &str,
+) -> Option<pioneer_observability::DesktopStartupStage> {
+    use pioneer_observability::DesktopStartupStage;
+
+    Some(match stage {
+        "installer.config.load" => DesktopStartupStage::GatewayInstallerConfigLoad,
+        "installer.source.resolve" => DesktopStartupStage::GatewayInstallerSourceResolve,
+        "installer.paths.prepare" => DesktopStartupStage::GatewayInstallerPathsPrepare,
+        "installer.asset.verify" => DesktopStartupStage::GatewayInstallerAssetVerify,
+        "installer.asset.unpack" => DesktopStartupStage::GatewayInstallerAssetUnpack,
+        "installer.current.inspect" => DesktopStartupStage::GatewayInstallerCurrentInspect,
+        "installer.config.backup" => DesktopStartupStage::GatewayInstallerConfigBackup,
+        "installer.binary.replace" => DesktopStartupStage::GatewayInstallerBinaryReplace,
+        "installer.binary.version_probe" => DesktopStartupStage::GatewayInstallerBinaryVersionProbe,
+        "installer.command_link.ensure" => DesktopStartupStage::GatewayInstallerCommandLinkEnsure,
+        "installer.state.persist" => DesktopStartupStage::GatewayInstallerStatePersist,
+        "installer.cleanup" => DesktopStartupStage::GatewayInstallerCleanup,
+        "installer.post_status.probe" => DesktopStartupStage::GatewayInstallerPostStatusProbe,
+        "service.stop" => DesktopStartupStage::GatewayServiceStop,
+        "service.start" => DesktopStartupStage::GatewayServiceCommand,
+        "service.config.load" => DesktopStartupStage::GatewayServiceConfigLoad,
+        "service.settings.load" => DesktopStartupStage::GatewayServiceSettingsLoad,
+        "service.persistence.prepare" => DesktopStartupStage::GatewayServicePersistencePrepare,
+        "service.definition.prepare" => DesktopStartupStage::GatewayServiceDefinitionPrepare,
+        "service.previous.remove" => DesktopStartupStage::GatewayServicePreviousRemove,
+        "service.manager.reload" => DesktopStartupStage::GatewayServiceManagerReload,
+        "service.manager.enable" => DesktopStartupStage::GatewayServiceManagerEnable,
+        "service.manager.enable_activate" => {
+            DesktopStartupStage::GatewayServiceManagerEnableActivate
+        }
+        "service.manager.register" => DesktopStartupStage::GatewayServiceManagerRegister,
+        "service.manager.activate" => DesktopStartupStage::GatewayServiceManagerActivate,
+        "service.manager.register_activate" => {
+            DesktopStartupStage::GatewayServiceManagerRegisterActivate
+        }
+        "service.state.persist" => DesktopStartupStage::GatewayServiceStatePersist,
+        "service.status.probe" => DesktopStartupStage::GatewayServiceStatusProbe,
+        "health.wait" => DesktopStartupStage::GatewayHealthWait,
+        _ => return None,
+    })
 }
 
 fn try_create_pending_device_session_with_command(
@@ -797,9 +999,9 @@ fn output_details(output: &Output) -> String {
 mod tests {
     use super::{
         BundledGatewayBootstrap, DESKTOP_MANAGED_BY, DeviceCreateAttempt, absolutize_config_path,
-        desktop_command_config_path, make_bundled_gateway_install_command_from_bundle,
-        make_pioneer_device_create_command, make_pioneer_start_command,
-        parse_install_command_output, parse_install_warnings_json,
+        desktop_command_config_path, desktop_startup_stage_for_gateway_timing,
+        make_bundled_gateway_install_command_from_bundle, make_pioneer_device_create_command,
+        make_pioneer_start_command, parse_install_command_output, parse_install_warnings_json,
         try_create_pending_device_session_with_command,
     };
     use std::ffi::OsStr;
@@ -953,6 +1155,51 @@ mod tests {
             command_started_at + Duration::from_millis(10)
         );
         assert!(timings[0].succeeded);
+    }
+
+    #[test]
+    fn gateway_timing_names_are_strictly_allowlisted() {
+        let known_stages = [
+            "installer.config.load",
+            "installer.source.resolve",
+            "installer.paths.prepare",
+            "installer.asset.verify",
+            "installer.asset.unpack",
+            "installer.current.inspect",
+            "installer.config.backup",
+            "installer.binary.replace",
+            "installer.binary.version_probe",
+            "installer.command_link.ensure",
+            "installer.state.persist",
+            "installer.cleanup",
+            "installer.post_status.probe",
+            "service.stop",
+            "service.start",
+            "service.config.load",
+            "service.settings.load",
+            "service.persistence.prepare",
+            "service.definition.prepare",
+            "service.previous.remove",
+            "service.manager.reload",
+            "service.manager.enable",
+            "service.manager.enable_activate",
+            "service.manager.register",
+            "service.manager.activate",
+            "service.manager.register_activate",
+            "service.state.persist",
+            "service.status.probe",
+            "health.wait",
+        ];
+        for stage in known_stages {
+            assert!(
+                desktop_startup_stage_for_gateway_timing(stage).is_some(),
+                "known Gateway timing stage `{stage}` is not mapped"
+            );
+        }
+        assert_eq!(
+            desktop_startup_stage_for_gateway_timing("unbounded.user.value"),
+            None
+        );
     }
 
     fn command_args(command: &std::process::Command) -> Vec<String> {

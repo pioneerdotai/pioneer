@@ -21,6 +21,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod desktop_gateway;
 mod metrics;
 mod operations;
 mod patch_telemetry;
@@ -28,6 +29,7 @@ mod performance;
 mod startup;
 mod telemetry;
 
+pub use desktop_gateway::{DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace};
 pub use metrics::{
     DatabaseAdmissionMetric, DatabaseOperation, DatabasePoolSnapshot, DatabaseReadAdmissionMetric,
     DatabaseReadMetric, DatabaseRole, NativeLifecycleDepthKind, NativeLifecycleEventMetric,

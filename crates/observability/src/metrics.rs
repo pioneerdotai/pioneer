@@ -406,6 +406,42 @@ pub(crate) struct DesktopUpdateMetrics {
     pub(crate) failures: Counter<u64>,
 }
 
+pub(crate) struct DesktopGatewayLifecycleMetrics {
+    pub(crate) duration: Histogram<f64>,
+    pub(crate) stage_duration: Histogram<f64>,
+    pub(crate) failures: Counter<u64>,
+}
+
+impl DesktopGatewayLifecycleMetrics {
+    pub(crate) fn new(meter: &Meter) -> Self {
+        let duration = meter
+            .f64_histogram("pioneer.desktop.gateway.lifecycle.duration")
+            .with_description("Duration of a Desktop-managed Gateway start or update operation")
+            .with_unit("ms")
+            .with_boundaries(startup_duration_boundaries())
+            .build();
+        let stage_duration = meter
+            .f64_histogram("pioneer.desktop.gateway.lifecycle.stage.duration")
+            .with_description(
+                "Duration of a stable, low-cardinality Desktop-managed Gateway lifecycle stage",
+            )
+            .with_unit("ms")
+            .with_boundaries(startup_duration_boundaries())
+            .build();
+        let failures = meter
+            .u64_counter("pioneer.desktop.gateway.lifecycle.failures")
+            .with_description("Number of Desktop-managed Gateway lifecycle operations that failed")
+            .with_unit("{failure}")
+            .build();
+
+        Self {
+            duration,
+            stage_duration,
+            failures,
+        }
+    }
+}
+
 impl DesktopUpdateMetrics {
     pub(crate) fn new(meter: &Meter) -> Self {
         let apply_duration = meter

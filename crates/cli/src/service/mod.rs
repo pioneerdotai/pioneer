@@ -7,7 +7,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SERVICE_MODE_ARG: &str = "gateway-service";
 
@@ -37,6 +37,51 @@ pub struct GatewayServiceWarning {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayServiceStageTiming {
+    pub stage: String,
+    pub started_after_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: String,
+}
+
+#[derive(Debug)]
+pub struct GatewayServiceStartReport {
+    pub warnings: Vec<GatewayServiceWarning>,
+    pub stage_timings: Vec<GatewayServiceStageTiming>,
+    started_at: Instant,
+}
+
+impl GatewayServiceStartReport {
+    fn new() -> Self {
+        Self {
+            warnings: Vec::new(),
+            stage_timings: Vec::new(),
+            started_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn observe<T>(
+        &mut self,
+        stage: &'static str,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let stage_started = Instant::now();
+        let result = operation();
+        self.stage_timings.push(GatewayServiceStageTiming {
+            stage: stage.to_owned(),
+            started_after_ms: duration_millis(stage_started.duration_since(self.started_at)),
+            duration_ms: duration_millis(stage_started.elapsed()),
+            outcome: if result.is_ok() { "ok" } else { "error" }.to_owned(),
+        });
+        result
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl GatewayServiceWarning {
     pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -58,12 +103,19 @@ pub fn run_gateway_service() -> Result<()> {
     ))
 }
 
-pub fn start_gateway_service() -> Result<Vec<GatewayServiceWarning>> {
-    let config = AppConfig::load().context("failed to load app config")?;
-    let settings = load_service_settings_from_config(&config)?;
-    let warnings = platform::start_gateway_service(&settings)?;
-    save_install_state_from_current_context(&config)?;
-    Ok(warnings)
+pub fn start_gateway_service() -> Result<GatewayServiceStartReport> {
+    let mut report = GatewayServiceStartReport::new();
+    let config = report.observe("service.config.load", || {
+        AppConfig::load().context("failed to load app config")
+    })?;
+    let settings = report.observe("service.settings.load", || {
+        load_service_settings_from_config(&config)
+    })?;
+    report.warnings = platform::start_gateway_service(&settings, &mut report)?;
+    report.observe("service.state.persist", || {
+        save_install_state_from_current_context(&config)
+    })?;
+    Ok(report)
 }
 
 pub fn stop_gateway_service() -> Result<()> {
@@ -315,7 +367,20 @@ fn normalize_unspecified_addr(addr: SocketAddr) -> SocketAddr {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_candidates_from_env;
+    use super::{GatewayServiceStartReport, shell_candidates_from_env};
+
+    #[test]
+    fn service_timing_report_uses_static_stage_and_outcome() {
+        let mut report = GatewayServiceStartReport::new();
+
+        report
+            .observe("service.manager.activate", || Ok::<_, anyhow::Error>(()))
+            .expect("stage should succeed");
+
+        assert_eq!(report.stage_timings.len(), 1);
+        assert_eq!(report.stage_timings[0].stage, "service.manager.activate");
+        assert_eq!(report.stage_timings[0].outcome, "ok");
+    }
 
     #[test]
     fn shell_candidates_keep_user_shell_first() {
@@ -362,6 +427,17 @@ mod macos;
 mod unsupported;
 #[cfg(target_os = "windows")]
 mod windows;
+
+// Linux and Windows adapters only compose external commands, so test builds can
+// type-check them on another host without requiring that platform's SDK.
+#[cfg(all(test, not(target_os = "linux")))]
+#[path = "linux.rs"]
+#[allow(dead_code)]
+mod linux_cross_platform;
+#[cfg(all(test, not(target_os = "windows")))]
+#[path = "windows.rs"]
+#[allow(dead_code)]
+mod windows_cross_platform;
 
 #[cfg(target_os = "linux")]
 use self::linux as platform;

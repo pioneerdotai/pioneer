@@ -134,6 +134,8 @@ struct StatusOutput {
 struct StartOutput {
     #[serde(default)]
     warnings: Vec<InstallWarning>,
+    #[serde(default)]
+    stage_timings: Vec<InstallStageTiming>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,107 +226,172 @@ enum DownloadAttemptFailure {
 pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     let install_started = Instant::now();
     let mut stage_timings = Vec::new();
-    let config = AppConfig::load().context("failed to load app config for install/update")?;
+    let config = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.config.load",
+        || AppConfig::load().context("failed to load app config for install/update"),
+    )?;
 
-    let source = resolve_install_source(&options)
-        .context("failed to resolve installer source for install/update")?;
+    let source = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.source.resolve",
+        || {
+            resolve_install_source(&options)
+                .context("failed to resolve installer source for install/update")
+        },
+    )?;
 
-    let install_root = install_root_path(&config)?;
-    let bin_dir = install_root.join("bin");
-    let target_binary = bin_dir.join(config.install_binary_file_name()?);
-    let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
-    let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
-    fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("failed to create install directory `{}`", bin_dir.display()))?;
+    let (install_root, bin_dir, target_binary, staged_binary, rollback_binary) =
+        observe_install_stage(
+            &mut stage_timings,
+            install_started,
+            "installer.paths.prepare",
+            || {
+                let install_root = install_root_path(&config)?;
+                let bin_dir = install_root.join("bin");
+                let target_binary = bin_dir.join(config.install_binary_file_name()?);
+                let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
+                let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
+                fs::create_dir_all(&bin_dir).with_context(|| {
+                    format!("failed to create install directory `{}`", bin_dir.display())
+                })?;
+                Ok((
+                    install_root,
+                    bin_dir,
+                    target_binary,
+                    staged_binary,
+                    rollback_binary,
+                ))
+            },
+        )?;
 
-    let asset_name = source
-        .asset_path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .context("asset path has no file name")?;
-    let expected_sha = expected_checksum_for_asset(&source.checksums_path, asset_name)?;
-    let actual_sha = sha256_file(&source.asset_path)?;
-    if expected_sha != actual_sha {
-        bail!(
-            "checksum mismatch for {}: expected {}, got {}",
-            asset_name,
-            expected_sha,
-            actual_sha
-        );
-    }
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.asset.verify",
+        || {
+            let asset_name = source
+                .asset_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("asset path has no file name")?;
+            let expected_sha = expected_checksum_for_asset(&source.checksums_path, asset_name)?;
+            let actual_sha = sha256_file(&source.asset_path)?;
+            if expected_sha != actual_sha {
+                bail!(
+                    "checksum mismatch for {}: expected {}, got {}",
+                    asset_name,
+                    expected_sha,
+                    actual_sha
+                );
+            }
+            Ok(())
+        },
+    )?;
 
-    if staged_binary.exists() {
-        let _ = fs::remove_file(&staged_binary);
-    }
-    unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
-    make_binary_executable(&staged_binary)?;
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.asset.unpack",
+        || {
+            if staged_binary.exists() {
+                let _ = fs::remove_file(&staged_binary);
+            }
+            unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
+            make_binary_executable(&staged_binary)
+        },
+    )?;
 
     let existing = target_binary.is_file();
-    let mut was_active = false;
-    let mut runtime_home: Option<PathBuf> = None;
-    let mut config_backup_dir: Option<PathBuf> = None;
-    if existing {
-        if let Some(snapshot) = query_gateway_status(&target_binary)? {
-            was_active = snapshot.service_active;
-            runtime_home = snapshot.runtime_home;
-        }
-
-        if let Some(home) = runtime_home.as_ref() {
+    let (was_active, runtime_home) = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.current.inspect",
+        || {
+            if !existing {
+                return Ok((false, None));
+            }
+            Ok(query_gateway_status(&target_binary)?
+                .map(|snapshot| (snapshot.service_active, snapshot.runtime_home))
+                .unwrap_or((false, None)))
+        },
+    )?;
+    let config_backup_dir = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.config.backup",
+        || {
+            let Some(home) = runtime_home.as_ref() else {
+                return Ok(None);
+            };
             let backup_dir = bin_dir.join(format!("config.rollback.{}", unix_timestamp_secs()?));
             if backup_runtime_toml(home, &backup_dir)? {
-                config_backup_dir = Some(backup_dir);
+                Ok(Some(backup_dir))
+            } else {
+                Ok(None)
             }
-        }
-    }
+        },
+    )?;
 
     let should_start = !options.no_start && (options.force_start || !existing || was_active);
     let mut warnings: Vec<InstallWarning> = Vec::new();
     if was_active {
-        let stage_started = Instant::now();
-        run_gateway_command(
-            &target_binary,
-            &["stop"],
-            &options.managed_by,
-            false,
-            "stop",
-        )?;
-        stage_timings.push(successful_stage_timing(
-            "service.stop",
-            install_started,
-            stage_started,
-        ));
-    }
-
-    if rollback_binary.exists() {
-        let _ = fs::remove_file(&rollback_binary);
-    }
-
-    if existing {
-        fs::rename(&target_binary, &rollback_binary).with_context(|| {
-            format!(
-                "failed to move existing binary `{}` to rollback `{}`",
-                target_binary.display(),
-                rollback_binary.display()
+        observe_install_stage(&mut stage_timings, install_started, "service.stop", || {
+            run_gateway_command(
+                &target_binary,
+                &["stop"],
+                &options.managed_by,
+                false,
+                "stop",
             )
         })?;
     }
 
-    if let Err(error) = fs::rename(&staged_binary, &target_binary) {
-        restore_binary_and_config(
-            &target_binary,
-            &rollback_binary,
-            runtime_home.as_deref(),
-            config_backup_dir.as_deref(),
-        );
-        return Err(error).with_context(|| {
-            format!(
-                "failed to replace binary with staged file `{}`",
-                target_binary.display()
-            )
-        });
-    }
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.binary.replace",
+        || {
+            if rollback_binary.exists() {
+                let _ = fs::remove_file(&rollback_binary);
+            }
 
-    let installed_version = match query_binary_version(&target_binary) {
+            if existing {
+                fs::rename(&target_binary, &rollback_binary).with_context(|| {
+                    format!(
+                        "failed to move existing binary `{}` to rollback `{}`",
+                        target_binary.display(),
+                        rollback_binary.display()
+                    )
+                })?;
+            }
+
+            if let Err(error) = fs::rename(&staged_binary, &target_binary) {
+                restore_binary_and_config(
+                    &target_binary,
+                    &rollback_binary,
+                    runtime_home.as_deref(),
+                    config_backup_dir.as_deref(),
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to replace binary with staged file `{}`",
+                        target_binary.display()
+                    )
+                });
+            }
+            Ok(())
+        },
+    )?;
+
+    let installed_version = match observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.binary.version_probe",
+        || query_binary_version(&target_binary),
+    ) {
         Ok(version) => version,
         Err(error) => {
             restore_binary_and_config(
@@ -343,7 +410,12 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         }
     };
 
-    let link_result = match ensure_global_command_link(&config, &target_binary) {
+    let link_result = match observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.command_link.ensure",
+        || ensure_global_command_link(&config, &target_binary),
+    ) {
         Ok(result) => result,
         Err(error) => {
             restore_binary_and_config(
@@ -368,7 +440,19 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     if should_start {
         let stage_started = Instant::now();
         match run_gateway_start_command(&target_binary, &options.managed_by) {
-            Ok(start_warnings) => warnings.extend(start_warnings),
+            Ok(start_output) => {
+                let nested_offset = duration_millis(stage_started.duration_since(install_started));
+                warnings.extend(start_output.warnings);
+                stage_timings.push(successful_stage_timing(
+                    "service.start",
+                    install_started,
+                    stage_started,
+                ));
+                stage_timings.extend(start_output.stage_timings.into_iter().map(|mut timing| {
+                    timing.started_after_ms = nested_offset.saturating_add(timing.started_after_ms);
+                    timing
+                }));
+            }
             Err(error) => {
                 rollback_and_restore(
                     &target_binary,
@@ -381,11 +465,6 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 bail!("failed to start gateway after update: {error:#}; update rolled back");
             }
         };
-        stage_timings.push(successful_stage_timing(
-            "service.start",
-            install_started,
-            stage_started,
-        ));
 
         let stage_started = Instant::now();
         if !wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
@@ -413,11 +492,18 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         ));
     }
 
-    if let Err(error) = persist_install_state(
-        &options.managed_by,
-        &target_binary,
-        &install_root,
-        installed_version.as_str(),
+    if let Err(error) = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.state.persist",
+        || {
+            persist_install_state(
+                &options.managed_by,
+                &target_binary,
+                &install_root,
+                installed_version.as_str(),
+            )
+        },
     ) {
         rollback_and_restore(
             &target_binary,
@@ -430,14 +516,28 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         bail!("failed to persist install-state: {error:#}; update rolled back");
     }
 
-    if rollback_binary.exists() {
-        let _ = fs::remove_file(&rollback_binary);
-    }
-    if let Some(backup_dir) = config_backup_dir.as_ref() {
-        let _ = fs::remove_dir_all(backup_dir);
-    }
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.cleanup",
+        || {
+            if rollback_binary.exists() {
+                let _ = fs::remove_file(&rollback_binary);
+            }
+            if let Some(backup_dir) = config_backup_dir.as_ref() {
+                let _ = fs::remove_dir_all(backup_dir);
+            }
+            Ok(())
+        },
+    )?;
 
-    let post_status = query_gateway_status(&target_binary)?.unwrap_or(ServiceSnapshot {
+    let post_status = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.post_status.probe",
+        || query_gateway_status(&target_binary),
+    )?
+    .unwrap_or(ServiceSnapshot {
         service_active: false,
         gateway_reachable: false,
         runtime_home: None,
@@ -466,6 +566,23 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         warnings,
         stage_timings,
     })
+}
+
+fn observe_install_stage<T>(
+    stage_timings: &mut Vec<InstallStageTiming>,
+    install_started: Instant,
+    stage: &'static str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let stage_started = Instant::now();
+    let result = operation();
+    stage_timings.push(InstallStageTiming {
+        stage: stage.to_owned(),
+        started_after_ms: duration_millis(stage_started.duration_since(install_started)),
+        duration_ms: duration_millis(stage_started.elapsed()),
+        outcome: if result.is_ok() { "ok" } else { "error" }.to_owned(),
+    });
+    result
 }
 
 fn successful_stage_timing(
@@ -973,10 +1090,7 @@ fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
     false
 }
 
-fn run_gateway_start_command(
-    binary: &Path,
-    managed_by: &InstallManagedBy,
-) -> Result<Vec<InstallWarning>> {
+fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Result<StartOutput> {
     let args = ["start", "--json"];
     let mut command = Command::new(binary);
     command.args(args.as_slice());
@@ -990,7 +1104,7 @@ fn run_gateway_start_command(
     })?;
 
     if output.status.success() {
-        return Ok(parse_start_warnings(&output.stdout));
+        return Ok(parse_start_output(&output.stdout));
     }
 
     bail!(
@@ -1000,10 +1114,11 @@ fn run_gateway_start_command(
     )
 }
 
-fn parse_start_warnings(stdout: &[u8]) -> Vec<InstallWarning> {
-    serde_json::from_slice::<StartOutput>(stdout)
-        .map(|output| output.warnings)
-        .unwrap_or_default()
+fn parse_start_output(stdout: &[u8]) -> StartOutput {
+    serde_json::from_slice::<StartOutput>(stdout).unwrap_or_else(|_| StartOutput {
+        warnings: Vec::new(),
+        stage_timings: Vec::new(),
+    })
 }
 
 fn run_gateway_command(
@@ -1803,7 +1918,7 @@ mod tests {
     use super::{
         DownloadRetryPolicy, download_partial_path, download_release_asset_with_policy,
         ensure_unix_user_path_configured, expected_checksum_for_asset, force_path_update_warning,
-        is_transient_download_error, parse_start_warnings,
+        is_transient_download_error, parse_start_output,
     };
     use anyhow::Context as _;
     use reqwest::blocking::Client;
@@ -1978,25 +2093,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_start_warnings_from_json() {
-        let warnings = parse_start_warnings(
+    fn parses_start_output_from_json() {
+        let output = parse_start_output(
             br#"{
                 "phase":"started",
                 "warnings":[
                     {"code":"linux_linger_enable_failed","message":"run loginctl"}
+                ],
+                "stage_timings":[
+                    {"stage":"service.manager.activate","started_after_ms":10,"duration_ms":20,"outcome":"ok"}
                 ]
             }"#,
         );
 
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "linux_linger_enable_failed");
-        assert_eq!(warnings[0].message, "run loginctl");
+        assert_eq!(output.warnings.len(), 1);
+        assert_eq!(output.warnings[0].code, "linux_linger_enable_failed");
+        assert_eq!(output.warnings[0].message, "run loginctl");
+        assert_eq!(output.stage_timings.len(), 1);
+        assert_eq!(output.stage_timings[0].stage, "service.manager.activate");
+        assert_eq!(output.stage_timings[0].duration_ms, 20);
     }
 
     #[test]
-    fn ignores_missing_or_invalid_start_warnings() {
-        assert!(parse_start_warnings(br#"{"phase":"started"}"#).is_empty());
-        assert!(parse_start_warnings(b"not json").is_empty());
+    fn ignores_missing_or_invalid_start_output_fields() {
+        let missing = parse_start_output(br#"{"phase":"started"}"#);
+        assert!(missing.warnings.is_empty());
+        assert!(missing.stage_timings.is_empty());
+
+        let invalid = parse_start_output(b"not json");
+        assert!(invalid.warnings.is_empty());
+        assert!(invalid.stage_timings.is_empty());
     }
 
     #[cfg(not(windows))]

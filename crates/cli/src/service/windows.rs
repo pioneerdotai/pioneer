@@ -5,23 +5,28 @@ use tracing::info;
 
 use pioneer_config::InstallManagedBy;
 
-use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+use super::{GatewayServiceStartReport, GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
 
 const WINDOWS_LOGON_TASK_SCOPE_WARNING_CODE: &str = "windows_logon_task_login_session_scoped";
 
-pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
+pub fn start_gateway_service(
+    settings: &ServiceSettings,
+    report: &mut GatewayServiceStartReport,
+) -> Result<Vec<GatewayServiceWarning>> {
     let task_name = settings.service_name.as_str();
-    let task_name_escaped = powershell_escape_single_quoted(task_name);
-    let executable = env::current_exe().context("failed to determine current executable path")?;
-    let executable = powershell_escape_single_quoted(&executable.display().to_string());
-    let service_path = super::resolve_service_path()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    let runner_script = render_gateway_runner_script(&executable, service_path.as_deref());
-    let runner_script = powershell_escape_single_quoted(runner_script.as_str());
+    let script = report.observe("service.definition.prepare", || {
+        let task_name_escaped = powershell_escape_single_quoted(task_name);
+        let executable =
+            env::current_exe().context("failed to determine current executable path")?;
+        let executable = powershell_escape_single_quoted(&executable.display().to_string());
+        let service_path = super::resolve_service_path()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let runner_script = render_gateway_runner_script(&executable, service_path.as_deref());
+        let runner_script = powershell_escape_single_quoted(runner_script.as_str());
 
-    let script = format!(
-        r#"$runner = '{runner_script}'
+        Ok(format!(
+            r#"$runner = '{runner_script}'
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runner))
         $actionArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
         $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -30,9 +35,12 @@ pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewaySe
         $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
         Register-ScheduledTask -TaskName '{task_name_escaped}' -Action $action -Trigger $trigger -Settings $settings -Description 'Persistent Pioneer gateway service' -User $user -RunLevel Limited -Force | Out-Null
         Start-ScheduledTask -TaskName '{task_name_escaped}'"#
-    );
+        ))
+    })?;
 
-    let output = run_powershell(&script)?;
+    let output = report.observe("service.manager.register_activate", || {
+        run_powershell(&script)
+    })?;
     if !output.status.success() {
         bail!(
             "failed to create/start Windows logon task `{task_name}`: {}",
