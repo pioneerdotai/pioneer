@@ -10,6 +10,9 @@ use tracing::info;
 
 use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
+const STARTUP_TURN_PROJECTION_REPLAY_LIMIT: u64 = 256;
+const STARTUP_TURN_FINALIZATION_RECONCILIATION_LIMIT: u64 = 256;
+
 pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
     let connection = connection.into().maintenance();
     let patch_intents =
@@ -46,8 +49,11 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
         patch_snapshot_reconciliation.collected_bytes,
     );
     let created_default_workspace = ensure_default_workspace_exists(&connection).await?;
-    let reconciled_prepared_turn_finalizations =
-        reconcile_prepared_turn_finalizations(&connection).await?;
+    let recovery_now = chrono::Utc::now().fixed_offset().timestamp();
+    let turn_projection_replay =
+        replay_due_turn_event_projections(&connection, recovery_now).await?;
+    let turn_finalization_reconciliation =
+        reconcile_prepared_turn_finalizations(&connection, recovery_now).await?;
     let reconciled_recovery_terminalizations =
         reconcile_recovery_terminalization_outbox(&connection).await?;
     let repaired_completed_turn_rows =
@@ -66,7 +72,15 @@ pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
         repaired_patch_snapshot_references = patch_snapshot_reconciliation.repaired_references,
         collected_patch_snapshot_blobs = patch_snapshot_reconciliation.collected_blobs,
         collected_patch_snapshot_bytes = patch_snapshot_reconciliation.collected_bytes,
-        reconciled_prepared_turn_finalizations,
+        replayed_turn_event_projections = turn_projection_replay.projected,
+        deferred_turn_event_projections = turn_projection_replay.deferred,
+        quarantined_turn_projection_streams = turn_projection_replay.quarantined,
+        scanned_prepared_turn_finalizations = turn_finalization_reconciliation.scanned,
+        reconciled_prepared_turn_finalizations = turn_finalization_reconciliation.committed_count(),
+        deferred_prepared_turn_finalizations =
+            turn_finalization_reconciliation.deferred_by_predecessor,
+        superseded_prepared_turn_finalizations =
+            turn_finalization_reconciliation.superseded_by_terminal_status,
         reconciled_recovery_terminalizations,
         repaired_completed_turn_rows,
         repaired_thread_foreground_status_rows,
@@ -177,12 +191,27 @@ async fn reconcile_recovery_terminalization_outbox(
 
 async fn reconcile_prepared_turn_finalizations(
     connection: impl Into<SqliteDatabase>,
-) -> Result<u64> {
+    now_unix: i64,
+) -> Result<pioneer_crud::TurnFinalizationReconciliationSummary> {
     let store = pioneer_crud::CrudStore::new(connection);
     store
-        .reconcile_prepared_turn_finalizations(4096, chrono::Utc::now().fixed_offset().timestamp())
+        .reconcile_prepared_turn_finalizations(
+            STARTUP_TURN_FINALIZATION_RECONCILIATION_LIMIT,
+            now_unix,
+        )
         .await
         .context("failed to reconcile prepared native Turn finalizations during bootstrap")
+}
+
+async fn replay_due_turn_event_projections(
+    connection: impl Into<SqliteDatabase>,
+    now_unix: i64,
+) -> Result<pioneer_crud::TurnProjectionReplaySummary> {
+    let store = pioneer_crud::CrudStore::new(connection);
+    store
+        .replay_due_turn_event_projections(now_unix, STARTUP_TURN_PROJECTION_REPLAY_LIMIT)
+        .await
+        .context("failed to replay pending Turn event projections during bootstrap")
 }
 
 async fn repair_thread_foreground_statuses(connection: impl Into<SqliteDatabase>) -> Result<u64> {
@@ -275,7 +304,7 @@ async fn ensure_default_workspace_exists(connection: &impl ConnectionTrait) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, cleanup_turn_llm_context,
+        DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, bootstrap, cleanup_turn_llm_context,
         cleanup_turn_runtime_snapshots, ensure_default_workspace_exists,
         repair_terminal_turn_execution_windows, repair_turns_completed_after_final_agent_message,
     };
@@ -285,9 +314,14 @@ mod tests {
     };
     use pioneer_entity::{thread, turn, workspace};
     use pioneer_protocol::{
-        ExecutionWindowStatus, ItemCompletedNotification, TurnItem, TurnStatus,
+        AgentMessagePhase, ExecutionWindowStatus, ItemCompletedNotification, PersistedActorRef,
+        SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        Turn, TurnItem, TurnOrigin, TurnStatus,
     };
-    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, Database, EntityTrait, QueryFilter, QueryOrder, Set,
+    };
 
     const DEFAULT_WORKSPACE_ID_LEN: usize = 21;
 
@@ -333,6 +367,134 @@ mod tests {
             .await
             .expect("must read workspaces");
         assert_eq!(workspaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replays_a_predecessor_before_reconciling_its_finalization() {
+        let connection = setup_workspace_database().await;
+        ensure_default_workspace_exists(&connection)
+            .await
+            .expect("default workspace should exist");
+        let timestamp = 1_700_000_000;
+        let thread_id = "thr_boot_recovery";
+        let turn_id = "turn_boot_recovery";
+        let final_item_id = "final_boot_recovery";
+        let store = CrudStore::new(connection.clone());
+        store
+            .materialize_turn_start(
+                &Thread {
+                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                    id: thread_id.to_owned(),
+                    name: Some("Bootstrap recovery".to_owned()),
+                    preview: "recover".to_owned(),
+                    preview_author: None,
+                    mode: ThreadMode::Agent,
+                    model: "test-model".to_owned(),
+                    model_provider: "test-provider".to_owned(),
+                    reasoning_effort: None,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    status: ThreadStatus::Active,
+                    origin_kind: ThreadOriginKind::User,
+                    sidebar_visibility: ThreadSidebarVisibility::Visible,
+                    agent_nickname: None,
+                    agent_role: None,
+                    visibility: None,
+                    turns: Vec::new(),
+                },
+                SandboxMode::FullAccess,
+                &Turn {
+                    id: turn_id.to_owned(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                },
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+        store
+            .prepare_turn_finalization(
+                &ItemCompletedNotification {
+                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::AgentMessage {
+                        id: final_item_id.to_owned(),
+                        text: "durable final answer".to_owned(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                1,
+                None,
+                timestamp + 1,
+            )
+            .await
+            .expect("finalization intent should prepare");
+
+        let first_event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .one(&connection)
+            .await
+            .expect("turn event lookup should succeed")
+            .expect("turn start event should exist");
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                Expr::value("failed"),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::NextRunAt,
+                Expr::value(
+                    chrono::DateTime::from_timestamp(timestamp + 2, 0)
+                        .unwrap()
+                        .fixed_offset(),
+                ),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimToken,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
+                Expr::value(Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None),
+            )
+            .filter(pioneer_entity::turn_event_projection_state::Column::EventId.eq(first_event.id))
+            .exec(&connection)
+            .await
+            .expect("turn start projection should become replayable");
+
+        bootstrap(&connection)
+            .await
+            .expect("causal recovery backlog must not create a bootstrap restart loop");
+
+        let (_, recovered_turn) = store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("recovered Turn should load")
+            .expect("recovered Turn should exist");
+        assert_eq!(recovered_turn.status, TurnStatus::Completed);
+        assert!(
+            store
+                .get_turn_item(turn_id, final_item_id)
+                .await
+                .expect("final item should load")
+                .is_some()
+        );
     }
 
     #[tokio::test]

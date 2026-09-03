@@ -5275,17 +5275,13 @@ impl MessageProcessor {
         &self,
         now_unix: i64,
         limit: u64,
-    ) -> Result<u64> {
-        let turn_ids = self
+    ) -> Result<TurnFinalizationReconciliationSummary> {
+        let summary = self
             .crud_store
-            .list_prepared_turn_finalization_ids(limit)
+            .reconcile_prepared_turn_finalizations(limit, now_unix)
             .await?;
-        let mut reconciled = 0_u64;
-        for turn_id in turn_ids {
-            let committed = self
-                .crud_store
-                .commit_prepared_turn_finalization(turn_id.as_str(), now_unix)
-                .await?;
+        for committed in &summary.committed {
+            let turn_id = committed.turn_completed.turn.id.as_str();
             self.thread_manager
                 .commit_terminal_turn(
                     committed.turn_completed.thread_id.as_str(),
@@ -5295,9 +5291,8 @@ impl MessageProcessor {
                 .with_context(|| {
                     format!("failed to synchronize reconciled native Turn `{turn_id}` in memory")
                 })?;
-            reconciled = reconciled.saturating_add(1);
         }
-        Ok(reconciled)
+        Ok(summary)
     }
 
     pub(super) fn handle_recovery_event<'a>(
@@ -6924,7 +6919,23 @@ impl MessageProcessor {
             .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
             .await
         {
-            Ok(committed) => committed,
+            Ok(TurnFinalizationCommitOutcome::Committed(committed)) => committed,
+            Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
+                debug!(
+                    thread_id,
+                    turn_id, "native Turn finalization is waiting for an earlier projection"
+                );
+                return false;
+            }
+            Ok(TurnFinalizationCommitOutcome::SupersededByTerminalStatus(status)) => {
+                debug!(
+                    thread_id,
+                    turn_id,
+                    ?status,
+                    "native Turn finalization was superseded by authoritative terminal state"
+                );
+                return false;
+            }
             Err(error) => {
                 warn!(
                     thread_id,

@@ -101,7 +101,8 @@ use pioneer_crud::{
     CliRuntimePendingRequestRecord,
     CliRuntimePendingRequestStatus as StoredCliRuntimePendingRequestStatus, ConversationEntry,
     CrudStore, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-    ResolveCliRuntimePendingRequest, TimeoutCandidate,
+    ResolveCliRuntimePendingRequest, TimeoutCandidate, TurnFinalizationCommitOutcome,
+    TurnFinalizationReconciliationSummary,
 };
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
 use pioneer_memory::{
@@ -1880,22 +1881,6 @@ impl MessageProcessor {
             let cycle = AssertUnwindSafe(async {
                 let now = now_timestamp_secs();
                 match retry_transient_storage_access(|| {
-                    this.reconcile_prepared_native_turn_finalizations(now, 64)
-                })
-                .await
-                {
-                    Ok(reconciled) if reconciled > 0 => {
-                        info!(reconciled, "reconciled prepared native Turn finalizations");
-                        this.kick_native_turn_event_deliveries();
-                    }
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "native Turn finalization reconciler failed"
-                    ),
-                }
-
-                match retry_transient_storage_access(|| {
                     this.crud_store.replay_due_turn_event_projections(now, 64)
                 })
                 .await
@@ -1917,6 +1902,39 @@ impl MessageProcessor {
                     Err(error) => error!(
                         error = %format!("{error:#}"),
                         "turn event projection replay failed"
+                    ),
+                }
+
+                match retry_transient_storage_access(|| {
+                    this.reconcile_prepared_native_turn_finalizations(now, 64)
+                })
+                .await
+                {
+                    Ok(summary) => {
+                        let committed = summary.committed_count();
+                        if committed > 0 {
+                            info!(
+                                scanned = summary.scanned,
+                                committed,
+                                newly_committed = summary.newly_committed_count(),
+                                "reconciled prepared native Turn finalizations"
+                            );
+                            this.kick_native_turn_event_deliveries();
+                        }
+                        if summary.deferred_by_predecessor > 0
+                            || summary.superseded_by_terminal_status > 0
+                        {
+                            debug!(
+                                scanned = summary.scanned,
+                                deferred = summary.deferred_by_predecessor,
+                                superseded = summary.superseded_by_terminal_status,
+                                "prepared native Turn finalization reconciliation deferred work"
+                            );
+                        }
+                    }
+                    Err(error) => error!(
+                        error = %format!("{error:#}"),
+                        "native Turn finalization reconciler failed"
                     ),
                 }
 

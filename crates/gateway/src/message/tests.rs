@@ -28118,13 +28118,12 @@ async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state()
         .await
         .expect("finalization intent should prepare");
 
-    assert_eq!(
-        processor
-            .reconcile_prepared_native_turn_finalizations(1_700_000_101, 10)
-            .await
-            .expect("periodic finalization should reconcile"),
-        1
-    );
+    let reconciliation = processor
+        .reconcile_prepared_native_turn_finalizations(1_700_000_101, 10)
+        .await
+        .expect("periodic finalization should reconcile");
+    assert_eq!(reconciliation.scanned, 1);
+    assert_eq!(reconciliation.committed_count(), 1);
     let (_, in_memory) = processor
         .thread_manager
         .turn_get(thread_id, turn_id)
@@ -34788,12 +34787,12 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
                 .expect("CLI finalization intent lookup should succeed"),
             "terminal CLI reconciliation must durably prepare success before completing the Turn",
         );
+        let reconciliation = crud_store
+            .reconcile_prepared_turn_finalizations(10, chrono::Utc::now().timestamp())
+            .await
+            .expect("committed finalization replay should succeed");
         assert_eq!(
-            crud_store
-                .reconcile_prepared_turn_finalizations(10, chrono::Utc::now().timestamp())
-                .await
-                .expect("committed finalization replay should succeed"),
-            0,
+            reconciliation.scanned, 0,
             "a committed CLI finalization must be idempotent and leave no prepared backlog",
         );
         assert!(cli_session.interrupts.lock().await.is_empty());

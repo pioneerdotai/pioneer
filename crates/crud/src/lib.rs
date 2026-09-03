@@ -927,6 +927,37 @@ pub struct CommittedTurnFinalization {
     pub already_committed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnFinalizationCommitOutcome {
+    Committed(CommittedTurnFinalization),
+    DeferredByPredecessor,
+    SupersededByTerminalStatus(TurnStatus),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnFinalizationReconciliationSummary {
+    pub scanned: u64,
+    pub committed: Vec<CommittedTurnFinalization>,
+    pub deferred_by_predecessor: u64,
+    pub superseded_by_terminal_status: u64,
+}
+
+impl TurnFinalizationReconciliationSummary {
+    pub fn committed_count(&self) -> u64 {
+        u64::try_from(self.committed.len()).unwrap_or(u64::MAX)
+    }
+
+    pub fn newly_committed_count(&self) -> u64 {
+        u64::try_from(
+            self.committed
+                .iter()
+                .filter(|committed| !committed.already_committed)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimedRecoveryTerminalizationRecord {
     pub recovery_job_id: String,
@@ -11452,18 +11483,30 @@ impl CrudStore {
         &self,
         limit: u64,
         event_timestamp_secs: i64,
-    ) -> Result<u64> {
+    ) -> Result<TurnFinalizationReconciliationSummary> {
         let turn_ids = self.list_prepared_turn_finalization_ids(limit).await?;
-        let mut committed = 0_u64;
+        let mut summary = TurnFinalizationReconciliationSummary::default();
         for turn_id in turn_ids {
-            self.commit_prepared_turn_finalization(turn_id.as_str(), event_timestamp_secs)
+            summary.scanned = summary.scanned.saturating_add(1);
+            match self
+                .commit_prepared_turn_finalization(turn_id.as_str(), event_timestamp_secs)
                 .await
-                .with_context(|| {
-                    format!("failed to reconcile finalization for turn `{turn_id}`")
-                })?;
-            committed = committed.saturating_add(1);
+                .with_context(|| format!("failed to reconcile finalization for turn `{turn_id}`"))?
+            {
+                TurnFinalizationCommitOutcome::Committed(committed) => {
+                    summary.committed.push(committed);
+                }
+                TurnFinalizationCommitOutcome::DeferredByPredecessor => {
+                    summary.deferred_by_predecessor =
+                        summary.deferred_by_predecessor.saturating_add(1);
+                }
+                TurnFinalizationCommitOutcome::SupersededByTerminalStatus(_) => {
+                    summary.superseded_by_terminal_status =
+                        summary.superseded_by_terminal_status.saturating_add(1);
+                }
+            }
         }
-        Ok(committed)
+        Ok(summary)
     }
 
     /// Atomically publishes the prepared final AgentMessage and immutable
@@ -11473,7 +11516,7 @@ impl CrudStore {
         &self,
         turn_id: &str,
         event_timestamp_secs: i64,
-    ) -> Result<CommittedTurnFinalization> {
+    ) -> Result<TurnFinalizationCommitOutcome> {
         let turn_id = turn_id.to_owned();
         self.run_serialized_write(|| async {
             // Decode the prepared item and materialize both canonical event
@@ -11611,23 +11654,53 @@ impl CrudStore {
                             anyhow::bail!("failed to reconcile committed finalization intent");
                         }
                     }
-                    return Ok(CommittedTurnFinalization {
-                        final_item,
-                        turn_completed,
-                        already_committed: true,
-                    });
+                    return Ok(TurnFinalizationCommitOutcome::Committed(
+                        CommittedTurnFinalization {
+                            final_item,
+                            turn_completed,
+                            already_committed: true,
+                        },
+                    ));
                 }
                 if authoritative_status != TurnStatus::InProgress {
-                    anyhow::bail!(
-                        "turn `{turn_id}` has conflicting terminal status `{:?}`",
-                        authoritative_status
-                    );
+                    if intent.status != turn_finalization::STATUS_PREPARED {
+                        anyhow::bail!(
+                            "terminal Turn `{turn_id}` has non-prepared finalization state `{}`",
+                            intent.status
+                        );
+                    }
+                    if !turn_finalization::delete_prepared_by_turn_id(
+                        &transaction,
+                        turn_id.as_str(),
+                    )
+                    .await?
+                    {
+                        anyhow::bail!(
+                            "failed to discard finalization superseded by terminal Turn `{turn_id}`"
+                        );
+                    }
+                    return Ok(TurnFinalizationCommitOutcome::SupersededByTerminalStatus(
+                        authoritative_status,
+                    ));
                 }
                 if intent.status != turn_finalization::STATUS_PREPARED {
                     anyhow::bail!(
                         "in-progress Turn `{turn_id}` has non-prepared finalization state `{}`",
                         intent.status
                     );
+                }
+
+                // Existing durable events necessarily precede the two events
+                // this transaction is about to append. Waiting for their
+                // authoritative projection is normal causal backpressure, not
+                // a failed finalization or a process-fatal storage error.
+                if turn_event_projection_state::has_unprojected_event(
+                    &transaction,
+                    turn_id.as_str(),
+                )
+                .await?
+                {
+                    return Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor);
                 }
 
                 let created_at = unix_to_datetime(event_timestamp_secs);
@@ -11660,20 +11733,26 @@ impl CrudStore {
                 {
                     anyhow::bail!("turn finalization compare-and-set was lost");
                 }
-                Ok(CommittedTurnFinalization {
-                    final_item,
-                    turn_completed,
-                    already_committed: false,
-                })
+                Ok(TurnFinalizationCommitOutcome::Committed(
+                    CommittedTurnFinalization {
+                        final_item,
+                        turn_completed,
+                        already_committed: false,
+                    },
+                ))
             }
             .await;
             match result {
-                Ok(committed) => {
+                Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor) => {
+                    let _ = transaction.rollback().await;
+                    Ok(TurnFinalizationCommitOutcome::DeferredByPredecessor)
+                }
+                Ok(outcome) => {
                     transaction
                         .commit()
                         .await
                         .context("failed to commit turn finalization transaction")?;
-                    Ok(committed)
+                    Ok(outcome)
                 }
                 Err(error) => {
                     let _ = transaction.rollback().await;
@@ -28300,13 +28379,13 @@ mod tests {
         ThreadEpisodicSourceRuntimeKind, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
         ThreadTimelineApprovalScope, ThreadTimelineBlockRecord, TurnExecutionCheckpointKind,
         TurnExecutionWindowStatsRecord, TurnExecutionWindowUsageAggregateRecord,
-        TurnItemAttemptDeadlines, TurnMcpBindingRecord, TurnMcpProjectionPersistenceError,
-        TurnMcpProjectionRecord, TurnMcpProjectionReplacement, TurnMessageMutationFailure,
-        TurnProjectionStreamHealth, TurnSkillBindingRecord, TurnWorkItemProjectionRecord,
-        TurnWorkOwner, WORK_ITEM_STATUS_COMPLETED, WORK_ITEM_STATUS_RUNNING,
-        WORK_VISIBILITY_VISIBLE, WorkspaceSkillPolicyRecord, create_gateway_singleton,
-        create_member_principal, create_superuser, delete_workspace_membership,
-        ensure_pioneer_for_workspace, insert_workspace_membership,
+        TurnFinalizationCommitOutcome, TurnItemAttemptDeadlines, TurnMcpBindingRecord,
+        TurnMcpProjectionPersistenceError, TurnMcpProjectionRecord, TurnMcpProjectionReplacement,
+        TurnMessageMutationFailure, TurnProjectionStreamHealth, TurnSkillBindingRecord,
+        TurnWorkItemProjectionRecord, TurnWorkOwner, WORK_ITEM_STATUS_COMPLETED,
+        WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_VISIBLE, WorkspaceSkillPolicyRecord,
+        create_gateway_singleton, create_member_principal, create_superuser,
+        delete_workspace_membership, ensure_pioneer_for_workspace, insert_workspace_membership,
         list_abandoned_runtime_draft_artifact_ids,
         message_mutation_actor_current_thread_write_kind, principal_current_thread_access_kind,
         resolve_artifact_authorization_scope, resolve_runtime_draft_artifact_authorization_scope,
@@ -29580,17 +29659,20 @@ mod tests {
         // A fresh store models a process restart after the provider response
         // was acknowledged but before TurnCompleted was emitted.
         let restarted = CrudStore::new(store.database_connection());
-        assert_eq!(
-            restarted
-                .reconcile_prepared_turn_finalizations(10, 1_700_000_101)
-                .await
-                .expect("startup reconciliation should finish the commit"),
-            1
-        );
-        let committed = restarted
+        let reconciliation = restarted
+            .reconcile_prepared_turn_finalizations(10, 1_700_000_101)
+            .await
+            .expect("startup reconciliation should finish the commit");
+        assert_eq!(reconciliation.scanned, 1);
+        assert_eq!(reconciliation.committed_count(), 1);
+        let committed = match restarted
             .commit_prepared_turn_finalization("turn_native_finalize", 1_700_000_102)
             .await
-            .expect("duplicate terminal acknowledgement should reconcile");
+            .expect("duplicate terminal acknowledgement should reconcile")
+        {
+            TurnFinalizationCommitOutcome::Committed(committed) => committed,
+            outcome => panic!("unexpected duplicate finalization outcome: {outcome:?}"),
+        };
         assert!(committed.already_committed);
         assert_eq!(committed.final_item, final_notification);
 
@@ -29620,6 +29702,218 @@ mod tests {
                 .await
                 .is_err(),
             "a finalization generation cannot alias different provider output"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_native_finalization_defers_until_its_predecessor_is_projected() {
+        let timestamp = 1_700_000_000;
+        let turn_id = "turn_finalize_defer";
+        let (store, _, _) =
+            test_store_with_started_turn("ws_finalize_defer", "thr_finalize_defer", turn_id).await;
+        let final_notification = ItemCompletedNotification {
+            workspace_id: "ws_finalize_defer".to_owned(),
+            thread_id: "thr_finalize_defer".to_owned(),
+            turn_id: turn_id.to_owned(),
+            item: TurnItem::AgentMessage {
+                id: "final_defer_message".to_owned(),
+                text: "publish after predecessor".to_owned(),
+                phase: AgentMessagePhase::FinalAnswer,
+                markdown: None,
+                markdown_version: None,
+            },
+        };
+        store
+            .prepare_turn_finalization(&final_notification, 1, None, timestamp + 1)
+            .await
+            .expect("finalization intent should prepare");
+        mark_first_turn_projection_failed(&store, turn_id, timestamp + 20).await;
+
+        assert_eq!(
+            store
+                .commit_prepared_turn_finalization(turn_id, timestamp + 2)
+                .await
+                .expect("causal backpressure should be a typed outcome"),
+            TurnFinalizationCommitOutcome::DeferredByPredecessor
+        );
+        let deferred = store
+            .reconcile_prepared_turn_finalizations(10, timestamp + 10)
+            .await
+            .expect("deferred finalization must not fail reconciliation");
+        assert_eq!(deferred.scanned, 1);
+        assert_eq!(deferred.deferred_by_predecessor, 1);
+        assert_eq!(deferred.committed_count(), 0);
+        assert!(
+            turn::find_turn_item(
+                &store.connection,
+                turn_id,
+                final_notification.item.item_id(),
+            )
+            .await
+            .expect("final item lookup should succeed")
+            .is_none(),
+            "a deferred finalization must not publish its final item"
+        );
+        let events_before_replay = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .count(&store.connection)
+            .await
+            .expect("turn events should count");
+        assert_eq!(
+            events_before_replay, 1,
+            "a deferred atomic finalization must roll back both new events"
+        );
+
+        let replay = store
+            .replay_due_turn_event_projections(timestamp + 30, 10)
+            .await
+            .expect("predecessor replay should succeed");
+        assert_eq!(replay.projected, 1);
+        let reconciled = store
+            .reconcile_prepared_turn_finalizations(10, timestamp + 31)
+            .await
+            .expect("finalization should commit after its predecessor");
+        assert_eq!(reconciled.scanned, 1);
+        assert_eq!(reconciled.committed_count(), 1);
+        assert_eq!(reconciled.deferred_by_predecessor, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_prepared_finalization_does_not_block_a_later_ready_turn() {
+        let timestamp = 1_700_000_000;
+        let workspace_id = "ws_finalize_fair";
+        let blocked_thread_id = "thr_finalize_blocked";
+        let blocked_turn_id = "turn_finalize_blocked";
+        let ready_thread_id = "thr_finalize_ready";
+        let ready_turn_id = "turn_finalize_ready";
+        let store = test_store_with_workspace(workspace_id).await;
+
+        for (thread_id, turn_id) in [
+            (blocked_thread_id, blocked_turn_id),
+            (ready_thread_id, ready_turn_id),
+        ] {
+            store
+                .materialize_turn_start(
+                    &sample_thread(workspace_id, thread_id, timestamp),
+                    SandboxMode::FullAccess,
+                    &sample_turn(turn_id),
+                    &[],
+                    PersistedActorRef::System,
+                )
+                .await
+                .expect("turn start should persist");
+        }
+
+        for (offset, thread_id, turn_id, item_id) in [
+            (1, blocked_thread_id, blocked_turn_id, "final_blocked"),
+            (2, ready_thread_id, ready_turn_id, "final_ready"),
+        ] {
+            store
+                .prepare_turn_finalization(
+                    &ItemCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: TurnItem::AgentMessage {
+                            id: item_id.to_owned(),
+                            text: format!("answer for {turn_id}"),
+                            phase: AgentMessagePhase::FinalAnswer,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    1,
+                    None,
+                    timestamp + offset,
+                )
+                .await
+                .expect("finalization intent should prepare");
+        }
+        mark_first_turn_projection_failed(&store, blocked_turn_id, timestamp + 20).await;
+
+        assert_eq!(
+            store
+                .list_prepared_turn_finalization_ids(10)
+                .await
+                .expect("prepared finalizations should list"),
+            vec![blocked_turn_id.to_owned(), ready_turn_id.to_owned()],
+            "prepared finalizations must use stable oldest-first ordering"
+        );
+        let reconciliation = store
+            .reconcile_prepared_turn_finalizations(10, timestamp + 3)
+            .await
+            .expect("one deferred Turn must not fail the bounded batch");
+        assert_eq!(reconciliation.scanned, 2);
+        assert_eq!(reconciliation.deferred_by_predecessor, 1);
+        assert_eq!(reconciliation.committed_count(), 1);
+        assert_eq!(
+            reconciliation.committed[0].turn_completed.turn.id,
+            ready_turn_id
+        );
+
+        let (_, blocked_turn) = store
+            .get_turn(blocked_thread_id, blocked_turn_id)
+            .await
+            .expect("blocked Turn should load")
+            .expect("blocked Turn should exist");
+        let (_, ready_turn) = store
+            .get_turn(ready_thread_id, ready_turn_id)
+            .await
+            .expect("ready Turn should load")
+            .expect("ready Turn should exist");
+        assert_eq!(blocked_turn.status, TurnStatus::InProgress);
+        assert_eq!(ready_turn.status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_supersedes_a_stale_prepared_finalization_during_reconciliation() {
+        let timestamp = 1_700_000_000;
+        let turn_id = "turn_finalize_stale";
+        let (store, _, _) =
+            test_store_with_started_turn("ws_finalize_stale", "thr_finalize_stale", turn_id).await;
+        store
+            .prepare_turn_finalization(
+                &ItemCompletedNotification {
+                    workspace_id: "ws_finalize_stale".to_owned(),
+                    thread_id: "thr_finalize_stale".to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::AgentMessage {
+                        id: "final_stale_message".to_owned(),
+                        text: "stale provider answer".to_owned(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                1,
+                None,
+                timestamp + 1,
+            )
+            .await
+            .expect("finalization intent should prepare");
+        pioneer_entity::turn::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn::Column::Status,
+                Expr::value("interrupted"),
+            )
+            .filter(pioneer_entity::turn::Column::Id.eq(turn_id.to_owned()))
+            .exec(&store.connection)
+            .await
+            .expect("terminal status should persist");
+
+        assert_eq!(
+            store
+                .commit_prepared_turn_finalization(turn_id, timestamp + 2)
+                .await
+                .expect("terminal conflict should resolve without an error"),
+            TurnFinalizationCommitOutcome::SupersededByTerminalStatus(TurnStatus::Interrupted)
+        );
+        assert!(
+            turn_finalization::find_by_turn_id(&store.connection, turn_id)
+                .await
+                .expect("finalization lookup should succeed")
+                .is_none(),
+            "superseded finalization intent must be removed"
         );
     }
 
@@ -29685,13 +29979,12 @@ mod tests {
                 .is_none(),
             "a superseded prepared finalization must not poison restart reconciliation"
         );
-        assert_eq!(
-            store
-                .reconcile_prepared_turn_finalizations(10, timestamp + 3)
-                .await
-                .expect("restart reconciliation should have no stale intent"),
-            0
-        );
+        let reconciliation = store
+            .reconcile_prepared_turn_finalizations(10, timestamp + 3)
+            .await
+            .expect("restart reconciliation should have no stale intent");
+        assert_eq!(reconciliation.scanned, 0);
+        assert_eq!(reconciliation.committed_count(), 0);
         let (_, terminal) = store
             .get_turn(thread_id, turn_id)
             .await
@@ -31561,13 +31854,12 @@ mod tests {
             .execute_unprepared("DROP TRIGGER reject_native_terminal_commit")
             .await
             .expect("fault trigger should uninstall");
-        assert_eq!(
-            store
-                .reconcile_prepared_turn_finalizations(10, 1_700_000_102)
-                .await
-                .expect("prepared intent should reconcile"),
-            1
-        );
+        let reconciliation = store
+            .reconcile_prepared_turn_finalizations(10, 1_700_000_102)
+            .await
+            .expect("prepared intent should reconcile");
+        assert_eq!(reconciliation.scanned, 1);
+        assert_eq!(reconciliation.committed_count(), 1);
     }
 
     #[tokio::test]
@@ -36696,6 +36988,43 @@ mod tests {
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
         }
+    }
+
+    async fn mark_first_turn_projection_failed(
+        store: &CrudStore,
+        turn_id: &str,
+        next_run_at_unix: i64,
+    ) {
+        let first_event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .one(&store.connection)
+            .await
+            .expect("first turn event lookup should succeed")
+            .expect("first turn event should exist");
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                Expr::value(
+                    crate::repositories::turn_event_projection_state::PROJECTION_STATUS_FAILED,
+                ),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::NextRunAt,
+                Expr::value(unix_to_datetime(next_run_at_unix)),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimToken,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
+                Expr::value(Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None),
+            )
+            .filter(pioneer_entity::turn_event_projection_state::Column::EventId.eq(first_event.id))
+            .exec(&store.connection)
+            .await
+            .expect("first turn projection should become replayable");
     }
 
     fn sample_task(timestamp: i64) -> Task {

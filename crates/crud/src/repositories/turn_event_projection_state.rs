@@ -445,6 +445,22 @@ pub async fn has_unprojected_predecessor<C: ConnectionTrait>(
     Ok(count > 0)
 }
 
+/// Returns whether this Turn already owns any durable event whose authoritative
+/// projection is incomplete. Every existing event is a causal predecessor of a
+/// finalization event that has not been appended yet.
+pub async fn has_unprojected_event<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    let count = turn_event_projection_state::Entity::find()
+        .filter(turn_event_projection_state::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_event_projection_state::Column::Status.ne(PROJECTION_STATUS_PROJECTED))
+        .count(db)
+        .await
+        .with_context(|| {
+            format!("failed to check incomplete turn event projections for turn `{turn_id}`")
+        })?;
+
+    Ok(count > 0)
+}
+
 pub async fn mark_projected_claimed<C: ConnectionTrait>(
     db: &C,
     event_id: &str,

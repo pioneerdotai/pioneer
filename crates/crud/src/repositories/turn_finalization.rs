@@ -3,7 +3,8 @@ use pioneer_entity::turn_finalization;
 use pioneer_protocol::{ItemCompletedNotification, TurnItem};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use sha2::{Digest, Sha256};
 
@@ -115,6 +116,8 @@ pub async fn list_prepared<C: ConnectionTrait>(
 ) -> Result<Vec<turn_finalization::Model>> {
     turn_finalization::Entity::find()
         .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
+        .order_by_asc(turn_finalization::Column::PreparedAt)
+        .order_by_asc(turn_finalization::Column::TurnId)
         .limit(limit)
         .all(db)
         .await
