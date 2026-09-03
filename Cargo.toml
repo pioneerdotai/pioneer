@@ -33,7 +33,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.47.2"
+version = "0.47.3"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -103,8 +103,8 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 # UI
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component-assets" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "c0946e6acdc9e2f984f317ef7f998ee2c79f1a87", package = "gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "c0946e6acdc9e2f984f317ef7f998ee2c79f1a87", package = "gpui-component-assets" }
 terminal = { path = "crates/terminal" }
 markdown = "1"
 
