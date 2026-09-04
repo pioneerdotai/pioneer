@@ -1,6 +1,6 @@
 use crate::app::root::{AdministrationContentView, PioneerDesktop};
-use gpui::{prelude::*, *};
-use gpui_component::{theme::ActiveTheme, *};
+use gpui_kit::component::{theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(super) fn render_administration_screen(

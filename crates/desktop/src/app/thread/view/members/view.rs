@@ -8,8 +8,7 @@ use crate::{
     assets::PioneerIconName,
     components::member_picker::{MemberPicker, member_picker_items},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     IconName,
     avatar::Avatar,
     button::*,
@@ -18,6 +17,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     composer::state_machine::{ComposerMentionCandidate, composer_mention_candidates},
     threads::scope::ThreadScopePendingAction,

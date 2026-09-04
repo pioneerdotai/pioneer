@@ -2,8 +2,7 @@ use crate::{
     app::root::PioneerDesktop,
     components::buttonts::{default_outline_button, default_primary_button},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Disableable, StyledExt, WindowExt,
     dialog::DialogFooter,
     form::{field, v_form},
@@ -11,6 +10,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use std::{cell::RefCell, rc::Rc};
 
 impl PioneerDesktop {

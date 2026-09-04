@@ -2,13 +2,13 @@ use crate::{
     app::root::PioneerDesktop,
     components::model_selector::{ModelSelectorDialogOptions, ModelSelectorSelection},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon,
     button::{Button, ButtonVariants},
     spinner::Spinner,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::providers::list::ProviderModelSelectorMode;
 use pioneer_client::providers::presentation::{
     self as provider_presentation, ProviderModelDisplayState,
@@ -55,7 +55,7 @@ impl PioneerDesktop {
                     .when(loading, |this| {
                         this.child(
                             Spinner::new()
-                                .with_size(gpui_component::Size::Small)
+                                .with_size(gpui_kit::component::Size::Small)
                                 .color(cx.theme().muted_foreground),
                         )
                     })

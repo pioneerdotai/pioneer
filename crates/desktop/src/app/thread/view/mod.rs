@@ -6,12 +6,12 @@ mod members;
 pub(crate) mod timeline;
 
 use super::super::root::PioneerDesktop;
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     resizable::{h_resizable, resizable_panel},
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_thread(

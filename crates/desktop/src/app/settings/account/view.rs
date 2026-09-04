@@ -1,6 +1,6 @@
 use crate::app::root::PioneerDesktop;
-use gpui::{prelude::*, *};
-use gpui_component::{avatar::Avatar, button::*, theme::ActiveTheme, *};
+use gpui_kit::component::{avatar::Avatar, button::*, theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::authorization::{CurrentPrincipalPresentation, current_principal_presentation};
 
 const ACCOUNT_CONTENT_MAX_WIDTH_PX: f32 = 860.0;

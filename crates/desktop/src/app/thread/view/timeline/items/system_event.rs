@@ -3,8 +3,8 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry},
     root::PioneerDesktop,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{collapsible::Collapsible, h_flex, v_flex, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, v_flex, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::{
     CapabilityRejectionKind, CapabilityRejectionLabel, SystemEventDetailLabel,
     SystemEventDetailValue, SystemEventLabel, SystemEventMessage,

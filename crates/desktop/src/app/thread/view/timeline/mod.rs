@@ -24,7 +24,7 @@ use crate::app::{
         TimelineScrollAnchor,
     },
 };
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::rows::UserMessagePresentation;
 use pioneer_observability::{DesktopTimelineCacheStatus, DesktopTimelineStage};
 use pioneer_protocol::{

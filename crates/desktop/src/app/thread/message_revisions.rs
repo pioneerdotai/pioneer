@@ -1,9 +1,9 @@
 use crate::app::PioneerDesktop;
 use chrono::{Local, TimeZone};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Disableable, StyledExt, WindowExt, button::Button, theme::ActiveTheme, v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::rows::{
     MessageRevisionPagePresentation, MessageRevisionPresentation, project_message_revision_page,
 };

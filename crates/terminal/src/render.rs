@@ -49,7 +49,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use gpui::px;
+//! use gpui_kit::px;
 //! use terminal::{ColorPalette, TerminalRenderer};
 //!
 //! let renderer = TerminalRenderer::new(
@@ -69,7 +69,7 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
-use gpui::{
+use gpui_kit::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
     SharedString, Size, TextAlign, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
@@ -204,7 +204,7 @@ impl TerminalRenderer {
     /// # Examples
     ///
     /// ```
-    /// use gpui::px;
+    /// use gpui_kit::px;
     /// use terminal::render::TerminalRenderer;
     /// use terminal::ColorPalette;
     ///
@@ -255,7 +255,7 @@ impl TerminalRenderer {
         let text_run = TextRun {
             len: "│".len(),
             font,
-            color: gpui::black(),
+            color: gpui_kit::black(),
             background_color: None,
             underline: None,
             strikethrough: None,

@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     input::{InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_protocol::{
     AuthProfileAvatarUpdate, AuthProfileUpdateParams, PROFILE_AVATAR_MAX_DECODED_BYTES,
 };

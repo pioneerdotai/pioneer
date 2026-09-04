@@ -1,5 +1,5 @@
 use super::PioneerDesktop;
-use gpui::{Context, Window};
+use gpui_kit::{Context, Window};
 use pioneer_client::state::client_state::GatewayConnectionState;
 use pioneer_observability::{
     DesktopGatewayConnectFailureClass, DesktopPostUpdateStage, DesktopPostUpdateStageGuard,

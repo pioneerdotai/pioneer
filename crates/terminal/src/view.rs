@@ -29,7 +29,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use gpui::{Context, Edges, px};
+//! use gpui_kit::{Context, Edges, px};
 //! use terminal::{ColorPalette, TerminalConfig, TerminalView};
 //!
 //! // In a GPUI window context:
@@ -52,7 +52,7 @@ use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
-use gpui::{Edges, *};
+use gpui_kit::{Edges, *};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -79,7 +79,7 @@ use std::thread;
 /// # Example
 ///
 /// ```ignore
-/// use gpui::{Edges, px};
+/// use gpui_kit::{Edges, px};
 /// use terminal::{ColorPalette, TerminalConfig};
 ///
 /// let config = TerminalConfig {

@@ -2,10 +2,10 @@ use crate::{
     app::root::{MainContentView, PioneerDesktop, SettingsContentView},
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, button::*, popover::Popover, separator::Separator, theme::ActiveTheme, *,
 };
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {

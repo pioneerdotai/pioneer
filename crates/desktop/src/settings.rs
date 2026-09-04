@@ -1,6 +1,6 @@
 use crate::file_opener::FileOpenerId;
 use anyhow::{Context as _, Result};
-use gpui::{App, Global};
+use gpui_kit::{App, Global};
 use pioneer_config::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};

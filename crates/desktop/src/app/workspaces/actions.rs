@@ -1,5 +1,5 @@
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::workspaces::actions as workspace_actions;
 use tracing::warn;
 

@@ -17,7 +17,7 @@ use pioneer_protocol::{MemberSummary, PrincipalId, ProfileAvatarMediaType};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::root::PioneerDesktop;
-use gpui::{AppContext as _, AsyncApp, Context, WeakEntity};
+use gpui_kit::{AppContext as _, AsyncApp, Context, WeakEntity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DesktopMemberAvatarStatus {

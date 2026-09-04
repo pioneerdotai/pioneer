@@ -8,8 +8,7 @@ repository = "https://github.com/zortax/gpui-terminal"
 authors = ["Leonard Seibold <git[@]zrtx.de"]
 
 [dependencies]
-gpui.workspace = true
-gpui_platform.workspace = true
+gpui-kit.workspace = true
 alacritty_terminal = "0.25.1"
 anyhow = "1"
 portable-pty = "0.9"

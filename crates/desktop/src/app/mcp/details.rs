@@ -6,8 +6,7 @@ use crate::app::{
     },
 };
 use chrono::{Local, TimeZone};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     StyledExt,
     button::*,
     collapsible::Collapsible,
@@ -17,6 +16,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::{details as mcp_details, presentation as mcp_presentation};
 use pioneer_protocol::{McpAuditEventSummary, McpListItem, McpServerDetailsResponse};
 
@@ -563,7 +563,7 @@ impl PioneerDesktop {
         row_count: usize,
     ) -> AnyElement {
         let visible_rows = row_count.clamp(1, 8) as f32;
-        let row_height = gpui_component::Size::Small.table_row_height();
+        let row_height = gpui_kit::component::Size::Small.table_row_height();
         let table_height = row_height * (visible_rows + 1.) + px(2.);
 
         div()
@@ -571,7 +571,7 @@ impl PioneerDesktop {
             .h(table_height)
             .child(
                 DataTable::new(state_entity)
-                    .with_size(gpui_component::Size::Small)
+                    .with_size(gpui_kit::component::Size::Small)
                     .scrollbar_visible(true, false),
             )
             .into_any_element()

@@ -5,8 +5,8 @@ use crate::{
         device_activation_form::{DeviceActivationForm, DeviceActivationFormPhase},
     },
 };
-use gpui::{prelude::*, *};
-use gpui_component::{button::*, dialog::DialogFooter, theme::ActiveTheme, *};
+use gpui_kit::component::{button::*, dialog::DialogFooter, theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     authorization::{SessionStatusPresentation, session_list_row_presentation},
     gateway::{device_activation::DeviceActivationQrPresentation, endpoint::GatewayBaseUrl},

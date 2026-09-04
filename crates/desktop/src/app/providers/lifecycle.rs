@@ -2,8 +2,8 @@ use super::{
     PROVIDERS_FILTER_API_NODE_ID, PROVIDERS_FILTER_CLI_NODE_ID, PROVIDERS_FILTER_CONNECTED_NODE_ID,
 };
 use crate::app::root::{GatewayConnectionState, MainContentView, PioneerDesktop, ProviderFilter};
-use gpui::{prelude::*, *};
-use gpui_component::tree::TreeItem;
+use gpui_kit::component::tree::TreeItem;
+use gpui_kit::{prelude::*, *};
 use pioneer_client::providers::{list as provider_list, selectors};
 use tracing::warn;
 

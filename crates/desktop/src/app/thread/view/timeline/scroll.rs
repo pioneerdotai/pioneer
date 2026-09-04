@@ -378,7 +378,7 @@ mod tests {
         ThreadTimelineViewState, consume_semantic_prefetch_scroll_intents,
         record_semantic_prefetch_scroll_intent, timeline_max_offset_for_item_sizes,
     };
-    use gpui::{px, size};
+    use gpui_kit::{px, size};
 
     #[test]
     fn scroll_events_coalesce_until_prefetch_intent_is_consumed() {

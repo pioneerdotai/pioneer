@@ -2,12 +2,12 @@ use crate::{
     app::root::{GatewayConnectionState, PioneerDesktop},
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::{Button, ButtonVariants},
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::skills::catalog as skill_catalog;
 
 const SIDEBAR_MENU_ITEM_OPACITY: f32 = 0.8;

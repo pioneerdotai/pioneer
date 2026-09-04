@@ -3,8 +3,7 @@ use crate::{
     app::root::{GatewaySetupAction, GatewaySetupFormMode, PioneerDesktop},
     components::buttonts::{default_outline_button, default_primary_button},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::ButtonVariants,
     form::{field, v_form},
     input::{Input, InputState, OtpInput, OtpState},
@@ -12,6 +11,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use tracing::warn;
 
 const ACTIVATION_CODE_CELL_SIZE_PX: f32 = 32.0;

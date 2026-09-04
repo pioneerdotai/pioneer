@@ -1,5 +1,5 @@
 use crate::app::root::PioneerDesktop;
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_protocol::{SkillId, SkillPackId};
 
 #[derive(Clone)]

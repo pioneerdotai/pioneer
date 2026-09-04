@@ -1,15 +1,15 @@
-use gpui::prelude::FluentBuilder as _;
-use gpui::{
+use gpui_kit::component::{ActiveTheme, Sizable, Size, StyledExt};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, ElementId, Hsla,
     InteractiveElement as _, IntoElement, ParentElement, Pixels, RenderOnce, StyleRefinement,
     Styled, Window, canvas, div, px, relative,
 };
-use gpui_component::{ActiveTheme, Sizable, Size, StyledExt};
 use std::{f32::consts::TAU, time::Duration};
 
-use gpui_component::plot::shape::{Arc, ArcData};
+use gpui_kit::component::plot::shape::{Arc, ArcData};
 
-// Compatibility backport of gpui-component's ProgressCircle for the 0.5.1 API.
+// Compatibility backport of GPUI Component's ProgressCircle for the 0.5.1 API.
 #[derive(IntoElement)]
 pub struct ProgressCircle {
     id: ElementId,

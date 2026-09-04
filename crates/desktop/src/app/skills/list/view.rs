@@ -2,14 +2,14 @@ use crate::{
     app::root::{GatewayConnectionState, PioneerDesktop},
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::{Button, ButtonVariants},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     scroll::Scrollbar,
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::skills::{
     catalog::SkillManagementProjection, presentation as skill_presentation, upload as skill_upload,
 };

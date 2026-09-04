@@ -2,8 +2,8 @@ use super::{ADMINISTRATION_CONTENT_INVITATIONS_NODE_ID, ADMINISTRATION_CONTENT_M
 use crate::app::root::{
     AdministrationContentView, GatewayConnectionState, MainContentView, PioneerDesktop,
 };
-use gpui::*;
-use gpui_component::tree::TreeItem;
+use gpui_kit::component::tree::TreeItem;
+use gpui_kit::*;
 use std::time::Duration;
 use tracing::warn;
 

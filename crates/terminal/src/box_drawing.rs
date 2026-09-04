@@ -26,7 +26,7 @@
 //! }
 //! ```
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
+use gpui_kit::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
 
 /// Calculate line thicknesses rounded to integer pixels to avoid aliasing.
 fn calculate_thickness(cell_width: Pixels) -> (Pixels, Pixels) {

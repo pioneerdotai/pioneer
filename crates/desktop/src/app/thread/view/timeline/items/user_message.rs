@@ -12,13 +12,13 @@ use crate::app::{
 };
 use crate::assets::PioneerIconName;
 use chrono::{Local, TimeZone};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, StyledExt, h_flex,
     menu::{ContextMenuExt, PopupMenuItem},
     theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::state_machine::{
     ComposerDomainAction, composer_reply_target_from_visible_message,
 };
@@ -510,14 +510,14 @@ impl PioneerDesktop {
     }
 }
 
-fn attachment_file_icon(flex_none: bool) -> gpui::Div {
+fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
     let mut container = div().size(px(22.)).flex().items_center().justify_center();
     if flex_none {
         container = container.flex_none();
     }
 
     container.child(
-        Icon::new(gpui_component::IconName::File)
+        Icon::new(gpui_kit::component::IconName::File)
             .size_3()
             .opacity(0.8),
     )
@@ -526,7 +526,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui::Div {
 fn attachment_capability_icon(
     kind: ParsedUserAttachmentKind,
     cx: &mut Context<PioneerDesktop>,
-) -> gpui::Div {
+) -> gpui_kit::Div {
     let icon = match kind {
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
         ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,

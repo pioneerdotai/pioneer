@@ -50,6 +50,7 @@ tempfile.workspace = true
 [package.metadata.pioneer-client]
 forbidden-dependencies = [
   "gpui",
+  "gpui-kit",
   "gpui-component",
   "terminal",
   "pioneer-gateway",

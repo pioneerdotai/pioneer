@@ -1,5 +1,5 @@
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
-use gpui::{AppContext, AsyncApp, Context, WeakEntity};
+use gpui_kit::{AppContext, AsyncApp, Context, WeakEntity};
 use pioneer_client::timeline::semantic::{
     self, DEFAULT_PREFETCH_THRESHOLD_ROWS, DEFAULT_TOP_LEVEL_PAGE_LIMIT,
     DEFAULT_TURN_WORK_PAGE_LIMIT, SemanticTimelineRequestAction, SemanticTimelineRequestKey,
@@ -521,22 +521,22 @@ impl PioneerDesktop {
 
     fn semantic_prefetch_can_request_thread_before(&self) -> bool {
         let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
-        if max_offset <= gpui::px(1.) {
+        if max_offset <= gpui_kit::px(1.) {
             return false;
         }
-        self.thread_timeline_scroll_handle.offset().y >= gpui::px(-24.)
+        self.thread_timeline_scroll_handle.offset().y >= gpui_kit::px(-24.)
     }
 
     fn semantic_prefetch_can_request_thread_after(&self) -> bool {
         let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
-        if max_offset <= gpui::px(1.) {
+        if max_offset <= gpui_kit::px(1.) {
             return false;
         }
         self.timeline_is_near_bottom()
     }
 
     fn semantic_prefetch_can_request_work_range(&self) -> bool {
-        self.thread_timeline_scroll_handle.max_offset().y > gpui::px(1.)
+        self.thread_timeline_scroll_handle.max_offset().y > gpui_kit::px(1.)
     }
 }
 

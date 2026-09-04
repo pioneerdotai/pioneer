@@ -1,13 +1,13 @@
 use crate::app::root::PioneerDesktop;
 use crate::assets::PioneerIconName;
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon,
     button::*,
     popover::{Popover, PopoverState},
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_protocol::TurnPermissionMode;
 
@@ -118,7 +118,7 @@ impl PioneerDesktop {
                             .when(is_active, |d| d.bg(muted_bg))
                             .hover(move |d| d.bg(ghost_hover))
                             .active(move |d| d.bg(ghost_active))
-                            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                            .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                                 window.prevent_default();
                             })
                             .on_click(move |_, window, cx| {

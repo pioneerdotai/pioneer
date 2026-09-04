@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable, StyledExt,
     avatar::Avatar,
     h_flex,
@@ -10,6 +9,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 
 use crate::components::buttonts::default_primary_button;
 

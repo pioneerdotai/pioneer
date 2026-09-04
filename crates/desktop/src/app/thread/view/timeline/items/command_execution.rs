@@ -7,8 +7,8 @@ use crate::{
     },
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::{
     command_execution_display_command, command_execution_terminal_text,
 };
@@ -78,7 +78,7 @@ impl PioneerDesktop {
             rows,
             line_height_multiplier: 1.0,
             scrollback: 1000,
-            padding: gpui::Edges::all(px(16.0)),
+            padding: gpui_kit::Edges::all(px(16.0)),
             colors: ColorPalette::builder().background(0x1e, 0x1e, 0x1e).build(),
             ..TerminalConfig::default()
         };

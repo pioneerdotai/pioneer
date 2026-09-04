@@ -7,13 +7,13 @@ use crate::{
     assets::PioneerIconName,
     file_opener::{FileOpenerId, available_file_openers},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::*,
     menu::{DropdownMenu, PopupMenuItem},
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::threads::scope::ThreadScopePendingAction;
 use pioneer_protocol::{ThreadStatus, ThreadVisibility};
 

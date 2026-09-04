@@ -3,8 +3,7 @@ use crate::{
     components::buttonts::{default_outline_button, default_primary_button},
     gateway::GatewayWsCommandSender,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon,
     dialog::DialogFooter,
     form::{Field, field, v_form},
@@ -16,6 +15,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 pub(crate) use pioneer_client::composer::model_selection::ModelSelectorSelection;
 use pioneer_client::providers::list::{
     self as provider_list, ProviderModelSelectorMode, ProviderModelSelectorState,
@@ -194,7 +194,7 @@ impl RenderOnce for SelectorPopoverTrigger {
                     .justify_between()
                     .child(div().flex_1().child(if self.loading {
                         Spinner::new()
-                            .with_size(gpui_component::Size::Small)
+                            .with_size(gpui_kit::component::Size::Small)
                             .color(theme.muted_foreground)
                             .into_any_element()
                     } else {
@@ -733,7 +733,7 @@ impl PioneerDesktop {
                         .when(is_active, |d| d.bg(muted_bg))
                         .hover(move |d| d.bg(ghost_hover))
                         .active(move |d| d.bg(ghost_active))
-                        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                        .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                             window.prevent_default();
                         })
                         .on_click(move |_, window, cx| {
@@ -934,7 +934,7 @@ impl PioneerDesktop {
                 .when(default_selected, |d| d.bg(muted_bg))
                 .hover(move |d| d.bg(ghost_hover))
                 .active(move |d| d.bg(ghost_active))
-                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                     window.prevent_default();
                 })
                 .on_click(move |_, window, cx| {
@@ -965,7 +965,7 @@ impl PioneerDesktop {
                     .when(row.selected, |d| d.bg(muted_bg))
                     .hover(move |d| d.bg(ghost_hover))
                     .active(move |d| d.bg(ghost_active))
-                    .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                         window.prevent_default();
                     })
                     .on_click(move |_, window, cx| {
@@ -1173,7 +1173,7 @@ impl PioneerDesktop {
         row_width: Pixels,
         window: &mut Window,
         popover_cx: &mut Context<PopoverState>,
-    ) -> Rc<Vec<gpui::Size<Pixels>>> {
+    ) -> Rc<Vec<gpui_kit::Size<Pixels>>> {
         Rc::new(
             filtered_models
                 .iter()
@@ -1186,7 +1186,7 @@ impl PioneerDesktop {
                             (cached.layout_hash == layout_hash).then_some(cached.height_px)
                         })
                     } {
-                        return gpui::size(
+                        return gpui_kit::size(
                             px(0.),
                             px(cached_height_px).max(px(MODEL_ROW_MIN_HEIGHT)),
                         );
@@ -1219,7 +1219,7 @@ impl PioneerDesktop {
                         },
                     );
 
-                    gpui::size(px(0.), measured_height)
+                    gpui_kit::size(px(0.), measured_height)
                 })
                 .collect::<Vec<_>>(),
         )
@@ -1271,7 +1271,7 @@ impl PioneerDesktop {
             .when(is_active, |d| d.bg(muted_bg))
             .hover(move |d| d.bg(ghost_hover))
             .active(move |d| d.bg(ghost_active))
-            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+            .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| {
                 window.prevent_default();
             })
             .on_click(move |_, window, cx| {

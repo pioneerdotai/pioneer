@@ -7,8 +7,7 @@ use crate::app::{
     thread::{ThreadCoordinator, thread_display_title},
 };
 use crate::assets::PioneerIconName;
-use gpui::{ClickEvent, prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::*,
     list::ListItem,
     menu::ContextMenuExt,
@@ -17,6 +16,7 @@ use gpui_component::{
     tree::{TreeItem, tree},
     *,
 };
+use gpui_kit::{ClickEvent, prelude::*, *};
 use pioneer_client::agents_doc::scope::{self as agents_doc_scope, AgentsDocEditAction};
 use pioneer_client::threads::tree::{self as client_thread_tree, SidebarTreeNodeKey};
 use pioneer_protocol::{ThreadAgentsDocSummary, ThreadFolder};

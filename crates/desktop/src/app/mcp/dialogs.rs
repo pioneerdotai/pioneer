@@ -1,13 +1,13 @@
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
 use crate::components::buttonts::{default_outline_button, default_primary_button};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     StyledExt, WindowExt,
     dialog::DialogFooter,
     form::{field, v_form},
     input::{Textarea, TextareaState},
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::{
     actions as mcp_actions,
     list::{self as mcp_list, MCP_INSTALL_PENDING_KEY},

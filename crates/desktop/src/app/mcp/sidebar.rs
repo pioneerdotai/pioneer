@@ -2,8 +2,8 @@ use crate::{
     app::root::{GatewayConnectionState, PioneerDesktop},
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{button::*, theme::ActiveTheme, *};
+use gpui_kit::component::{button::*, theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::{details as mcp_details, list::MCP_INSTALL_PENDING_KEY};
 
 const SIDEBAR_MENU_ITEM_OPACITY: f32 = 0.8;

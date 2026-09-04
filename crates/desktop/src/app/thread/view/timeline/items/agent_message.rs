@@ -8,8 +8,7 @@ use crate::{
     assets::PioneerIconName,
 };
 use chrono::{Local, TimeZone};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName,
     clipboard::Clipboard,
     collapsible::Collapsible,
@@ -17,6 +16,7 @@ use gpui_component::{
     menu::{ContextMenuExt, PopupMenuItem},
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::is_task_timeline_agent_message;
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};

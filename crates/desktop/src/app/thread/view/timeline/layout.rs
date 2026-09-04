@@ -1,6 +1,6 @@
 use super::{TimelinePresentationContext, TimelineRenderRow, is_current_principal_user_message};
 use crate::app::conversation::ConversationViewState;
-use gpui::{Pixels, Size, px};
+use gpui_kit::{Pixels, Size, px};
 use pioneer_client::timeline::{
     labels::is_task_timeline_agent_message,
     rows::{TimelineRow, TimelineRowKind},
@@ -967,8 +967,8 @@ mod tests {
         let index = TimelineLayoutIndex::new(
             grouping.clone(),
             Rc::new(vec![
-                gpui::size(px(100.), px(70.)),
-                gpui::size(px(100.), px(50.)),
+                gpui_kit::size(px(100.), px(70.)),
+                gpui_kit::size(px(100.), px(50.)),
             ]),
         );
 

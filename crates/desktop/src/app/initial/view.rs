@@ -3,8 +3,8 @@ use crate::app::{
     root::{GatewaySetupFormMode, PioneerDesktop},
 };
 use crate::gateway::GatewayRuntime;
-use gpui::{prelude::*, *};
-use gpui_component::{theme::ActiveTheme, *};
+use gpui_kit::component::{theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_initial_setup(

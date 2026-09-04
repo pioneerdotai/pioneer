@@ -6,7 +6,7 @@ mod view;
 mod voice;
 
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
-use gpui::prelude::*;
+use gpui_kit::prelude::*;
 use pioneer_client::composer::turn_prepare::{
     ComposerSubmitAvailabilityInput, can_submit_composer_message,
 };

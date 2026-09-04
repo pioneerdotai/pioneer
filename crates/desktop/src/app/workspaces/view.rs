@@ -2,8 +2,7 @@ use crate::{
     app::root::{GatewayConnectionState, PioneerDesktop},
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Colorize, Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
@@ -13,6 +12,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::workspaces::selectors as workspace_selectors;
 use pioneer_protocol::Workspace;
 
@@ -127,7 +127,9 @@ impl RenderOnce for WorkspaceSelectorTrigger {
                             .items_center()
                             .justify_center()
                             .when(self.show_spinner, |this| {
-                                this.child(Spinner::new().with_size(gpui_component::Size::Small))
+                                this.child(
+                                    Spinner::new().with_size(gpui_kit::component::Size::Small),
+                                )
                             })
                             .when(!self.show_spinner, |this| {
                                 this.child(

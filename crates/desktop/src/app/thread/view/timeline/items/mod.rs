@@ -21,10 +21,10 @@ use crate::app::{
     root::PioneerDesktop,
 };
 use crate::assets::PioneerIconName;
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName, StyledExt, h_flex, separator::Separator, theme::ActiveTheme, v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     security::{
         ClientSecurityEnforcementStatus, ClientSecurityFilesystemAccess, ClientTurnSecuritySummary,

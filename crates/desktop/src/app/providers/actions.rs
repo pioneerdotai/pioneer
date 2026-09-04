@@ -1,5 +1,5 @@
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::providers::{
     actions as provider_actions, cli_runtime_settings as cli_provider_settings,
     diagnostics as cli_provider_diagnostics,

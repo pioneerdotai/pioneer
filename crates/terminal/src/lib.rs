@@ -27,14 +27,13 @@
 //! using [portable-pty](https://docs.rs/portable-pty):
 //!
 //! ```ignore
-//! use gpui::{Edges, px};
-//! use gpui_platform;
+//! use gpui_kit::{Edges, px};
 //! use terminal::{ColorPalette, TerminalConfig, TerminalView};
 //! use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 //! use std::sync::Arc;
 //!
 //! fn main() {
-//!     let app = gpui_platform::application();
+//!     let app = gpui_kit::application();
 //!     app.run(|cx| {
 //!         // 1. Create PTY with initial dimensions
 //!         let pty_system = native_pty_system();
@@ -142,7 +141,7 @@
 //! Configure the terminal through [`TerminalConfig`]:
 //!
 //! ```ignore
-//! use gpui::{Edges, px};
+//! use gpui_kit::{Edges, px};
 //! use terminal::{ColorPalette, TerminalConfig};
 //!
 //! let config = TerminalConfig {

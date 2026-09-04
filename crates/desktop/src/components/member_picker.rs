@@ -1,5 +1,4 @@
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Colorize, Icon, IconName, Sizable,
     avatar::Avatar,
     combobox::{Combobox, ComboboxState},
@@ -7,6 +6,7 @@ use gpui_component::{
     searchable_list::{SearchableListItem, SearchableVec},
     theme::ActiveTheme,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::state_machine::ComposerMentionCandidate;
 use pioneer_protocol::PrincipalId;
 use std::path::PathBuf;
@@ -172,7 +172,7 @@ impl RenderOnce for MemberPicker {
                     .placeholder("")
                     .menu_width(px(420.))
                     .check_icon(Icon::new(IconName::Check).opacity(0.0))
-                    .with_size(gpui_component::Size::Small)
+                    .with_size(gpui_kit::component::Size::Small)
                     .render_trigger(|_, _, _| div()),
             )
             .child(

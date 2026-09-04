@@ -6,8 +6,7 @@ use crate::{
     assets::PioneerIconName,
     components::member_picker::{MemberPicker, member_picker_items},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     IconName,
     button::*,
     input::Textarea,
@@ -16,6 +15,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::skill_selection::{
     ComposerSkillChip, ComposerSkillChipKind, ComposerSkillSelection, project_composer_skill_chips,
 };
@@ -725,7 +725,7 @@ impl PioneerDesktop {
                     .justify_center()
                     .child(if is_uploading {
                         Spinner::new()
-                            .with_size(gpui_component::Size::Small)
+                            .with_size(gpui_kit::component::Size::Small)
                             .color(status_color)
                             .into_any_element()
                     } else {

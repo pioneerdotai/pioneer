@@ -16,8 +16,7 @@ use crate::{
     file_opener::{FileOpenerId, available_file_openers},
     settings::{self, AppLanguagePreference, WindowThemePreference},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::*,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -26,6 +25,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::providers::list::ProviderModelSelectorMode;
 use pioneer_client::settings::gateway::{self as gateway_settings, ThreadEpisodicSettingToggle};
 use pioneer_client::settings::memory as settings_memory;

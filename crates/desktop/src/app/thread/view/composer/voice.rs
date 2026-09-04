@@ -16,8 +16,8 @@ use crate::{
     },
     gateway::DesktopGatewayWsCommandSenderExt,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{theme::ActiveTheme, *};
+use gpui_kit::component::{theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     composer::{
         state_machine::ComposerDomainAction,

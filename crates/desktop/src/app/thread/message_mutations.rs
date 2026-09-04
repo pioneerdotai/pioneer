@@ -1,5 +1,5 @@
 use crate::app::root::{DesktopComposerEditTarget, PioneerDesktop};
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::timeline::rows::UserMessagePresentation;
 use pioneer_client::transport::ws::command_sender::turn_message_error_reason;

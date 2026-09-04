@@ -3,8 +3,8 @@ use crate::app::{
     root::{GatewayConnectionState, MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope},
     sidebar::agents_doc_tree_node_key,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{input::EditorState, theme::ActiveTheme};
+use gpui_kit::component::{input::EditorState, theme::ActiveTheme};
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_agents_doc_editor(&self, cx: &mut Context<Self>) -> AnyElement {

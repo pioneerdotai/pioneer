@@ -84,7 +84,9 @@ impl PioneerDesktop {
                             .items_center()
                             .gap_2()
                             .when(show_spinner, |this| {
-                                this.child(Spinner::new().with_size(gpui_component::Size::Small))
+                                this.child(
+                                    Spinner::new().with_size(gpui_kit::component::Size::Small),
+                                )
                             })
                             .when(!show_spinner, |this| {
                                 this.child(
@@ -108,7 +110,7 @@ impl PioneerDesktop {
                                     let gateway_hover_status = gateway_hover_status.clone();
                                     let gateway_hover_error = gateway_hover_error.clone();
 
-                                    gpui_component::tooltip::Tooltip::element(
+                                    gpui_kit::component::tooltip::Tooltip::element(
                                         move |_, element_cx| {
                                             v_flex()
                                                 .w(px(360.))

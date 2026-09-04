@@ -1,9 +1,9 @@
 use crate::app::root::PioneerDesktop;
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName, Sizable, StyledExt, button::*, h_flex, popover::Popover, theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(in crate::app) fn render_task_user_notifications_button(

@@ -30,8 +30,7 @@ use super::root::{
 use crate::app::gateway_setup::GatewaySetupFormState;
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};
 use anyhow::anyhow;
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     WindowExt,
     button::*,
     h_flex,
@@ -42,6 +41,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayEndpointKind};
 use pioneer_client::transport::ws::GatewayWsConnectSpec;
 use pioneer_protocol::GatewayNotification;

@@ -3,8 +3,8 @@ use super::{
     view::{GatewaySetupFormState, render_gateway_setup_form},
 };
 use crate::app::root::{GatewaySetupFormMode, PioneerDesktop};
-use gpui::{prelude::*, *};
-use gpui_component::{StyledExt, WindowExt, *};
+use gpui_kit::component::{StyledExt, WindowExt, *};
+use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn open_add_gateway_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {

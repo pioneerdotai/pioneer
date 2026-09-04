@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use pioneer_config::AppConfig;
 use std::{fs, path::PathBuf};
 
-use gpui::{App, SharedString};
-use gpui_component::{Theme, ThemeMode, ThemeRegistry};
+use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
+use gpui_kit::{App, SharedString};
 
 const THEME_LIGHT: &str = "Pioneer Light";
 const THEME_DARK: &str = "Pioneer Dark";

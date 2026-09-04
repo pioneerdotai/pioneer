@@ -6,7 +6,7 @@ use crate::{
     state as desktop_state,
 };
 use anyhow::{Context as _, Result, bail};
-use gpui::{AppContext, AsyncApp, Context, WeakEntity};
+use gpui_kit::{AppContext, AsyncApp, Context, WeakEntity};
 use image::{DynamicImage, GenericImageView as _, ImageFormat, imageops::FilterType};
 use pioneer_client::artifacts::{
     presentation as client_artifact_presentation, preview as client_artifact_preview,

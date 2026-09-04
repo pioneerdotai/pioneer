@@ -3,8 +3,7 @@ use crate::app::root::{
     GatewayConnectionState, PioneerDesktop, ThreadArtifactActionStatus, ThreadArtifactFilter,
 };
 use chrono::{Local, TimeZone};
-use gpui::{StatefulInteractiveElement as _, prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
@@ -12,6 +11,7 @@ use gpui_component::{
     theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{StatefulInteractiveElement as _, prelude::*, *};
 use pioneer_client::artifacts::presentation as client_artifact_presentation;
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,

@@ -3,7 +3,7 @@ use crate::{
     gateway::GatewayWsCommandSender,
 };
 use anyhow::Result;
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::skills::{
     actions as skill_actions,
     archive::{

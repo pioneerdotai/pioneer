@@ -16,10 +16,10 @@ use crate::app::{
     conversation::ConversationViewState,
     root::{PendingRequest, PioneerDesktop},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName, StyledExt, h_flex, scroll::Scrollbar, v_flex, v_virtual_list,
 };
+use gpui_kit::{prelude::*, *};
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},

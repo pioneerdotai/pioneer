@@ -2,8 +2,8 @@ mod actions;
 mod dialogs;
 mod view;
 
-use gpui::{prelude::*, *};
-use gpui_component::{theme::ActiveTheme, *};
+use gpui_kit::component::{theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 pub(in crate::app) use view::agents_doc_tree_node_key;
 
 #[derive(Clone)]

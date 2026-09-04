@@ -1,6 +1,6 @@
 use crate::{app::root::PioneerDesktop, assets::PioneerIconName};
-use gpui::{prelude::*, *};
-use gpui_component::{button::*, scroll::Scrollbar, theme::ActiveTheme, *};
+use gpui_kit::component::{button::*, scroll::Scrollbar, theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::presentation as mcp_presentation;
 use pioneer_protocol::{McpListItem, McpServerStatus};
 use std::rc::Rc;

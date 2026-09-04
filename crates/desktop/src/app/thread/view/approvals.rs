@@ -2,8 +2,7 @@ use crate::{
     app::root::{PendingRequest, PioneerDesktop},
     components::buttonts::{default_outline_button, default_primary_button},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName, WindowExt,
     button::*,
     dialog::DialogFooter,
@@ -13,6 +12,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::cli_runtime::approvals::{
     PendingRequestActionKind, PendingRequestAvailableAction, PendingRequestDetailRow,
     PendingRequestDetailStyle, PendingRequestKind, PendingRequestPresentation,
@@ -561,7 +561,7 @@ fn render_user_input_question_summary(
 #[cfg(test)]
 mod tests {
     use super::{pending_request_action_element_prefix, pending_request_icon};
-    use gpui_component::{IconName, IconNamed};
+    use gpui_kit::component::{IconName, IconNamed};
     use pioneer_client::cli_runtime::approvals::PendingRequestActionKind;
     use pioneer_client::cli_runtime::approvals::PendingRequestKind;
 

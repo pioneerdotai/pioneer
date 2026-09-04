@@ -2,8 +2,7 @@ use crate::{
     app::root::{ComposerCapability, GatewayConnectionState, PioneerDesktop},
     components::buttonts::{default_outline_button, default_primary_button},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     WindowExt,
     button::*,
     dialog::DialogFooter,
@@ -13,6 +12,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::capabilities as composer_capabilities;
 use pioneer_client::composer::capabilities::{
     McpCapabilityUnavailableReason, SelectableMcpCapability, SelectableSkillCapability,

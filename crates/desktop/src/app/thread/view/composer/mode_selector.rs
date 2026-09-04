@@ -1,7 +1,7 @@
 use crate::app::root::{DesktopComposerEditTarget, PioneerDesktop};
 use crate::assets::PioneerIconName;
-use gpui::{prelude::*, *};
-use gpui_component::{Icon, button::*, theme::ActiveTheme, *};
+use gpui_kit::component::{Icon, button::*, theme::ActiveTheme, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::composer::{
     model_selection as composer_model_selection,
     state_machine::{ComposerDomainAction, ComposerReplyTarget},

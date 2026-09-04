@@ -22,9 +22,9 @@ mod window;
 use anyhow::Context as _;
 use assets::PioneerAssetsSource;
 use futures_util::{AsyncReadExt as _, FutureExt as _, future::BoxFuture};
-use gpui::http_client::{self, HttpClient};
-use gpui::*;
-use gpui_component::Root;
+use gpui_kit::component::Root;
+use gpui_kit::http_client::{self, HttpClient};
+use gpui_kit::*;
 use reqwest::header::HeaderValue;
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,7 +206,7 @@ fn main() {
     let (url_sender, mut url_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
     let ui_runtime_stage =
         startup.stage(pioneer_observability::DesktopStartupStage::UiRuntimeInitialize);
-    let app = gpui_platform::application()
+    let app = gpui_kit::application()
         .with_assets(PioneerAssetsSource)
         .with_http_client(Arc::new(http_client));
     ui_runtime_stage.succeed();
@@ -221,7 +221,7 @@ fn main() {
         ui_event_loop_stage.succeed();
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         theme::init(cx);
         menu::init_system_menus(cx);
 
@@ -233,7 +233,7 @@ fn main() {
             let window_stage =
                 startup.stage(pioneer_observability::DesktopStartupStage::WindowOpen);
             let window_options = WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                titlebar: Some(gpui_kit::component::TitleBar::title_bar_options()),
                 window_bounds: Some(initial_window_bounds),
                 ..Default::default()
             };

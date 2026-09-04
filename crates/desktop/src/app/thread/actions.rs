@@ -1,6 +1,6 @@
 use super::super::root::{ComposerCapability, PioneerDesktop};
 use crate::gateway::DesktopGatewayWsCommandSenderExt;
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::cli_runtime::approvals::{
     PendingRequest, PendingRequestResolution, PendingRequestResponseAction,
     PendingRequestsReduction, plan_pending_request_response,

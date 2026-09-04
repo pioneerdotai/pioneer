@@ -3,8 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui::{prelude::*, *};
-use gpui_component::theme::ActiveTheme as _;
+use gpui_kit::component::theme::ActiveTheme as _;
+use gpui_kit::{prelude::*, *};
 use pioneer_observability::{
     DesktopCodeHighlightCacheStatus, DesktopCodeHighlightFallbackReason,
     DesktopCodeHighlightMetric, DesktopCodeHighlightOutcome, DesktopCodeHighlightTheme,
@@ -252,7 +252,7 @@ mod tests {
             blue: 0x56,
             alpha: 0x78,
         });
-        let expected: gpui::Hsla = gpui::rgba(0x12345678).into();
+        let expected: gpui_kit::Hsla = gpui_kit::rgba(0x12345678).into();
         assert_eq!(color, expected);
     }
 }

@@ -1,5 +1,5 @@
-use gpui::{AssetSource, IntoElement, Result, SharedString, prelude::*};
-use gpui_component::{Icon, IconNamed};
+use gpui_kit::component::{Icon, IconNamed};
+use gpui_kit::{AssetSource, IntoElement, Result, SharedString, prelude::*};
 use rust_embed::RustEmbed;
 use std::borrow::Cow;
 
@@ -12,7 +12,7 @@ use std::borrow::Cow;
 struct PioneerAssets;
 
 /// Asset source that serves Pioneer's custom icons,
-/// falling back to gpui-component-assets for built-in icons.
+/// falling back to GPUI Kit's bundled assets for built-in icons.
 pub struct PioneerAssetsSource;
 
 impl AssetSource for PioneerAssetsSource {
@@ -25,7 +25,7 @@ impl AssetSource for PioneerAssetsSource {
             return Ok(Some(file.data));
         }
 
-        gpui_component_assets::Assets.load(path)
+        gpui_kit::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -34,7 +34,7 @@ impl AssetSource for PioneerAssetsSource {
             .map(|p| p.into())
             .collect();
 
-        if let Ok(mut base_items) = gpui_component_assets::Assets.list(path) {
+        if let Ok(mut base_items) = gpui_kit::assets::Assets.list(path) {
             items.append(&mut base_items);
         }
 
@@ -123,7 +123,7 @@ impl IconNamed for PioneerIconName {
 }
 
 impl RenderOnce for PioneerIconName {
-    fn render(self, _: &mut gpui::Window, _: &mut gpui::App) -> impl IntoElement {
+    fn render(self, _: &mut gpui_kit::Window, _: &mut gpui_kit::App) -> impl IntoElement {
         Icon::new(self)
     }
 }
@@ -132,7 +132,7 @@ impl RenderOnce for PioneerIconName {
 mod tests {
     use super::PioneerAssetsSource;
     use crate::file_opener::FILE_OPENER_CANDIDATES;
-    use gpui::AssetSource as _;
+    use gpui_kit::AssetSource as _;
 
     #[test]
     fn serves_running_turn_dino_assets() {

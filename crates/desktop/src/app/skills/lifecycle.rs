@@ -2,7 +2,7 @@ use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop},
     gateway::GatewayRuntime,
 };
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     skills::actions as skill_actions, skills::catalog as skill_catalog,
     workspaces::selectors as workspace_selectors,

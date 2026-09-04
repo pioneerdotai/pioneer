@@ -3,8 +3,7 @@ use crate::{
     app::root::{GatewayConnectionState, PioneerDesktop, ProviderFilter},
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::*,
     form::{field, v_form},
     input::{Input, InputEvent, InputState},
@@ -13,6 +12,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::providers::cli_runtime_settings::CLIRuntimeProviderDraftField;
 use pioneer_client::providers::diagnostics::{
     CliRuntimeMcpReadinessReason, cli_runtime_mcp_readiness_reason,

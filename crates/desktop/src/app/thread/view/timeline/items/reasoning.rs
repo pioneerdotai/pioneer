@@ -8,8 +8,8 @@ use crate::{
     },
     assets::PioneerIconName,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::reasoning_text;
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};

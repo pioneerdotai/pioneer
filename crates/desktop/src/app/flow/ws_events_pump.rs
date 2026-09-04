@@ -3,7 +3,7 @@ use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop},
     gateway::GatewayRuntime,
 };
-use gpui::{AsyncApp, Context, WeakEntity, prelude::*};
+use gpui_kit::{AsyncApp, Context, WeakEntity, prelude::*};
 use pioneer_client::runtime::ClientRuntimePostEventSink;
 use pioneer_client::transport::ws::GatewayWsEvent;
 use pioneer_protocol::GatewayNotification;

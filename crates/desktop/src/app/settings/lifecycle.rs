@@ -9,11 +9,11 @@ use crate::{
     settings::{self, AppLanguagePreference, WindowThemePreference},
     window,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     theme::{Theme, ThemeMode},
     tree::TreeItem,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::settings::{
     gateway as gateway_settings, memory as settings_memory,
     self_improvement as settings_self_improvement, voice as voice_input_settings,

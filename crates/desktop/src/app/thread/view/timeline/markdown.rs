@@ -3,10 +3,10 @@ use crate::{
     assets::PioneerIconName,
     file_opener::{LocalFileTarget, local_file_target, open_local_file},
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     IconName, IconNamed, StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::conversation::TimelineEntryStatus;
 use pioneer_protocol::{
     MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownMark, MarkdownMarkKind,

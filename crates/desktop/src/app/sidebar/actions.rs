@@ -2,7 +2,7 @@ use crate::app::{
     root::{GatewayConnectionState, MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope},
     sidebar::{SidebarTreeDragItem, SidebarTreeDragPayload},
 };
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::agents_doc::scope as agents_doc_scope;
 use pioneer_client::threads::{scope as thread_scope, tree as thread_tree};
 use pioneer_client::workspaces::selectors as workspace_selectors;

@@ -5,8 +5,8 @@ use super::content::{
 };
 use crate::gateway::GatewayWsCommandSender;
 use anyhow::Error;
-use gpui::{prelude::*, *};
-use gpui_component::input::{EditorState, InputEvent};
+use gpui_kit::component::input::{EditorState, InputEvent};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::agents_doc::autosave::{
     AGENTS_DOC_AUTOSAVE_DELAY, AgentsDocAutosaveDecision, AgentsDocAutosaveState,
     AgentsDocEditorLoadState, AgentsDocEditorSaveState,

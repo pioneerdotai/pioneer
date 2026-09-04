@@ -1,6 +1,8 @@
 use super::state::AgentsDocEditor;
-use gpui::{prelude::*, *};
-use gpui_component::{button::*, input::Editor, scroll::ScrollableElement, theme::ActiveTheme, *};
+use gpui_kit::component::{
+    button::*, input::Editor, scroll::ScrollableElement, theme::ActiveTheme, *,
+};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::agents_doc::autosave::{AgentsDocEditorLoadState, AgentsDocEditorSaveState};
 
 const AGENTS_DOC_EDITOR_LINE_HEIGHT_PX: f32 = 25.0;

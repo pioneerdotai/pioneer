@@ -4,7 +4,7 @@ use crate::{
     state as desktop_state,
 };
 use anyhow::{Context as AnyhowContext, Result};
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::artifacts::{
     actions as client_artifact_actions,
     http_download::{ArtifactHttpDownloadError, ArtifactHttpDownloadProgress},

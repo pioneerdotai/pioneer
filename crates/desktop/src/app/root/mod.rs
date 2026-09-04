@@ -33,11 +33,11 @@ use crate::{
     gateway::{ClientRuntime, DesktopGatewayHttpClient, GatewayRuntime, GatewayWsCommandSender},
 };
 pub(super) use desktop_update::DesktopUpdateUiState;
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     VirtualListScrollHandle, combobox::ComboboxState, input::TextareaState, table::TableState,
     tree::TreeState,
 };
+use gpui_kit::{prelude::*, *};
 pub(super) use pioneer_client::{
     administration::AdministrationCache,
     agents_doc::scope::{

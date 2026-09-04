@@ -27,11 +27,8 @@ semver.workspace = true
 sha2.workspace = true
 toml.workspace = true
 zeroize.workspace = true
-gpui.workspace = true
-gpui_platform.workspace = true
 terminal.workspace = true
-gpui-component.workspace = true
-gpui-component-assets.workspace = true
+gpui-kit = { workspace = true, features = ["component", "assets"] }
 rust-i18n.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

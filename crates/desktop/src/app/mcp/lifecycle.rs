@@ -2,7 +2,7 @@ use crate::{
     app::root::{GatewayConnectionState, MainContentView, PioneerDesktop},
     gateway::GatewayRuntime,
 };
-use gpui::{prelude::*, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::mcp::{
     actions as mcp_actions, details as mcp_details, list as mcp_list,
     notifications::{

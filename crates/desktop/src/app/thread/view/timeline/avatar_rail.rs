@@ -4,8 +4,8 @@ use super::layout::{
 };
 use super::running_indicator::RunningDinoView;
 use crate::app::root::PioneerDesktop;
-use gpui::{prelude::*, *};
-use gpui_component::{Sizable as _, avatar::Avatar};
+use gpui_kit::component::{Sizable as _, avatar::Avatar};
+use gpui_kit::{prelude::*, *};
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
@@ -31,7 +31,7 @@ impl PioneerDesktop {
     pub(super) fn render_timeline_avatar_rail(
         &mut self,
         layout: Rc<TimelineLayoutIndex>,
-        scroll_handle: gpui_component::VirtualListScrollHandle,
+        scroll_handle: gpui_kit::component::VirtualListScrollHandle,
         content_width: Pixels,
         rendered_list_width: Pixels,
         cx: &mut Context<Self>,
@@ -268,7 +268,7 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
             .src(path.clone())
             .with_size(TIMELINE_AVATAR_SIZE)
             .into_any_element(),
-        // gpui-component gives custom-size initials a half-size layout box. Use the
+        // GPUI Component gives custom-size initials a half-size layout box. Use the
         // unconstrained Medium initials layout, then override only the outer box back
         // to the established 32 px timeline size.
         TimelineAvatarVisual::HistoricalUser { display_name, .. } => Avatar::new()

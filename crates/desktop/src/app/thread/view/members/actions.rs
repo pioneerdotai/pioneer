@@ -1,6 +1,6 @@
 use super::state::participant_summaries;
 use crate::app::root::{GatewayConnectionState, PioneerDesktop};
-use gpui::{AsyncApp, Context, WeakEntity, prelude::*};
+use gpui_kit::{AsyncApp, Context, WeakEntity, prelude::*};
 use pioneer_client::threads::scope::{ThreadScopeAction, ThreadScopePendingAction};
 use pioneer_protocol::{
     PrincipalId, ThreadParticipantMutationParams, ThreadUpdateParams, ThreadVisibility,

@@ -1,9 +1,9 @@
-use gpui::{prelude::FluentBuilder as _, *};
-use gpui_component::{
+use gpui_kit::component::{
     Icon, IconName, h_flex,
     table::{Column, TableDelegate, TableState},
     theme::ActiveTheme,
 };
+use gpui_kit::{prelude::FluentBuilder as _, *};
 pub(crate) use pioneer_client::skills::presentation::{
     SkillDiagnosticsTableCell, SkillDiagnosticsTableRow, SkillDiagnosticsTone,
 };
@@ -105,11 +105,11 @@ impl TableDelegate for SkillDiagnosticsTableDelegate {
             .when(!hint.is_empty(), |this| {
                 this.child(
                     div()
-                        .id((gpui::ElementId::from((self.scope, col_ix)), "hint"))
+                        .id((gpui_kit::ElementId::from((self.scope, col_ix)), "hint"))
                         .text_color(cx.theme().muted_foreground.opacity(0.8))
                         .child(Icon::new(IconName::Info).size_2p5().mt_px())
                         .tooltip(move |window, tooltip_cx| {
-                            gpui_component::tooltip::Tooltip::new(hint.clone())
+                            gpui_kit::component::tooltip::Tooltip::new(hint.clone())
                                 .text_xs()
                                 .text_color(tooltip_cx.theme().popover_foreground)
                                 .build(window, tooltip_cx)
@@ -165,7 +165,7 @@ impl TableDelegate for SkillDiagnosticsTableDelegate {
         };
 
         div()
-            .id((gpui::ElementId::from((self.scope, row_ix)), col_marker))
+            .id((gpui_kit::ElementId::from((self.scope, row_ix)), col_marker))
             .h_full()
             .flex()
             .items_center()

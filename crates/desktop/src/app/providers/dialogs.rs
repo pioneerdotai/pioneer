@@ -1,7 +1,6 @@
 use crate::app::root::PioneerDesktop;
 use crate::components::buttonts::{default_outline_button, default_primary_button};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     WindowExt,
     button::*,
     dialog::DialogFooter,
@@ -11,6 +10,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::providers::cli_runtime_settings::{
     self as cli_provider_settings, CLIRuntimeProviderDraft, CLIRuntimeProviderDraftField,
     CLIRuntimeProviderDraftMode, CLIRuntimeProviderSettingsRejection,
@@ -593,7 +593,7 @@ fn cli_runtime_provider_draft_field_from_settings_field(
 fn cli_runtime_provider_dialog_error_field(
     error: String,
     cx: &mut App,
-) -> gpui_component::form::Field {
+) -> gpui_kit::component::form::Field {
     field().label_indent(false).child(
         div()
             .text_sm()

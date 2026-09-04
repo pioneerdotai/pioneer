@@ -3,8 +3,8 @@ use crate::{
     file_opener::{FileOpenerId, available_or_file_manager, is_file_opener_available},
     settings::{self, FileOpenerThreadScope, FileOpenerWorkspaceScope},
 };
-use gpui::{AnyElement, App, Context, ElementId, SharedString, div, img, prelude::*, px};
-use gpui_component::{Icon, IconName, button::Button, h_flex, theme::ActiveTheme};
+use gpui_kit::component::{Icon, IconName, button::Button, h_flex, theme::ActiveTheme};
+use gpui_kit::{AnyElement, App, Context, ElementId, SharedString, div, img, prelude::*, px};
 use tracing::warn;
 
 use super::PioneerDesktop;

@@ -5,10 +5,10 @@ use crate::{
         device_activation_form::CredentialPresentationForm,
     },
 };
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     button::*, dialog::DialogFooter, form::field, spinner::Spinner, theme::ActiveTheme, *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     administration::{AdministrationAction, InvitationPresentationStatus, invitation_list_row},
     gateway::invitation::InvitationQrPresentation,

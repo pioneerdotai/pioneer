@@ -1,7 +1,6 @@
 use super::{MainContentView, PioneerDesktop};
 use crate::{assets::PioneerIconName, settings::WindowThemePreference, window};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     Disableable, Icon, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
@@ -10,20 +9,21 @@ use gpui_component::{
     theme::{ActiveTheme, Theme, ThemeMode},
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 
 impl Render for PioneerDesktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_desktop_startup_readiness(window, cx);
-        let sheet_layer = gpui_component::Root::render_sheet_layer(window, cx);
-        let dialog_layer = gpui_component::Root::render_dialog_layer(window, cx);
-        let notification_layer = gpui_component::Root::render_notification_layer(window, cx);
+        let sheet_layer = gpui_kit::component::Root::render_sheet_layer(window, cx);
+        let dialog_layer = gpui_kit::component::Root::render_dialog_layer(window, cx);
+        let notification_layer = gpui_kit::component::Root::render_notification_layer(window, cx);
         let invitation_join = self.invitation_join.clone();
         let invitation_active = invitation_join.is_some();
 
         let theme_icon = if cx.theme().mode.is_dark() {
-            gpui_component::IconName::Sun
+            gpui_kit::component::IconName::Sun
         } else {
-            gpui_component::IconName::Moon
+            gpui_kit::component::IconName::Moon
         };
 
         let is_gateway_setup_required = self.is_gateway_setup_required();
@@ -138,7 +138,7 @@ impl Render for PioneerDesktop {
                 v_flex()
                     .size_full()
                     .child(
-                        gpui_component::TitleBar::new().child(
+                        gpui_kit::component::TitleBar::new().child(
                             h_flex()
                                 .w_full()
                                 .pr_4()

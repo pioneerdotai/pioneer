@@ -2,7 +2,7 @@ use super::*;
 use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::components::member_picker::{MemberPickerDelegate, new_member_picker_state};
 use crate::{state, window};
-use gpui_component::table::TableState;
+use gpui_kit::component::table::TableState;
 use pioneer_client::composer::{
     model_selection::default_composer_turn_mode, permissions::default_composer_permission_mode,
 };
@@ -266,8 +266,8 @@ impl PioneerDesktop {
         let composer_state = view.composer_state.clone();
         view.composer_input_subscription = Some(cx.subscribe(
             &composer_state,
-            |view, input, event: &gpui_component::input::InputEvent, cx| {
-                if !matches!(event, gpui_component::input::InputEvent::Change) {
+            |view, input, event: &gpui_kit::component::input::InputEvent, cx| {
+                if !matches!(event, gpui_kit::component::input::InputEvent::Change) {
                     return;
                 }
                 let text = input.read(cx).value();
@@ -290,10 +290,10 @@ impl PioneerDesktop {
             window,
             |_view,
              select,
-             event: &gpui_component::combobox::ComboboxEvent<MemberPickerDelegate>,
+             event: &gpui_kit::component::combobox::ComboboxEvent<MemberPickerDelegate>,
              window,
              cx| {
-                if let gpui_component::combobox::ComboboxEvent::Confirm(candidates) = event {
+                if let gpui_kit::component::combobox::ComboboxEvent::Confirm(candidates) = event {
                     let Some(candidate) = candidates.first().cloned() else {
                         return;
                     };
@@ -319,10 +319,10 @@ impl PioneerDesktop {
             window,
             |_view,
              select,
-             event: &gpui_component::combobox::ComboboxEvent<MemberPickerDelegate>,
+             event: &gpui_kit::component::combobox::ComboboxEvent<MemberPickerDelegate>,
              window,
              cx| {
-                if let gpui_component::combobox::ComboboxEvent::Confirm(candidates) = event {
+                if let gpui_kit::component::combobox::ComboboxEvent::Confirm(candidates) = event {
                     let Some(candidate) = candidates.first().cloned() else {
                         return;
                     };

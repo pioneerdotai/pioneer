@@ -2,8 +2,8 @@ use super::{
     PROVIDERS_FILTER_API_NODE_ID, PROVIDERS_FILTER_CLI_NODE_ID, PROVIDERS_FILTER_CONNECTED_NODE_ID,
 };
 use crate::app::root::{PioneerDesktop, ProviderFilter};
-use gpui::{ClickEvent, prelude::*, *};
-use gpui_component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
+use gpui_kit::component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
+use gpui_kit::{ClickEvent, prelude::*, *};
 use pioneer_client::providers::selectors;
 
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;

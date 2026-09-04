@@ -1,4 +1,4 @@
-use gpui::{
+use gpui_kit::{
     App, ClipboardItem, KeyBinding, Menu, MenuItem, PromptButton, PromptLevel, SystemMenuType,
     actions,
 };

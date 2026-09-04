@@ -8,14 +8,14 @@ use crate::{
     gateway::{DesktopInvitationCommitError, DesktopInvitationRegistryRecovery, GatewayRuntime},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     input::{InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
     spinner::Spinner,
     theme::ActiveTheme,
     v_flex,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     gateway::invitation::{
         InvitationJoinField, InvitationJoinFlow, InvitationJoinPhase, InvitationJoinSafeProfile,

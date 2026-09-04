@@ -1,6 +1,6 @@
 use crate::settings::WindowOpenState;
 use anyhow::{Context as _, Result};
-use gpui::{App, Global};
+use gpui_kit::{App, Global};
 use pioneer_config::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::PathBuf};

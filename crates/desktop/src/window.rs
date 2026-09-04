@@ -2,7 +2,7 @@ use crate::{
     settings::{self, WindowOpenState, WindowThemePreference},
     state::{self, WindowState},
 };
-use gpui::{App, Bounds, Context, Window, WindowBounds, point, px, size};
+use gpui_kit::{App, Bounds, Context, Window, WindowBounds, point, px, size};
 use tracing::warn;
 
 const DEFAULT_RESTORE_WIDTH: f32 = 1280.0;

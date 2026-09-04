@@ -4,8 +4,8 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
 };
-use gpui::{prelude::*, *};
-use gpui_component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::{
     TimelineFinalStatusKind, download_display_url, final_download_status, format_bytes_human,
 };

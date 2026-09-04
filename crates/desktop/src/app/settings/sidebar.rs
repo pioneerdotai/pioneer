@@ -3,8 +3,8 @@ use super::{
     SETTINGS_CONTENT_MEMORY_NODE_ID, SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID,
 };
 use crate::app::root::{PioneerDesktop, SettingsContentView};
-use gpui::{ClickEvent, prelude::*, *};
-use gpui_component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
+use gpui_kit::component::{list::ListItem, theme::ActiveTheme, tree::tree, *};
+use gpui_kit::{ClickEvent, prelude::*, *};
 
 const TREE_ROW_HEIGHT_PX: f32 = 32.0;
 const TREE_ROW_CONTENT_HEIGHT_PX: f32 = 28.0;

@@ -5,8 +5,7 @@ use crate::app::{
     },
 };
 use chrono::{Local, TimeZone};
-use gpui::{prelude::*, *};
-use gpui_component::{
+use gpui_kit::component::{
     StyledExt,
     button::*,
     collapsible::Collapsible,
@@ -15,6 +14,7 @@ use gpui_component::{
     theme::ActiveTheme,
     *,
 };
+use gpui_kit::{prelude::*, *};
 use pioneer_client::skills::{
     catalog as skill_catalog, health as skill_health, presentation as skill_presentation,
     presentation::{SkillDiagnosticsTableCell, SkillDiagnosticsTableRow, SkillDiagnosticsTone},
@@ -896,10 +896,12 @@ impl PioneerDesktop {
                                 .mt_px()
                                 .child(Icon::new(IconName::Info).size_2p5())
                                 .tooltip(move |window, tooltip_cx| {
-                                    gpui_component::tooltip::Tooltip::new(hint_for_tooltip.clone())
-                                        .text_xs()
-                                        .text_color(tooltip_cx.theme().popover_foreground)
-                                        .build(window, tooltip_cx)
+                                    gpui_kit::component::tooltip::Tooltip::new(
+                                        hint_for_tooltip.clone(),
+                                    )
+                                    .text_xs()
+                                    .text_color(tooltip_cx.theme().popover_foreground)
+                                    .build(window, tooltip_cx)
                                 }),
                         )
                     }),
@@ -962,10 +964,12 @@ impl PioneerDesktop {
                                 .mt_px()
                                 .child(Icon::new(IconName::Info).size_2p5())
                                 .tooltip(move |window, tooltip_cx| {
-                                    gpui_component::tooltip::Tooltip::new(hint_for_tooltip.clone())
-                                        .text_xs()
-                                        .text_color(tooltip_cx.theme().popover_foreground)
-                                        .build(window, tooltip_cx)
+                                    gpui_kit::component::tooltip::Tooltip::new(
+                                        hint_for_tooltip.clone(),
+                                    )
+                                    .text_xs()
+                                    .text_color(tooltip_cx.theme().popover_foreground)
+                                    .build(window, tooltip_cx)
                                 }),
                         )
                     }),
@@ -1078,7 +1082,7 @@ impl PioneerDesktop {
         row_count: usize,
     ) -> AnyElement {
         let visible_rows = row_count.clamp(1, 8) as f32;
-        let row_height = gpui_component::Size::Small.table_row_height();
+        let row_height = gpui_kit::component::Size::Small.table_row_height();
         let table_height = row_height * (visible_rows + 1.) + px(2.);
 
         div()
@@ -1086,7 +1090,7 @@ impl PioneerDesktop {
             .h(table_height)
             .child(
                 DataTable::new(state_entity)
-                    .with_size(gpui_component::Size::Small)
+                    .with_size(gpui_kit::component::Size::Small)
                     .scrollbar_visible(true, false),
             )
             .into_any_element()
