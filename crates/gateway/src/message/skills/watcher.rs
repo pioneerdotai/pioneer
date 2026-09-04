@@ -23,7 +23,12 @@ impl MessageProcessor {
                 let workspaces_stage = startup_trace.as_ref().map(|trace| {
                     trace.stage(pioneer_observability::GatewayOperationStage::SkillsWorkspacesLoad)
                 });
-                let workspaces = match this.workspace_manager.list_workspaces().await {
+                let workspaces = match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::SkillsWatch,
+                    this.workspace_manager.list_workspaces(),
+                )
+                .await
+                {
                     Ok(workspaces) => {
                         if let Some(stage) = workspaces_stage {
                             stage.succeed();
@@ -134,12 +139,16 @@ impl MessageProcessor {
                 for (workspace_id, configured, managed) in changes {
                     let changed = configured.is_some() || managed.is_some();
                     if let Some(config) = configured
-                        && let Err(error) = import_configured_skill_roots(
-                            this.crud_store.as_ref(),
-                            &this.skills_write_lock,
-                            &config,
-                        )
-                        .await
+                        && let Err(error) =
+                            crate::database::attribution::scope_database_workload_result(
+                                pioneer_observability::DatabaseWorkload::SkillsWatch,
+                                import_configured_skill_roots(
+                                    this.crud_store.as_ref(),
+                                    &this.skills_write_lock,
+                                    &config,
+                                ),
+                            )
+                            .await
                     {
                         warn!(
                             workspace_id,
@@ -148,12 +157,16 @@ impl MessageProcessor {
                         );
                     }
                     if let Some(config) = managed
-                        && let Err(error) = scan_managed_skill_roots(
-                            this.crud_store.as_ref(),
-                            &this.skills_write_lock,
-                            &config,
-                        )
-                        .await
+                        && let Err(error) =
+                            crate::database::attribution::scope_database_workload_result(
+                                pioneer_observability::DatabaseWorkload::SkillsWatch,
+                                scan_managed_skill_roots(
+                                    this.crud_store.as_ref(),
+                                    &this.skills_write_lock,
+                                    &config,
+                                ),
+                            )
+                            .await
                     {
                         warn!(
                             workspace_id,

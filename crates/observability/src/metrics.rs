@@ -14,14 +14,18 @@ static NATIVE_LIFECYCLE_DEPTH_VALUES: [AtomicU64; 5] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
+static GATEWAY_ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static GATEWAY_DATABASE_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum DatabaseRole {
     Reader,
     Writer,
 }
 
 impl DatabaseRole {
+    pub const CARDINALITY: usize = 2;
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Reader => "reader",
@@ -30,7 +34,7 @@ impl DatabaseRole {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum DatabaseOperation {
     Select,
     Insert,
@@ -43,7 +47,21 @@ pub enum DatabaseOperation {
     Other,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DatabaseOperationMetric {
+    pub role: DatabaseRole,
+    pub operation: DatabaseOperation,
+    pub workload: crate::DatabaseWorkload,
+    /// Stable, value-free SQL-shape fingerprint. Zero is the bounded overflow
+    /// bucket and never represents a raw query or application identifier.
+    pub query_fingerprint: u64,
+    pub elapsed: Duration,
+    pub failed: bool,
+}
+
 impl DatabaseOperation {
+    pub const CARDINALITY: usize = 9;
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Select => "select",
@@ -130,6 +148,11 @@ pub(crate) struct GatewayMetrics {
     pub(crate) database_admission_wait_duration: Histogram<f64>,
     pub(crate) database_admission_quantum_duration: Histogram<f64>,
     pub(crate) database_admission_queue_depth: Histogram<u64>,
+    pub(crate) database_workload_operations: Counter<u64>,
+    pub(crate) database_workload_duration: Histogram<f64>,
+    pub(crate) database_workload_query_count: Histogram<u64>,
+    pub(crate) database_workload_query_duration: Histogram<f64>,
+    pub(crate) database_workload_anomalies: Counter<u64>,
     pub(crate) provider_warmup_duration: Histogram<f64>,
     pub(crate) provider_warmup_stage_duration: Histogram<f64>,
     pub(crate) provider_warmup_failures: Counter<u64>,
@@ -250,6 +273,36 @@ impl GatewayMetrics {
             .with_boundaries(vec![
                 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1_024.0,
             ])
+            .build();
+        let database_workload_operations = meter
+            .u64_counter("pioneer.gateway.db.workload.operations")
+            .with_description("Logical Gateway database-capable work units by bounded owner")
+            .with_unit("{operation}")
+            .build();
+        let database_workload_duration = meter
+            .f64_histogram("pioneer.gateway.db.workload.duration")
+            .with_description("End-to-end duration of a bounded Gateway database work unit")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let database_workload_query_count = meter
+            .u64_histogram("pioneer.gateway.db.workload.query_count")
+            .with_description("SQLite statement count within one bounded Gateway work unit")
+            .with_unit("{query}")
+            .with_boundaries(operation_item_boundaries())
+            .build();
+        let database_workload_query_duration = meter
+            .f64_histogram("pioneer.gateway.db.workload.query_duration")
+            .with_description("Cumulative SQLite execution time within one Gateway work unit")
+            .with_unit("ms")
+            .with_boundaries(operation_duration_boundaries())
+            .build();
+        let database_workload_anomalies = meter
+            .u64_counter("pioneer.gateway.db.workload.anomalies")
+            .with_description(
+                "Database work units exceeding bounded amplification, latency or failure thresholds",
+            )
+            .with_unit("{anomaly}")
             .build();
         let provider_warmup_duration = meter
             .f64_histogram("pioneer.gateway.providers.warmup.duration")
@@ -373,6 +426,11 @@ impl GatewayMetrics {
             database_admission_wait_duration,
             database_admission_quantum_duration,
             database_admission_queue_depth,
+            database_workload_operations,
+            database_workload_duration,
+            database_workload_query_count,
+            database_workload_query_duration,
+            database_workload_anomalies,
             provider_warmup_duration,
             provider_warmup_stage_duration,
             provider_warmup_failures,
@@ -1182,12 +1240,7 @@ impl Visit for PoolAcquireEventVisitor {
     fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
 }
 
-pub fn record_database_operation(
-    role: DatabaseRole,
-    operation: DatabaseOperation,
-    elapsed: Duration,
-    failed: bool,
-) {
+pub fn record_database_operation(metric: DatabaseOperationMetric) {
     if !super::telemetry_enabled() {
         return;
     }
@@ -1196,10 +1249,15 @@ pub fn record_database_operation(
     };
     let attributes = [
         KeyValue::new("db.system.name", "sqlite"),
-        KeyValue::new("db.pool.role", role.as_str()),
-        KeyValue::new("db.operation.name", operation.as_str()),
-        KeyValue::new("db.operation.type", operation.kind()),
-        KeyValue::new("outcome", if failed { "error" } else { "ok" }),
+        KeyValue::new("db.pool.role", metric.role.as_str()),
+        KeyValue::new("db.operation.name", metric.operation.as_str()),
+        KeyValue::new("db.operation.type", metric.operation.kind()),
+        KeyValue::new("db.workload.name", metric.workload.as_str()),
+        KeyValue::new(
+            "db.query.fingerprint",
+            crate::database_workload::fingerprint_attribute_value(metric.query_fingerprint),
+        ),
+        KeyValue::new("outcome", if metric.failed { "error" } else { "ok" }),
     ];
     let Some(metrics) = state.gateway_metrics.as_ref() else {
         return;
@@ -1207,7 +1265,127 @@ pub fn record_database_operation(
     metrics.database_operations.add(1, &attributes);
     metrics
         .database_operation_duration
-        .record(elapsed.as_secs_f64() * 1_000.0, &attributes);
+        .record(metric.elapsed.as_secs_f64() * 1_000.0, &attributes);
+}
+
+pub fn record_gateway_active_connections(value: u64) {
+    GATEWAY_ACTIVE_CONNECTIONS.store(value, Ordering::Release);
+}
+
+pub fn record_gateway_database_size_bytes(value: u64) {
+    GATEWAY_DATABASE_SIZE_BYTES.store(value, Ordering::Release);
+}
+
+fn database_runtime_context() -> (u64, u64, u64, u64) {
+    let active_turns = NATIVE_LIFECYCLE_DEPTH_VALUES[NativeLifecycleDepthKind::ActiveTurns.index()]
+        .load(Ordering::Acquire);
+    let recovery_backlog = NATIVE_LIFECYCLE_DEPTH_VALUES
+        [NativeLifecycleDepthKind::RecoveryBacklog.index()]
+    .load(Ordering::Acquire);
+    let active_connections = GATEWAY_ACTIVE_CONNECTIONS.load(Ordering::Acquire);
+    let database_size_bytes = GATEWAY_DATABASE_SIZE_BYTES.load(Ordering::Acquire);
+    (
+        active_turns,
+        active_connections,
+        recovery_backlog,
+        database_size_bytes,
+    )
+}
+
+/// Aggregate metrics deliberately combine the three live-load dimensions into
+/// one finite cohort. Keeping them as independent labels would multiply every
+/// workload/fingerprint series and eventually hit the SDK cardinality limit.
+pub(crate) fn database_runtime_metric_attributes() -> [KeyValue; 2] {
+    let (active_turns, active_connections, recovery_backlog, database_size_bytes) =
+        database_runtime_context();
+    [
+        KeyValue::new(
+            "gateway.load.bucket",
+            gateway_load_bucket(active_turns, active_connections, recovery_backlog),
+        ),
+        KeyValue::new(
+            "gateway.database_size.bucket",
+            database_size_bucket(database_size_bytes),
+        ),
+    ]
+}
+
+/// Rate-limited anomaly traces can retain the individual buckets without
+/// creating persistent metric series for their Cartesian product.
+pub(crate) fn database_runtime_trace_attributes() -> [KeyValue; 3] {
+    let (active_turns, active_connections, recovery_backlog, _) = database_runtime_context();
+    [
+        KeyValue::new(
+            "gateway.active_turns.bucket",
+            activity_count_bucket(active_turns),
+        ),
+        KeyValue::new(
+            "gateway.active_connections.bucket",
+            connection_count_bucket(active_connections),
+        ),
+        KeyValue::new(
+            "gateway.recovery_backlog.bucket",
+            backlog_count_bucket(recovery_backlog),
+        ),
+    ]
+}
+
+const fn gateway_load_bucket(
+    active_turns: u64,
+    active_connections: u64,
+    recovery_backlog: u64,
+) -> &'static str {
+    match (
+        active_turns > 0,
+        active_connections > 0,
+        recovery_backlog > 0,
+    ) {
+        (false, false, false) => "idle",
+        (false, true, false) => "client_connected",
+        (true, _, false) => "agent_active",
+        (false, _, true) => "recovery",
+        (true, _, true) => "mixed",
+    }
+}
+
+const fn activity_count_bucket(value: u64) -> &'static str {
+    match value {
+        0 => "0",
+        1 => "1",
+        2..=4 => "2_4",
+        5..=16 => "5_16",
+        _ => "17_plus",
+    }
+}
+
+const fn connection_count_bucket(value: u64) -> &'static str {
+    match value {
+        0 => "0",
+        1 => "1",
+        2..=4 => "2_4",
+        _ => "5_plus",
+    }
+}
+
+const fn backlog_count_bucket(value: u64) -> &'static str {
+    match value {
+        0 => "0",
+        1..=16 => "1_16",
+        17..=256 => "17_256",
+        257..=4_096 => "257_4096",
+        _ => "4097_plus",
+    }
+}
+
+const fn database_size_bucket(value: u64) -> &'static str {
+    match value {
+        0 => "unknown",
+        1..=268_435_455 => "under_256_mib",
+        268_435_456..=1_073_741_823 => "256_mib_1_gib",
+        1_073_741_824..=4_294_967_295 => "1_4_gib",
+        4_294_967_296..=17_179_869_183 => "4_16_gib",
+        _ => "16_gib_plus",
+    }
 }
 
 pub fn record_database_read(metric: DatabaseReadMetric) {
@@ -1393,6 +1571,34 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     struct PoolContextCaptureLayer(Arc<Mutex<Vec<Option<DatabasePoolContext>>>>);
+
+    #[test]
+    fn database_runtime_context_buckets_have_stable_boundaries() {
+        assert_eq!(gateway_load_bucket(0, 0, 0), "idle");
+        assert_eq!(gateway_load_bucket(0, 1, 0), "client_connected");
+        assert_eq!(gateway_load_bucket(1, 0, 0), "agent_active");
+        assert_eq!(gateway_load_bucket(0, 1, 1), "recovery");
+        assert_eq!(gateway_load_bucket(1, 1, 1), "mixed");
+
+        assert_eq!(activity_count_bucket(0), "0");
+        assert_eq!(activity_count_bucket(1), "1");
+        assert_eq!(activity_count_bucket(4), "2_4");
+        assert_eq!(activity_count_bucket(16), "5_16");
+        assert_eq!(activity_count_bucket(17), "17_plus");
+
+        assert_eq!(connection_count_bucket(0), "0");
+        assert_eq!(connection_count_bucket(4), "2_4");
+        assert_eq!(connection_count_bucket(5), "5_plus");
+
+        assert_eq!(backlog_count_bucket(0), "0");
+        assert_eq!(backlog_count_bucket(256), "17_256");
+        assert_eq!(backlog_count_bucket(4_097), "4097_plus");
+
+        assert_eq!(database_size_bucket(0), "unknown");
+        assert_eq!(database_size_bucket(268_435_455), "under_256_mib");
+        assert_eq!(database_size_bucket(268_435_456), "256_mib_1_gib");
+        assert_eq!(database_size_bucket(4_294_967_296), "4_16_gib");
+    }
 
     impl<S> Layer<S> for PoolContextCaptureLayer
     where

@@ -8,7 +8,11 @@ use pioneer_sqlite::{
     sqlite_read_only_connection_url,
 };
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::info;
 
@@ -58,6 +62,146 @@ impl GatewayDatabaseRuntimeConfig {
 }
 
 const WRITER_MAX_CONNECTIONS: u32 = 1;
+const MAX_DATABASE_RAW_QUERY_CACHE_ENTRIES: usize = 4_096;
+const MAX_DATABASE_QUERY_FINGERPRINTS: usize = 2_048;
+const MAX_DATABASE_METRIC_SERIES: usize = 1_024;
+const DEFAULT_OTEL_METRIC_CARDINALITY_LIMIT: usize = 2_000;
+const DATABASE_METRIC_OVERFLOW_SERIES: usize = pioneer_observability::DatabaseWorkload::CARDINALITY
+    * pioneer_observability::DatabaseRole::CARDINALITY
+    * pioneer_observability::DatabaseOperation::CARDINALITY
+    * 2;
+const _: () = assert!(
+    MAX_DATABASE_METRIC_SERIES + DATABASE_METRIC_OVERFLOW_SERIES
+        < DEFAULT_OTEL_METRIC_CARDINALITY_LIMIT
+);
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct QueryMetricSeries {
+    fingerprint: u64,
+    role: pioneer_observability::DatabaseRole,
+    operation: pioneer_observability::DatabaseOperation,
+    workload: pioneer_observability::DatabaseWorkload,
+    failed: bool,
+}
+
+#[derive(Debug, Default)]
+struct QueryFingerprintState {
+    raw_query_cache: HashMap<u64, u64>,
+    normalized_fingerprints: HashMap<Box<str>, u64>,
+    metric_series: HashSet<QueryMetricSeries>,
+}
+
+#[derive(Debug)]
+struct QueryFingerprintLimiter {
+    max_raw_query_cache_entries: usize,
+    max_fingerprints: usize,
+    max_metric_series: usize,
+    state: Mutex<QueryFingerprintState>,
+}
+
+impl Default for QueryFingerprintLimiter {
+    fn default() -> Self {
+        Self {
+            max_raw_query_cache_entries: MAX_DATABASE_RAW_QUERY_CACHE_ENTRIES,
+            max_fingerprints: MAX_DATABASE_QUERY_FINGERPRINTS,
+            max_metric_series: MAX_DATABASE_METRIC_SERIES,
+            state: Mutex::new(QueryFingerprintState::default()),
+        }
+    }
+}
+
+impl QueryFingerprintLimiter {
+    fn metric_fingerprint(
+        &self,
+        sql: &str,
+        role: pioneer_observability::DatabaseRole,
+        operation: pioneer_observability::DatabaseOperation,
+        workload: pioneer_observability::DatabaseWorkload,
+        failed: bool,
+    ) -> u64 {
+        let raw_query_key = transient_sql_cache_key(sql);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(fingerprint) = state.raw_query_cache.get(&raw_query_key).copied() {
+                return self.admit_metric_series(
+                    &mut state,
+                    fingerprint,
+                    role,
+                    operation,
+                    workload,
+                    failed,
+                );
+            }
+        }
+
+        // Normalize only cache misses. The cache key itself is transient and
+        // opaque, so raw SQL (which can contain a literal in handwritten
+        // statements) is never retained by the observability layer.
+        let normalized = normalize_sql_shape(sql);
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fingerprint = state
+            .raw_query_cache
+            .get(&raw_query_key)
+            .copied()
+            .unwrap_or_else(|| {
+                let fingerprint = if let Some(fingerprint) =
+                    state.normalized_fingerprints.get(normalized.as_str())
+                {
+                    *fingerprint
+                } else if state.normalized_fingerprints.len() >= self.max_fingerprints {
+                    0
+                } else {
+                    let fingerprint = stable_normalized_sql_fingerprint(normalized.as_str());
+                    state
+                        .normalized_fingerprints
+                        .insert(normalized.into_boxed_str(), fingerprint);
+                    fingerprint
+                };
+                if state.raw_query_cache.len() < self.max_raw_query_cache_entries {
+                    state.raw_query_cache.insert(raw_query_key, fingerprint);
+                }
+                fingerprint
+            });
+        self.admit_metric_series(&mut state, fingerprint, role, operation, workload, failed)
+    }
+
+    fn admit_metric_series(
+        &self,
+        state: &mut QueryFingerprintState,
+        fingerprint: u64,
+        role: pioneer_observability::DatabaseRole,
+        operation: pioneer_observability::DatabaseOperation,
+        workload: pioneer_observability::DatabaseWorkload,
+        failed: bool,
+    ) -> u64 {
+        if fingerprint == 0 {
+            return 0;
+        }
+
+        let series = QueryMetricSeries {
+            fingerprint,
+            role,
+            operation,
+            workload,
+            failed,
+        };
+        if state.metric_series.contains(&series) {
+            fingerprint
+        } else if state.metric_series.len() < self.max_metric_series {
+            state.metric_series.insert(series);
+            fingerprint
+        } else {
+            0
+        }
+    }
+}
 
 pub async fn initialize(runtime_home: &Path, app_config: &AppConfig) -> Result<SqliteDatabase> {
     initialize_inner(runtime_home, app_config, None).await
@@ -84,6 +228,7 @@ async fn initialize_inner(
 
     let database_path = runtime_home.join(config.file_name.as_str());
     let writer_url = sqlite_connection_url(database_path.as_path());
+    let query_fingerprints = Arc::new(QueryFingerprintLimiter::default());
 
     let mut writer = Database::connect(connect_options(
         writer_url.clone(),
@@ -102,6 +247,7 @@ async fn initialize_inner(
         &mut writer,
         pioneer_observability::DatabaseRole::Writer,
         WRITER_MAX_CONNECTIONS,
+        query_fingerprints.clone(),
     );
 
     let writer = SqliteWriteExecutor::with_observer(writer, super::write_observer());
@@ -161,6 +307,7 @@ async fn initialize_inner(
         &mut reader,
         pioneer_observability::DatabaseRole::Reader,
         config.max_connections,
+        query_fingerprints,
     );
     if let Some(stage) = reader_configure_stage {
         stage.succeed();
@@ -176,6 +323,9 @@ async fn initialize_inner(
         .validate_reader()
         .await
         .context("failed to validate gateway read pool")?;
+    if let Ok(metadata) = std::fs::metadata(database_path.as_path()) {
+        pioneer_observability::record_gateway_database_size_bytes(metadata.len());
+    }
     if let Some(stage) = reader_validate_stage {
         stage.succeed();
     }
@@ -216,13 +366,37 @@ fn configure_observability(
     connection: &mut DatabaseConnection,
     role: pioneer_observability::DatabaseRole,
     max_connections: u32,
+    query_fingerprints: Arc<QueryFingerprintLimiter>,
 ) {
     connection.set_metric_callback(move |info| {
-        pioneer_observability::record_database_operation(
+        if !pioneer_observability::telemetry_enabled() {
+            return;
+        }
+        let operation = sqlite_operation(info.statement.sql.as_str());
+        let workload = super::attribution::current_database_workload();
+        let workload_name =
+            workload.unwrap_or(pioneer_observability::DatabaseWorkload::Unclassified);
+        let query_fingerprint = query_fingerprints.metric_fingerprint(
+            info.statement.sql.as_str(),
             role,
-            sqlite_operation(info.statement.sql.as_str()),
-            info.elapsed,
+            operation,
+            workload_name,
             info.failed,
+        );
+        super::attribution::record_database_query(
+            query_fingerprint,
+            database_query_kind(operation),
+            info.elapsed,
+        );
+        pioneer_observability::record_database_operation(
+            pioneer_observability::DatabaseOperationMetric {
+                role,
+                operation,
+                workload: workload_name,
+                query_fingerprint,
+                elapsed: info.elapsed,
+                failed: info.failed,
+            },
         );
     });
     let pool = connection.get_sqlite_connection_pool().clone();
@@ -234,6 +408,146 @@ fn configure_observability(
             idle: u64::try_from(pool.num_idle()).unwrap_or(u64::MAX),
         },
     );
+}
+
+fn database_query_kind(
+    operation: pioneer_observability::DatabaseOperation,
+) -> pioneer_observability::DatabaseQueryKind {
+    use pioneer_observability::{DatabaseOperation, DatabaseQueryKind};
+
+    match operation {
+        DatabaseOperation::Select | DatabaseOperation::Pragma => DatabaseQueryKind::Read,
+        DatabaseOperation::Insert
+        | DatabaseOperation::Update
+        | DatabaseOperation::Delete
+        | DatabaseOperation::Replace
+        | DatabaseOperation::Transaction
+        | DatabaseOperation::Schema => DatabaseQueryKind::Write,
+        DatabaseOperation::Other => DatabaseQueryKind::Other,
+    }
+}
+
+#[cfg(test)]
+fn stable_sql_fingerprint(sql: &str) -> u64 {
+    let normalized = normalize_sql_shape(sql);
+    stable_normalized_sql_fingerprint(normalized.as_str())
+}
+
+fn stable_normalized_sql_fingerprint(normalized: &str) -> u64 {
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let fingerprint = u64::from_be_bytes(bytes) & i64::MAX as u64;
+    fingerprint.max(1)
+}
+
+fn transient_sql_cache_key(sql: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn normalize_sql_shape(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len().min(4_096));
+    let mut chars = sql.chars().peekable();
+    let mut pending_space = false;
+
+    while let Some(character) = chars.next() {
+        if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if character == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for comment_character in chars.by_ref() {
+                if comment_character == '\n' || comment_character == '\r' {
+                    break;
+                }
+            }
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if character == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for comment_character in chars.by_ref() {
+                if previous == '*' && comment_character == '/' {
+                    break;
+                }
+                previous = comment_character;
+            }
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if matches!(
+            character,
+            '=' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '|' | '&'
+        ) {
+            normalized.push(character);
+            pending_space = false;
+            continue;
+        }
+        if pending_space {
+            if !matches!(character, ',' | ')' | ';')
+                && !normalized.ends_with('(')
+                && !normalized.ends_with(',')
+                && !normalized.ends_with(' ')
+                && !normalized.ends_with('=')
+                && !normalized.ends_with('<')
+                && !normalized.ends_with('>')
+                && !normalized.ends_with('+')
+                && !normalized.ends_with('-')
+                && !normalized.ends_with('*')
+                && !normalized.ends_with('/')
+                && !normalized.ends_with('%')
+                && !normalized.ends_with('|')
+                && !normalized.ends_with('&')
+            {
+                normalized.push(' ');
+            }
+            pending_space = false;
+        }
+        if character == '\'' {
+            normalized.push('?');
+            while let Some(literal_character) = chars.next() {
+                if literal_character != '\'' {
+                    continue;
+                }
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        if character == '?' {
+            normalized.push('?');
+            while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                chars.next();
+            }
+            continue;
+        }
+        let begins_numeric_literal = character.is_ascii_digit()
+            && normalized
+                .chars()
+                .next_back()
+                .is_none_or(|previous| !previous.is_ascii_alphanumeric() && previous != '_');
+        if begins_numeric_literal {
+            normalized.push('?');
+            while chars.peek().is_some_and(|next| {
+                next.is_ascii_alphanumeric() || matches!(next, '.' | '_' | '+' | '-')
+            }) {
+                chars.next();
+            }
+            continue;
+        }
+        normalized.extend(character.to_lowercase());
+    }
+
+    let trimmed_len = normalized.trim_end().len();
+    normalized.truncate(trimmed_len);
+    normalized
 }
 
 fn sqlite_operation(sql: &str) -> pioneer_observability::DatabaseOperation {
@@ -372,6 +686,128 @@ mod tests {
         assert_eq!(
             super::sqlite_operation("WITH rows AS (...) SELECT 1"),
             DatabaseOperation::Other
+        );
+    }
+
+    #[test]
+    fn normalizes_literals_comments_case_and_spacing_into_one_sql_shape() {
+        let first = super::normalize_sql_shape(
+            "SELECT payload FROM turn_event WHERE sequence = 42 AND id = 'secret' -- request",
+        );
+        let second = super::normalize_sql_shape(
+            " select payload from turn_event where sequence=9001 and id='different' ",
+        );
+
+        assert_eq!(
+            first,
+            "select payload from turn_event where sequence=? and id=?"
+        );
+        assert_eq!(
+            second,
+            "select payload from turn_event where sequence=? and id=?"
+        );
+        assert_eq!(
+            super::stable_sql_fingerprint(
+                "SELECT payload FROM turn_event WHERE sequence=42 AND id='secret'"
+            ),
+            super::stable_sql_fingerprint(
+                "select payload from turn_event where sequence=9001 and id='different'"
+            )
+        );
+    }
+
+    #[test]
+    fn fingerprint_cache_is_bounded_and_uses_an_overflow_bucket() {
+        let limiter = super::QueryFingerprintLimiter {
+            max_raw_query_cache_entries: 4,
+            max_fingerprints: 2,
+            max_metric_series: 2,
+            state: std::sync::Mutex::new(super::QueryFingerprintState::default()),
+        };
+        let fingerprint = |sql, workload| {
+            limiter.metric_fingerprint(
+                sql,
+                pioneer_observability::DatabaseRole::Reader,
+                pioneer_observability::DatabaseOperation::Select,
+                workload,
+                false,
+            )
+        };
+        let first = fingerprint(
+            "SELECT one FROM probe",
+            pioneer_observability::DatabaseWorkload::TimelinePage,
+        );
+        let second = fingerprint(
+            "SELECT two FROM probe",
+            pioneer_observability::DatabaseWorkload::TimelinePage,
+        );
+
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_eq!(
+            fingerprint(
+                "SELECT one FROM probe",
+                pioneer_observability::DatabaseWorkload::TimelinePage,
+            ),
+            first
+        );
+        assert_eq!(
+            fingerprint(
+                "SELECT three FROM probe",
+                pioneer_observability::DatabaseWorkload::TimelinePage,
+            ),
+            0
+        );
+        assert_eq!(
+            fingerprint(
+                "SELECT one FROM probe",
+                pioneer_observability::DatabaseWorkload::ThreadTreeLoad,
+            ),
+            0,
+            "a new attribute combination must use overflow after the series cap"
+        );
+        assert_eq!(
+            limiter
+                .state
+                .lock()
+                .expect("fingerprint cache lock")
+                .normalized_fingerprints
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn dynamic_literals_share_one_normalized_fingerprint_and_cache_no_raw_sql() {
+        let limiter = super::QueryFingerprintLimiter {
+            max_raw_query_cache_entries: 4,
+            max_fingerprints: 1,
+            max_metric_series: 4,
+            state: std::sync::Mutex::new(super::QueryFingerprintState::default()),
+        };
+        let fingerprint = |sql| {
+            limiter.metric_fingerprint(
+                sql,
+                pioneer_observability::DatabaseRole::Reader,
+                pioneer_observability::DatabaseOperation::Select,
+                pioneer_observability::DatabaseWorkload::TimelinePage,
+                false,
+            )
+        };
+
+        let first = fingerprint("SELECT payload FROM turn_event WHERE sequence = 42");
+        let second = fingerprint("select payload from turn_event where sequence=9001");
+        assert_ne!(first, 0);
+        assert_eq!(second, first);
+
+        let state = limiter.state.lock().expect("fingerprint cache lock");
+        assert_eq!(state.normalized_fingerprints.len(), 1);
+        assert_eq!(state.raw_query_cache.len(), 2);
+        assert!(
+            state
+                .normalized_fingerprints
+                .keys()
+                .all(|shape| !shape.contains("42") && !shape.contains("9001"))
         );
     }
 

@@ -2,10 +2,10 @@ use super::layout::{
     TIMELINE_AVATAR_SIZE, TIMELINE_AVATAR_STICKY_BOTTOM, TIMELINE_CONTENT_HORIZONTAL_PADDING,
     TimelineAvatarSource, TimelineLayoutIndex,
 };
-use super::running_indicator::render_running_turn_dino;
+use super::running_indicator::RunningDinoView;
 use crate::app::root::PioneerDesktop;
 use gpui::{prelude::*, *};
-use gpui_component::{Sizable as _, avatar::Avatar, theme::ActiveTheme};
+use gpui_component::{Sizable as _, avatar::Avatar};
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
@@ -23,8 +23,7 @@ enum TimelineAvatarVisual {
         cached_path: Option<PathBuf>,
     },
     RunningAgent {
-        is_dark: bool,
-        image_id: ElementId,
+        dino: Entity<RunningDinoView>,
     },
 }
 
@@ -84,11 +83,10 @@ impl PioneerDesktop {
                         shows_running_dino: true,
                         ..
                     } => TimelineAvatarVisual::RunningAgent {
-                        is_dark: cx.theme().mode.is_dark(),
-                        image_id: ElementId::from((
-                            ElementId::from("timeline-avatar-running-dino"),
-                            format!("{}:{}", group.first_row_index, group.last_row_index),
-                        )),
+                        dino: self.running_turn_dino_view(
+                            format!("avatar:{}:{}", group.first_row_index, group.last_row_index),
+                            cx,
+                        ),
                     },
                     TimelineAvatarSource::Agent { author, .. } => {
                         super::timeline_agent_execution_author(author.as_ref()).map_or_else(
@@ -291,10 +289,10 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
             .size(TIMELINE_AVATAR_SIZE)
             .border_0()
             .into_any_element(),
-        TimelineAvatarVisual::RunningAgent { is_dark, image_id } => div()
+        TimelineAvatarVisual::RunningAgent { dino } => div()
             .w(TIMELINE_AVATAR_SIZE)
             .h(TIMELINE_AVATAR_SIZE)
-            .child(render_running_turn_dino(image_id.clone(), *is_dark))
+            .child(dino.clone())
             .into_any_element(),
     }
 }

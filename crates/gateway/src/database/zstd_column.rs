@@ -276,6 +276,28 @@ async fn run_periodic_maintenance(
     cancellation: Option<&tokio_util::sync::CancellationToken>,
     row_inspection: RowInspection,
 ) -> Result<ZstdPeriodicMaintenanceOutcome> {
+    crate::database::attribution::scope_database_workload_result(
+        pioneer_observability::DatabaseWorkload::ZstdMaintenance,
+        run_periodic_maintenance_inner(
+            crud_store,
+            configs,
+            maintenance_seconds,
+            target_db_load,
+            cancellation,
+            row_inspection,
+        ),
+    )
+    .await
+}
+
+async fn run_periodic_maintenance_inner(
+    crud_store: &CrudStore,
+    configs: &[ZstdColumnConfig],
+    maintenance_seconds: Option<f64>,
+    target_db_load: f64,
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    row_inspection: RowInspection,
+) -> Result<ZstdPeriodicMaintenanceOutcome> {
     let crud_store = crud_store.with_maintenance_access();
     let crud_store = &crud_store;
     if cancellation.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {

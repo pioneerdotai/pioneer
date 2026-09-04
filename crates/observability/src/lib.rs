@@ -21,6 +21,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod database_workload;
 mod desktop_gateway;
 mod metrics;
 mod operations;
@@ -29,16 +30,21 @@ mod performance;
 mod startup;
 mod telemetry;
 
+pub use database_workload::{
+    DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext, DatabaseWorkloadOutcome,
+    DatabaseWorkloadTrace,
+};
 pub use desktop_gateway::{DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace};
 pub use metrics::{
-    DatabaseAdmissionMetric, DatabaseOperation, DatabasePoolSnapshot, DatabaseReadAdmissionMetric,
-    DatabaseReadMetric, DatabaseRole, NativeLifecycleDepthKind, NativeLifecycleEventMetric,
-    NativeLifecycleOutcome, NativeLifecycleStage, NativeProviderClass, NativeReadinessComponent,
-    NativeReadinessState, PatchOperationMetric, record_database_admission,
-    record_database_operation, record_database_read, record_database_read_admission,
-    record_native_lifecycle_depth, record_native_lifecycle_event,
-    record_native_readiness_component, record_patch_mutation_fallback, record_patch_operation,
-    register_database_pool_observer,
+    DatabaseAdmissionMetric, DatabaseOperation, DatabaseOperationMetric, DatabasePoolSnapshot,
+    DatabaseReadAdmissionMetric, DatabaseReadMetric, DatabaseRole, NativeLifecycleDepthKind,
+    NativeLifecycleEventMetric, NativeLifecycleOutcome, NativeLifecycleStage, NativeProviderClass,
+    NativeReadinessComponent, NativeReadinessState, PatchOperationMetric,
+    record_database_admission, record_database_operation, record_database_read,
+    record_database_read_admission, record_gateway_active_connections,
+    record_gateway_database_size_bytes, record_native_lifecycle_depth,
+    record_native_lifecycle_event, record_native_readiness_component,
+    record_patch_mutation_fallback, record_patch_operation, register_database_pool_observer,
 };
 pub use operations::{
     GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,

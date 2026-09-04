@@ -73,6 +73,11 @@ impl ActiveConnectionRegistry {
         } else {
             let _ = cancellation_tx.send(true);
         }
+        let active_connections = state.connections.len();
+        drop(state);
+        pioneer_observability::record_gateway_active_connections(
+            u64::try_from(active_connections).unwrap_or(u64::MAX),
+        );
         ActiveConnectionGuard {
             id,
             registered,
@@ -90,7 +95,13 @@ impl ActiveConnectionRegistry {
     }
 
     async fn unregister(&self, id: u64) {
-        self.state.lock().await.connections.remove(&id);
+        let mut state = self.state.lock().await;
+        state.connections.remove(&id);
+        let active_connections = state.connections.len();
+        drop(state);
+        pioneer_observability::record_gateway_active_connections(
+            u64::try_from(active_connections).unwrap_or(u64::MAX),
+        );
     }
 
     #[cfg(test)]

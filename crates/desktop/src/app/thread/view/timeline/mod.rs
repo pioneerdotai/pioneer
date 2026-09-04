@@ -16,6 +16,7 @@ pub(crate) use self::layout::{
     TimelineRowTopSpacing,
 };
 use self::model::{TimelineRow, TimelineRowKind};
+pub(crate) use self::running_indicator::RunningIndicatorViewCache;
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
     root::{

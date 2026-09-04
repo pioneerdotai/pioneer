@@ -2487,16 +2487,21 @@ impl MessageProcessor {
         // it in an awaited, abort-on-drop task so SeaORM does not inherit the
         // caller's poll stack.  Awaiting preserves event order; cancellation
         // still rolls back an in-flight transaction.
-        let result = match message_fresh_task(async move {
-            crud_store
-                .materialize_native_agent_turn_event_owned(
-                    event,
-                    event_timestamp_secs,
-                    item_started_deadlines,
-                    turn_execution_owner_id.as_ref(),
-                )
-                .await
-        })
+        let result = match message_fresh_task(
+            crate::database::attribution::scope_database_workload_result(
+                pioneer_observability::DatabaseWorkload::TurnEventCommit,
+                async move {
+                    crud_store
+                        .materialize_native_agent_turn_event_owned(
+                            event,
+                            event_timestamp_secs,
+                            item_started_deadlines,
+                            turn_execution_owner_id.as_ref(),
+                        )
+                        .await
+                },
+            ),
+        )
         .await
         {
             Ok(result) => result,
@@ -2875,7 +2880,12 @@ impl MessageProcessor {
         let executor = self.thread_episodic_index_executor.clone();
         tokio::spawn(async move {
             let now_unix = chrono::Utc::now().timestamp();
-            if let Err(error) = executor.run_once(now_unix).await {
+            if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                pioneer_observability::DatabaseWorkload::EpisodicMaintenance,
+                executor.run_once(now_unix),
+            )
+            .await
+            {
                 warn!(
                     error = %format!("{error:#}"),
                     "thread episodic index run failed"
@@ -3944,6 +3954,14 @@ impl MessageProcessor {
     }
 
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
+        crate::database::attribution::scope_database_workload(
+            pioneer_observability::DatabaseWorkload::AgentProgress,
+            self.handle_progress_agent_event_inner(event),
+        )
+        .await;
+    }
+
+    async fn handle_progress_agent_event_inner(&self, event: AgentProgressEvent) {
         let turn_id = match &event {
             AgentProgressEvent::ItemDelta { notification } => notification.turn_id.as_str(),
             AgentProgressEvent::ItemHeartbeat { turn_id, .. }

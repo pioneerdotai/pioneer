@@ -4305,13 +4305,16 @@ impl MessageProcessor {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ThreadTreeParams>(params_value) {
                         Ok(params) => {
-                            self.thread_tree(
-                                &context,
-                                admission
-                                    .workspace()
-                                    .expect("central admission supplies exact workspace proof"),
-                                request.id,
-                                params,
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ThreadTreeLoad,
+                                self.thread_tree(
+                                    &context,
+                                    admission.workspace().expect(
+                                        "central admission supplies exact workspace proof",
+                                    ),
+                                    request.id,
+                                    params,
+                                ),
                             )
                             .await;
                         }
@@ -4678,7 +4681,10 @@ impl MessageProcessor {
                                 .thread()
                                 .expect("central admission supplies thread proof");
                             debug_assert_eq!(proof.thread_id(), params.thread_id.trim());
-                            self.thread_timeline_page(&context, proof, request.id, params)
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::TimelinePage,
+                                self.thread_timeline_page(&context, proof, request.id, params),
+                            )
                                 .await;
                         }
                         Err(error) => {

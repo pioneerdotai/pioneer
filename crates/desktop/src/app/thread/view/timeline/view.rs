@@ -56,8 +56,7 @@ impl PioneerDesktop {
         let semantic_row_ids = model.semantic_row_ids.clone();
         let row_render_fingerprints = model.row_render_fingerprints.clone();
 
-        self.ensure_running_task_indicator_timer(projection.as_ref(), cx);
-        let rows = self.hydrate_running_turn_render_rows(model.rows, cx);
+        let rows = self.hydrate_running_turn_render_rows(model.rows);
         let pending_requests = pending_requests
             .into_iter()
             .map(|request| (request, None))
@@ -650,7 +649,6 @@ impl PioneerDesktop {
     fn hydrate_running_turn_render_rows(
         &self,
         rows: Rc<Vec<TimelineRenderRow>>,
-        cx: &mut Context<Self>,
     ) -> Rc<Vec<TimelineRenderRow>> {
         let timeline_rows = rows
             .iter()
@@ -659,7 +657,7 @@ impl PioneerDesktop {
                 TimelineRenderRow::PendingRequest(_) => None,
             })
             .collect::<Vec<_>>();
-        let hydrated = self.hydrate_running_turn_rows(Rc::new(timeline_rows), cx);
+        let hydrated = self.hydrate_running_turn_rows(Rc::new(timeline_rows));
         let mut hydrated_iter = hydrated.iter();
         let mut changed = false;
         let mut render_rows = rows.as_ref().clone();

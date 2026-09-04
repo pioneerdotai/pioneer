@@ -19,7 +19,7 @@ use crate::{
         thread::{
             ThreadCoordinator,
             message_revisions::DesktopMessageRevisionDialogState,
-            view::timeline::{TimelineLayoutIndex, TimelineRenderModel},
+            view::timeline::{RunningIndicatorViewCache, TimelineLayoutIndex, TimelineRenderModel},
         },
     },
     audio::{
@@ -245,7 +245,6 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) pending_scroll_anchor: Option<TimelineScrollAnchor>,
     pub(super) semantic_prefetch_scroll_generation: u64,
     pub(super) semantic_prefetch_consumed_scroll_generation: u64,
-    pub(super) running_turn_indicator_timer_active: bool,
     pub(super) running_turn_indicator_fallback_turn_id: Option<String>,
     pub(super) running_turn_indicator_fallback_started_at_unix_ms: Option<i64>,
 }
@@ -496,6 +495,7 @@ pub struct PioneerDesktop {
     pub(super) pending_thread_create_visibility: ThreadVisibility,
     pub(super) thread_timeline_scroll_handle: VirtualListScrollHandle,
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
+    pub(super) running_indicator_views: RefCell<RunningIndicatorViewCache>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
     pub(super) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,

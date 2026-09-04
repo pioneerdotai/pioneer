@@ -2080,9 +2080,12 @@ impl MessageProcessor {
             let this = this.for_background_reconciliation();
             let cycle = AssertUnwindSafe(async {
                 let now = now_timestamp_secs();
-                match retry_transient_storage_access(|| {
-                    this.crud_store.replay_due_turn_event_projections(now, 64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                    retry_transient_storage_access(|| {
+                        this.crud_store.replay_due_turn_event_projections(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(summary) if summary.quarantined > 0 || summary.missing_events > 0 => warn!(
@@ -2105,9 +2108,12 @@ impl MessageProcessor {
                     ),
                 }
 
-                match retry_transient_storage_access(|| {
-                    this.reconcile_prepared_native_turn_finalizations(now, 64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                    retry_transient_storage_access(|| {
+                        this.reconcile_prepared_native_turn_finalizations(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(summary) => {
@@ -2138,9 +2144,12 @@ impl MessageProcessor {
                     ),
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.process_due_native_turn_event_deliveries(now, 64)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::EventDelivery,
+                    retry_transient_storage_access(|| {
+                        this.process_due_native_turn_event_deliveries(now, 64)
+                    }),
+                )
                 .await
                 {
                     error!(
@@ -2166,9 +2175,10 @@ impl MessageProcessor {
             let this = this.for_background_reconciliation();
             let cycle = AssertUnwindSafe(async {
                 let now = now_timestamp_secs();
-                match retry_transient_storage_access(|| {
-                    this.reconcile_terminal_task_child_turns(64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    retry_transient_storage_access(|| this.reconcile_terminal_task_child_turns(64)),
+                )
                 .await
                 {
                     Ok(reconciled) if reconciled > 0 => info!(
@@ -2182,9 +2192,12 @@ impl MessageProcessor {
                     ),
                 }
 
-                match retry_transient_storage_access(|| {
-                    this.reconcile_terminal_task_run_occurrence_turns(64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    retry_transient_storage_access(|| {
+                        this.reconcile_terminal_task_run_occurrence_turns(64)
+                    }),
+                )
                 .await
                 {
                     Ok(reconciled) if reconciled > 0 => info!(
@@ -2198,9 +2211,11 @@ impl MessageProcessor {
                     ),
                 }
 
-                if let Err(error) =
-                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64))
-                        .await
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64)),
+                )
+                .await
                 {
                     error!(error = %format!("{error:#}"), "task delivery worker failed");
                 }
@@ -2442,17 +2457,24 @@ impl MessageProcessor {
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
                 if now >= next_skill_upload_cleanup {
-                    maintenance.cleanup_stale_skill_uploads(now).await;
+                    crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        maintenance.cleanup_stale_skill_uploads(now),
+                    )
+                    .await;
                     next_skill_upload_cleanup = now.saturating_add(60);
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.crud_store.heartbeat_turn_executions_owned_by(
-                        this.turn_execution_owner_id.as_ref(),
-                        now,
-                        now.saturating_add(TURN_EXECUTION_OWNER_LEASE_SECONDS),
-                    )
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.crud_store.heartbeat_turn_executions_owned_by(
+                            this.turn_execution_owner_id.as_ref(),
+                            now,
+                            now.saturating_add(TURN_EXECUTION_OWNER_LEASE_SECONDS),
+                        )
+                    }),
+                )
                 .await
                 {
                     record_resilience_worker_poll_error(
@@ -2468,28 +2490,40 @@ impl MessageProcessor {
                 // Confirm live native command activity before timeout polling.
                 // A command whose lease is near its boundary must get the
                 // authoritative liveness check before any destructive claim.
-                this.heartbeat_due_cli_runtime_command_items(now).await;
+                crate::database::attribution::scope_database_workload(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    this.heartbeat_due_cli_runtime_command_items(now),
+                )
+                .await;
 
                 let agent_resource_policy =
                     crate::authorization::AgentWorkResourcePolicy::default();
-                match retry_transient_storage_access(|| {
-                    this.crud_store.promote_queued_agent_executions(
-                        pioneer_crud::utc_now(),
-                        64,
-                        i64::try_from(agent_resource_policy.idle_timeout_secs).unwrap_or(i64::MAX),
-                        i64::try_from(agent_resource_policy.hard_timeout_secs).unwrap_or(i64::MAX),
-                    )
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.crud_store.promote_queued_agent_executions(
+                            pioneer_crud::utc_now(),
+                            64,
+                            i64::try_from(agent_resource_policy.idle_timeout_secs)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(agent_resource_policy.hard_timeout_secs)
+                                .unwrap_or(i64::MAX),
+                        )
+                    }),
+                )
                 .await
                 {
                     Ok(promoted) => {
                         let database = this.crud_store.database_connection();
                         for execution in &promoted {
                             if let Err(error) =
-                                pioneer_crud::wake_agent_action_outbox_for_execution(
-                                    &database,
-                                    execution.execution_id.as_str(),
-                                    pioneer_crud::utc_now(),
+                                crate::database::attribution::scope_database_workload_result(
+                                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                    pioneer_crud::wake_agent_action_outbox_for_execution(
+                                        &database,
+                                        execution.execution_id.as_str(),
+                                        pioneer_crud::utc_now(),
+                                    ),
                                 )
                                 .await
                             {
@@ -2505,8 +2539,13 @@ impl MessageProcessor {
                             .map(|execution| execution.root_execution_id)
                             .collect::<std::collections::BTreeSet<_>>();
                         for root_execution_id in roots {
-                            this.notify_agent_work_graph_state_changed(root_execution_id.as_str())
-                                .await;
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                this.notify_agent_work_graph_state_changed(
+                                    root_execution_id.as_str(),
+                                ),
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -2524,17 +2563,20 @@ impl MessageProcessor {
                 if now >= next_agent_action_ledger_compaction {
                     next_agent_action_ledger_compaction =
                         now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
-                    match retry_transient_storage_access(|| {
-                        let database = maintenance.crud_store.database_connection();
-                        async move {
-                            pioneer_crud::compact_terminal_agent_action_ledger(
-                                &database,
-                                pioneer_crud::utc_now(),
-                                AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
-                            )
-                            .await
-                        }
-                    })
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        retry_transient_storage_access(|| {
+                            let database = maintenance.crud_store.database_connection();
+                            async move {
+                                pioneer_crud::compact_terminal_agent_action_ledger(
+                                    &database,
+                                    pioneer_crud::utc_now(),
+                                    AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
+                                )
+                                .await
+                            }
+                        }),
+                    )
                     .await
                     {
                         Ok(summary) => {
@@ -2567,14 +2609,17 @@ impl MessageProcessor {
                 if now >= next_native_terminal_effect_purge {
                     next_native_terminal_effect_purge =
                         now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
-                    match retry_transient_storage_access(|| {
-                        maintenance
-                            .crud_store
-                            .purge_resolved_native_terminal_effects_before(
-                                now.saturating_sub(NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS),
-                                NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE,
-                            )
-                    })
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        retry_transient_storage_access(|| {
+                            maintenance
+                                .crud_store
+                                .purge_resolved_native_terminal_effects_before(
+                                    now.saturating_sub(NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS),
+                                    NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE,
+                                )
+                        }),
+                    )
                     .await
                     {
                         Ok(purged) => {
@@ -2603,9 +2648,12 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    agent_action_tools::process_due_agent_action_outbox(&this, 64)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        agent_action_tools::process_due_agent_action_outbox(&this, 64)
+                    }),
+                )
                 .await
                 {
                     record_resilience_worker_poll_error(
@@ -2623,14 +2671,21 @@ impl MessageProcessor {
                 // rest of this global resilience control loop.
                 this.kick_native_terminal_effects();
 
-                match retry_transient_storage_access(|| {
-                    this.poll_timeouts_respecting_human_wait(now, 64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.poll_timeouts_respecting_human_wait(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(candidates) => {
                         for candidate in candidates {
-                            this.handle_timeout_candidate(candidate, now).await;
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                this.handle_timeout_candidate(candidate, now),
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -2645,10 +2700,13 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.crud_store
-                        .enqueue_missing_recovery_terminalizations(64, now)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.crud_store
+                            .enqueue_missing_recovery_terminalizations(64, now)
+                    }),
+                )
                 .await
                 {
                     record_resilience_worker_poll_error(
@@ -2661,9 +2719,12 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.process_due_recovery_terminalizations(now, 64)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.process_due_recovery_terminalizations(now, 64)
+                    }),
+                )
                 .await
                 {
                     record_resilience_worker_poll_error(
@@ -2676,14 +2737,21 @@ impl MessageProcessor {
                     continue;
                 }
 
-                match retry_transient_storage_access(|| {
-                    this.recovery_coordinator.run_ready_jobs(now, 64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.recovery_coordinator.run_ready_jobs(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(events) => {
                         for event in events {
-                            this.handle_recovery_event(event, now).await;
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                this.handle_recovery_event(event, now),
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -2698,8 +2766,11 @@ impl MessageProcessor {
                     continue;
                 }
 
-                this.fail_stale_cli_runtime_turns(now_timestamp_millis())
-                    .await;
+                crate::database::attribution::scope_database_workload(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    this.fail_stale_cli_runtime_turns(now_timestamp_millis()),
+                )
+                .await;
 
                 sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
             }
@@ -3095,7 +3166,11 @@ impl MessageProcessor {
                 let this = this.for_background_reconciliation();
                 let config = this.hook_recovery_config.read().await.clone();
                 if config.enabled && (!first_pass || config.startup_scan) {
-                    this.run_hook_recovery_pass(config.clone()).await;
+                    crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::HookRecovery,
+                        this.run_hook_recovery_pass(config.clone()),
+                    )
+                    .await;
                 }
                 first_pass = false;
                 sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
@@ -3173,12 +3248,14 @@ impl MessageProcessor {
                 tokio::select! {
                     delivery = subscription.recv() => match delivery {
                         pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
-                            if let Err(error) = runtime
-                                .emit_committed_task_events_after_cursor(
+                            if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                                pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                                runtime.emit_committed_task_events_after_cursor(
                                     wake.task_id.as_str(),
                                     &mut cursors_by_task,
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                             {
                                 warn!(
                                     task_id = %wake.task_id,
@@ -3194,12 +3271,14 @@ impl MessageProcessor {
                                 missed_wakes = count,
                                 "task wake bus lagged; durable fanout backlog will be rescanned"
                             );
-                            if let Err(error) = reconciliation
-                                .replay_pending_task_event_fanout(
+                            if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                                pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                                reconciliation.replay_pending_task_event_fanout(
                                     &mut cursors_by_task,
                                     &mut durable_replay_after_task_id,
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                             {
                                 warn!(
                                     missed_wakes = count,
@@ -3211,12 +3290,14 @@ impl MessageProcessor {
                         pioneer_tasks::TaskEventWakeDelivery::Closed => break,
                     },
                     _ = durable_replay.tick() => {
-                        if let Err(error) = reconciliation
-                            .replay_pending_task_event_fanout(
+                        if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                            pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                            reconciliation.replay_pending_task_event_fanout(
                                 &mut cursors_by_task,
                                 &mut durable_replay_after_task_id,
-                            )
-                            .await
+                            ),
+                        )
+                        .await
                         {
                             warn!(
                                 error = %format!("{error:#}"),
