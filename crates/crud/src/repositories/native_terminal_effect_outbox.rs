@@ -241,12 +241,11 @@ pub async fn prepare_supplemental<C: ConnectionTrait>(
                         effect.effect_id
                     );
                 }
-                if existing.payload_identity_sha256 != payload_sha256 {
-                    bail!(
-                        "committed supplemental terminal effect `{}` has a conflicting immutable payload",
-                        effect.effect_id
-                    );
-                }
+                // The effect already activated by the canonical terminal
+                // commit is immutable authority. Recovery may reconstruct a
+                // different explanatory reason or runtime generation after a
+                // rolling upgrade; that must neither rewrite the committed
+                // obligation nor poison the recovery outbox forever.
                 continue;
             }
             if !matches!(

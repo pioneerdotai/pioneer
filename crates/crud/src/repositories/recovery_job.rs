@@ -18,6 +18,17 @@ use crate::convention::{
 const DB_ID_LEN: usize = 21;
 const CLAIM_TOKEN_LEN: usize = 21;
 
+fn resolution_remains_pending(status: RecoveryJobStatus) -> bool {
+    matches!(
+        status,
+        RecoveryJobStatus::Pending
+            | RecoveryJobStatus::Active
+            | RecoveryJobStatus::Failed
+            | RecoveryJobStatus::Exhausted
+            | RecoveryJobStatus::Blocked
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimedJobActivation {
     Activated,
@@ -84,6 +95,7 @@ pub async fn enqueue_recovery_job<C: ConnectionTrait>(
         claim_expires_at: Set(None),
         active_attempt_id: Set(None),
         active_attempt_started_at: Set(None),
+        resolution_pending: Set(true),
         created_at: Set(job.created_at),
         updated_at: Set(job.created_at),
     })
@@ -653,6 +665,7 @@ pub async fn mark_due_pending_job_terminal_if_turn_idle<C: ConnectionTrait>(
     let active = recovery_job_status_to_db(RecoveryJobStatus::Active);
     let action_db = recovery_action_to_db(action);
     let status_db = recovery_job_status_to_db(status).to_owned();
+    let resolution_pending = resolution_remains_pending(status);
 
     let claim_is_available = || {
         Condition::any()
@@ -719,6 +732,10 @@ pub async fn mark_due_pending_job_terminal_if_turn_idle<C: ConnectionTrait>(
             recovery_job::Column::UpdatedAt,
             sea_orm::sea_query::Expr::value(now),
         )
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(resolution_pending),
+        )
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
         .filter(recovery_job::Column::Status.eq(pending))
         .filter(recovery_job::Column::Action.eq(action_db))
@@ -743,6 +760,7 @@ pub async fn mark_claimed_job_terminal<C: ConnectionTrait>(
 ) -> Result<bool> {
     let pending = recovery_job_status_to_db(RecoveryJobStatus::Pending);
     let status_db = recovery_job_status_to_db(status).to_owned();
+    let resolution_pending = resolution_remains_pending(status);
     let affected = recovery_job::Entity::update_many()
         .col_expr(
             recovery_job::Column::Status,
@@ -775,6 +793,10 @@ pub async fn mark_claimed_job_terminal<C: ConnectionTrait>(
         .col_expr(
             recovery_job::Column::UpdatedAt,
             sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(resolution_pending),
         )
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
         .filter(recovery_job::Column::Status.eq(pending))
@@ -796,6 +818,7 @@ pub async fn mark_job_terminal<C: ConnectionTrait>(
     now: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let status_db = recovery_job_status_to_db(status).to_owned();
+    let resolution_pending = resolution_remains_pending(status);
 
     let affected = recovery_job::Entity::update_many()
         .col_expr(
@@ -829,6 +852,10 @@ pub async fn mark_job_terminal<C: ConnectionTrait>(
         .col_expr(
             recovery_job::Column::ActiveAttemptStartedAt,
             sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(resolution_pending),
         )
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
         .exec(db)
@@ -849,6 +876,7 @@ pub async fn mark_active_without_attempt_terminal<C: ConnectionTrait>(
 ) -> Result<bool> {
     let status_db = recovery_job_status_to_db(status).to_owned();
     let active = recovery_job_status_to_db(RecoveryJobStatus::Active);
+    let resolution_pending = resolution_remains_pending(status);
 
     let affected = recovery_job::Entity::update_many()
         .col_expr(
@@ -882,6 +910,10 @@ pub async fn mark_active_without_attempt_terminal<C: ConnectionTrait>(
         .col_expr(
             recovery_job::Column::ActiveAttemptStartedAt,
             sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(resolution_pending),
         )
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
         .filter(recovery_job::Column::Status.eq(active))
@@ -906,6 +938,7 @@ pub async fn mark_job_terminal_after_attempt<C: ConnectionTrait>(
     now: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let status_db = recovery_job_status_to_db(status).to_owned();
+    let resolution_pending = resolution_remains_pending(status);
     let affected = recovery_job::Entity::update_many()
         .col_expr(
             recovery_job::Column::Status,
@@ -947,6 +980,10 @@ pub async fn mark_job_terminal_after_attempt<C: ConnectionTrait>(
             recovery_job::Column::ActiveAttemptStartedAt,
             sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
         )
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(resolution_pending),
+        )
         .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
         .filter(
             recovery_job::Column::Status.eq(recovery_job_status_to_db(RecoveryJobStatus::Active)),
@@ -985,6 +1022,23 @@ pub async fn find_open_jobs_by_turn<C: ConnectionTrait>(
         .all(db)
         .await
         .with_context(|| format!("failed to load open recovery jobs for turn `{turn_id}`"))
+}
+
+/// Returns the single durable recovery episode which still owns resolution of
+/// this Turn. Unlike `find_open_jobs_by_turn`, terminal jobs remain unresolved
+/// until their terminalization outbox is delivered, superseded, or
+/// quarantined.
+pub async fn find_unresolved_job_by_turn<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<Option<recovery_job::Model>> {
+    recovery_job::Entity::find()
+        .filter(recovery_job::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(recovery_job::Column::ResolutionPending.eq(true))
+        .order_by_asc(recovery_job::Column::CreatedAt)
+        .one(db)
+        .await
+        .with_context(|| format!("failed to load unresolved recovery for turn `{turn_id}`"))
 }
 
 pub async fn cancel_open_jobs_for_turn<C: ConnectionTrait>(
@@ -1047,6 +1101,10 @@ pub async fn cancel_open_jobs_for_turn<C: ConnectionTrait>(
         .col_expr(
             recovery_job::Column::UpdatedAt,
             sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(false),
         )
         .filter(recovery_job::Column::Id.is_in(ids))
         .exec(db)

@@ -4325,11 +4325,11 @@ impl MessageProcessor {
         source_attempt_id: Option<&str>,
         recovery_grace_secs: Option<u64>,
     ) -> Result<()> {
-        let mut open_jobs = self
+        let mut unresolved_job = self
             .crud_store
-            .find_open_recovery_jobs_for_turn(turn_id)
+            .find_unresolved_recovery_job_for_turn(turn_id)
             .await?;
-        if open_jobs.is_empty() {
+        if unresolved_job.is_none() {
             let Some((thread_id, _workspace_id)) =
                 self.crud_store.get_turn_location(turn_id).await?
             else {
@@ -4345,12 +4345,12 @@ impl MessageProcessor {
                         .unwrap_or(crate::resilience::TURN_RECOVERY_MAX_WALL_CLOCK_SECS),
                 )
                 .await;
-            open_jobs = self
+            unresolved_job = self
                 .crud_store
-                .find_open_recovery_jobs_for_turn(turn_id)
+                .find_unresolved_recovery_job_for_turn(turn_id)
                 .await?;
         }
-        let Some(job) = open_jobs.first() else {
+        let Some(job) = unresolved_job.as_ref() else {
             bail!("failed to durably open observation recovery for Turn `{turn_id}`");
         };
         if let Some(attempt_id) = source_attempt_id {
@@ -5144,9 +5144,75 @@ impl MessageProcessor {
             .claim_due_recovery_terminalizations(now_unix, CLAIM_LEASE_SECS, limit)
             .await?;
         let count = records.len() as u64;
-        for record in records {
+        let classified = match self
+            .crud_store
+            .classify_claimed_recovery_terminalization_batch(&records, now_unix)
+            .await
+        {
+            Ok(classified) => classified,
+            Err(error) => {
+                // A storage/ownership failure is transient. Preserve the
+                // individual retry budgets; semantic poison is classified
+                // and quarantined inside the successful batch transaction.
+                for record in &records {
+                    let exponent = record.attempt_count.min(8);
+                    let delay = 1_i64.checked_shl(exponent).unwrap_or(256).min(300);
+                    let retry_at = now_unix.saturating_add(delay);
+                    if let Err(mark_error) = self
+                        .crud_store
+                        .fail_recovery_terminalization_claim(
+                            record,
+                            format!("{error:#}"),
+                            retry_at,
+                            now_unix,
+                        )
+                        .await
+                    {
+                        warn!(
+                            recovery_job_id = record.recovery_job_id,
+                            turn_id = record.turn_id,
+                            error = %format!("{error:#}"),
+                            mark_error = %format!("{mark_error:#}"),
+                            "failed to classify recovery terminalization batch and could not persist retry state"
+                        );
+                    }
+                }
+                return Ok(count);
+            }
+        };
+        for (record, classification) in classified {
+            let needs_resume_metadata = match classification {
+                pioneer_crud::RecoveryTerminalizationClaimDisposition::NeedsCommit => true,
+                pioneer_crud::RecoveryTerminalizationClaimDisposition::AlreadyTerminal => {
+                    false
+                }
+                pioneer_crud::RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                    current_status,
+                ) => {
+                    debug!(
+                        recovery_job_id = record.recovery_job_id,
+                        turn_id = record.turn_id,
+                        ?current_status,
+                        "discarded recovery terminalization before metadata reconstruction"
+                    );
+                    continue;
+                }
+                pioneer_crud::RecoveryTerminalizationClaimDisposition::Quarantined {
+                    reason_code,
+                } => {
+                    warn!(
+                        recovery_job_id = record.recovery_job_id,
+                        turn_id = record.turn_id,
+                        reason_code,
+                        "quarantined invalid recovery terminalization before metadata reconstruction"
+                    );
+                    continue;
+                }
+            };
             let resume = async {
-                if record.recovery_status != pioneer_protocol::RecoveryJobStatus::Blocked {
+                if !needs_resume_metadata
+                    || record.recovery_status != pioneer_protocol::RecoveryJobStatus::Blocked
+                {
                     return Ok(None);
                 }
                 let display_reason = self
@@ -5186,11 +5252,11 @@ impl MessageProcessor {
                 Err(error) => Err(error),
             };
             match applied {
-                Ok(applied) => {
-                    if !applied.already_terminal {
+                Ok(pioneer_crud::RecoveryTerminalizationApplyOutcome::Applied(applied)) => {
+                    if let Some(turn) = applied.newly_terminal_turn.as_ref() {
                         if let Err(error) = self
                             .thread_manager
-                            .commit_terminal_turn(applied.thread_id.as_str(), &applied.turn)
+                            .commit_terminal_turn(applied.thread_id.as_str(), turn)
                             .await
                         {
                             warn!(
@@ -5202,6 +5268,28 @@ impl MessageProcessor {
                         }
                     }
                     self.kick_native_turn_event_deliveries();
+                }
+                Ok(
+                    pioneer_crud::RecoveryTerminalizationApplyOutcome::SupersededByTerminalStatus(
+                        current_status,
+                    ),
+                ) => {
+                    debug!(
+                        recovery_job_id = record.recovery_job_id,
+                        turn_id = record.turn_id,
+                        ?current_status,
+                        "discarded recovery terminalization superseded by authoritative terminal Turn status"
+                    );
+                }
+                Ok(pioneer_crud::RecoveryTerminalizationApplyOutcome::Quarantined {
+                    reason_code,
+                }) => {
+                    warn!(
+                        recovery_job_id = record.recovery_job_id,
+                        turn_id = record.turn_id,
+                        reason_code,
+                        "quarantined permanently invalid recovery terminalization"
+                    );
                 }
                 Err(error) => {
                     let exponent = record.attempt_count.min(8);

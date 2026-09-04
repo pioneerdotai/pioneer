@@ -2701,7 +2701,7 @@ impl MessageProcessor {
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
                     retry_transient_storage_access(|| {
                         this.crud_store
                             .enqueue_missing_recovery_terminalizations(64, now)
@@ -2720,7 +2720,7 @@ impl MessageProcessor {
                 }
 
                 if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
                     retry_transient_storage_access(|| {
                         this.process_due_recovery_terminalizations(now, 64)
                     }),

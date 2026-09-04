@@ -1310,6 +1310,14 @@ pub(crate) fn database_runtime_metric_attributes() -> [KeyValue; 2] {
     ]
 }
 
+pub(crate) fn database_runtime_load_metric_attribute() -> KeyValue {
+    let (active_turns, active_connections, recovery_backlog, _) = database_runtime_context();
+    KeyValue::new(
+        "gateway.load.bucket",
+        gateway_load_bucket(active_turns, active_connections, recovery_backlog),
+    )
+}
+
 /// Rate-limited anomaly traces can retain the individual buckets without
 /// creating persistent metric series for their Cartesian product.
 pub(crate) fn database_runtime_trace_attributes() -> [KeyValue; 3] {

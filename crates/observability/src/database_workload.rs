@@ -28,6 +28,8 @@ pub enum DatabaseWorkload {
     EventDelivery,
     TaskReconcile,
     ExecutionSupervision,
+    RecoveryTerminalizationAudit,
+    RecoveryTerminalizationApply,
     TaskEventFanout,
     HookRecovery,
     TimelinePage,
@@ -38,7 +40,7 @@ pub enum DatabaseWorkload {
 }
 
 impl DatabaseWorkload {
-    pub const CARDINALITY: usize = 15;
+    pub const CARDINALITY: usize = 17;
 
     const fn index(self) -> usize {
         match self {
@@ -50,13 +52,15 @@ impl DatabaseWorkload {
             Self::EventDelivery => 5,
             Self::TaskReconcile => 6,
             Self::ExecutionSupervision => 7,
-            Self::TaskEventFanout => 8,
-            Self::HookRecovery => 9,
-            Self::TimelinePage => 10,
-            Self::ThreadTreeLoad => 11,
-            Self::SkillsWatch => 12,
-            Self::EpisodicMaintenance => 13,
-            Self::ZstdMaintenance => 14,
+            Self::RecoveryTerminalizationAudit => 8,
+            Self::RecoveryTerminalizationApply => 9,
+            Self::TaskEventFanout => 10,
+            Self::HookRecovery => 11,
+            Self::TimelinePage => 12,
+            Self::ThreadTreeLoad => 13,
+            Self::SkillsWatch => 14,
+            Self::EpisodicMaintenance => 15,
+            Self::ZstdMaintenance => 16,
         }
     }
 
@@ -70,6 +74,8 @@ impl DatabaseWorkload {
             Self::EventDelivery => "event.delivery",
             Self::TaskReconcile => "task.reconcile",
             Self::ExecutionSupervision => "execution.supervision",
+            Self::RecoveryTerminalizationAudit => "recovery_terminalization.audit",
+            Self::RecoveryTerminalizationApply => "recovery_terminalization.apply",
             Self::TaskEventFanout => "task_event.fanout",
             Self::HookRecovery => "hook.recovery",
             Self::TimelinePage => "timeline.page",
@@ -92,7 +98,6 @@ const _: () = assert!(
     DatabaseWorkload::CARDINALITY
         * DATABASE_WORKLOAD_ANOMALY_REASON_CARDINALITY
         * GATEWAY_LOAD_BUCKET_CARDINALITY
-        * DATABASE_SIZE_BUCKET_CARDINALITY
         < DEFAULT_OTEL_METRIC_CARDINALITY_LIMIT
 );
 
@@ -311,7 +316,10 @@ fn emit_database_workload(snapshot: DatabaseWorkloadSnapshot) {
         KeyValue::new("db.workload.name", snapshot.workload.as_str()),
         KeyValue::new("db.workload.anomaly.reason", reason),
     ];
-    anomaly_attributes.extend(super::metrics::database_runtime_metric_attributes());
+    // Anomaly counters omit database-size cohorting so adding an exact bounded
+    // workload cannot overflow the SDK's default series limit. Rate-limited
+    // traces below still retain the full runtime context.
+    anomaly_attributes.push(super::metrics::database_runtime_load_metric_attribute());
     metrics
         .database_workload_anomalies
         .add(1, &anomaly_attributes);
@@ -424,6 +432,8 @@ mod tests {
             DatabaseWorkload::EventDelivery,
             DatabaseWorkload::TaskReconcile,
             DatabaseWorkload::ExecutionSupervision,
+            DatabaseWorkload::RecoveryTerminalizationAudit,
+            DatabaseWorkload::RecoveryTerminalizationApply,
             DatabaseWorkload::TaskEventFanout,
             DatabaseWorkload::HookRecovery,
             DatabaseWorkload::TimelinePage,
@@ -444,6 +454,8 @@ mod tests {
                 "event.delivery",
                 "task.reconcile",
                 "execution.supervision",
+                "recovery_terminalization.audit",
+                "recovery_terminalization.apply",
                 "task_event.fanout",
                 "hook.recovery",
                 "timeline.page",

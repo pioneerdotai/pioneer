@@ -68,6 +68,8 @@ pub async fn enqueue_for_terminal_job<C: ConnectionTrait>(
         claim_token: Set(None),
         claim_expires_at: Set(None),
         delivered_at: Set(None),
+        quarantine_reason_code: Set(None),
+        quarantined_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -96,46 +98,54 @@ pub async fn claim_due<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list due recovery terminalizations")?;
-    let mut claimed = Vec::new();
-    for row in candidates {
-        let claim_token = generate_id(DB_ID_LEN);
-        let affected = recovery_terminalization_outbox::Entity::update_many()
-            .col_expr(
-                recovery_terminalization_outbox::Column::Status,
-                sea_orm::sea_query::Expr::value(STATUS_DELIVERING.to_owned()),
-            )
-            .col_expr(
-                recovery_terminalization_outbox::Column::ClaimToken,
-                sea_orm::sea_query::Expr::value(Some(claim_token.clone())),
-            )
-            .col_expr(
-                recovery_terminalization_outbox::Column::ClaimExpiresAt,
-                sea_orm::sea_query::Expr::value(Some(claim_expires_at)),
-            )
-            .col_expr(
-                recovery_terminalization_outbox::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now),
-            )
-            .filter(
-                recovery_terminalization_outbox::Column::RecoveryJobId
-                    .eq(row.recovery_job_id.clone()),
-            )
-            .filter(Condition::any().add(due.clone()).add(expired.clone()))
-            .exec(db)
-            .await
-            .context("failed to claim recovery terminalization")?
-            .rows_affected;
-        if affected == 1
-            && let Some(row) =
-                recovery_terminalization_outbox::Entity::find_by_id(row.recovery_job_id)
-                    .one(db)
-                    .await
-                    .context("failed to reload recovery terminalization")?
-        {
-            claimed.push(ClaimedRecoveryTerminalization { row, claim_token });
-        }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(claimed)
+    let candidate_ids = candidates
+        .into_iter()
+        .map(|row| row.recovery_job_id)
+        .collect::<Vec<_>>();
+    // A batch token is safe because every transition is still fenced by both
+    // recovery_job_id and token. It lets selection, claim and reload remain a
+    // bounded three-statement transaction instead of an N+1 loop.
+    let claim_token = generate_id(DB_ID_LEN);
+    recovery_terminalization_outbox::Entity::update_many()
+        .col_expr(
+            recovery_terminalization_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(STATUS_DELIVERING.to_owned()),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Some(claim_token.clone())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Some(claim_expires_at)),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_terminalization_outbox::Column::RecoveryJobId.is_in(candidate_ids.clone()))
+        .filter(Condition::any().add(due).add(expired))
+        .exec(db)
+        .await
+        .context("failed to claim recovery terminalization batch")?;
+    let rows = recovery_terminalization_outbox::Entity::find()
+        .filter(recovery_terminalization_outbox::Column::RecoveryJobId.is_in(candidate_ids))
+        .filter(recovery_terminalization_outbox::Column::Status.eq(STATUS_DELIVERING))
+        .filter(recovery_terminalization_outbox::Column::ClaimToken.eq(claim_token.clone()))
+        .order_by_asc(recovery_terminalization_outbox::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("failed to reload claimed recovery terminalization batch")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ClaimedRecoveryTerminalization {
+            row,
+            claim_token: claim_token.clone(),
+        })
+        .collect())
 }
 
 pub async fn mark_delivered<C: ConnectionTrait>(
@@ -176,6 +186,210 @@ pub async fn mark_failed<C: ConnectionTrait>(
         false,
     )
     .await
+}
+
+/// Permanently removes a semantically invalid row from the retry set while
+/// retaining a bounded, queryable reason. The exact claim token is the fence:
+/// an expired worker cannot quarantine a row reclaimed by another worker.
+pub async fn quarantine_claim<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    claim_token: &str,
+    reason_code: &str,
+    error: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = recovery_terminalization_outbox::Entity::update_many()
+        .col_expr(
+            recovery_terminalization_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(STATUS_CANCELLED.to_owned()),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::AttemptCount,
+            sea_orm::sea_query::Expr::col(recovery_terminalization_outbox::Column::AttemptCount)
+                .add(1),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(error.to_owned())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::QuarantineReasonCode,
+            sea_orm::sea_query::Expr::value(Some(reason_code.to_owned())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::QuarantinedAt,
+            sea_orm::sea_query::Expr::value(Some(now)),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_terminalization_outbox::Column::RecoveryJobId.eq(job_id.to_owned()))
+        .filter(recovery_terminalization_outbox::Column::Status.eq(STATUS_DELIVERING))
+        .filter(recovery_terminalization_outbox::Column::ClaimToken.eq(claim_token.to_owned()))
+        .exec(db)
+        .await
+        .context("failed to quarantine recovery terminalization claim")?
+        .rows_affected;
+    if affected == 1 {
+        resolve_recovery_episode(db, job_id, now).await?;
+    }
+    Ok(affected == 1)
+}
+
+pub async fn quarantine_claim_batch<C: ConnectionTrait>(
+    db: &C,
+    job_ids: &[String],
+    claim_token: &str,
+    reason_code: &str,
+    error: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    let affected = recovery_terminalization_outbox::Entity::update_many()
+        .col_expr(
+            recovery_terminalization_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(STATUS_CANCELLED.to_owned()),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::AttemptCount,
+            sea_orm::sea_query::Expr::col(recovery_terminalization_outbox::Column::AttemptCount)
+                .add(1),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(error.to_owned())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::QuarantineReasonCode,
+            sea_orm::sea_query::Expr::value(Some(reason_code.to_owned())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::QuarantinedAt,
+            sea_orm::sea_query::Expr::value(Some(now)),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_terminalization_outbox::Column::RecoveryJobId.is_in(job_ids.to_vec()))
+        .filter(recovery_terminalization_outbox::Column::Status.eq(STATUS_DELIVERING))
+        .filter(recovery_terminalization_outbox::Column::ClaimToken.eq(claim_token.to_owned()))
+        .exec(db)
+        .await
+        .context("failed to quarantine recovery terminalization batch")?
+        .rows_affected;
+    if affected > 0 {
+        resolve_recovery_episodes(db, job_ids, now).await?;
+    }
+    Ok(affected)
+}
+
+/// Supersedes the exact claim owned by a worker after a newer terminal Turn
+/// status has made the recovery outcome obsolete. The claim token is part of
+/// the fence so an expired worker cannot cancel a subsequently reclaimed row.
+pub async fn cancel_claim<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    claim_token: &str,
+    reason: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let affected = recovery_terminalization_outbox::Entity::update_many()
+        .col_expr(
+            recovery_terminalization_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(STATUS_CANCELLED.to_owned()),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(reason.to_owned())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_terminalization_outbox::Column::RecoveryJobId.eq(job_id.to_owned()))
+        .filter(recovery_terminalization_outbox::Column::Status.eq(STATUS_DELIVERING))
+        .filter(recovery_terminalization_outbox::Column::ClaimToken.eq(claim_token.to_owned()))
+        .exec(db)
+        .await
+        .context("failed to cancel superseded recovery terminalization claim")?
+        .rows_affected;
+    if affected == 1 {
+        resolve_recovery_episode(db, job_id, now).await?;
+    }
+    Ok(affected == 1)
+}
+
+pub async fn cancel_claim_batch<C: ConnectionTrait>(
+    db: &C,
+    job_ids: &[String],
+    claim_token: &str,
+    reason: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    let affected = recovery_terminalization_outbox::Entity::update_many()
+        .col_expr(
+            recovery_terminalization_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(STATUS_CANCELLED.to_owned()),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(reason.to_owned())),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimToken,
+            sea_orm::sea_query::Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::ClaimExpiresAt,
+            sea_orm::sea_query::Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            recovery_terminalization_outbox::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_terminalization_outbox::Column::RecoveryJobId.is_in(job_ids.to_vec()))
+        .filter(recovery_terminalization_outbox::Column::Status.eq(STATUS_DELIVERING))
+        .filter(recovery_terminalization_outbox::Column::ClaimToken.eq(claim_token.to_owned()))
+        .exec(db)
+        .await
+        .context("failed to cancel superseded recovery terminalization batch")?
+        .rows_affected;
+    if affected > 0 {
+        resolve_recovery_episodes(db, job_ids, now).await?;
+    }
+    Ok(affected)
 }
 
 /// Supersedes an undelivered terminalization when an explicit, fenced resume
@@ -272,5 +486,52 @@ async fn transition_claim<C: ConnectionTrait>(
         .await
         .context("failed to transition recovery terminalization claim")?
         .rows_affected;
+    if affected == 1 && delivered {
+        resolve_recovery_episode(db, job_id, now).await?;
+    }
     Ok(affected == 1)
+}
+
+async fn resolve_recovery_episode<C: ConnectionTrait>(
+    db: &C,
+    job_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(false),
+        )
+        .col_expr(
+            recovery_job::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_job::Column::Id.eq(job_id.to_owned()))
+        .filter(recovery_job::Column::ResolutionPending.eq(true))
+        .exec(db)
+        .await
+        .context("failed to resolve recovery episode")?;
+    Ok(())
+}
+
+async fn resolve_recovery_episodes<C: ConnectionTrait>(
+    db: &C,
+    job_ids: &[String],
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    recovery_job::Entity::update_many()
+        .col_expr(
+            recovery_job::Column::ResolutionPending,
+            sea_orm::sea_query::Expr::value(false),
+        )
+        .col_expr(
+            recovery_job::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .filter(recovery_job::Column::Id.is_in(job_ids.to_vec()))
+        .filter(recovery_job::Column::ResolutionPending.eq(true))
+        .exec(db)
+        .await
+        .context("failed to resolve recovery episode batch")?;
+    Ok(())
 }

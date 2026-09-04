@@ -6,8 +6,8 @@ use pioneer_agent::{
 };
 use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
-    BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
-    NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, RecoveryJobRecord,
+    AtomicRecoveryJobEnqueueOutcome, BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
+    CrudStore, NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, RecoveryJobRecord,
     TimeoutCandidate, TurnExecutionCheckpointKind, TurnExecutionRecord, TurnExecutorKind,
 };
 use pioneer_protocol::{
@@ -521,6 +521,15 @@ pub enum RecoveryJobEnqueueOutcome {
     Reused(RecoveryJobRecord),
 }
 
+impl From<AtomicRecoveryJobEnqueueOutcome> for RecoveryJobEnqueueOutcome {
+    fn from(outcome: AtomicRecoveryJobEnqueueOutcome) -> Self {
+        match outcome {
+            AtomicRecoveryJobEnqueueOutcome::Created(job) => Self::Created(job),
+            AtomicRecoveryJobEnqueueOutcome::Reused(job) => Self::Reused(job),
+        }
+    }
+}
+
 impl RecoveryJobEnqueueOutcome {
     pub fn job(&self) -> &RecoveryJobRecord {
         match self {
@@ -783,21 +792,6 @@ impl RecoveryCoordinator {
         candidate: &TimeoutCandidate,
         now_unix: i64,
     ) -> Result<RecoveryJobEnqueueOutcome> {
-        if let Some(existing) = self
-            .open_recovery_for_turn(candidate.turn_id.as_str())
-            .await?
-        {
-            let _ = self
-                .crud_store
-                .mark_attempt_recovery_action(
-                    candidate.attempt_id.as_str(),
-                    existing.action,
-                    now_unix,
-                )
-                .await?;
-            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
-        }
-
         let decision = self.policy_for_timeout_candidate(candidate).await?;
         let policy = decision.policy;
 
@@ -823,9 +817,9 @@ impl RecoveryCoordinator {
                 serde_json::to_value(tool_snapshot).unwrap_or_else(|_| serde_json::json!({}));
         }
 
-        let record = self
+        let outcome: RecoveryJobEnqueueOutcome = self
             .crud_store
-            .enqueue_recovery_job(
+            .enqueue_recovery_job_if_no_unresolved(
                 candidate.turn_id.clone(),
                 candidate.item_id.clone(),
                 candidate.item_type,
@@ -845,14 +839,19 @@ impl RecoveryCoordinator {
                 snapshot,
                 now_unix,
             )
-            .await?;
+            .await?
+            .into();
 
         let _ = self
             .crud_store
-            .mark_attempt_recovery_action(candidate.attempt_id.as_str(), policy.action, now_unix)
+            .mark_attempt_recovery_action(
+                candidate.attempt_id.as_str(),
+                outcome.job().action,
+                now_unix,
+            )
             .await?;
 
-        Ok(RecoveryJobEnqueueOutcome::Created(record))
+        Ok(outcome)
     }
 
     pub async fn enqueue_provider_failure_job(
@@ -860,13 +859,6 @@ impl RecoveryCoordinator {
         candidate: &ProviderFailureCandidate,
         now_unix: i64,
     ) -> Result<RecoveryJobEnqueueOutcome> {
-        if let Some(existing) = self
-            .open_recovery_for_turn(candidate.turn_id.as_str())
-            .await?
-        {
-            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
-        }
-
         let provider_policy = self.provider_recovery_policy(&candidate.failure);
 
         // TODO(fallback_model): persist configured fallback model into provider snapshot,
@@ -885,9 +877,9 @@ impl RecoveryCoordinator {
             "is_recoverable_hint": candidate.failure.is_recoverable_hint,
         });
 
-        let record = self
+        let outcome = self
             .crud_store
-            .enqueue_recovery_job(
+            .enqueue_recovery_job_if_no_unresolved(
                 candidate.turn_id.clone(),
                 candidate.item_id.clone(),
                 candidate.item_type,
@@ -908,7 +900,7 @@ impl RecoveryCoordinator {
                 now_unix,
             )
             .await?;
-        Ok(RecoveryJobEnqueueOutcome::Created(record))
+        Ok(outcome.into())
     }
 
     pub async fn enqueue_runtime_failure_job(
@@ -916,13 +908,6 @@ impl RecoveryCoordinator {
         candidate: &RuntimeFailureCandidate,
         now_unix: i64,
     ) -> Result<RecoveryJobEnqueueOutcome> {
-        if let Some(existing) = self
-            .open_recovery_for_turn(candidate.turn_id.as_str())
-            .await?
-        {
-            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
-        }
-
         let mut snapshot = serde_json::json!({
             "source": "runtime_failure",
             "trigger": recovery_trigger_name(candidate.trigger),
@@ -937,9 +922,9 @@ impl RecoveryCoordinator {
             snapshot_object.insert("metadata".to_owned(), candidate.metadata.to_json());
         }
 
-        let record = self
+        let outcome = self
             .crud_store
-            .enqueue_recovery_job(
+            .enqueue_recovery_job_if_no_unresolved(
                 candidate.turn_id.clone(),
                 candidate.item_id.clone(),
                 candidate.item_type,
@@ -957,7 +942,7 @@ impl RecoveryCoordinator {
                 now_unix,
             )
             .await?;
-        Ok(RecoveryJobEnqueueOutcome::Created(record))
+        Ok(outcome.into())
     }
 
     pub async fn record_recovery_provider_failure(
@@ -3928,12 +3913,9 @@ impl RecoveryCoordinator {
     }
 
     async fn open_recovery_for_turn(&self, turn_id: &str) -> Result<Option<RecoveryJobRecord>> {
-        Ok(self
-            .crud_store
-            .find_open_recovery_jobs_for_turn(turn_id)
-            .await?
-            .into_iter()
-            .next())
+        self.crud_store
+            .find_unresolved_recovery_job_for_turn(turn_id)
+            .await
     }
 
     async fn build_attempt_plan(
@@ -5571,6 +5553,7 @@ mod tests {
             claim_token: None,
             active_attempt_id: None,
             active_attempt_started_at_unix: None,
+            resolution_pending: true,
         }
     }
 

@@ -1014,8 +1014,25 @@ pub struct AppliedRecoveryTerminalization {
     pub recovery_job_id: String,
     pub thread_id: String,
     pub final_item: Option<pioneer_protocol::ItemCompletedNotification>,
-    pub turn: Turn,
-    pub already_terminal: bool,
+    /// Present only when this application authored the terminal Turn event.
+    /// Historical already-terminal rows need no prompt/security decoding and
+    /// must not be re-published to the in-memory projection.
+    pub newly_terminal_turn: Option<Turn>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecoveryTerminalizationApplyOutcome {
+    Applied(AppliedRecoveryTerminalization),
+    SupersededByTerminalStatus(TurnStatus),
+    Quarantined { reason_code: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryTerminalizationClaimDisposition {
+    NeedsCommit,
+    AlreadyTerminal,
+    SupersededByTerminalStatus(TurnStatus),
+    Quarantined { reason_code: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1036,6 +1053,41 @@ struct PreparedRecoveryTerminalizationCommit {
     terminal_event: Option<PreparedProjectedTurnEvent>,
     terminal_effects: native_terminal_effect_outbox::PreparedNativeTerminalEffectPreparation,
     applied: AppliedRecoveryTerminalization,
+}
+
+enum PreparedRecoveryTerminalizationOutcome {
+    Commit(PreparedRecoveryTerminalizationCommit),
+    Superseded {
+        outbox_updated_at: DateTimeWithTimeZone,
+        job_updated_at: DateTimeWithTimeZone,
+        turn_updated_at: DateTimeWithTimeZone,
+        current_status: TurnStatus,
+    },
+}
+
+#[derive(Debug)]
+struct PermanentRecoveryTerminalizationError {
+    reason_code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for PermanentRecoveryTerminalizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message.as_str())
+    }
+}
+
+impl std::error::Error for PermanentRecoveryTerminalizationError {}
+
+fn permanent_recovery_terminalization_error(
+    reason_code: &'static str,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    PermanentRecoveryTerminalizationError {
+        reason_code,
+        message: message.into(),
+    }
+    .into()
 }
 
 fn terminal_turn_execution_status(status: TurnStatus) -> Option<TurnExecutionStatus> {
@@ -1787,6 +1839,13 @@ pub struct RecoveryJobRecord {
     pub claim_token: Option<String>,
     pub active_attempt_id: Option<String>,
     pub active_attempt_started_at_unix: Option<i64>,
+    pub resolution_pending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AtomicRecoveryJobEnqueueOutcome {
+    Created(RecoveryJobRecord),
+    Reused(RecoveryJobRecord),
 }
 
 #[derive(Debug, Clone)]
@@ -22479,6 +22538,97 @@ WHERE id IN (SELECT event_id FROM candidates)
         .await
     }
 
+    /// Atomically creates one recovery episode or returns the episode which
+    /// already owns resolution of the Turn. The partial unique index on
+    /// `resolution_pending` is the final cross-process fence; this transaction
+    /// also makes the common same-process reuse path deterministic.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_recovery_job_if_no_unresolved(
+        &self,
+        turn_id: String,
+        item_id: String,
+        item_type: TurnItemType,
+        source_attempt_id: Option<String>,
+        trigger: RecoveryTrigger,
+        action: RecoveryAction,
+        reason: Option<String>,
+        error_class: Option<ProviderFailureClass>,
+        transport_stage: Option<ProviderFailureStage>,
+        retry_after_ms: Option<i64>,
+        provider_attempt_number: i64,
+        max_attempts: i64,
+        policy_json: serde_json::Value,
+        policy_snapshot: serde_json::Value,
+        now_unix: i64,
+    ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
+        self.run_serialized_write(|| async {
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin atomic recovery enqueue transaction")?;
+            let result = async {
+                if let Some(existing) =
+                    recovery_job::find_unresolved_job_by_turn(&tx, turn_id.as_str()).await?
+                {
+                    return Ok(AtomicRecoveryJobEnqueueOutcome::Reused(
+                        recovery_job_record_from_model(existing),
+                    ));
+                }
+
+                let now = unix_to_datetime(now_unix);
+                let retry_delay_secs = retry_after_ms
+                    .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
+                    .unwrap_or(0);
+                let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
+                let policy_json = serde_json::to_string(&policy_json)
+                    .context("failed to serialize recovery policy json")?;
+                let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
+                    .context("failed to serialize recovery policy snapshot json")?;
+                let row = recovery_job::enqueue_recovery_job(
+                    &tx,
+                    recovery_job::NewRecoveryJob {
+                        turn_id: turn_id.clone(),
+                        item_id: item_id.clone(),
+                        item_type,
+                        source_attempt_id: source_attempt_id.clone(),
+                        trigger,
+                        action,
+                        reason: reason.clone(),
+                        policy_json,
+                        error_class,
+                        transport_stage,
+                        retry_after_ms,
+                        provider_attempt_number,
+                        policy_snapshot_json,
+                        max_attempts,
+                        created_at: now,
+                        scheduled_at,
+                        next_run_at: scheduled_at,
+                    },
+                )
+                .await?;
+                Ok(AtomicRecoveryJobEnqueueOutcome::Created(
+                    recovery_job_record_from_model(row),
+                ))
+            }
+            .await;
+            match result {
+                Ok(outcome) => {
+                    tx.commit()
+                        .await
+                        .context("failed to commit atomic recovery enqueue transaction")?;
+                    Ok(outcome)
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    Err(error)
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn mark_attempt_recovery_action(
         &self,
         attempt_id: &str,
@@ -23290,32 +23440,93 @@ WHERE id IN (SELECT event_id FROM candidates)
             let claim_expires_at = unix_to_datetime(
                 now_unix.saturating_add(i64::try_from(claim_lease_secs).unwrap_or(i64::MAX)),
             );
-            recovery_terminalization_outbox::claim_due(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin recovery terminalization batch claim")?;
+            let claimed = match recovery_terminalization_outbox::claim_due(
+                &transaction,
                 now,
                 claim_expires_at,
                 limit,
             )
-            .await?
-            .into_iter()
-            .map(|claimed| {
+            .await
+            {
+                Ok(claimed) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit recovery terminalization batch claim")?;
+                    claimed
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+            let mut valid = Vec::with_capacity(claimed.len());
+            for claimed in claimed {
                 let row = claimed.row;
-                Ok(ClaimedRecoveryTerminalizationRecord {
-                    recovery_job_id: row.recovery_job_id,
-                    turn_id: row.turn_id,
-                    item_id: row.item_id,
-                    item_type: turn_item_type_from_db(row.item_type.as_str())
-                        .context("recovery terminalization has an unknown item type")?,
-                    recovery_status: recovery_job_status_from_db(row.recovery_status.as_str())
-                        .context("recovery terminalization has an unknown recovery status")?,
-                    attempt_number: u32::try_from(row.attempt_number)
-                        .context("recovery terminalization attempt number is invalid")?,
-                    error_message: row.error_message,
-                    attempt_count: u32::try_from(row.attempt_count).unwrap_or(u32::MAX),
-                    claim_token: claimed.claim_token,
-                })
-            })
-            .collect()
+                let recovery_job_id = row.recovery_job_id.clone();
+                let claim_token = claimed.claim_token.clone();
+                let decoded = (|| -> Result<ClaimedRecoveryTerminalizationRecord> {
+                    let item_type =
+                        turn_item_type_from_db(row.item_type.as_str()).ok_or_else(|| {
+                            permanent_recovery_terminalization_error(
+                                "unknown_item_type",
+                                "recovery terminalization has an unknown item type",
+                            )
+                        })?;
+                    let recovery_status = recovery_job_status_from_db(row.recovery_status.as_str())
+                        .ok_or_else(|| {
+                            permanent_recovery_terminalization_error(
+                                "unknown_recovery_status",
+                                "recovery terminalization has an unknown recovery status",
+                            )
+                        })?;
+                    let attempt_number = u32::try_from(row.attempt_number).map_err(|_| {
+                        permanent_recovery_terminalization_error(
+                            "invalid_attempt_number",
+                            "recovery terminalization attempt number is invalid",
+                        )
+                    })?;
+                    Ok(ClaimedRecoveryTerminalizationRecord {
+                        recovery_job_id: row.recovery_job_id,
+                        turn_id: row.turn_id,
+                        item_id: row.item_id,
+                        item_type,
+                        recovery_status,
+                        attempt_number,
+                        error_message: row.error_message,
+                        attempt_count: u32::try_from(row.attempt_count).unwrap_or(u32::MAX),
+                        claim_token: claimed.claim_token,
+                    })
+                })();
+                match decoded {
+                    Ok(record) => valid.push(record),
+                    Err(error) => {
+                        let permanent = error
+                            .downcast_ref::<PermanentRecoveryTerminalizationError>()
+                            .expect("claim decoding only returns permanent validation errors");
+                        if !recovery_terminalization_outbox::quarantine_claim(
+                            &self.connection,
+                            recovery_job_id.as_str(),
+                            claim_token.as_str(),
+                            permanent.reason_code,
+                            permanent.message.as_str(),
+                            now,
+                        )
+                        .await?
+                        {
+                            anyhow::bail!(
+                                "recovery terminalization claim was lost before quarantine"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(valid)
         })
         .await
     }
@@ -23351,6 +23562,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                              LEFT JOIN recovery_terminalization_outbox o \
                                ON o.recovery_job_id = r.id \
                              WHERE r.status IN ('failed', 'exhausted', 'blocked') \
+                               AND r.resolution_pending = 1 \
                                AND o.recovery_job_id IS NULL \
                              ORDER BY r.updated_at ASC, r.id ASC LIMIT ?"
                                 .to_owned(),
@@ -23414,13 +23626,469 @@ WHERE id IN (SELECT event_id FROM candidates)
         .await
     }
 
+    /// Classifies an exact claimed row before the Gateway performs any
+    /// recovery-specific metadata reconstruction. Supersession and quarantine
+    /// are committed under the same claim-token fence; the two non-terminal
+    /// dispositions are revalidated by the later atomic apply transaction.
+    pub async fn classify_claimed_recovery_terminalization(
+        &self,
+        record: &ClaimedRecoveryTerminalizationRecord,
+        now_unix: i64,
+    ) -> Result<RecoveryTerminalizationClaimDisposition> {
+        enum Decision {
+            NeedsCommit,
+            AlreadyTerminal,
+            Superseded(TurnStatus),
+            Quarantine {
+                reason_code: &'static str,
+                message: String,
+            },
+        }
+
+        let record = record.clone();
+        self.run_serialized_write(|| async {
+            let now = unix_to_datetime(now_unix);
+            let tx = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin recovery terminalization classification")?;
+            let result = async {
+                let outbox = pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(
+                    record.recovery_job_id.clone(),
+                )
+                .one(&tx)
+                .await?
+                .context("recovery terminalization outbox row disappeared")?;
+                if outbox.status != recovery_terminalization_outbox::STATUS_DELIVERING
+                    || outbox.claim_token.as_deref() != Some(record.claim_token.as_str())
+                {
+                    anyhow::bail!("recovery terminalization claim is no longer owned");
+                }
+                let Some(job) =
+                    recovery_job::find_job_by_id(&tx, record.recovery_job_id.as_str()).await?
+                else {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "missing_recovery_job",
+                        message: "recovery terminalization job is missing".to_owned(),
+                    });
+                };
+                let Some(job_status) = recovery_job_status_from_db(job.status.as_str()) else {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "unknown_recovery_status",
+                        message: "recovery terminalization job has an unknown status".to_owned(),
+                    });
+                };
+                let Some(job_item_type) = turn_item_type_from_db(job.item_type.as_str()) else {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "unknown_item_type",
+                        message: "recovery terminalization job has an unknown item type".to_owned(),
+                    });
+                };
+                let Ok(job_attempt_number) = u32::try_from(job.run_count.max(1)) else {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "invalid_attempt_number",
+                        message: "recovery terminalization job has an invalid attempt number"
+                            .to_owned(),
+                    });
+                };
+                let job_error_message = job
+                    .last_error
+                    .clone()
+                    .or_else(|| job.reason.clone())
+                    .unwrap_or_else(|| "recovery reached a terminal outcome".to_owned());
+                if job.turn_id != record.turn_id
+                    || job.item_id != record.item_id
+                    || job_item_type != record.item_type
+                    || job_status != record.recovery_status
+                    || job_attempt_number != record.attempt_number
+                    || job_error_message != record.error_message
+                {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "job_identity_mismatch",
+                        message: "recovery terminalization no longer matches its recovery job"
+                            .to_owned(),
+                    });
+                }
+                if !matches!(
+                    job_status,
+                    RecoveryJobStatus::Blocked
+                        | RecoveryJobStatus::Failed
+                        | RecoveryJobStatus::Exhausted
+                ) {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "non_terminal_recovery_job",
+                        message: "recovery terminalization job is not terminalizable".to_owned(),
+                    });
+                }
+                let Some(turn_model) = turn::find_turn_by_id(&tx, record.turn_id.as_str()).await?
+                else {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "missing_turn",
+                        message: "recovery terminalization Turn is missing".to_owned(),
+                    });
+                };
+                let Some(current_status) = turn_status_from_db(turn_model.status.as_str()) else {
+                    return Ok(Decision::Quarantine {
+                        reason_code: "unknown_turn_status",
+                        message: "recovery terminalization Turn has an unknown status".to_owned(),
+                    });
+                };
+                let desired_status = if job_status == RecoveryJobStatus::Blocked {
+                    TurnStatus::Blocked
+                } else {
+                    TurnStatus::Failed
+                };
+                if current_status == TurnStatus::InProgress {
+                    Ok(Decision::NeedsCommit)
+                } else if current_status == desired_status {
+                    Ok(Decision::AlreadyTerminal)
+                } else {
+                    Ok(Decision::Superseded(current_status))
+                }
+            }
+            .await;
+
+            let disposition = match result {
+                Ok(Decision::NeedsCommit) => RecoveryTerminalizationClaimDisposition::NeedsCommit,
+                Ok(Decision::AlreadyTerminal) => {
+                    RecoveryTerminalizationClaimDisposition::AlreadyTerminal
+                }
+                Ok(Decision::Superseded(current_status)) => {
+                    let reason = format!(
+                        "superseded by authoritative terminal Turn status `{:?}`",
+                        current_status
+                    );
+                    if !recovery_terminalization_outbox::cancel_claim(
+                        &tx,
+                        record.recovery_job_id.as_str(),
+                        record.claim_token.as_str(),
+                        reason.as_str(),
+                        now,
+                    )
+                    .await?
+                    {
+                        anyhow::bail!(
+                            "recovery terminalization claim was lost before supersession"
+                        );
+                    }
+                    RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                        current_status,
+                    )
+                }
+                Ok(Decision::Quarantine {
+                    reason_code,
+                    message,
+                }) => {
+                    if !recovery_terminalization_outbox::quarantine_claim(
+                        &tx,
+                        record.recovery_job_id.as_str(),
+                        record.claim_token.as_str(),
+                        reason_code,
+                        message.as_str(),
+                        now,
+                    )
+                    .await?
+                    {
+                        anyhow::bail!("recovery terminalization claim was lost before quarantine");
+                    }
+                    RecoveryTerminalizationClaimDisposition::Quarantined {
+                        reason_code: reason_code.to_owned(),
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(error);
+                }
+            };
+            tx.commit()
+                .await
+                .context("failed to commit recovery terminalization classification")?;
+            Ok(disposition)
+        })
+        .await
+    }
+
+    /// Set-based form used by the recovery worker. A full 64-row stale batch
+    /// is classified with one joined read and resolved with two fenced writes,
+    /// rather than reconstructing metadata and issuing queries per row.
+    pub async fn classify_claimed_recovery_terminalization_batch(
+        &self,
+        records: &[ClaimedRecoveryTerminalizationRecord],
+        now_unix: i64,
+    ) -> Result<
+        Vec<(
+            ClaimedRecoveryTerminalizationRecord,
+            RecoveryTerminalizationClaimDisposition,
+        )>,
+    > {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            records.len() <= 100,
+            "recovery terminalization classification batch exceeds its bounded limit"
+        );
+        let claim_token = records[0].claim_token.clone();
+        anyhow::ensure!(
+            records
+                .iter()
+                .all(|record| record.claim_token == claim_token),
+            "recovery terminalization classification batch crosses claim tokens"
+        );
+        anyhow::ensure!(
+            records
+                .iter()
+                .map(|record| record.recovery_job_id.as_str())
+                .collect::<HashSet<_>>()
+                .len()
+                == records.len(),
+            "recovery terminalization classification batch contains duplicate jobs"
+        );
+        let records = records.to_vec();
+        self.run_serialized_write(|| {
+            let records = records.clone();
+            let claim_token = claim_token.clone();
+            async move {
+                let now = unix_to_datetime(now_unix);
+                let tx = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin recovery terminalization batch classification")?;
+                let result = async {
+                    let placeholders = std::iter::repeat_n("?", records.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut values = Vec::<sea_orm::Value>::with_capacity(records.len() + 1);
+                    values.push(claim_token.clone().into());
+                    values.extend(
+                        records
+                            .iter()
+                            .map(|record| record.recovery_job_id.clone().into()),
+                    );
+                    let rows = tx
+                        .query_all_raw(Statement::from_sql_and_values(
+                            tx.get_database_backend(),
+                            format!(
+                                "SELECT o.recovery_job_id, \
+                                        r.id AS job_id, r.turn_id AS job_turn_id, \
+                                        r.item_id AS job_item_id, r.item_type AS job_item_type, \
+                                        r.status AS job_status, \
+                                        CASE WHEN r.run_count < 1 THEN 1 ELSE r.run_count END \
+                                            AS job_attempt_number, \
+                                        COALESCE(r.last_error, r.reason, \
+                                            'recovery reached a terminal outcome') \
+                                            AS job_error_message, \
+                                        t.id AS turn_row_id, t.status AS turn_status \
+                                 FROM recovery_terminalization_outbox o \
+                                 LEFT JOIN recovery_job r ON r.id = o.recovery_job_id \
+                                 LEFT JOIN \"turn\" t ON t.id = o.turn_id \
+                                 WHERE o.status = 'delivering' \
+                                   AND o.claim_token = ? \
+                                   AND o.recovery_job_id IN ({placeholders})"
+                            ),
+                            values,
+                        ))
+                        .await
+                        .context("failed to classify claimed recovery terminalization batch")?;
+                    if rows.len() != records.len() {
+                        anyhow::bail!(
+                            "one or more recovery terminalization claims are no longer owned"
+                        );
+                    }
+
+                    let records_by_id = records
+                        .iter()
+                        .map(|record| (record.recovery_job_id.clone(), record))
+                        .collect::<HashMap<_, _>>();
+                    let mut dispositions = HashMap::with_capacity(records.len());
+                    let mut superseded = Vec::new();
+                    let mut quarantined = HashMap::<String, (String, Vec<String>)>::new();
+                    for row in rows {
+                        let recovery_job_id: String = row.try_get("", "recovery_job_id")?;
+                        let record = records_by_id
+                            .get(&recovery_job_id)
+                            .context("classification returned an unexpected recovery job")?;
+                        let quarantine = |reason_code: &str, message: &str| {
+                            (
+                                RecoveryTerminalizationClaimDisposition::Quarantined {
+                                    reason_code: reason_code.to_owned(),
+                                },
+                                Some((reason_code.to_owned(), message.to_owned())),
+                            )
+                        };
+                        let (disposition, quarantine_reason) = 'decision: {
+                            if row.try_get::<Option<String>>("", "job_id")?.is_none() {
+                                break 'decision quarantine(
+                                    "missing_recovery_job",
+                                    "recovery terminalization job is missing",
+                                );
+                            }
+                            let job_turn_id: String = row.try_get("", "job_turn_id")?;
+                            let job_item_id: String = row.try_get("", "job_item_id")?;
+                            let job_item_type_db: String = row.try_get("", "job_item_type")?;
+                            let job_status_db: String = row.try_get("", "job_status")?;
+                            let job_attempt_number: i64 = row.try_get("", "job_attempt_number")?;
+                            let job_error_message: String = row.try_get("", "job_error_message")?;
+                            let Some(job_item_type) =
+                                turn_item_type_from_db(job_item_type_db.as_str())
+                            else {
+                                break 'decision quarantine(
+                                    "unknown_item_type",
+                                    "recovery terminalization job has an unknown item type",
+                                );
+                            };
+                            let Some(job_status) =
+                                recovery_job_status_from_db(job_status_db.as_str())
+                            else {
+                                break 'decision quarantine(
+                                    "unknown_recovery_status",
+                                    "recovery terminalization job has an unknown status",
+                                );
+                            };
+                            let Ok(job_attempt_number) = u32::try_from(job_attempt_number) else {
+                                break 'decision quarantine(
+                                    "invalid_attempt_number",
+                                    "recovery terminalization job has an invalid attempt number",
+                                );
+                            };
+                            if job_turn_id != record.turn_id
+                                || job_item_id != record.item_id
+                                || job_item_type != record.item_type
+                                || job_status != record.recovery_status
+                                || job_attempt_number != record.attempt_number
+                                || job_error_message != record.error_message
+                            {
+                                break 'decision quarantine(
+                                    "job_identity_mismatch",
+                                    "recovery terminalization no longer matches its recovery job",
+                                );
+                            }
+                            if !matches!(
+                                job_status,
+                                RecoveryJobStatus::Blocked
+                                    | RecoveryJobStatus::Failed
+                                    | RecoveryJobStatus::Exhausted
+                            ) {
+                                break 'decision quarantine(
+                                    "non_terminal_recovery_job",
+                                    "recovery terminalization job is not terminalizable",
+                                );
+                            }
+                            if row.try_get::<Option<String>>("", "turn_row_id")?.is_none() {
+                                break 'decision quarantine(
+                                    "missing_turn",
+                                    "recovery terminalization Turn is missing",
+                                );
+                            }
+                            let turn_status_db: String = row.try_get("", "turn_status")?;
+                            let Some(turn_status) = turn_status_from_db(turn_status_db.as_str())
+                            else {
+                                break 'decision quarantine(
+                                    "unknown_turn_status",
+                                    "recovery terminalization Turn has an unknown status",
+                                );
+                            };
+                            let desired_status = if job_status == RecoveryJobStatus::Blocked {
+                                TurnStatus::Blocked
+                            } else {
+                                TurnStatus::Failed
+                            };
+                            if turn_status == TurnStatus::InProgress {
+                                break 'decision (
+                                    RecoveryTerminalizationClaimDisposition::NeedsCommit,
+                                    None,
+                                );
+                            }
+                            if turn_status == desired_status {
+                                break 'decision (
+                                    RecoveryTerminalizationClaimDisposition::AlreadyTerminal,
+                                    None,
+                                );
+                            }
+                            superseded.push(recovery_job_id.clone());
+                            break 'decision (
+                                RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                                    turn_status,
+                                ),
+                                None,
+                            );
+                        };
+                        if let Some((reason_code, message)) = quarantine_reason {
+                            quarantined
+                                .entry(reason_code)
+                                .or_insert_with(|| (message, Vec::new()))
+                                .1
+                                .push(recovery_job_id.clone());
+                        }
+                        dispositions.insert(recovery_job_id, disposition);
+                    }
+                    if !superseded.is_empty() {
+                        let affected = recovery_terminalization_outbox::cancel_claim_batch(
+                            &tx,
+                            &superseded,
+                            claim_token.as_str(),
+                            "superseded by authoritative terminal Turn status",
+                            now,
+                        )
+                        .await?;
+                        anyhow::ensure!(
+                            affected == superseded.len() as u64,
+                            "recovery terminalization claim was lost during batch supersession"
+                        );
+                    }
+                    for (reason_code, (message, job_ids)) in quarantined {
+                        let affected = recovery_terminalization_outbox::quarantine_claim_batch(
+                            &tx,
+                            &job_ids,
+                            claim_token.as_str(),
+                            reason_code.as_str(),
+                            message.as_str(),
+                            now,
+                        )
+                        .await?;
+                        anyhow::ensure!(
+                            affected == job_ids.len() as u64,
+                            "recovery terminalization claim was lost during batch quarantine"
+                        );
+                    }
+                    let classified = records
+                        .into_iter()
+                        .map(|record| {
+                            let disposition = dispositions
+                                .remove(record.recovery_job_id.as_str())
+                                .context("recovery terminalization was not classified")?;
+                            Ok((record, disposition))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok::<_, anyhow::Error>(classified)
+                }
+                .await;
+                match result {
+                    Ok(classified) => {
+                        tx.commit()
+                            .await
+                            .context("failed to commit terminalization batch classification")?;
+                        Ok(classified)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     async fn prepare_claimed_recovery_terminalization_commit(
         &self,
         record: &ClaimedRecoveryTerminalizationRecord,
         resume: Option<&pioneer_protocol::TurnBlockedResumeMetadata>,
         cleanup_plan: &RecoveryTerminalCleanupPlan,
         event_created_at: DateTimeWithTimeZone,
-    ) -> Result<PreparedRecoveryTerminalizationCommit> {
+    ) -> Result<PreparedRecoveryTerminalizationOutcome> {
         let outbox = pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(
             record.recovery_job_id.clone(),
         )
@@ -23434,13 +24102,30 @@ WHERE id IN (SELECT event_id FROM candidates)
         }
         let job = recovery_job::find_job_by_id(&self.connection, record.recovery_job_id.as_str())
             .await?
-            .context("recovery terminalization job disappeared")?;
-        let job_status = recovery_job_status_from_db(job.status.as_str())
-            .context("recovery terminalization job has an unknown status")?;
-        let job_item_type = turn_item_type_from_db(job.item_type.as_str())
-            .context("recovery terminalization job has an unknown item type")?;
-        let job_attempt_number = u32::try_from(job.run_count.max(1))
-            .context("recovery terminalization job has an invalid attempt number")?;
+            .ok_or_else(|| {
+                permanent_recovery_terminalization_error(
+                    "missing_recovery_job",
+                    "recovery terminalization job disappeared",
+                )
+            })?;
+        let job_status = recovery_job_status_from_db(job.status.as_str()).ok_or_else(|| {
+            permanent_recovery_terminalization_error(
+                "unknown_recovery_status",
+                "recovery terminalization job has an unknown status",
+            )
+        })?;
+        let job_item_type = turn_item_type_from_db(job.item_type.as_str()).ok_or_else(|| {
+            permanent_recovery_terminalization_error(
+                "unknown_item_type",
+                "recovery terminalization job has an unknown item type",
+            )
+        })?;
+        let job_attempt_number = u32::try_from(job.run_count.max(1)).map_err(|_| {
+            permanent_recovery_terminalization_error(
+                "invalid_attempt_number",
+                "recovery terminalization job has an invalid attempt number",
+            )
+        })?;
         let job_error_message = job
             .last_error
             .clone()
@@ -23453,44 +24138,74 @@ WHERE id IN (SELECT event_id FROM candidates)
             || job_attempt_number != record.attempt_number
             || job_error_message != record.error_message
         {
-            anyhow::bail!("recovery terminalization is stale: job identity/status changed");
+            return Err(permanent_recovery_terminalization_error(
+                "job_identity_mismatch",
+                "recovery terminalization is stale: job identity/status changed",
+            ));
         }
         if !matches!(
             job_status,
             RecoveryJobStatus::Blocked | RecoveryJobStatus::Failed | RecoveryJobStatus::Exhausted
         ) {
-            anyhow::bail!("recovery terminalization job is no longer terminalizable");
+            return Err(permanent_recovery_terminalization_error(
+                "non_terminal_recovery_job",
+                "recovery terminalization job is no longer terminalizable",
+            ));
         }
         let turn_model = turn::find_turn_by_id(&self.connection, record.turn_id.as_str())
             .await?
-            .context("recovery terminalization Turn is missing")?;
+            .ok_or_else(|| {
+                permanent_recovery_terminalization_error(
+                    "missing_turn",
+                    "recovery terminalization Turn is missing",
+                )
+            })?;
         let thread_model =
             thread::find_thread_by_id(&self.connection, turn_model.thread_id.as_str())
                 .await?
-                .context("recovery terminalization Thread is missing")?;
-        let current_status = turn_status_from_db(turn_model.status.as_str())
-            .context("recovery terminalization Turn has an unknown status")?;
+                .ok_or_else(|| {
+                    permanent_recovery_terminalization_error(
+                        "missing_thread",
+                        "recovery terminalization Thread is missing",
+                    )
+                })?;
+        let current_status = turn_status_from_db(turn_model.status.as_str()).ok_or_else(|| {
+            permanent_recovery_terminalization_error(
+                "unknown_turn_status",
+                "recovery terminalization Turn has an unknown status",
+            )
+        })?;
         let desired_status = if job_status == RecoveryJobStatus::Blocked {
             TurnStatus::Blocked
         } else {
             TurnStatus::Failed
         };
         if current_status != TurnStatus::InProgress && current_status != desired_status {
-            anyhow::bail!(
-                "stale recovery job cannot replace terminal Turn status `{:?}`",
-                current_status
-            );
+            return Ok(PreparedRecoveryTerminalizationOutcome::Superseded {
+                outbox_updated_at: outbox.updated_at,
+                job_updated_at: job.updated_at,
+                turn_updated_at: turn_model.updated_at,
+                current_status,
+            });
         }
-        let prompt_manifest = parse_turn_prompt_manifest(&turn_model)?;
-        let permission_profile = parse_turn_permission_profile(&turn_model)?;
-        let collaboration = turn::collaboration_from_model(&turn_model)?;
         let terminal_error = if job_status == RecoveryJobStatus::Blocked {
-            let resume = resume
-                .context("blocked recovery terminalization is missing durable resume metadata")?;
-            format!(
-                "{} (recovery job {})",
-                resume.human_message, record.recovery_job_id
-            )
+            if current_status == TurnStatus::Blocked {
+                turn_model
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| record.error_message.clone())
+            } else {
+                let resume = resume.ok_or_else(|| {
+                    permanent_recovery_terminalization_error(
+                        "missing_blocked_resume_metadata",
+                        "blocked recovery terminalization is missing durable resume metadata",
+                    )
+                })?;
+                format!(
+                    "{} (recovery job {})",
+                    resume.human_message, record.recovery_job_id
+                )
+            }
         } else {
             let status_label = match job_status {
                 RecoveryJobStatus::Exhausted => "exhausted",
@@ -23531,21 +24246,54 @@ WHERE id IN (SELECT event_id FROM candidates)
                     max_attempts: 5,
                 }],
             },
-        )?;
-        let terminal_turn = Turn {
-            id: turn_model.id.clone(),
-            status: desired_status,
-            turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
-            origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
-            mode: collaboration.mode.effective_mode,
-            author: collaboration.author,
-            reply_to_turn_id: collaboration.reply_to_turn_id,
-            mentions: collaboration.mentions,
-            message_revision: collaboration.message_revision,
-            message_deleted: collaboration.message_deleted,
-            error: Some(terminal_error),
-            prompt_manifest,
-            permission_profile,
+        )
+        .map_err(|error| {
+            permanent_recovery_terminalization_error(
+                "invalid_terminal_cleanup_plan",
+                format!("failed to prepare recovery terminal cleanup: {error:#}"),
+            )
+        })?;
+        let terminal_turn = if already_terminal {
+            // An older Gateway may have committed the terminal Turn before
+            // consuming this outbox row. No new terminal event is needed, so
+            // do not decode historical prompt/security schemas merely to
+            // manufacture an unused return value.
+            None
+        } else {
+            let prompt_manifest = parse_turn_prompt_manifest(&turn_model).map_err(|error| {
+                permanent_recovery_terminalization_error(
+                    "invalid_prompt_manifest",
+                    format!("failed to decode terminal Turn prompt manifest: {error:#}"),
+                )
+            })?;
+            let permission_profile =
+                parse_turn_permission_profile(&turn_model).map_err(|error| {
+                    permanent_recovery_terminalization_error(
+                        "invalid_permission_profile",
+                        format!("failed to decode terminal Turn permission profile: {error:#}"),
+                    )
+                })?;
+            let collaboration = turn::collaboration_from_model(&turn_model).map_err(|error| {
+                permanent_recovery_terminalization_error(
+                    "invalid_collaboration_metadata",
+                    format!("failed to decode terminal Turn collaboration metadata: {error:#}"),
+                )
+            })?;
+            Some(Turn {
+                id: turn_model.id.clone(),
+                status: desired_status,
+                turn_kind: turn_kind_from_db(turn_model.turn_kind.as_str()).unwrap_or_default(),
+                origin: turn_origin_from_db(turn_model.origin.as_str()).unwrap_or_default(),
+                mode: collaboration.mode.effective_mode,
+                author: collaboration.author,
+                reply_to_turn_id: collaboration.reply_to_turn_id,
+                mentions: collaboration.mentions,
+                message_revision: collaboration.message_revision,
+                message_deleted: collaboration.message_deleted,
+                error: Some(terminal_error),
+                prompt_manifest,
+                permission_profile,
+            })
         };
         let item_model = if desired_status == TurnStatus::Failed {
             turn::find_turn_item(
@@ -23559,8 +24307,13 @@ WHERE id IN (SELECT event_id FROM candidates)
         };
         let mut final_item = None;
         let item_event = if let Some(item_model) = item_model.as_ref() {
-            let mut item: TurnItem = serde_json::from_str(item_model.payload.as_str())
-                .context("failed to decode recovery terminalization item")?;
+            let mut item: TurnItem =
+                serde_json::from_str(item_model.payload.as_str()).map_err(|error| {
+                    permanent_recovery_terminalization_error(
+                        "invalid_turn_item_payload",
+                        format!("failed to decode recovery terminalization item: {error}"),
+                    )
+                })?;
             if tool_call_status(&item) == Some(ToolCallStatus::InProgress) {
                 terminalize_turn_item_payload(
                     &mut item,
@@ -23595,14 +24348,18 @@ WHERE id IN (SELECT event_id FROM candidates)
                 TurnEventPayload::TurnBlocked(pioneer_protocol::TurnBlockedNotification {
                     workspace_id: thread_model.workspace_id.clone(),
                     thread_id: turn_model.thread_id.clone(),
-                    turn: terminal_turn.clone(),
+                    turn: terminal_turn
+                        .clone()
+                        .expect("non-terminal recovery must construct a terminal Turn"),
                     resume: resume.cloned(),
                 })
             } else {
                 TurnEventPayload::TurnFailed(pioneer_protocol::TurnFailedNotification {
                     workspace_id: thread_model.workspace_id.clone(),
                     thread_id: turn_model.thread_id.clone(),
-                    turn: terminal_turn.clone(),
+                    turn: terminal_turn
+                        .clone()
+                        .expect("non-terminal recovery must construct a terminal Turn"),
                 })
             };
             Some(
@@ -23614,25 +24371,26 @@ WHERE id IN (SELECT event_id FROM candidates)
                 .await?,
             )
         };
-        Ok(PreparedRecoveryTerminalizationCommit {
-            outbox_updated_at: outbox.updated_at,
-            job_updated_at: job.updated_at,
-            turn_updated_at: turn_model.updated_at,
-            thread_id: thread_model.id.clone(),
-            workspace_id: thread_model.workspace_id,
-            revalidate_item: desired_status == TurnStatus::Failed,
-            item_updated_at: item_model.map(|item| item.updated_at),
-            item_event,
-            terminal_event,
-            terminal_effects,
-            applied: AppliedRecoveryTerminalization {
-                recovery_job_id: record.recovery_job_id.clone(),
-                thread_id: turn_model.thread_id,
-                final_item,
-                turn: terminal_turn,
-                already_terminal,
+        Ok(PreparedRecoveryTerminalizationOutcome::Commit(
+            PreparedRecoveryTerminalizationCommit {
+                outbox_updated_at: outbox.updated_at,
+                job_updated_at: job.updated_at,
+                turn_updated_at: turn_model.updated_at,
+                thread_id: thread_model.id.clone(),
+                workspace_id: thread_model.workspace_id,
+                revalidate_item: desired_status == TurnStatus::Failed,
+                item_updated_at: item_model.map(|item| item.updated_at),
+                item_event,
+                terminal_event,
+                terminal_effects,
+                applied: AppliedRecoveryTerminalization {
+                    recovery_job_id: record.recovery_job_id.clone(),
+                    thread_id: turn_model.thread_id,
+                    final_item,
+                    newly_terminal_turn: terminal_turn,
+                },
             },
-        })
+        ))
     }
 
     /// Applies item and Turn terminal state and consumes the recovery outbox
@@ -23643,18 +24401,151 @@ WHERE id IN (SELECT event_id FROM candidates)
         resume: Option<pioneer_protocol::TurnBlockedResumeMetadata>,
         cleanup_plan: RecoveryTerminalCleanupPlan,
         event_timestamp_secs: i64,
-    ) -> Result<AppliedRecoveryTerminalization> {
+    ) -> Result<RecoveryTerminalizationApplyOutcome> {
         let record = record.clone();
         self.run_serialized_write(|| async {
-            let mut prepared = self
+            let created_at = unix_to_datetime(event_timestamp_secs);
+            let prepared = match self
                 .prepare_claimed_recovery_terminalization_commit(
                     &record,
                     resume.as_ref(),
                     &cleanup_plan,
-                    unix_to_datetime(event_timestamp_secs),
+                    created_at,
                 )
-                .await?;
-            let created_at = unix_to_datetime(event_timestamp_secs);
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let Some(permanent) =
+                        error.downcast_ref::<PermanentRecoveryTerminalizationError>()
+                    else {
+                        return Err(error);
+                    };
+                    let reason_code = permanent.reason_code.to_owned();
+                    let message = permanent.message.chars().take(4_096).collect::<String>();
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin recovery terminalization quarantine transaction",
+                    )?;
+                    let quarantined = recovery_terminalization_outbox::quarantine_claim(
+                        &transaction,
+                        record.recovery_job_id.as_str(),
+                        record.claim_token.as_str(),
+                        reason_code.as_str(),
+                        message.as_str(),
+                        created_at,
+                    )
+                    .await;
+                    match quarantined {
+                        Ok(true) => {
+                            transaction.commit().await.context(
+                                "failed to commit recovery terminalization quarantine",
+                            )?;
+                            return Ok(RecoveryTerminalizationApplyOutcome::Quarantined {
+                                reason_code,
+                            });
+                        }
+                        Ok(false) => {
+                            let _ = transaction.rollback().await;
+                            anyhow::bail!(
+                                "recovery terminalization claim was lost before quarantine"
+                            );
+                        }
+                        Err(quarantine_error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(quarantine_error.context(format!(
+                                "failed to quarantine permanent recovery terminalization error: {error:#}"
+                            )));
+                        }
+                    }
+                }
+            };
+            let mut prepared = match prepared {
+                PreparedRecoveryTerminalizationOutcome::Commit(prepared) => prepared,
+                PreparedRecoveryTerminalizationOutcome::Superseded {
+                    outbox_updated_at,
+                    job_updated_at,
+                    turn_updated_at,
+                    current_status,
+                } => {
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin superseded recovery terminalization transaction",
+                    )?;
+                    let result = async {
+                        let outbox =
+                            pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(
+                                record.recovery_job_id.clone(),
+                            )
+                            .one(&transaction)
+                            .await?
+                            .context("recovery terminalization outbox row disappeared")?;
+                        if outbox.status != recovery_terminalization_outbox::STATUS_DELIVERING
+                            || outbox.claim_token.as_deref() != Some(record.claim_token.as_str())
+                            || outbox.updated_at != outbox_updated_at
+                        {
+                            anyhow::bail!("recovery terminalization claim is no longer owned");
+                        }
+                        let job = recovery_job::find_job_by_id(
+                            &transaction,
+                            record.recovery_job_id.as_str(),
+                        )
+                        .await?
+                        .context("recovery terminalization job disappeared")?;
+                        if job.updated_at != job_updated_at {
+                            anyhow::bail!(
+                                "recovery terminalization is stale: job identity/status changed"
+                            );
+                        }
+                        let turn_model =
+                            turn::find_turn_by_id(&transaction, record.turn_id.as_str())
+                                .await?
+                                .context("recovery terminalization Turn is missing")?;
+                        if turn_model.updated_at != turn_updated_at
+                            || turn_status_from_db(turn_model.status.as_str())
+                                != Some(current_status)
+                        {
+                            anyhow::bail!(
+                                "recovery terminalization target changed before supersession"
+                            );
+                        }
+                        let reason = format!(
+                            "superseded by authoritative terminal Turn status `{:?}`",
+                            current_status
+                        );
+                        if !recovery_terminalization_outbox::cancel_claim(
+                            &transaction,
+                            record.recovery_job_id.as_str(),
+                            record.claim_token.as_str(),
+                            reason.as_str(),
+                            created_at,
+                        )
+                        .await?
+                        {
+                            anyhow::bail!(
+                                "recovery terminalization claim was lost before supersession"
+                            );
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            transaction
+                                .commit()
+                                .await
+                                .context("failed to commit superseded recovery terminalization")?;
+                            return Ok(
+                                RecoveryTerminalizationApplyOutcome::SupersededByTerminalStatus(
+                                    current_status,
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
+                    }
+                }
+            };
             // Supplemental cleanup rows are non-runnable until the canonical
             // terminal event activates them. Persist that bounded preparation
             // before the atomic terminal transaction, then rebuild the exact
@@ -23775,7 +24666,7 @@ WHERE id IN (SELECT event_id FROM candidates)
                         .commit()
                         .await
                         .context("failed to commit recovery terminalization transaction")?;
-                    Ok(applied)
+                    Ok(RecoveryTerminalizationApplyOutcome::Applied(applied))
                 }
                 Err(error) => {
                     let _ = transaction.rollback().await;
@@ -24560,6 +25451,20 @@ WHERE id IN (SELECT event_id FROM candidates)
                 .into_iter()
                 .map(recovery_job_record_from_model)
                 .collect::<Vec<_>>())
+        })
+        .await
+    }
+
+    pub async fn find_unresolved_recovery_job_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<RecoveryJobRecord>> {
+        self.run_serialized_write(|| async {
+            Ok(
+                recovery_job::find_unresolved_job_by_turn(&self.connection, turn_id)
+                    .await?
+                    .map(recovery_job_record_from_model),
+            )
         })
         .await
     }
@@ -28786,6 +29691,7 @@ fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) ->
         active_attempt_started_at_unix: model
             .active_attempt_started_at
             .map(|timestamp| timestamp.timestamp()),
+        resolution_pending: model.resolution_pending,
     }
 }
 
@@ -28812,14 +29718,14 @@ async fn enqueue_recovery_terminalization_if_required<C: ConnectionTrait>(
 mod tests {
     use super::{
         AgentExecutionInput, AgentResourceStateInput, ArtifactBindingTargetRecord,
-        BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE, BlockedTurnRecoveryResumeOutcome,
-        CanonicalTurnEventPayload, ClaimedRecoveryActivation, CliRuntimeExecutionSegmentStatus,
-        CliRuntimeNativeEventListFilter, CliRuntimePendingRequestListFilter,
-        CliRuntimePendingRequestStatus, CliRuntimeProviderSessionLifecycle,
-        CliRuntimeRequestAuthorizationBinding, CliRuntimeThreadMcpMetadata,
-        CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter, CliRuntimeTurnMcpMetadata,
-        CompletedMessageTurnWrite, ConversationArtifactRefLimits, CrudStore,
-        DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
+        AtomicRecoveryJobEnqueueOutcome, BLOCK_KIND_APPROVAL, BLOCK_KIND_USER_MESSAGE,
+        BlockedTurnRecoveryResumeOutcome, CanonicalTurnEventPayload, ClaimedRecoveryActivation,
+        CliRuntimeExecutionSegmentStatus, CliRuntimeNativeEventListFilter,
+        CliRuntimePendingRequestListFilter, CliRuntimePendingRequestStatus,
+        CliRuntimeProviderSessionLifecycle, CliRuntimeRequestAuthorizationBinding,
+        CliRuntimeThreadMcpMetadata, CliRuntimeTurnAttemptStatus, CliRuntimeTurnBindingListFilter,
+        CliRuntimeTurnMcpMetadata, CompletedMessageTurnWrite, ConversationArtifactRefLimits,
+        CrudStore, DeleteTurnMessageRequest, EditTurnMessageRequest, IngestArtifactMetadataRecord,
         McpAuditEventRecord, McpServerCatalogSnapshotRecord, McpServerInstallationRecord,
         NativeExecutionWindowTransition, NewArtifactBlobRecord, NewCliRuntimeInstructionProjection,
         NewCliRuntimeNativeEvent, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
@@ -28828,7 +29734,8 @@ mod tests {
         NewTurnExecutionWindowRecord, NewTurnLlmContextEntry, NewTurnRuntimeSnapshot,
         NewWorkspaceMembership, PrepareClaudeProviderSessionBinding,
         PrepareTurnFinalizationOutcome, PreparedClaudeProviderSessionMode, ProjectionPageAnchor,
-        RecoveryJobRecord, RecoveryTerminalCleanupPlan, ResolveCliRuntimePendingRequest,
+        RecoveryJobRecord, RecoveryTerminalCleanupPlan, RecoveryTerminalizationApplyOutcome,
+        RecoveryTerminalizationClaimDisposition, ResolveCliRuntimePendingRequest,
         RestoreTurnProjectionStreamOutcome, SkillAuditEventRecord, SkillDependencySnapshotRecord,
         SkillInstallationPatch, SkillInstallationRecord, SkillPackChildDiff,
         SkillPackInstallationRecord, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
@@ -28855,8 +29762,8 @@ mod tests {
     };
     use crate::convention::ATTEMPT_STATUS_COMPLETED;
     use crate::repositories::{
-        cli_runtime_binding, native_terminal_effect_outbox, read_model_repair, thread, turn,
-        turn_finalization,
+        cli_runtime_binding, native_terminal_effect_outbox, read_model_repair,
+        recovery_terminalization_outbox, thread, turn, turn_finalization,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -28905,11 +29812,17 @@ mod tests {
         QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
     };
     use std::collections::BTreeMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
 
     const NATIVE_DELIVERY_MIGRATION: &str = "m20260805_000001_native_durable_delivery";
     const ATOMIC_TERMINALIZATION_MIGRATION: &str = "m20260806_000001_atomic_turn_terminalization";
     const EXECUTION_WINDOW_MIGRATION: &str = "m20260603_000001_turn_execution_window";
     const NATIVE_TERMINAL_EFFECT_MIGRATION: &str = "m20260829_000001_native_terminal_effect_outbox";
+    const RECOVERY_EPISODE_INVARIANT_MIGRATION: &str =
+        "m20260904_000001_recovery_episode_invariant";
     const INITIAL_SCHEMA_MIGRATION: &str = "m20260313_125253_create_workspace_table";
     fn migrations_before(name: &str) -> Vec<Box<dyn migration::MigrationTrait>> {
         let migrations = Migrator::migrations();
@@ -29003,6 +29916,14 @@ mod tests {
         }
     }
 
+    struct PreRecoveryEpisodeInvariantMigrator;
+
+    impl MigratorTrait for PreRecoveryEpisodeInvariantMigrator {
+        fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
+            migrations_before(RECOVERY_EPISODE_INVARIANT_MIGRATION)
+        }
+    }
+
     async fn test_store_with_workspace(workspace_id: &str) -> CrudStore {
         let connection = Database::connect("sqlite::memory:")
             .await
@@ -29025,6 +29946,39 @@ mod tests {
         .expect("workspace insert should succeed");
 
         CrudStore::new(connection)
+    }
+
+    async fn test_store_with_workspace_and_query_counter(
+        workspace_id: &str,
+    ) -> (CrudStore, Arc<AtomicU64>) {
+        let mut connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        let query_count = Arc::new(AtomicU64::new(0));
+        connection.set_metric_callback({
+            let query_count = Arc::clone(&query_count);
+            move |_| {
+                query_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+
+        let timestamp = unix_to_datetime(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Test Workspace".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(timestamp),
+            updated_at: Set(timestamp),
+        })
+        .exec(&connection)
+        .await
+        .expect("workspace insert should succeed");
+
+        (CrudStore::new(connection), query_count)
     }
 
     async fn test_store_with_zstd_turn_items() -> CrudStore {
@@ -29782,6 +30736,125 @@ mod tests {
                 "{table_name} should be removed by rollback"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_episode_migration_converges_legacy_duplicates_before_installing_guard() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        PreRecoveryEpisodeInvariantMigrator::up(&connection, None)
+            .await
+            .expect("baseline migrations must succeed");
+
+        connection
+            .execute_unprepared(
+                "INSERT INTO recovery_job (
+                    id, turn_id, item_id, item_type, status, trigger, action,
+                    created_at, updated_at
+                 ) VALUES (
+                    'job_legacy_terminal', 'turn_legacy_duplicate', 'runtime:terminal',
+                    'reasoning', 'failed', 'runtime_failure', 'mark_failed',
+                    '2026-09-04 00:00:00+00:00', '2026-09-04 00:00:00+00:00'
+                 )",
+            )
+            .await
+            .expect("legacy terminal recovery should insert");
+        connection
+            .execute_unprepared(
+                "INSERT INTO recovery_terminalization_outbox (
+                    recovery_job_id, turn_id, item_id, item_type, recovery_status,
+                    attempt_number, error_message, status, next_run_at, created_at, updated_at
+                 ) VALUES (
+                    'job_legacy_terminal', 'turn_legacy_duplicate', 'runtime:terminal',
+                    'reasoning', 'failed', 1, 'obsolete recovery', 'pending',
+                    '2026-09-04 00:00:00+00:00', '2026-09-04 00:00:00+00:00',
+                    '2026-09-04 00:00:00+00:00'
+                 )",
+            )
+            .await
+            .expect("legacy terminalization should insert");
+        connection
+            .execute_unprepared(
+                "INSERT INTO recovery_job (
+                    id, turn_id, item_id, item_type, status, trigger, action,
+                    created_at, updated_at
+                 ) VALUES (
+                    'job_legacy_current', 'turn_legacy_duplicate', 'runtime:current',
+                    'reasoning', 'pending', 'runtime_failure', 'mark_failed',
+                    '2026-09-04 00:01:00+00:00', '2026-09-04 00:01:00+00:00'
+                 )",
+            )
+            .await
+            .expect("legacy current recovery should insert");
+
+        Migrator::up(&connection, None)
+            .await
+            .expect("recovery episode invariant migration must converge legacy data");
+
+        let current = connection
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT status, resolution_pending FROM recovery_job \
+                 WHERE id = 'job_legacy_current'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("current recovery lookup should succeed")
+            .expect("current recovery should remain");
+        assert_eq!(
+            current
+                .try_get::<String>("", "status")
+                .expect("current recovery status"),
+            "pending"
+        );
+        assert_eq!(
+            current
+                .try_get::<i64>("", "resolution_pending")
+                .expect("current recovery ownership"),
+            1
+        );
+        let obsolete = connection
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT r.resolution_pending, o.status AS outbox_status \
+                 FROM recovery_job r \
+                 JOIN recovery_terminalization_outbox o ON o.recovery_job_id = r.id \
+                 WHERE r.id = 'job_legacy_terminal'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("obsolete recovery lookup should succeed")
+            .expect("obsolete recovery audit should remain");
+        assert_eq!(
+            obsolete
+                .try_get::<i64>("", "resolution_pending")
+                .expect("obsolete recovery ownership"),
+            0
+        );
+        assert_eq!(
+            obsolete
+                .try_get::<String>("", "outbox_status")
+                .expect("obsolete outbox status"),
+            recovery_terminalization_outbox::STATUS_CANCELLED
+        );
+
+        let duplicate = connection
+            .execute_unprepared(
+                "INSERT INTO recovery_job (
+                    id, turn_id, item_id, item_type, status, trigger, action,
+                    resolution_pending, created_at, updated_at
+                 ) VALUES (
+                    'job_guard_violation', 'turn_legacy_duplicate', 'runtime:duplicate',
+                    'reasoning', 'pending', 'runtime_failure', 'mark_failed', 1,
+                    '2026-09-04 00:02:00+00:00', '2026-09-04 00:02:00+00:00'
+                 )",
+            )
+            .await;
+        assert!(
+            duplicate.is_err(),
+            "the database must reject a second unresolved recovery episode for one Turn"
+        );
     }
 
     #[tokio::test]
@@ -32397,7 +33470,7 @@ mod tests {
             .await
             .expect("terminalization should survive restart");
         assert_eq!(claimed.len(), 1);
-        let applied = restarted
+        let outcome = restarted
             .apply_claimed_recovery_terminalization(
                 &claimed[0],
                 None,
@@ -32409,8 +33482,13 @@ mod tests {
             )
             .await
             .expect("item and Turn should commit atomically");
-        assert!(!applied.already_terminal);
-        assert_eq!(applied.turn.status, TurnStatus::Failed);
+        let RecoveryTerminalizationApplyOutcome::Applied(applied) = outcome else {
+            panic!("running Turn terminalization must not be superseded");
+        };
+        assert_eq!(
+            applied.newly_terminal_turn.as_ref().map(|turn| turn.status),
+            Some(TurnStatus::Failed)
+        );
         assert!(applied.final_item.is_some());
         let cleanup = restarted
             .claim_due_native_terminal_effects(1_700_000_004, 90, 10)
@@ -32666,6 +33744,722 @@ mod tests {
             )
             .await
             .expect("reclaimed terminalization should converge");
+    }
+
+    #[tokio::test]
+    async fn recovery_terminalization_cancels_claim_superseded_by_authoritative_terminal_status() {
+        let workspace_id = "ws_recovery_terminal_superseded";
+        let thread_id = "thr_recovery_terminal_superseded";
+        let turn_id = "turn_recovery_superseded";
+        let (store, _, mut turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn,
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("authoritative completion should persist");
+        let job = store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                "reasoning_recovery_superseded".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::MarkFailed,
+                Some("obsolete recovery failure".to_owned()),
+                None,
+                None,
+                None,
+                1,
+                1,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_002,
+            )
+            .await
+            .expect("recovery job should enqueue");
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    job.id.as_str(),
+                    RecoveryJobStatus::Failed,
+                    Some("obsolete recovery failure".to_owned()),
+                    1_700_000_003,
+                )
+                .await
+                .expect("terminal job should enqueue its outbox row")
+        );
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_000_004, 45, 10)
+            .await
+            .expect("stale terminalization should claim");
+        assert_eq!(claimed.len(), 1);
+
+        let disposition = store
+            .classify_claimed_recovery_terminalization(&claimed[0], 1_700_000_004)
+            .await
+            .expect("newer terminal status should be classified without retry");
+        assert_eq!(
+            disposition,
+            RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                TurnStatus::Completed
+            )
+        );
+        let outbox = pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(job.id)
+            .one(&store.connection)
+            .await
+            .expect("outbox lookup should succeed")
+            .expect("outbox audit row should remain");
+        assert_eq!(
+            outbox.status,
+            recovery_terminalization_outbox::STATUS_CANCELLED
+        );
+        assert!(outbox.claim_token.is_none());
+        assert!(
+            outbox
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Completed"))
+        );
+        assert!(
+            store
+                .claim_due_recovery_terminalizations(1_800_000_000, 45, 10)
+                .await
+                .expect("cancelled terminalization lookup should succeed")
+                .is_empty(),
+            "superseded terminalization must never be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_terminal_recovery_consumes_legacy_row_without_rewriting_committed_cleanup() {
+        let workspace_id = "ws_recovery_terminal_legacy";
+        let thread_id = "thr_recovery_terminal_legacy";
+        let turn_id = "turn_recovery_legacy";
+        let (store, _, mut turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let original_preparation =
+            cleanup_effect_preparation(workspace_id, thread_id, turn_id, "original");
+        let effect_id = original_preparation.effects[0].effect_id.clone();
+        store
+            .prepare_native_terminal_effects(original_preparation, 1_700_000_001)
+            .await
+            .expect("canonical cleanup should prepare");
+        turn.status = TurnStatus::Failed;
+        turn.error = Some("canonical failure".to_owned());
+        store
+            .materialize_turn_failed(
+                TurnFailedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn,
+                },
+                1_700_000_002,
+            )
+            .await
+            .expect("canonical failure should activate cleanup");
+        let original_effect =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id.clone())
+                .one(&store.connection)
+                .await
+                .expect("cleanup lookup should succeed")
+                .expect("canonical cleanup should exist");
+        assert!(original_effect.terminal_committed_at.is_some());
+
+        pioneer_entity::turn::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn::Column::PromptManifestJson,
+                Expr::value(r#"{"profile":"retired_prompt_variant"}"#.to_owned()),
+            )
+            .filter(pioneer_entity::turn::Column::Id.eq(turn_id.to_owned()))
+            .exec(&store.connection)
+            .await
+            .expect("legacy prompt fixture should persist");
+        let job = store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                "reasoning_recovery_legacy".to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::Timeout,
+                RecoveryAction::MarkFailed,
+                Some("later reconstructed failure".to_owned()),
+                None,
+                None,
+                None,
+                1,
+                1,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_003,
+            )
+            .await
+            .expect("legacy recovery job should enqueue");
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    job.id.as_str(),
+                    RecoveryJobStatus::Failed,
+                    Some("later reconstructed failure".to_owned()),
+                    1_700_000_004,
+                )
+                .await
+                .expect("legacy recovery terminalization should enqueue")
+        );
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_000_005, 45, 10)
+            .await
+            .expect("legacy terminalization should claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            store
+                .classify_claimed_recovery_terminalization(&claimed[0], 1_700_000_005)
+                .await
+                .expect("legacy terminalization classification should succeed"),
+            RecoveryTerminalizationClaimDisposition::AlreadyTerminal
+        );
+
+        let outcome = store
+            .apply_claimed_recovery_terminalization(
+                &claimed[0],
+                None,
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 99,
+                    runtime_contract: "pioneer.test.new-cleanup-contract.v2".to_owned(),
+                },
+                1_700_000_005,
+            )
+            .await
+            .expect("already-terminal legacy row should converge");
+        let RecoveryTerminalizationApplyOutcome::Applied(applied) = outcome else {
+            panic!("matching terminal status must consume rather than supersede recovery");
+        };
+        assert!(applied.newly_terminal_turn.is_none());
+
+        let delivered = pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(job.id)
+            .one(&store.connection)
+            .await
+            .expect("terminalization lookup should succeed")
+            .expect("terminalization audit row should remain");
+        assert_eq!(
+            delivered.status,
+            recovery_terminalization_outbox::STATUS_DELIVERED
+        );
+        let retained_effect =
+            pioneer_entity::native_terminal_effect_outbox::Entity::find_by_id(effect_id)
+                .one(&store.connection)
+                .await
+                .expect("retained cleanup lookup should succeed")
+                .expect("retained cleanup should exist");
+        assert_eq!(
+            retained_effect.payload_identity_sha256, original_effect.payload_identity_sha256,
+            "recovery must preserve the canonical committed cleanup payload"
+        );
+        assert_eq!(retained_effect.payload_json, original_effect.payload_json);
+    }
+
+    #[tokio::test]
+    async fn atomic_recovery_enqueue_reuses_terminal_job_until_outbox_resolution() {
+        let workspace_id = "ws_recovery_episode_guard";
+        let thread_id = "thr_recovery_episode_guard";
+        let turn_id = "turn_recovery_guard";
+        let (store, _, mut turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+
+        let enqueue = |item_id: &str, now_unix| {
+            store.enqueue_recovery_job_if_no_unresolved(
+                turn_id.to_owned(),
+                item_id.to_owned(),
+                TurnItemType::Reasoning,
+                None,
+                RecoveryTrigger::RuntimeFailure,
+                RecoveryAction::MarkFailed,
+                Some("observation gap".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                1,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                now_unix,
+            )
+        };
+
+        let AtomicRecoveryJobEnqueueOutcome::Created(first) =
+            enqueue("runtime:first", 1_700_000_001)
+                .await
+                .expect("first recovery episode should enqueue")
+        else {
+            panic!("first recovery episode must be created");
+        };
+        let AtomicRecoveryJobEnqueueOutcome::Reused(reused_pending) =
+            enqueue("runtime:duplicate", 1_700_000_002)
+                .await
+                .expect("pending recovery episode should be reused")
+        else {
+            panic!("pending recovery episode must be reused");
+        };
+        assert_eq!(reused_pending.id, first.id);
+
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    first.id.as_str(),
+                    RecoveryJobStatus::Failed,
+                    Some("terminal observation gap".to_owned()),
+                    1_700_000_003,
+                )
+                .await
+                .expect("recovery job should become terminal")
+        );
+        let AtomicRecoveryJobEnqueueOutcome::Reused(reused_terminal) =
+            enqueue("runtime:after-terminal", 1_700_000_004)
+                .await
+                .expect("unresolved terminalization should retain episode ownership")
+        else {
+            panic!("terminal recovery with unresolved outbox must be reused");
+        };
+        assert_eq!(reused_terminal.id, first.id);
+
+        turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn,
+                },
+                1_700_000_005,
+            )
+            .await
+            .expect("authoritative completion should persist");
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_000_006, 45, 10)
+            .await
+            .expect("terminalization should claim");
+        assert_eq!(claimed.len(), 1);
+        assert!(matches!(
+            store
+                .classify_claimed_recovery_terminalization(&claimed[0], 1_700_000_006)
+                .await
+                .expect("terminalization should be superseded"),
+            RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                TurnStatus::Completed
+            )
+        ));
+
+        let AtomicRecoveryJobEnqueueOutcome::Created(next) =
+            enqueue("runtime:next-episode", 1_700_000_007)
+                .await
+                .expect("resolved episode should release the database guard")
+        else {
+            panic!("a new recovery may start only after durable resolution");
+        };
+        assert_ne!(next.id, first.id);
+    }
+
+    #[tokio::test]
+    async fn superseded_terminalization_batch_has_constant_query_count() {
+        const BATCH_SIZE: usize = 64;
+        let workspace_id = "ws_recovery_batch_queries";
+        let (store, query_count) = test_store_with_workspace_and_query_counter(workspace_id).await;
+
+        for index in 0..BATCH_SIZE {
+            let timestamp = 1_700_000_000 + i64::try_from(index).unwrap_or_default();
+            let thread_id = format!("thr_recovery_batch_{index}");
+            let turn_id = format!("turn_recovery_batch_{index}");
+            let thread = Thread {
+                workspace_id: workspace_id.to_owned(),
+                id: thread_id.clone(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "gpt-5.4".to_owned(),
+                model_provider: "openai".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            };
+            let mut turn = Turn {
+                id: turn_id.clone(),
+                status: TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .upsert_thread_model(&thread, pioneer_protocol::PersistedActorRef::System)
+                .await
+                .expect("batch thread should persist");
+            store
+                .materialize_turn_start(
+                    &thread,
+                    SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .expect("batch Turn should persist");
+            turn.status = TurnStatus::Completed;
+            store
+                .materialize_turn_completed(
+                    TurnCompletedNotification {
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id,
+                        turn,
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .expect("authoritative terminal Turn should persist");
+            let job = store
+                .enqueue_recovery_job(
+                    turn_id,
+                    format!("runtime:batch:{index}"),
+                    TurnItemType::Reasoning,
+                    None,
+                    RecoveryTrigger::RuntimeFailure,
+                    RecoveryAction::MarkFailed,
+                    Some("obsolete recovery".to_owned()),
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    timestamp + 2,
+                )
+                .await
+                .expect("batch recovery should enqueue");
+            assert!(
+                store
+                    .mark_recovery_job_terminal(
+                        job.id.as_str(),
+                        RecoveryJobStatus::Failed,
+                        Some("obsolete recovery".to_owned()),
+                        timestamp + 3,
+                    )
+                    .await
+                    .expect("batch recovery should become terminal")
+            );
+        }
+
+        query_count.store(0, Ordering::Relaxed);
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_001_000, 45, BATCH_SIZE as u64)
+            .await
+            .expect("full terminalization batch should claim");
+        assert_eq!(claimed.len(), BATCH_SIZE);
+        let classified = store
+            .classify_claimed_recovery_terminalization_batch(&claimed, 1_700_001_000)
+            .await
+            .expect("full terminalization batch should classify");
+        assert_eq!(classified.len(), BATCH_SIZE);
+        assert!(classified.iter().all(|(_, disposition)| matches!(
+            disposition,
+            RecoveryTerminalizationClaimDisposition::SupersededByTerminalStatus(
+                TurnStatus::Completed
+            )
+        )));
+        let measured = query_count.load(Ordering::Relaxed);
+        assert!(
+            measured <= 8,
+            "claiming and classifying {BATCH_SIZE} stale rows issued {measured} SQL statements"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_terminalization_is_quarantined_without_blocking_later_rows() {
+        async fn terminal_job(
+            store: &CrudStore,
+            turn_id: &str,
+            item_id: &str,
+            now_unix: i64,
+        ) -> RecoveryJobRecord {
+            let job = store
+                .enqueue_recovery_job(
+                    turn_id.to_owned(),
+                    item_id.to_owned(),
+                    TurnItemType::Reasoning,
+                    None,
+                    RecoveryTrigger::RuntimeFailure,
+                    RecoveryAction::MarkFailed,
+                    Some("terminal recovery".to_owned()),
+                    None,
+                    None,
+                    None,
+                    0,
+                    1,
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    now_unix,
+                )
+                .await
+                .expect("recovery job should enqueue");
+            assert!(
+                store
+                    .mark_recovery_job_terminal(
+                        job.id.as_str(),
+                        RecoveryJobStatus::Failed,
+                        Some("terminal recovery".to_owned()),
+                        now_unix + 1,
+                    )
+                    .await
+                    .expect("recovery job should become terminal")
+            );
+            job
+        }
+
+        let (store, _, _) = test_store_with_started_turn(
+            "ws_recovery_poison",
+            "thr_recovery_poison",
+            "turn_recovery_poison",
+        )
+        .await;
+        let poison = terminal_job(
+            &store,
+            "turn_recovery_poison",
+            "runtime:poison",
+            1_700_000_001,
+        )
+        .await;
+        let second_thread = Thread {
+            workspace_id: "ws_recovery_poison".to_owned(),
+            id: "thr_recovery_valid".to_owned(),
+            name: None,
+            preview: String::new(),
+            preview_author: None,
+            mode: ThreadMode::Agent,
+            model: "gpt-5.4".to_owned(),
+            model_provider: "openai".to_owned(),
+            reasoning_effort: None,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            status: ThreadStatus::Active,
+            origin_kind: ThreadOriginKind::User,
+            sidebar_visibility: ThreadSidebarVisibility::Visible,
+            agent_nickname: None,
+            agent_role: None,
+            visibility: None,
+            turns: Vec::new(),
+        };
+        let second_turn = Turn {
+            id: "turn_recovery_valid".to_owned(),
+            status: TurnStatus::InProgress,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: Vec::new(),
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        };
+        store
+            .upsert_thread_model(&second_thread, pioneer_protocol::PersistedActorRef::System)
+            .await
+            .expect("second thread should persist");
+        store
+            .materialize_turn_start(
+                &second_thread,
+                SandboxMode::FullAccess,
+                &second_turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("second Turn should persist");
+        let valid = terminal_job(
+            &store,
+            "turn_recovery_valid",
+            "runtime:valid",
+            1_700_000_003,
+        )
+        .await;
+
+        pioneer_entity::recovery_terminalization_outbox::Entity::update_many()
+            .col_expr(
+                pioneer_entity::recovery_terminalization_outbox::Column::ItemType,
+                Expr::value("retired_item_type"),
+            )
+            .filter(
+                pioneer_entity::recovery_terminalization_outbox::Column::RecoveryJobId
+                    .eq(poison.id.clone()),
+            )
+            .exec(&store.connection)
+            .await
+            .expect("poison fixture should persist");
+
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_000_010, 45, 10)
+            .await
+            .expect("poison row must not fail the batch");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].recovery_job_id, valid.id);
+        let quarantined =
+            pioneer_entity::recovery_terminalization_outbox::Entity::find_by_id(poison.id.clone())
+                .one(&store.connection)
+                .await
+                .expect("quarantine lookup should succeed")
+                .expect("quarantined audit row should remain");
+        assert_eq!(
+            quarantined.status,
+            recovery_terminalization_outbox::STATUS_CANCELLED
+        );
+        assert_eq!(
+            quarantined.quarantine_reason_code.as_deref(),
+            Some("unknown_item_type")
+        );
+        assert!(quarantined.quarantined_at.is_some());
+        let poison_job = store
+            .get_recovery_job(poison.id.as_str())
+            .await
+            .expect("poison recovery lookup should succeed")
+            .expect("poison recovery should remain for audit");
+        assert!(!poison_job.resolution_pending);
+    }
+
+    #[tokio::test]
+    async fn permanently_invalid_terminalization_payload_is_quarantined_instead_of_retried() {
+        let workspace_id = "ws_recovery_apply_poison";
+        let thread_id = "thr_recovery_apply_poison";
+        let turn_id = "turn_recovery_apply_poison";
+        let (store, _, _) = test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let item_id = "tool_recovery_apply_poison";
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: safe_web_fetch_item(item_id),
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("tool item should start");
+        let job = store
+            .enqueue_recovery_job(
+                turn_id.to_owned(),
+                item_id.to_owned(),
+                TurnItemType::WebFetch,
+                None,
+                RecoveryTrigger::RuntimeFailure,
+                RecoveryAction::MarkFailed,
+                Some("terminal recovery".to_owned()),
+                None,
+                None,
+                None,
+                0,
+                1,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                1_700_000_002,
+            )
+            .await
+            .expect("recovery job should enqueue");
+        assert!(
+            store
+                .mark_recovery_job_terminal(
+                    job.id.as_str(),
+                    RecoveryJobStatus::Failed,
+                    Some("terminal recovery".to_owned()),
+                    1_700_000_003,
+                )
+                .await
+                .expect("recovery job should become terminal")
+        );
+        pioneer_entity::turn_item::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_item::Column::Payload,
+                Expr::value("{retired-invalid-payload"),
+            )
+            .filter(pioneer_entity::turn_item::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(pioneer_entity::turn_item::Column::ItemId.eq(item_id.to_owned()))
+            .exec(&store.connection)
+            .await
+            .expect("poison payload fixture should persist");
+
+        let claimed = store
+            .claim_due_recovery_terminalizations(1_700_000_004, 45, 10)
+            .await
+            .expect("terminalization should claim");
+        let classified = store
+            .classify_claimed_recovery_terminalization_batch(&claimed, 1_700_000_004)
+            .await
+            .expect("terminalization should pass early classification");
+        assert_eq!(classified.len(), 1);
+        assert_eq!(
+            classified[0].1,
+            RecoveryTerminalizationClaimDisposition::NeedsCommit
+        );
+        let outcome = store
+            .apply_claimed_recovery_terminalization(
+                &classified[0].0,
+                None,
+                RecoveryTerminalCleanupPlan {
+                    runtime_generation: 1,
+                    runtime_contract: "pioneer.test.attached-task-cleanup.v1".to_owned(),
+                },
+                1_700_000_004,
+            )
+            .await
+            .expect("permanent payload error should converge through quarantine");
+        assert_eq!(
+            outcome,
+            RecoveryTerminalizationApplyOutcome::Quarantined {
+                reason_code: "invalid_turn_item_payload".to_owned(),
+            }
+        );
+        assert!(
+            store
+                .claim_due_recovery_terminalizations(1_800_000_000, 45, 10)
+                .await
+                .expect("quarantined lookup should succeed")
+                .is_empty(),
+            "permanent payload poison must never re-enter the retry loop"
+        );
+        let retained = store
+            .get_recovery_job(job.id.as_str())
+            .await
+            .expect("recovery audit lookup should succeed")
+            .expect("recovery audit should remain");
+        assert!(!retained.resolution_pending);
+        let (_, running) = store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("Turn lookup should succeed")
+            .expect("Turn should remain");
+        assert_eq!(running.status, TurnStatus::InProgress);
     }
 
     #[tokio::test]

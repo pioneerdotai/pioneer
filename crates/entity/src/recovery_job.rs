@@ -38,6 +38,7 @@ pub struct Model {
     pub claim_expires_at: Option<DateTimeWithTimeZone>,
     pub active_attempt_id: Option<String>,
     pub active_attempt_started_at: Option<DateTimeWithTimeZone>,
+    pub resolution_pending: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_one)]
