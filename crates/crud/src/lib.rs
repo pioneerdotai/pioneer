@@ -7991,6 +7991,212 @@ impl CrudStore {
         .await
     }
 
+    /// Publish a prepared memory payload. The expected active ID fences the
+    /// read/put/publish gap: an INSERT race cannot attach B's frame to row A.
+    /// Supersession and replacement publication share this SQL-only transaction.
+    /// None means the active identity changed; the caller must reload/retry.
+    pub async fn publish_agent_memory_record(
+        &self,
+        record: NewAgentMemoryControlRecord,
+        expected_active_id: Option<String>,
+        supersedes: Option<String>,
+        canonical_identity: Option<pioneer_protocol::MemoryCanonicalKey>,
+        now_unix: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        let memory_id = record
+            .id
+            .clone()
+            .context("memory publication requires an id")?;
+        let resolved = self.resolve_memory_scope(record.scope.clone()).await?;
+        let namespace = crate::memory::normalized_memory_namespace(record.namespace.as_deref())?;
+        let key = crate::memory::normalized_optional_memory_key(record.key.clone())?;
+        let event_kind = if expected_active_id.is_some() && supersedes.is_none() {
+            MEMORY_EVENT_UPDATED
+        } else {
+            MEMORY_EVENT_CREATED
+        };
+        let publication_event = agent_memory_event::prepare_memory_event(memory_event_for_record(
+            None,
+            memory_id.clone(),
+            resolved.workspace_id.clone(),
+            event_kind,
+            now_unix,
+        ));
+        let superseded_event = supersedes.as_ref().map(|id| {
+            agent_memory_event::prepare_memory_event(memory_event_for_record(
+                None,
+                id.clone(),
+                resolved.workspace_id.clone(),
+                MEMORY_EVENT_SUPERSEDED,
+                now_unix,
+            ))
+        });
+        self.run_serialized_write(|| {
+            let record = record.clone();
+            let resolved = resolved.clone();
+            let namespace = namespace.clone();
+            let key = key.clone();
+            let memory_id = memory_id.clone();
+            let expected_active_id = expected_active_id.clone();
+            let supersedes = supersedes.clone();
+            let publication_event = publication_event.clone();
+            let superseded_event = superseded_event.clone();
+            let canonical_identity = canonical_identity.clone();
+            async move {
+                let tx = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("begin memory publication")?;
+                // Only thread/task ownership is mutable state used by scope
+                // preparation. Revalidate it inside the publication boundary.
+                let current_workspace = match resolved.scope.kind {
+                    MemoryScopeKind::Thread => Some(
+                        pioneer_entity::thread::Entity::find_by_id(resolved.scope.key.clone())
+                            .one(&tx)
+                            .await?
+                            .context("memory thread disappeared")?
+                            .workspace_id,
+                    ),
+                    MemoryScopeKind::Task => Some(
+                        pioneer_entity::task::Entity::find_by_id(resolved.scope.key.clone())
+                            .one(&tx)
+                            .await?
+                            .context("memory task disappeared")?
+                            .workspace_id,
+                    ),
+                    _ => resolved.workspace_id.clone(),
+                };
+                if current_workspace != resolved.workspace_id {
+                    bail!("memory scope ownership changed during publication");
+                }
+                let current = if let Some(id) = supersedes.as_deref() {
+                    agent_memory::find_memory_by_id(&tx, id, false).await?
+                } else if let Some(key) = key.as_deref() {
+                    agent_memory::find_active_memory_by_scoped_key(&tx, &resolved, &namespace, key)
+                        .await?
+                } else if let Some(id) = expected_active_id.as_deref() {
+                    agent_memory::find_memory_by_id(&tx, id, false).await?
+                } else {
+                    None
+                };
+                if current.as_ref().map(|row| row.id.as_str()) != expected_active_id.as_deref() {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+                let now = unix_to_datetime(now_unix);
+                if let Some(old) = current.as_ref() {
+                    if old.scope_kind
+                        != crate::convention::memory_scope_kind_to_db(resolved.scope.kind)
+                        || old.scope_key_hash != resolved.scope_key_hash
+                        || old.workspace_id != resolved.workspace_id
+                    {
+                        bail!("memory replacement must retain its owning scope");
+                    }
+                }
+                if let Some(id) = supersedes.as_deref() {
+                    if expected_active_id.as_deref() != Some(id) {
+                        bail!("supersession must replace the expected active record");
+                    }
+                    agent_memory::mark_memory_superseded(&tx, id, &memory_id, now)
+                        .await?
+                        .context("superseded memory disappeared")?;
+                    agent_memory_event::append_prepared_memory_event(
+                        &tx,
+                        superseded_event.expect("supersession event"),
+                    )
+                    .await?;
+                }
+                let row = if supersedes.is_some() || key.is_none() {
+                    agent_memory::insert_memory_record(&tx, record, resolved.clone(), now).await?
+                } else {
+                    agent_memory::upsert_active_memory_record(&tx, record, resolved.clone(), now)
+                        .await?
+                };
+                if row.id != memory_id {
+                    bail!("memory publication identity mismatch");
+                }
+                if let Some(old_id) = supersedes.as_deref() {
+                    repositories::agent_memory_identity::transfer(&tx, old_id, &memory_id).await?;
+                }
+                if let Some(identity) = canonical_identity.as_ref() {
+                    repositories::agent_memory_identity::bind(
+                        &tx,
+                        &resolved,
+                        &identity.namespace,
+                        &identity.key,
+                        &memory_id,
+                    )
+                    .await?;
+                }
+                agent_memory_event::append_prepared_memory_event(&tx, publication_event).await?;
+                tx.commit().await.context("commit memory publication")?;
+                Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                    row,
+                )?))
+            }
+        })
+        .await
+    }
+
+    pub async fn get_agent_memory_by_identity(
+        &self,
+        scope: MemoryScope,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        let resolved = self.resolve_memory_scope(scope).await?;
+        let namespace = crate::memory::normalized_memory_namespace(Some(namespace))?;
+        let key = crate::memory::normalized_memory_key(key)?;
+        let id = repositories::agent_memory_identity::lookup(
+            &self.connection,
+            &resolved,
+            &namespace,
+            &key,
+        )
+        .await?;
+        match id {
+            Some(id) => self.get_agent_memory_record(&id, false).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Bind an unchanged duplicate only while it is still the active target.
+    pub async fn bind_agent_memory_identity(
+        &self,
+        memory_id: &str,
+        identity: pioneer_protocol::MemoryCanonicalKey,
+    ) -> Result<()> {
+        let resolved = self.resolve_memory_scope(identity.scope.clone()).await?;
+        self.run_serialized_write(|| {
+            let resolved = resolved.clone();
+            let identity = identity.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                let row = agent_memory::find_memory_by_id(&tx, memory_id, false)
+                    .await?
+                    .context("identity target is no longer active")?;
+                if row.scope_kind != crate::convention::memory_scope_kind_to_db(resolved.scope.kind)
+                    || row.scope_key_hash != resolved.scope_key_hash
+                    || row.workspace_id != resolved.workspace_id
+                {
+                    bail!("identity target scope mismatch");
+                }
+                repositories::agent_memory_identity::bind(
+                    &tx,
+                    &resolved,
+                    &identity.namespace,
+                    &identity.key,
+                    memory_id,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
     pub async fn get_agent_memory_record(
         &self,
         memory_id: &str,
@@ -8114,6 +8320,28 @@ impl CrudStore {
         rows.into_iter()
             .map(crate::memory::agent_memory_control_record_from_model)
             .collect()
+    }
+
+    /// Read one bounded inventory page. The caller carries the last scanned
+    /// (created_at, id), including rows later hidden by payload/read policy.
+    pub async fn list_agent_memory_record_page(
+        &self,
+        filter: AgentMemoryListFilter,
+        before: Option<(i64, String)>,
+        now_unix: i64,
+    ) -> Result<Vec<AgentMemoryControlRecord>> {
+        let resolved = self.resolve_memory_scopes(filter.scopes.clone()).await?;
+        agent_memory::list_memory_record_page(
+            &self.connection,
+            filter,
+            resolved,
+            unix_to_datetime(now_unix),
+            before,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_control_record_from_model)
+        .collect()
     }
 
     pub async fn mark_agent_memory_deleted(

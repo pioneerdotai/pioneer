@@ -391,6 +391,7 @@ fn semantic_write_params(
         source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         disposition: Some(disposition),
         client_provided_key: None,
+        target_memory_id: None,
         confidence: Some(0.95),
         importance: Some(0.7),
         metadata: BTreeMap::new(),
@@ -728,6 +729,230 @@ async fn list_get_and_forget_use_control_plane_visibility() {
 }
 
 #[tokio::test]
+async fn inventory_cursor_visits_tied_records_once_even_when_updated_or_deleted() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut expected = std::collections::BTreeSet::new();
+    for i in 0..7 {
+        let response = service
+            .remember(
+                user_context(200),
+                remember_params(
+                    scope(MemoryScopeKind::User, "default"),
+                    Some(&format!("page.{i}")),
+                    &format!("Fact {i}"),
+                ),
+            )
+            .await
+            .unwrap();
+        expected.insert(response.record.id);
+    }
+    let mut cursor = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let response = service
+            .list(
+                user_context(201),
+                MemoryListParams {
+                    limit: Some(2),
+                    cursor,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        for record in response.records {
+            assert!(seen.insert(record.id.clone()), "duplicate inventory row");
+            // An update must not move an already scanned row to a later page.
+            service
+                .remember(
+                    user_context(202),
+                    remember_params(record.scope, record.key.as_deref(), "Updated fact"),
+                )
+                .await
+                .unwrap();
+            service
+                .forget(
+                    user_context(203),
+                    MemoryForgetParams {
+                        target: MemoryForgetTarget::Id {
+                            memory_id: record.id,
+                        },
+                        reason: None,
+                        actor: None,
+                        dry_run: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        cursor = response.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+        assert!(pages < 10);
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(seen, expected);
+}
+
+#[tokio::test]
+async fn inventory_empty_filtered_page_still_has_a_continuation() {
+    let (_store, _backend, service) = setup_service().await;
+    let visible = service
+        .remember(
+            user_context(100),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("visible"),
+                "Visible fact",
+            ),
+        )
+        .await
+        .unwrap();
+    for i in 0..3 {
+        let mut params = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            Some(&format!("hidden.{i}")),
+            "Restricted fact",
+        );
+        params.sensitivity = Some(MemorySensitivity::Regulated);
+        service
+            .remember(user_context(101 + i), params)
+            .await
+            .unwrap();
+    }
+    let first = service
+        .list(
+            user_context(110),
+            MemoryListParams {
+                limit: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(first.records.is_empty());
+    assert!(first.next_cursor.is_some());
+    let second = service
+        .list(
+            user_context(110),
+            MemoryListParams {
+                limit: Some(2),
+                cursor: first.next_cursor,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(second.records[0].id, visible.record.id);
+    assert!(second.next_cursor.is_none());
+    for invalid in [
+        "garbage",
+        "memory-list-v1:9223372036854775807:x",
+        "memory-list-v1:1:",
+    ] {
+        assert!(
+            service
+                .list(
+                    user_context(110),
+                    MemoryListParams {
+                        cursor: Some(invalid.to_owned()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn forget_authority_is_independent_of_sensitivity_expiry_and_repair() {
+    let (store, _backend, service) = setup_service().await;
+    for (i, sensitivity) in [
+        MemorySensitivity::SecretLike,
+        MemorySensitivity::Regulated,
+        MemorySensitivity::Normal,
+        MemorySensitivity::Normal,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params = remember_params(
+            scope(MemoryScopeKind::Workspace, "ws_owner"),
+            Some(&format!("forget.{i}")),
+            "Owned content",
+        );
+        params.sensitivity = Some(sensitivity);
+        let saved = service
+            .remember(workspace_context("ws_owner", 300), params)
+            .await
+            .unwrap();
+        if i == 2 {
+            store
+                .mark_agent_memory_expired(&saved.record.id, 301)
+                .await
+                .unwrap();
+        }
+        if i == 3 {
+            store
+                .mark_agent_memory_repair_status(&saved.record.id, "repair_needed", 301)
+                .await
+                .unwrap();
+        }
+        let params = MemoryForgetParams {
+            target: MemoryForgetTarget::Id {
+                memory_id: saved.record.id.clone(),
+            },
+            reason: None,
+            actor: None,
+            dry_run: false,
+        };
+        let foreign = service
+            .forget(workspace_context("ws_foreign", 302), params.clone())
+            .await
+            .unwrap();
+        assert!(foreign.forgotten_memory_ids.is_empty());
+        let preview = service
+            .forget(
+                workspace_context("ws_owner", 302),
+                MemoryForgetParams {
+                    dry_run: true,
+                    ..params.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(preview.forgotten_memory_ids, vec![saved.record.id.clone()]);
+        let result = service
+            .forget(workspace_context("ws_owner", 303), params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.forgotten_memory_ids, vec![saved.record.id.clone()]);
+        assert_eq!(
+            store
+                .get_agent_memory_record(&saved.record.id, true)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MemoryStatus::Deleted
+        );
+        assert!(
+            service
+                .forget(workspace_context("ws_owner", 304), params)
+                .await
+                .unwrap()
+                .forgotten_memory_ids
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn keyed_remember_upserts_existing_active_memory() {
     let (store, _backend, service) = setup_service().await;
     let first = service
@@ -829,6 +1054,231 @@ async fn remember_with_supersedes_marks_old_row_superseded() {
         decisions
             .iter()
             .any(|decision| { decision.action == "remember" && decision.decision == "allow" })
+    );
+}
+
+#[tokio::test]
+async fn addressed_semantic_corrections_preserve_legacy_keys_and_follow_the_link() {
+    // The tool's generated key is also an ordinary opaque key at this boundary.
+    for key in [
+        Some("my.custom.name"),
+        Some("auto_identity_opaque_hash"),
+        None,
+    ] {
+        let (store, _backend, service) = setup_service().await;
+        let mut direct = remember_params(
+            scope(MemoryScopeKind::User, "default"),
+            key,
+            "Имя: Алексей.",
+        );
+        direct.namespace = Some("legacy".to_owned());
+        let old = service
+            .remember(user_context(100), direct.clone())
+            .await
+            .unwrap()
+            .record;
+        let mut correction = semantic_write_params(
+            identity_name_semantic(MemoryExplicitness::Explicit),
+            "Имя: Александр.",
+            "Александр",
+            MemorySemanticWriteDisposition::RouteToCandidatePolicy,
+            "correction",
+        );
+        correction.target_memory_id = Some(old.id.clone());
+        let new = service
+            .write_semantic_memory(user_context(101), correction.clone())
+            .await
+            .unwrap();
+        assert_eq!(new.relation, MemoryWriteRelation::CompatibleUpdate);
+        let new = new.record.unwrap();
+        assert_eq!(new.key.as_deref(), key);
+        assert_eq!(new.namespace.as_deref(), Some("legacy"));
+        assert_ne!(new.id, old.id);
+        assert_eq!(
+            store
+                .get_agent_memory_record(&old.id, true)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MemoryStatus::Superseded
+        );
+
+        // Future semantic writes need no guessed legacy key or previous run ID.
+        correction.target_memory_id = None;
+        correction.disposition = Some(MemorySemanticWriteDisposition::AcceptActive);
+        correction.content = "Имя: Саша.".to_owned();
+        correction.value = Some("Саша".to_owned());
+        let linked = service
+            .write_semantic_memory(user_context(102), correction.clone())
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        assert_eq!(linked.key.as_deref(), key);
+        assert_eq!(linked.namespace.as_deref(), Some("legacy"));
+
+        // Reverse direction: direct addressed replacement keeps the identity
+        // link, then a semantic duplicate resolves to that same current record.
+        direct.content = "Саша".to_owned();
+        direct.supersedes = Some(linked.id.clone());
+        let direct_new = service
+            .remember(user_context(103), direct)
+            .await
+            .unwrap()
+            .record;
+        let duplicate = service
+            .write_semantic_memory(user_context(104), correction)
+            .await
+            .unwrap();
+        assert_eq!(duplicate.relation, MemoryWriteRelation::Duplicate);
+        assert_eq!(duplicate.record.unwrap().id, direct_new.id);
+        let all = service
+            .list(user_context(105), MemoryListParams::default())
+            .await
+            .unwrap();
+        assert_eq!(all.records.len(), 1);
+        let by_identity = service
+            .get_by_key(
+                user_context(105),
+                direct_new.scope.clone(),
+                None,
+                "user/global:identity:self:name".to_owned(),
+            )
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        assert_eq!(by_identity.id, direct_new.id);
+        let recalled = service
+            .recall_mode_for_prompt(
+                user_context(105),
+                MemoryModeRecallParams {
+                    mode: MemoryRecallMode::ExactCanonical,
+                    targets: vec![MemoryRecallTarget {
+                        scope_kind: Some(MemoryScopeKind::User),
+                        category: Some(MemoryCategory::Identity),
+                        subject: Some(MemorySubject::CurrentUser),
+                        attribute: Some(MemoryAttribute::Name),
+                        ..Default::default()
+                    }],
+                    top_k: Some(5),
+                    max_chars: Some(1000),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(recalled.items.len(), 1);
+        assert_eq!(recalled.items[0].memory_id, direct_new.id);
+        let via_alias = service
+            .remember(
+                user_context(106),
+                remember_params(
+                    direct_new.scope.clone(),
+                    Some("user/global:identity:self:name"),
+                    "Новое имя",
+                ),
+            )
+            .await
+            .unwrap()
+            .record;
+        assert_eq!(via_alias.key.as_deref(), key);
+        assert_eq!(via_alias.namespace.as_deref(), Some("legacy"));
+        assert_eq!(
+            service
+                .list(user_context(107), MemoryListParams::default())
+                .await
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        if let Some(key) = key {
+            let read = service
+                .get_by_key(
+                    user_context(105),
+                    old.scope,
+                    Some("legacy".to_owned()),
+                    key.to_owned(),
+                )
+                .await
+                .unwrap()
+                .record
+                .unwrap();
+            assert_eq!(read.id, via_alias.id);
+        }
+    }
+}
+
+#[tokio::test]
+async fn semantic_target_cannot_cross_scope_or_rebind_another_active_identity() {
+    let (_store, _backend, service) = setup_service().await;
+    let mut params = semantic_write_params(
+        identity_name_semantic(MemoryExplicitness::Explicit),
+        "Александр",
+        "Александр",
+        MemorySemanticWriteDisposition::AcceptActive,
+        "initial",
+    );
+    let canonical = service
+        .write_semantic_memory(user_context(100), params.clone())
+        .await
+        .unwrap()
+        .record
+        .unwrap();
+    let legacy = service
+        .remember(
+            user_context(101),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("legacy_name"),
+                "Алексей",
+            ),
+        )
+        .await
+        .unwrap()
+        .record;
+    params.target_memory_id = Some(legacy.id.clone());
+    params.value = Some("Саша".to_owned());
+    params.content = "Саша".to_owned();
+    assert!(
+        service
+            .write_semantic_memory(user_context(102), params.clone())
+            .await
+            .is_err()
+    );
+    params.target_memory_id = Some(canonical.id.clone());
+    params.scope = scope(MemoryScopeKind::Workspace, "ws_private");
+    assert!(
+        service
+            .write_semantic_memory(user_context(103), params.clone())
+            .await
+            .is_err()
+    );
+    params.scope = canonical.scope.clone();
+    let mut revoked = user_context(104);
+    revoked.source_access = MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new());
+    assert!(
+        service
+            .write_semantic_memory(revoked, params)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service
+            .get(
+                user_context(105),
+                MemoryGetParams {
+                    memory_id: canonical.id,
+                    include_deleted: false
+                }
+            )
+            .await
+            .unwrap()
+            .record
+            .unwrap()
+            .content,
+        "Александр"
     );
 }
 
@@ -2876,6 +3326,170 @@ async fn member_memory_write_requires_accessible_normal_thread_provenance() {
         created_by: None,
     });
     assert!(service.remember(member_context, user_scope).await.is_err());
+}
+
+#[tokio::test]
+async fn scoped_memory_survives_hidden_runs_without_granting_foreign_scopes() {
+    use pioneer_memory::MemoryMutationBoundary;
+    use sea_orm::ConnectionTrait;
+    let (store, _backend, service) = setup_service().await;
+    store.database_connection().execute_unprepared(
+        "INSERT INTO thread (id,workspace_id,preview,mode,model,model_provider,status) VALUES ('root_a','ws_a','','agent','test','test','active'),('root_b','ws_a','','agent','test','test','active');
+         INSERT INTO task (id,workspace_id,owner_kind,executor_kind,status,title,goal) VALUES ('task_a','ws_a','user','agent','draft','A','A'),('task_b','ws_a','user','agent','draft','B','B');"
+    ).await.unwrap();
+    let context = |run: &str, root: &str, task: &str| MemoryOperationContext {
+        workspace_id: Some("ws_a".to_owned()),
+        thread_id: Some(root.to_owned()),
+        task_id: Some(task.to_owned()),
+        now_unix: Some(410),
+        read_policy: Some(MemoryReadPolicy {
+            allow_normal: true,
+            allow_personal: false,
+            allow_secret_like: false,
+            allow_regulated: false,
+        }),
+        source_access: MemorySourceAccessPolicy::accessible_threads([
+            root.to_owned(),
+            run.to_owned(),
+        ])
+        .with_owned_scopes([
+            scope(MemoryScopeKind::Thread, root),
+            scope(MemoryScopeKind::Task, task),
+        ]),
+        mutation_boundary: MemoryMutationBoundary::thread_capsule_with_sources(
+            root,
+            Some(task.to_owned()),
+            [run.to_owned()],
+        ),
+        ..Default::default()
+    };
+    for kind in [MemoryScopeKind::Thread, MemoryScopeKind::Task] {
+        let owner_scope = scope(
+            kind,
+            if kind == MemoryScopeKind::Thread {
+                "root_a"
+            } else {
+                "task_a"
+            },
+        );
+        let mut params = remember_params(
+            owner_scope.clone(),
+            Some("continuity"),
+            "Stable shared project fact",
+        );
+        params.category = MemoryCategory::ProjectFact;
+        params.provenance = Some(MemoryProvenance {
+            source_thread_id: Some("hidden_a".to_owned()),
+            source_turn_id: Some("turn_a".to_owned()),
+            source_item_id: None,
+            created_by: None,
+        });
+        let saved = service
+            .remember(context("hidden_a", "root_a", "task_a"), params.clone())
+            .await
+            .unwrap();
+        let second = context("hidden_b", "root_a", "task_a");
+        let loaded = service
+            .get_by_key(
+                second.clone(),
+                owner_scope.clone(),
+                None,
+                "continuity".to_owned(),
+            )
+            .await
+            .unwrap()
+            .record
+            .unwrap();
+        assert_eq!(
+            loaded.provenance.source_thread_id.as_deref(),
+            Some("hidden_a")
+        );
+        assert_eq!(
+            service
+                .list(
+                    second.clone(),
+                    MemoryListParams {
+                        scopes: vec![owner_scope.clone()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        assert!(
+            !service
+                .search(
+                    second.clone(),
+                    MemorySearchParams {
+                        query: "Stable shared project fact".to_owned(),
+                        scopes: vec![owner_scope.clone()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        for denied in [
+            context("other_hidden", "root_b", "task_b"),
+            MemoryOperationContext {
+                workspace_id: Some("other_ws".to_owned()),
+                ..second.clone()
+            },
+            MemoryOperationContext {
+                source_access: MemorySourceAccessPolicy::accessible_threads(Vec::<String>::new()),
+                ..second.clone()
+            },
+        ] {
+            assert!(
+                service
+                    .get(
+                        denied,
+                        MemoryGetParams {
+                            memory_id: saved.record.id.clone(),
+                            include_deleted: false
+                        }
+                    )
+                    .await
+                    .unwrap()
+                    .record
+                    .is_none()
+            );
+        }
+        params.content = "Updated shared project fact".to_owned();
+        params.provenance.as_mut().unwrap().source_thread_id = Some("hidden_b".to_owned());
+        service.remember(second, params).await.unwrap();
+        let third = context("hidden_c", "root_a", "task_a");
+        assert_eq!(
+            service
+                .get_by_key(third.clone(), owner_scope, None, "continuity".to_owned())
+                .await
+                .unwrap()
+                .record
+                .unwrap()
+                .content,
+            "Updated shared project fact"
+        );
+        let forgotten = service
+            .forget(
+                third,
+                MemoryForgetParams {
+                    target: MemoryForgetTarget::Id {
+                        memory_id: saved.record.id.clone(),
+                    },
+                    reason: None,
+                    actor: None,
+                    dry_run: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(forgotten.forgotten_memory_ids, vec![saved.record.id]);
+    }
 }
 
 #[tokio::test]

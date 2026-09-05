@@ -160,6 +160,12 @@ Use this after search/list when exact details, provenance, or stable-key lookup 
 
 Use `memory_remember` for direct durable writes. Use it proactively when the user provides clearly durable, future-useful information, even if the user did not explicitly say "remember this".
 
+For a correction, optionally supply `memoryId` from a prior read. This preserves
+the target's namespace/key and supersedes its old version atomically. If scope
+or key is also provided it must match the target. Use the returned record ID
+for subsequent operations. This is distinct from an ordinary same-key in-place
+update, which retains its ID.
+
 ```json
 {
   "content": "string",

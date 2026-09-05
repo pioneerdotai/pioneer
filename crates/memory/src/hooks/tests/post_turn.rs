@@ -60,6 +60,38 @@ fn durable_terminal_effect_claim_requires_a_complete_text_fence() {
 }
 
 #[test]
+fn post_turn_correction_retains_explicit_target_through_the_write_contract() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    raw["facts"][0]["target_memory_id"] = serde_json::json!("existing_manifest_record");
+    let parsed = parse_memory_post_turn_extractor_json(
+        &raw.to_string(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .unwrap();
+    let params = memory_semantic_write_params_from_extracted_fact(
+        0,
+        parsed.facts.into_iter().next().unwrap(),
+        &test_memory_turn_context(),
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryPostTurnExtractorConfig::default(),
+        MemorySourceContextKind::DirectUserConversation,
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .unwrap();
+    assert_eq!(
+        params.target_memory_id.as_deref(),
+        Some("existing_manifest_record")
+    );
+    assert_eq!(params.scope.kind, MemoryScopeKind::User);
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
+}
+
+#[test]
 fn strict_json_parser_accepts_typed_semantic_fact() {
     let parsed = parse_memory_post_turn_extractor_json(
         valid_post_turn_extractor_json().as_str(),

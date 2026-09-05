@@ -60952,6 +60952,62 @@ async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
 }
 
 #[tokio::test]
+async fn memory_tool_addressed_correction_preserves_generated_key_across_turns() {
+    let harness = setup_memory_gateway_harness("addressed_correction", true).await;
+    let first = built_memory_tools(&harness, "addressed_first").await;
+    let second = built_memory_tools(&harness, "addressed_second").await;
+    let seed = execute_memory_tool_payload(
+        &first,
+        "memory_remember",
+        "addressed_seed",
+        json!({"content":"User's name is Alexey.","category":"identity","scope":"user"}),
+    )
+    .await;
+    let id = seed["memoryId"].as_str().unwrap();
+    let read = execute_memory_tool_payload(
+        &second,
+        "memory_get",
+        "addressed_read",
+        json!({"memoryId":id}),
+    )
+    .await;
+    let key = read["record"]["key"].as_str().unwrap();
+    let updated = execute_memory_tool_payload(
+        &second,
+        "memory_remember",
+        "addressed_update",
+        json!({"memoryId":id,"content":"User's name is Alexander.","category":"identity"}),
+    )
+    .await;
+    let new_id = updated["memoryId"].as_str().unwrap();
+    assert_ne!(id, new_id);
+    let by_key = execute_memory_tool_payload(
+        &first,
+        "memory_get",
+        "addressed_key",
+        json!({"scope":"user","key":key}),
+    )
+    .await;
+    assert_eq!(by_key["record"]["memoryId"], new_id);
+    assert_eq!(by_key["record"]["content"], "User's name is Alexander.");
+    let _ = execute_memory_tool_error(
+        &second,
+        "memory_remember",
+        "addressed_wrong_key",
+        json!({"memoryId":new_id,"key":"different","content":"wrong","category":"identity"}),
+    )
+    .await;
+    let list = execute_memory_tool_payload(
+        &second,
+        "memory_list",
+        "addressed_inventory",
+        json!({"scopes":["user"]}),
+    )
+    .await;
+    assert_eq!(list["records"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn memory_tool_get_returns_exact_record_with_provenance() {
     let harness = setup_memory_gateway_harness("tool_get", true).await;
     let tools = built_memory_tools(&harness, "get").await;

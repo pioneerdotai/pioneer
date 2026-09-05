@@ -110,6 +110,13 @@ When writing, keep the content compact, precise, and in the user's language when
 
 Do not claim a memory write succeeded unless `memory_remember` succeeded.
 
+When correcting a saved fact, read it first. Use `memory_remember` with its
+`memoryId` to preserve the stored scope, namespace and key, including an
+automatically generated key. A keyed write without `memoryId` updates that exact
+key; omitting both does not identify the old fact. Semantic similarity is not an
+update address. See `references/scopes-categories-keys.md` for the shared identity
+contract with automatic extraction.
+
 ## Forget Flow
 
 For exact forget requests, use `memory_forget`.

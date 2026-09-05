@@ -61,6 +61,7 @@ mod m20260902_000001_task_occurrence_delivery_plan;
 mod m20260902_000002_turn_event_projection_watermark;
 mod m20260902_000003_turn_work_owner;
 mod m20260904_000001_recovery_episode_invariant;
+mod m20260905_000001_memory_identity;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -123,6 +124,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260902_000002_turn_event_projection_watermark::Migration),
             Box::new(m20260902_000003_turn_work_owner::Migration),
             Box::new(m20260904_000001_recovery_episode_invariant::Migration),
+            Box::new(m20260905_000001_memory_identity::Migration),
         ]
     }
 }

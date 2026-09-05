@@ -5,6 +5,7 @@ pub mod agent_memory;
 pub mod agent_memory_candidate;
 pub mod agent_memory_capsule;
 pub mod agent_memory_event;
+pub(crate) mod agent_memory_identity;
 pub mod agent_memory_policy_decision;
 pub mod agent_memory_quality_decision;
 pub mod agent_memory_quarantine;

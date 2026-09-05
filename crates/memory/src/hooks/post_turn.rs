@@ -195,6 +195,7 @@ pub(super) struct MemoryPostTurnParsedFacts {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct MemoryPostTurnExtractedFact {
+    pub(super) target_memory_id: Option<String>,
     pub(super) semantic: MemorySemanticFields,
     pub(super) ontology_proposal: Option<MemoryExtractorOntologyProposal>,
     pub(super) content: String,
@@ -212,6 +213,8 @@ pub(super) struct MemoryPostTurnExtractorJson {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MemoryPostTurnExtractedFactJson {
+    #[serde(default)]
+    target_memory_id: Option<String>,
     semantic: MemorySemanticFields,
     #[serde(default)]
     ontology: Option<Value>,
@@ -348,6 +351,7 @@ pub(super) fn validate_memory_post_turn_fact(
     let confidence = Some(computed_post_turn_fact_confidence(&semantic));
     let importance = Some(computed_post_turn_fact_importance(&semantic));
     Ok(MemoryPostTurnExtractedFact {
+        target_memory_id: fact.target_memory_id,
         semantic,
         ontology_proposal,
         content,
@@ -655,6 +659,7 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
         source_context_kind: Some(source_context_kind),
         disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
         client_provided_key: None,
+        target_memory_id: fact.target_memory_id,
         confidence: fact.confidence,
         importance: fact.importance,
         metadata,

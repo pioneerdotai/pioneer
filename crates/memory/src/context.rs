@@ -56,9 +56,8 @@ impl MemoryMutationBoundary {
         source_thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let Self::ThreadCapsule {
-            root_thread_id,
-            task_id,
             authorized_source_thread_ids,
+            ..
         } = self
         else {
             return Ok(());
@@ -70,6 +69,20 @@ impl MemoryMutationBoundary {
             anyhow::bail!("memory mutation provenance is outside the authorized thread capsule");
         }
 
+        self.validate_owned_scope(scope)
+    }
+
+    /// Existing records belong to a stable scope. Their historical source
+    /// thread is evidence, not the authority of the current mutator.
+    pub fn validate_owned_scope(&self, scope: &MemoryScope) -> anyhow::Result<()> {
+        let Self::ThreadCapsule {
+            root_thread_id,
+            task_id,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
         match scope.kind {
             MemoryScopeKind::Thread if scope.key == *root_thread_id => Ok(()),
             MemoryScopeKind::Task
@@ -94,19 +107,40 @@ impl MemoryMutationBoundary {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySourceAccessPolicy {
     accessible_thread_ids: Option<BTreeSet<String>>,
+    owned_scopes: Vec<MemoryScope>,
 }
 
 impl MemorySourceAccessPolicy {
     pub fn unrestricted() -> Self {
         Self {
             accessible_thread_ids: None,
+            owned_scopes: Vec::new(),
         }
     }
 
     pub fn accessible_threads(thread_ids: impl IntoIterator<Item = String>) -> Self {
         Self {
             accessible_thread_ids: Some(thread_ids.into_iter().collect()),
+            owned_scopes: Vec::new(),
         }
+    }
+
+    /// Server-derived scope grants. Only thread/task memory can be owned by a
+    /// collaboration capsule; this cannot grant personal/global memory.
+    pub fn with_owned_scopes(mut self, scopes: impl IntoIterator<Item = MemoryScope>) -> Self {
+        self.owned_scopes = scopes
+            .into_iter()
+            .filter(|scope| matches!(scope.kind, MemoryScopeKind::Thread | MemoryScopeKind::Task))
+            .collect();
+        self
+    }
+
+    pub fn owned_scopes(&self) -> Vec<MemoryScope> {
+        self.owned_scopes.clone()
+    }
+
+    pub fn allows_record(&self, scope: &MemoryScope, source_thread_id: Option<&str>) -> bool {
+        self.owned_scopes.contains(scope) || self.allows_source_thread(source_thread_id)
     }
 
     pub fn requires_authoritative_provenance(&self) -> bool {
@@ -190,6 +224,14 @@ impl MemoryOperationContext {
 
     pub fn allows_source_thread(&self, source_thread_id: Option<&str>) -> bool {
         self.source_access.allows_source_thread(source_thread_id)
+    }
+
+    pub fn allows_memory_record(
+        &self,
+        scope: &MemoryScope,
+        source_thread_id: Option<&str>,
+    ) -> bool {
+        self.source_access.allows_record(scope, source_thread_id)
     }
 
     pub fn accessible_source_thread_ids(&self) -> Option<Vec<String>> {

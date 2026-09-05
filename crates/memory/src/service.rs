@@ -226,7 +226,7 @@ impl MemoryService {
         context: MemoryOperationContext,
         params: MemoryRememberParams,
     ) -> Result<MemoryRememberResponse> {
-        self.remember_with_source_context(context, params, None)
+        self.remember_with_source_context(context, params, None, None)
             .await
     }
 
@@ -235,8 +235,71 @@ impl MemoryService {
         context: MemoryOperationContext,
         params: MemoryRememberParams,
         source_context_kind: Option<MemorySourceContextKind>,
+        canonical_identity: Option<pioneer_protocol::MemoryCanonicalKey>,
+    ) -> Result<MemoryRememberResponse> {
+        for attempt in 0..3 {
+            match self
+                .remember_attempt(
+                    context.clone(),
+                    params.clone(),
+                    source_context_kind,
+                    canonical_identity.clone(),
+                )
+                .await
+            {
+                Err(error)
+                    if error.is::<MemoryPublicationConflict>()
+                        && params.supersedes.is_none()
+                        && attempt < 2 =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("last publication attempt returns its outcome")
+    }
+
+    async fn remember_attempt(
+        &self,
+        context: MemoryOperationContext,
+        mut params: MemoryRememberParams,
+        source_context_kind: Option<MemorySourceContextKind>,
+        canonical_identity: Option<pioneer_protocol::MemoryCanonicalKey>,
     ) -> Result<MemoryRememberResponse> {
         let now = context.now_or(current_unix());
+        if params.supersedes.is_none()
+            && let Some(key) = params.key.as_deref()
+            && let Some(linked) = self
+                .store
+                .get_agent_memory_by_identity(
+                    params.scope.clone(),
+                    params.namespace.as_deref().unwrap_or("default"),
+                    key,
+                )
+                .await?
+        {
+            if !self.row_control_plane_visible(&linked, &context, &[], now) {
+                bail!("memory identity is unavailable in this execution");
+            }
+            let physical = self
+                .store
+                .get_active_agent_memory_by_key(
+                    params.scope.clone(),
+                    params.namespace.as_deref(),
+                    key,
+                    context.workspace_guard(),
+                )
+                .await?;
+            if physical.is_some_and(|row| row.id != linked.id) {
+                bail!("memory key and canonical identity resolve to different active records");
+            }
+            params.namespace = Some(linked.namespace);
+            params.key = linked.key;
+            if params.key.is_none() {
+                params.supersedes = Some(linked.id);
+            }
+        }
         let source_context_kind = source_context_kind
             .or(params.source_context_kind)
             .or(Some(MemorySourceContextKind::DirectUserConversation));
@@ -285,10 +348,10 @@ impl MemoryService {
             if !self.row_control_plane_visible(&superseded, &context, &[], now) {
                 bail!("superseded memory `{superseded_id}` does not exist");
             }
-            None
+            Some(superseded)
         };
 
-        let created = existing.is_none();
+        let created = existing.is_none() || params.supersedes.is_some();
         let memory_id = params
             .supersedes
             .as_ref()
@@ -363,24 +426,53 @@ impl MemoryService {
             metadata_json: metadata_json.or(backend_result.backend_metadata_json),
         };
 
-        if let Some(superseded_id) = params.supersedes.as_deref() {
-            self.store
-                .mark_agent_memory_superseded(superseded_id, memory_id.as_str(), now)
+        let unpublished_payload = BackendDeleteRequest {
+            memory_id: memory_id.clone(),
+            scope: params.scope.clone(),
+            scope_key_hash: Some(resolved_scope.scope_key_hash.clone()),
+            capsule_id: new_record.capsule_id.clone(),
+            capsule_ref: new_record.capsule_ref.clone(),
+            frame_id: new_record.frame_id,
+            frame_uri: new_record.frame_uri.clone(),
+        };
+        let publication = self
+            .store
+            .publish_agent_memory_record(
+                new_record,
+                existing.as_ref().map(|row| row.id.clone()),
+                params.supersedes.clone(),
+                canonical_identity,
+                now,
+            )
+            .await;
+        let published = match publication {
+            Ok(published) => published,
+            Err(error) => {
+                // A fresh unpublished ID can be cleaned safely. Never delete
+                // an existing in-place payload or a possibly committed write.
+                if created
+                    && self
+                        .store
+                        .get_agent_memory_record(&memory_id, true)
+                        .await?
+                        .is_none()
+                {
+                    self.backend
+                        .delete(unpublished_payload)
+                        .await
+                        .context("clean failed memory publication payload")?;
+                }
+                return Err(error);
+            }
+        };
+        let Some(row) = published else {
+            // A losing first-insert payload has no published owner. Do not
+            // attach it to the winner's ID; clean it and retry from fresh state.
+            self.backend
+                .delete(unpublished_payload)
                 .await
-                .with_context(|| format!("failed to supersede memory `{superseded_id}`"))?
-                .with_context(|| format!("superseded memory `{superseded_id}` disappeared"))?;
-        }
-
-        let row = if params.supersedes.is_some() || params.key.is_none() {
-            self.store
-                .insert_agent_memory_record(new_record, None, now)
-                .await
-                .with_context(|| format!("failed to insert memory `{memory_id}`"))?
-        } else {
-            self.store
-                .upsert_active_agent_memory_record(new_record, None, now)
-                .await
-                .with_context(|| format!("failed to upsert memory `{memory_id}`"))?
+                .context("failed to clean unpublished memory payload")?;
+            return Err(MemoryPublicationConflict.into());
         };
 
         self.record_policy_decision(
@@ -445,6 +537,10 @@ impl MemoryService {
             })?;
         validate_memory_write_scope(&context, &resolved_scope)?;
         let mut base_metadata = params.metadata.clone();
+        base_metadata.remove("target_memory_id");
+        if let Some(target) = params.target_memory_id.as_ref() {
+            base_metadata.insert("target_memory_id".to_owned(), serde_json::json!(target));
+        }
         for (key, value) in semantic_metadata(
             &params.semantic,
             &prepared,
@@ -455,7 +551,15 @@ impl MemoryService {
         }
         let metadata_json = merge_metadata(None, base_metadata, params.evidence.as_ref(), now)?;
 
-        if let Some(existing) = self
+        let linked = self
+            .store
+            .get_agent_memory_by_identity(
+                params.scope.clone(),
+                &prepared.canonical.namespace,
+                &prepared.canonical.key,
+            )
+            .await?;
+        let canonical_record = self
             .store
             .get_active_agent_memory_by_key(
                 params.scope.clone(),
@@ -463,8 +567,35 @@ impl MemoryService {
                 prepared.canonical.key.as_str(),
                 context.workspace_guard(),
             )
-            .await?
-        {
+            .await?;
+        let existing = if let Some(target_id) = params.target_memory_id.as_deref() {
+            let target = self
+                .store
+                .get_agent_memory_record(target_id, false)
+                .await?
+                .context("memory correction target is unavailable")?;
+            if target.scope != params.scope
+                || !self.row_control_plane_visible(&target, &context, &[], now)
+            {
+                bail!("memory correction target is unavailable in this scope");
+            }
+            if linked
+                .iter()
+                .chain(canonical_record.iter())
+                .any(|row| row.id != target.id)
+            {
+                bail!(
+                    "canonical identity already resolves to another active memory; resolve the conflict explicitly"
+                );
+            }
+            Some(target)
+        } else {
+            linked.or(canonical_record)
+        };
+        if let Some(existing) = existing {
+            if !self.row_control_plane_visible(&existing, &context, &[], now) {
+                bail!("semantic memory identity is unavailable in this execution");
+            }
             let existing_value = metadata_normalized_value(existing.metadata_json.as_deref())
                 .or_else(|| {
                     existing
@@ -473,6 +604,9 @@ impl MemoryService {
                         .map(normalize_semantic_text)
                 });
             if existing_value.as_deref() == Some(prepared.normalized_value.as_str()) {
+                self.store
+                    .bind_agent_memory_identity(&existing.id, prepared.canonical.clone())
+                    .await?;
                 let merged_metadata = merge_metadata(
                     existing.metadata_json.as_deref(),
                     semantic_metadata(
@@ -540,7 +674,11 @@ impl MemoryService {
                 ));
             }
 
-            if disposition == MemorySemanticWriteDisposition::AcceptActive
+            if (disposition == MemorySemanticWriteDisposition::AcceptActive
+                || (params.target_memory_id.is_some()
+                    && params.semantic.intent == pioneer_protocol::MemoryIntent::ExplicitStore
+                    && params.source_context_kind
+                        == Some(MemorySourceContextKind::DirectUserConversation)))
                 && params.semantic.explicitness == pioneer_protocol::MemoryExplicitness::Explicit
             {
                 let relation_context = context.clone();
@@ -644,7 +782,7 @@ impl MemoryService {
                         content.as_str(),
                         metadata_json,
                         MemoryWriteRelation::Contradiction,
-                        None,
+                        Some(existing.id.clone()),
                         &quality_input,
                         &quality_decision,
                         &ownership_route,
@@ -1052,16 +1190,28 @@ impl MemoryService {
         key: String,
     ) -> Result<MemoryGetResponse> {
         let now = context.now_or(current_unix());
-        let Some(row) = self
+        let physical = self
             .store
             .get_active_agent_memory_by_key(
-                scope,
+                scope.clone(),
                 namespace.as_deref(),
                 key.as_str(),
                 context.workspace_guard(),
             )
-            .await?
-        else {
+            .await?;
+        let row = match physical {
+            Some(row) => Some(row),
+            None => {
+                self.store
+                    .get_agent_memory_by_identity(
+                        scope,
+                        namespace.as_deref().unwrap_or("default"),
+                        &key,
+                    )
+                    .await?
+            }
+        };
+        let Some(row) = row else {
             return Ok(MemoryGetResponse { record: None });
         };
         let Some(record) = self
@@ -1109,25 +1259,46 @@ impl MemoryService {
         let include_deleted = params.statuses.contains(&MemoryStatus::Deleted);
         let include_superseded = params.statuses.contains(&MemoryStatus::Superseded);
         let include_expired = params.statuses.contains(&MemoryStatus::Expired);
+        // A cursor is an address, never an authorization grant. Every page is
+        // filtered again using the caller's current workspace/source policy.
+        let before = params
+            .cursor
+            .as_deref()
+            .map(decode_inventory_cursor)
+            .transpose()?;
         let rows = self
             .store
-            .list_agent_memory_records(AgentMemoryListFilter {
-                scopes,
-                workspace_guard: context.workspace_guard(),
-                namespace: None,
-                key: None,
-                categories: params.categories.clone(),
-                statuses: params.statuses.clone(),
-                include_expired,
-                include_deleted,
-                include_superseded,
-                allowed_source_thread_ids: context.accessible_source_thread_ids(),
-                limit: Some(u64::from(limit)),
-            })
+            .list_agent_memory_record_page(
+                AgentMemoryListFilter {
+                    scopes,
+                    workspace_guard: context.workspace_guard(),
+                    namespace: None,
+                    key: None,
+                    categories: params.categories.clone(),
+                    statuses: params.statuses.clone(),
+                    include_expired,
+                    include_deleted,
+                    include_superseded,
+                    allowed_source_thread_ids: context.accessible_source_thread_ids(),
+                    owned_scopes: context.source_access.owned_scopes(),
+                    limit: Some(u64::from(limit) + 1),
+                },
+                before,
+                now,
+            )
             .await?;
 
+        let has_more = rows.len() > limit as usize;
+        let scanned = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
+        let next_cursor = if has_more {
+            scanned
+                .last()
+                .map(|row| encode_inventory_cursor(row.created_at_unix, &row.id))
+        } else {
+            None
+        };
         let mut records = Vec::new();
-        for row in rows {
+        for row in scanned {
             if let Some(record) = self
                 .hydrate_control_plane_row(row, &context, &params.statuses, now, false)
                 .await?
@@ -1138,7 +1309,7 @@ impl MemoryService {
 
         Ok(MemoryListResponse {
             records,
-            next_cursor: None,
+            next_cursor,
         })
     }
 
@@ -1593,6 +1764,7 @@ impl MemoryService {
                     include_deleted: params.statuses.contains(&MemoryStatus::Deleted),
                     include_superseded: params.statuses.contains(&MemoryStatus::Superseded),
                     allowed_source_thread_ids: context.accessible_source_thread_ids(),
+                    owned_scopes: context.source_access.owned_scopes(),
                     limit: Some(backend_limit as u64),
                 })
                 .await?;
@@ -1758,6 +1930,7 @@ impl MemoryService {
                 include_deleted: false,
                 include_superseded: false,
                 allowed_source_thread_ids: context.accessible_source_thread_ids(),
+                owned_scopes: context.source_access.owned_scopes(),
                 limit: Some(u64::from(top_k)),
             })
             .await
@@ -1831,6 +2004,33 @@ impl MemoryService {
             }
             let categories = target.category.into_iter().collect::<Vec<_>>();
             for key in exact_target_lookup_keys(&context, target) {
+                // Semantic targets can be bound to a legacy keyed record.
+                // Follow the explicit link without renaming its stored key.
+                for scope in &scopes {
+                    if let Some(row) = self
+                        .store
+                        .get_agent_memory_by_identity(scope.clone(), "default", &key)
+                        .await?
+                    {
+                        if (categories.is_empty() || categories.contains(&row.category))
+                            && self.row_control_plane_visible(
+                                &row,
+                                &context,
+                                &[],
+                                context.now_or(current_unix()),
+                            )
+                            && seen.insert(row.id.clone())
+                        {
+                            rows.push(row);
+                        }
+                        if rows.len() >= top_k as usize {
+                            break;
+                        }
+                    }
+                }
+                if rows.len() >= top_k as usize {
+                    break;
+                }
                 let target_rows = self
                     .store
                     .list_agent_memory_records(AgentMemoryListFilter {
@@ -1844,6 +2044,7 @@ impl MemoryService {
                         include_deleted: false,
                         include_superseded: false,
                         allowed_source_thread_ids: context.accessible_source_thread_ids(),
+                        owned_scopes: context.source_access.owned_scopes(),
                         limit: Some(u64::from(top_k)),
                     })
                     .await?;
@@ -2685,13 +2886,30 @@ impl MemoryService {
         metadata_json: String,
         supersedes: Option<String>,
     ) -> Result<MemoryRememberResponse> {
+        let destination = match supersedes.as_deref() {
+            Some(id) => Some(
+                self.store
+                    .get_agent_memory_record(id, false)
+                    .await?
+                    .context("correction target is no longer active")?,
+            ),
+            None => None,
+        };
         self.remember_with_source_context(
             context,
             MemoryRememberParams {
                 scope: params.scope.clone(),
                 category: prepared.canonical.category,
-                namespace: Some(prepared.canonical.namespace.clone()),
-                key: Some(prepared.canonical.key.clone()),
+                namespace: Some(
+                    destination
+                        .as_ref()
+                        .map(|row| row.namespace.clone())
+                        .unwrap_or_else(|| prepared.canonical.namespace.clone()),
+                ),
+                key: destination
+                    .as_ref()
+                    .map(|row| row.key.clone())
+                    .unwrap_or_else(|| Some(prepared.canonical.key.clone())),
                 content: content.to_owned(),
                 sensitivity: Some(sensitivity),
                 confidence: params.confidence,
@@ -2704,6 +2922,7 @@ impl MemoryService {
                     .context("semantic metadata must decode")?,
             },
             params.source_context_kind,
+            Some(prepared.canonical.clone()),
         )
         .await
     }
@@ -2908,11 +3127,10 @@ impl MemoryService {
         context: &MemoryOperationContext,
         params: &MemoryForgetParams,
     ) -> Result<Vec<AgentMemoryControlRecord>> {
-        let now = context.now_or(current_unix());
         let row = match &params.target {
             MemoryForgetTarget::Id { memory_id } => {
                 self.store
-                    .get_agent_memory_record(memory_id.as_str(), false)
+                    .get_agent_memory_record(memory_id.as_str(), true)
                     .await?
             }
             MemoryForgetTarget::ScopedKey {
@@ -2920,23 +3138,40 @@ impl MemoryService {
                 namespace,
                 key,
             } => {
-                self.store
+                let physical = self
+                    .store
                     .get_active_agent_memory_by_key(
                         scope.clone(),
                         namespace.as_deref(),
                         key.as_str(),
                         context.workspace_guard(),
                     )
-                    .await?
+                    .await?;
+                match physical {
+                    Some(row) => Some(row),
+                    None => {
+                        self.store
+                            .get_agent_memory_by_identity(
+                                scope.clone(),
+                                namespace.as_deref().unwrap_or("default"),
+                                key,
+                            )
+                            .await?
+                    }
+                }
             }
         };
         let Some(row) = row else {
             return Ok(Vec::new());
         };
-        context
-            .mutation_boundary
-            .validate_scope(&row.scope, row.source_thread_id.as_deref())?;
-        if self.row_control_plane_visible(&row, context, &[], now) {
+        context.mutation_boundary.validate_owned_scope(&row.scope)?;
+        // Mutation authority is not recall eligibility. An authorized owner
+        // must be able to remove expired, sensitive and repair-needed records
+        // without hydrating (or exposing) their contents.
+        if row.status != MemoryStatus::Deleted
+            && workspace_visible(&row, context)
+            && context.allows_memory_record(&row.scope, row.source_thread_id.as_deref())
+        {
             Ok(vec![row])
         } else {
             Ok(Vec::new())
@@ -3001,7 +3236,7 @@ impl MemoryService {
             return false;
         }
         workspace_visible(row, context)
-            && context.allows_source_thread(row.source_thread_id.as_deref())
+            && context.allows_memory_record(&row.scope, row.source_thread_id.as_deref())
     }
 
     async fn hydrate_visible_row(
@@ -3103,7 +3338,7 @@ impl MemoryService {
             quarantined,
             &read_policy,
             workspace_visible(row, context)
-                && context.allows_source_thread(row.source_thread_id.as_deref()),
+                && context.allows_memory_record(&row.scope, row.source_thread_id.as_deref()),
             quality,
         );
         Ok(decide_memory_recall_visibility(&input))
@@ -3908,6 +4143,10 @@ fn candidate_semantic_write_params(
         source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
         client_provided_key: None,
+        target_memory_id: metadata
+            .get("target_memory_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         confidence: Some(candidate.confidence.clamp(0.0, 1.0) as f32),
         importance: None,
         metadata,
@@ -4131,6 +4370,38 @@ fn memory_recall_mode_categories(mode: MemoryRecallMode) -> Vec<MemoryCategory> 
         | MemoryRecallMode::TaskContext
         | MemoryRecallMode::ExactCanonical => Vec::new(),
     }
+}
+
+#[derive(Debug)]
+struct MemoryPublicationConflict;
+
+impl std::fmt::Display for MemoryPublicationConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("memory changed during publication; retry from current state")
+    }
+}
+
+impl std::error::Error for MemoryPublicationConflict {}
+
+fn encode_inventory_cursor(created_at: i64, id: &str) -> String {
+    format!("memory-list-v1:{created_at}:{id}")
+}
+
+fn decode_inventory_cursor(cursor: &str) -> Result<(i64, String)> {
+    if cursor.len() > 256 {
+        bail!("invalid memory inventory cursor");
+    }
+    let (timestamp, id) = cursor
+        .strip_prefix("memory-list-v1:")
+        .and_then(|value| value.split_once(':'))
+        .context("invalid memory inventory cursor")?;
+    let timestamp = timestamp
+        .parse::<i64>()
+        .context("invalid memory inventory timestamp")?;
+    if id.is_empty() || chrono::DateTime::from_timestamp(timestamp, 0).is_none() {
+        bail!("invalid memory inventory cursor");
+    }
+    Ok((timestamp, id.to_owned()))
 }
 
 fn recency_anchor_unix(row: &AgentMemoryControlRecord) -> i64 {
@@ -4434,6 +4705,7 @@ mod tests {
             source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
             disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
             client_provided_key: None,
+            target_memory_id: None,
             confidence: Some(0.99),
             importance: Some(0.7),
             metadata: Default::default(),

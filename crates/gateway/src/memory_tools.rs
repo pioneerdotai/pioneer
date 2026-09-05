@@ -1103,16 +1103,58 @@ impl MemoryToolHandler {
         let idempotency_key = invocation.idempotency_key.clone();
         let input: MemoryRememberToolInput = decode_tool_args(invocation)?;
         let content = required_string(Some(input.content.as_str()), "content")?;
-        let scope = match input.scope {
+        let mut scope = match input.scope {
             Some(kind) => self.mutation_scope_for_kind(kind, scoped_collaboration)?,
             None => {
                 self.default_mutation_scope_for_category(input.category, scoped_collaboration)?
             }
         };
-        let key = optional_trimmed(input.key)
+        let mut key = optional_trimmed(input.key.clone())
             .or_else(|| Some(stable_memory_key(input.category, content.as_str())));
         let actor = assistant_actor(&self.context);
         let context = self.operation_context(Some(actor.clone()), scoped_collaboration)?;
+        let mut namespace = None;
+        if let Some(memory_id) = input.memory_id.as_deref() {
+            let target = self
+                .processor
+                .memory_runtime()
+                .service()
+                .get(
+                    context.clone(),
+                    MemoryGetParams {
+                        memory_id: memory_id.to_owned(),
+                        include_deleted: false,
+                    },
+                )
+                .await
+                .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+                .record
+                .ok_or_else(|| {
+                    ToolError::invalid_arguments("memory correction target is unavailable")
+                })?;
+            if input.scope.is_some_and(|kind| kind != target.scope.kind)
+                || input
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| Some(key.trim()) != target.key.as_deref())
+            {
+                return Err(ToolError::invalid_arguments(
+                    "memoryId correction must preserve the target scope and key",
+                ));
+            }
+            // Reading a record does not grant mutation authority. Resolve the
+            // target against the same mutation policy used for keyed writes.
+            let permitted =
+                self.mutation_scope_for_kind(target.scope.kind, scoped_collaboration)?;
+            if permitted != target.scope {
+                return Err(ToolError::invalid_arguments(
+                    "memory correction target is outside the current mutation scope",
+                ));
+            }
+            scope = target.scope;
+            key = target.key;
+            namespace = target.namespace;
+        }
         let source_context_kind = input
             .source_context
             .unwrap_or(MemoryToolSourceContext::DirectUserConversation)
@@ -1133,7 +1175,7 @@ impl MemoryToolHandler {
                 MemoryRememberParams {
                     scope,
                     category: input.category,
-                    namespace: None,
+                    namespace,
                     key,
                     content,
                     sensitivity: input.sensitivity,
@@ -1142,7 +1184,7 @@ impl MemoryToolHandler {
                     provenance: Some(provenance),
                     source_context_kind: Some(source_context_kind),
                     idempotency_key,
-                    supersedes: None,
+                    supersedes: input.memory_id,
                     metadata: BTreeMap::new(),
                 },
             )
@@ -1411,6 +1453,8 @@ struct MemoryGetToolInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryRememberToolInput {
+    #[serde(default)]
+    memory_id: Option<String>,
     content: String,
     category: MemoryCategory,
     #[serde(default)]
@@ -1592,6 +1636,7 @@ fn memory_remember_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
+            "memoryId": { "type": "string", "description": "Existing active record to correct. Preserves its namespace and key; scope/key, if provided, must match. Read the record first." },
             "content": { "type": "string", "minLength": 1 },
             "category": { "type": "string", "enum": category_values() },
             "key": { "type": "string" },

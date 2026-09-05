@@ -55,6 +55,69 @@ async fn connect(url: &str) -> DatabaseConnection {
         .expect("connect migration test database")
 }
 
+#[tokio::test]
+async fn memory_identity_migration_preserves_legacy_keys_and_restarts_idempotently() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = sqlite_url(&directory);
+    let database = connect(&url).await;
+    let before_count = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == "m20260905_000001_memory_identity")
+        .unwrap();
+    Migrator::up(&database, Some(before_count as u32))
+        .await
+        .unwrap();
+    database.execute_unprepared("INSERT INTO agent_memory (id,scope_kind,scope_key,scope_key_hash,category,key,active_key) VALUES ('legacy','user','default','hash','identity','custom_name','custom_name')").await.unwrap();
+    Migrator::up(&database, None).await.unwrap();
+    let identity_migration = Migrator::migrations()
+        .into_iter()
+        .find(|m| m.name() == "m20260905_000001_memory_identity")
+        .unwrap();
+    // Retry after DDL but before the migrator's completion marker is safe.
+    identity_migration
+        .up(&migration::SchemaManager::new(&database))
+        .await
+        .unwrap();
+    database.execute_unprepared("INSERT INTO agent_memory_identity VALUES ('user','hash','default','identity:name','legacy')").await.unwrap();
+    drop(database);
+    let database = connect(&url).await;
+    Migrator::up(&database, None).await.unwrap();
+    let row = database.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT m.key, m.active_key, i.memory_id FROM agent_memory m JOIN agent_memory_identity i ON i.memory_id=m.id WHERE m.id='legacy'" )).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<String>("", "key").unwrap(), "custom_name");
+    assert_eq!(
+        row.try_get::<String>("", "active_key").unwrap(),
+        "custom_name"
+    );
+    assert_eq!(row.try_get::<String>("", "memory_id").unwrap(), "legacy");
+    assert!(database.execute_unprepared("INSERT INTO agent_memory_identity VALUES ('user','hash','default','identity:other','legacy')").await.is_err());
+    database.execute_unprepared("INSERT INTO agent_memory (id,scope_kind,scope_key,scope_key_hash,category,key,active_key) VALUES ('other','user','default','hash','identity','other_name','other_name')").await.unwrap();
+    // A canonical identity cannot point at two different memories.
+    assert!(database.execute_unprepared("INSERT INTO agent_memory_identity VALUES ('user','hash','default','identity:name','other')").await.is_err());
+    // Links must reference existing memories, and deletion cleans them up.
+    assert!(database.execute_unprepared("INSERT INTO agent_memory_identity VALUES ('user','hash','default','identity:missing','missing')").await.is_err());
+    database
+        .execute_unprepared("DELETE FROM agent_memory WHERE id='legacy'")
+        .await
+        .unwrap();
+    let row = database
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS count FROM agent_memory_identity",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "count").unwrap(), 0);
+
+    let manager = migration::SchemaManager::new(&database);
+    identity_migration.down(&manager).await.unwrap();
+    assert!(!table_exists(&database, "agent_memory_identity").await);
+    identity_migration.down(&manager).await.unwrap();
+    identity_migration.up(&manager).await.unwrap();
+    assert!(table_exists(&database, "agent_memory_identity").await);
+}
+
 async fn applied_migration_count(database: &DatabaseConnection) -> i64 {
     let row = database
         .query_one_raw(Statement::from_string(

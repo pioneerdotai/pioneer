@@ -421,6 +421,7 @@ impl SemanticMemoryEvaluationFixture {
             source_context_kind: Some(self.source_context_kind),
             disposition: self.write_disposition,
             client_provided_key: None,
+            target_memory_id: None,
             confidence: None,
             importance: None,
             metadata: BTreeMap::new(),

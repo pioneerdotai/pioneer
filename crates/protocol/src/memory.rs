@@ -484,6 +484,10 @@ pub struct MemoryCanonicalKey {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct MemorySemanticWriteParams {
+    /// Explicit correction target; preserves its stored namespace/key. Never
+    /// inferred from similarity. The server validates scope and visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_memory_id: Option<String>,
     pub scope: MemoryScope,
     pub semantic: MemorySemanticFields,
     pub content: String,
@@ -1318,6 +1322,7 @@ mod tests {
             source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
             disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
             client_provided_key: Some("llm/freeform/key".to_owned()),
+            target_memory_id: None,
             confidence: Some(0.95),
             importance: Some(0.7),
             metadata: BTreeMap::new(),

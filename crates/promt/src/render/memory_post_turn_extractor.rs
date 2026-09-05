@@ -107,7 +107,7 @@ pub fn render_memory_post_turn_extractor_prompt(
 
     prompt.push_str("# Manifest, Duplicate, and Conflict Rules\n");
     prompt.push_str("- Use the memory manifest only to detect duplicates and conflicts. Do not copy manifest facts into output unless the current turn provides new direct evidence.\n");
-    prompt.push_str("- If the current turn corrects or supersedes the manifest, emit the corrected durable fact with direct user evidence. The memory service will merge or supersede.\n");
+    prompt.push_str("- If the current turn corrects a manifest fact, emit the corrected durable fact with direct user evidence and target_memory_id copied exactly from that manifest record. Keep its scope and semantic identity. Never invent an ID or target an unrelated fact. The service validates the target, preserves its existing key and binds the canonical identity explicitly; similarity alone does not merge arbitrary keys. Use null for a genuinely new fact.\n");
     prompt.push_str("- If the current turn merely repeats an active manifest fact without new value, omit it.\n\n");
 
     prompt.push_str("# Allowed Values\n");
@@ -134,6 +134,7 @@ pub fn render_memory_post_turn_extractor_prompt(
     prompt.push_str("{\n");
     prompt.push_str("  \"facts\": [\n");
     prompt.push_str("    {\n");
+    prompt.push_str("      \"target_memory_id\": null,\n");
     prompt.push_str("      \"semantic\": {\n");
     prompt.push_str("        \"intent\": \"explicit_store|implicit_candidate\",\n");
     prompt.push_str("        \"explicitness\": \"explicit|implicit|unclear\",\n");

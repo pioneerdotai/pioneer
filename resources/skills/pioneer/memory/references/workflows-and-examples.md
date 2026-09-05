@@ -276,7 +276,10 @@ Then write the new value with the same key:
 }
 ```
 
-If the old memory should be removed and the user asked for cleanup, forget the stale id after resolving it.
+Read back the returned record. Do not forget the old ID as an automatic cleanup
+step: a same-key update can retain that ID, so deleting it would delete the new
+value. To correct a fact with an unknown/generated key, use the `memoryId` from
+the initial read instead of inventing a key.
 
 ## Forget One Memory
 

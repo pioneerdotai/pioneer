@@ -120,6 +120,24 @@ Use keys for:
 
 Do not force a key when the memory is a one-off durable fact without a stable update path.
 
+### Corrections and automatic extraction
+
+- A tool write without a key gets a content-derived key. Changing the content
+  without addressing the existing record can create another record.
+- For a correction, find the existing fact with search/list/get, then pass its
+  `memoryId` to `memory_remember`. Its scope, namespace and key are retained;
+  if you also provide scope/key they must match. Use the returned new record ID.
+- A write with the same scope/namespace/key and no `memoryId` updates in place
+  and may return the same ID. Do not delete that ID as cleanup after updating.
+- Automatic extraction uses semantic identity (subject/attribute/category).
+  When correcting a manifest fact, the extractor explicitly supplies
+  `target_memory_id`. The server validates access and links that semantic identity
+  to the existing keyed fact. Later semantic writes follow the link; existing
+  user keys remain valid. A link does not grant additional access.
+- Neither similarity nor a new arbitrary key automatically merges legacy facts.
+  If two active records already claim the same identity, resolve that conflict
+  explicitly; do not repeatedly write a third copy.
+
 ## Sensitivity
 
 Default to `normal` for non-sensitive project and preference records.
