@@ -124,11 +124,27 @@ Keep track of it and continue.
 Send it to me.
 ```
 
-Better:
+For ordinary remembered facts, use the normal read/write flow in
+`system:pioneer/memory`. Merely using a name, preference or project decision in
+a scheduled run does not require baseline setup or move the fact into task scope.
 
-```text
-Each run, fetch the latest GitHub release for owner/repo through any available web or HTTP tool. Compare it with the configured baseline or available durable state. If the release is unchanged, return "No new release." If it changed, summarize the changelog in Russian Markdown for product readers. If release data cannot be fetched, fail clearly with the URL and error.
-```
+If later runs resume from and advance a saved baseline, read
+`system:pioneer/memory` and its `references/workflows-and-examples.md`, section
+**Continuing Work From A Saved Baseline**, through the available skill-reading tools. It
+contains the shared workflow and a concrete repeated-review instruction example.
+Do not invent a separate memory contract for scheduled tasks.
+
+Put the chosen address (`scope + namespace + key`), the meaning of its value,
+first-use policy, update milestone, and read/write failure behavior into the
+task's self-contained instructions. Check the future execution's authority, not
+only the creator's. A static creation-time default must not overwrite a saved
+value or silently replace an unavailable record.
+
+When configuring or changing this workflow, verify continuity at the next normal
+execution or an authorized read-only check, following the memory guide. Do not
+force another run with side effects just to validate the instructions. Keep
+memory persistence, result production and delivery as separate claims: a run
+returning a report cannot yet confirm delivery of that report.
 
 ## No-Op Runs
 

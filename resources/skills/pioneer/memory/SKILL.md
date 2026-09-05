@@ -30,13 +30,27 @@ Before any non-trivial answer or task, inspect what is already in the prompt and
 
 Do not invent memory. If a fact is not in injected context and cannot be verified with visible tools, say that you cannot verify it from available memory.
 
+## Ordinary Facts Versus Work Baselines
+
+Remembering a name, preference or project decision uses the normal read/write
+flows below. Choose scope by ownership: user identity belongs in authorized
+`user` memory, project decisions in `workspace` memory. A new thread or a
+scheduled execution is not a reason to move those facts to `thread` or `task`.
+After a successful ordinary write, confirm it without requiring workflow setup
+or a separate test run. If a fact is already reliably recalled and not stale or
+conflicting, use it without a redundant `memory_get` or `memory_search`.
+
+The baseline procedure is only for work that resumes from and advances a saved
+reference value. Its initialization, milestone and next-execution verification
+steps are not prerequisites for ordinary remembering or answering from memory.
+
 ## Load References When Needed
 
 Keep this file in context for the normal flow. Load detailed references only for the matching situation:
 
 - Read `references/tool-schemas.md` before constructing a non-trivial `memory_*` payload, after a schema error, or when exact field names matter.
 - Read `references/scopes-categories-keys.md` before writing memory when scope, category, sensitivity, confidence, importance, or key choice is not obvious.
-- Read `references/workflows-and-examples.md` for memory audits, cleanup, multi-memory deletion, exact update flows, or ambiguous user requests.
+- Read `references/workflows-and-examples.md` for memory audits, cleanup, multi-memory deletion, exact update flows, or ambiguous user requests. **Memory Between Executions** explains ordinary cross-thread use; **Continuing Work From A Saved Baseline** covers workflows that read and advance a saved reference value.
 - Read `references/troubleshooting.md` after memory tool failures, empty search results, incomplete inventory, confusing recalled context, or questions about retention and deletion guarantees.
 
 ## Tool Visibility
