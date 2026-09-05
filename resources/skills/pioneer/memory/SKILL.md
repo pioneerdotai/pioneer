@@ -37,7 +37,7 @@ Keep this file in context for the normal flow. Load detailed references only for
 - Read `references/tool-schemas.md` before constructing a non-trivial `memory_*` payload, after a schema error, or when exact field names matter.
 - Read `references/scopes-categories-keys.md` before writing memory when scope, category, sensitivity, confidence, importance, or key choice is not obvious.
 - Read `references/workflows-and-examples.md` for memory audits, cleanup, multi-memory deletion, exact update flows, or ambiguous user requests.
-- Read `references/troubleshooting.md` after memory tool failures, empty search results, incomplete inventory, or confusing recalled context.
+- Read `references/troubleshooting.md` after memory tool failures, empty search results, incomplete inventory, confusing recalled context, or questions about retention and deletion guarantees.
 
 ## Tool Visibility
 
@@ -141,6 +141,41 @@ For ambiguous forget requests, resolve first:
 4. Use `dryRun:true` when the user expects confirmation before deletion.
 
 After a memory is forgotten, do not keep using it as active context.
+
+## Lifetime, Recall, And Deletion
+
+An ordinary `memory_remember` write has no automatic expiration deadline (no
+TTL). Ending a turn does not delete it; `task` scope is an ownership boundary,
+not a promise to erase the fact when a run finishes. This is not a guarantee of
+permanent storage or availability after deletion of its parent resources.
+
+Storage and recall are different. Relevance ranking, recency weighting, top-k
+and prompt budgets can omit a stored fact. Recency half-life is not a deletion
+timer. Access grants, sensitivity, quality, expiration and repair state also
+affect visibility. A missing prompt item is not evidence that the record was lost.
+
+- `active`: current stored version; check `recallEligibility` before using it.
+- Same scope/namespace/key update: changes the current record in place, retaining
+  its ID. Addressed correction with `memoryId` instead supersedes the old version
+  atomically and returns a new ID. Do not delete the updated ID as cleanup.
+- `superseded`: replaced version, excluded from ordinary recall, potentially
+  available for authorized historical audit; not proof of physical erasure.
+- `expired` or an elapsed `expires_at`: unavailable for ordinary recall, not
+  proof that all stored bytes were removed. Do not invent an expiry deadline.
+- Repair-needed: backend consistency/availability issue, not a retention policy
+  or proof of permanent loss. Do not create a duplicate merely to bypass it.
+- `deleted`: a tombstone excludes the record from ordinary durable-memory recall.
+
+For `memory_forget`, check `dryRun:false` and the returned `forgottenMemoryIds`.
+A dry run only previews targets; an empty result does not confirm a new deletion.
+The service commits the tombstone before attempting backend deletion; failed
+backend cleanup can be queued for repair. Metadata and a content preview may
+remain in the control-plane row. Forget does not erase conversation history,
+logs, backups, or the separate episodic index, nor does it retract context already
+sent to a model. Do not promise "erased everywhere" or secure physical erasure.
+Do not re-save the forgotten fact from an old transcript against the user's request.
+For whole-history/parent-resource deletion, verify that operation's own contract
+and authorization; do not assume a semantic-memory forget performs it.
 
 ## Scopes And Categories
 

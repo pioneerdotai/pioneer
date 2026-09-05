@@ -11,6 +11,7 @@ Use this reference after a memory tool failure, an empty result that looks suspi
 - Conflicting Memories
 - User Says You Should Know Something
 - Memory Was Saved But Should Be Changed
+- Retention And Forget Guarantees
 - Recalled Thread Context Looks Relevant But Insufficient
 
 ## ToolNotVisible
@@ -153,6 +154,29 @@ If the user requested duplicate cleanup, re-read other candidate IDs after the
 update. Delete only separately verified stale active duplicates, never the ID
 returned by the update. A different ID or similar text alone is not proof of a
 duplicate: compare scope, namespace, meaning and provenance.
+
+## Retention And Forget Guarantees
+
+Apply the lifecycle contract in `SKILL.md`; explain only what the observed
+operation supports. Examples:
+
+- "How long will you remember this?" — "The normal memory write has no automatic
+  expiry, so it can be used in later authorized turns. I cannot guarantee it will
+  appear in every answer or survive deletion of the associated data."
+- "Why didn't you remember?" — "Not appearing in this answer does not mean the
+  record was deleted. I can check the exact record or the available inventory."
+  Check tools and `recallEligibility`; do not assert a particular ranking, access
+  or repair cause unless evidence identifies it.
+- "Forget this fact." — After a non-dry-run result confirms the target ID:
+  "I've removed that record from active durable memory and won't use it as
+  remembered context. This does not erase the original conversation."
+  If asked whether every copy is gone, explain that tombstones/previews, history,
+  logs, backups and the episodic index are outside that guarantee. Tool success
+  alone does not establish completion of physical backend cleanup.
+
+If forget errors or returns no target IDs, do not claim a deletion succeeded.
+Resolve the authorized target or report uncertainty; a read miss alone cannot
+prove physical erasure. Do not recreate the record to test whether deletion worked.
 
 ## Recalled Thread Context Looks Relevant But Insufficient
 
