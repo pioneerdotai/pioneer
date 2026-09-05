@@ -60421,6 +60421,115 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
 }
 
 #[tokio::test]
+async fn memory_owner_facts_survive_a_new_thread() {
+    use pioneer_memory::hooks::{AgentMemoryWriteProvider, MemoryManifestRequest};
+    let harness = setup_memory_gateway_harness("owner_cross_thread", true).await;
+    let first = built_memory_tools(&harness, "owner_first").await;
+    let second = built_memory_tools(&harness, "owner_second").await;
+    let provider =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
+
+    // Omit scope deliberately: personal and project facts must use their
+    // normal user/workspace defaults, not silently fall back to thread memory.
+    for (category, scope, key, content) in [
+        ("identity", "user", "user_name", "Меня зовут Александр."),
+        (
+            "project_fact",
+            "workspace",
+            "project_name",
+            "Проект называется Pioneer.",
+        ),
+    ] {
+        let remembered = execute_memory_tool_payload(
+            &first,
+            "memory_remember",
+            &format!("remember_{key}"),
+            json!({"category": category, "key": key, "content": content}),
+        )
+        .await;
+        assert_eq!(remembered.pointer("/scope/kind"), Some(&json!(scope)));
+        let recalled = execute_memory_tool_payload(
+            &second,
+            "memory_get",
+            &format!("get_{key}"),
+            json!({"scope": scope, "key": key}),
+        )
+        .await;
+        assert_eq!(recalled.pointer("/record/content"), Some(&json!(content)));
+        assert_eq!(
+            recalled.pointer("/record/provenance/source_thread_id"),
+            Some(&json!(
+                memory_tool_context(&harness, "owner_first").thread_id
+            )),
+        );
+        let recall = provider
+            .recall_memory(
+                memory_tool_context(&harness, "owner_second"),
+                MemoryRecallRequest {
+                    query: content.to_owned(),
+                    categories: Vec::new(),
+                    top_k: Some(5),
+                    max_chars: Some(1000),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            recall
+                .items
+                .iter()
+                .any(|item| json!(item.memory_id) == remembered["memoryId"])
+        );
+        let manifest = provider
+            .load_memory_manifest(
+                memory_tool_context(&harness, "owner_second"),
+                MemoryManifestRequest {
+                    max_items: 10,
+                    max_item_chars: 500,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .active
+                .iter()
+                .any(|item| json!(item.memory_id) == remembered["memoryId"])
+        );
+        let inventory = execute_memory_tool_payload(
+            &second,
+            "memory_list",
+            &format!("list_{key}"),
+            json!({"scopes": [scope]}),
+        )
+        .await;
+        assert!(
+            inventory["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| { record["memoryId"] == remembered["memoryId"] })
+        );
+        execute_memory_tool_payload(
+            &second,
+            "memory_forget",
+            &format!("forget_{key}"),
+            json!({"scope": scope, "key": key, "reason": "User requested forgetting"}),
+        )
+        .await;
+        let forgotten = execute_memory_tool_payload(
+            &first,
+            "memory_get",
+            &format!("get_forgotten_{key}"),
+            json!({"scope": scope, "key": key}),
+        )
+        .await;
+        assert_eq!(forgotten["record"], serde_json::Value::Null);
+    }
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
 async fn memory_tool_remember_writes_memory_with_turn_provenance() {
     let mut harness = setup_memory_gateway_harness("tool_remember", true).await;
     let tools = built_memory_tools(&harness, "remember").await;

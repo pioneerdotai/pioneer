@@ -206,8 +206,11 @@ async fn authorize_memory_execution(
                 current.authorization().decision(),
             );
             Ok(MemoryExecutionBoundary {
-                scoped_collaboration: current.resource_boundary()
-                    == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule,
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|_| "memory principal policy is unavailable".to_owned())?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
         Err(_) => {
@@ -246,8 +249,11 @@ async fn authorize_post_turn_memory_execution(
                 current.authorization().decision(),
             );
             Ok(MemoryExecutionBoundary {
-                scoped_collaboration: current.resource_boundary()
-                    == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule,
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|_| "post-turn memory principal policy is unavailable".to_owned())?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
         Err(_) => {

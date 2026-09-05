@@ -3299,6 +3299,38 @@ impl RevalidatedExecutionAuthorization {
         self.resource_boundary
     }
 
+    /// Global owner memory follows the initiating principal's admission and
+    /// current policy. The collaborator selected to keep a shared execution
+    /// alive must not lend its personal-memory authority to that execution.
+    /// RootThreadCapsule alone cannot answer this: every Turn carries it,
+    /// including interactive Turns admitted by the instance owner.
+    pub(crate) async fn memory_runtime_principal_policy(
+        &self,
+        store: &CrudStore,
+    ) -> Result<RuntimePrincipalPolicy> {
+        let role_key = RoleKey::new(self.admitted_role_key.clone())?;
+        let admitted_role = super::RoleDefinitionRegistry::new()
+            .resolve_key(&role_key)
+            .context("memory execution role is not registered")?;
+        if admitted_role.runtime_principal != RuntimePrincipalPolicy::Absolute {
+            return Ok(RuntimePrincipalPolicy::ScopedCollaboration);
+        }
+        let initiator = pioneer_crud::load_principal_by_id(
+            &store.database_connection(),
+            &self.admitted_principal_id,
+        )
+        .await?;
+        let Some(initiator) = initiator
+            .filter(|principal| principal.status == pioneer_protocol::PrincipalStatus::Active)
+        else {
+            return Ok(RuntimePrincipalPolicy::ScopedCollaboration);
+        };
+        let current_role = initiator.role_key.map(RoleKey::new).transpose()?;
+        Ok(AuthorizationService::new()
+            .runtime_principal_policy(initiator.kind, current_role.as_ref())
+            .unwrap_or(RuntimePrincipalPolicy::ScopedCollaboration))
+    }
+
     pub(crate) fn effective_permission_profile(&self) -> &TurnPermissionProfileSnapshot {
         &self.effective_permission_profile
     }
@@ -4397,6 +4429,67 @@ mod tests {
                 .expect("changed-capability CLI scope"),
             collaboration_scope,
             "capability projection changes must reset provider-session grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_policy_uses_current_initiator_without_borrowing_collaborator_authority() {
+        use crate::tests::authorization::{
+            IsolatedEpic4Harness, MEMBER_A_ID, REMOVED_MEMBER_ID, SUSPENDED_MEMBER_ID,
+        };
+        let harness = IsolatedEpic4Harness::new().await.unwrap();
+        let store = CrudStore::new(harness.database.clone());
+        let request = member_request();
+        let owner = crate::auth::test_support::TEST_SUPERUSER_ID;
+        let owner_role = AuthorizationService::new()
+            .resolved_role_key(PrincipalKind::Superuser, None)
+            .unwrap()
+            .to_owned();
+        let fingerprint = super::super::RoleDefinitionRegistry::new().policy_fingerprint();
+        let mut proof = RevalidatedExecutionAuthorization {
+            principal: request.principal().clone(),
+            authorization: authorized_thread(&request),
+            resource_boundary: ExecutionResourceBoundary::RootThreadCapsule,
+            effective_permission_profile:
+                pioneer_protocol::default_turn_permission_profile_snapshot(),
+            admitted_workspace_id: "workspace-a".to_owned(),
+            admitted_root_thread_id: "thread-a".to_owned(),
+            admitted_principal_id: PrincipalId::new(owner).unwrap(),
+            admitted_session_id: request.principal().session_id.clone(),
+            admitted_role_key: owner_role.clone(),
+            admitted_policy_generation: 1,
+            admitted_policy_fingerprint: fingerprint.clone(),
+            validated_policy_generation: 1,
+            validated_policy_fingerprint: fingerprint,
+        };
+        // A different collaborator may supply the execution's continuation
+        // proof; personal memory still belongs to the actual initiator.
+        assert_eq!(
+            proof.memory_runtime_principal_policy(&store).await.unwrap(),
+            RuntimePrincipalPolicy::Absolute,
+        );
+        for principal_id in [
+            MEMBER_A_ID,
+            SUSPENDED_MEMBER_ID,
+            REMOVED_MEMBER_ID,
+            &"Z".repeat(21),
+        ] {
+            proof.admitted_principal_id = PrincipalId::new(principal_id).unwrap();
+            assert_eq!(
+                proof.memory_runtime_principal_policy(&store).await.unwrap(),
+                RuntimePrincipalPolicy::ScopedCollaboration,
+                "an old absolute admission cannot override the initiator's current status/role",
+            );
+        }
+        // Neither a promoted initiator nor an absolute collaborator widens an
+        // admission that originally had only collaborative memory authority.
+        proof.admitted_principal_id = PrincipalId::new(owner).unwrap();
+        proof.admitted_role_key = "member".to_owned();
+        proof.principal.kind = PrincipalKind::Superuser;
+        proof.principal.role_key = None;
+        assert_eq!(
+            proof.memory_runtime_principal_policy(&store).await.unwrap(),
+            RuntimePrincipalPolicy::ScopedCollaboration,
         );
     }
 
