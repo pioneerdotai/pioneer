@@ -233,10 +233,37 @@ mod scope_contract_tests {
         }
         assert!(!context.allow_global_user);
         assert!(
+            context
+                .tool_scope_contract(true)
+                .contains("mutation scopes: thread, task.")
+        );
+        assert!(
+            context
+                .tool_scope_contract(false)
+                .contains("read scopes: workspace, thread, task.")
+        );
+        assert!(
+            context
+                .tool_scope_contract(false)
+                .contains("source-filtered")
+        );
+        assert_eq!(
+            context.scope_read_denial(&MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".into(),
+            }),
+            Some("global_user_memory_unavailable")
+        );
+        assert!(
             !context.source_access.allows_source_thread(Some("run_a")),
             "scope grants must not authorize fabricated provenance"
         );
         let owner = runtime.operation_context_for_authorized_turn(&turn, None, false);
         assert!(owner.allow_global_user);
+        assert!(
+            owner
+                .tool_scope_contract(false)
+                .contains("read scopes: user, workspace, thread, task.")
+        );
     }
 }

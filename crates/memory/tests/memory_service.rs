@@ -710,6 +710,13 @@ async fn list_get_and_forget_use_control_plane_visibility() {
         .record
         .expect("record");
     assert_eq!(loaded.content, remembered.record.content);
+    let eligibility = loaded.recall_eligibility.as_ref().expect("assessed get");
+    assert!(!eligibility.eligible);
+    assert!(eligibility.reason.starts_with("suppress_"));
+    assert_eq!(
+        listed.records[0].recall_eligibility.as_ref(),
+        Some(eligibility)
+    );
 
     let forgotten = service
         .forget(
@@ -1045,6 +1052,22 @@ async fn remember_with_supersedes_marks_old_row_superseded() {
         .expect("search");
     assert_eq!(search.hits.len(), 1);
     assert_eq!(search.hits[0].record.id, replacement.record.id);
+
+    let historical = service
+        .list(
+            user_context(304),
+            MemoryListParams {
+                statuses: vec![MemoryStatus::Superseded],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.records.len(), 1);
+    assert_eq!(historical.records[0].id, old.record.id);
+    let eligibility = historical.records[0].recall_eligibility.as_ref().unwrap();
+    assert!(!eligibility.eligible);
+    assert_eq!(eligibility.reason, "suppress_superseded");
 
     let decisions = store
         .list_agent_memory_policy_decisions_for_memory(replacement.record.id.as_str(), 10)

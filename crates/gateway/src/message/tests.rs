@@ -60015,6 +60015,8 @@ async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
         );
         assert!(configured.spec.parameters.is_object());
         assert!(!configured.spec.description.trim().is_empty());
+        assert!(configured.spec.description.contains("Current execution"));
+        assert!(configured.spec.description.contains("Unavailable scopes:"));
     }
     let search = bundle
         .specs
@@ -60105,6 +60107,111 @@ async fn memory_remember_tool_accepts_recurring_instruction_category() {
         Some("recurring_instruction.concise_direct_answers")
     );
 
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
+    let harness = setup_memory_gateway_harness("namespace_contract", true).await;
+    let tools = built_memory_tools(&harness, "namespace_contract").await;
+    let mut seeds = Vec::new();
+    for namespace in ["default", "project-a", "project-b"] {
+        seeds.push(
+            execute_memory_tool_payload(
+                &tools,
+                "memory_remember",
+                &format!("seed_{namespace}"),
+                json!({
+                    "scope": "thread", "namespace": namespace, "key": "baseline",
+                    "category": "project_fact", "content": format!("Original fact for {namespace}")
+                }),
+            )
+            .await,
+        );
+    }
+    let updated = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "update_project_a",
+        json!({
+            "scope": "thread", "namespace": "project-a", "key": "baseline",
+            "category": "project_fact", "content": "Corrected project A fact"
+        }),
+    )
+    .await;
+    assert_eq!(updated["memoryId"], seeds[1]["memoryId"]);
+    assert_eq!(updated["namespace"], "project-a");
+    let listed = execute_memory_tool_payload(
+        &tools,
+        "memory_list",
+        "inventory_namespace",
+        json!({"scopes":["thread"]}),
+    )
+    .await;
+    assert_eq!(listed["records"].as_array().unwrap().len(), 3);
+    for (index, namespace) in ["default", "project-a", "project-b"].iter().enumerate() {
+        let record = execute_memory_tool_payload(
+            &tools,
+            "memory_get",
+            &format!("get_{namespace}"),
+            json!({
+                "scope":"thread", "namespace":namespace, "key":"baseline"
+            }),
+        )
+        .await;
+        assert_eq!(record["record"]["namespace"], *namespace);
+        assert_eq!(record["record"]["memoryId"], seeds[index]["memoryId"]);
+        assert_eq!(
+            record["record"]["content"],
+            if index == 1 {
+                json!("Corrected project A fact")
+            } else {
+                seeds[index]["content"].clone()
+            }
+        );
+        assert_eq!(record["record"]["recallEligibility"]["eligible"], true);
+    }
+    // Explicitly addressed correction must not silently move the record.
+    let error = execute_memory_tool_error(
+        &tools,
+        "memory_remember",
+        "wrong_namespace",
+        json!({
+            "memoryId": updated["memoryId"], "namespace":"project-b",
+            "category":"project_fact", "content":"Wrong namespace correction"
+        }),
+    )
+    .await;
+    assert!(matches!(error, ToolError::InvalidArguments(_)));
+    let forgotten = execute_memory_tool_payload(
+        &tools,
+        "memory_forget",
+        "cleanup_other_namespace",
+        json!({
+            "scope":"thread", "namespace":"project-b", "key":"baseline"
+        }),
+    )
+    .await;
+    assert_eq!(
+        forgotten["forgottenMemoryIds"],
+        json!([seeds[2]["memoryId"]])
+    );
+    let current = execute_memory_tool_payload(
+        &tools,
+        "memory_get",
+        "verify_updated_survives",
+        json!({"memoryId":updated["memoryId"]}),
+    )
+    .await;
+    assert_eq!(current["record"]["content"], "Corrected project A fact");
+    let default = execute_memory_tool_payload(
+        &tools,
+        "memory_get",
+        "verify_default_unchanged",
+        json!({"scope":"thread","key":"baseline"}),
+    )
+    .await;
+    assert_eq!(default["record"]["memoryId"], seeds[0]["memoryId"]);
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 

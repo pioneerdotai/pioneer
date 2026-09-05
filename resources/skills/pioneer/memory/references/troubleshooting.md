@@ -75,6 +75,26 @@ Better payload:
 
 ## Search Misses A Known Memory
 
+### Scope denial or null exact result
+
+`scope_not_authorized` explains execution policy without looking up the requested
+record. It does not imply that a hidden record exists. The mutation error
+`this execution may mutate only thread-capsule or active-task memory` means that
+user/workspace/agent writes are outside this execution's grant, not malformed JSON.
+Do not retry with a different scope silently; report the limit and preserve the
+user's requested ownership.
+
+Even exact `memory_get` can return `record:null` because a record is absent,
+expired, under repair, outside record-level authorization, or blocked by
+sensitivity policy. An empty inventory is only empty within this execution's
+visible area and supplied filters. Say "not visible in memory available to this
+execution", not "the database is empty". Check the tool's runtime scope contract
+and the full scope/namespace/key address before changing the request.
+
+If an inventory/get record has `recallEligibility.eligible:false`, its reason
+explains why it is audit-only. It may be inspected or forgotten when authorized,
+but must not be promoted to a trusted answer merely because search omitted it.
+
 Semantic search is not guaranteed to find every record.
 
 Try this sequence:
@@ -123,9 +143,16 @@ Do not pretend to remember.
 
 ## Memory Was Saved But Should Be Changed
 
-If a stable key exists, write the replacement with the same key. If stale records remain and the user asked for cleanup, forget the stale ids.
+Read the record first. A write to the same scope/namespace/key without `memoryId`
+updates in place and retains the ID: never forget that "old" ID afterward.
+Alternatively supply the existing `memoryId` to correct it; supersession is
+atomic and the returned ID becomes the current one. No follow-up deletion of
+the superseded ID is needed. This also works for generated or missing keys.
 
-If no stable key exists, search/list first, then write the corrected memory and delete the wrong one only after the target is clear.
+If the user requested duplicate cleanup, re-read other candidate IDs after the
+update. Delete only separately verified stale active duplicates, never the ID
+returned by the update. A different ID or similar text alone is not proof of a
+duplicate: compare scope, namespace, meaning and provenance.
 
 ## Recalled Thread Context Looks Relevant But Insufficient
 

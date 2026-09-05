@@ -58,6 +58,7 @@ pub(crate) fn crud_record_to_protocol(
     .with_context(|| format!("failed to parse metadata for memory `{}`", record.id))?;
 
     Ok(MemoryRecord {
+        recall_eligibility: None,
         id: record.id,
         scope: record.scope,
         namespace: namespace_to_protocol(record.namespace),

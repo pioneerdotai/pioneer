@@ -72,6 +72,7 @@ fn quality_audit_is_read_only_for_records_and_candidates() {
 
 fn representative_memory_record() -> MemoryRecord {
     MemoryRecord {
+        recall_eligibility: None,
         id: "memory-1".to_owned(),
         scope: scope(MemoryScopeKind::User, "user-1"),
         namespace: Some("default".to_owned()),

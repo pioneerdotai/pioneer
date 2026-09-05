@@ -56,6 +56,18 @@ Do not call hidden memory tools directly. If the memory domain cannot be opened,
 
 ## Read Flow
 
+Read the execution-specific scope contract in the visible tool descriptions.
+An available tool does not grant every scope. `record:null` or an empty list
+means no visible result, not that the database is empty. Do not silently save
+in another scope after denial; explain the limitation. See
+`references/scopes-categories-keys.md` for bindings and access boundaries.
+
+For exact/inventory records, check `recallEligibility`. `eligible:false` means
+audit/cleanup only: do not use the content as established knowledge in an answer.
+`status:active` describes storage, not evidence quality. A missing/null assessment
+means not assessed, not approved. Do not bypass a quality rejection by switching
+from search to get/list.
+
 Use injected memory first. Tool calls are for memory that is likely useful but missing, ambiguous, stale, conflicting, incomplete, or provenance-sensitive.
 
 Use `memory_search` proactively when the current turn may depend on:
@@ -134,7 +146,7 @@ After a memory is forgotten, do not keep using it as active context.
 
 Choose the narrowest truthful scope and category.
 
-Common defaults:
+Common defaults when the execution's mutation scope contract permits them:
 
 - user identity/preference/biography/communication style -> `user`
 - project rule, decision, convention, procedure, or constraint -> `workspace`

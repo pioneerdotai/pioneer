@@ -832,6 +832,7 @@ fn test_semantic_write_response() -> MemorySemanticWriteResponse {
 
 fn test_memory_record(id: &str) -> MemoryRecord {
     MemoryRecord {
+        recall_eligibility: None,
         id: id.to_owned(),
         scope: user_scope(),
         namespace: Some("identity".to_owned()),

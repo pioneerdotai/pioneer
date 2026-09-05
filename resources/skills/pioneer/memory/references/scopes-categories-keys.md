@@ -16,6 +16,35 @@ Use this reference when writing memory or choosing filters for reads. The goal i
 
 Choose the narrowest truthful scope.
 
+### Runtime bindings and access
+
+The tool descriptions contain the current execution's read or mutation scopes,
+derived from its authorization context. The handler rechecks authorization when
+called; a grant can be revoked after the prompt was compiled.
+
+| Scope | Address supplied by runtime | Owner/absolute execution | Scoped collaboration |
+|---|---|---|---|
+| user | `user/default`, instance owner's memory, not a separate profile per participant | Read if global-user access is enabled; mutation subject to authorization | No global-user read or mutation |
+| workspace | Current workspace | Read/mutate subject to authorization | Read only records with allowed source provenance; no mutation |
+| thread | Effective conversation/root capsule | Read/mutate subject to authorization | Read/mutate its granted capsule across hidden runs |
+| task | Current active task ID | Available only with active task | Read/mutate its granted active task across runs |
+| agent | Current workspace's agent ID | Available only with active agent | Read with allowed source provenance; no mutation |
+
+Read and mutation rights are distinct. Global-user read configuration does not
+itself revoke otherwise authorized mutation. Global-agent configuration affects
+global agent memory, not the workspace-bound `agent` address used by these tools.
+All reads still enforce record sensitivity, provenance, lifecycle and repair
+filters; search/recall additionally enforce quality. Scoped contexts cannot read
+personal/secret-like/regulated payloads. Tool names accept scope kinds, not
+arbitrary workspace/task/agent IDs. Hidden source thread IDs are provenance, not
+the lifetime of granted task/thread memory.
+
+For scoped writes, project categories default to `thread`; personal categories
+require separate authorization and cannot use their usual `user` default.
+`custom` needs an explicit permitted scope. Never change a requested user or
+workspace fact into task/thread memory merely to make a denied write succeed.
+Explain the boundary instead. Examples below assume their scopes are permitted.
+
 ### user
 
 Use `user` for facts that follow the person across projects and threads:
@@ -88,6 +117,11 @@ If more than one category seems plausible, choose the one that will help future 
 
 ## Keys
 
+An exact address is **scope + namespace + key**, not key alone. `namespace`
+defaults to `default`; search/list/get outputs include it. Preserve all three
+when updating or forgetting by key. Two namespaces can legitimately contain the
+same key with different values. A known `memoryId` addresses one record directly.
+
 Use a stable `key` when future lookup or update should be exact.
 
 Good keys are lowercase, stable, and domain-specific:
@@ -126,7 +160,7 @@ Do not force a key when the memory is a one-off durable fact without a stable up
   without addressing the existing record can create another record.
 - For a correction, find the existing fact with search/list/get, then pass its
   `memoryId` to `memory_remember`. Its scope, namespace and key are retained;
-  if you also provide scope/key they must match. Use the returned new record ID.
+  if you also provide scope/namespace/key they must match. Use the returned new record ID.
 - A write with the same scope/namespace/key and no `memoryId` updates in place
   and may return the same ID. Do not delete that ID as cleanup after updating.
 - Automatic extraction uses semantic identity (subject/attribute/category).

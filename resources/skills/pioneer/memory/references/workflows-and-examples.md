@@ -2,6 +2,11 @@
 
 Use this reference for multi-step memory operations, proactive memory use, and common user requests.
 
+Examples assume their scopes are permitted by the runtime contract in tool
+descriptions. Do not switch ownership silently to work around a denial. For
+reads, use only recall-eligible records as knowledge; audit-only records may be
+listed as stored claims but must be explicitly labelled as excluded from recall.
+
 ## Contents
 
 - Proactive Memory Check For Non-Trivial Turns
@@ -333,7 +338,10 @@ Use `memory_list` first:
 }
 ```
 
-Then identify duplicates by meaning, scope, category, and key. Do not rely only on exact text match: "User's name is Alexander" and "The user's name is Alexander" are duplicates.
+Then identify candidate duplicates by meaning, scope, namespace, category, key
+and provenance. Similar wording is a reason to inspect, not permission to merge
+different namespaces or ownership. After an update, re-read other stale active
+candidates and never delete the ID returned by that update as cleanup.
 
 Before deletion, either:
 

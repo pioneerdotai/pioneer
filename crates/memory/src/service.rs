@@ -3216,7 +3216,22 @@ impl MemoryService {
             row
         };
 
-        Ok(Some(crud_record_to_protocol(row, payload)?))
+        let quality = self.recall_quality_signals_for_row(&row).await?;
+        let visibility = self
+            .row_recall_visibility_with_quality(
+                &row,
+                context,
+                &[MemoryStatus::Active],
+                now,
+                &quality,
+            )
+            .await?;
+        let mut record = crud_record_to_protocol(row, payload)?;
+        record.recall_eligibility = Some(pioneer_protocol::MemoryRecallEligibility {
+            eligible: visibility.is_visible(),
+            reason: visibility.as_str().to_owned(),
+        });
+        Ok(Some(record))
     }
 
     fn row_control_plane_visible(
@@ -3317,7 +3332,26 @@ impl MemoryService {
             row
         };
 
-        Ok(Some((crud_record_to_protocol(row, payload)?, quality)))
+        // An explicit historical search may expose superseded/deleted records
+        // for audit, but that does not make them eligible for ordinary recall.
+        let eligibility = if allowed_statuses == [MemoryStatus::Active] {
+            visibility
+        } else {
+            self.row_recall_visibility_with_quality(
+                &row,
+                context,
+                &[MemoryStatus::Active],
+                now,
+                &quality,
+            )
+            .await?
+        };
+        let mut record = crud_record_to_protocol(row, payload)?;
+        record.recall_eligibility = Some(pioneer_protocol::MemoryRecallEligibility {
+            eligible: eligibility.is_visible(),
+            reason: eligibility.as_str().to_owned(),
+        });
+        Ok(Some((record, quality)))
     }
 
     async fn row_recall_visibility_with_quality(

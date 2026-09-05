@@ -133,12 +133,19 @@ Rules:
 
 ## memory_get
 
-Use `memory_get` for exact lookup by memory id or stable scoped key.
+Choose exactly one address: `memoryId` alone, or `scope` + `key` with optional
+`namespace` (defaults to `default`). Do not combine ID with scope/namespace.
+All record outputs include `namespace`. Get/list/search also report
+`recallEligibility` when assessed: `eligible:false` is audit-only, and `reason`
+is a policy code. A null assessment is not an approval. Active status is separate.
+
+Use `memory_get` for exact lookup by memory id or stable scoped key. For example,
+an exact key request is:
 
 ```json
 {
-  "memoryId": "string",
   "key": "string",
+  "namespace": "default",
   "scope": "user | workspace | thread | agent | task"
 }
 ```
@@ -161,14 +168,16 @@ Use this after search/list when exact details, provenance, or stable-key lookup 
 Use `memory_remember` for direct durable writes. Use it proactively when the user provides clearly durable, future-useful information, even if the user did not explicitly say "remember this".
 
 For a correction, optionally supply `memoryId` from a prior read. This preserves
-the target's namespace/key and supersedes its old version atomically. If scope
-or key is also provided it must match the target. Use the returned record ID
+the target's namespace/key and supersedes its old version atomically. If scope,
+namespace or key is also provided it must match the target. Without `memoryId`,
+optional `namespace` defaults to `default`. Use the returned record ID
 for subsequent operations. This is distinct from an ordinary same-key in-place
 update, which retains its ID.
 
 ```json
 {
   "content": "string",
+  "namespace": "default",
   "category": "identity | preference | biography | relationship | recurring_instruction | project_policy | project_fact | project_decision | procedure | todo | constraint | communication_style | custom",
   "key": "string",
   "scope": "user | workspace | thread | agent | task",
@@ -249,13 +258,15 @@ Why it is bad:
 
 ## memory_forget
 
-Use `memory_forget` to suppress/delete durable memory by id or scoped key.
+Choose exactly one address: `memoryId` alone, or `scope` + `key` with optional
+`namespace` (defaults to `default`). Do not combine ID with scope/namespace.
+
+Use `memory_forget` to suppress/delete durable memory by id or scoped key. An
+ID request is:
 
 ```json
 {
   "memoryId": "string",
-  "key": "string",
-  "scope": "user | workspace | thread | agent | task",
   "reason": "string",
   "dryRun": false,
   "idempotency_key": "string"

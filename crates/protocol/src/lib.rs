@@ -263,12 +263,13 @@ pub use memory::{
     MemoryIntent, MemoryLifecycleActor, MemoryLifecycleActorKind, MemoryLifecycleReasonCode,
     MemoryLifecycleTransitionKind, MemoryLifetimeClass, MemoryListParams, MemoryListResponse,
     MemoryOwnershipClass, MemoryProvenance, MemoryQualityAction, MemoryQualityDecision,
-    MemoryQualityReasonCode, MemoryRecord, MemoryRememberParams, MemoryRememberResponse,
-    MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind, MemorySearchHit,
-    MemorySearchParams, MemorySearchResponse, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySemanticWriteRoute,
-    MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
-    MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemoryQualityReasonCode, MemoryRecallEligibility, MemoryRecord, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySemanticWriteRoute, MemorySemanticWriteRouteInfo, MemorySensitivity,
+    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
+    MemoryWriteEvidence, MemoryWriteRelation,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use patch_history::{

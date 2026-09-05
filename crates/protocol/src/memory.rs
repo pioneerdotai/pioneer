@@ -532,6 +532,9 @@ pub struct MemorySemanticWriteResponse {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 pub struct MemoryRecord {
+    /// Response-only assessment for this read; absence means not assessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_eligibility: Option<MemoryRecallEligibility>,
     pub id: String,
     pub scope: MemoryScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -563,6 +566,13 @@ pub struct MemoryRecord {
     pub delete_reason: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
+pub struct MemoryRecallEligibility {
+    pub eligible: bool,
+    /// Low-cardinality policy reason, never a payload or identifier.
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Default)]

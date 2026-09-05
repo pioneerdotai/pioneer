@@ -1346,6 +1346,7 @@ mod tests {
 
     fn memory_record_with_metadata(metadata: BTreeMap<String, Value>) -> MemoryRecord {
         MemoryRecord {
+            recall_eligibility: None,
             id: "memory-1".to_owned(),
             scope: MemoryScope {
                 kind: MemoryScopeKind::User,

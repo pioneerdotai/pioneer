@@ -208,6 +208,73 @@ impl MemoryActiveScopes {
 }
 
 impl MemoryOperationContext {
+    /// Scope-level denial only: never inspect a row or reveal whether it exists.
+    /// Other readable scopes still undergo record-level authorization/filtering.
+    pub fn scope_read_denial(&self, scope: &MemoryScope) -> Option<&'static str> {
+        match scope.kind {
+            MemoryScopeKind::User if self.workspace_id.is_some() && !self.allow_global_user => {
+                Some("global_user_memory_unavailable")
+            }
+            MemoryScopeKind::Agent if self.workspace_id.is_none() && !self.allow_global_agent => {
+                Some("global_agent_memory_unavailable")
+            }
+            _ => None,
+        }
+    }
+
+    /// Describes the same context used by the tool handler, not a role-name guess.
+    /// This is a scope ceiling; sensitivity, provenance and record lifecycle still apply.
+    pub fn tool_scope_contract(&self, mutation: bool) -> String {
+        let mut allowed = Vec::new();
+        let mut unavailable = Vec::new();
+        for scope in self.effective_scopes(&[]) {
+            let name = match scope.kind {
+                MemoryScopeKind::User => "user",
+                MemoryScopeKind::Workspace => "workspace",
+                MemoryScopeKind::Thread => "thread",
+                MemoryScopeKind::Task => "task",
+                MemoryScopeKind::Agent => "agent",
+            };
+            let permits = if mutation {
+                self.mutation_boundary.validate_owned_scope(&scope).is_ok()
+            } else {
+                self.scope_read_denial(&scope).is_none()
+            };
+            if permits {
+                allowed.push(name);
+            } else {
+                unavailable.push(name);
+            }
+        }
+        if self.task_id.is_none() {
+            unavailable.push("task (no active task)");
+        }
+        if self.agent_id.is_none() {
+            unavailable.push("agent (no active agent)");
+        }
+        format!(
+            "Current execution {} scopes: {}. Unavailable scopes: {}. {}",
+            if mutation { "mutation" } else { "read" },
+            if allowed.is_empty() {
+                "none".to_owned()
+            } else {
+                allowed.join(", ")
+            },
+            if unavailable.is_empty() {
+                "none".to_owned()
+            } else {
+                unavailable.join(", ")
+            },
+            if mutation {
+                "Subject to current authorization, tool permission and sensitivity policy; do not silently move facts to another scope after denial."
+            } else if self.source_access.requires_authoritative_provenance() {
+                "Read access is source-filtered except for explicitly granted thread/task scopes. Personal/secret/regulated payloads remain unavailable under the scoped policy. A null/empty result is not proof that no stored memory exists."
+            } else {
+                "Record-level provenance, sensitivity, lifecycle and repair filters still apply. A null/empty result is not proof that no stored memory exists."
+            },
+        )
+    }
+
     pub fn now_or(&self, fallback: i64) -> i64 {
         self.now_unix.unwrap_or(fallback)
     }
@@ -420,6 +487,74 @@ fn push_unique_scope(scopes: &mut Vec<MemoryScope>, scope: MemoryScope) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_scope_contract_tracks_context_without_inspecting_records() {
+        use super::*;
+        let mut context = MemoryOperationContext {
+            workspace_id: Some("workspace".into()),
+            thread_id: Some("root".into()),
+            allow_global_user: true,
+            ..Default::default()
+        };
+        assert!(
+            context
+                .tool_scope_contract(false)
+                .contains("read scopes: user, workspace, thread")
+        );
+        assert!(
+            context
+                .tool_scope_contract(true)
+                .contains("mutation scopes: user, workspace, thread")
+        );
+        assert!(
+            context
+                .tool_scope_contract(false)
+                .contains("task (no active task)")
+        );
+        assert!(
+            context
+                .tool_scope_contract(false)
+                .contains("agent (no active agent)")
+        );
+        context.allow_global_user = false;
+        let user = MemoryScope {
+            kind: MemoryScopeKind::User,
+            key: "default".into(),
+        };
+        assert_eq!(
+            context.scope_read_denial(&user),
+            Some("global_user_memory_unavailable")
+        );
+        // Read configuration and authority to mutate are not interchangeable.
+        assert!(
+            context
+                .tool_scope_contract(true)
+                .contains("mutation scopes: user")
+        );
+        context.task_id = Some("task".into());
+        context.agent_id = Some("agent".into());
+        context.mutation_boundary =
+            MemoryMutationBoundary::thread_capsule("root", context.task_id.clone());
+        assert!(
+            context
+                .tool_scope_contract(true)
+                .contains("mutation scopes: thread, task.")
+        );
+        assert!(
+            context
+                .tool_scope_contract(true)
+                .contains("Unavailable scopes: user, workspace, agent.")
+        );
+        assert!(
+            context
+                .tool_scope_contract(false)
+                .contains("read scopes: workspace, thread, task, agent.")
+        );
+        // Tool agent scope is workspace-bound, not controlled by global-agent config.
+        context.allow_global_agent = false;
+        assert!(context.tool_scope_contract(false).contains("task, agent."));
+    }
+
     use super::*;
 
     fn scope(kind: MemoryScopeKind, key: &str) -> MemoryScope {
