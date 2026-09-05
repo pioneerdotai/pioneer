@@ -31,6 +31,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Providers
+        ));
         let desktop_entity = cx.entity().clone();
         let can_manage = self
             .principal_presentation_capabilities()
@@ -169,7 +172,10 @@ impl PioneerDesktop {
                             .icon(PioneerIconName::RefreshCw)
                             .tooltip(t!("providers.button.refresh").to_string())
                             .disabled(!is_connected)
-                            .loading(is_loading)
+                            .loading(crate::qualification_diagnostics::observed_loading!(
+                                pioneer_observability::AnimationSourceId::ProviderRefreshButton,
+                                is_loading,
+                            ))
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.refresh_configured_providers(cx);
                                 view.load_cli_provider_snapshot(cx);

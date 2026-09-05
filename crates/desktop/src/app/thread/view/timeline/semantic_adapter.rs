@@ -49,6 +49,13 @@ impl PioneerDesktop {
         }
 
         let build_started = Instant::now();
+        pioneer_observability::record_qualification_diagnostic!(record_presentation(
+            pioneer_observability::PresentationOwner::DesktopShell,
+            pioneer_observability::ClientHostApp::Desktop,
+            pioneer_observability::PresentationStage::SemanticFlatten,
+            pioneer_observability::Visibility::NotApplicable,
+            pioneer_observability::DiagnosticAction::Executed,
+        ));
         let Some(flattened) =
             semantic::flatten_semantic_timeline(&self.semantic_timelines, active_thread_id)
         else {
@@ -71,6 +78,13 @@ impl PioneerDesktop {
         let mut projection = ConversationViewState::default();
         self.merge_turn_metadata_for_timeline(active_thread_id, &mut projection);
         let render_model = render_semantic_timeline_rows(semantic_rows.rows.as_slice(), projection);
+        pioneer_observability::record_qualification_diagnostic!(record_presentation(
+            pioneer_observability::PresentationOwner::DesktopShell,
+            pioneer_observability::ClientHostApp::Desktop,
+            pioneer_observability::PresentationStage::SemanticProjection,
+            pioneer_observability::Visibility::NotApplicable,
+            pioneer_observability::DiagnosticAction::Executed,
+        ));
 
         let mut projection = render_model.projection;
         projection.revision = self.semantic_timeline_revision;
@@ -83,6 +97,13 @@ impl PioneerDesktop {
             Rc::new(rows),
             pending_requests_from_semantic_rows(semantic_rows.rows.as_slice()),
         );
+        pioneer_observability::record_qualification_diagnostic!(record_presentation(
+            pioneer_observability::PresentationOwner::DesktopShell,
+            pioneer_observability::ClientHostApp::Desktop,
+            pioneer_observability::PresentationStage::SemanticRowPendingMerge,
+            pioneer_observability::Visibility::NotApplicable,
+            pioneer_observability::DiagnosticAction::Executed,
+        ));
 
         let model = TimelineRenderModel {
             projection: Rc::new(projection),

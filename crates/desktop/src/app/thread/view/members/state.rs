@@ -97,6 +97,16 @@ impl PioneerDesktop {
                     let request_workspace_id = workspace_id.clone();
                     let request_thread_id = thread_id.clone();
                     let request_principal_id = expected_principal_id.clone();
+                    #[cfg(feature = "qualification-diagnostics")]
+                    if attempt > 0 {
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ThreadCapabilityRefreshRetry,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                    }
                     let result = cx
                         .background_spawn(async move {
                             let snapshot = request_sender.authorization_capabilities(
@@ -206,14 +216,55 @@ impl PioneerDesktop {
                         .unwrap_or(ThreadCapabilityRefreshDecision::Stale);
 
                     match decision {
+                        #[cfg(not(feature = "qualification-diagnostics"))]
                         ThreadCapabilityRefreshDecision::Complete
                         | ThreadCapabilityRefreshDecision::Stale => return,
+                        #[cfg(feature = "qualification-diagnostics")]
+                        ThreadCapabilityRefreshDecision::Complete => {
+                            if attempt > 0 {
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::ThreadCapabilityRefreshRetry,
+                                        pioneer_observability::DiagnosticAction::Completed,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
+                            }
+                            return;
+                        }
+                        #[cfg(feature = "qualification-diagnostics")]
+                        ThreadCapabilityRefreshDecision::Stale => {
+                            if attempt > 0 {
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::ThreadCapabilityRefreshRetry,
+                                        pioneer_observability::DiagnosticAction::Cancelled,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
+                            }
+                            return;
+                        }
                         ThreadCapabilityRefreshDecision::Retry
                             if attempt < THREAD_CAPABILITY_REFRESH_RETRY_DELAYS.len() =>
                         {
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::ThreadCapabilityRefreshRetry,
+                                    pioneer_observability::DiagnosticAction::Scheduled,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
                             cx.background_executor()
                                 .timer(THREAD_CAPABILITY_REFRESH_RETRY_DELAYS[attempt])
                                 .await;
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::ThreadCapabilityRefreshRetry,
+                                    pioneer_observability::DiagnosticAction::Woke,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
                         }
                         ThreadCapabilityRefreshDecision::Retry => {
                             let _ = this.update(&mut cx, |view, _| {
@@ -229,6 +280,16 @@ impl PioneerDesktop {
                                     );
                                 }
                             });
+                            #[cfg(feature = "qualification-diagnostics")]
+                            if attempt > 0 {
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::ThreadCapabilityRefreshRetry,
+                                        pioneer_observability::DiagnosticAction::Completed,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
+                            }
                             return;
                         }
                     }

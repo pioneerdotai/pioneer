@@ -11,6 +11,7 @@ mod components;
 mod file_opener;
 mod gateway;
 mod menu;
+mod qualification_diagnostics;
 mod settings;
 mod state;
 #[cfg(test)]

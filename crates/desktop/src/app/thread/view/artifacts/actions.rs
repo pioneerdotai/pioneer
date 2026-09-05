@@ -451,10 +451,31 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 loop {
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::ArtifactDownloadProgressClock,
+                            pioneer_observability::DiagnosticAction::Scheduled,
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
                     cx.background_executor()
                         .timer(Duration::from_millis(100))
                         .await;
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::ArtifactDownloadProgressClock,
+                            pioneer_observability::DiagnosticAction::Woke,
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
                     if download_finished.load(Ordering::Acquire) {
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ArtifactDownloadProgressClock,
+                                pioneer_observability::DiagnosticAction::Completed,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
                         return;
                     }
                     let current = downloaded_bytes.load(Ordering::Relaxed).min(total_bytes);
@@ -473,11 +494,25 @@ impl PioneerDesktop {
                                     total_bytes,
                                 },
                             );
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::ArtifactDownloadProgressClock,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
                             cx.notify();
                             true
                         })
                         .unwrap_or(false);
                     if !still_active {
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ArtifactDownloadProgressClock,
+                                pioneer_observability::DiagnosticAction::Cancelled,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
                         return;
                     }
                 }

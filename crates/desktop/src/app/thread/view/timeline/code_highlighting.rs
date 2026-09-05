@@ -31,6 +31,11 @@ impl PioneerDesktop {
         } else {
             CodeThemeId::Light
         };
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::MarkdownHighlightPlan,
+            pioneer_observability::DiagnosticAction::Requested,
+            1,
+        ));
         let request = self.code_highlight_cache.borrow_mut().request(
             source,
             language_hint,
@@ -138,6 +143,15 @@ impl PioneerDesktop {
                         completion_generation,
                         result,
                     );
+                    pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                        pioneer_observability::TimelineStage::MarkdownHighlightResultApply,
+                        if completion.accepted {
+                            pioneer_observability::DiagnosticAction::Applied
+                        } else {
+                            pioneer_observability::DiagnosticAction::StaleDiscard
+                        },
+                        1,
+                    ));
                     if !completion.accepted {
                         outcome = DesktopCodeHighlightOutcome::Stale;
                         fallback_reason = DesktopCodeHighlightFallbackReason::None;

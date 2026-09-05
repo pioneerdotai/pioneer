@@ -5,7 +5,6 @@ use gpui_kit::component::{
     avatar::Avatar,
     h_flex,
     input::{Input, InputState},
-    spinner::Spinner,
     theme::ActiveTheme,
     v_flex,
 };
@@ -232,7 +231,11 @@ pub fn profile_editor_header(
                         .rounded_full()
                         .disabled(saving || !can_complete)
                         .child(if saving {
-                            Spinner::new().small().into_any_element()
+                            crate::qualification_diagnostics::spinner!(
+                                pioneer_observability::AnimationSourceId::ProfileEditor,
+                            )
+                            .small()
+                            .into_any_element()
                         } else {
                             div()
                                 .text_sm()

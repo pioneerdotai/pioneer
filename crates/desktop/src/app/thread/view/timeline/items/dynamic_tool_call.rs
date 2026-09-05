@@ -15,7 +15,6 @@ use gpui_kit::component::{
     form::{field, v_form},
     h_flex,
     input::{Textarea, TextareaState},
-    spinner::Spinner,
     v_flex, *,
 };
 use gpui_kit::{prelude::*, *};
@@ -82,7 +81,12 @@ impl PioneerDesktop {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(Spinner::new().icon(IconName::Loader))
+                    this.child(
+                        crate::qualification_diagnostics::spinner!(
+                            pioneer_observability::AnimationSourceId::TimelineRunningDynamicTool,
+                        )
+                        .icon(IconName::Loader),
+                    )
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(PioneerIconName::Terminal).size_4().opacity(0.8))

@@ -390,9 +390,19 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 loop {
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::McpPoller,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::Global,
+                    ));
                     cx.background_executor()
                         .timer(Duration::from_secs(MCP_POLL_INTERVAL_SECS))
                         .await;
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::McpPoller,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::Global,
+                    ));
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if matches!(
@@ -404,10 +414,22 @@ impl PioneerDesktop {
                             if view.main_content_view == MainContentView::McpDetails {
                                 view.queue_mcp_details_refresh();
                             }
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::McpPoller,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
                             cx.notify();
                         }
                     });
                     if updated.is_err() {
+                        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                            pioneer_observability::AnimationSourceId::McpPoller,
+                            pioneer_observability::DiagnosticAction::Cancelled,
+                            pioneer_observability::Visibility::Global,
+                        ));
                         break;
                     }
                 }

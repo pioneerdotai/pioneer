@@ -37,7 +37,6 @@ use gpui_kit::component::{
     notification::{Notification, NotificationType},
     popover::{Popover, PopoverState},
     separator::Separator,
-    spinner::Spinner,
     theme::ActiveTheme,
     *,
 };

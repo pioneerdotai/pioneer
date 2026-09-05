@@ -269,7 +269,10 @@ impl PioneerDesktop {
                         default_primary_button("mcp-config-dialog-save")
                             .label(t!("mcp.dialog.install").to_string())
                             .disabled(is_install_pending)
-                            .loading(is_install_pending)
+                            .loading(crate::qualification_diagnostics::observed_loading!(
+                                pioneer_observability::AnimationSourceId::McpInstallDialogButton,
+                                is_install_pending,
+                            ))
                             .on_click({
                                 let install_config = install_config.clone();
                                 move |_, window, cx| {

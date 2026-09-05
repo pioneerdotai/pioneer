@@ -7,7 +7,7 @@ use crate::{
     },
     assets::PioneerIconName,
 };
-use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::{
     command_execution_display_command, command_execution_terminal_text,
@@ -164,7 +164,12 @@ impl PioneerDesktop {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(Spinner::new().icon(IconName::Loader))
+                    this.child(
+                        crate::qualification_diagnostics::spinner!(
+                            pioneer_observability::AnimationSourceId::TimelineRunningCommand,
+                        )
+                        .icon(IconName::Loader),
+                    )
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(PioneerIconName::Terminal).size_4().opacity(0.8))

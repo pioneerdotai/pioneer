@@ -70,6 +70,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Settings
+        ));
         if let Some(editor) = self.profile_editor.clone() {
             return self.render_profile_editor(editor, window, cx);
         }

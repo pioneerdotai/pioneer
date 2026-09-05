@@ -30,6 +30,9 @@ impl PioneerDesktop {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Skills
+        ));
         let Some(skill_id) = self.selected_skill_target.clone() else {
             return v_flex()
                 .size_full()

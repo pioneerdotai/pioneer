@@ -1231,37 +1231,111 @@ impl ClientFfiRuntime {
             let events = reduce_gateway_ws_events_to_client_events(events, Default::default());
 
             if !events.is_empty() {
-                if let Some(revision) = newest_authorization_revision(events.as_slice()) {
-                    self.authorization_projection_state
-                        .lock()
-                        .map_err(|_| "authorization projection state is unavailable".to_owned())?
-                        .store
-                        .invalidate_for_revision(revision);
-                }
-                if contains_session_termination(events.as_slice())
-                    || contains_avatar_authorization_boundary(events.as_slice())
+                #[cfg(not(feature = "qualification-diagnostics"))]
                 {
-                    if let Ok(runtime_home) = self.native_cache_runtime_home() {
-                        self.avatar_cache.invalidate_all(runtime_home.as_path());
+                    if let Some(revision) = newest_authorization_revision(events.as_slice()) {
+                        self.authorization_projection_state
+                            .lock()
+                            .map_err(|_| {
+                                "authorization projection state is unavailable".to_owned()
+                            })?
+                            .store
+                            .invalidate_for_revision(revision);
                     }
+                    if contains_session_termination(events.as_slice())
+                        || contains_avatar_authorization_boundary(events.as_slice())
+                    {
+                        if let Ok(runtime_home) = self.native_cache_runtime_home() {
+                            self.avatar_cache.invalidate_all(runtime_home.as_path());
+                        }
+                    }
+                    if contains_session_termination(events.as_slice()) {
+                        self.invitation_commits
+                            .lock()
+                            .map_err(|_| "invitation commit state is unavailable".to_owned())?
+                            .clear();
+                    }
+                    if contains_gateway_connection_epoch_boundary(events.as_slice()) {
+                        self.authorization_projection_state
+                            .lock()
+                            .map_err(|_| {
+                                "authorization projection state is unavailable".to_owned()
+                            })?
+                            .store
+                            .clear_epoch();
+                        self.active_thread
+                            .begin_authorization_epoch()
+                            .map_err(|error| format!("{error:#}"))?;
+                    }
+                    return Ok(events);
                 }
-                if contains_session_termination(events.as_slice()) {
-                    self.invitation_commits
-                        .lock()
-                        .map_err(|_| "invitation commit state is unavailable".to_owned())?
-                        .clear();
+
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_client_delivery_measurement(
+                            pioneer_observability::Shell::Mobile,
+                            pioneer_observability::DeliveryLayer::MobileFfiGatewayEvents,
+                            pioneer_observability::ClientScope::Other,
+                            pioneer_observability::DeliveryMeasurement::BatchItems,
+                            u64::try_from(events.len()).unwrap_or(u64::MAX),
+                        )
+                    );
+                    let delivery_result = (|| -> Result<(), String> {
+                        if let Some(revision) = newest_authorization_revision(events.as_slice()) {
+                            self.authorization_projection_state
+                                .lock()
+                                .map_err(|_| {
+                                    "authorization projection state is unavailable".to_owned()
+                                })?
+                                .store
+                                .invalidate_for_revision(revision);
+                        }
+                        if contains_session_termination(events.as_slice())
+                            || contains_avatar_authorization_boundary(events.as_slice())
+                        {
+                            if let Ok(runtime_home) = self.native_cache_runtime_home() {
+                                self.avatar_cache.invalidate_all(runtime_home.as_path());
+                            }
+                        }
+                        if contains_session_termination(events.as_slice()) {
+                            self.invitation_commits
+                                .lock()
+                                .map_err(|_| {
+                                    "invitation commit state is unavailable".to_owned()
+                                })?
+                                .clear();
+                        }
+                        if contains_gateway_connection_epoch_boundary(events.as_slice()) {
+                            self.authorization_projection_state
+                                .lock()
+                                .map_err(|_| {
+                                    "authorization projection state is unavailable".to_owned()
+                                })?
+                                .store
+                                .clear_epoch();
+                            self.active_thread
+                                .begin_authorization_epoch()
+                                .map_err(|error| format!("{error:#}"))?;
+                        }
+                        Ok(())
+                    })();
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_client_delivery(
+                            pioneer_observability::Shell::Mobile,
+                            pioneer_observability::DeliveryLayer::MobileFfiGatewayEvents,
+                            pioneer_observability::ClientScope::Other,
+                            if delivery_result.is_ok() {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Dropped
+                            },
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
+                    delivery_result?;
+                    return Ok(events);
                 }
-                if contains_gateway_connection_epoch_boundary(events.as_slice()) {
-                    self.authorization_projection_state
-                        .lock()
-                        .map_err(|_| "authorization projection state is unavailable".to_owned())?
-                        .store
-                        .clear_epoch();
-                    self.active_thread
-                        .begin_authorization_epoch()
-                        .map_err(|error| format!("{error:#}"))?;
-                }
-                return Ok(events);
             }
         }
     }
@@ -2530,12 +2604,53 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<ClientActiveThreadEventResult, String> {
-        let request = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
-            .map_err(|error| format!("invalid active thread event request: {error}"))?;
+        pioneer_observability::record_qualification_diagnostic!(
+            record_client_delivery_measurement(
+                pioneer_observability::Shell::Mobile,
+                pioneer_observability::DeliveryLayer::MobileFfiActiveThreadReducer,
+                pioneer_observability::ClientScope::Thread,
+                pioneer_observability::DeliveryMeasurement::PayloadBytes,
+                u64::try_from(input_json.len()).unwrap_or(u64::MAX),
+            )
+        );
+        pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
+            pioneer_observability::Shell::Mobile,
+            pioneer_observability::DeliveryLayer::MobileFfiActiveThreadReducer,
+            pioneer_observability::ClientScope::Thread,
+            pioneer_observability::DiagnosticAction::Received,
+            pioneer_observability::Visibility::NotApplicable,
+        ));
 
-        self.active_thread
-            .apply_event(&self.client_runtime, request)
-            .map_err(|error| format!("{error:#}"))
+        #[cfg(not(feature = "qualification-diagnostics"))]
+        {
+            let request = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
+                .map_err(|error| format!("invalid active thread event request: {error}"))?;
+            self.active_thread
+                .apply_event(&self.client_runtime, request)
+                .map_err(|error| format!("{error:#}"))
+        }
+        #[cfg(feature = "qualification-diagnostics")]
+        {
+            let result = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
+                .map_err(|error| format!("invalid active thread event request: {error}"))
+                .and_then(|request| {
+                    self.active_thread
+                        .apply_event(&self.client_runtime, request)
+                        .map_err(|error| format!("{error:#}"))
+                });
+            pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
+                pioneer_observability::Shell::Mobile,
+                pioneer_observability::DeliveryLayer::MobileFfiActiveThreadReducer,
+                pioneer_observability::ClientScope::Thread,
+                if result.is_ok() {
+                    pioneer_observability::DiagnosticAction::Completed
+                } else {
+                    pioneer_observability::DiagnosticAction::Dropped
+                },
+                pioneer_observability::Visibility::NotApplicable,
+            ));
+            result
+        }
     }
 
     fn active_thread_send_text(

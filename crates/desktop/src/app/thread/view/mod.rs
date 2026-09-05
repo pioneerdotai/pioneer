@@ -19,6 +19,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::ThreadScreen
+        ));
         self.ensure_active_thread_workspace_members_loaded(cx);
         self.ensure_active_thread_mention_directory_loaded(cx);
         self.ensure_active_thread_artifacts_loaded(cx);

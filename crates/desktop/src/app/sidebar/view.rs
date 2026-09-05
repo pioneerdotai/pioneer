@@ -11,7 +11,6 @@ use gpui_kit::component::{
     button::*,
     list::ListItem,
     menu::ContextMenuExt,
-    spinner::Spinner,
     theme::ActiveTheme,
     tree::{TreeItem, tree},
     *,
@@ -855,7 +854,9 @@ impl PioneerDesktop {
             .bg(cx.theme().muted.opacity(0.35))
             .child(
                 div().size_5().flex().items_center().justify_center().child(
-                    Spinner::new()
+                    crate::qualification_diagnostics::spinner!(
+                        pioneer_observability::AnimationSourceId::DesktopUpdateDownload,
+                    )
                         .icon(IconName::Loader)
                         .color(cx.theme().foreground.opacity(0.6)),
                 ),

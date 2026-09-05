@@ -35,14 +35,59 @@ impl PioneerDesktop {
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::GatewaySessionRefreshClock,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
                 cx.background_executor().timer(delay).await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    view.refresh_gateway_session_if_current(
-                        generation,
-                        DesktopSessionConnectionMode::ReplaceActive,
-                        cx,
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::GatewaySessionRefreshClock,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    let _ = this.update(&mut cx, |view, cx| {
+                        view.refresh_gateway_session_if_current(
+                            generation,
+                            DesktopSessionConnectionMode::ReplaceActive,
+                            cx,
+                        );
+                    });
+                }
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let handoff = this.update(&mut cx, |view, cx| {
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::GatewaySessionRefreshClock,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                        view.refresh_gateway_session_if_current(
+                            generation,
+                            DesktopSessionConnectionMode::ReplaceActive,
+                            cx,
+                        );
+                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::GatewaySessionRefreshClock,
+                            if handoff.is_ok() {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Cancelled
+                            },
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
                     );
-                });
+                }
             }
         })
         .detach();
@@ -113,12 +158,53 @@ impl PioneerDesktop {
             cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::GatewaySessionRefreshDeferral,
+                            pioneer_observability::DiagnosticAction::Scheduled,
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
                     cx.background_executor()
                         .timer(DESKTOP_ACCESS_REFRESH_WORKSPACE_RETRY_DELAY)
                         .await;
-                    let _ = this.update(&mut cx, |view, cx| {
-                        view.refresh_gateway_session_if_current(generation, mode, cx);
-                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::GatewaySessionRefreshDeferral,
+                            pioneer_observability::DiagnosticAction::Woke,
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
+                    #[cfg(not(feature = "qualification-diagnostics"))]
+                    {
+                        let _ = this.update(&mut cx, |view, cx| {
+                            view.refresh_gateway_session_if_current(generation, mode, cx);
+                        });
+                    }
+                    #[cfg(feature = "qualification-diagnostics")]
+                    {
+                        let handoff = this.update(&mut cx, |view, cx| {
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::GatewaySessionRefreshDeferral,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
+                            view.refresh_gateway_session_if_current(generation, mode, cx);
+                        });
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::GatewaySessionRefreshDeferral,
+                                if handoff.is_ok() {
+                                    pioneer_observability::DiagnosticAction::Completed
+                                } else {
+                                    pioneer_observability::DiagnosticAction::Cancelled
+                                },
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                    }
                 }
             })
             .detach();

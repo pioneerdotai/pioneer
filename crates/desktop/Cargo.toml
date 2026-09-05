@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Application-owned, bounded diagnostics for an approved non-production runner.
+qualification-diagnostics = ["pioneer-observability/qualification-diagnostics"]
+
 [[bin]]
 name = "pioneer-app"
 path = "src/main.rs"

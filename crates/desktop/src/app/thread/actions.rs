@@ -388,13 +388,57 @@ impl PioneerDesktop {
                 let workspace_id_for_prepare = workspace_id.clone();
 
                 async move {
+                    #[cfg(feature = "qualification-diagnostics")]
+                    {
+                        let mut waited_for_session_refresh = false;
+                        loop {
+                            match this.update_in(&mut cx, |view, _, _| {
+                                view.gateway.session_refresh_in_flight
+                            }) {
+                                Ok(true) => {
+                                    waited_for_session_refresh = true;
+                                    pioneer_observability::record_qualification_diagnostic!(
+                                        record_animation_activity(
+                                            pioneer_observability::AnimationSourceId::ComposerSubmissionSessionWait,
+                                            pioneer_observability::DiagnosticAction::Scheduled,
+                                            pioneer_observability::Visibility::NotApplicable,
+                                        )
+                                    );
+                                    cx.background_executor()
+                                        .timer(COMPOSER_SESSION_READY_RETRY_DELAY)
+                                        .await;
+                                    pioneer_observability::record_qualification_diagnostic!(
+                                        record_animation_activity(
+                                            pioneer_observability::AnimationSourceId::ComposerSubmissionSessionWait,
+                                            pioneer_observability::DiagnosticAction::Woke,
+                                            pioneer_observability::Visibility::NotApplicable,
+                                        )
+                                    );
+                                }
+                                Ok(false) | Err(_) => break,
+                            }
+                        }
+                        if waited_for_session_refresh {
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::ComposerSubmissionSessionWait,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
+                        }
+                    }
+
+                    #[cfg(not(feature = "qualification-diagnostics"))]
                     while this
                         .update_in(&mut cx, |view, _, _| {
                             view.gateway.session_refresh_in_flight
                         })
                         .unwrap_or(false)
                     {
-                        cx.background_executor().timer(COMPOSER_SESSION_READY_RETRY_DELAY).await;
+                        cx.background_executor()
+                            .timer(COMPOSER_SESSION_READY_RETRY_DELAY)
+                            .await;
                     }
                     let prepare_result = cx
                         .background_spawn(async move {

@@ -214,6 +214,9 @@ impl AgentsDocEditor {
 
 impl Render for AgentsDocEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::AgentsDocEditor
+        ));
         v_flex()
             .size_full()
             .min_w_0()

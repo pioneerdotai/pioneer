@@ -274,26 +274,88 @@ impl PioneerDesktop {
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::WorkspaceSwitchSessionWait,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
                 cx.background_executor()
                     .timer(WORKSPACE_SWITCH_SESSION_RETRY_DELAY)
                     .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.session_refresh_in_flight {
-                        view.defer_workspace_switch_until_session_refresh(
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::WorkspaceSwitchSessionWait,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    let _ = this.update(&mut cx, |view, cx| {
+                        if view.gateway.session_refresh_in_flight {
+                            view.defer_workspace_switch_until_session_refresh(
+                                workspace_id,
+                                target_active_thread_id,
+                                previous_workspace_id,
+                                cx,
+                            );
+                            return;
+                        }
+                        view.begin_workspace_switch_transport(
                             workspace_id,
                             target_active_thread_id,
                             previous_workspace_id,
                             cx,
                         );
-                        return;
-                    }
-                    view.begin_workspace_switch_transport(
-                        workspace_id,
-                        target_active_thread_id,
-                        previous_workspace_id,
-                        cx,
+                    });
+                }
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let handoff = this.update(&mut cx, |view, cx| {
+                        if view.gateway.session_refresh_in_flight {
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::WorkspaceSwitchSessionWait,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
+                            view.defer_workspace_switch_until_session_refresh(
+                                workspace_id,
+                                target_active_thread_id,
+                                previous_workspace_id,
+                                cx,
+                            );
+                            return;
+                        }
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::WorkspaceSwitchSessionWait,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                        view.begin_workspace_switch_transport(
+                            workspace_id,
+                            target_active_thread_id,
+                            previous_workspace_id,
+                            cx,
+                        );
+                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::WorkspaceSwitchSessionWait,
+                            if handoff.is_ok() {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Cancelled
+                            },
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
                     );
-                });
+                }
             }
         })
         .detach();

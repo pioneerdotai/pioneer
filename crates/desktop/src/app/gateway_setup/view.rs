@@ -208,6 +208,9 @@ pub(crate) fn render_gateway_setup_form(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    pioneer_observability::record_qualification_diagnostic!(record_render(
+        pioneer_observability::RenderRegion::GatewaySetup
+    ));
     let snapshot = form_state.read(cx).snapshot();
     let status = render_gateway_setup_status(&snapshot, cx);
 
@@ -378,7 +381,10 @@ fn render_gateway_setup_form_actions(
     let mut actions = v_flex().w_full().min_w_0().pt_4().gap_3().child(
         default_primary_button(mode.remote_button_id())
             .label(primary_label)
-            .loading(snapshot.connecting && snapshot.setup_action == Some(primary_action))
+            .loading(crate::qualification_diagnostics::observed_loading!(
+                pioneer_observability::AnimationSourceId::GatewaySetupRemoteButton,
+                snapshot.connecting && snapshot.setup_action == Some(primary_action),
+            ))
             .disabled(snapshot.connecting)
             .on_click({
                 let desktop_entity = desktop_entity.clone();
@@ -439,10 +445,11 @@ fn render_gateway_setup_form_actions(
             )
             .label(t!("gateway.action.delete").to_string())
             .danger()
-            .loading(
+            .loading(crate::qualification_diagnostics::observed_loading!(
+                pioneer_observability::AnimationSourceId::GatewaySetupDeleteButton,
                 snapshot.connecting
                     && snapshot.setup_action == Some(GatewaySetupAction::DeleteGateway),
-            )
+            ))
             .disabled(snapshot.connecting)
             .on_click({
                 let desktop_entity = desktop_entity.clone();
@@ -472,10 +479,11 @@ fn render_gateway_setup_form_actions(
                         .expect("local setup action has a button id"),
                 )
                 .label(t!("gateway.action.start_local").to_string())
-                .loading(
+                .loading(crate::qualification_diagnostics::observed_loading!(
+                    pioneer_observability::AnimationSourceId::GatewaySetupLocalButton,
                     snapshot.connecting
                         && snapshot.setup_action == Some(GatewaySetupAction::StartLocal),
-                )
+                ))
                 .disabled(snapshot.connecting)
                 .on_click({
                     let desktop_entity = desktop_entity.clone();

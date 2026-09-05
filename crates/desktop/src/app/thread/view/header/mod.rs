@@ -19,6 +19,9 @@ use pioneer_protocol::{ThreadStatus, ThreadVisibility};
 
 impl PioneerDesktop {
     pub(crate) fn render_thread_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::ThreadHeader
+        ));
         let task_navigation = self.active_task_thread_navigation().cloned();
         let thread_title = self.active_thread_header_title();
         let active_thread_id = if task_navigation.is_some() {

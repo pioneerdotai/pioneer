@@ -4,7 +4,7 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
 };
-use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, v_flex, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::{
     TimelineFinalStatusKind, download_display_url, final_download_status, format_bytes_human,
@@ -53,7 +53,13 @@ impl PioneerDesktop {
             .w_full()
             .items_center()
             .gap_2()
-            .child(Spinner::new().icon(IconName::Loader))
+            .child(
+                crate::qualification_diagnostics::spinner!(
+                    pioneer_observability::AnimationSourceId::TimelineRunningDownload,
+                    is_running,
+                )
+                .icon(IconName::Loader),
+            )
             .child(
                 div()
                     .text_sm()

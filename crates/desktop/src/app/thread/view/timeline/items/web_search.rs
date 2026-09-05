@@ -4,7 +4,7 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
 };
-use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, v_flex, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::web_search_display_query;
 use pioneer_protocol::{TurnItem, WebSearchResultItem};
@@ -52,7 +52,12 @@ impl PioneerDesktop {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(Spinner::new().icon(IconName::Loader))
+                    this.child(
+                        crate::qualification_diagnostics::spinner!(
+                            pioneer_observability::AnimationSourceId::TimelineRunningWebSearch,
+                        )
+                        .icon(IconName::Loader),
+                    )
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(IconName::Search).size_4().opacity(0.8))

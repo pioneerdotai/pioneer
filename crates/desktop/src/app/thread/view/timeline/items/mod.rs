@@ -65,6 +65,11 @@ pub(super) fn now_unix_ms() -> i64 {
 }
 
 pub(super) fn format_running_elapsed(item_view: &ItemView) -> Option<String> {
+    pioneer_observability::record_qualification_diagnostic!(record_timeline(
+        pioneer_observability::TimelineStage::InlineElapsedFormat,
+        pioneer_observability::DiagnosticAction::Executed,
+        1,
+    ));
     running_elapsed_ms(
         item_view.status,
         item_view.started_at_unix_ms,

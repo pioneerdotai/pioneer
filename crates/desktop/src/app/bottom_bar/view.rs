@@ -9,6 +9,9 @@ use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::BottomBar
+        ));
         let can_manage_capabilities = self
             .principal_presentation_capabilities()
             .can_manage_capabilities;

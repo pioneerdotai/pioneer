@@ -11,7 +11,6 @@ use gpui_kit::component::{
     button::*,
     dialog::DialogFooter,
     menu::{ContextMenuExt, PopupMenuItem},
-    spinner::Spinner,
     theme::ActiveTheme,
     *,
 };
@@ -1110,7 +1109,11 @@ fn member_feedback(label: String, loading: bool, cx: &mut Context<PioneerDesktop
         .items_center()
         .justify_center()
         .gap_2()
-        .when(loading, |content| content.child(Spinner::new()))
+        .when(loading, |content| {
+            content.child(crate::qualification_diagnostics::spinner!(
+                pioneer_observability::AnimationSourceId::AdministrationMemberList,
+            ))
+        })
         .child(div().text_sm().opacity(0.6).child(label))
         .bg(cx.theme().background)
         .into_any_element()

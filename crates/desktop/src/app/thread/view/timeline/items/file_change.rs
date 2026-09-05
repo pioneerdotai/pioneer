@@ -4,7 +4,7 @@ use crate::app::{
     conversation::{ItemView, TimelineEntry, TimelineEntryStatus},
     root::PioneerDesktop,
 };
-use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, v_flex, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, v_flex, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::{
     TimelineFinalStatusKind, file_change_display_text, final_file_change_status,
@@ -71,7 +71,12 @@ impl PioneerDesktop {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(Spinner::new().icon(IconName::Loader))
+                    this.child(
+                        crate::qualification_diagnostics::spinner!(
+                            pioneer_observability::AnimationSourceId::TimelineRunningFileChange,
+                        )
+                        .icon(IconName::Loader),
+                    )
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(IconName::File).size_4().opacity(0.8))

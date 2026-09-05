@@ -26,6 +26,8 @@ mod desktop_gateway;
 mod metrics;
 mod operations;
 mod patch_telemetry;
+#[cfg(feature = "qualification-diagnostics")]
+mod qualification_diagnostics;
 mod performance;
 mod startup;
 mod telemetry;
@@ -53,6 +55,8 @@ pub use operations::{
     GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard, GatewayProviderWarmupTrace,
 };
 pub use patch_telemetry::{PatchTelemetrySnapshot, register_patch_telemetry_snapshot_provider};
+#[cfg(feature = "qualification-diagnostics")]
+pub use qualification_diagnostics::*;
 pub use performance::{
     DesktopCodeHighlightCacheStatus, DesktopCodeHighlightFallbackReason,
     DesktopCodeHighlightMetric, DesktopCodeHighlightOutcome, DesktopCodeHighlightTheme,
@@ -73,6 +77,31 @@ pub use telemetry::{
     OtlpTelemetryConfig, TelemetryTarget, force_flush_observability, init_otlp_observability,
     init_otlp_observability_for, schedule_observability_flush, shutdown_observability,
 };
+
+/// Compiles a diagnostic call out at its consumer unless that consumer's
+/// explicit qualification feature is enabled. Arguments are not evaluated in
+/// ordinary builds.
+#[macro_export]
+macro_rules! record_qualification_diagnostic {
+    ($function:ident($($argument:expr),* $(,)?)) => {
+        #[cfg(feature = "qualification-diagnostics")]
+        {
+            $crate::$function($($argument),*);
+        }
+    };
+}
+
+#[cfg(all(test, not(feature = "qualification-diagnostics")))]
+mod qualification_diagnostics_disabled_tests {
+    #[test]
+    fn diagnostic_macro_does_not_evaluate_arguments_when_disabled() {
+        let evaluated = std::cell::Cell::new(false);
+        crate::record_qualification_diagnostic!(unavailable_diagnostic_recorder({
+            evaluated.set(true);
+        }));
+        assert!(!evaluated.get());
+    }
+}
 
 /// DSN for non-desktop runtime binaries.
 pub const SENTRY_DSN_ENV: &str = "PIONEER_SENTRY_DSN";

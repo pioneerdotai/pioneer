@@ -448,6 +448,11 @@ impl PioneerDesktop {
         stats.element_build_elapsed += build_started.elapsed();
         stats.measured_input_bytes = stats.measured_input_bytes.saturating_add(input_bytes);
         let layout_started = Instant::now();
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::RowLayoutInvoke,
+            pioneer_observability::DiagnosticAction::Executed,
+            1,
+        ));
         let measured = row_element.layout_as_root(
             size(
                 AvailableSpace::Definite(row_width),
@@ -456,6 +461,11 @@ impl PioneerDesktop {
             window,
             cx,
         );
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::RowLayoutResult,
+            pioneer_observability::DiagnosticAction::Completed,
+            1,
+        ));
         stats.layout_elapsed += layout_started.elapsed();
 
         size(
@@ -496,11 +506,21 @@ impl PioneerDesktop {
         {
             stats.cache_hits = stats.cache_hits.saturating_add(1);
             stats.cache_hit_lookup_elapsed += cache_lookup_started.elapsed();
+            pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                pioneer_observability::TimelineStage::RowLayoutCacheLookup,
+                pioneer_observability::DiagnosticAction::Hit,
+                1,
+            ));
             return size(px(0.), cached.height.max(px(1.)));
         }
 
         stats.cache_misses = stats.cache_misses.saturating_add(1);
         stats.cache_miss_lookup_elapsed += cache_lookup_started.elapsed();
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::RowLayoutCacheLookup,
+            pioneer_observability::DiagnosticAction::Miss,
+            1,
+        ));
 
         let measured = self.measure_timeline_row_size(
             projection,

@@ -5,9 +5,7 @@ use crate::{
         device_activation_form::CredentialPresentationForm,
     },
 };
-use gpui_kit::component::{
-    button::*, dialog::DialogFooter, form::field, spinner::Spinner, theme::ActiveTheme, *,
-};
+use gpui_kit::component::{button::*, dialog::DialogFooter, form::field, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::{
     administration::{AdministrationAction, InvitationPresentationStatus, invitation_list_row},
@@ -113,7 +111,9 @@ impl PioneerDesktop {
                 .p_6()
                 .items_center()
                 .gap_2()
-                .child(Spinner::new())
+                .child(crate::qualification_diagnostics::spinner!(
+                    pioneer_observability::AnimationSourceId::AdministrationInvitationList,
+                ))
                 .child(t!("settings.invitations.loading").to_string())
                 .into_any_element()
         } else if let Some(error) = self.invitations_error.as_ref() {
@@ -620,11 +620,19 @@ impl PioneerDesktop {
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
-                                                .child(Spinner::new().small()),
+                                                .child(
+                                                    crate::qualification_diagnostics::spinner!(
+                                                        pioneer_observability::AnimationSourceId::AdministrationInvitationCreateOverlay,
+                                                    )
+                                                    .small(),
+                                                ),
                                         )
                                     }),
                             )
-                            .loading(snapshot.creating)
+                            .loading(crate::qualification_diagnostics::observed_loading!(
+                                pioneer_observability::AnimationSourceId::AdministrationInvitationCreateButton,
+                                snapshot.creating,
+                            ))
                             .disabled(
                                 snapshot.selected.is_empty()
                                     || snapshot.selected_role_key.is_none()

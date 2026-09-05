@@ -70,7 +70,28 @@ impl PioneerDesktop {
     ) {
         let mut events_applied = false;
         for event in events {
+            pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
+                pioneer_observability::Shell::Desktop,
+                pioneer_observability::DeliveryLayer::DesktopEventPump,
+                pioneer_observability::ClientScope::Other,
+                pioneer_observability::DiagnosticAction::Delivered,
+                pioneer_observability::Visibility::NotApplicable,
+            ));
+            pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
+                pioneer_observability::Shell::Desktop,
+                pioneer_observability::DeliveryLayer::DesktopRootReducer,
+                pioneer_observability::ClientScope::Other,
+                pioneer_observability::DiagnosticAction::Attempted,
+                pioneer_observability::Visibility::NotApplicable,
+            ));
             self.apply_gateway_ws_event(event, cx);
+            pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
+                pioneer_observability::Shell::Desktop,
+                pioneer_observability::DeliveryLayer::DesktopRootReducer,
+                pioneer_observability::ClientScope::Other,
+                pioneer_observability::DiagnosticAction::Completed,
+                pioneer_observability::Visibility::NotApplicable,
+            ));
             events_applied = true;
         }
         let outcome = {

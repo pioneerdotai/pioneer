@@ -247,12 +247,22 @@ impl RunningDinoView {
             .as_ref()
             .map(|assets| assets.delay(self.frame_index))
             .unwrap_or(MIN_DINO_FRAME_DELAY);
+        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+            pioneer_observability::AnimationSourceId::TimelineRunningDinoClock,
+            pioneer_observability::DiagnosticAction::Scheduled,
+            pioneer_observability::Visibility::NotApplicable,
+        ));
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let mut delay = first_delay;
                 loop {
                     cx.background_executor().timer(delay).await;
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::TimelineRunningDinoClock,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    ));
                     let next_delay = this
                         .update(&mut cx, |view, cx| {
                             if view.reduce_motion {
@@ -265,21 +275,45 @@ impl RunningDinoView {
                                 // notification renders the still-mounted view
                                 // and restarts its clock. An actually unmounted
                                 // entity remains quiet after this one wake-up.
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::TimelineRunningDinoClock,
+                                        pioneer_observability::DiagnosticAction::Requested,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
                                 cx.notify();
                                 return None;
                             }
                             let assets = view.assets.as_ref()?;
                             view.frame_index = (view.frame_index + 1) % assets.frame_count();
                             let next_delay = assets.delay(view.frame_index);
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::TimelineRunningDinoClock,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
                             cx.notify();
                             Some(next_delay)
                         })
                         .ok()
                         .flatten();
                     let Some(next_delay) = next_delay else {
+                        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                            pioneer_observability::AnimationSourceId::TimelineRunningDinoClock,
+                            pioneer_observability::DiagnosticAction::Cancelled,
+                            pioneer_observability::Visibility::NotApplicable,
+                        ));
                         break;
                     };
                     delay = next_delay;
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::TimelineRunningDinoClock,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::NotApplicable,
+                    ));
                 }
             }
         })
@@ -289,6 +323,9 @@ impl RunningDinoView {
 
 impl Render for RunningDinoView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::RunningDino
+        ));
         self.last_rendered_at = Instant::now();
         self.reduce_motion = cx.reduce_motion();
         if self.reduce_motion {
@@ -338,12 +375,22 @@ impl RunningElapsedView {
         }
         self.clock_active = true;
         let started_at_unix_ms = self.started_at_unix_ms;
+        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+            pioneer_observability::AnimationSourceId::TimelineRunningElapsedClock,
+            pioneer_observability::DiagnosticAction::Scheduled,
+            pioneer_observability::Visibility::NotApplicable,
+        ));
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 loop {
                     let delay = next_elapsed_tick_delay(started_at_unix_ms, now_unix_ms());
                     cx.background_executor().timer(delay).await;
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::TimelineRunningElapsedClock,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    ));
                     let keep_running = this
                         .update(&mut cx, |view, cx| {
                             if view.last_rendered_at.elapsed() > ELAPSED_OFFSCREEN_GRACE {
@@ -352,16 +399,40 @@ impl RunningElapsedView {
                                 // offscreen view without polling forever. A
                                 // mounted view renders once and restarts on the
                                 // next absolute-second boundary.
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::TimelineRunningElapsedClock,
+                                        pioneer_observability::DiagnosticAction::Requested,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
                                 cx.notify();
                                 return false;
                             }
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::TimelineRunningElapsedClock,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
                             cx.notify();
                             true
                         })
                         .unwrap_or(false);
                     if !keep_running {
+                        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                            pioneer_observability::AnimationSourceId::TimelineRunningElapsedClock,
+                            pioneer_observability::DiagnosticAction::Cancelled,
+                            pioneer_observability::Visibility::NotApplicable,
+                        ));
                         break;
                     }
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::TimelineRunningElapsedClock,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::NotApplicable,
+                    ));
                 }
             }
         })
@@ -371,6 +442,9 @@ impl RunningElapsedView {
 
 impl Render for RunningElapsedView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::RunningElapsed
+        ));
         self.last_rendered_at = Instant::now();
         self.ensure_clock(cx);
         let elapsed_ms = now_unix_ms().saturating_sub(self.started_at_unix_ms).max(0) as u64;
@@ -595,6 +669,9 @@ impl PioneerDesktop {
         show_dino: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::RunningActivity
+        ));
         let started_at = started_at_unix_ms.unwrap_or_else(now_unix_ms);
         let dino =
             show_dino.then(|| self.running_turn_dino_view(format!("content:{activity_id}"), cx));

@@ -36,6 +36,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Timeline
+        ));
         self.sync_timeline_layout_width(cx);
         let projection = model.projection.clone();
 
@@ -65,6 +68,13 @@ impl PioneerDesktop {
             rows,
             pending_requests,
         ));
+        pioneer_observability::record_qualification_diagnostic!(record_presentation(
+            pioneer_observability::PresentationOwner::DesktopShell,
+            pioneer_observability::ClientHostApp::Desktop,
+            pioneer_observability::PresentationStage::TimelinePendingRequestMerge,
+            pioneer_observability::Visibility::Visible,
+            pioneer_observability::DiagnosticAction::Executed,
+        ));
         let expanded = self.thread_timeline_item_expanded.borrow().clone();
         let render_fingerprint_started = Instant::now();
         let rows_render_fingerprint = timeline_render_rows_fingerprint(
@@ -73,6 +83,13 @@ impl PioneerDesktop {
             row_render_fingerprints.as_ref(),
             &expanded,
         );
+        pioneer_observability::record_qualification_diagnostic!(record_presentation(
+            pioneer_observability::PresentationOwner::DesktopShell,
+            pioneer_observability::ClientHostApp::Desktop,
+            pioneer_observability::PresentationStage::TimelineFingerprint,
+            pioneer_observability::Visibility::Visible,
+            pioneer_observability::DiagnosticAction::Executed,
+        ));
         pioneer_observability::record_desktop_timeline_stage(
             pioneer_observability::DesktopTimelineStageMetric {
                 stage: pioneer_observability::DesktopTimelineStage::RenderFingerprint,
@@ -123,6 +140,11 @@ impl PioneerDesktop {
                 && let Some(sizes) = state.cached_item_sizes.as_ref()
                 && let Some(layout_index) = state.cached_timeline_layout_index.as_ref()
             {
+                pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                    pioneer_observability::TimelineStage::ItemSizesCacheLookup,
+                    pioneer_observability::DiagnosticAction::Hit,
+                    u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                ));
                 pioneer_observability::record_desktop_timeline_stage(
                     pioneer_observability::DesktopTimelineStageMetric {
                         stage: pioneer_observability::DesktopTimelineStage::ItemSizes,
@@ -141,6 +163,11 @@ impl PioneerDesktop {
                     layout_index.clone(),
                 )
             } else {
+                pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                    pioneer_observability::TimelineStage::ItemSizesCacheLookup,
+                    pioneer_observability::DiagnosticAction::Miss,
+                    u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                ));
                 let grouping = TimelineGrouping::build(
                     rows.as_ref(),
                     projection.as_ref(),
@@ -160,6 +187,11 @@ impl PioneerDesktop {
                     window,
                     cx,
                 );
+                pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                    pioneer_observability::TimelineStage::ItemSizesBuild,
+                    pioneer_observability::DiagnosticAction::Completed,
+                    u64::try_from(item_sizes.len()).unwrap_or(u64::MAX),
+                ));
                 let layout_index = TimelineLayoutIndex::new(grouping.clone(), item_sizes.clone());
 
                 state.cached_render_active_thread_id = active_thread_id.map(str::to_owned);
@@ -236,6 +268,11 @@ impl PioneerDesktop {
                     move |view, visible_range, _, cx| {
                         let projection = render_projection.as_ref();
                         let visible_indices = visible_range.collect::<Vec<_>>();
+                        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                            pioneer_observability::TimelineStage::VisibleRowTraversal,
+                            pioneer_observability::DiagnosticAction::Executed,
+                            u64::try_from(visible_indices.len()).unwrap_or(u64::MAX),
+                        ));
                         if let Some(thread_id) = render_thread_id.as_deref() {
                             view.request_semantic_timeline_prefetch_for_visible_rows(
                                 thread_id,
@@ -247,7 +284,7 @@ impl PioneerDesktop {
                             );
                         }
 
-                        visible_indices
+                        let elements = visible_indices
                             .into_iter()
                             .filter_map(|ix| {
                                 render_rows.get(ix).map(|row| {
@@ -262,7 +299,13 @@ impl PioneerDesktop {
                                     )
                                 })
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>();
+                        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+                            pioneer_observability::TimelineStage::VisibleRowElementBuild,
+                            pioneer_observability::DiagnosticAction::Completed,
+                            u64::try_from(elements.len()).unwrap_or(u64::MAX),
+                        ));
+                        elements
                     },
                 )
                 .gap_0()
@@ -293,6 +336,14 @@ impl PioneerDesktop {
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::TimelineRowSlot
+        ));
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::RowBuild,
+            pioneer_observability::DiagnosticAction::Executed,
+            1,
+        ));
         if row_layout.avatar_group_kind == Some(TimelineAvatarGroupKind::Agent) {
             let grouped_content_width = (content_width - TIMELINE_AVATAR_RAIL_WIDTH).max(px(1.));
             let body_top_spacing = if row_layout.starts_avatar_group {
@@ -335,6 +386,9 @@ impl PioneerDesktop {
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::RowBody
+        ));
         match row {
             TimelineRenderRow::Timeline(TimelineRow {
                 author,
@@ -658,20 +712,45 @@ impl PioneerDesktop {
             })
             .collect::<Vec<_>>();
         let hydrated = self.hydrate_running_turn_rows(Rc::new(timeline_rows));
+        pioneer_observability::record_qualification_diagnostic!(record_presentation(
+            pioneer_observability::PresentationOwner::DesktopShell,
+            pioneer_observability::ClientHostApp::Desktop,
+            pioneer_observability::PresentationStage::RunningHydration,
+            pioneer_observability::Visibility::Visible,
+            pioneer_observability::DiagnosticAction::Executed,
+        ));
         let mut hydrated_iter = hydrated.iter();
         let mut changed = false;
+        #[cfg(feature = "qualification-diagnostics")]
+        let mut changed_rows = 0_u64;
         let mut render_rows = rows.as_ref().clone();
         for row in &mut render_rows {
             if let TimelineRenderRow::Timeline(row) = row
                 && matches!(row.kind, TimelineRowKind::RunningTurn(_))
                 && let Some(hydrated_row) = hydrated_iter.next()
             {
-                changed |= row != hydrated_row;
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let row_changed = row != hydrated_row;
+                    changed |= row_changed;
+                    if row_changed {
+                        changed_rows = changed_rows.saturating_add(1);
+                    }
+                }
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    changed |= row != hydrated_row;
+                }
                 *row = hydrated_row.clone();
             } else if matches!(row, TimelineRenderRow::Timeline(_)) {
                 let _ = hydrated_iter.next();
             }
         }
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::RowReconcile,
+            pioneer_observability::DiagnosticAction::Completed,
+            changed_rows,
+        ));
         if changed { Rc::new(render_rows) } else { rows }
     }
 }

@@ -8,7 +8,7 @@ use crate::{
     },
     assets::PioneerIconName,
 };
-use gpui_kit::component::{collapsible::Collapsible, h_flex, spinner::Spinner, *};
+use gpui_kit::component::{collapsible::Collapsible, h_flex, *};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::labels::reasoning_text;
 use pioneer_protocol::TurnItem;
@@ -79,7 +79,12 @@ impl PioneerDesktop {
                                         h_flex()
                                             .items_center()
                                             .gap_2()
-                                            .child(Spinner::new().icon(IconName::Loader))
+                                            .child(
+                                                crate::qualification_diagnostics::spinner!(
+                                                    pioneer_observability::AnimationSourceId::TimelineRunningReasoning,
+                                                )
+                                                .icon(IconName::Loader),
+                                            )
                                             .child(t!("timeline.reasoning.running").to_string()),
                                     )
                                     .child(
@@ -119,7 +124,12 @@ impl PioneerDesktop {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(Spinner::new().icon(IconName::Loader))
+                            .child(
+                                crate::qualification_diagnostics::spinner!(
+                                    pioneer_observability::AnimationSourceId::TimelineRunningReasoning,
+                                )
+                                .icon(IconName::Loader),
+                            )
                             .child(t!("timeline.reasoning.running").to_string()),
                     )
                     .child(

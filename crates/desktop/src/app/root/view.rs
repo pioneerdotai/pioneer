@@ -13,6 +13,9 @@ use gpui_kit::{prelude::*, *};
 
 impl Render for PioneerDesktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::DesktopShell
+        ));
         self.reconcile_desktop_startup_readiness(window, cx);
         let sheet_layer = gpui_kit::component::Root::render_sheet_layer(window, cx);
         let dialog_layer = gpui_kit::component::Root::render_dialog_layer(window, cx);
@@ -53,6 +56,9 @@ impl Render for PioneerDesktop {
                 .principal_presentation_capabilities()
                 .can_read_own_notifications;
 
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::ScreenHost
+        ));
         let body = if let Some(invitation_join) = invitation_join {
             self.render_desktop_invitation_join(invitation_join, window, cx)
         } else if is_gateway_setup_required {
@@ -71,6 +77,12 @@ impl Render for PioneerDesktop {
                 MainContentView::Settings => self.render_settings(window, cx),
             };
 
+            pioneer_observability::record_qualification_diagnostic!(record_render(
+                pioneer_observability::RenderRegion::SidebarHost
+            ));
+            pioneer_observability::record_qualification_diagnostic!(record_render(
+                pioneer_observability::RenderRegion::Sidebar
+            ));
             let sidebar = if is_settings_view_active {
                 self.render_settings_sidebar(cx)
             } else if is_providers_view_active {
@@ -132,6 +144,9 @@ impl Render for PioneerDesktop {
                 .into_any_element()
         };
 
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Titlebar
+        ));
         div()
             .size_full()
             .child(

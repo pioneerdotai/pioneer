@@ -85,7 +85,10 @@ impl PioneerDesktop {
                             .gap_2()
                             .when(show_spinner, |this| {
                                 this.child(
-                                    Spinner::new().with_size(gpui_kit::component::Size::Small),
+                                    crate::qualification_diagnostics::spinner!(
+                                        pioneer_observability::AnimationSourceId::GatewayPopover,
+                                    )
+                                    .with_size(gpui_kit::component::Size::Small),
                                 )
                             })
                             .when(!show_spinner, |this| {

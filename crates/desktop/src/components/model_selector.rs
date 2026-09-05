@@ -11,7 +11,6 @@ use gpui_kit::component::{
     popover::{Popover, PopoverState},
     scroll::Scrollbar,
     separator::Separator,
-    spinner::Spinner,
     theme::ActiveTheme,
     *,
 };
@@ -193,7 +192,9 @@ impl RenderOnce for SelectorPopoverTrigger {
                     .items_center()
                     .justify_between()
                     .child(div().flex_1().child(if self.loading {
-                        Spinner::new()
+                        crate::qualification_diagnostics::spinner!(
+                            pioneer_observability::AnimationSourceId::SharedModelSelector,
+                        )
                             .with_size(gpui_kit::component::Size::Small)
                             .color(theme.muted_foreground)
                             .into_any_element()

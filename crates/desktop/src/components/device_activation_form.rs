@@ -1,5 +1,5 @@
 use gpui_kit::component::{
-    StyledExt, clipboard::Clipboard, h_flex, spinner::Spinner, theme::ActiveTheme, v_flex,
+    StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex,
 };
 use gpui_kit::{prelude::*, *};
 use pioneer_client::gateway::device_activation::DeviceActivationQrPresentation;
@@ -72,7 +72,9 @@ impl RenderOnce for DeviceActivationForm {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .child(Spinner::new())
+                .child(crate::qualification_diagnostics::spinner!(
+                    pioneer_observability::AnimationSourceId::DeviceActivation,
+                ))
                 .child(
                     div()
                         .text_sm()

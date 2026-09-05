@@ -7,7 +7,6 @@ use gpui_kit::component::{
     Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
-    spinner::Spinner,
     theme::ActiveTheme,
     v_flex,
 };
@@ -23,6 +22,9 @@ const THREAD_ARTIFACT_DETAIL_PREVIEW_ASPECT_RATIO: f32 = 2.0;
 
 impl PioneerDesktop {
     pub(crate) fn render_thread_artifacts_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::SidePanel
+        ));
         let total_count = self.thread_artifacts.items_for_active_thread().len();
         let visible_items = self.thread_artifacts.visible_items();
         let visible_count = visible_items.len();
@@ -602,7 +604,9 @@ fn render_thread_artifact_action_status(
                 .text_color(cx.theme().danger)
                 .into_any_element()
         } else {
-            Spinner::new()
+            crate::qualification_diagnostics::spinner!(
+                pioneer_observability::AnimationSourceId::ThreadArtifactAction,
+            )
                 .icon(IconName::Loader)
                 .color(cx.theme().muted_foreground)
                 .into_any_element()

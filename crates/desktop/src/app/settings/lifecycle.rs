@@ -767,9 +767,19 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 for _ in 0..REMOTE_ACCESS_STATUS_POLL_ATTEMPTS {
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::Global,
+                    ));
                     cx.background_executor()
                         .timer(REMOTE_ACCESS_STATUS_POLL_INTERVAL)
                         .await;
+                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                        pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::Global,
+                    ));
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if view.remote_access_status_poll_generation != generation {
@@ -789,15 +799,37 @@ impl PioneerDesktop {
                             return false;
                         }
 
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
                         view.refresh_gateway_settings(cx);
                         true
                     });
 
                     match updated {
                         Ok(true) => {}
+                        #[cfg(not(feature = "qualification-diagnostics"))]
                         _ => break,
+                        #[cfg(feature = "qualification-diagnostics")]
+                        _ => {
+                            pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                                pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                                pioneer_observability::DiagnosticAction::Cancelled,
+                                pioneer_observability::Visibility::Global,
+                            ));
+                            return;
+                        }
                     }
                 }
+                pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                    pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                    pioneer_observability::DiagnosticAction::Completed,
+                    pioneer_observability::Visibility::Global,
+                ));
             }
         })
         .detach();

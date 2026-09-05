@@ -22,6 +22,9 @@ use pioneer_protocol::{McpAuditEventSummary, McpListItem, McpServerDetailsRespon
 
 impl PioneerDesktop {
     pub(crate) fn render_mcp_details(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Mcp
+        ));
         let details = self.mcp_server_details.as_ref();
         let server = mcp_details::mcp_details_server(
             self.mcp_servers.as_slice(),

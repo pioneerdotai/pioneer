@@ -9056,6 +9056,8 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "sentry",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "url",

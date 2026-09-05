@@ -156,19 +156,55 @@ impl RenderOnce for ProgressCircle {
                 }
 
                 let duration = Duration::from_secs_f64(0.15);
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
                 cx.spawn({
                     let state = state.clone();
                     async move |cx| {
                         cx.background_executor().timer(duration).await;
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                                pioneer_observability::DiagnosticAction::Woke,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
                         _ = state.update(cx, |state, _| state.value = value);
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                                pioneer_observability::DiagnosticAction::Completed,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
                     }
                 })
                 .detach();
+
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                        pioneer_observability::DiagnosticAction::Requested,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
 
                 this.with_animation(
                     ("progress-circle-animation", previous_value.to_bits() as u64),
                     Animation::new(duration),
                     move |this, delta| {
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                                pioneer_observability::DiagnosticAction::Executed,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
                         let animated_value = previous_value + (value - previous_value) * delta;
                         this.child(Self::render_circle(animated_value, color))
                     },

@@ -164,26 +164,84 @@ impl PioneerDesktop {
         delay: Duration,
         cx: &mut Context<Self>,
     ) {
+        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+            pioneer_observability::AnimationSourceId::ThreadArtifactRefreshRetry,
+            pioneer_observability::DiagnosticAction::Scheduled,
+            pioneer_observability::Visibility::NotApplicable,
+        ));
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
 
             async move {
                 cx.background_executor().timer(delay).await;
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::ThreadArtifactRefreshRetry,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
 
-                let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id)
-                        || view.gateway.connection_state != GatewayConnectionState::Connected
-                    {
-                        return;
-                    }
-                    if !view.is_thread_materialized_for_artifacts(thread_id.as_str()) {
-                        view.thread_artifacts.clear_error(thread_id.as_str());
-                        cx.notify();
-                        return;
-                    }
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    let _ = this.update(&mut cx, |view, cx| {
+                        if view.gateway.ws_connection_id != Some(connection_id)
+                            || view.gateway.connection_state != GatewayConnectionState::Connected
+                        {
+                            return;
+                        }
+                        if !view.is_thread_materialized_for_artifacts(thread_id.as_str()) {
+                            view.thread_artifacts.clear_error(thread_id.as_str());
+                            cx.notify();
+                            return;
+                        }
 
-                    view.refresh_thread_artifacts(thread_id, true, cx);
-                });
+                        view.refresh_thread_artifacts(thread_id, true, cx);
+                    });
+                }
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let handoff = this.update(&mut cx, |view, cx| {
+                        if view.gateway.ws_connection_id != Some(connection_id)
+                            || view.gateway.connection_state != GatewayConnectionState::Connected
+                        {
+                            return false;
+                        }
+                        if !view.is_thread_materialized_for_artifacts(thread_id.as_str()) {
+                            view.thread_artifacts.clear_error(thread_id.as_str());
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::ThreadArtifactRefreshRetry,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
+                            cx.notify();
+                            return true;
+                        }
+
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ThreadArtifactRefreshRetry,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                        view.refresh_thread_artifacts(thread_id, true, cx);
+                        true
+                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::ThreadArtifactRefreshRetry,
+                            if matches!(handoff, Ok(true)) {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Cancelled
+                            },
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
+                }
             }
         })
         .detach();

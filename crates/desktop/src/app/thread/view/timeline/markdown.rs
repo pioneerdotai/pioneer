@@ -205,6 +205,14 @@ impl PioneerDesktop {
     }
 
     pub(super) fn render_markdown_plain(&self, text: &str, _cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Markdown
+        ));
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::MarkdownElementBuild,
+            pioneer_observability::DiagnosticAction::Executed,
+            1,
+        ));
         let started = Instant::now();
         let element = div()
             .w_full()
@@ -236,6 +244,19 @@ impl PioneerDesktop {
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Markdown
+        ));
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::MarkdownElementBuild,
+            pioneer_observability::DiagnosticAction::Executed,
+            1,
+        ));
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::MarkdownDocumentProjection,
+            pioneer_observability::DiagnosticAction::Executed,
+            u64::try_from(document.blocks.len()).unwrap_or(u64::MAX),
+        ));
         let started = Instant::now();
         if document.blocks.is_empty() {
             let element = div()
@@ -575,6 +596,11 @@ impl PioneerDesktop {
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_timeline(
+            pioneer_observability::TimelineStage::MarkdownCodeBlockProjection,
+            pioneer_observability::DiagnosticAction::Executed,
+            1,
+        ));
         let language_label = sanitized_language_label(language);
         let clipboard_id = code_block_clipboard_id(language_label.as_deref(), text);
         let header = h_flex()

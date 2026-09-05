@@ -30,7 +30,10 @@ impl PioneerDesktop {
                             .justify_start()
                             .px_2()
                             .disabled(!is_connected || install_pending)
-                            .loading(install_pending)
+                            .loading(crate::qualification_diagnostics::observed_loading!(
+                                pioneer_observability::AnimationSourceId::McpSidebarInstallButton,
+                                install_pending,
+                            ))
                             .child(
                                 h_flex()
                                     .w_full()
@@ -56,7 +59,10 @@ impl PioneerDesktop {
                             .justify_start()
                             .px_2()
                             .disabled(!is_connected)
-                            .loading(self.mcp_loading)
+                            .loading(crate::qualification_diagnostics::observed_loading!(
+                                pioneer_observability::AnimationSourceId::McpSidebarRefreshButton,
+                                self.mcp_loading,
+                            ))
                             .child(
                                 h_flex()
                                     .w_full()
@@ -189,7 +195,10 @@ impl PioneerDesktop {
                                         || is_pending
                                         || restart_disabled,
                                 )
-                                .loading(is_pending)
+                                .loading(crate::qualification_diagnostics::observed_loading!(
+                                    pioneer_observability::AnimationSourceId::McpSidebarRestartButton,
+                                    is_pending,
+                                ))
                                 .child(
                                     h_flex()
                                         .w_full()

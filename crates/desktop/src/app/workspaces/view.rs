@@ -8,7 +8,6 @@ use gpui_kit::component::{
     h_flex,
     popover::{Popover, PopoverState},
     separator::Separator,
-    spinner::Spinner,
     theme::ActiveTheme,
     v_flex,
 };
@@ -128,7 +127,10 @@ impl RenderOnce for WorkspaceSelectorTrigger {
                             .justify_center()
                             .when(self.show_spinner, |this| {
                                 this.child(
-                                    Spinner::new().with_size(gpui_kit::component::Size::Small),
+                                    crate::qualification_diagnostics::spinner!(
+                                        pioneer_observability::AnimationSourceId::WorkspaceSelector,
+                                    )
+                                    .with_size(gpui_kit::component::Size::Small),
                                 )
                             })
                             .when(!self.show_spinner, |this| {

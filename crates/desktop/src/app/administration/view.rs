@@ -11,6 +11,9 @@ impl PioneerDesktop {
         content: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Administration
+        ));
         v_flex()
             .size_full()
             .bg(cx.theme().background)

@@ -8,6 +8,9 @@ use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn render_agents_doc_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::AgentsDoc
+        ));
         self.agents_doc_editor
             .as_ref()
             .map(|editor| editor.clone().into_any_element())

@@ -27,35 +27,95 @@ impl PioneerDesktop {
         let expected_attempt = attempt;
         let thread_id_for_timer = thread_id.to_owned();
 
+        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+            pioneer_observability::AnimationSourceId::ThreadStartRetryClock,
+            pioneer_observability::DiagnosticAction::Scheduled,
+            pioneer_observability::Visibility::NotApplicable,
+        ));
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
 
             async move {
                 cx.background_executor().timer(delay).await;
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::ThreadStartRetryClock,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
 
-                let _ = this.update(&mut cx, |app, cx| {
-                    if app.gateway.ws_connection_id != Some(connection_id)
-                        || app.gateway.connection_state != GatewayConnectionState::Connected
-                    {
-                        return;
-                    }
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    let _ = this.update(&mut cx, |app, cx| {
+                        if app.gateway.ws_connection_id != Some(connection_id)
+                            || app.gateway.connection_state != GatewayConnectionState::Connected
+                        {
+                            return;
+                        }
 
-                    let start = app.thread_start_coordinator();
+                        let start = app.thread_start_coordinator();
 
-                    if !thread_start::should_fire_scheduled_thread_start_retry(
-                        start,
-                        expected_attempt,
-                        thread_id_for_timer.as_str(),
-                    ) {
-                        return;
-                    }
+                        if !thread_start::should_fire_scheduled_thread_start_retry(
+                            start,
+                            expected_attempt,
+                            thread_id_for_timer.as_str(),
+                        ) {
+                            return;
+                        }
 
-                    app.enqueue_thread_start_request();
-                    let started = app.drive_thread_start_queue(cx);
-                    if started {
-                        cx.notify();
-                    }
-                });
+                        app.enqueue_thread_start_request();
+                        let started = app.drive_thread_start_queue(cx);
+                        if started {
+                            cx.notify();
+                        }
+                    });
+                }
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let handoff = this.update(&mut cx, |app, cx| {
+                        if app.gateway.ws_connection_id != Some(connection_id)
+                            || app.gateway.connection_state != GatewayConnectionState::Connected
+                        {
+                            return false;
+                        }
+
+                        let start = app.thread_start_coordinator();
+
+                        if !thread_start::should_fire_scheduled_thread_start_retry(
+                            start,
+                            expected_attempt,
+                            thread_id_for_timer.as_str(),
+                        ) {
+                            return false;
+                        }
+
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::ThreadStartRetryClock,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                        app.enqueue_thread_start_request();
+                        let started = app.drive_thread_start_queue(cx);
+                        if started {
+                            cx.notify();
+                        }
+                        true
+                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::ThreadStartRetryClock,
+                            if matches!(handoff, Ok(true)) {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Cancelled
+                            },
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
+                }
             }
         })
         .detach();

@@ -154,6 +154,9 @@ fn skill_pack_context_menu(
 
 impl PioneerDesktop {
     pub(crate) fn render_skills(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Skills
+        ));
         let desktop_entity = cx.entity().clone();
         let can_manage = self
             .principal_presentation_capabilities()

@@ -162,16 +162,66 @@ impl PioneerDesktop {
                     return;
                 }
 
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::DesktopVoiceStatusPoller,
+                        pioneer_observability::DiagnosticAction::Scheduled,
+                        pioneer_observability::Visibility::Global,
+                    )
+                );
                 cx.background_executor()
                     .timer(DESKTOP_VOICE_STATUS_RETRY_INTERVAL)
                     .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id == Some(connection_id)
-                        && view.gateway.connection_state == GatewayConnectionState::Connected
-                    {
-                        view.refresh_desktop_voice_status(cx);
-                    }
-                });
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::DesktopVoiceStatusPoller,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::Global,
+                    )
+                );
+
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let refresh_handoff = this.update(&mut cx, |view, cx| {
+                        if view.gateway.ws_connection_id == Some(connection_id)
+                            && view.gateway.connection_state == GatewayConnectionState::Connected
+                        {
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::DesktopVoiceStatusPoller,
+                                    pioneer_observability::DiagnosticAction::Requested,
+                                    pioneer_observability::Visibility::NotApplicable,
+                                )
+                            );
+                            view.refresh_desktop_voice_status(cx);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::DesktopVoiceStatusPoller,
+                            if matches!(refresh_handoff, Ok(true)) {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Cancelled
+                            },
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
+                }
+
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    let _ = this.update(&mut cx, |view, cx| {
+                        if view.gateway.ws_connection_id == Some(connection_id)
+                            && view.gateway.connection_state == GatewayConnectionState::Connected
+                        {
+                            view.refresh_desktop_voice_status(cx);
+                        }
+                    });
+                }
             }
         })
         .detach();
@@ -334,6 +384,48 @@ impl PioneerDesktop {
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let mut waited_for_session_refresh = false;
+                    loop {
+                        match this.update(&mut cx, |view, _| {
+                            view.gateway.session_refresh_in_flight
+                        }) {
+                            Ok(true) => {
+                                waited_for_session_refresh = true;
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::VoiceCaptureSessionWait,
+                                        pioneer_observability::DiagnosticAction::Scheduled,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
+                                cx.background_executor()
+                                    .timer(DESKTOP_VOICE_SESSION_READY_RETRY_DELAY)
+                                    .await;
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::VoiceCaptureSessionWait,
+                                        pioneer_observability::DiagnosticAction::Woke,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
+                            }
+                            Ok(false) | Err(_) => break,
+                        }
+                    }
+                    if waited_for_session_refresh {
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::VoiceCaptureSessionWait,
+                                pioneer_observability::DiagnosticAction::Requested,
+                                pioneer_observability::Visibility::NotApplicable,
+                            )
+                        );
+                    }
+                }
+
+                #[cfg(not(feature = "qualification-diagnostics"))]
                 while this
                     .update(&mut cx, |view, _| view.gateway.session_refresh_in_flight)
                     .unwrap_or(false)

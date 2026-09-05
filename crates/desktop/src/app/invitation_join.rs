@@ -11,7 +11,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_kit::component::{
     input::{InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenuItem},
-    spinner::Spinner,
     theme::ActiveTheme,
     v_flex,
 };
@@ -327,6 +326,9 @@ impl PioneerDesktop {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Invitation
+        ));
         let desktop = cx.entity().clone();
         let (
             screen,
@@ -418,7 +420,9 @@ impl PioneerDesktop {
                 .gap_3()
                 .py_12()
                 .when(loading, |this| {
-                    this.child(Spinner::new()).child(
+                    this.child(crate::qualification_diagnostics::spinner!(
+                        pioneer_observability::AnimationSourceId::InvitationJoin,
+                    )).child(
                         div()
                             .text_sm()
                             .opacity(0.65)

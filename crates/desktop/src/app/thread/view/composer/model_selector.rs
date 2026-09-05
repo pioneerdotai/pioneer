@@ -5,7 +5,6 @@ use crate::{
 use gpui_kit::component::{
     Icon,
     button::{Button, ButtonVariants},
-    spinner::Spinner,
     *,
 };
 use gpui_kit::{prelude::*, *};
@@ -54,7 +53,9 @@ impl PioneerDesktop {
                     .opacity(0.6)
                     .when(loading, |this| {
                         this.child(
-                            Spinner::new()
+                            crate::qualification_diagnostics::spinner!(
+                                pioneer_observability::AnimationSourceId::ComposerModelSelector,
+                            )
                                 .with_size(gpui_kit::component::Size::Small)
                                 .color(cx.theme().muted_foreground),
                         )

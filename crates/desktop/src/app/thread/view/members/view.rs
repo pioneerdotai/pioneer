@@ -13,7 +13,6 @@ use gpui_kit::component::{
     avatar::Avatar,
     button::*,
     menu::{ContextMenuExt, PopupMenuItem},
-    spinner::Spinner,
     theme::ActiveTheme,
     *,
 };
@@ -30,6 +29,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::SidePanel
+        ));
         let workspace_id = self
             .current_active_thread_id()
             .and_then(|thread_id| self.thread_workspace_id(thread_id))
@@ -142,7 +144,12 @@ impl PioneerDesktop {
                                 .gap_2()
                                 .items_center()
                                 .text_xs()
-                                .child(Spinner::new().small())
+                                .child(
+                                    crate::qualification_diagnostics::spinner!(
+                                        pioneer_observability::AnimationSourceId::ThreadMemberList,
+                                    )
+                                    .small(),
+                                )
                                 .child(t!("settings.members.loading").to_string()),
                         )
                     })
@@ -211,7 +218,10 @@ impl PioneerDesktop {
                 .ghost()
                 .compact()
                 .disabled(true)
-                .loading(pending)
+                .loading(crate::qualification_diagnostics::observed_loading!(
+                    pioneer_observability::AnimationSourceId::ThreadMemberAddButton,
+                    pending,
+                ))
                 .mr(px(-8.))
                 .tooltip(t!("thread.scope.add").to_string())
                 .child(Icon::new(IconName::Plus).size_4().opacity(0.6))

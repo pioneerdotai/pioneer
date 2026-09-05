@@ -11,6 +11,9 @@ const MCP_SERVER_ROW_HEIGHT: f32 = MCP_SERVER_CARD_HEIGHT + MCP_SERVER_ROW_GAP;
 
 impl PioneerDesktop {
     pub(crate) fn render_mcp(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Mcp
+        ));
         let desktop_entity = cx.entity().clone();
         let servers = Rc::new(self.mcp_servers.clone());
 

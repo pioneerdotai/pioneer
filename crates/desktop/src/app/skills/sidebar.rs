@@ -211,7 +211,10 @@ impl PioneerDesktop {
                                 .px_2()
                                 .group("skills-details-sidebar-update-btn")
                                 .disabled(!is_connected || selected_skill.is_none() || is_pending)
-                                .loading(is_pending)
+                                .loading(crate::qualification_diagnostics::observed_loading!(
+                                    pioneer_observability::AnimationSourceId::SkillsUpdateButton,
+                                    is_pending,
+                                ))
                                 .child({
                                     h_flex()
                                         .w_full()

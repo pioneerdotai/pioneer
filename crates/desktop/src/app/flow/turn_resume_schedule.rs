@@ -28,43 +28,113 @@ impl PioneerDesktop {
         let retry_attempt = schedule_plan.retry_attempt;
         let thread_id = thread_id.to_owned();
 
+        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+            pioneer_observability::AnimationSourceId::TurnResumeScheduleClock,
+            pioneer_observability::DiagnosticAction::Scheduled,
+            pioneer_observability::Visibility::NotApplicable,
+        ));
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
 
             async move {
                 cx.background_executor().timer(delay).await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    if view.gateway.ws_connection_id != Some(connection_id)
-                        || view.gateway.connection_state != GatewayConnectionState::Connected
-                    {
-                        return;
-                    }
-
-                    let has_in_flight_turn = view
-                        .in_flight_turn_id_for_thread(thread_id.as_str())
-                        .is_some();
-                    let Some(resume) = view.thread_resume_state_mut(thread_id.as_str()) else {
-                        return;
-                    };
-
-                    match thread_resume::plan_scheduled_turn_resume(
-                        resume,
-                        retry_attempt,
-                        has_in_flight_turn,
-                    ) {
-                        ScheduledTurnResumePlan::Skip => {}
-                        ScheduledTurnResumePlan::ResetMissingTurn => {
-                            view.reset_thread_resume_state(thread_id.as_str());
+                pioneer_observability::record_qualification_diagnostic!(
+                    record_animation_activity(
+                        pioneer_observability::AnimationSourceId::TurnResumeScheduleClock,
+                        pioneer_observability::DiagnosticAction::Woke,
+                        pioneer_observability::Visibility::NotApplicable,
+                    )
+                );
+                #[cfg(not(feature = "qualification-diagnostics"))]
+                {
+                    let _ = this.update(&mut cx, |view, cx| {
+                        if view.gateway.ws_connection_id != Some(connection_id)
+                            || view.gateway.connection_state != GatewayConnectionState::Connected
+                        {
+                            return;
                         }
-                        ScheduledTurnResumePlan::Resume => {
-                            view.enqueue_turn_resume_thread(thread_id.clone());
-                            let resumed = view.drive_turn_resume_queue(cx);
-                            if resumed {
-                                cx.notify();
+
+                        let has_in_flight_turn = view
+                            .in_flight_turn_id_for_thread(thread_id.as_str())
+                            .is_some();
+                        let Some(resume) = view.thread_resume_state_mut(thread_id.as_str()) else {
+                            return;
+                        };
+
+                        match thread_resume::plan_scheduled_turn_resume(
+                            resume,
+                            retry_attempt,
+                            has_in_flight_turn,
+                        ) {
+                            ScheduledTurnResumePlan::Skip => {}
+                            ScheduledTurnResumePlan::ResetMissingTurn => {
+                                view.reset_thread_resume_state(thread_id.as_str());
+                            }
+                            ScheduledTurnResumePlan::Resume => {
+                                view.enqueue_turn_resume_thread(thread_id.clone());
+                                let resumed = view.drive_turn_resume_queue(cx);
+                                if resumed {
+                                    cx.notify();
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
+                #[cfg(feature = "qualification-diagnostics")]
+                {
+                    let handoff = this.update(&mut cx, |view, cx| {
+                        if view.gateway.ws_connection_id != Some(connection_id)
+                            || view.gateway.connection_state != GatewayConnectionState::Connected
+                        {
+                            return false;
+                        }
+
+                        let has_in_flight_turn = view
+                            .in_flight_turn_id_for_thread(thread_id.as_str())
+                            .is_some();
+                        let Some(resume) = view.thread_resume_state_mut(thread_id.as_str()) else {
+                            return false;
+                        };
+
+                        match thread_resume::plan_scheduled_turn_resume(
+                            resume,
+                            retry_attempt,
+                            has_in_flight_turn,
+                        ) {
+                            ScheduledTurnResumePlan::Skip => false,
+                            ScheduledTurnResumePlan::ResetMissingTurn => {
+                                view.reset_thread_resume_state(thread_id.as_str());
+                                false
+                            }
+                            ScheduledTurnResumePlan::Resume => {
+                                pioneer_observability::record_qualification_diagnostic!(
+                                    record_animation_activity(
+                                        pioneer_observability::AnimationSourceId::TurnResumeScheduleClock,
+                                        pioneer_observability::DiagnosticAction::Requested,
+                                        pioneer_observability::Visibility::NotApplicable,
+                                    )
+                                );
+                                view.enqueue_turn_resume_thread(thread_id.clone());
+                                let resumed = view.drive_turn_resume_queue(cx);
+                                if resumed {
+                                    cx.notify();
+                                }
+                                true
+                            }
+                        }
+                    });
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::TurnResumeScheduleClock,
+                            if matches!(handoff, Ok(true)) {
+                                pioneer_observability::DiagnosticAction::Completed
+                            } else {
+                                pioneer_observability::DiagnosticAction::Cancelled
+                            },
+                            pioneer_observability::Visibility::NotApplicable,
+                        )
+                    );
+                }
             }
         })
         .detach();

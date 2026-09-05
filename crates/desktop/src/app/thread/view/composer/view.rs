@@ -11,7 +11,6 @@ use gpui_kit::component::{
     button::*,
     input::Textarea,
     menu::{DropdownMenu, PopupMenuItem},
-    spinner::Spinner,
     theme::ActiveTheme,
     *,
 };
@@ -110,6 +109,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        pioneer_observability::record_qualification_diagnostic!(record_render(
+            pioneer_observability::RenderRegion::Composer
+        ));
         let composer_state = self.composer_state.clone();
         let attachments = self.composer_attachments.clone();
         let capabilities = self.effective_composer_capabilities();
@@ -363,7 +365,10 @@ impl PioneerDesktop {
                                                                 .to_string(),
                                                         )
                                                         .disabled(!can_stop)
-                                                        .loading(is_cancelling)
+                                                        .loading(crate::qualification_diagnostics::observed_loading!(
+                                                            pioneer_observability::AnimationSourceId::ComposerCancelTurnButton,
+                                                            is_cancelling,
+                                                        ))
                                                         .on_click(cx.listener(
                                                             |view, _, window, cx| {
                                                                 view.stop_active_turn(window, cx);
@@ -402,7 +407,10 @@ impl PioneerDesktop {
                                                         .primary()
                                                         .rounded_full()
                                                         .disabled(composer_action_disabled)
-                                                        .loading(composer_action_loading)
+                                                        .loading(crate::qualification_diagnostics::observed_loading!(
+                                                            pioneer_observability::AnimationSourceId::ComposerPrimaryActionButton,
+                                                            composer_action_loading,
+                                                        ))
                                                         .when(composer_action_is_stop, |this| {
                                                             this.icon(PioneerIconName::Square)
                                                         })
@@ -724,7 +732,9 @@ impl PioneerDesktop {
                     .items_center()
                     .justify_center()
                     .child(if is_uploading {
-                        Spinner::new()
+                        crate::qualification_diagnostics::spinner!(
+                            pioneer_observability::AnimationSourceId::ComposerAttachmentUpload,
+                        )
                             .with_size(gpui_kit::component::Size::Small)
                             .color(status_color)
                             .into_any_element()
