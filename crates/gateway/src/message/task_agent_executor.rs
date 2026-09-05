@@ -1633,9 +1633,7 @@ impl TaskAgentExecutor {
             launch.model = Some(effective_model.model.clone());
             launch.model_provider = Some(effective_model.model_provider.clone());
         }
-        let normalized_composer_capabilities = if cli_runtime_backend.is_none()
-            && let Some(launch) = composer_launch.as_mut()
-        {
+        let normalized_composer_capabilities = if let Some(launch) = composer_launch.as_mut() {
             let normalized = processor
                 .normalize_turn_skill_capabilities(
                     context.workspace_id.as_str(),
@@ -1644,7 +1642,12 @@ impl TaskAgentExecutor {
                 .await
                 .map_err(|message| anyhow!(message))
                 .context("failed to normalize composer work capabilities")?;
-            launch.capabilities = normalized.execution.clone();
+            // Admission needs the expanded Skill IDs for every backend. CLI
+            // preparation still owns attachment presentation, so retain the
+            // original pack there until its own normalization/materialization.
+            if cli_runtime_backend.is_none() {
+                launch.capabilities = normalized.execution.clone();
+            }
             Some(normalized)
         } else {
             None
@@ -1872,7 +1875,10 @@ impl TaskAgentExecutor {
                 effective_model_provider.as_str(),
                 effective_model.model.as_str(),
                 child_execution_backend.as_ref(),
-                turn_params.capabilities.as_slice(),
+                normalized_composer_capabilities
+                    .as_ref()
+                    .map(|normalized| normalized.execution.as_slice())
+                    .unwrap_or(turn_params.capabilities.as_slice()),
                 &child_security_snapshot.permission_profile,
                 child_turn_id.as_str(),
             )

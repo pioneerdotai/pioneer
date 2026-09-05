@@ -20634,6 +20634,251 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
 }
 
 #[test]
+fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation() {
+    run_gateway_message_test("composer-cli-skill-pack", || async {
+        for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+            for select_pack in [true, false] {
+                let mut harness =
+                    setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
+                let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).unwrap();
+                let skill_ids =
+                    ["A", "B"].map(|id| pioneer_protocol::SkillId::new(id.repeat(21)).unwrap());
+                let children = skill_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, skill_id)| {
+                        let slug = format!("packed-{index}");
+                        let path =
+                            write_test_skill(&harness.user_root, &slug, "", "selected skill body");
+                        SkillInstallationRecord {
+                            skill_id: skill_id.clone(),
+                            owner: Some("tests".to_owned()),
+                            slug: slug.clone(),
+                            version: None,
+                            source_kind: "user".to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_ref: format!("test:{slug}"),
+                            install_path: path.display().to_string(),
+                            trust_level: "community".to_owned(),
+                            fingerprint: format!("fingerprint:{slug}"),
+                            updated_at_unix: 1,
+                            pack_id: Some(pack_id.clone()),
+                            pack_member_key: Some(slug),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                harness
+                    .crud_store
+                    .insert_skill_pack_installation_with_children(
+                        &SkillPackInstallationRecord {
+                            pack_id: pack_id.clone(),
+                            name: "Selected Pack".to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_kind: "user".to_owned(),
+                            created_at_unix: 1,
+                            updated_at_unix: 1,
+                        },
+                        &children,
+                    )
+                    .await
+                    .unwrap();
+                harness
+                    .cli_session
+                    .enable_projected_mcp_metadata(harness.crud_store.clone())
+                    .await;
+                let processor = Arc::new(harness.processor);
+                processor.bind_task_bridge().await;
+                processor.start_task_event_listener().await;
+                let parent = "thr_composer_cli_pack";
+                let source = "turn_composer_cli_pack";
+                let model = match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => "gpt-5",
+                    CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                };
+                let thread = harness
+                    .thread_manager
+                    .thread_start_seeded(
+                        harness.connection_id,
+                        harness.workspace_id.clone(),
+                        ThreadStartParams {
+                            thread_id: parent.to_owned(),
+                            workspace_id: harness.workspace_id.clone(),
+                            name: None,
+                            model: Some(model.to_owned()),
+                            model_provider: Some("openai".to_owned()),
+                            sandbox: Some(SandboxMode::FullAccess),
+                            mode: Some(ThreadMode::Agent),
+                            origin_kind: Some(ThreadOriginKind::Collaborative),
+                            sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                            visibility: None,
+                            agent_nickname: None,
+                            agent_role: None,
+                        },
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                harness
+                    .crud_store
+                    .upsert_thread_model(
+                        &thread.response.thread,
+                        pioneer_protocol::PersistedActorRef::System,
+                    )
+                    .await
+                    .unwrap();
+                let capabilities = if select_pack {
+                    vec![TurnCapability {
+                        id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                        kind: TurnCapabilityKind::SkillPack {
+                            pack_id: pack_id.clone(),
+                        },
+                        label: Some("Selected Pack".to_owned()),
+                    }]
+                } else {
+                    skill_ids
+                        .iter()
+                        .map(|skill_id| TurnCapability {
+                            id: pioneer_protocol::skill_capability_key(skill_id),
+                            kind: TurnCapabilityKind::Skill {
+                                skill_id: skill_id.clone(),
+                                pack_id: Some(pack_id.clone()),
+                            },
+                            label: None,
+                        })
+                        .collect()
+                };
+                let request_id = generate_test_request_id("pack", "composer");
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("native_pack_turn".to_owned())
+                    .await;
+                let context = processor
+                    .session_manager
+                    .connection_context(harness.connection_id)
+                    .await
+                    .unwrap();
+                processor.clone().process_owned_request(context, json!({
+                    "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
+                        "thread_id":parent, "turn_id":source,
+                        "input":[{"type":"text","text":"use selected skills"}],
+                        "capabilities":capabilities, "model":model, "mode":"Agent",
+                        "execution_backend":{"type":"cliAgentRuntime","runtime_id":harness.runtime_id,"runtime_kind":runtime_kind},
+                        "permission_profile":{"mode":"full_access"}
+                    }
+                }).to_string()).await;
+                let response = recv_response_by_id(&mut harness.rx, &request_id).await;
+                let _: pioneer_protocol::TurnStartResponse =
+                    serde_json::from_value(response.result).unwrap();
+                let tasks = processor
+                    .task_runtime
+                    .service()
+                    .list_tasks(pioneer_protocol::TaskListParams {
+                        workspace_id: harness.workspace_id.clone(),
+                        owner_kind: Some(TaskOwnerKind::Thread),
+                        owner_id: Some(parent.to_owned()),
+                        limit: Some(10),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(tasks.tasks.len(), 1);
+                let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 1).await;
+                let task = harness
+                    .crud_store
+                    .get_task(&tasks.tasks[0].id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    starts.len(),
+                    1,
+                    "{runtime_kind:?} select_pack={select_pack}: {:?}",
+                    task.task.error
+                );
+                let run = &task.runs[0];
+                let lineage =
+                    wait_for_child_lineage_for_run(harness.crud_store.clone(), &run.id).await;
+                let mut bound_ids = harness
+                    .crud_store
+                    .list_turn_skill_bindings(&lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|binding| binding.skill_id)
+                    .collect::<Vec<_>>();
+                bound_ids.sort();
+                assert_eq!(
+                    bound_ids,
+                    skill_ids.to_vec(),
+                    "pack and individual selection must bind exactly the same skills"
+                );
+                let authorization = processor
+                    .load_turn_execution_authorization_context(&lineage.child_turn_id)
+                    .await
+                    .expect("child authorization");
+                assert_eq!(
+                    authorization.granted_skill_ids(),
+                    skill_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    "admission must grant the expanded members, not a pack or additional skills"
+                );
+                let events = harness
+                    .crud_store
+                    .get_turn_item_events(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let attachments = events
+                    .events
+                    .iter()
+                    .find_map(|event| match &event.payload {
+                        TurnItemEventPayload::ItemCompleted {
+                            item: TurnItem::UserMessage { attachments, .. },
+                            ..
+                        } => Some(attachments),
+                        _ => None,
+                    })
+                    .expect("hidden CLI user message");
+                if select_pack {
+                    assert!(
+                        matches!(attachments.as_slice(), [UserMessageAttachment::SkillPack { capability }] if capability.pack_id == pack_id)
+                    );
+                } else {
+                    assert_eq!(attachments.len(), 2);
+                    assert!(attachments.iter().all(|attachment| matches!(
+                        attachment,
+                        UserMessageAttachment::Skill { .. }
+                    )));
+                }
+                complete_recorded_cli_task_turn(
+                    &processor,
+                    &harness.cli_manager,
+                    &harness.workspace_id,
+                    &harness.runtime_id,
+                    parent,
+                    &starts[0].native_thread_id,
+                    "native_pack_turn",
+                    r#"<task_result>{"summary":"skills completed"}</task_result>"#,
+                )
+                .await;
+                assert_eq!(
+                    wait_for_task_status(
+                        harness.crud_store.clone(),
+                        &task.task.id,
+                        TaskStatus::Completed
+                    )
+                    .await,
+                    TaskStatus::Completed
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage() {
     run_gateway_message_test("collaborative-composer-cli-runtimes", || async {
         collaborative_composer_dispatches_codex_and_claude_without_api_provider_leakage_impl()
