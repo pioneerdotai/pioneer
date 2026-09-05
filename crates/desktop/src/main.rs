@@ -12,6 +12,7 @@ mod file_opener;
 mod gateway;
 mod menu;
 mod qualification_diagnostics;
+mod render_guard;
 mod settings;
 mod state;
 #[cfg(test)]

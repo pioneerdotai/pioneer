@@ -13,6 +13,7 @@ use gpui_kit::{prelude::*, *};
 
 impl Render for PioneerDesktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _render_guard = crate::render_guard::DesktopRenderGuard::enter();
         pioneer_observability::record_qualification_diagnostic!(record_render(
             pioneer_observability::RenderRegion::DesktopShell
         ));

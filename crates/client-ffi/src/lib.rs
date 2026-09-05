@@ -7,6 +7,7 @@ mod active_thread;
 mod artifacts;
 mod auth;
 mod avatars;
+mod client_binding;
 mod composer;
 mod contracts;
 mod diagnostics;
@@ -102,6 +103,7 @@ use pioneer_client::{
         AgentsDocSaveErrorKind, agents_doc_get_params, agents_doc_save_error_kind,
         agents_doc_save_params,
     },
+    core::{ClientCore, ClientScope, ClientSubscription},
     gateway::setup::{
         ActivateGatewayRegistryPlan, DeleteRemoteGatewayRegistryPlan, RemoteGatewayValidation,
         SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
@@ -171,10 +173,11 @@ use std::{
     any::Any,
     collections::HashMap,
     ffi::{CStr, CString, c_char},
+    num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -201,7 +204,8 @@ pub struct PioneerClientFfi {
 #[derive(Default)]
 struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
-    client_runtime: ClientRuntime,
+    client_runtime: ClientRuntimeCompatibility,
+    client_subscriptions: Mutex<HashMap<ClientScope, ClientSubscription>>,
     active_thread: ClientFfiActiveThreadState,
     authorization_projection_state: Mutex<AuthorizationProjectionRuntimeState>,
     active_connection_id: Mutex<Option<u64>>,
@@ -213,6 +217,28 @@ struct ClientFfiRuntime {
     invitation_commit_sequence: AtomicU64,
     invitation_commits:
         Mutex<HashMap<String, pioneer_client::gateway::invitation::InvitationSessionCommit>>,
+}
+
+/// Frozen route used only by capabilities whose mutable owner has not moved
+/// into `ClientCore` yet.
+struct ClientRuntimeCompatibility {
+    core: Arc<ClientCore>,
+}
+
+impl Default for ClientRuntimeCompatibility {
+    fn default() -> Self {
+        Self {
+            core: Arc::new(ClientCore::new()),
+        }
+    }
+}
+
+impl std::ops::Deref for ClientRuntimeCompatibility {
+    type Target = ClientRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        self.core.compatibility_runtime()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,6 +399,128 @@ impl ClientFfiRuntime {
     ) -> Result<telemetry::ClientMobileStartupRecordResult, String> {
         self.require_initialized().map_err(|error| error.message)?;
         telemetry::record_mobile_startup(input_json)
+    }
+
+    fn client_intent_dispatch(
+        &self,
+        input_json: &str,
+    ) -> Result<client_binding::ClientTransitionDto, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request = serde_json::from_str::<client_binding::ClientIntentDispatchDto>(input_json)
+            .map_err(|error| format!("invalid Client intent request: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        Ok(client_binding::transition_dto(
+            self.client_runtime.core.dispatch(request.intent),
+        ))
+    }
+
+    fn client_scoped_snapshot(
+        &self,
+        input_json: &str,
+    ) -> Result<Option<client_binding::ClientScopedSnapshotDto>, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request =
+            serde_json::from_str::<client_binding::ClientScopedSnapshotRequestDto>(input_json)
+                .map_err(|error| format!("invalid Client scoped snapshot request: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        self.ensure_client_subscription(request.scope.clone())?;
+        Ok(self
+            .client_runtime
+            .core
+            .snapshot_if_newer(&request.scope, request.after_revision)
+            .map(client_binding::snapshot_dto))
+    }
+
+    fn client_change_batch(
+        &self,
+        input_json: &str,
+    ) -> Result<client_binding::ClientChangeBatchDto, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request =
+            serde_json::from_str::<client_binding::ClientChangeBatchRequestDto>(input_json)
+                .map_err(|error| format!("invalid Client change batch request: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        if request.maximum_items == 0 || request.maximum_items > 256 {
+            return Err("Client change batch maximum_items must be between 1 and 256".to_owned());
+        }
+        self.ensure_client_subscription(request.scope.clone())?;
+
+        let subscriptions = self
+            .client_subscriptions
+            .lock()
+            .map_err(|_| "Client subscription registry lock is poisoned".to_owned())?;
+        let subscription = subscriptions
+            .get(&request.scope)
+            .ok_or_else(|| "Client scope subscription is unavailable".to_owned())?;
+        let mut changes = Vec::new();
+        for _ in 0..request.maximum_items {
+            let Some(event) = subscription.try_next() else {
+                break;
+            };
+            changes.push(client_binding::change_dto(event));
+        }
+        Ok(client_binding::ClientChangeBatchDto {
+            schema_version: client_binding::CLIENT_BINDING_SCHEMA_VERSION,
+            changes,
+        })
+    }
+
+    fn client_effect_complete(
+        &self,
+        input_json: &str,
+    ) -> Result<client_binding::ClientTransitionDto, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request = serde_json::from_str::<client_binding::ClientEffectCompletionDto>(input_json)
+            .map_err(|error| format!("invalid Client effect completion: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        Ok(client_binding::transition_dto(
+            self.client_runtime.core.complete_effect(request.completion),
+        ))
+    }
+
+    fn client_effect_cancel(
+        &self,
+        input_json: &str,
+    ) -> Result<client_binding::ClientTransitionDto, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request =
+            serde_json::from_str::<client_binding::ClientEffectCancellationDto>(input_json)
+                .map_err(|error| format!("invalid Client effect cancellation: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        Ok(client_binding::transition_dto(
+            self.client_runtime.core.cancel_effect(request.cancellation),
+        ))
+    }
+
+    fn client_sequence_gap_resnapshot(
+        &self,
+        input_json: &str,
+    ) -> Result<Option<client_binding::ClientScopedSnapshotDto>, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request =
+            serde_json::from_str::<client_binding::ClientSequenceGapResnapshotDto>(input_json)
+                .map_err(|error| format!("invalid Client sequence-gap resnapshot: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        self.ensure_client_subscription(request.scope.clone())?;
+        Ok(self
+            .client_runtime
+            .core
+            .snapshot(&request.scope)
+            .map(client_binding::snapshot_dto))
+    }
+
+    fn ensure_client_subscription(&self, scope: ClientScope) -> Result<(), String> {
+        let mut subscriptions = self
+            .client_subscriptions
+            .lock()
+            .map_err(|_| "Client subscription registry lock is poisoned".to_owned())?;
+        if subscriptions.contains_key(&scope) {
+            return Ok(());
+        }
+        let capacity = NonZeroUsize::new(64).expect("fixed Client queue capacity is non-zero");
+        let subscription = self.client_runtime.core.subscribe(scope.clone(), capacity);
+        subscriptions.insert(scope, subscription);
+        Ok(())
     }
 
     fn gateway_validate_remote(&self, input_json: &str) -> Result<RemoteGatewayValidation, String> {
@@ -2911,6 +3059,13 @@ where
 
 macro_rules! ffi_client_json_method {
     ($export_name:ident, $runtime_method:ident) => {
+        /// Calls a JSON Client operation through an owned native Client handle.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must be null or a live handle returned by
+        /// `pioneer_client_ffi_client_create`; `input_json` must be null or
+        /// point to a valid NUL-terminated string for the duration of the call.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $export_name(
             ptr: *mut PioneerClientFfi,
@@ -2928,6 +3083,13 @@ macro_rules! ffi_client_json_method {
 
 macro_rules! ffi_client_json_typed_method {
     ($export_name:ident, $runtime_method:ident) => {
+        /// Calls a typed-error JSON operation through an owned native Client handle.
+        ///
+        /// # Safety
+        ///
+        /// `ptr` must be null or a live handle returned by
+        /// `pioneer_client_ffi_client_create`; `input_json` must be null or
+        /// point to a valid NUL-terminated string for the duration of the call.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $export_name(
             ptr: *mut PioneerClientFfi,
@@ -2972,6 +3134,27 @@ pub unsafe extern "C" fn pioneer_client_ffi_client_destroy(ptr: *mut PioneerClie
 }
 
 ffi_client_json_method!(pioneer_client_ffi_client_initialize, initialize);
+ffi_client_json_method!(
+    pioneer_client_ffi_client_intent_dispatch,
+    client_intent_dispatch
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_client_scoped_snapshot,
+    client_scoped_snapshot
+);
+ffi_client_json_method!(pioneer_client_ffi_client_change_batch, client_change_batch);
+ffi_client_json_method!(
+    pioneer_client_ffi_client_effect_complete,
+    client_effect_complete
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_client_effect_cancel,
+    client_effect_cancel
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_client_sequence_gap_resnapshot,
+    client_sequence_gap_resnapshot
+);
 ffi_client_json_method!(
     pioneer_client_ffi_mobile_startup_record,
     mobile_startup_record
@@ -3711,6 +3894,234 @@ mod tests {
             .expect("initialize");
 
         assert!(result.initialized);
+    }
+
+    #[test]
+    fn client_binding_routes_versioned_intents_and_exact_scope_subscription() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+        let intent = serde_json::json!({
+            "schema_version": client_binding::CLIENT_BINDING_SCHEMA_VERSION,
+            "intent": {
+                "kind": "set_scope_demand",
+                "scope": { "kind": "settings" },
+                "demand": "visible",
+                "generation": 1
+            }
+        })
+        .to_string();
+        assert_eq!(
+            runtime.client_intent_dispatch(&intent).unwrap().outcome,
+            pioneer_client::core::ClientTransitionOutcome::Changed
+        );
+        assert_eq!(
+            runtime.client_intent_dispatch(&intent).unwrap().outcome,
+            pioneer_client::core::ClientTransitionOutcome::Noop
+        );
+
+        let snapshot_request = serde_json::json!({
+            "schema_version": client_binding::CLIENT_BINDING_SCHEMA_VERSION,
+            "scope": { "kind": "settings" },
+            "after_revision": null
+        })
+        .to_string();
+        assert!(
+            runtime
+                .client_scoped_snapshot(&snapshot_request)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .client_scoped_snapshot(&snapshot_request)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(runtime.client_subscriptions.lock().unwrap().len(), 1);
+
+        let batch = runtime
+            .client_change_batch(
+                serde_json::json!({
+                    "schema_version": client_binding::CLIENT_BINDING_SCHEMA_VERSION,
+                    "scope": { "kind": "settings" },
+                    "maximum_items": 4
+                })
+                .to_string()
+                .as_str(),
+            )
+            .unwrap();
+        assert!(batch.changes.is_empty());
+    }
+
+    #[test]
+    fn client_binding_rejects_unknown_schema_versions() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").unwrap();
+        let error = runtime
+            .client_scoped_snapshot(
+                serde_json::json!({
+                    "schema_version": client_binding::CLIENT_BINDING_SCHEMA_VERSION + 1,
+                    "scope": { "kind": "navigation" },
+                    "after_revision": null
+                })
+                .to_string()
+                .as_str(),
+            )
+            .expect_err("unknown binding versions must fail closed");
+        assert!(error.contains("unsupported Client binding schema version"));
+    }
+
+    #[test]
+    fn client_binding_replays_independent_core_outputs_and_bounded_delivery() {
+        use pioneer_client::core::*;
+        let direct = Arc::new(ClientCore::new());
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").unwrap();
+        assert!(!Arc::ptr_eq(&direct, &runtime.client_runtime.core));
+        let scope = ClientScope::Settings;
+        let subscription = direct.subscribe(scope.clone(), NonZeroUsize::new(64).unwrap());
+        let request = serde_json::json!({"schema_version": 1, "scope": scope}).to_string();
+        assert!(runtime.client_scoped_snapshot(&request).unwrap().is_none());
+        let authority = ClientMutationAuthority::for_test();
+        let revisions = |n| {
+            ClientRevisions::new(
+                DomainRevision::new(n),
+                PresentationRevision::new(n),
+                ContentRevision::new(n),
+                ScopedRevision::new(n),
+            )
+        };
+        let operation = ClientOperationId::new("refresh-settings").unwrap();
+        let plan = ClientEffectPlan::new(
+            operation.clone(),
+            ClientGeneration::new(1),
+            pioneer_client::notifications::effects::ClientEffect::RefreshGatewaySettings,
+        );
+        let compare = |left: ClientTransition, right: ClientTransition| {
+            assert_eq!(
+                client_binding::transition_dto(left),
+                client_binding::transition_dto(right)
+            );
+        };
+        compare(
+            direct.transition(&authority, vec![], vec![plan.clone()]),
+            runtime
+                .client_runtime
+                .core
+                .transition(&authority, vec![], vec![plan]),
+        );
+        for (generation, demand) in [
+            (2, ClientDemand::Visible),
+            (2, ClientDemand::Visible),
+            (1, ClientDemand::Visible),
+            (2, ClientDemand::Suspended),
+        ] {
+            let intent = ClientIntent::SetScopeDemand {
+                scope: scope.clone(),
+                generation: ClientGeneration::new(generation),
+                demand,
+            };
+            let expected = client_binding::transition_dto(direct.dispatch(intent.clone()));
+            let actual = runtime
+                .client_intent_dispatch(
+                    &serde_json::json!({"schema_version": 1, "intent": intent}).to_string(),
+                )
+                .unwrap();
+            assert_eq!(expected, actual);
+        }
+        for generation in [0, 1, 1] {
+            let cancellation =
+                ClientEffectCancellation::new(operation.clone(), ClientGeneration::new(generation));
+            let expected =
+                client_binding::transition_dto(direct.cancel_effect(cancellation.clone()));
+            let actual = runtime
+                .client_effect_cancel(
+                    &serde_json::json!({"schema_version": 1, "cancellation": cancellation})
+                        .to_string(),
+                )
+                .unwrap();
+            assert_eq!(expected, actual);
+        }
+        let completion = ClientEffectCompletion::new(
+            operation,
+            ClientGeneration::new(1),
+            ClientEffectResult::Completed,
+        );
+        assert_eq!(
+            client_binding::transition_dto(direct.complete_effect(completion.clone())),
+            runtime
+                .client_effect_complete(
+                    &serde_json::json!({"schema_version": 1, "completion": completion}).to_string()
+                )
+                .unwrap()
+        );
+
+        for n in 1..=70 {
+            compare(
+                direct.publish(&authority, scope.clone(), revisions(n), Arc::new(n), vec![]),
+                runtime.client_runtime.core.publish(
+                    &authority,
+                    scope.clone(),
+                    revisions(n),
+                    Arc::new(n),
+                    vec![],
+                ),
+            );
+        }
+        let batch_request =
+            serde_json::json!({"schema_version": 1, "scope": scope, "maximum_items": 256})
+                .to_string();
+        let actual = runtime.client_change_batch(&batch_request).unwrap();
+        let mut expected = Vec::new();
+        while let Some(event) = subscription.try_next() {
+            expected.push(client_binding::change_dto(event));
+        }
+        assert_eq!(actual.changes, expected);
+        assert!(
+            matches!(actual.changes.as_slice(), [client_binding::ClientChangeDto::ResnapshotRequired { latest_sequence, .. }] if latest_sequence.get() == 70)
+        );
+        assert!(
+            runtime
+                .client_change_batch(&batch_request)
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        let expected_snapshot = client_binding::snapshot_dto(direct.snapshot(&scope).unwrap());
+        assert_eq!(
+            runtime.client_sequence_gap_resnapshot(&request).unwrap(),
+            Some(expected_snapshot)
+        );
+        assert!(
+            runtime
+                .client_scoped_snapshot(
+                    &serde_json::json!({"schema_version": 1, "scope": scope, "after_revision": 70})
+                        .to_string()
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        for n in 71..=73 {
+            compare(
+                direct.publish(&authority, scope.clone(), revisions(n), Arc::new(n), vec![]),
+                runtime.client_runtime.core.publish(
+                    &authority,
+                    scope.clone(),
+                    revisions(n),
+                    Arc::new(n),
+                    vec![],
+                ),
+            );
+        }
+        let actual = runtime.client_change_batch(&batch_request).unwrap();
+        let expected = (0..3)
+            .map(|_| client_binding::change_dto(subscription.try_next().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual.changes, expected);
+        for limit in [0, 257] {
+            assert!(runtime.client_change_batch(&serde_json::json!({"schema_version": 1, "scope": scope, "maximum_items": limit}).to_string()).is_err());
+        }
     }
 
     #[test]

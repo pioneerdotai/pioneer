@@ -8848,6 +8848,7 @@ dependencies = [
  "image",
  "pioneer-client",
  "pioneer-config",
+ "pioneer-desktop-foundation",
  "pioneer-keystore",
  "pioneer-observability",
  "pioneer-protocol",
@@ -8876,6 +8877,14 @@ dependencies = [
  "windows-sys 0.61.2",
  "winresource",
  "zeroize",
+]
+
+[[package]]
+name = "pioneer-desktop-foundation"
+version = "0.47.5"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
 ]
 
 [[package]]

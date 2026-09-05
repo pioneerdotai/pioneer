@@ -32,3 +32,6 @@ tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+pioneer-client = { workspace = true, features = ["test-support"] }

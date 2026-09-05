@@ -23,6 +23,42 @@ macro_rules! schema_doc {
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "client_intent_dispatch_dto.json",
+            crate::client_binding::ClientIntentDispatchDto
+        ),
+        schema_doc!(
+            "client_scoped_snapshot_request_dto.json",
+            crate::client_binding::ClientScopedSnapshotRequestDto
+        ),
+        schema_doc!(
+            "client_scoped_snapshot_dto.json",
+            crate::client_binding::ClientScopedSnapshotDto
+        ),
+        schema_doc!(
+            "client_change_batch_request_dto.json",
+            crate::client_binding::ClientChangeBatchRequestDto
+        ),
+        schema_doc!(
+            "client_change_batch_dto.json",
+            crate::client_binding::ClientChangeBatchDto
+        ),
+        schema_doc!(
+            "client_effect_completion_dto.json",
+            crate::client_binding::ClientEffectCompletionDto
+        ),
+        schema_doc!(
+            "client_effect_cancellation_dto.json",
+            crate::client_binding::ClientEffectCancellationDto
+        ),
+        schema_doc!(
+            "client_sequence_gap_resnapshot_dto.json",
+            crate::client_binding::ClientSequenceGapResnapshotDto
+        ),
+        schema_doc!(
+            "client_transition_dto.json",
+            crate::client_binding::ClientTransitionDto
+        ),
+        schema_doc!(
             "client_artifact_target_request.json",
             crate::artifacts::ClientArtifactTargetRequest
         ),

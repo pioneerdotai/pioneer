@@ -14,6 +14,7 @@ members = [
   "crates/hooks",
   "crates/observability",
   "crates/desktop",
+  "crates/desktop-foundation",
   "crates/desktop-updater",
   "crates/cli",
   "crates/crud",
@@ -52,6 +53,7 @@ pioneer-hooks = { path = "crates/hooks" }
 pioneer-observability = { path = "crates/observability" }
 pioneer-config = { path = "crates/config" }
 pioneer-desktop = { path = "crates/desktop" }
+pioneer-desktop-foundation = { path = "crates/desktop-foundation" }
 pioneer-app-updater = { path = "crates/desktop-updater" }
 pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }

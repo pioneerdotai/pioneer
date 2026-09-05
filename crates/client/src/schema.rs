@@ -41,6 +41,41 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
+        schema_doc!("client_scope.json", crate::core::ClientScope),
+        schema_doc!("client_revisions.json", crate::core::ClientRevisions),
+        schema_doc!("client_generation.json", crate::core::ClientGeneration),
+        schema_doc!(
+            "client_request_state.json",
+            crate::request_state::RequestState<serde_json::Value>
+        ),
+        schema_doc!(
+            "client_request_failure.json",
+            crate::request_state::ClientRequestFailure
+        ),
+        schema_doc!(
+            "request_update_outcome.json",
+            crate::request_state::RequestUpdateOutcome
+        ),
+        schema_doc!("client_intent.json", crate::core::ClientIntent),
+        schema_doc!("client_effect_plan.json", crate::core::ClientEffectPlan),
+        schema_doc!(
+            "client_effect_completion.json",
+            crate::core::ClientEffectCompletion
+        ),
+        schema_doc!(
+            "client_effect_cancellation.json",
+            crate::core::ClientEffectCancellation
+        ),
+        schema_doc!("client_identity.json", crate::ids::ClientIdentity),
+        schema_doc!(
+            "client_identity_namespace.json",
+            crate::ids::ClientIdentityNamespace
+        ),
+        schema_doc!("client_feature.json", crate::ids::ClientFeature),
+        schema_doc!(
+            "client_domain_identity.json",
+            crate::ids::ClientDomainIdentity
+        ),
         schema_doc!(
             "active_thread_phase_snapshot.json",
             crate::state::snapshot::ActiveThreadPhaseSnapshot
