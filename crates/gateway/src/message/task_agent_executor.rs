@@ -5953,12 +5953,7 @@ impl TaskAgentExecutor {
             )
             .await?;
         handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(
-            &processor,
-            &child_runtime.lineage,
-            "child_turn_blocked",
-        )
-        .await?;
+        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, reason).await?;
         Ok(())
     }
 

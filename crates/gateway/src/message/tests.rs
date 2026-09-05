@@ -18776,6 +18776,88 @@ async fn failed_child_task_run_opens_recovery_without_candidate_impl() {
 }
 
 #[test]
+fn detached_task_block_preserves_child_reason_in_parent_timeline() {
+    run_standard_stack_message_test("detached child block reason", async {
+        let provider = Arc::new(HangingChildProvider::new());
+        let providers = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        ));
+        let (workspaces, store, workspace_id) = setup_workspace_manager().await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            providers,
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        ));
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+        let parent = "thr_detached_block_reason";
+        let mut params = test_task_create_params(
+            &workspace_id,
+            parent,
+            "turn_detached_block_reason",
+            "Blocked child",
+            3,
+        );
+        params.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Detached,
+            on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+            on_parent_failure: TaskParentTerminalAction::KeepRunning,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+        let response = create_task_for_test(&processor, params)
+            .await
+            .expect("create task");
+        let run = response.run.expect("run");
+        let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+        for _ in 0..100 {
+            if provider.child_main_call_count() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(provider.child_main_call_count() > 0);
+        let reason =
+            "failed to open CLI runtime thread: cannot resume paginated thread with stale path";
+        processor
+            .mark_turn_blocked(
+                lineage.child_thread_id.clone(),
+                lineage.child_turn_id.clone(),
+                reason.to_owned(),
+            )
+            .await;
+        assert_eq!(
+            wait_for_turn_status(store.clone(), parent, &run.id, TurnStatus::Blocked).await,
+            TurnStatus::Blocked
+        );
+        let (_, occurrence) = store
+            .get_turn(parent, &run.id)
+            .await
+            .expect("parent lookup")
+            .expect("parent");
+        assert_eq!(occurrence.error.as_deref(), Some(reason));
+        // A repeated durable reconciliation must not replace the useful cause
+        // with the generic child_turn_blocked classification.
+        processor
+            .reconcile_terminal_task_child_turns(10)
+            .await
+            .expect("reconcile");
+        let (_, occurrence) = store
+            .get_turn(parent, &run.id)
+            .await
+            .expect("parent lookup")
+            .expect("parent");
+        assert_eq!(occurrence.error.as_deref(), Some(reason));
+    });
+}
+
+#[test]
 fn blocked_execution_window_recovery_blocks_child_task_run_without_failure() {
     run_standard_stack_message_test(
         "blocked execution window child Task recovery",
