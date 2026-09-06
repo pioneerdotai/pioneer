@@ -1664,7 +1664,7 @@ fn next_supervisor_delay(now: DateTime<Utc>, retry_at_unix: Option<i64>) -> Dura
     daily.min(retry)
 }
 
-fn next_daily_utc_delay(now: DateTime<Utc>) -> Duration {
+pub(super) fn next_daily_utc_delay(now: DateTime<Utc>) -> Duration {
     let Some(next_date) = now.date_naive().succ_opt() else {
         return Duration::from_secs(24 * 60 * 60);
     };

@@ -337,6 +337,72 @@
       },
       "additionalProperties": false
     },
+    "GatewaySelfImprovementStatus": {
+      "description": "Bounded operational projection; contains no history, prompts, or provider error payloads.",
+      "type": "object",
+      "properties": {
+        "last_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelfImprovementStatusReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_run_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "next_retry_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "next_scheduled_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "observed_at_unix": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "phase": {
+          "$ref": "#/$defs/SelfImprovementPhase"
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelfImprovementProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/SelfImprovementStatusReason"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "phase",
+        "reason",
+        "observed_at_unix"
+      ]
+    },
     "GatewaySettingsSnapshot": {
       "type": "object",
       "properties": {
@@ -395,6 +461,17 @@
           "default": {
             "enabled": false
           }
+        },
+        "self_improvement_status": {
+          "description": "Read-only status of learning in the connection's workspace. Absent on older gateways.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "thread_episodic": {
           "$ref": "#/$defs/GatewayThreadEpisodicSettings",
@@ -768,6 +845,67 @@
           }
         }
       }
+    },
+    "SelfImprovementPhase": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "unavailable",
+        "waiting",
+        "running",
+        "retrying",
+        "failed",
+        "no_change",
+        "completed",
+        "cancelled"
+      ]
+    },
+    "SelfImprovementProgress": {
+      "type": "object",
+      "properties": {
+        "processed_chunks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "total_chunks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "processed_chunks",
+        "total_chunks"
+      ]
+    },
+    "SelfImprovementStatusReason": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "model_unavailable",
+        "worker_unavailable",
+        "preparing",
+        "no_new_sources",
+        "awaiting_schedule",
+        "analyzing",
+        "finalizing",
+        "pending",
+        "recovering",
+        "timeout",
+        "output_limit",
+        "invalid_response",
+        "provider_error",
+        "response_filtered",
+        "no_candidate",
+        "reviewer_rejected",
+        "validation_rejected",
+        "created",
+        "updated",
+        "rolled_back",
+        "cancelled",
+        "unknown"
+      ]
     }
   }
 }

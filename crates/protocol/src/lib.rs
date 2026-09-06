@@ -303,9 +303,9 @@ pub use settings::{
     GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
     GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
-    GatewaySelfImprovementSettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
-    GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
-    GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
+    GatewaySelfImprovementSettings, GatewaySelfImprovementStatus, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
     GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
     GatewayThreadEpisodicVectorRefillStatus,
@@ -313,7 +313,8 @@ pub use settings::{
     GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
     GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
     GatewayVoiceInputSettings, GatewayVoiceInputSettingsUpdate,
-    GatewayVoiceInputStatusChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, SelfImprovementPhase, SelfImprovementProgress,
+    SelfImprovementStatusReason,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,

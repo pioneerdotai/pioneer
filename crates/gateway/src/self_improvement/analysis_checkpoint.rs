@@ -19,6 +19,27 @@ const CHUNK_TERMINAL_MALFORMED_JSON: u8 = 2;
 const CHUNK_TERMINAL_CONTRACT_REJECTED: u8 = 3;
 const CHUNKS_PER_TERMINAL_CODE_BYTE: u32 = 4;
 
+/// Reads only bounded cursor metadata; status requests never reconstruct the history plan.
+pub(crate) fn checkpoint_progress(
+    run: &SelfImprovementRunRecord,
+) -> Option<pioneer_protocol::SelfImprovementProgress> {
+    let text = run.analysis_cursor_json.as_deref()?;
+    if text.len() > CURSOR_MAX_BYTES {
+        return None;
+    }
+    let cursor: AnalysisCursor = serde_json::from_str(text).ok()?;
+    (cursor.schema_version == CHECKPOINT_SCHEMA_VERSION
+        && cursor.source_lower_exclusive == run.source_lower_exclusive
+        && cursor.source_upper_inclusive == run.source_upper_inclusive
+        && cursor.chunk_count > 0
+        && cursor.validated_chunk_count <= cursor.next_chunk_index
+        && cursor.next_chunk_index <= cursor.chunk_count)
+        .then_some(pioneer_protocol::SelfImprovementProgress {
+            processed_chunks: cursor.validated_chunk_count,
+            total_chunks: cursor.chunk_count,
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AnalysisCursor {

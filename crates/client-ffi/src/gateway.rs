@@ -391,6 +391,7 @@ mod tests {
 
     fn settings_snapshot() -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
             self_improvement: Default::default(),

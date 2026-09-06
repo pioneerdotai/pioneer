@@ -7738,6 +7738,19 @@ impl MessageProcessor {
             );
         snapshot.self_improvement =
             crate::settings::self_improvement_settings_to_protocol(&authoritative.desired_config());
+        snapshot.self_improvement_status = match workspace_id {
+            Some(workspace_id) => Some(
+                crate::self_improvement::status::snapshot(
+                    self.crud_store.as_ref(),
+                    workspace_id,
+                    &authoritative,
+                    self.self_improvement_supervisor.is_some(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
         self.apply_vector_provider_key_presence(&mut snapshot, workspace_id)?;
         crate::settings::apply_thread_episodic_vector_search_status(
             &mut snapshot.thread_episodic.vector_search,

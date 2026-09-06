@@ -62,6 +62,10 @@ impl PioneerDesktop {
         self.profile_editor = None;
         self.profile_editor_input_subscriptions.clear();
         self.settings_content_view = content_view;
+        self.self_improvement_status_poll = None;
+        if content_view == SettingsContentView::SelfImprovement {
+            self.start_self_improvement_status_poll(cx);
+        }
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
         match content_view {

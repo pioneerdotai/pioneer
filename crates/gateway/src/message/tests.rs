@@ -4554,6 +4554,17 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
     let enabled: pioneer_protocol::GatewaySettingsUpdateResponse =
         serde_json::from_value(enable_response.result).expect("enabled settings response");
     assert!(enabled.settings.self_improvement.enabled);
+    let status = enabled
+        .settings
+        .self_improvement_status
+        .as_ref()
+        .expect("runtime status");
+    assert_eq!(status.workspace_id, workspace_id);
+    assert_eq!(
+        status.reason,
+        pioneer_protocol::SelfImprovementStatusReason::NoNewSources
+    );
+    assert!(status.next_scheduled_at_unix.is_some());
     assert_eq!(
         enabled
             .settings
@@ -4587,6 +4598,17 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
     let peer_response = recv_response_by_id(&mut other_rx, peer_get_id.as_str()).await;
     let peer: pioneer_protocol::GatewaySettingsGetResponse =
         serde_json::from_value(peer_response.result).expect("peer settings response");
+    let peer_status = peer
+        .settings
+        .self_improvement_status
+        .as_ref()
+        .expect("peer runtime status");
+    assert_eq!(peer_status.workspace_id, other_workspace.id);
+    assert_eq!(
+        peer_status.phase,
+        pioneer_protocol::SelfImprovementPhase::Disabled
+    );
+    assert!(peer_status.next_scheduled_at_unix.is_none());
     assert_eq!(
         peer.settings.self_improvement,
         pioneer_protocol::GatewaySelfImprovementSettings::default(),
@@ -5990,6 +6012,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let mut settings_snapshot = pioneer_protocol::GatewaySettingsSnapshot {
+        self_improvement_status: None,
         general: Default::default(),
         memory: Default::default(),
         self_improvement: Default::default(),

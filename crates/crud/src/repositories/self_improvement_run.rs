@@ -34,6 +34,22 @@ pub async fn find_by_id<C: ConnectionTrait>(
         })
 }
 
+pub async fn find_latest<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    activation_epoch: i64,
+) -> Result<Option<self_improvement_run::Model>> {
+    self_improvement_run::Entity::find()
+        .filter(self_improvement_run::Column::WorkspaceId.eq(workspace_id))
+        .filter(self_improvement_run::Column::ActivationEpoch.eq(activation_epoch))
+        .order_by_desc(self_improvement_run::Column::ScheduledDateUtc)
+        .order_by_desc(self_improvement_run::Column::CreatedAt)
+        .order_by_desc(self_improvement_run::Column::Id)
+        .one(db)
+        .await
+        .context("failed to read latest self-improvement run")
+}
+
 pub async fn find_daily<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,

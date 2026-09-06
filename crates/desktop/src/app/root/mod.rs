@@ -391,6 +391,7 @@ pub struct PioneerDesktop {
     pub(super) remote_access_settings_expanded: bool,
     pub(super) remote_access_key_input_revision: u64,
     pub(super) remote_access_status_poll_generation: u64,
+    pub(super) self_improvement_status_poll: Option<Task<()>>,
     pub(super) settings_tree_state: Entity<TreeState>,
     pub(super) administration_tree_state: Entity<TreeState>,
     pub(super) provider_tree_state: Entity<TreeState>,

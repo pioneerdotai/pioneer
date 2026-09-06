@@ -723,6 +723,7 @@ impl GatewaySettings {
     ) -> pioneer_protocol::GatewaySettingsSnapshot {
         let general = self.effective_general_settings(config);
         pioneer_protocol::GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general,
             memory: self.effective_memory_settings(&config.memory).to_protocol(),
             self_improvement: self_improvement_settings_to_protocol(

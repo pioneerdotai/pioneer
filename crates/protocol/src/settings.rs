@@ -2,6 +2,68 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::VoiceStatus;
+
+/// Bounded operational projection; contains no history, prompts, or provider error payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewaySelfImprovementStatus {
+    pub workspace_id: String,
+    pub phase: SelfImprovementPhase,
+    pub reason: SelfImprovementStatusReason,
+    pub observed_at_unix: i64,
+    pub last_run_at_unix: Option<i64>,
+    pub last_result: Option<SelfImprovementStatusReason>,
+    pub next_scheduled_at_unix: Option<i64>,
+    pub next_retry_at_unix: Option<i64>,
+    pub progress: Option<SelfImprovementProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelfImprovementProgress {
+    pub processed_chunks: u32,
+    pub total_chunks: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfImprovementPhase {
+    Disabled,
+    Unavailable,
+    Waiting,
+    Running,
+    Retrying,
+    Failed,
+    NoChange,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfImprovementStatusReason {
+    Disabled,
+    ModelUnavailable,
+    WorkerUnavailable,
+    Preparing,
+    NoNewSources,
+    AwaitingSchedule,
+    Analyzing,
+    Finalizing,
+    Pending,
+    Recovering,
+    Timeout,
+    OutputLimit,
+    InvalidResponse,
+    ProviderError,
+    ResponseFiltered,
+    NoCandidate,
+    ReviewerRejected,
+    ValidationRejected,
+    Created,
+    Updated,
+    RolledBack,
+    Cancelled,
+    Unknown,
+}
 use crate::turn::CLIAgentRuntimeKind;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -53,6 +115,9 @@ pub struct GatewaySettingsUpdateResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsSnapshot {
+    /// Read-only status of learning in the connection's workspace. Absent on older gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_improvement_status: Option<GatewaySelfImprovementStatus>,
     #[serde(default)]
     pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
@@ -940,6 +1005,7 @@ mod tests {
     #[test]
     fn settings_snapshot_roundtrips_thread_episodic_settings() {
         let snapshot = GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: Default::default(),
             self_improvement: Default::default(),
@@ -1096,6 +1162,7 @@ mod tests {
     #[test]
     fn gateway_settings_snapshot_reports_vector_key_presence_without_secret_values() {
         let snapshot = GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
             self_improvement: GatewaySelfImprovementSettings::default(),

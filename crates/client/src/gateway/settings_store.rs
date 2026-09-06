@@ -291,6 +291,7 @@ mod tests {
     use super::*;
     fn snapshot(keepawake: bool) -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: pioneer_protocol::GatewayGeneralSettings {
                 keepawake,
                 ..Default::default()

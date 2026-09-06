@@ -4,5 +4,6 @@ pub(crate) mod learner;
 pub(crate) mod overlay;
 mod prompts;
 pub(crate) mod settings;
+pub(crate) mod status;
 pub(crate) mod supervisor;
 pub(crate) mod validation;

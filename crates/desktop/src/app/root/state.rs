@@ -124,6 +124,7 @@ impl PioneerDesktop {
             remote_access_settings_expanded: false,
             remote_access_key_input_revision: 0,
             remote_access_status_poll_generation: 0,
+            self_improvement_status_poll: None,
             settings_tree_state,
             administration_tree_state,
             provider_tree_state,

@@ -3359,6 +3359,21 @@ impl CrudStore {
             .await
     }
 
+    /// Read-only, workspace/activation-scoped summary source for the settings surface.
+    pub async fn get_latest_self_improvement_run(
+        &self,
+        workspace_id: &str,
+        activation_epoch: i64,
+    ) -> Result<Option<SelfImprovementRunRecord>> {
+        repositories::self_improvement_run::find_latest(
+            &self.connection,
+            workspace_id,
+            activation_epoch,
+        )
+        .await
+        .map(|run| run.map(repositories::self_improvement_run::record_from_model))
+    }
+
     pub async fn get_self_improvement_run(
         &self,
         workspace_id: &str,

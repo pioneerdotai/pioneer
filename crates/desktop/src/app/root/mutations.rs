@@ -154,6 +154,9 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         self.main_content_view = view;
+        if view != MainContentView::Settings {
+            self.self_improvement_status_poll = None;
+        }
         self.rebuild_sidebar_tree_state(cx);
     }
 

@@ -297,7 +297,8 @@ impl PioneerDesktop {
                                     t!("settings.self_improvement.description").to_string(),
                                 )),
                         )
-                        .child(panel),
+                        .child(panel)
+                        .child(self.render_self_improvement_status(cx)),
                 ),
             )
             .into_any_element()

@@ -110,6 +110,7 @@ pub fn gateway_settings_snapshot_with_memory(
     memory: GatewayMemorySettings,
 ) -> GatewaySettingsSnapshot {
     let mut snapshot = current.cloned().unwrap_or_else(|| GatewaySettingsSnapshot {
+        self_improvement_status: None,
         general: GatewayGeneralSettings::default(),
         memory: GatewayMemorySettings::default(),
         self_improvement: Default::default(),
@@ -140,6 +141,7 @@ mod tests {
 
     fn snapshot() -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings {
                 keepawake: true,
                 ..Default::default()
