@@ -55,7 +55,8 @@ impl ClientEffectSink for DesktopClientEffectSink<'_, '_> {
             let _ = self
                 .app
                 .gateway
-                .ws_command_sender
+                .client_runtime
+                .ws_command_sender()
                 .thread_unsubscribe(thread_id);
         }
     }

@@ -174,7 +174,7 @@ impl PioneerDesktop {
             .set_action_status(&summary.artifact, ThreadArtifactActionStatus::Opening);
         cx.notify();
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         let artifact = summary.artifact.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -641,7 +641,8 @@ impl PioneerDesktop {
             .ok_or(DesktopArtifactActionError::Reconfigure)?;
         let access = self
             .gateway
-            .ws_command_sender
+            .client_runtime
+            .ws_command_sender()
             .current_gateway_http_access()
             .map_err(|_| DesktopArtifactActionError::Authentication)?;
         if let Some(client) = self.gateway.http_client.as_ref()
@@ -653,8 +654,9 @@ impl PioneerDesktop {
             .map_err(|_| DesktopArtifactActionError::DownloadFailed)?;
         let client = DesktopGatewayHttpClient::for_endpoint(
             &endpoint,
-            self.gateway.ws_command_sender.clone(),
+            self.gateway.client_runtime.ws_command_sender().clone(),
             runtime_home,
+            self.gateway.client_runtime.client_core().clone(),
         )
         .map_err(map_gateway_http_error)?;
         self.gateway.http_client = Some(client.clone());

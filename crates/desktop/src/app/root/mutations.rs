@@ -610,7 +610,6 @@ impl PioneerDesktop {
     /// deliberately owned by the Gateway coordinator and remain untouched.
     pub(in crate::app) fn clear_authorization_epoch_cache(&mut self) {
         self.gateway.capability_snapshot = None;
-        self.gateway.authorization_projections.clear_epoch();
         self.workspaces.clear();
         self.workspaces_error = None;
         self.set_active_thread_id(None);

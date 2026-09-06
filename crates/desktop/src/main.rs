@@ -6,6 +6,7 @@ i18n!("locales", fallback = "en");
 mod app;
 mod assets;
 mod audio;
+mod client_runtime;
 mod code_highlight;
 mod components;
 mod file_opener;
@@ -224,6 +225,7 @@ fn main() {
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
         gpui_kit::init(cx);
+        client_runtime::DesktopRuntimeCoordinator::install(cx);
         theme::init(cx);
         menu::init_system_menus(cx);
 

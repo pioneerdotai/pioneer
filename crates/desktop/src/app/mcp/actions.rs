@@ -44,7 +44,7 @@ impl PioneerDesktop {
         self.mark_mcp_pending(name.as_str(), true);
         self.apply_local_mcp_policy(name.as_str(), enabled, allow_implicit_invocation);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let name_for_request = name.clone();
@@ -135,7 +135,7 @@ impl PioneerDesktop {
         self.mcp_error = None;
         self.mark_mcp_pending(name.as_str(), true);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let name_for_request = name.clone();
@@ -218,7 +218,7 @@ impl PioneerDesktop {
         self.mcp_error = None;
         self.mark_mcp_pending(name.as_str(), true);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let name_for_request = name.clone();

@@ -76,7 +76,7 @@ impl PioneerDesktop {
                 editor_workspace_id,
                 editor_folder_id,
                 input,
-                self.gateway.ws_command_sender.clone(),
+                self.gateway.client_runtime.ws_command_sender().clone(),
                 window.window_handle(),
                 window,
                 cx,

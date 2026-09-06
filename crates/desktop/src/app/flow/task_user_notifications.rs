@@ -48,7 +48,7 @@ impl PioneerDesktop {
             .task_user_notifications_refresh_generation
             .wrapping_add(1);
         let generation = self.task_user_notifications_refresh_generation;
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         let request_workspace_id = workspace_id.clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -115,7 +115,7 @@ impl PioneerDesktop {
         let Some(connection_id) = self.gateway.ws_connection_id else {
             return;
         };
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         let request_notification_id = notification_id.clone();
         let request_workspace_id = workspace_id.clone();
 

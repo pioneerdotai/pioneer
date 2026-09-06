@@ -64,12 +64,31 @@ impl PioneerDesktop {
             .col_resizable(false)
             .loop_selection(false)
         });
-        let client_runtime = ClientRuntime::new();
-        let gateway_ws_command_sender = client_runtime.ws_command_sender();
+        crate::client_runtime::DesktopRuntimeCoordinator::install(cx);
+        let client_runtime = ClientRuntime::from_core(
+            cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                .core(),
+        );
         let desktop_microphone_gate = DesktopMicrophoneGateReport::unknown();
+        let session_binding = crate::gateway::GatewaySessionBinding::new(
+            cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                .registrar()
+                .as_ref(),
+        );
+        let desktop = cx.weak_entity();
+        let switcher_view = cx.new(|cx| {
+            crate::app::flow::GatewaySwitcherView::new(desktop.clone(), session_binding.clone(), cx)
+        });
+
+        let setup_view = cx.new(|cx| {
+            crate::app::initial::InitialGatewaySetupView::new(desktop, session_binding.clone(), cx)
+        });
 
         let mut view = Self {
-            startup: DesktopStartupCoordinator::new(startup_trace),
+            startup: DesktopStartupCoordinator::new(
+                startup_trace,
+                client_runtime.client_core().clone(),
+            ),
             invitation_join: None,
             invitation_join_input_subscriptions: Vec::new(),
             thread_coordinators: HashMap::new(),
@@ -232,18 +251,31 @@ impl PioneerDesktop {
             show_sidebar: true,
             sidebar_panel_width: px(320.),
             gateway: GatewayCoordinator {
+                compatibility_task: None,
+                settings_task: None,
+                settings_binding: crate::gateway::GatewaySettingsBinding::new(
+                    cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                        .registrar()
+                        .as_ref(),
+                ),
+                identity_task: None,
+                session_task: None,
+                transport_verification_task: None,
+                transport_verification_id: None,
+                applied_transport_revision: 0,
+                identity_binding: crate::gateway::IdentityAuthorizationBinding::new(
+                    cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                        .registrar()
+                        .as_ref(),
+                ),
+                session_binding,
+                switcher_view,
+                setup_view,
                 runtime: None,
                 client_runtime,
-                ws_command_sender: gateway_ws_command_sender,
                 http_client: None,
                 ws_connection_id: None,
-                deferred_ws_events: VecDeque::new(),
-                connection_epoch: 0,
-                session_refresh_generation: 0,
                 current_principal_refresh_generation: 0,
-                session_refresh_in_flight: false,
-                authorization_revision: None,
-                authorization_projections: Default::default(),
                 connection_state: GatewayConnectionState::Connecting,
                 status: t!("gateway.status.connecting").to_string(),
                 status_level: GatewayStatusLevel::Neutral,
@@ -254,9 +286,7 @@ impl PioneerDesktop {
                 settings: None,
                 settings_loading: false,
                 settings_error: None,
-                auth_sessions: Vec::new(),
-                auth_sessions_loading: false,
-                auth_sessions_error: None,
+                auth_session_action_error: None,
                 auth_session_action_pending: None,
                 current_auth: None,
                 capability_snapshot: None,

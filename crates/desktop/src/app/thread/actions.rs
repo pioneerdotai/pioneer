@@ -52,7 +52,7 @@ impl PioneerDesktop {
             return;
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn_in(
             window,
             move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
@@ -110,7 +110,7 @@ impl PioneerDesktop {
                 return;
             }
         };
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -366,8 +366,8 @@ impl PioneerDesktop {
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.active_gateway().map(|gateway| gateway.kind));
-        let upload_sender = self.gateway.ws_command_sender.clone();
-        let turn_start_sender = self.gateway.ws_command_sender.clone();
+        let upload_sender = self.gateway.client_runtime.ws_command_sender().clone();
+        let turn_start_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         self.composer_upload_in_progress = true;
         self.composer_upload_error = None;
@@ -393,7 +393,7 @@ impl PioneerDesktop {
                         let mut waited_for_session_refresh = false;
                         loop {
                             match this.update_in(&mut cx, |view, _, _| {
-                                view.gateway.session_refresh_in_flight
+                                view.gateway.client_runtime.client_core().gateway_refresh_in_flight()
                             }) {
                                 Ok(true) => {
                                     waited_for_session_refresh = true;
@@ -432,7 +432,7 @@ impl PioneerDesktop {
                     #[cfg(not(feature = "qualification-diagnostics"))]
                     while this
                         .update_in(&mut cx, |view, _, _| {
-                            view.gateway.session_refresh_in_flight
+                            view.gateway.client_runtime.client_core().gateway_refresh_in_flight()
                         })
                         .unwrap_or(false)
                     {
@@ -715,7 +715,7 @@ impl PioneerDesktop {
         } = cancel_request;
         conversation.apply(requested_event);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
 

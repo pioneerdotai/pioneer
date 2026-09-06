@@ -252,7 +252,7 @@ impl PioneerDesktop {
         self.startup
             .begin(pioneer_observability::DesktopStartupStage::ThreadTreeRequest);
         self.thread_list_loading = true;
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -416,7 +416,7 @@ impl PioneerDesktop {
             self.active_thread_resubscribe_pending = true;
         }
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let thread_id_for_request = thread_id.clone();
@@ -514,7 +514,7 @@ impl PioneerDesktop {
         }
         cx.notify();
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         let thread_id = thread_id.to_owned();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -585,7 +585,7 @@ impl PioneerDesktop {
             return;
         }
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let request_thread_id = thread_id.clone();

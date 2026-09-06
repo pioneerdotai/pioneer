@@ -205,13 +205,28 @@ pub(crate) fn render_gateway_setup_form(
     form_state: Entity<GatewaySetupFormState>,
     mode: GatewaySetupFormMode,
     desktop_entity: Entity<PioneerDesktop>,
+    session: Option<&pioneer_client::gateway::session_controller::GatewaySessionPublication>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     pioneer_observability::record_qualification_diagnostic!(record_render(
         pioneer_observability::RenderRegion::GatewaySetup
     ));
-    let snapshot = form_state.read(cx).snapshot();
+    let mut snapshot = form_state.read(cx).snapshot();
+    if !snapshot.connecting && snapshot.setup_action.is_none() {
+        if let Some(session) = session {
+            if let Some(status) = &session.status {
+                if let pioneer_client::state::reducers::GatewayStatusTextUpdate::Set(status) =
+                    &status.status
+                {
+                    snapshot.status = crate::app::flow::gateway_status_message_text(status);
+                }
+            }
+            if snapshot.error.is_none() {
+                snapshot.error = session.gateway_error.clone();
+            }
+        }
+    }
     let status = render_gateway_setup_status(&snapshot, cx);
 
     let mut form = v_form();

@@ -229,17 +229,9 @@ impl PioneerDesktop {
             ClientRuntimeNotification::TaskUserNotificationDelivered(notification) => {
                 self.apply_task_user_notification_delivered(notification, cx);
             }
-            ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(notification) => {
-                self.apply_remote_access_status_changed(notification.status, cx);
-            }
-            ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
-                notification,
-            ) => {
-                self.apply_thread_episodic_vector_refill_status_changed(notification, cx);
-            }
-            ClientRuntimeNotification::GatewayVoiceInputStatusChanged(notification) => {
-                self.apply_voice_input_status_changed(notification.settings, cx);
-            }
+            ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
+            | ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(_)
+            | ClientRuntimeNotification::GatewayVoiceInputStatusChanged(_) => {}
             ClientRuntimeNotification::WorkspaceChanged {
                 notification,
                 preference,
@@ -323,7 +315,7 @@ impl PioneerDesktop {
         let known_threads = desktop_thread_authorization_scopes(&self.thread_coordinators);
         let plan = plan_access_changed(
             &notification,
-            self.gateway.authorization_revision,
+            None,
             active_workspace_id.as_deref(),
             active_thread_id.as_deref(),
             known_threads.as_slice(),
@@ -334,10 +326,6 @@ impl PioneerDesktop {
 
         let administration_invalidation = self.administration.apply_access_changed(&notification);
 
-        self.gateway.authorization_revision = Some(plan.authorization_revision);
-        self.gateway
-            .authorization_projections
-            .invalidate_for_revision(plan.authorization_revision);
         // A newer revision is one atomic fence across global, workspace and
         // thread projections. No capability from the previous generation may
         // remain readable while its replacement is fetched.
@@ -490,23 +478,6 @@ impl PioneerDesktop {
         if !invalidate_workspace && !invalidate_thread {
             return;
         }
-        let generation = notification.policy_generation.get();
-        if self
-            .gateway
-            .authorization_revision
-            // `access/changed` and the typed projection event intentionally
-            // share one durable generation for the same ACL commit. The
-            // access event can arrive first, so equality must still apply the
-            // typed, exact-scope cache invalidation.
-            .is_some_and(|current| current > generation)
-        {
-            return;
-        }
-        self.gateway.authorization_revision = Some(generation);
-        self.gateway
-            .authorization_projections
-            .invalidate_for_revision(generation);
-
         self.gateway.capability_snapshot = None;
         self.invalidate_active_thread_capability_projection();
         self.reconcile_composer_draft_with_capabilities();
@@ -517,57 +488,6 @@ impl PioneerDesktop {
         // lifecycle event happens to refresh it.
         self.refresh_current_principal(cx);
         self.ensure_active_thread_capabilities_loaded(true, cx);
-        cx.notify();
-    }
-
-    fn apply_remote_access_status_changed(
-        &mut self,
-        status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(settings) = self.gateway.settings.as_mut() else {
-            return;
-        };
-        settings.remote_access.status = status;
-        cx.notify();
-    }
-
-    fn apply_thread_episodic_vector_refill_status_changed(
-        &mut self,
-        notification: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(settings) = self.gateway.settings.as_mut() else {
-            return;
-        };
-        let should_refresh = apply_vector_refill_notification(
-            &mut settings.thread_episodic.vector_search,
-            &notification,
-        );
-        cx.notify();
-
-        if should_refresh {
-            self.refresh_gateway_settings(cx);
-        }
-    }
-
-    fn apply_voice_input_status_changed(
-        &mut self,
-        settings: pioneer_protocol::GatewayVoiceInputSettings,
-        cx: &mut Context<Self>,
-    ) {
-        self.desktop_voice_status = settings.runtime.phase.coarse_voice_status();
-        self.desktop_voice_status_error =
-            settings.runtime.error.as_ref().map(|error| error.clone());
-        self.desktop_voice_status_poll_generation =
-            self.desktop_voice_status_poll_generation.saturating_add(1);
-        let Some(current) = self.gateway.settings.as_mut() else {
-            self.refresh_gateway_settings(cx);
-            cx.notify();
-            return;
-        };
-        current.voice_input = settings;
-        self.gateway.settings_error = None;
         cx.notify();
     }
 
@@ -1289,44 +1209,8 @@ mod access_change_tests {
     }
 }
 
-fn apply_vector_refill_notification(
-    vector_search: &mut pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
-    notification: &pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification,
-) -> bool {
-    vector_search.refill_status = notification.status;
-    if let Some(local_model_status) = notification.local_model_status {
-        vector_search.local_model_status = local_model_status;
-        if local_model_status
-            == pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading
-        {
-            vector_search.downloaded_bytes = notification.downloaded_bytes;
-            vector_search.total_bytes = notification.total_bytes;
-        } else {
-            vector_search.downloaded_bytes = None;
-            vector_search.total_bytes = None;
-        }
-    } else if notification.status
-        == pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
-        && vector_search.provider
-            == Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local)
-        && vector_search.local_model_status
-            != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
-    {
-        vector_search.local_model_status =
-            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading;
-    }
-
-    let terminal = matches!(
-        notification.status,
-        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
-            | pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed
-    );
-    if terminal {
-        vector_search.downloaded_bytes = None;
-        vector_search.total_bytes = None;
-    }
-    terminal
-}
+#[cfg(test)]
+use pioneer_client::gateway::settings_store::apply_vector_refill_notification;
 
 fn desktop_voice_no_speech_message(error: Option<&VoiceError>) -> String {
     let Some(details) = error.and_then(|error| desktop_voice_error_details(error.message.as_str()))

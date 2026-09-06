@@ -107,7 +107,7 @@ impl PioneerDesktop {
                 selected_reasoning_effort: self.composer_selected_reasoning_effort.clone(),
                 mode: ProviderModelSelectorMode::Chat,
                 workspace_id,
-                ws_sender: self.gateway.ws_command_sender.clone(),
+                ws_sender: self.gateway.client_runtime.ws_command_sender().clone(),
                 on_save: Rc::new(
                     |view: &mut PioneerDesktop, selection: ModelSelectorSelection, _cx| {
                         view.set_composer_model_selection_from_user(

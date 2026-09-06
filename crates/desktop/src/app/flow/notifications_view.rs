@@ -12,7 +12,11 @@ impl PioneerDesktop {
             return;
         }
 
-        let operation_epoch = self.gateway.connection_epoch;
+        let operation_epoch = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .gateway_operation_epoch();
 
         for (index, message) in messages.into_iter().enumerate() {
             let notification_id = operation_epoch.saturating_mul(1_000) + index as u64;

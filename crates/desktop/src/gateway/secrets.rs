@@ -4,85 +4,38 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pioneer_keystore::{
     DbKeyStore, DbKeyStoreConfig, SecretEntryMeta, SecretFilter, SecretId, SecretKind, SecretMeta,
     SecretStore,
 };
-use pioneer_protocol::{
-    AuthSecretString, AuthSessionId, DeviceId, GatewayId, PrincipalId, REFRESH_CREDENTIAL_BODY_LEN,
-    REFRESH_CREDENTIAL_PREFIX, TokenFamilyId,
-};
-use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use pioneer_protocol::{REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX};
+use serde::Deserialize;
 use zeroize::Zeroizing;
 
 pub(crate) const DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 2;
 const RETIRED_DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 1;
 const RETIRED_DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE: &str = "pioneer.desktop.gateway_auth_token";
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DesktopGatewaySessionSecret {
-    pub schema_version: u32,
-    pub gateway_id: GatewayId,
-    pub principal_id: PrincipalId,
-    pub device_id: DeviceId,
-    pub session_id: AuthSessionId,
-    pub token_family_id: TokenFamilyId,
-    pub installation_id: String,
-    pub refresh_generation: u64,
-    pub refresh_expires_at_unix: u64,
-    pub refresh_token: AuthSecretString,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_refresh_request_id: Option<String>,
-}
+pub(crate) use pioneer_client::gateway::session_envelope::GatewaySessionEnvelope as DesktopGatewaySessionSecret;
 
 #[derive(Deserialize)]
 struct DesktopGatewaySessionEnvelopeVersion {
     schema_version: u32,
 }
 
-impl DesktopGatewaySessionSecret {
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.schema_version != DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION {
-            bail!("unsupported desktop Gateway session secret version");
-        }
-        if !is_valid_refresh_credential(self.refresh_token.expose_secret()) {
-            bail!("invalid desktop Gateway refresh credential");
-        }
-        let installation_id = self.installation_id.trim();
-        if installation_id != self.installation_id
-            || installation_id.is_empty()
-            || installation_id.chars().count() > 255
-            || installation_id.chars().any(char::is_control)
-        {
-            bail!("invalid desktop Gateway installation id");
-        }
-        if self.refresh_expires_at_unix == 0 {
-            bail!("invalid desktop Gateway refresh expiry");
-        }
-        if self
-            .pending_refresh_request_id
-            .as_ref()
-            .is_some_and(|request_id| {
-                pioneer_protocol::RequestId::new(request_id.clone()).is_err()
-                    || !request_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
-            })
-        {
-            bail!("invalid desktop Gateway pending refresh request id");
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn is_valid_refresh_credential(value: &str) -> bool {
-    let Some(body) = value.strip_prefix(REFRESH_CREDENTIAL_PREFIX) else {
-        return false;
-    };
-    body.len() == REFRESH_CREDENTIAL_BODY_LEN
-        && body
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+pub(super) fn desktop_session_validation_error(
+    error: pioneer_client::gateway::session_envelope::GatewaySessionEnvelopeError,
+) -> anyhow::Error {
+    use pioneer_client::gateway::session_envelope::GatewaySessionEnvelopeError::*;
+    anyhow::anyhow!(match error {
+        Version => "unsupported desktop Gateway session secret version",
+        Credential => "invalid desktop Gateway refresh credential",
+        Installation => "invalid desktop Gateway installation id",
+        Expiry => "invalid desktop Gateway refresh expiry",
+        RequestId => "invalid desktop Gateway pending refresh request id",
+    })
 }
 
 #[derive(Clone)]
@@ -124,7 +77,9 @@ impl DesktopSecrets {
         }
         let session = serde_json::from_str::<DesktopGatewaySessionSecret>(raw.as_str())
             .context("failed to decode desktop Gateway session envelope")?;
-        session.validate()?;
+        session
+            .validate()
+            .map_err(desktop_session_validation_error)?;
         Ok(Some(session))
     }
 
@@ -134,7 +89,9 @@ impl DesktopSecrets {
         session: &DesktopGatewaySessionSecret,
         label: Option<String>,
     ) -> Result<()> {
-        session.validate()?;
+        session
+            .validate()
+            .map_err(desktop_session_validation_error)?;
         let id = desktop_gateway_session_secret_id(session_ref)?;
         let serialized = Zeroizing::new(
             serde_json::to_string(session)
@@ -305,5 +262,32 @@ mod tests {
         assert!(
             format!("{error:#}").contains("invalid desktop Gateway pending refresh request id")
         );
+    }
+}
+
+impl pioneer_client::gateway::session_refresh::GatewaySessionStorage for DesktopSecrets {
+    fn load(
+        &self,
+        endpoint: &pioneer_client::gateway::types::GatewayEndpoint,
+    ) -> Result<Option<DesktopGatewaySessionSecret>> {
+        match endpoint.session_ref.as_deref() {
+            Some(reference) => self.get_gateway_session(reference),
+            None => Ok(None),
+        }
+    }
+
+    fn persist(
+        &self,
+        endpoint: &pioneer_client::gateway::types::GatewayEndpoint,
+        envelope: &DesktopGatewaySessionSecret,
+    ) -> Result<()> {
+        self.put_gateway_session(
+            endpoint
+                .session_ref
+                .as_deref()
+                .context("Gateway endpoint has no session reference")?,
+            envelope,
+            Some(format!("{} session", endpoint.name)),
+        )
     }
 }

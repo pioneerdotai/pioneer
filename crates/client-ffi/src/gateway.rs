@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::contracts::{ClientGatewaySettingsGetRequest, ClientGatewaySettingsUpdateRequest};
 use pioneer_client::gateway::{
     migration::{GatewayRegistryLoad, GatewayRegistryLoadError, load_registry_json},
     runtime::GatewayProfileError,
@@ -18,17 +20,13 @@ use pioneer_client::{
     rpc::JsonRpcRequestTransport,
     settings::voice::{voice_input_settings_plan, voice_input_status_reduction},
 };
-use pioneer_protocol::{
-    GatewaySettingsGetResponse, GatewaySettingsUpdateResponse, ProviderListModelsParams,
-    ProviderListModelsResponse,
-};
+#[cfg(test)]
+use pioneer_protocol::{GatewaySettingsGetResponse, GatewaySettingsUpdateResponse};
+use pioneer_protocol::{ProviderListModelsParams, ProviderListModelsResponse};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::contracts::{
-    ClientGatewaySettingsGetRequest, ClientGatewaySettingsUpdateRequest,
-    ClientVoiceInputPlanRequest, ClientVoiceInputPlanResult,
-};
+use crate::contracts::{ClientVoiceInputPlanRequest, ClientVoiceInputPlanResult};
 
 pub const CLIENT_NOT_INITIALIZED_CODE: &str = "client_not_initialized";
 pub const GATEWAY_DISCONNECTED_CODE: &str = "gateway_disconnected";
@@ -263,7 +261,8 @@ pub fn plan_delete_remote_gateway_registry_request(
     )
 }
 
-pub fn gateway_settings_get_for_bridge<TTransport>(
+#[cfg(test)]
+fn gateway_settings_get_for_bridge<TTransport>(
     transport: &TTransport,
     _request: ClientGatewaySettingsGetRequest,
 ) -> anyhow::Result<GatewaySettingsGetResponse>
@@ -273,7 +272,8 @@ where
     pioneer_client::transport::ws::command_sender::gateway_settings_get(transport)
 }
 
-pub fn gateway_settings_update_for_bridge<TTransport>(
+#[cfg(test)]
+fn gateway_settings_update_for_bridge<TTransport>(
     transport: &TTransport,
     request: ClientGatewaySettingsUpdateRequest,
 ) -> anyhow::Result<GatewaySettingsUpdateResponse>

@@ -1,7 +1,7 @@
 use super::*;
 use pioneer_client::state::reducers::{
     GatewayOperationFinishOutcome, GatewayOperationSuccessInfo, GatewayStatusEndpoint,
-    GatewayStatusInput, GatewayStatusProjection, GatewayStatusTextUpdate, project_gateway_status,
+    GatewayStatusInput, GatewayStatusProjection, GatewayStatusTextUpdate,
     reduce_gateway_operation_begin, reduce_gateway_operation_finish,
 };
 
@@ -34,7 +34,13 @@ impl PioneerDesktop {
         status: String,
         cx: &mut Context<Self>,
     ) {
-        if !should_apply_gateway_operation_result(self.gateway.connection_epoch, operation_epoch) {
+        if !should_apply_gateway_operation_result(
+            self.gateway
+                .client_runtime
+                .client_core()
+                .gateway_operation_epoch(),
+            operation_epoch,
+        ) {
             return;
         }
 
@@ -54,7 +60,13 @@ impl PioneerDesktop {
         result: Result<GatewayOperationSuccess, anyhow::Error>,
         cx: &mut Context<Self>,
     ) {
-        if !should_apply_gateway_operation_result(self.gateway.connection_epoch, operation_epoch) {
+        if !should_apply_gateway_operation_result(
+            self.gateway
+                .client_runtime
+                .client_core()
+                .gateway_operation_epoch(),
+            operation_epoch,
+        ) {
             return;
         }
 
@@ -115,7 +127,7 @@ impl PioneerDesktop {
             self.clear_turn_resume_queue();
         }
         if reduction.disconnect_ws {
-            let _ = self.gateway.ws_command_sender.disconnect();
+            let _ = self.gateway.client_runtime.ws_command_sender().disconnect();
         }
         if self.gateway.ws_connection_id.is_some() {
             self.replay_deferred_gateway_ws_events(cx);
@@ -173,14 +185,18 @@ impl PioneerDesktop {
             self.gateway.ws_connection_id,
         );
 
-        let projection = project_gateway_status(GatewayStatusInput {
-            connecting: self.gateway.connecting,
-            current_status_is_empty: self.gateway.status.is_empty(),
-            runtime_state,
-            active_endpoint,
-            has_ready_ws_connection,
-            gateway_error: self.gateway.error.clone(),
-        });
+        let projection = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .project_gateway_status(GatewayStatusInput {
+                connecting: self.gateway.connecting,
+                current_status_is_empty: self.gateway.status.is_empty(),
+                runtime_state,
+                active_endpoint,
+                has_ready_ws_connection,
+                gateway_error: self.gateway.error.clone(),
+            });
 
         self.apply_gateway_status_projection(projection);
     }

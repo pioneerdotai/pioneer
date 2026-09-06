@@ -63,7 +63,7 @@ impl PioneerDesktop {
             0,
         ));
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -232,7 +232,7 @@ impl PioneerDesktop {
         ));
         self.mark_skill_pack_pending(&pack_id, true);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let pack_id_for_request = pack_id.clone();
@@ -331,7 +331,7 @@ impl PioneerDesktop {
 
         self.skills_error = None;
         self.mark_skill_pack_pending(&pack_id, true);
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let pack_id_for_request = pack_id.clone();
@@ -430,7 +430,7 @@ impl PioneerDesktop {
         ));
         self.mark_skill_pending(&skill_id, true);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let skill_id_for_request = skill_id.clone();
@@ -537,7 +537,7 @@ impl PioneerDesktop {
         self.skills_error = None;
         self.mark_skill_pending(&skill_id, true);
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let skill_id_for_request = skill_id.clone();
@@ -641,7 +641,7 @@ impl PioneerDesktop {
         );
         self.reproject_skill_management();
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let skill_id_for_request = skill_id.clone();

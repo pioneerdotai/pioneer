@@ -41,6 +41,18 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
+        schema_doc!(
+            "gateway_settings_store.json",
+            crate::gateway::settings_store::GatewaySettingsStore
+        ),
+        schema_doc!(
+            "identity_authorization_publication.json",
+            crate::gateway::identity_authorization::IdentityAuthorizationPublication
+        ),
+        schema_doc!(
+            "gateway_session_publication.json",
+            crate::gateway::session_controller::GatewaySessionPublication
+        ),
         schema_doc!("client_scope.json", crate::core::ClientScope),
         schema_doc!("client_revisions.json", crate::core::ClientRevisions),
         schema_doc!("client_generation.json", crate::core::ClientGeneration),
@@ -1539,6 +1551,58 @@ mod tests {
                 "{} should serialize to a JSON object",
                 document.file_name
             );
+        }
+    }
+
+    #[test]
+    fn native_storage_effect_schemas_export_typed_completions() {
+        for document in client_schema_documents().into_iter().filter(|document| {
+            matches!(
+                document.file_name,
+                "client_effect_plan.json" | "client_effect_completion.json"
+            )
+        }) {
+            let json = serde_json::to_string_pretty(&document.schema).unwrap();
+            assert!(json.contains("GatewaySession") || json.contains("gateway_session"));
+            if std::env::var_os("PIONEER_PRINT_PUBLICATION_SCHEMAS").is_some() {
+                println!("SCHEMA_BEGIN:{}\n{json}\nSCHEMA_END", document.file_name);
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_settings_store_schema_exports_scoped_state() {
+        let schema = schema_for!(crate::gateway::settings_store::GatewaySettingsStore);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        assert!(json.contains("loading"));
+        assert!(json.contains("saving"));
+        if std::env::var_os("PIONEER_PRINT_SETTINGS_SCHEMA").is_some() {
+            println!("SETTINGS_SCHEMA_BEGIN\n{json}\nSETTINGS_SCHEMA_END");
+        }
+    }
+
+    #[test]
+    fn identity_authorization_publication_schema_contains_no_credentials() {
+        let schema =
+            schema_for!(crate::gateway::identity_authorization::IdentityAuthorizationPublication);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        for forbidden in ["refresh_token", "access_token", "credential"] {
+            assert!(!json.contains(&format!("\"{forbidden}\"")));
+        }
+        if std::env::var_os("PIONEER_PRINT_IDENTITY_SCHEMA").is_some() {
+            println!("IDENTITY_SCHEMA_BEGIN\n{json}\nIDENTITY_SCHEMA_END");
+        }
+    }
+
+    #[test]
+    fn gateway_session_publication_schema_contains_no_credentials() {
+        let schema = schema_for!(crate::gateway::session_controller::GatewaySessionPublication);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        for forbidden in ["refresh_token", "access_token", "credential"] {
+            assert!(!json.contains(&format!("\"{forbidden}\"")));
+        }
+        if std::env::var_os("PIONEER_PRINT_SESSION_SCHEMA").is_some() {
+            println!("SESSION_SCHEMA_BEGIN\n{json}\nSESSION_SCHEMA_END");
         }
     }
 

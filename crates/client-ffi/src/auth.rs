@@ -272,7 +272,7 @@ pub fn auth_exchange_error(error: AuthExchangeError) -> crate::ClientFfiError {
     crate::ClientFfiError::new(error.message, code)
 }
 
-const fn default_exchange_timeout_ms() -> u64 {
+pub(crate) const fn default_exchange_timeout_ms() -> u64 {
     15_000
 }
 
@@ -372,4 +372,185 @@ mod tests {
         assert_eq!(parsed.activation_code.expose_secret(), token);
         assert!(!format!("{parsed:?}").contains(&token));
     }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientGatewaySessionValidationRequest {
+    Envelope {
+        envelope: serde_json::Value,
+    },
+    Refresh {
+        envelope: pioneer_client::gateway::session_envelope::GatewaySessionEnvelope,
+        installation_id: String,
+        grant: pioneer_protocol::AuthRefreshGrant,
+    },
+    Identity {
+        envelope: pioneer_client::gateway::session_envelope::GatewaySessionEnvelope,
+        installation_id: String,
+        identity: pioneer_protocol::AuthMeResponse,
+    },
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Serialize)]
+pub struct ClientGatewaySessionValidationResult {
+    pub valid: bool,
+    pub terminal_reason: Option<pioneer_client::gateway::session_lifecycle::SessionTerminalReason>,
+}
+
+pub fn validate_gateway_session(
+    request: ClientGatewaySessionValidationRequest,
+) -> ClientGatewaySessionValidationResult {
+    use ClientGatewaySessionValidationRequest::*;
+    const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+    let (valid, terminal_reason) = match request {
+        Envelope { envelope } => (
+            serde_json::from_value::<
+                pioneer_client::gateway::session_envelope::GatewaySessionEnvelope,
+            >(envelope)
+            .is_ok_and(|envelope| {
+                envelope.validate().is_ok()
+                    && envelope.refresh_generation <= MAX_SAFE_INTEGER
+                    && envelope.refresh_expires_at_unix <= MAX_SAFE_INTEGER
+            }),
+            None,
+        ),
+        Refresh {
+            envelope,
+            installation_id,
+            grant,
+        } => (
+            envelope.accepts_refresh(
+                &installation_id,
+                pioneer_protocol::ClientKind::Mobile,
+                &grant,
+            ) && envelope.refresh_generation < MAX_SAFE_INTEGER
+                && grant.refresh_generation <= MAX_SAFE_INTEGER
+                && grant.refresh_expires_at_unix > 0
+                && grant.refresh_expires_at_unix <= MAX_SAFE_INTEGER
+                && grant.access_expires_at_unix <= MAX_SAFE_INTEGER,
+            None,
+        ),
+        Identity {
+            envelope,
+            installation_id,
+            identity,
+        } => {
+            let reason = envelope.identity_failure(
+                Some(&envelope.gateway_id),
+                &installation_id,
+                pioneer_protocol::ClientKind::Mobile,
+                &identity,
+            );
+            (reason.is_none(), reason)
+        }
+    };
+    ClientGatewaySessionValidationResult {
+        valid,
+        terminal_reason,
+    }
+}
+
+#[cfg(test)]
+mod session_validation_tests {
+    use serde_json::{Value, json};
+
+    fn envelope() -> Value {
+        json!({"schema_version":2,"gateway_id":"G00000000000000000001","principal_id":"P00000000000000000001","device_id":"D00000000000000000001","session_id":"S00000000000000000001","token_family_id":"F00000000000000000001","installation_id":"installation-mobile-1","refresh_generation":0,"refresh_expires_at_unix":1900000000,"refresh_token":format!("prf2_{}", "r".repeat(164))})
+    }
+
+    #[test]
+    fn envelope_boundary_rejects_missing_binding_unknown_secrets_and_bad_request_ids() {
+        let runtime = crate::ClientFfiRuntime::default();
+        let check = |envelope| {
+            runtime
+                .gateway_session_validate(
+                    &json!({"kind":"envelope","envelope":envelope}).to_string(),
+                )
+                .unwrap()
+                .valid
+        };
+        assert!(check(envelope()));
+        for field in ["installation_id", "token_family_id"] {
+            let mut value = envelope();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(!check(value));
+        }
+        for (field, value) in [
+            ("access_token", json!("not-durable")),
+            ("pending_refresh_request_id", json!("not-a-request-id")),
+            ("refresh_generation", json!(9007199254740992_u64)),
+        ] {
+            let mut invalid = envelope();
+            invalid[field] = value;
+            assert!(!check(invalid));
+        }
+    }
+
+    #[test]
+    fn shared_refresh_validation_checks_the_mobile_installation_family_and_identity() {
+        let runtime = crate::ClientFfiRuntime::default();
+        let grant = json!({
+            "auth_protocol_version":pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION,
+            "credential_storage_order":"persist_refresh_before_activating_access",
+            "gateway":{"id":"G00000000000000000001"},
+            "principal":{"id":"P00000000000000000001","kind":"user","display_name":"Synthetic","nickname":"synthetic"},
+            "device":{"id":"D00000000000000000001","installation_id":"installation-mobile-1","display_name":"Synthetic","client_kind":"mobile","status":"active"},
+            "session":{"id":"S00000000000000000001","device_id":"D00000000000000000001","token_family_id":"F00000000000000000001","status":"active","refresh_generation":1,"refresh_expires_at_unix":1900000000},
+            "access_token":"synthetic-access","access_expires_at_unix":1800000900,
+            "refresh_token":format!("prf2_{}", "s".repeat(164)),"refresh_generation":1,"refresh_expires_at_unix":1900000000
+        });
+        let check = |grant| {
+            runtime.gateway_session_validate(&json!({"kind":"refresh","envelope":envelope(),"installation_id":"installation-mobile-1","grant":grant}).to_string())
+        };
+        assert!(check(grant.clone()).unwrap().valid);
+        let mut wrong_installation = grant.clone();
+        wrong_installation["device"]["installation_id"] = json!("different-installation");
+        assert!(!check(wrong_installation).unwrap().valid);
+        let mut wrong_family = grant.clone();
+        wrong_family["session"]["token_family_id"] = json!("F00000000000000000002");
+        assert!(!check(wrong_family).unwrap().valid);
+        let mut malformed_family = grant.clone();
+        malformed_family["session"]["token_family_id"] = json!("invalid-family");
+        assert!(check(malformed_family).is_err());
+        let mut stored = envelope();
+        stored["refresh_generation"] = json!(1);
+        let mut identity = json!({"gateway":grant["gateway"],"principal":grant["principal"],"device":grant["device"],"session":grant["session"],"role_key":null});
+        identity["device"]["installation_id"] = json!("different-installation");
+        let result = runtime.gateway_session_validate(&json!({"kind":"identity","envelope":stored,"installation_id":"installation-mobile-1","identity":identity}).to_string()).unwrap();
+        assert!(!result.valid);
+        assert_eq!(result.terminal_reason, Some(pioneer_client::gateway::session_lifecycle::SessionTerminalReason::SessionCompromised));
+    }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientGatewaySessionEnsureRequest {
+    pub endpoint: pioneer_client::gateway::types::GatewayEndpoint,
+    pub installation_id: String,
+    pub timings: ClientGatewayWsTimings,
+    pub rejected_connection_id: Option<u64>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientGatewaySessionControlRequest {
+    Suspend {
+        endpoint_id: String,
+    },
+    Clear {
+        endpoint_id: String,
+    },
+    Disconnected {
+        endpoint_id: String,
+        connection_id: Option<u64>,
+    },
+    Stop {
+        endpoint_id: String,
+        reason: pioneer_client::gateway::session_lifecycle::SessionTerminalReason,
+    },
 }

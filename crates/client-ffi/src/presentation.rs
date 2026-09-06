@@ -23,6 +23,7 @@ pub struct ClientArtifactPresentationPolicyRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct ClientAuthorizationProjectionAcceptRequest {
     /// Exact native transport epoch that produced `snapshot`. Delayed
     /// responses from a replaced Gateway connection must never advance the
@@ -132,57 +133,6 @@ pub fn artifact_presentation_policy(
         request.can_attach_artifacts,
         request.connected,
     )
-}
-
-pub fn accept_authorization_projection(
-    store: &mut pioneer_client::authorization::AuthorizationProjectionStore,
-    active_gateway_id: Option<&str>,
-    active_connection_id: Option<u64>,
-    request: ClientAuthorizationProjectionAcceptRequest,
-) -> ClientAuthorizationProjectionAcceptResult {
-    if request.gateway_id.trim().is_empty()
-        || active_gateway_id != Some(request.gateway_id.as_str())
-        || active_connection_id != Some(request.connection_id)
-    {
-        return ClientAuthorizationProjectionAcceptResult {
-            acceptance:
-                pioneer_client::authorization::AuthorizationProjectionAcceptance::Incompatible,
-            snapshot: None,
-        };
-    }
-    if !pioneer_client::authorization::authorization_capability_snapshot_is_compatible(
-        &request.snapshot,
-        &request.expected_principal_id,
-        request.workspace_id.as_deref(),
-        request.thread_id.as_deref(),
-    ) {
-        return ClientAuthorizationProjectionAcceptResult {
-            acceptance:
-                pioneer_client::authorization::AuthorizationProjectionAcceptance::Incompatible,
-            snapshot: None,
-        };
-    }
-    let acceptance = store.accept(request.snapshot);
-    let snapshot = (acceptance
-        == pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted)
-        .then(|| {
-            store
-                .snapshot(
-                    request.workspace_id.as_deref(),
-                    request.thread_id.as_deref(),
-                )
-                // An absent requested scope is an authoritative negative
-                // projection, not a malformed response. Preserve the narrowest
-                // confirmed parent scope so Mobile can fail closed immediately
-                // instead of retaining an older positive cache entry.
-                .or_else(|| store.snapshot(request.workspace_id.as_deref(), None))
-                .or_else(|| store.snapshot(None, None))
-        })
-        .flatten();
-    ClientAuthorizationProjectionAcceptResult {
-        acceptance,
-        snapshot,
-    }
 }
 
 pub fn reconcile_execution_draft(
@@ -581,74 +531,89 @@ mod tests {
     #[test]
     fn authorization_projection_rejects_a_delayed_previous_connection_epoch() {
         let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let mut store = pioneer_client::authorization::AuthorizationProjectionStore::default();
-        let result = accept_authorization_projection(
-            &mut store,
-            Some("gateway-new"),
-            Some(12),
-            ClientAuthorizationProjectionAcceptRequest {
-                gateway_id: "gateway-old".to_owned(),
-                connection_id: 11,
-                expected_principal_id: auth.principal.id.clone(),
-                workspace_id: Some("workspace-a".to_owned()),
-                thread_id: None,
-                snapshot: capability_snapshot(&auth, false),
-            },
-        );
+        let runtime = crate::ClientFfiRuntime::default();
+        runtime
+            .client_runtime
+            .core
+            .begin_authorization_epoch(Some(("gateway-new".into(), 12)));
+        let result = runtime
+            .authorization_projection_accept(
+                &serde_json::to_string(&ClientAuthorizationProjectionAcceptRequest {
+                    gateway_id: "gateway-old".to_owned(),
+                    connection_id: 11,
+                    expected_principal_id: auth.principal.id.clone(),
+                    workspace_id: Some("workspace-a".to_owned()),
+                    thread_id: None,
+                    snapshot: capability_snapshot(&auth, false),
+                })
+                .unwrap(),
+            )
+            .unwrap();
 
         assert_eq!(
             result.acceptance,
             pioneer_client::authorization::AuthorizationProjectionAcceptance::Incompatible
         );
         assert!(result.snapshot.is_none());
-        assert_eq!(store.accepted_revision(), None);
+        assert_eq!(runtime.client_runtime.core.authorization_revision(), None);
     }
 
     #[test]
     fn authorization_projection_accepts_only_the_exact_active_connection_epoch() {
         let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let mut store = pioneer_client::authorization::AuthorizationProjectionStore::default();
-        let result = accept_authorization_projection(
-            &mut store,
-            Some("gateway-a"),
-            Some(12),
-            ClientAuthorizationProjectionAcceptRequest {
-                gateway_id: "gateway-a".to_owned(),
-                connection_id: 12,
-                expected_principal_id: auth.principal.id.clone(),
-                workspace_id: Some("workspace-a".to_owned()),
-                thread_id: None,
-                snapshot: capability_snapshot(&auth, false),
-            },
-        );
+        let runtime = crate::ClientFfiRuntime::default();
+        runtime
+            .client_runtime
+            .core
+            .begin_authorization_epoch(Some(("gateway-a".into(), 12)));
+        let result = runtime
+            .authorization_projection_accept(
+                &serde_json::to_string(&ClientAuthorizationProjectionAcceptRequest {
+                    gateway_id: "gateway-a".to_owned(),
+                    connection_id: 12,
+                    expected_principal_id: auth.principal.id.clone(),
+                    workspace_id: Some("workspace-a".to_owned()),
+                    thread_id: None,
+                    snapshot: capability_snapshot(&auth, false),
+                })
+                .unwrap(),
+            )
+            .unwrap();
 
         assert_eq!(
             result.acceptance,
             pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
         );
         assert!(result.snapshot.is_some());
-        assert_eq!(store.accepted_revision(), Some(7));
+        assert_eq!(
+            runtime.client_runtime.core.authorization_revision(),
+            Some(7)
+        );
     }
 
     #[test]
     fn authorization_projection_accepts_a_missing_thread_as_an_authoritative_deny() {
         let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let mut store = pioneer_client::authorization::AuthorizationProjectionStore::default();
-        let result = accept_authorization_projection(
-            &mut store,
-            Some("gateway-a"),
-            Some(12),
-            ClientAuthorizationProjectionAcceptRequest {
-                gateway_id: "gateway-a".to_owned(),
-                connection_id: 12,
-                expected_principal_id: auth.principal.id.clone(),
-                workspace_id: Some("workspace-a".to_owned()),
-                thread_id: Some("thread-a".to_owned()),
-                // The Gateway response is workspace-scoped only. It must not
-                // satisfy a thread-scoped Mobile query.
-                snapshot: capability_snapshot(&auth, false),
-            },
-        );
+        let runtime = crate::ClientFfiRuntime::default();
+        runtime
+            .client_runtime
+            .core
+            .begin_authorization_epoch(Some(("gateway-a".into(), 12)));
+        let result = runtime
+            .authorization_projection_accept(
+                &serde_json::to_string(&ClientAuthorizationProjectionAcceptRequest {
+                    gateway_id: "gateway-a".to_owned(),
+                    connection_id: 12,
+                    expected_principal_id: auth.principal.id.clone(),
+                    workspace_id: Some("workspace-a".to_owned()),
+                    thread_id: Some("thread-a".to_owned()),
+                    // The Gateway response is workspace-scoped only. It must not
+                    // satisfy a thread-scoped Mobile query.
+                    snapshot: capability_snapshot(&auth, false),
+                })
+                .unwrap(),
+            )
+            .unwrap();
 
         assert_eq!(
             result.acceptance,
@@ -657,6 +622,9 @@ mod tests {
         let snapshot = result.snapshot.expect("negative thread projection");
         assert!(snapshot.workspace.is_some());
         assert!(snapshot.thread.is_none());
-        assert_eq!(store.accepted_revision(), Some(7));
+        assert_eq!(
+            runtime.client_runtime.core.authorization_revision(),
+            Some(7)
+        );
     }
 }

@@ -14,16 +14,31 @@ pub(super) fn gateway_endpoint_subtitle(endpoint: &GatewayEndpoint) -> String {
 }
 
 impl PioneerDesktop {
-    pub(crate) fn render_gateways_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_gateways_popover(
+        &self,
+        desktop_entity: Entity<Self>,
+        publication: Option<
+            &pioneer_client::gateway::session_controller::GatewaySessionPublication,
+        >,
+        cx: &gpui_kit::App,
+    ) -> AnyElement {
+        let scoped_status = publication
+            .and_then(|publication| publication.status.as_ref())
+            .filter(|_| !self.gateway.connecting);
         let show_spinner = !self.is_gateway_setup_required()
-            && (self.gateway.connecting || self.gateway.connection_state.is_transitioning());
-
-        let gateway_status_color = match self.gateway.status_level {
-            GatewayStatusLevel::Neutral => cx.theme().muted_foreground,
-            GatewayStatusLevel::Connected => cx.theme().success,
-            GatewayStatusLevel::Degraded => cx.theme().warning,
-            GatewayStatusLevel::Failed => cx.theme().danger,
-        };
+            && (self.gateway.connecting
+                || scoped_status
+                    .map_or(self.gateway.connection_state, |status| {
+                        status.connection_state
+                    })
+                    .is_transitioning());
+        let gateway_status_color =
+            match scoped_status.map_or(self.gateway.status_level, |status| status.status_level) {
+                GatewayStatusLevel::Neutral => cx.theme().muted_foreground,
+                GatewayStatusLevel::Connected => cx.theme().success,
+                GatewayStatusLevel::Degraded => cx.theme().warning,
+                GatewayStatusLevel::Failed => cx.theme().danger,
+            };
 
         let gateway_endpoints = self
             .gateway
@@ -47,8 +62,19 @@ impl PioneerDesktop {
             .map(|endpoint| format!("{} ({})", endpoint.name, endpoint.gateway_base_url))
             .unwrap_or_else(|| t!("gateway.status.connecting").to_string());
 
-        let gateway_hover_status = self.gateway.status.clone();
-        let gateway_hover_error = self.gateway.error.clone();
+        let gateway_hover_status = scoped_status
+            .and_then(|status| match &status.status {
+                pioneer_client::state::reducers::GatewayStatusTextUpdate::Set(status) => Some(
+                    super::ws_events_connection::gateway_status_message_text(status),
+                ),
+                pioneer_client::state::reducers::GatewayStatusTextUpdate::KeepExisting => None,
+            })
+            .unwrap_or_else(|| self.gateway.status.clone());
+        let gateway_hover_error = if scoped_status.is_some() {
+            publication.and_then(|publication| publication.gateway_error.clone())
+        } else {
+            self.gateway.error.clone()
+        };
 
         let gateway_selection_locked = self.gateway.connecting;
 
@@ -56,8 +82,6 @@ impl PioneerDesktop {
         let inactive_indicator_color = cx.theme().yellow;
         let option_foreground = cx.theme().foreground;
         let option_muted_background = cx.theme().muted;
-
-        let desktop_entity = cx.entity();
 
         let ghost_hover = if cx.theme().mode.is_dark() {
             cx.theme().secondary.lighten(0.2).opacity(0.8)
@@ -417,5 +441,50 @@ impl PioneerDesktop {
                 )
             })
             .into_any_element()
+    }
+}
+
+/// Retains the Gateway switcher's exact session subscription for one window.
+pub(crate) struct GatewaySwitcherView {
+    desktop: WeakEntity<PioneerDesktop>,
+    binding: std::sync::Arc<crate::gateway::GatewaySessionBinding>,
+    _delivery: gpui_kit::Task<()>,
+}
+
+impl GatewaySwitcherView {
+    pub(crate) fn new(
+        desktop: WeakEntity<PioneerDesktop>,
+        binding: std::sync::Arc<crate::gateway::GatewaySessionBinding>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut publications = binding.watch();
+        let delivery = cx.spawn(async move |view, cx| {
+            while publications.changed().await.is_ok() {
+                let _ = *publications.borrow_and_update();
+                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            desktop,
+            binding,
+            _delivery: delivery,
+        }
+    }
+}
+
+impl gpui_kit::Render for GatewaySwitcherView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(desktop) = self.desktop.upgrade() else {
+            return div().into_any_element();
+        };
+        let publication = self
+            .binding
+            .publication()
+            .map(|publication| publication.payload());
+        desktop
+            .read(cx)
+            .render_gateways_popover(desktop.clone(), publication.as_deref(), cx)
     }
 }

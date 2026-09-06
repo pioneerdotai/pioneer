@@ -253,7 +253,11 @@ impl PioneerDesktop {
         let workspace_unavailable = self.gateway.connecting
             || self.gateway.connection_state.is_transitioning()
             || self.gateway.connection_state != GatewayConnectionState::Connected
-            || self.gateway.session_refresh_in_flight;
+            || self
+                .gateway
+                .client_runtime
+                .client_core()
+                .gateway_refresh_in_flight();
         let selector_interaction = workspace_selector_interaction_state(
             workspace_unavailable,
             self.workspace_action_in_progress(),
