@@ -112,6 +112,12 @@ Search queries should normally be in the user's language. Include concrete names
 
 Write memory only when the information is durable and future-useful.
 
+Every `memory_remember` call must include both `content` and singular `category`
+as top-level fields, including updates by key and corrections by `memoryId`.
+The address identifies the record; it does not supply these required fields.
+After a missing-field error, correct the payload before retrying; do not repeat
+the unchanged call. See `references/tool-schemas.md` for the exact arguments.
+
 Good memory candidates:
 
 - stable user identity, biography, preferences, communication style;

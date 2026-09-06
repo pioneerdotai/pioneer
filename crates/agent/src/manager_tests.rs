@@ -1766,6 +1766,7 @@ struct SequencedToolProvider {
     preflight_response_text: String,
     first_response_delay: Duration,
     first_provider_replay_state: Option<ProviderReplayState>,
+    fail_after_first: bool,
     next_index: AtomicUsize,
 }
 
@@ -1781,6 +1782,7 @@ impl SequencedToolProvider {
             preflight_response_text: TEST_PREFLIGHT_RESPONSE.to_owned(),
             first_response_delay: Duration::ZERO,
             first_provider_replay_state: None,
+            fail_after_first: false,
             next_index: AtomicUsize::new(0),
         }
     }
@@ -1797,6 +1799,7 @@ impl SequencedToolProvider {
             preflight_response_text: preflight_response_text.into(),
             first_response_delay: Duration::ZERO,
             first_provider_replay_state: None,
+            fail_after_first: false,
             next_index: AtomicUsize::new(0),
         }
     }
@@ -3108,6 +3111,10 @@ impl Provider for SequencedToolProvider {
                 provider_replay_state: self.first_provider_replay_state.clone(),
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
             });
+        }
+
+        if index == 1 && self.fail_after_first {
+            anyhow::bail!("simulated provider failure after request_tools");
         }
 
         Ok(ChatResponse {
@@ -4964,12 +4971,33 @@ async fn provider_failure_prepares_cleanup_for_later_recovery_terminalization() 
 
 #[tokio::test]
 async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_window() {
-    let provider = Arc::new(EmptyNoToolRoundProvider::new(usize::MAX));
+    let mut provider = SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "request_before_failure".to_owned(),
+            name: "request_tools".to_owned(),
+            arguments:
+                serde_json::json!({"domains":["memory"], "reason":"Need memory after recovery"})
+                    .to_string(),
+        }],
+        "recovered",
+    );
+    provider.fail_after_first = true;
+    let provider = Arc::new(provider);
     let registry = Arc::new(ProviderRegistry::with_provider(
         "empty-no-tool-round",
-        provider,
+        provider.clone(),
     ));
     let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
+    manager
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
+            Ok(MemoryRecallSnapshot::empty()),
+            Ok(MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            }),
+        ))))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
     let workspace_id = "provider_failure_window_workspace";
     let thread_id = "provider_failure_window_thread";
     let turn_id = "provider_failure_window_turn";
@@ -5036,6 +5064,14 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                 );
                 assert_eq!(payload.provider_budget.exhausted_limit, None);
                 assert_eq!(payload.provider_budget.exhausted_observed, None);
+                assert!(
+                    payload
+                        .requested_tool_names
+                        .contains(&"memory_remember".to_owned())
+                );
+                // Simulate the persisted wire boundary rather than retaining only Rust state.
+                let payload =
+                    serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
                 checkpoint_context = Some(ExecutionCheckpointContext {
                     window_id: notification.window_id,
                     window_index: notification.window_index,
@@ -5058,6 +5094,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
     }
     assert!(saw_provider_failure, "provider failure should be emitted");
 
+    let restart_checkpoint = checkpoint_context.clone();
     let recovery_manager = manager.clone();
     let recovery_handle = tokio::spawn(async move {
         recovery_manager
@@ -5107,6 +5144,61 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     .await
                     .expect("provider recovery task should not panic")
                     .expect("provider recovery should start from the checkpoint");
+                recv_terminal_effect_preparation_until_completed(&mut durable_events, turn_id)
+                    .await;
+                let requests = provider.snapshot_requests();
+                assert!(
+                    requests
+                        .last()
+                        .unwrap()
+                        .tools
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool.name == "memory_remember")
+                );
+                let restarted_provider = Arc::new(CaptureAgentProvider::default());
+                let restarted = AgentManager::new(
+                    Arc::new(ProviderRegistry::with_provider(
+                        "capture",
+                        restarted_provider.clone(),
+                    )),
+                    test_tool_loop_config(),
+                );
+                restarted
+                    .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
+                        Ok(MemoryRecallSnapshot::empty()),
+                        Ok(MemoryToolMaterialization {
+                            bundles: vec![fake_standard_memory_tool_bundle()],
+                            diagnostics: Vec::new(),
+                        }),
+                    ))))
+                    .await;
+                install_configured_memory_hooks_for_test(&restarted).await;
+                restarted
+                    .ensure_thread(thread_id, workspace_id)
+                    .await
+                    .unwrap();
+                let mut restarted_events = subscribe_agent_events(&restarted, thread_id).await;
+                restarted.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
+                    thread_id, turn_id, ThreadMode::Agent, AgentTurnHookRuntimeContext::default(),
+                    "test-model", "capture", HashMap::new(), SkillCatalogSnapshot { version: 1, generated_at_unix: 0, skills: Vec::new() },
+                    vec![UserInput::Text { text: "ordinary question".to_owned(), text_elements: Vec::new() }],
+                    Vec::new(), Vec::new(), HashMap::new(), Vec::new(), restart_checkpoint,
+                    pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
+                ).await.unwrap();
+                assert_turn_completed(&recv_events_until_terminal(&mut restarted_events).await);
+                assert!(
+                    restarted_provider
+                        .snapshot_requests()
+                        .last()
+                        .unwrap()
+                        .tools
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool.name == "memory_remember")
+                );
                 return;
             }
             _ => {}
@@ -11731,6 +11823,101 @@ async fn wall_clock_window_checkpoints_before_executing_the_next_tool_batch() {
         Some("final after time checkpoint")
     );
     assert_eq!(provider.snapshot_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn request_tools_selection_survives_execution_window_and_not_next_turn() {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "request_memory".to_owned(),
+            name: "request_tools".to_owned(),
+            arguments: serde_json::json!({"domains":["memory"],"reason":"Need durable memory later in this turn"}).to_string(),
+        }],
+        "finished",
+    ));
+    let registry = Arc::new(ProviderRegistry::with_provider(
+        "sequenced-tools",
+        provider.clone(),
+    ));
+    let mut config = test_tool_loop_config();
+    set_execution_window_budget(&mut config, 1, 8);
+    let manager = AgentManager::new(registry, config);
+    manager
+        .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
+            Ok(MemoryRecallSnapshot::empty()),
+            Ok(MemoryToolMaterialization {
+                bundles: vec![fake_standard_memory_tool_bundle()],
+                diagnostics: Vec::new(),
+            }),
+        ))))
+        .await;
+    install_configured_memory_hooks_for_test(&manager).await;
+    manager
+        .ensure_thread("visibility_thread", "visibility_workspace")
+        .await
+        .unwrap();
+    let mut events = subscribe_agent_events(&manager, "visibility_thread").await;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "visibility_thread",
+            "visibility_turn",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "ordinary question".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    let has_memory_write = |request: &ChatRequest| {
+        request
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "memory_remember")
+    };
+    assert!(!has_memory_write(&requests[0]));
+    assert!(
+        has_memory_write(&requests[1]),
+        "resumed provider request must contain the previously requested schema"
+    );
+    assert!(
+        observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnToolLoopBudgetExceeded(_)))
+    );
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "visibility_thread",
+            "visibility_next_turn",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "ordinary question".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+    assert!(!has_memory_write(
+        provider.snapshot_requests().last().unwrap()
+    ));
 }
 
 #[tokio::test]

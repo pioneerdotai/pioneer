@@ -1567,7 +1567,7 @@ fn memory_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         memory_tool_spec(
             MEMORY_REMEMBER_TOOL,
-            "Store durable memory only when the user explicitly asks or when memory policy allows. Do not use for one-off commands, temporary debugging state, raw logs or secrets unless explicitly requested and policy allows.",
+            "Store durable memory only when the user explicitly asks or when memory policy allows. Every call requires both content and category, including updates by key and corrections by memoryId; neither address supplies these fields. Do not use for one-off commands, temporary debugging state, raw logs or secrets unless explicitly requested and policy allows.",
             memory_remember_schema(),
             safe_mutation_recovery(),
         ),
@@ -1692,8 +1692,8 @@ fn memory_remember_schema() -> JsonValue {
         "properties": {
             "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. With memoryId, must match the target namespace." },
             "memoryId": { "type": "string", "description": "Existing active record to correct. Preserves its namespace and key; scope/namespace/key, if provided, must match. Read the record first." },
-            "content": { "type": "string", "minLength": 1 },
-            "category": { "type": "string", "enum": category_values() },
+            "content": { "type": "string", "minLength": 1, "description": "Required full content to save, including on updates and corrections." },
+            "category": { "type": "string", "enum": category_values(), "description": "Required on every call, including updates by key and corrections by memoryId. Not inferred from the address or existing record." },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() },
             "sensitivity": { "type": "string", "enum": sensitivity_values() },
@@ -1973,6 +1973,35 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_remember_requires_content_and_category_for_all_write_addresses() {
+        let spec = memory_tool_specs()
+            .into_iter()
+            .find(|s| s.spec.name == MEMORY_REMEMBER_TOOL)
+            .unwrap()
+            .spec;
+        assert_eq!(spec.parameters["required"], json!(["content", "category"]));
+        for address in [
+            json!({}),
+            json!({"key":"name","scope":"user"}),
+            json!({"memoryId":"existing"}),
+        ] {
+            let mut payload = address;
+            payload["content"] = json!("User is Alexander.");
+            payload["category"] = json!("identity");
+            assert!(serde_json::from_value::<MemoryRememberToolInput>(payload.clone()).is_ok());
+            for field in ["content", "category"] {
+                let mut missing = payload.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                let error = serde_json::from_value::<MemoryRememberToolInput>(missing).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("missing field `{field}`"))
+                );
+            }
+        }
+    }
     #[test]
     fn memory_scope_diagnostics_are_policy_only_and_schemas_keep_namespace() {
         let context = MemoryOperationContext {

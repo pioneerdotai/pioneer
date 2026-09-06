@@ -194,6 +194,21 @@ Required fields:
 - `content`
 - `category`
 
+Both are required on every call: creation, same-key update, and correction by
+`memoryId`. Neither an existing key nor `memoryId` makes the call a partial patch
+or causes `category` to be inherited. For example, after reading the target:
+
+```json
+{
+  "memoryId": "id-returned-by-memory-get",
+  "content": "User prefers detailed answers.",
+  "category": "communication_style"
+}
+```
+
+If the tool reports a missing `category`, add it before retrying.
+Do not resend the unchanged payload.
+
 Good proactive write candidates:
 
 - stable user preferences and communication style;
