@@ -242,6 +242,7 @@ impl PioneerDesktop {
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
+        content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
         item: &TurnItem,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
@@ -263,6 +264,7 @@ impl PioneerDesktop {
             TurnItem::AgentMessage { .. } => self.render_item_agent_message(
                 entry,
                 item_view,
+                content,
                 item,
                 top_spacing,
                 is_last_row,
@@ -307,6 +309,7 @@ impl PioneerDesktop {
             TurnItem::FileChange { .. } => self.render_item_file_change(
                 entry,
                 item_view,
+                content,
                 item,
                 top_spacing,
                 is_last_row,

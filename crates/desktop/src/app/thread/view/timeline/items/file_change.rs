@@ -6,9 +6,7 @@ use crate::app::{
 };
 use gpui_kit::component::{collapsible::Collapsible, h_flex, v_flex, *};
 use gpui_kit::{prelude::*, *};
-use pioneer_client::timeline::labels::{
-    TimelineFinalStatusKind, file_change_display_text, final_file_change_status,
-};
+use pioneer_client::timeline::labels::{TimelineFinalStatusKind, file_change_display_text};
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -25,34 +23,32 @@ impl PioneerDesktop {
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
+        content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
         item: &TurnItem,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (tool_name, changed_files, exit_code, output, success) = match item {
+        let (tool_name, changed_files, exit_code, output) = match item {
             TurnItem::FileChange {
                 tool_name,
                 changed_files,
                 exit_code,
                 stdout,
                 stderr,
-                success,
                 ..
             } => (
                 tool_name.clone(),
                 changed_files.clone(),
                 *exit_code,
                 file_change_display_text(stdout.as_deref(), stderr.as_deref(), None),
-                *success,
             ),
             _ => (
                 "apply_patch".to_owned(),
                 Vec::new(),
                 None,
                 file_change_display_text(None, None, Some(Self::timeline_entry_text(item_view))),
-                None,
             ),
         };
 
@@ -106,7 +102,9 @@ impl PioneerDesktop {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let status = final_file_change_status(item_view.status, success, exit_code);
+        let status = content
+            .final_status
+            .expect("captured published file change status");
         let final_status = file_change_status_label(status.kind);
         let is_successful = status.successful;
         let details =

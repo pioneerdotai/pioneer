@@ -11,6 +11,7 @@ pub(in crate::app) struct ThreadBindings {
     latest: RefCell<HashMap<ClientScope, ClientPublicationReference>>,
     pending: RefCell<HashMap<ClientScope, ClientPublicationReference>>,
     changed: tokio::sync::watch::Sender<u64>,
+    timeline: RefCell<Option<(String, super::view::timeline::TimelineRenderModel)>>,
 }
 impl ThreadBindings {
     pub(in crate::app) fn new(registrar: Arc<dyn ClientBindingRegistrar>) -> Arc<Self> {
@@ -20,6 +21,7 @@ impl ThreadBindings {
             latest: RefCell::default(),
             pending: RefCell::default(),
             changed: tokio::sync::watch::channel(0).0,
+            timeline: RefCell::default(),
         })
     }
     fn register(self: &Arc<Self>, scope: ClientScope) {
@@ -33,11 +35,22 @@ impl ThreadBindings {
         self.registrations.borrow_mut().insert(scope, registration);
     }
     pub(in crate::app) fn select(self: &Arc<Self>, id: Option<&str>) {
-        let keep = |scope: &ClientScope| !matches!(scope, ClientScope::Thread { thread_id } if Some(thread_id.as_str()) != id);
+        let keep = |scope: &ClientScope| !matches!(scope, ClientScope::Thread { thread_id } | ClientScope::Timeline { thread_id } if Some(thread_id.as_str()) != id);
         self.registrations.borrow_mut().retain(|s, _| keep(s));
         self.pending.borrow_mut().retain(|s, _| keep(s));
         self.latest.borrow_mut().retain(|s, _| keep(s));
+        if self
+            .timeline
+            .borrow()
+            .as_ref()
+            .is_some_and(|(thread, _)| Some(thread.as_str()) != id)
+        {
+            self.timeline.borrow_mut().take();
+        }
         if let Some(id) = id {
+            self.register(ClientScope::Timeline {
+                thread_id: id.to_owned(),
+            });
             self.register(ClientScope::Thread {
                 thread_id: id.to_owned(),
             });
@@ -50,12 +63,31 @@ impl ThreadBindings {
         });
     }
     pub(in crate::app) fn remove(&self, id: &str) {
-        let keep = |scope: &ClientScope| !matches!(scope, ClientScope::Thread {thread_id} | ClientScope::SidebarSummary {thread_id, ..} if thread_id == id);
+        if self
+            .timeline
+            .borrow()
+            .as_ref()
+            .is_some_and(|(thread, _)| thread == id)
+        {
+            self.timeline.borrow_mut().take();
+        }
+        let keep = |scope: &ClientScope| !matches!(scope, ClientScope::Thread {thread_id} | ClientScope::Timeline {thread_id} | ClientScope::SidebarSummary {thread_id, ..} if thread_id == id);
         self.registrations.borrow_mut().retain(|s, _| keep(s));
         self.pending.borrow_mut().retain(|s, _| keep(s));
         self.latest.borrow_mut().retain(|s, _| keep(s));
     }
+    pub(in crate::app) fn timeline_model(
+        &self,
+        id: Option<&str>,
+    ) -> Option<super::view::timeline::TimelineRenderModel> {
+        self.timeline
+            .borrow()
+            .as_ref()
+            .filter(|(thread, _)| Some(thread.as_str()) == id)
+            .map(|(_, model)| model.clone())
+    }
     pub(in crate::app) fn clear(&self) {
+        self.timeline.borrow_mut().take();
         self.registrations.borrow_mut().clear();
         self.pending.borrow_mut().clear();
         self.latest.borrow_mut().clear();
@@ -80,6 +112,18 @@ impl ClientPublicationSink for ThreadBindings {
             .is_some_and(|old| old.snapshot().sequence() >= publication.snapshot().sequence())
         {
             return;
+        }
+        if let ClientScope::Timeline { thread_id } = scope {
+            *self.timeline.borrow_mut() = publication
+                .typed::<pioneer_client::timeline::presentation::TimelineSnapshot>()
+                .map(|snapshot| {
+                    (
+                        thread_id.clone(),
+                        super::view::timeline::TimelineRenderModel::from_snapshot(
+                            &snapshot.payload(),
+                        ),
+                    )
+                });
         }
         self.latest
             .borrow_mut()
@@ -142,5 +186,84 @@ mod tests {
         binding.publish(core.snapshot(&b).unwrap());
         assert!(binding.drain().is_empty());
         assert!(scopes.borrow().is_empty());
+    }
+    #[test]
+    fn timeline_binding_reuses_client_output_and_only_accepts_its_selected_scope() {
+        use pioneer_client::timeline::semantic::TopLevelPageMergeMode;
+        use pioneer_protocol::{ThreadTimelinePageResponse, TimelineBlock};
+        use std::num::NonZeroUsize;
+        let core = Arc::new(pioneer_client::core::ClientCore::new());
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../client-ffi/tests/fixtures/thread-registry-wire.json"
+        ))
+        .unwrap();
+        for snapshot in fixture["initial"].as_array().unwrap() {
+            core.upsert_thread(
+                serde_json::from_value(snapshot["payload"]["thread"].clone()).unwrap(),
+            );
+        }
+        let page = |id: &str, text: &str| {
+            let block: TimelineBlock = serde_json::from_value(serde_json::json!({"workspaceId":"ws", "threadId":id, "blockId":"message", "turnId":"turn", "sortKey":"1", "kind":{"kind":"user_message", "text":text, "mode":"Message"}})).unwrap();
+            ThreadTimelinePageResponse {
+                workspace_id: "ws".into(),
+                thread_id: id.into(),
+                projection_version: 1,
+                blocks: vec![block],
+                page: Default::default(),
+            }
+        };
+        core.apply_thread_timeline_page(page("a", "a"), TopLevelPageMergeMode::Reset);
+        let a = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        let b = ClientScope::Timeline {
+            thread_id: "b".into(),
+        };
+        let _a = core.subscribe(a.clone(), NonZeroUsize::new(16).unwrap());
+        let _b = core.subscribe(b.clone(), NonZeroUsize::new(16).unwrap());
+        let binding = ThreadBindings::new(Arc::new(Registrar(Rc::default())));
+        binding.select(Some("a"));
+        binding.publish(core.snapshot(&a).unwrap());
+        let model = binding.timeline_model(Some("a")).unwrap();
+        let direct = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert!(Arc::ptr_eq(&model.projection, &direct.projection()));
+        assert!(Arc::ptr_eq(&model.rows, &direct.render_rows()));
+        assert_eq!(binding.drain().len(), 1);
+        core.apply_thread_timeline_page(page("b", "offscreen"), TopLevelPageMergeMode::Reset);
+        let _flush = core.subscribe(b.clone(), NonZeroUsize::new(16).unwrap());
+        binding.publish(core.snapshot(&b).unwrap());
+        binding.publish(core.snapshot(&a).unwrap());
+        assert!(binding.drain().is_empty());
+        assert!(Arc::ptr_eq(
+            &model.rows,
+            &binding.timeline_model(Some("a")).unwrap().rows
+        ));
+        core.apply_thread_timeline_page(page("a", "changed"), TopLevelPageMergeMode::Reset);
+        let _flush_a = core.subscribe(a.clone(), NonZeroUsize::new(16).unwrap());
+        binding.publish(core.snapshot(&a).unwrap());
+        assert_eq!(binding.drain().len(), 1);
+        assert!(!Arc::ptr_eq(
+            &model.rows,
+            &binding.timeline_model(Some("a")).unwrap().rows
+        ));
+        assert_eq!(model.item_presentations.values().next().unwrap().text, "a");
+        assert_eq!(
+            binding
+                .timeline_model(Some("a"))
+                .unwrap()
+                .item_presentations
+                .values()
+                .next()
+                .unwrap()
+                .text,
+            "changed"
+        );
+        binding.select(Some("b"));
+        assert!(binding.timeline_model(Some("a")).is_none());
+        binding.publish(core.snapshot(&a).unwrap());
+        assert!(binding.drain().is_empty());
+        binding.clear();
+        binding.publish(core.snapshot(&b).unwrap());
+        assert!(binding.timeline_model(Some("b")).is_none());
     }
 }

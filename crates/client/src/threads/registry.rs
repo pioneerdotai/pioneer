@@ -24,6 +24,7 @@ const INACTIVE_THREAD_LIMIT: usize = 32;
 /// Immutable source snapshot; the contained coordinator has no mutable shell handle.
 pub struct ThreadDomainSnapshot {
     coordinator: Arc<ThreadCoordinator>,
+    current_principal_id: Option<String>,
     semantic: Arc<SemanticTimelineState>,
     pending: Arc<Vec<PendingRequest>>,
     cli_binding: Option<CLIRuntimeThreadBinding>,
@@ -36,6 +37,9 @@ pub struct ThreadDomainSnapshot {
 }
 
 impl ThreadDomainSnapshot {
+    pub fn current_principal_id(&self) -> Option<&str> {
+        self.current_principal_id.as_deref()
+    }
     pub fn coordinator(&self) -> Arc<ThreadCoordinator> {
         self.coordinator.clone()
     }
@@ -69,6 +73,7 @@ impl Serialize for ThreadDomainSnapshot {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Source<'a> {
+            current_principal_id: Option<&'a str>,
             thread: Option<&'a Thread>,
             workspace_id: &'a str,
             projection: &'a crate::conversation::ConversationViewState,
@@ -82,6 +87,7 @@ impl Serialize for ThreadDomainSnapshot {
             subscription_failed: bool,
         }
         Source {
+            current_principal_id: self.current_principal_id.as_deref(),
             thread: self.coordinator.thread(),
             workspace_id: &self.coordinator.workspace_id,
             projection: self.coordinator.conversation.projection(),
@@ -115,6 +121,8 @@ struct ThreadDomainStore {
     pending: HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
     snapshot: Option<Arc<ThreadDomainSnapshot>>,
     summary_revision: u64,
+    presentation: Option<Arc<crate::timeline::presentation::ThreadPresentationSnapshot>>,
+    presentation_blocked: bool,
     demand: ClientDemand,
     subscriptions: usize,
     last_used: u64,
@@ -132,6 +140,8 @@ impl ThreadDomainStore {
             pending: Default::default(),
             snapshot: None,
             summary_revision: 0,
+            presentation: None,
+            presentation_blocked: false,
             demand: ClientDemand::Suspended,
             subscriptions: 0,
             last_used: 0,
@@ -144,14 +154,17 @@ impl ThreadDomainStore {
 /// One owner for thread lifecycle, navigation mappings, and per-thread stores.
 #[derive(Default)]
 pub struct ThreadRegistry {
+    current_principal_id: Option<String>,
     stores: HashMap<String, ThreadDomainStore>,
     catalog: HashMap<String, Thread>,
     placements: HashMap<String, pioneer_protocol::ThreadPlacement>,
     revisions: HashMap<String, (u64, u64, u64)>,
     retired: HashSet<String>,
+    presentation_revisions: HashMap<String, u64>,
     summaries: HashMap<String, SidebarSummaryChanged>,
     subscription_counts: HashMap<String, usize>,
     demands: HashMap<ClientScope, ClientDemand>,
+    timeline_subscription_counts: HashMap<String, usize>,
     pending_requests: PendingRequestRegistry,
     active_thread_id: Option<String>,
     drafts: HashMap<String, String>,
@@ -192,10 +205,19 @@ impl ThreadRegistry {
         self.clock = self.clock.saturating_add(1);
         let store = self.stores.entry(id.to_owned()).or_insert_with(|| {
             let mut store = ThreadDomainStore::new(id, workspace);
-            if let Some(thread) = self.catalog.get(id) { store.coordinator.set_snapshot(thread.clone()); }
+            if let Some(thread) = self.catalog.get(id) {
+                store.coordinator.set_snapshot(thread.clone());
+            }
             store.generation = self.clock;
             store.subscriptions = self.subscription_counts.get(id).copied().unwrap_or(0);
-            store.demand = self.demands.iter().filter(|(scope,_)| matches!(scope,ClientScope::Thread {thread_id} | ClientScope::Timeline {thread_id} if thread_id == id)).map(|(_,d)|*d).find(|d|*d != ClientDemand::Suspended).unwrap_or(ClientDemand::Suspended);
+            store.demand = timeline_demand(
+                &self.demands,
+                id,
+                self.timeline_subscription_counts
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0),
+            );
             store
         });
         store.last_used = self.clock;
@@ -209,11 +231,14 @@ impl ThreadRegistry {
         let pending = self
             .pending_requests
             .pending_for_scope(Some(&store.coordinator.workspace_id), Some(id));
+        let was_blocked = store.presentation_blocked;
+        store.presentation_blocked = false;
         let previous = store.snapshot.as_ref();
         let namespace = self.revisions.get(id).copied().unwrap_or_default();
         let old_revision = namespace.0;
         let old_timeline_revision = namespace.1;
         let mut snapshot = ThreadDomainSnapshot {
+            current_principal_id: self.current_principal_id.clone(),
             coordinator: Arc::new(store.coordinator.snapshot_copy()),
             semantic: Arc::new(store.semantic.clone()),
             pending: Arc::new(pending),
@@ -226,37 +251,41 @@ impl ThreadRegistry {
                 ),
             placement: self.placements.get(id).cloned(),
             subscription_failed: store.subscription_failed,
-            cache_patch: semantic_cache_projection(
-                id,
-                &store.coordinator.workspace_id,
-                &store.semantic,
-                previous.map(AsRef::as_ref),
-            ),
+            cache_patch: Default::default(),
         };
         let mut current_value =
             serde_json::to_value(&snapshot).expect("thread snapshot serializes");
         current_value["projection"]["revision"] = serde_json::Value::from(0);
-        if previous.is_some_and(|previous| {
-            let mut previous_value =
-                serde_json::to_value(previous.as_ref()).expect("thread snapshot serializes");
-            previous_value["projection"]["revision"] = serde_json::Value::from(0);
-            current_value == previous_value
-        }) {
+        if !was_blocked
+            && previous.is_some_and(|previous| {
+                let mut previous_value =
+                    serde_json::to_value(previous.as_ref()).expect("thread snapshot serializes");
+                previous_value["projection"]["revision"] = serde_json::Value::from(0);
+                current_value == previous_value
+            })
+        {
             return Vec::new();
         }
-        let timeline_changed = previous.is_none_or(|previous| {
-            if previous.semantic.as_ref() != &store.semantic || previous.pending != snapshot.pending
-            {
-                return true;
-            }
-            let mut old = serde_json::to_value(previous.coordinator.conversation.projection())
-                .expect("projection serializes");
-            let mut new = serde_json::to_value(snapshot.coordinator.conversation.projection())
-                .expect("projection serializes");
-            old["revision"] = 0.into();
-            new["revision"] = 0.into();
-            old != new
-        });
+        let timeline_changed = was_blocked
+            || previous.is_none_or(|previous| {
+                if previous.current_principal_id != snapshot.current_principal_id {
+                    return true;
+                }
+                if previous.semantic.as_ref() != &store.semantic
+                    || previous.pending != snapshot.pending
+                {
+                    return true;
+                }
+                let mut old = serde_json::to_value(previous.coordinator.conversation.projection())
+                    .expect("projection serializes");
+                let mut new = serde_json::to_value(snapshot.coordinator.conversation.projection())
+                    .expect("projection serializes");
+                old["revision"] = 0.into();
+                new["revision"] = 0.into();
+                old != new
+                    || previous.coordinator.thread().map(|thread| &thread.turns)
+                        != snapshot.coordinator.thread().map(|thread| &thread.turns)
+            });
         snapshot.revision += 1;
         if timeline_changed {
             snapshot.timeline_revision += 1;
@@ -275,15 +304,6 @@ impl ThreadRegistry {
             ),
             snapshot.clone(),
         )];
-        if timeline_changed {
-            drafts.push(authority.publication(
-                ClientScope::Timeline {
-                    thread_id: id.to_owned(),
-                },
-                revisions(snapshot.timeline_revision),
-                snapshot.clone(),
-            ));
-        }
         let mut thread_summary = store.coordinator.thread().cloned();
         if let Some(thread) = &mut thread_summary {
             thread.turns.clear();
@@ -325,7 +345,7 @@ impl ThreadRegistry {
     }
 }
 
-fn revisions(value: u64) -> ClientRevisions {
+pub(crate) fn revisions(value: u64) -> ClientRevisions {
     ClientRevisions::new(
         DomainRevision::new(value),
         PresentationRevision::new(value),
@@ -780,17 +800,24 @@ impl ClientCore {
             drafts.extend(registry.retire(&id));
             drafts.extend(registry.retire_summary(&id));
         }
+        let current_principal_id = registry.current_principal_id.clone();
+        let presentation_revisions = std::mem::take(&mut registry.presentation_revisions);
         let retired = std::mem::take(&mut registry.retired);
         let revisions = std::mem::take(&mut registry.revisions);
         let subscriptions = std::mem::take(&mut registry.subscription_counts);
         let demands = std::mem::take(&mut registry.demands);
+        let timeline_subscription_counts =
+            std::mem::take(&mut registry.timeline_subscription_counts);
         let clock = registry.clock.saturating_add(1);
         let session_revision = registry.session_revision.saturating_add(1);
         *registry = ThreadRegistry {
+            current_principal_id,
+            presentation_revisions,
             clock,
             revisions,
             retired,
             demands,
+            timeline_subscription_counts,
             subscription_counts: subscriptions,
             session_revision,
             ..Default::default()
@@ -1698,79 +1725,6 @@ impl ClientCore {
     }
 }
 
-fn semantic_cache_projection(
-    id: &str,
-    workspace: &str,
-    state: &SemanticTimelineState,
-    previous: Option<&ThreadDomainSnapshot>,
-) -> crate::timeline::semantic::SemanticTimelineCachePatch {
-    let mut patch = previous.map(|s| s.cache_patch.clone()).unwrap_or_default();
-    patch.workspace_id = workspace.to_owned();
-    patch.thread_id = id.to_owned();
-    let current = state.thread(id);
-    let mut removed_blocks: HashSet<_> = patch.removed_block_ids.into_iter().collect();
-    let mut removed_items: HashSet<_> = patch
-        .removed_work_items
-        .into_iter()
-        .map(|item| (item.turn_id, item.work_item_id))
-        .collect();
-    if let Some(old) = previous.and_then(|s| s.semantic.thread(id)) {
-        for key in old.top_level.blocks_by_id.keys() {
-            if current.is_none_or(|t| !t.top_level.blocks_by_id.contains_key(key)) {
-                removed_blocks.insert(key.clone());
-            }
-        }
-        for (turn, range) in &old.work_ranges_by_turn {
-            for key in range.items_by_id.keys() {
-                if current
-                    .and_then(|t| t.work_range(turn))
-                    .is_none_or(|r| !r.items_by_id.contains_key(key))
-                {
-                    removed_items.insert((turn.clone(), key.clone()));
-                }
-            }
-        }
-    }
-    patch.changed_blocks = current
-        .into_iter()
-        .flat_map(|t| t.top_level.ordered_blocks())
-        .cloned()
-        .collect();
-    patch.changed_work_items = current
-        .into_iter()
-        .flat_map(|t| t.work_ranges_by_turn.values())
-        .flat_map(|r| r.ordered_items())
-        .cloned()
-        .collect();
-    for block in &patch.changed_blocks {
-        removed_blocks.remove(&block.block_id);
-    }
-    for item in &patch.changed_work_items {
-        removed_items.remove(&(item.turn_id.clone(), item.work_item_id.clone()));
-    }
-    patch.removed_block_ids = removed_blocks.into_iter().collect();
-    patch.removed_block_ids.sort();
-    let mut removed = removed_items.into_iter().collect::<Vec<_>>();
-    removed.sort();
-    patch.removed_work_items = removed
-        .into_iter()
-        .map(
-            |(turn_id, work_item_id)| crate::timeline::semantic::SemanticTimelineRemovedWorkItem {
-                turn_id,
-                work_item_id,
-            },
-        )
-        .collect();
-    patch.changed_work_items.sort_by(|a, b| {
-        (&a.turn_id, &a.order_key, &a.work_item_id).cmp(&(
-            &b.turn_id,
-            &b.order_key,
-            &b.work_item_id,
-        ))
-    });
-    patch
-}
-
 impl ThreadRegistry {
     fn retire_summary(&mut self, id: &str) -> Vec<ClientPublicationDraft> {
         let Some(summary) = self.summaries.remove(id) else {
@@ -1796,6 +1750,11 @@ impl ThreadRegistry {
         };
         revisions.0 += 1;
         revisions.1 += 1;
+        let presentation_revision = self
+            .presentation_revisions
+            .entry(id.to_owned())
+            .or_default();
+        *presentation_revision += 1;
         let authority = ClientMutationAuthority { _private: () };
         vec![
             authority.publication(
@@ -1814,7 +1773,7 @@ impl ThreadRegistry {
                 ClientScope::Timeline {
                     thread_id: id.to_owned(),
                 },
-                crate::threads::registry::revisions(revisions.1),
+                crate::threads::registry::revisions(*presentation_revision),
                 Arc::new(serde_json::Value::Null),
             ),
         ]
@@ -1873,8 +1832,32 @@ impl ClientCore {
         if count == 0 {
             registry.subscription_counts.remove(id);
         }
+        if matches!(scope, ClientScope::Timeline { .. }) {
+            let timeline_count = registry
+                .timeline_subscription_counts
+                .entry(id.clone())
+                .or_default();
+            *timeline_count = if added {
+                timeline_count.saturating_add(1)
+            } else {
+                timeline_count.saturating_sub(1)
+            };
+            if *timeline_count == 0 {
+                registry.timeline_subscription_counts.remove(id);
+            }
+        }
+        let demand = timeline_demand(
+            &registry.demands,
+            id,
+            registry
+                .timeline_subscription_counts
+                .get(id)
+                .copied()
+                .unwrap_or(0),
+        );
         if let Some(store) = registry.stores.get_mut(id) {
             store.subscriptions = count;
+            store.demand = demand;
         }
         let drafts = registry.evict_inactive();
         self.transition(
@@ -1882,6 +1865,10 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        if added {
+            self.request_thread_presentation(id);
+        }
     }
     pub(crate) fn thread_demand_changed(&self, scope: &ClientScope, demand: ClientDemand) {
         let (ClientScope::Thread { thread_id: id } | ClientScope::Timeline { thread_id: id }) =
@@ -1893,12 +1880,16 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        if demand == ClientDemand::Suspended {
-            registry.demands.remove(scope);
-        } else {
-            registry.demands.insert(scope.clone(), demand);
-        }
-        let combined = registry.demands.iter().filter(|(scope,_)| matches!(scope,ClientScope::Thread {thread_id} | ClientScope::Timeline {thread_id} if thread_id == id)).map(|(_,d)|*d).find(|d|*d != ClientDemand::Suspended).unwrap_or(ClientDemand::Suspended);
+        registry.demands.insert(scope.clone(), demand);
+        let combined = timeline_demand(
+            &registry.demands,
+            id,
+            registry
+                .timeline_subscription_counts
+                .get(id)
+                .copied()
+                .unwrap_or(0),
+        );
         if let Some(store) = registry.stores.get_mut(id) {
             store.demand = combined;
         }
@@ -1908,6 +1899,10 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        if combined != ClientDemand::Suspended {
+            self.request_thread_presentation(id);
+        }
     }
 }
 
@@ -1985,6 +1980,45 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn exact_work_refresh_batches_ids_without_changing_scope_or_reducing_in_the_shell() {
+        struct Transport(std::cell::RefCell<Vec<usize>>);
+        impl crate::rpc::JsonRpcRequestTransport for Transport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                self.0
+                    .borrow_mut()
+                    .push(request["params"]["workItemIds"].as_array().unwrap().len());
+                response.send(Ok(serde_json::json!({"workspaceId":"ws", "threadId":"a", "turnId":"turn", "projectionVersion":1, "items":[]}))).unwrap();
+                Ok(())
+            }
+        }
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::TurnWorkItemsGet {
+                key: SemanticTimelineRequestKey::TurnWorkItems {
+                    thread_id: "a".into(),
+                    turn_id: "turn".into(),
+                },
+                params: TurnWorkItemsGetParams {
+                    thread_id: "a".into(),
+                    turn_id: "turn".into(),
+                    work_item_ids: (0..405).map(|ix| format!("item-{ix}")).collect(),
+                },
+            })
+            .unwrap();
+        let transport = Transport(Default::default());
+        core.execute_thread_semantic_request(&transport, request);
+        assert_eq!(*transport.0.borrow(), [200, 200, 5]);
+        assert!(core.thread_semantic_in_flight("a").is_empty());
+    }
+
     #[test]
     fn semantic_worker_rejects_another_turn_in_the_same_thread() {
         for items in [false, true] {
@@ -2327,6 +2361,718 @@ mod tests {
         })
     }
 
+    fn presentation_page(texts: &[(&str, &str)]) -> ThreadTimelinePageResponse {
+        ThreadTimelinePageResponse {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            projection_version: 4,
+            blocks: texts
+                .iter()
+                .enumerate()
+                .map(|(ix, (id, text))| TimelineBlock {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    block_id: (*id).into(),
+                    turn_id: Some(format!("turn-{id}")),
+                    sort_key: format!("{ix:04}"),
+                    started_at_unix_ms: Some(1),
+                    updated_at_unix_ms: Some(2),
+                    kind: TimelineBlockKind::UserMessage {
+                        item_id: Some(format!("item-{id}")),
+                        inputs: vec![],
+                        text: (*text).into(),
+                        attachments: vec![],
+                        mode: ThreadMode::Message,
+                        author: None,
+                        route: None,
+                        reply: None,
+                        mentions: vec![],
+                        revision: 0,
+                        edited: false,
+                        deleted: false,
+                    },
+                })
+                .collect(),
+            page: Default::default(),
+        }
+    }
+
+    #[test]
+    fn presentation_reinserted_identity_never_reuses_a_retired_row_revision() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "before")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let before = core.thread_presentation_snapshot("a").unwrap().timeline();
+        core.apply_thread_timeline_page(
+            presentation_page(&[]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "after")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let after = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(before.rows()[0].id(), after.rows()[0].id());
+        assert!(after.rows()[0].revision() > before.rows()[0].revision());
+    }
+
+    #[test]
+    fn presentation_authorization_fence_rejects_late_domain_requests_and_old_content() {
+        struct PageTransport;
+        impl crate::rpc::JsonRpcRequestTransport for PageTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                response
+                    .send(Ok(serde_json::to_value(presentation_page(&[(
+                        "x",
+                        "protected-before-fence",
+                    )]))
+                    .unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "protected-before-fence")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: "a".into(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: "a".into(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(50),
+                },
+            })
+            .unwrap();
+        core.begin_authorization_epoch(Some(("synthetic-endpoint".into(), 1)));
+        core.execute_thread_semantic_request(&PageTransport, request);
+        core.materialize_demanded_timelines();
+        assert!(core.thread_presentation_snapshot("a").is_none());
+        core.upsert_thread(thread("a", "ws"));
+        core.materialize_demanded_timelines();
+        assert!(
+            core.thread_presentation_snapshot("a")
+                .unwrap()
+                .timeline()
+                .rows()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn presentation_empty_page_and_refresh_keep_loaded_state() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_value(core.thread_presentation_snapshot("a").unwrap().timeline())
+                .unwrap()["has_loaded_page"],
+            false
+        );
+        core.apply_thread_timeline_page(
+            presentation_page(&[]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        assert_eq!(
+            serde_json::to_value(core.thread_presentation_snapshot("a").unwrap().timeline())
+                .unwrap()["has_loaded_page"],
+            true
+        );
+        let request = core
+            .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: "a".into(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: "a".into(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(50),
+                },
+            })
+            .unwrap();
+        core.materialize_demanded_timelines();
+        let loading =
+            serde_json::to_value(core.thread_presentation_snapshot("a").unwrap().timeline())
+                .unwrap();
+        assert_eq!(loading["has_loaded_page"], true);
+        assert!(loading["status"].get("Loading").is_some());
+        drop(request);
+    }
+
+    #[test]
+    fn presentation_coalesces_dormant_sources_and_preserves_row_identity() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.upsert_thread(thread("b", "ws"));
+        for text in ["one", "two", "latest"] {
+            core.apply_thread_timeline_page(
+                presentation_page(&[("x", text), ("y", "unchanged")]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.materialize_demanded_timelines();
+            assert!(core.thread_presentation_snapshot("a").is_none());
+        }
+        let subscription = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(first.revision(), 1);
+        assert_eq!(first.rows().len(), 2);
+        assert_eq!(first.rows()[0].item().unwrap().partial_text, "latest");
+        core.materialize_demanded_timelines();
+        assert!(Arc::ptr_eq(
+            &first,
+            &core.thread_presentation_snapshot("a").unwrap().timeline()
+        ));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "changed"), ("y", "unchanged")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let second = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert!(!Arc::ptr_eq(&first.rows()[0], &second.rows()[0]));
+        assert!(Arc::ptr_eq(&first.rows()[1], &second.rows()[1]));
+        let changes = core
+            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .changes
+            .last()
+            .unwrap()
+            .timeline_changes()
+            .to_vec();
+        assert_eq!(changes.len(), 1);
+        assert_eq!((changes[0].from_revision, changes[0].to_revision), (1, 2));
+        assert_eq!(changes[0].replaced.len(), 1);
+        assert!(changes[0].inserted.is_empty());
+        assert!(changes[0].removed.is_empty());
+        assert!(changes[0].order.is_none());
+        let mut b = thread("b", "ws");
+        b.preview = "summary changed".into();
+        core.upsert_thread(b);
+        core.materialize_demanded_timelines();
+        assert!(Arc::ptr_eq(
+            &second,
+            &core.thread_presentation_snapshot("a").unwrap().timeline()
+        ));
+        assert!(core.thread_presentation_snapshot("b").is_none());
+        drop(subscription);
+    }
+
+    #[test]
+    fn presentation_reorder_insert_remove_have_exact_ranges() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "x"), ("y", "y")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _subscription = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        core.apply_thread_timeline_page(
+            presentation_page(&[("y", "y"), ("x", "x"), ("z", "z")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let second = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert!(Arc::ptr_eq(&first.rows()[0], &second.rows()[1]));
+        assert!(Arc::ptr_eq(&first.rows()[1], &second.rows()[0]));
+        let changes = core
+            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .changes
+            .last()
+            .unwrap()
+            .timeline_changes()
+            .to_vec();
+        assert_eq!(changes[0].inserted.len(), 1);
+        assert!(changes[0].replaced.is_empty());
+        assert_eq!(
+            changes[0]
+                .order
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            second
+                .rows()
+                .iter()
+                .map(|row| row.id().as_str())
+                .collect::<Vec<_>>()
+        );
+        core.apply_thread_timeline_page(
+            presentation_page(&[("z", "z")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let changes = core
+            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .changes
+            .last()
+            .unwrap()
+            .timeline_changes()
+            .to_vec();
+        assert_eq!(changes[0].removed.len(), 2);
+        assert_eq!((changes[0].from_revision, changes[0].to_revision), (2, 3));
+    }
+
+    #[test]
+    fn presentation_rejects_old_source_and_incarnation_results() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "old")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _subscription = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let source = core.thread_snapshot("a").unwrap();
+        let old = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let (late, delta) = crate::timeline::presentation::project(
+            "a",
+            old.generation(),
+            &source,
+            Some(&old),
+            2,
+            100,
+        );
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "latest")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        assert!(!core.accept_thread_timeline(
+            "a",
+            source.timeline_revision(),
+            old.generation(),
+            2,
+            late.clone(),
+            delta.clone()
+        ));
+        core.remove_thread_store("a");
+        core.upsert_thread(thread("a", "ws"));
+        assert!(!core.accept_thread_timeline(
+            "a",
+            core.thread_snapshot("a").unwrap().timeline_revision(),
+            old.generation(),
+            2,
+            late,
+            delta
+        ));
+    }
+
+    #[test]
+    fn presentation_demand_and_summary_have_independent_scopes() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let _metadata = core.subscribe(scope("a"), NonZeroUsize::new(8).unwrap());
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "first")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        assert!(core.thread_presentation_snapshot("a").is_none());
+        let timeline_scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Suspended);
+        let _timeline = core.subscribe(timeline_scope.clone(), NonZeroUsize::new(8).unwrap());
+        assert!(
+            core.thread_presentation_snapshot("a").is_none(),
+            "explicit dormant demand survives subscriptions"
+        );
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Prefetch);
+        let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Visible);
+        assert!(Arc::ptr_eq(
+            &first,
+            &core.thread_presentation_snapshot("a").unwrap().timeline()
+        ));
+        let mut summary = thread("a", "ws");
+        summary.preview = "new summary".into();
+        core.upsert_thread(summary);
+        core.materialize_demanded_timelines();
+        assert!(Arc::ptr_eq(
+            &first,
+            &core.thread_presentation_snapshot("a").unwrap().timeline()
+        ));
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Suspended);
+        for text in ["one", "two", "latest"] {
+            core.apply_thread_timeline_page(
+                presentation_page(&[("x", text)]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.materialize_demanded_timelines();
+            assert!(Arc::ptr_eq(
+                &first,
+                &core.thread_presentation_snapshot("a").unwrap().timeline()
+            ));
+        }
+        core.thread_demand_changed(&timeline_scope, ClientDemand::Visible);
+        let next = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(next.revision(), first.revision() + 1);
+        assert_eq!(
+            next.source_revision(),
+            core.thread_snapshot("a").unwrap().timeline_revision()
+        );
+        assert_eq!(next.rows()[0].item().unwrap().partial_text, "latest");
+    }
+
+    #[test]
+    fn presentation_pending_positions_scope_and_running_start_are_stable() {
+        use crate::timeline::presentation::TimelineRenderRow;
+        use crate::timeline::rows::TimelineRowKind;
+        for running_first in [true, false] {
+            let core = core();
+            core.upsert_thread(thread("a", "ws"));
+            core.upsert_thread(thread("b", "ws"));
+            let mut page = presentation_page(&[("user", "text")]);
+            page.blocks.push(TimelineBlock {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                block_id: "running".into(),
+                turn_id: Some("running-turn".into()),
+                sort_key: if running_first { "0000" } else { "9999" }.into(),
+                started_at_unix_ms: None,
+                updated_at_unix_ms: None,
+                kind: TimelineBlockKind::TurnState {
+                    state: pioneer_protocol::TurnWorkState::Running,
+                    message: None,
+                    author: None,
+                    route: None,
+                },
+            });
+            core.apply_thread_timeline_page(
+                page,
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.apply_pending_requests(PendingRequestsReduction::Opened(pending_request(
+                "visible", "ws", "a",
+            )));
+            core.apply_pending_requests(PendingRequestsReduction::Opened(pending_request(
+                "other", "ws", "b",
+            )));
+            let _subscription = core.subscribe(
+                ClientScope::Timeline {
+                    thread_id: "a".into(),
+                },
+                NonZeroUsize::new(8).unwrap(),
+            );
+            let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+            let running_ix = first.rows().iter().position(|row| matches!(row.value(), TimelineRenderRow::Timeline(row) if matches!(row.kind, TimelineRowKind::RunningTurn(_)))).unwrap();
+            assert_eq!(
+                first.rows()[running_ix - 1].id().as_str(),
+                "timeline-pending-request::visible"
+            );
+            assert!(
+                !first
+                    .rows()
+                    .iter()
+                    .any(|row| row.id().as_str().contains("other"))
+            );
+            let started = match first.rows()[running_ix].value() {
+                TimelineRenderRow::Timeline(row) => match &row.kind {
+                    TimelineRowKind::RunningTurn(row) => row.started_at_unix_ms.unwrap(),
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            };
+            let source = core.thread_snapshot("a").unwrap();
+            let (later, _) = crate::timeline::presentation::project(
+                "a",
+                first.generation(),
+                &source,
+                Some(&first),
+                first.revision() + 1,
+                started + 100_000,
+            );
+            let running = later
+                .rows()
+                .iter()
+                .find(|row| row.id() == first.rows()[running_ix].id())
+                .unwrap();
+            assert!(Arc::ptr_eq(running, &first.rows()[running_ix]));
+            core.apply_thread_timeline_page(
+                presentation_page(&[("user", "text")]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.materialize_demanded_timelines();
+            let last = core.thread_presentation_snapshot("a").unwrap().timeline();
+            assert_eq!(
+                last.rows().last().unwrap().id().as_str(),
+                "timeline-pending-request::visible"
+            );
+        }
+    }
+
+    #[test]
+    fn presentation_visible_burst_and_authorship_use_exact_subrevisions() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let mut page = presentation_page(&[("x", "initial")]);
+        core.apply_thread_timeline_page(
+            page.clone(),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _subscription = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        for text in ["one", "two", "latest"] {
+            page = presentation_page(&[("x", text)]);
+            core.apply_thread_timeline_page(
+                page.clone(),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+        }
+        core.materialize_demanded_timelines();
+        let last = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(last.revision(), first.revision() + 1);
+        assert_eq!(last.rows()[0].item().unwrap().partial_text, "latest");
+        if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[0].kind {
+            *author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                actor: pioneer_protocol::PersistedActorRef::Principal(
+                    pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                ),
+                display_name: "Alice".into(),
+                nickname: "alice".into(),
+                avatar_revision: Some("avatar-2".into()),
+                agent: None,
+            });
+        }
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        core.materialize_demanded_timelines();
+        let authored = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(last.rows()[0].id(), authored.rows()[0].id());
+        assert_eq!(
+            last.rows()[0].content_revision(),
+            authored.rows()[0].content_revision()
+        );
+        assert_eq!(
+            last.rows()[0].metadata_revision() + 1,
+            authored.rows()[0].metadata_revision()
+        );
+    }
+
+    #[test]
+    fn presentation_paging_and_prefetch_use_published_identity_and_source_fences() {
+        use crate::timeline::semantic::*;
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let mut page = presentation_page(&[("last", "last")]);
+        page.page.has_more_before = true;
+        page.page.before_cursor = Some(pioneer_protocol::TimelineCursor {
+            value: "older".into(),
+        });
+        core.apply_thread_timeline_page(page, TopLevelPageMergeMode::Reset);
+        let _subscription = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let ids = vec![first.rows()[0].id().as_str().to_owned()];
+        for presented in [false, true] {
+            let actions = core.plan_thread_timeline_viewport(
+                "a",
+                first.source_revision(),
+                &ids,
+                6,
+                true,
+                false,
+                false,
+                presented,
+            );
+            assert!(
+                matches!(actions.as_slice(), [SemanticTimelineRequestAction::ThreadTimelinePage { key:SemanticTimelineRequestKey::ThreadBefore { cursor, .. }, .. }] if cursor == "older")
+            );
+            assert!(
+                core.plan_thread_timeline_viewport(
+                    "a",
+                    first.source_revision() - 1,
+                    &ids,
+                    6,
+                    true,
+                    true,
+                    true,
+                    presented
+                )
+                .is_empty()
+            );
+        }
+        core.apply_thread_timeline_page(
+            presentation_page(&[("first", "first")]),
+            TopLevelPageMergeMode::MergeBefore,
+        );
+        core.materialize_demanded_timelines();
+        let next = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(next.rows().len(), 2);
+        assert!(
+            next.rows()
+                .iter()
+                .any(|row| Arc::ptr_eq(row, &first.rows()[0]))
+        );
+        let changes = core
+            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .changes
+            .last()
+            .unwrap()
+            .timeline_changes()
+            .to_vec();
+        assert_eq!((changes[0].from_revision, changes[0].to_revision), (1, 2));
+        assert_eq!(changes[0].inserted.len(), 1);
+        assert!(changes[0].replaced.is_empty());
+    }
+
+    #[test]
+    fn presentation_identity_groups_optimistic_and_persisted_self_messages() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let principal = "PAAAAAAAAAAAAAAAAAAAA";
+        let mut page = presentation_page(&[("x", "optimistic"), ("y", "persisted")]);
+        if let TimelineBlockKind::UserMessage { item_id, .. } = &mut page.blocks[0].kind {
+            *item_id = Some("user_turn-x".into());
+        }
+        if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[1].kind {
+            *author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                actor: pioneer_protocol::PersistedActorRef::Principal(
+                    pioneer_protocol::PrincipalId::new(principal).unwrap(),
+                ),
+                display_name: "Self".into(),
+                nickname: "self".into(),
+                avatar_revision: None,
+                agent: None,
+            });
+        }
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _subscription = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(8).unwrap(),
+        );
+        let before = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(before.groups().len(), 2);
+        core.update_thread_presentation_identity(Some(principal.into()));
+        core.materialize_demanded_timelines();
+        let next = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(next.groups().len(), 1);
+        assert!(next.groups()[0].current_principal);
+        assert!(Arc::ptr_eq(&before.rows()[0], &next.rows()[0]));
+        assert!(Arc::ptr_eq(&before.rows()[1], &next.rows()[1]));
+        assert!(next.source_revision() > before.source_revision());
+    }
+
+    #[test]
+    fn presentation_cannot_cross_protected_eviction_or_reuse_retired_revisions() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "private")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        let _subscription = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+        let before = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let source = core.thread_snapshot("a").unwrap();
+        let (late, change) = crate::timeline::presentation::project(
+            "a",
+            before.generation(),
+            &source,
+            Some(&before),
+            before.revision() + 1,
+            1000,
+        );
+        core.begin_authorization_epoch(Some(("synthetic-endpoint".into(), 1)));
+        assert!(core.thread_presentation_snapshot("a").is_none());
+        assert!(
+            core.snapshot(&scope)
+                .unwrap()
+                .snapshot()
+                .serialized_payload()
+                .is_null()
+        );
+        assert!(!core.accept_thread_timeline(
+            "a",
+            source.timeline_revision(),
+            before.generation(),
+            late.revision(),
+            late,
+            change
+        ));
+        core.materialize_demanded_timelines();
+        assert!(core.thread_presentation_snapshot("a").is_none());
+        let fence = core.snapshot(&scope).unwrap().revisions().scoped().get();
+        core.upsert_thread(thread("a", "ws"));
+        core.materialize_demanded_timelines();
+        let refreshed = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert_eq!(refreshed.revision(), fence + 1);
+        assert_eq!(
+            core.snapshot(&scope).unwrap().revisions().scoped().get(),
+            refreshed.revision()
+        );
+        core.clear_thread_stores();
+        core.upsert_thread(thread("a", "ws"));
+        core.materialize_demanded_timelines();
+        let recreated = core.thread_presentation_snapshot("a").unwrap().timeline();
+        assert!(recreated.revision() > refreshed.revision());
+        assert_ne!(recreated.generation(), refreshed.generation());
+    }
+
     fn core() -> Arc<ClientCore> {
         Arc::new(ClientCore::new())
     }
@@ -2572,7 +3318,7 @@ impl ClientCore {
                 TopLevelPageMergeMode,
             ),
             Work(pioneer_protocol::TurnWorkPageResponse, WorkPageMergeMode),
-            Items(pioneer_protocol::TurnWorkItemsGetResponse),
+            Items(Vec<pioneer_protocol::TurnWorkItemsGetResponse>),
         }
         loop {
             if self.is_stopped() {
@@ -2621,9 +3367,21 @@ impl ClientCore {
                     };
                     commands::turn_work_page(transport, params).map(|p| Page::Work(p, mode))
                 }
-                SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } => {
-                    commands::turn_work_items_get(transport, params).map(Page::Items)
-                }
+                SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } => params
+                    .work_item_ids
+                    .chunks(200)
+                    .map(|ids| {
+                        commands::turn_work_items_get(
+                            transport,
+                            pioneer_protocol::TurnWorkItemsGetParams {
+                                thread_id: params.thread_id.clone(),
+                                turn_id: params.turn_id.clone(),
+                                work_item_ids: ids.to_vec(),
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Page::Items),
             };
             let mut registry = self
                 .thread_registry
@@ -2653,11 +3411,15 @@ impl ClientCore {
                 {
                     apply_turn_work_page(&mut store.semantic, page, mode);
                 }
-                Ok(Page::Items(page))
-                    if valid_scope(&page.workspace_id, &page.thread_id)
-                        && expected_turn.as_deref() == Some(page.turn_id.as_str()) =>
+                Ok(Page::Items(pages))
+                    if pages.iter().all(|page| {
+                        valid_scope(&page.workspace_id, &page.thread_id)
+                            && expected_turn.as_deref() == Some(page.turn_id.as_str())
+                    }) =>
                 {
-                    apply_turn_work_items_get_response(&mut store.semantic, page);
+                    for page in pages {
+                        apply_turn_work_items_get_response(&mut store.semantic, page);
+                    }
                 }
                 Ok(_) => set_request_status(
                     &mut store.semantic,
@@ -3485,5 +4247,523 @@ impl ClientCore {
         let drafts = registry.publish(&token.id);
         self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
         true
+    }
+}
+
+impl ClientCore {
+    fn request_thread_presentation(&self, id: &str) {
+        if self
+            .presentation_sender
+            .lock()
+            .expect("presentation sender poisoned")
+            .is_some()
+        {
+            self.wake_thread_presentation();
+        } else {
+            self.materialize_thread_timeline(id);
+        }
+    }
+
+    pub(crate) fn wake_thread_presentation(&self) {
+        if let Some(sender) = self
+            .presentation_sender
+            .lock()
+            .expect("presentation sender poisoned")
+            .as_ref()
+        {
+            let _ = sender.try_send(());
+        }
+    }
+
+    /// Read-only access never materializes or advances a revision.
+    pub fn thread_presentation_snapshot(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::timeline::presentation::ThreadPresentationSnapshot>> {
+        self.thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .stores
+            .get(id)
+            .filter(|store| !store.presentation_blocked)
+            .and_then(|store| store.presentation.clone())
+    }
+
+    pub(crate) fn materialize_demanded_timelines(&self) {
+        let ids = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .stores
+            .iter()
+            .filter(|(_, store)| store.demand != ClientDemand::Suspended)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.materialize_thread_timeline(&id);
+        }
+    }
+
+    pub(crate) fn materialize_thread_timeline(&self, id: &str) {
+        let (source, previous, generation, revision) = {
+            let registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            let Some(store) = registry.stores.get(id) else {
+                return;
+            };
+            if store.presentation_blocked
+                || store.demand == ClientDemand::Suspended
+                || self.is_stopped()
+            {
+                return;
+            }
+            let Some(source) = store.snapshot.clone() else {
+                return;
+            };
+            let previous = store
+                .presentation
+                .as_ref()
+                .map(|snapshot| snapshot.timeline());
+            if previous
+                .as_ref()
+                .is_some_and(|p| p.source_revision() == source.timeline_revision())
+            {
+                return;
+            }
+            (
+                source,
+                previous,
+                store.generation,
+                registry
+                    .presentation_revisions
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+                    + 1,
+            )
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let (snapshot, changes) = crate::timeline::presentation::project(
+            id,
+            generation,
+            &source,
+            previous.as_deref(),
+            revision,
+            now,
+        );
+        self.accept_thread_timeline(
+            id,
+            source.timeline_revision(),
+            generation,
+            revision,
+            snapshot,
+            changes,
+        );
+    }
+
+    fn accept_thread_timeline(
+        &self,
+        id: &str,
+        source_revision: u64,
+        generation: u64,
+        revision: u64,
+        snapshot: Arc<crate::timeline::presentation::TimelineSnapshot>,
+        changes: crate::timeline::presentation::TimelineChangeSet,
+    ) -> bool {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let Some(store) = registry.stores.get_mut(id) else {
+            return false;
+        };
+        if self.is_stopped()
+            || store.presentation_blocked
+            || store.demand == ClientDemand::Suspended
+            || store.generation != generation
+            || store
+                .snapshot
+                .as_ref()
+                .is_none_or(|current| current.timeline_revision() != source_revision)
+            || store
+                .presentation
+                .as_ref()
+                .is_some_and(|current| current.timeline().revision() >= revision)
+        {
+            self.wake_thread_presentation();
+            return false;
+        }
+        let initial_work = snapshot
+            .semantic_rows()
+            .request_hints
+            .iter()
+            .filter_map(|hint| match hint {
+                crate::timeline::semantic::SemanticTimelineRequestHint::TurnWorkInitial {
+                    thread_id,
+                    turn_id,
+                } => Some(SemanticTimelineRequestAction::TurnWorkPage {
+                    key: SemanticTimelineRequestKey::TurnWorkInitial {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                    params: pioneer_protocol::TurnWorkPageParams {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                        limit: Some(crate::timeline::semantic::DEFAULT_TURN_WORK_PAGE_LIMIT),
+                    },
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let authority = ClientMutationAuthority { _private: () };
+        let transition = self.transition(
+            &authority,
+            vec![
+                authority
+                    .timeline_publication(snapshot.clone())
+                    .with_timeline_change(changes),
+            ],
+            Vec::new(),
+        );
+        if transition.outcome() != crate::core::ClientTransitionOutcome::Changed {
+            return false;
+        }
+        registry
+            .stores
+            .get_mut(id)
+            .expect("accepted thread")
+            .presentation = Some(Arc::new(
+            crate::timeline::presentation::ThreadPresentationSnapshot::new(snapshot),
+        ));
+        registry
+            .presentation_revisions
+            .insert(id.to_owned(), revision);
+        drop(registry);
+        for action in initial_work {
+            self.schedule_thread_semantic_request(action);
+        }
+        true
+    }
+}
+
+impl ClientCore {
+    pub fn set_thread_timeline_expansion(
+        &self,
+        id: &str,
+        row_ids: &[String],
+        collapsed_row_ids: &[String],
+    ) {
+        for (ids, expanded) in [(row_ids, true), (collapsed_row_ids, false)] {
+            for row in ids {
+                if let Some(turn) = row
+                    .strip_prefix(crate::timeline::semantic_render::SEMANTIC_TURN_WORK_GROUP_PREFIX)
+                {
+                    self.set_thread_turn_work_expanded(id, turn, expanded);
+                }
+            }
+        }
+    }
+
+    pub fn set_thread_turn_work_expanded(&self, id: &str, turn: &str, expanded: bool) -> bool {
+        let Some(mut state) = self.existing_thread_timeline_mutation(id) else {
+            return false;
+        };
+        let changed = if expanded {
+            crate::timeline::semantic::expand_turn_work(&mut state, id.to_owned(), turn.to_owned())
+        } else {
+            crate::timeline::semantic::collapse_turn_work(
+                &mut state,
+                id.to_owned(),
+                turn.to_owned(),
+            )
+        };
+        let stale = if expanded {
+            state
+                .thread(id)
+                .and_then(|thread| thread.work_range(turn))
+                .map(|range| {
+                    range
+                        .stale_work_item_ids()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        drop(state);
+        if !stale.is_empty() {
+            self.schedule_thread_semantic_request(
+                SemanticTimelineRequestAction::TurnWorkItemsGet {
+                    key: SemanticTimelineRequestKey::TurnWorkItems {
+                        thread_id: id.to_owned(),
+                        turn_id: turn.to_owned(),
+                    },
+                    params: pioneer_protocol::TurnWorkItemsGetParams {
+                        thread_id: id.to_owned(),
+                        turn_id: turn.to_owned(),
+                        work_item_ids: stale,
+                    },
+                },
+            );
+        }
+        changed
+    }
+
+    pub fn refresh_thread_timeline(&self, id: &str) {
+        use crate::timeline::semantic::*;
+        if self.thread_snapshot(id).is_none() {
+            return;
+        }
+        self.schedule_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+            key: SemanticTimelineRequestKey::ThreadNewest {
+                thread_id: id.to_owned(),
+            },
+            params: pioneer_protocol::ThreadTimelinePageParams {
+                thread_id: id.to_owned(),
+                anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                limit: Some(DEFAULT_TOP_LEVEL_PAGE_LIMIT),
+            },
+        });
+        let semantic = self.thread_semantic_snapshot(id);
+        let Some(thread) = semantic.thread(id) else {
+            return;
+        };
+        for (turn_id, range) in &thread.work_ranges_by_turn {
+            if thread
+                .cached_turn_work_block(turn_id)
+                .is_some_and(|work| resolve_work_expanded(work, &thread.expansion))
+            {
+                self.schedule_thread_semantic_request(
+                    SemanticTimelineRequestAction::TurnWorkPage {
+                        key: SemanticTimelineRequestKey::TurnWorkInitial {
+                            thread_id: id.to_owned(),
+                            turn_id: turn_id.clone(),
+                        },
+                        params: pioneer_protocol::TurnWorkPageParams {
+                            thread_id: id.to_owned(),
+                            turn_id: turn_id.clone(),
+                            anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                            limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
+                        },
+                    },
+                );
+            }
+            let mut work_item_ids: Vec<_> = range
+                .stale_work_item_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            work_item_ids.extend(range.running_work_item_ids());
+            work_item_ids.sort();
+            work_item_ids.dedup();
+            if !work_item_ids.is_empty() {
+                self.schedule_thread_semantic_request(
+                    SemanticTimelineRequestAction::TurnWorkItemsGet {
+                        key: SemanticTimelineRequestKey::TurnWorkItems {
+                            thread_id: id.to_owned(),
+                            turn_id: turn_id.clone(),
+                        },
+                        params: pioneer_protocol::TurnWorkItemsGetParams {
+                            thread_id: id.to_owned(),
+                            turn_id: turn_id.clone(),
+                            work_item_ids,
+                        },
+                    },
+                );
+            }
+        }
+    }
+
+    /// Viewport geometry remains in the shell; Client resolves identities, ranges and request policy.
+    pub fn plan_thread_timeline_viewport(
+        &self,
+        id: &str,
+        source_revision: u64,
+        row_ids: &[String],
+        threshold: usize,
+        before: bool,
+        after: bool,
+        work: bool,
+        presented_rows: bool,
+    ) -> Vec<SemanticTimelineRequestAction> {
+        use crate::timeline::semantic::*;
+        let Some(presentation) = self.thread_presentation_snapshot(id) else {
+            return Vec::new();
+        };
+        let timeline = presentation.timeline();
+        if timeline.source_revision() != source_revision {
+            return Vec::new();
+        }
+        let semantic_ids = timeline.semantic_row_ids();
+        let positions = timeline
+            .rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row_ids.iter().any(|id| id == row.id().as_str()))
+            .map(|(ix, _)| ix)
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            return Vec::new();
+        }
+        let visible_rows = row_ids
+            .iter()
+            .filter_map(|id| semantic_ids.get(id).cloned())
+            .map(|row_id| SemanticTimelineVisibleRow {
+                row_id,
+                top_offset_px: 0,
+            })
+            .collect();
+        plan_semantic_timeline_requests_from_rows(
+            &timeline.semantic_rows(),
+            &SemanticTimelineRequestPlannerInput {
+                visible_rows: if presented_rows {
+                    timeline
+                        .semantic_rows()
+                        .rows
+                        .iter()
+                        .map(|row| SemanticTimelineVisibleRow {
+                            row_id: row.id.clone(),
+                            top_offset_px: 0,
+                        })
+                        .collect()
+                } else {
+                    visible_rows
+                },
+                leading_threshold_rows: if presented_rows {
+                    usize::MAX
+                } else {
+                    threshold
+                },
+                trailing_threshold_rows: if presented_rows {
+                    usize::MAX
+                } else {
+                    threshold
+                },
+                top_level_limit: DEFAULT_TOP_LEVEL_PAGE_LIMIT,
+                turn_work_limit: DEFAULT_TURN_WORK_PAGE_LIMIT,
+                in_flight: self.thread_semantic_in_flight(id),
+            },
+        )
+        .actions
+        .into_iter()
+        .filter(|action| {
+            !presented_rows
+                || timeline.presented_boundary_allows(
+                    semantic_timeline_request_key(action),
+                    &positions,
+                    threshold,
+                )
+        })
+        .filter(|action| match semantic_timeline_request_key(action) {
+            SemanticTimelineRequestKey::ThreadBefore { .. } => before,
+            SemanticTimelineRequestKey::ThreadAfter { .. } => after,
+            SemanticTimelineRequestKey::TurnWorkBefore { .. }
+            | SemanticTimelineRequestKey::TurnWorkAfter { .. } => work,
+            _ => true,
+        })
+        .collect()
+    }
+}
+
+fn timeline_demand(
+    demands: &HashMap<ClientScope, ClientDemand>,
+    id: &str,
+    timeline_subscriptions: usize,
+) -> ClientDemand {
+    demands
+        .get(&ClientScope::Timeline {
+            thread_id: id.to_owned(),
+        })
+        .copied()
+        .unwrap_or(if timeline_subscriptions > 0 {
+            ClientDemand::Visible
+        } else {
+            ClientDemand::Suspended
+        })
+}
+
+impl ClientCore {
+    // Identity is a domain input to authorship grouping. Protected-publication fences
+    // invalidate derived outputs until the thread owner accepts fresh source state.
+    pub(crate) fn update_thread_presentation_identity(&self, principal: Option<String>) {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if registry.current_principal_id == principal {
+            return;
+        }
+        registry.current_principal_id = principal;
+        let ids = registry
+            .stores
+            .iter()
+            .filter(|(_, store)| !store.presentation_blocked)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut drafts = Vec::new();
+        for id in ids {
+            drafts.extend(registry.publish(&id));
+        }
+        self.transition(
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            Vec::new(),
+        );
+    }
+}
+
+impl ThreadRegistry {
+    pub(crate) fn fence_presentations(&mut self, principal: Option<String>) {
+        self.current_principal_id = principal;
+        self.pending_requests
+            .apply(PendingRequestsReduction::ClearAll);
+        self.catalog.clear();
+        self.ready_resume.clear();
+        self.ready_resume_set.clear();
+        for (id, store) in &mut self.stores {
+            // A protected-publication fence also retires the source incarnation:
+            // neither an old RPC completion nor retained semantic pages can revive it.
+            self.clock = self.clock.saturating_add(1);
+            let mut fresh = ThreadDomainStore::new(id, &store.coordinator.workspace_id);
+            fresh.generation = self.clock;
+            fresh.subscriptions = store.subscriptions;
+            fresh.demand = store.demand;
+            fresh.last_used = store.last_used;
+            fresh.presentation_blocked = true;
+            *store = fresh;
+        }
+    }
+    pub(crate) fn synchronize_publication_revisions(
+        &mut self,
+        publications: &[crate::core::ClientPublicationReference],
+    ) {
+        for publication in publications {
+            match publication.scope() {
+                ClientScope::Thread { thread_id } => {
+                    let revisions = self.revisions.entry(thread_id.clone()).or_default();
+                    revisions.0 = publication.revisions().domain().get();
+                    revisions.1 = publication.revisions().presentation().get();
+                }
+                ClientScope::Timeline { thread_id } => {
+                    self.presentation_revisions
+                        .insert(thread_id.clone(), publication.revisions().scoped().get());
+                }
+                ClientScope::SidebarSummary { thread_id, .. } => {
+                    self.revisions.entry(thread_id.clone()).or_default().2 =
+                        publication.revisions().scoped().get();
+                    self.summaries.remove(thread_id);
+                }
+                _ => {}
+            }
+        }
     }
 }

@@ -7,7 +7,6 @@ use crate::{
     conversation::{ConversationViewState, ItemView, TimelineEntry, TimelineEntryStatus},
     timeline::{
         labels::RunningTurnDisplay,
-        render_fingerprint::timeline_row_content_fingerprint,
         rows::{
             TimelineRow, TimelineRowKind, TurnWorkGroupRow, UserMessagePresentation,
             timeline_reply_state,
@@ -30,7 +29,6 @@ pub struct SemanticTimelineRenderModel {
     pub projection: ConversationViewState,
     pub rows: Vec<TimelineRow>,
     pub semantic_row_ids: HashMap<String, SemanticTimelineRowId>,
-    pub row_render_fingerprints: HashMap<String, u64>,
 }
 
 pub fn render_semantic_timeline_rows(
@@ -92,21 +90,10 @@ pub fn render_semantic_timeline_rows(
         }
     }
 
-    let row_render_fingerprints = rows
-        .iter()
-        .map(|row| {
-            (
-                row.key.clone(),
-                timeline_row_content_fingerprint(&projection, row),
-            )
-        })
-        .collect();
-
     SemanticTimelineRenderModel {
         projection,
         rows,
         semantic_row_ids,
-        row_render_fingerprints,
     }
 }
 
@@ -711,12 +698,6 @@ mod tests {
         );
 
         assert_eq!(model.rows.len(), 1);
-        assert_eq!(model.row_render_fingerprints.len(), 1);
-        assert!(
-            model
-                .row_render_fingerprints
-                .contains_key(model.rows[0].key.as_str())
-        );
         assert_eq!(model.projection.items.len(), 1);
         assert_eq!(
             model.projection.items[0].final_text.as_deref(),

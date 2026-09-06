@@ -312,6 +312,8 @@ impl From<&TimelinePageInfo> for TimelineLoadedRange {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct TopLevelTimelineCache {
+    #[serde(default)]
+    pub has_loaded_page: bool,
     pub blocks_by_id: HashMap<TimelineBlockId, TimelineBlock>,
     pub ordered_block_ids: Vec<TimelineBlockId>,
     pub stale_block_ids: HashSet<TimelineBlockId>,
@@ -617,6 +619,7 @@ pub fn top_level_cache_from_page(page: ThreadTimelinePageResponse) -> TopLevelTi
         blocks_by_id.insert(block.block_id.clone(), block);
     }
     TopLevelTimelineCache {
+        has_loaded_page: true,
         blocks_by_id,
         ordered_block_ids,
         stale_block_ids: HashSet::new(),
@@ -1063,6 +1066,7 @@ pub fn apply_top_level_page(
         sort_top_level_blocks(cache);
         cache.loaded_range = (&page.page).into();
         cache.request_status = TimelineRequestStatus::Ready;
+        cache.has_loaded_page = true;
         return previous != *cache;
     }
 
@@ -1086,6 +1090,8 @@ pub fn apply_top_level_page(
     let previous_loaded_range = cache.loaded_range.clone();
     merge_top_level_loaded_range(cache, &page.page, merge_mode, was_empty);
     changed |= cache.loaded_range != previous_loaded_range;
+    changed |= !cache.has_loaded_page;
+    cache.has_loaded_page = true;
     changed |= cache.request_status != TimelineRequestStatus::Ready;
     cache.request_status = TimelineRequestStatus::Ready;
 

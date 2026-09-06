@@ -11,7 +11,6 @@ use pioneer_client::timeline::labels::{RunningTurnDisplay, now_unix_ms};
 use std::{
     collections::HashMap,
     io::Cursor,
-    rc::Rc,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -518,63 +517,6 @@ impl PioneerDesktop {
                 })
             )
         })
-    }
-
-    pub(super) fn hydrate_running_turn_rows(
-        &self,
-        rows: Rc<Vec<TimelineRow>>,
-    ) -> Rc<Vec<TimelineRow>> {
-        let Some((running_row_index, running_turn)) =
-            rows.iter().enumerate().find_map(|(index, row)| {
-                if let TimelineRowKind::RunningTurn(running_turn) = &row.kind {
-                    Some((index, running_turn))
-                } else {
-                    None
-                }
-            })
-        else {
-            let mut state = self.thread_timeline_view_state.borrow_mut();
-            state.running_turn_indicator_fallback_turn_id = None;
-            state.running_turn_indicator_fallback_started_at_unix_ms = None;
-            return rows;
-        };
-
-        let now = now_unix_ms();
-        let started_at = {
-            let mut state = self.thread_timeline_view_state.borrow_mut();
-            let started_at = if let Some(started_at) = running_turn.started_at_unix_ms {
-                state.running_turn_indicator_fallback_turn_id = Some(running_turn.turn_id.clone());
-                state.running_turn_indicator_fallback_started_at_unix_ms = Some(started_at);
-                started_at
-            } else {
-                if state.running_turn_indicator_fallback_turn_id.as_deref()
-                    != Some(running_turn.turn_id.as_str())
-                {
-                    state.running_turn_indicator_fallback_turn_id =
-                        Some(running_turn.turn_id.clone());
-                    state.running_turn_indicator_fallback_started_at_unix_ms = Some(now);
-                }
-
-                state
-                    .running_turn_indicator_fallback_started_at_unix_ms
-                    .unwrap_or(now)
-            };
-
-            started_at
-        };
-
-        if running_turn.started_at_unix_ms == Some(started_at) {
-            return rows;
-        }
-
-        let mut hydrated_rows = rows.as_ref().clone();
-        if let Some(row) = hydrated_rows.get_mut(running_row_index)
-            && let TimelineRowKind::RunningTurn(running_turn) = &mut row.kind
-        {
-            running_turn.started_at_unix_ms = Some(started_at);
-        }
-
-        Rc::new(hydrated_rows)
     }
 
     pub(super) fn running_turn_dino_view(

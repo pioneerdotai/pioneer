@@ -20,8 +20,7 @@ pub(crate) use self::running_indicator::RunningIndicatorViewCache;
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
     root::{
-        CachedTimelineEntryLayout, PendingRequest, PioneerDesktop, ThreadTimelineViewState,
-        TimelineScrollAnchor,
+        CachedTimelineEntryLayout, PioneerDesktop, ThreadTimelineViewState, TimelineScrollAnchor,
     },
 };
 use gpui_kit::{prelude::*, *};
@@ -106,27 +105,7 @@ impl TimelineRowMeasurementStats {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct TimelinePendingRequestRow {
-    pub key: String,
-    pub request: PendingRequest,
-    pub author: Option<TurnAuthorSnapshot>,
-}
-
-#[derive(Clone)]
-pub(crate) enum TimelineRenderRow {
-    Timeline(TimelineRow),
-    PendingRequest(TimelinePendingRequestRow),
-}
-
-impl TimelineRenderRow {
-    pub(super) fn key(&self) -> &str {
-        match self {
-            TimelineRenderRow::Timeline(row) => row.key.as_str(),
-            TimelineRenderRow::PendingRequest(row) => row.key.as_str(),
-        }
-    }
-}
+pub(crate) use pioneer_client::timeline::presentation::TimelineRenderRow;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TimelinePresentationContext {
@@ -233,46 +212,30 @@ fn user_message_uses_current_principal_alignment(
     }
 }
 
-fn is_current_principal_user_message(
-    row: &TimelineRenderRow,
-    current_principal_id: Option<&str>,
-) -> bool {
-    let TimelineRenderRow::Timeline(TimelineRow {
-        author,
-        kind: TimelineRowKind::UserMessage { presentation, .. },
-        ..
-    }) = row
-    else {
-        return false;
-    };
-
-    user_message_uses_current_principal_alignment(
-        Some(presentation),
-        author.as_ref(),
-        current_principal_id,
-    )
-}
+pub(super) type TimelineItemPresentations =
+    HashMap<String, pioneer_client::timeline::item_presentation::TimelineItemPresentation>;
 
 #[derive(Clone)]
 pub(crate) struct TimelineRenderModel {
-    pub projection: Rc<ConversationViewState>,
-    pub rows: Rc<Vec<TimelineRenderRow>>,
-    pub row_render_fingerprints: Rc<HashMap<String, u64>>,
-    pub semantic_row_ids:
-        Rc<HashMap<String, pioneer_client::timeline::semantic::SemanticTimelineRowId>>,
-    pub semantic_rows: Rc<pioneer_client::timeline::semantic::SemanticTimelineRows>,
+    pub source_revision: u64,
+    pub(crate) item_presentations: std::sync::Arc<
+        HashMap<String, pioneer_client::timeline::item_presentation::TimelineItemPresentation>,
+    >,
+    pub groups: std::sync::Arc<Vec<pioneer_client::timeline::presentation::TimelineGroup>>,
+    pub projection: std::sync::Arc<ConversationViewState>,
+    pub rows: std::sync::Arc<Vec<TimelineRenderRow>>,
+    pub row_revisions: std::sync::Arc<HashMap<String, u64>>,
 }
 
 impl TimelineRenderModel {
     pub(crate) fn empty() -> Self {
         Self {
-            projection: Rc::new(ConversationViewState::default()),
-            rows: Rc::new(Vec::new()),
-            row_render_fingerprints: Rc::new(HashMap::new()),
-            semantic_row_ids: Rc::new(HashMap::new()),
-            semantic_rows: Rc::new(
-                pioneer_client::timeline::semantic::SemanticTimelineRows::default(),
-            ),
+            source_revision: 0,
+            item_presentations: Default::default(),
+            groups: Default::default(),
+            projection: std::sync::Arc::new(ConversationViewState::default()),
+            rows: std::sync::Arc::new(Vec::new()),
+            row_revisions: std::sync::Arc::new(HashMap::new()),
         }
     }
 }
@@ -371,26 +334,24 @@ impl PioneerDesktop {
         &self,
         projection: &ConversationViewState,
         row: &TimelineRenderRow,
-        row_render_fingerprints: &HashMap<String, u64>,
+        row_revisions: &HashMap<String, u64>,
         expanded: &HashSet<String>,
     ) -> u64 {
         match row {
             TimelineRenderRow::Timeline(row) => {
                 model::timeline_row_render_fingerprint_from_content(
-                    row_render_fingerprints
+                    row_revisions
                         .get(row.key.as_str())
                         .copied()
-                        .unwrap_or_else(|| {
-                            model::timeline_row_content_fingerprint(projection, row)
-                        }),
+                        .expect("published timeline row revision"),
                     projection,
                     row,
                     expanded,
                 )
             }
-            TimelineRenderRow::PendingRequest(row) => {
-                timeline_pending_request_render_fingerprint(row)
-            }
+            TimelineRenderRow::PendingRequest(row) => *row_revisions
+                .get(&row.key)
+                .expect("published pending row revision"),
         }
     }
 
@@ -424,6 +385,7 @@ impl PioneerDesktop {
     fn measure_timeline_row_size(
         &self,
         projection: &ConversationViewState,
+        item_presentations: &TimelineItemPresentations,
         row: &TimelineRenderRow,
         is_last_row: bool,
         row_layout: TimelineRowLayout,
@@ -438,6 +400,7 @@ impl PioneerDesktop {
         let build_started = Instant::now();
         let mut row_element = self.render_timeline_row(
             projection,
+            item_presentations,
             row,
             is_last_row,
             row_layout,
@@ -478,13 +441,14 @@ impl PioneerDesktop {
         &self,
         state: &mut ThreadTimelineViewState,
         projection: &ConversationViewState,
+        item_presentations: &TimelineItemPresentations,
         row: &TimelineRenderRow,
         is_last_row: bool,
         row_layout: TimelineRowLayout,
         agent_group_author: Option<&TurnAuthorSnapshot>,
         row_width: Pixels,
         content_width: Pixels,
-        row_render_fingerprints: &HashMap<String, u64>,
+        row_revisions: &HashMap<String, u64>,
         expanded: &HashSet<String>,
         stats: &mut TimelineRowMeasurementStats,
         window: &mut Window,
@@ -492,7 +456,7 @@ impl PioneerDesktop {
     ) -> Size<Pixels> {
         let cache_lookup_started = Instant::now();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.timeline_row_render_fingerprint(projection, row, row_render_fingerprints, expanded)
+        self.timeline_row_render_fingerprint(projection, row, row_revisions, expanded)
             .hash(&mut hasher);
         is_last_row.hash(&mut hasher);
         row_layout.hash(&mut hasher);
@@ -524,6 +488,7 @@ impl PioneerDesktop {
 
         let measured = self.measure_timeline_row_size(
             projection,
+            item_presentations,
             row,
             is_last_row,
             row_layout,
@@ -548,11 +513,12 @@ impl PioneerDesktop {
         &self,
         state: &mut ThreadTimelineViewState,
         projection: &ConversationViewState,
+        item_presentations: &TimelineItemPresentations,
         rows: &[TimelineRenderRow],
         grouping: &TimelineGrouping,
         row_width: Pixels,
         content_width: Pixels,
-        row_render_fingerprints: &HashMap<String, u64>,
+        row_revisions: &HashMap<String, u64>,
         expanded: &HashSet<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -566,13 +532,14 @@ impl PioneerDesktop {
                 self.cached_or_measure_timeline_row_size(
                     state,
                     projection,
+                    item_presentations,
                     row,
                     ix + 1 == row_len,
                     grouping.row_layout(ix),
                     grouping.agent_author_for_group_start(ix),
                     row_width,
                     content_width,
-                    row_render_fingerprints,
+                    row_revisions,
                     expanded,
                     &mut stats,
                     window,
@@ -604,24 +571,6 @@ impl PioneerDesktop {
             TimelineRenderRow::PendingRequest(_) => None,
         }
     }
-}
-
-fn timeline_pending_request_render_fingerprint(row: &TimelinePendingRequestRow) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    row.request.workspace_id.hash(&mut hasher);
-    row.request.request_id.hash(&mut hasher);
-    row.request.thread_id.hash(&mut hasher);
-    row.request.turn_id.hash(&mut hasher);
-    row.request.item_id.hash(&mut hasher);
-    serde_json::to_vec(&row.author)
-        .expect("timeline author snapshot must serialize")
-        .hash(&mut hasher);
-    format!("{:?}", row.request.origin).hash(&mut hasher);
-    format!("{:?}", row.request.kind).hash(&mut hasher);
-    row.request.title.hash(&mut hasher);
-    row.request.message.hash(&mut hasher);
-    format!("{:?}", row.request.payload).hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]

@@ -17,7 +17,6 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{prelude::*, *};
-use pioneer_client::timeline::labels::is_task_timeline_agent_message;
 use pioneer_protocol::TurnItem;
 use std::hash::{Hash, Hasher};
 
@@ -26,6 +25,7 @@ impl PioneerDesktop {
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
+        content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
         item: &TurnItem,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
@@ -58,7 +58,7 @@ impl PioneerDesktop {
         let copy_text = text.to_owned();
         let code_highlight_policy = CodeHighlightPolicy::for_timeline_status(item_view.status);
 
-        if is_task_timeline_agent_message(item_view) {
+        if content.task_timeline {
             let body_element =
                 if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
                     self.render_markdown_document(

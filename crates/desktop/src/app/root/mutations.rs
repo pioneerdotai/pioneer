@@ -10,17 +10,6 @@ use pioneer_client::threads::{session as thread_session, tree as thread_tree};
 use tracing::warn;
 
 impl PioneerDesktop {
-    pub(in crate::app) fn thread_semantic_mutation(
-        &self,
-        id: &str,
-    ) -> pioneer_client::threads::registry::ThreadTimelineMutation<'_> {
-        self.gateway
-            .client_runtime
-            .client_core()
-            .existing_thread_timeline_mutation(id)
-            .expect("known thread scope")
-    }
-
     pub(in crate::app) fn reconcile_composer_draft_with_capabilities(&mut self) {
         let Some(policy) = self
             .gateway
