@@ -5,6 +5,11 @@ mod http;
 mod registry;
 mod runtime;
 mod secrets;
+pub(crate) use secrets::DesktopSecrets;
+mod identity_binding;
+pub(crate) use identity_binding::IdentityAuthorizationBinding;
+mod session_binding;
+pub(crate) use session_binding::GatewaySessionBinding;
 mod timings;
 mod ws;
 
@@ -30,10 +35,8 @@ pub struct ClientRuntime {
 }
 
 impl ClientRuntime {
-    pub fn new() -> Self {
-        Self {
-            core: std::sync::Arc::new(pioneer_client::core::ClientCore::new()),
-        }
+    pub(crate) fn from_core(core: std::sync::Arc<pioneer_client::core::ClientCore>) -> Self {
+        Self { core }
     }
 
     pub fn ws_command_sender(&self) -> pioneer_client::transport::ws::GatewayWsCommandSender {
@@ -46,23 +49,12 @@ impl ClientRuntime {
         &self.core
     }
 
-    pub fn recv_ws_event(&self) -> Option<pioneer_client::transport::ws::GatewayWsEvent> {
-        self.client_core().compatibility_runtime().recv_ws_event()
-    }
-
     pub fn drain_ws_events(&self) -> Vec<pioneer_client::transport::ws::GatewayWsEvent> {
-        self.client_core().compatibility_runtime().drain_ws_events()
-    }
-
-    pub fn reduce_ws_event(
-        &self,
-        event: pioneer_client::transport::ws::GatewayWsEvent,
-        context: pioneer_client::runtime::ClientRuntimeWsEventContext,
-    ) -> pioneer_client::runtime::ClientRuntimeWsEvent {
-        crate::render_guard::assert_not_rendering("Client transport event reduction");
         self.client_core()
-            .compatibility_runtime()
-            .reduce_ws_event(event, context)
+            .drain_gateway_compatibility_events()
+            .into_iter()
+            .map(|event| event.into_event())
+            .collect()
     }
 
     pub fn reduce_gateway_notification(
@@ -95,3 +87,6 @@ impl ClientRuntime {
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+
+mod settings_binding;
+pub(crate) use settings_binding::GatewaySettingsBinding;

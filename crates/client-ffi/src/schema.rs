@@ -23,6 +23,22 @@ macro_rules! schema_doc {
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "client_gateway_session_validation_request.json",
+            crate::auth::ClientGatewaySessionValidationRequest
+        ),
+        schema_doc!(
+            "client_gateway_session_validation_result.json",
+            crate::auth::ClientGatewaySessionValidationResult
+        ),
+        schema_doc!(
+            "client_publication_wait_request_dto.json",
+            crate::client_binding::ClientPublicationWaitRequestDto
+        ),
+        schema_doc!(
+            "client_process_change_batch_dto.json",
+            crate::client_binding::ClientProcessChangeBatchDto
+        ),
+        schema_doc!(
             "client_intent_dispatch_dto.json",
             crate::client_binding::ClientIntentDispatchDto
         ),
@@ -463,6 +479,34 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "auth_device_create_response.json",
             pioneer_protocol::AuthDeviceCreateResponse
+        ),
+        schema_doc!(
+            "client_access_change_plan_request_dto.json",
+            crate::client_binding::ClientAccessChangePlanRequestDto
+        ),
+        schema_doc!(
+            "access_changed_plan.json",
+            pioneer_client::authorization::AccessChangedPlan
+        ),
+        schema_doc!(
+            "client_transport_reserve_request_dto.json",
+            crate::client_binding::ClientTransportReserveRequestDto
+        ),
+        schema_doc!(
+            "client_transport_lease_request_dto.json",
+            crate::client_binding::ClientTransportLeaseRequestDto
+        ),
+        schema_doc!(
+            "client_gateway_session_ensure_request.json",
+            crate::auth::ClientGatewaySessionEnsureRequest
+        ),
+        schema_doc!(
+            "client_gateway_session_control_request.json",
+            crate::auth::ClientGatewaySessionControlRequest
+        ),
+        schema_doc!(
+            "gateway_session_connection_result.json",
+            pioneer_client::gateway::session_connection::GatewaySessionConnectionResult
         ),
         schema_doc!(
             "client_gateway_session_replace_access_request.json",
@@ -982,6 +1026,43 @@ mod tests {
                 !schema.contains("\"bytes\""),
                 "Epic 6 FFI contract {expected} exposes attachment bytes"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod publication_schema_tests {
+    #[test]
+    fn process_batch_schema_exports_coherent_change_sets() {
+        let documents = super::client_ffi_schema_documents();
+        for name in [
+            "client_access_change_plan_request_dto.json",
+            "access_changed_plan.json",
+            "client_transport_reserve_request_dto.json",
+            "client_transport_lease_request_dto.json",
+            "client_gateway_session_lifecycle_request.json",
+            "client_gateway_session_lifecycle_result.json",
+            "client_gateway_session_ensure_request.json",
+            "client_gateway_session_control_request.json",
+            "gateway_session_connection_result.json",
+            "client_publication_wait_request_dto.json",
+            "client_process_change_batch_dto.json",
+            "client_effect_completion_dto.json",
+            "client_transition_dto.json",
+            "client_event.json",
+            "client_active_thread_event_request.json",
+            "client_gateway_session_validation_request.json",
+            "client_gateway_session_validation_result.json",
+        ] {
+            let document = documents
+                .iter()
+                .find(|document| document.file_name == name)
+                .unwrap();
+            let json = serde_json::to_string_pretty(&document.schema).unwrap();
+            assert!(document.schema.as_value().is_object());
+            if std::env::var_os("PIONEER_PRINT_PUBLICATION_SCHEMAS").is_some() {
+                println!("SCHEMA_BEGIN:{name}\n{json}\nSCHEMA_END");
+            }
         }
     }
 }

@@ -9,6 +9,7 @@ impl GatewayWsClient {
             command_tx,
             next_connection_id: Arc::new(AtomicU64::new(0)),
             session_access: Arc::new(Mutex::new(None)),
+            connection_generations: Arc::default(),
         };
 
         spawn_worker(command_rx, event_tx);

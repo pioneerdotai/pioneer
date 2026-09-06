@@ -11,12 +11,11 @@ impl PioneerDesktop {
         self.gateway.status = t!("gateway.status.connecting").to_string();
         self.gateway.status_level = GatewayStatusLevel::Neutral;
         self.gateway.error = None;
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
         let startup_trace = self.startup.diagnostic_trace();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
-            let ws_sender = ws_sender.clone();
             let startup_trace = startup_trace.clone();
 
             async move {
@@ -47,7 +46,7 @@ impl PioneerDesktop {
                         let mut runtime = crate::gateway::observe_startup_stage(
                             &startup_trace,
                             pioneer_observability::DesktopStartupStage::GatewayRuntimeStateLoad,
-                            GatewayRuntime::load,
+                            || GatewayRuntime::load(client_core),
                         )?;
                         runtime.discover_and_adopt_existing_local_gateway_once(&startup_trace)?;
                         runtime.try_recover_active_local_gateway_once(&startup_trace)?;
@@ -59,7 +58,7 @@ impl PioneerDesktop {
                                 pioneer_observability::DesktopStartupStage::GatewayRuntimeConnectionPrepare,
                                 || build_ws_connect_spec(&mut runtime, &endpoint),
                             )?;
-                            Some(ws_sender.connect_with_retry(spec)?)
+                            Some(runtime.start_gateway_session_transport(spec, true)?)
                         } else {
                             None
                         };

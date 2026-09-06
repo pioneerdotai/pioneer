@@ -7,11 +7,14 @@ use gpui_kit::component::{theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
-    pub(crate) fn render_initial_setup(
+    fn initial_setup_presentation(
         &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (
+        String,
+        String,
+        GatewaySetupFormMode,
+        Entity<crate::app::gateway_setup::GatewaySetupFormState>,
+    ) {
         let reauthentication = self
             .gateway
             .runtime
@@ -46,8 +49,55 @@ impl PioneerDesktop {
                 GatewaySetupFormMode::Initial { allow_local },
             )
         };
-        let desktop_entity = cx.entity().clone();
-        let form_state = self.gateway_setup_form_state.clone();
+        (
+            title,
+            description,
+            mode,
+            self.gateway_setup_form_state.clone(),
+        )
+    }
+}
+
+pub(crate) struct InitialGatewaySetupView {
+    desktop: WeakEntity<PioneerDesktop>,
+    binding: std::sync::Arc<crate::gateway::GatewaySessionBinding>,
+    _delivery: Task<()>,
+}
+
+impl InitialGatewaySetupView {
+    pub(crate) fn new(
+        desktop: WeakEntity<PioneerDesktop>,
+        binding: std::sync::Arc<crate::gateway::GatewaySessionBinding>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut publications = binding.watch();
+        let delivery = cx.spawn(async move |view, cx| {
+            while publications.changed().await.is_ok() {
+                let _ = *publications.borrow_and_update();
+                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            desktop,
+            binding,
+            _delivery: delivery,
+        }
+    }
+}
+
+impl Render for InitialGatewaySetupView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(desktop_entity) = self.desktop.upgrade() else {
+            return div().into_any_element();
+        };
+        let (title, description, mode, form_state) =
+            desktop_entity.read(cx).initial_setup_presentation();
+        let publication = self
+            .binding
+            .publication()
+            .map(|publication| publication.payload());
 
         v_flex()
             .size_full()
@@ -89,6 +139,7 @@ impl PioneerDesktop {
                         form_state,
                         mode,
                         desktop_entity,
+                        publication.as_deref(),
                         window,
                         cx,
                     )),

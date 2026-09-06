@@ -78,6 +78,27 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
 
     let mut contracts = vec![
         contract_type!(
+            "gateway_settings_store.json",
+            crate::gateway::settings_store::GatewaySettingsStore,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "identity_authorization_publication.json",
+            crate::gateway::identity_authorization::IdentityAuthorizationPublication,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_session_publication.json",
+            crate::gateway::session_controller::GatewaySessionPublication,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "client_scope.json",
             crate::core::ClientScope,
             Domain::Root,

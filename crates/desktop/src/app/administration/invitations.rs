@@ -238,7 +238,7 @@ impl PioneerDesktop {
         }
         self.invitations_loading = true;
         self.invitations_error = None;
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -319,7 +319,7 @@ impl PioneerDesktop {
             state.error = None;
             cx.notify();
         });
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -406,7 +406,7 @@ impl PioneerDesktop {
         if !self.administration.begin_action(action) {
             return;
         }
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {

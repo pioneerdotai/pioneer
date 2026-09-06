@@ -95,6 +95,33 @@ pub struct ClientChangeBatchDto {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientPublicationWaitRequestDto {
+    pub schema_version: u32,
+    pub after_sequence: ClientChangeSequence,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize)]
+pub struct ClientProcessChangeSetDto {
+    pub sequence: ClientChangeSequence,
+    pub predecessor: Option<ClientChangeSequence>,
+    pub snapshots: Vec<ClientScopedSnapshotDto>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Serialize)]
+pub struct ClientProcessChangeBatchDto {
+    pub closed: bool,
+    pub effects: Vec<ClientEffectPlan>,
+    pub schema_version: u32,
+    pub sequence: ClientChangeSequence,
+    pub resnapshot: bool,
+    pub changes: Vec<ClientProcessChangeSetDto>,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ClientTransitionDto {
     pub schema_version: u32,
@@ -184,4 +211,32 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTransportReserveRequestDto {
+    pub schema_version: u32,
+    pub exclusive: bool,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTransportLeaseRequestDto {
+    pub schema_version: u32,
+    pub lease_id: u64,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientAccessChangePlanRequestDto {
+    pub schema_version: u32,
+    pub connection_generation: u64,
+    pub change_sequence: u64,
+    pub active_workspace_id: Option<String>,
+    pub active_thread_id: Option<String>,
+    pub known_threads: Vec<pioneer_client::authorization::ThreadAuthorizationScope>,
 }

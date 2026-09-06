@@ -111,7 +111,12 @@ impl PioneerDesktop {
         cx.notify();
 
         let previous_workspace_id = current_workspace_id;
-        if self.gateway.session_refresh_in_flight {
+        if self
+            .gateway
+            .client_runtime
+            .client_core()
+            .gateway_refresh_in_flight()
+        {
             self.defer_workspace_switch_until_session_refresh(
                 workspace_id,
                 target_active_thread_id,
@@ -162,7 +167,7 @@ impl PioneerDesktop {
             return;
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let requested_workspace_id = workspace_id.clone();
@@ -294,7 +299,7 @@ impl PioneerDesktop {
                 #[cfg(not(feature = "qualification-diagnostics"))]
                 {
                     let _ = this.update(&mut cx, |view, cx| {
-                        if view.gateway.session_refresh_in_flight {
+                        if view.gateway.client_runtime.client_core().gateway_refresh_in_flight() {
                             view.defer_workspace_switch_until_session_refresh(
                                 workspace_id,
                                 target_active_thread_id,
@@ -314,7 +319,7 @@ impl PioneerDesktop {
                 #[cfg(feature = "qualification-diagnostics")]
                 {
                     let handoff = this.update(&mut cx, |view, cx| {
-                        if view.gateway.session_refresh_in_flight {
+                        if view.gateway.client_runtime.client_core().gateway_refresh_in_flight() {
                             pioneer_observability::record_qualification_diagnostic!(
                                 record_animation_activity(
                                     pioneer_observability::AnimationSourceId::WorkspaceSwitchSessionWait,

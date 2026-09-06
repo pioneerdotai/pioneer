@@ -26,7 +26,8 @@ pub enum AuthorizationProjectionAcceptance {
     Incompatible,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct AuthorizationProjectionManifest {
     schema_version: u32,
     principal_id: PrincipalId,
@@ -38,7 +39,8 @@ struct AuthorizationProjectionManifest {
 /// Coherent authorization projections for one connection epoch. All shells
 /// feed every scoped response through this store before exposing any bit to UI
 /// consumers.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthorizationProjectionStore {
     accepted_revision: Option<u64>,
     manifest: Option<AuthorizationProjectionManifest>,
@@ -416,13 +418,15 @@ pub fn thread_presentation_capabilities(
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadAuthorizationScope {
     pub thread_id: String,
     pub workspace_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessChangedPlan {
     pub authorization_revision: u64,
     pub workspace_id: String,

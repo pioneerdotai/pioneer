@@ -66,6 +66,9 @@ pub enum GatewayWsCommand {
         payload: Vec<u8>,
     },
     Disconnect,
+    DisconnectConnection {
+        connection_id: u64,
+    },
     Shutdown,
 }
 
@@ -93,6 +96,7 @@ enum ConnectionRpcCommand {
 }
 
 struct ActiveConnectionTask {
+    connection_id: u64,
     handle: JoinHandle<()>,
     rpc_tx: UnboundedSender<ConnectionRpcCommand>,
 }
@@ -126,6 +130,7 @@ async fn run_worker(
                 abort_connection_task(&mut connection_task).await;
                 let (rpc_tx, rpc_rx) = unbounded_channel();
                 connection_task = Some(ActiveConnectionTask {
+                    connection_id,
                     handle: tokio::spawn(run_connection_task(
                         connection_id,
                         spec,
@@ -153,6 +158,7 @@ async fn run_worker(
                         abort_connection_task(&mut connection_task).await;
                         let (rpc_tx, rpc_rx) = unbounded_channel();
                         connection_task = Some(ActiveConnectionTask {
+                            connection_id,
                             handle: tokio::spawn(run_connection_task(
                                 connection_id,
                                 spec,
@@ -267,6 +273,14 @@ async fn run_worker(
             }
             GatewayWsCommand::Disconnect => {
                 abort_connection_task(&mut connection_task).await;
+            }
+            GatewayWsCommand::DisconnectConnection { connection_id } => {
+                if connection_task
+                    .as_ref()
+                    .is_some_and(|task| task.connection_id == connection_id)
+                {
+                    abort_connection_task(&mut connection_task).await;
+                }
             }
             GatewayWsCommand::Shutdown => {
                 break;

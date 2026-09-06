@@ -56,6 +56,7 @@ impl DesktopGatewayHttpClient {
         endpoint: &pioneer_client::gateway::types::GatewayEndpoint,
         sender: GatewayWsCommandSender,
         runtime_home: PathBuf,
+        client_core: Arc<pioneer_client::core::ClientCore>,
     ) -> Result<Self, GatewayHttpError> {
         let access = sender
             .current_gateway_http_access()
@@ -67,6 +68,7 @@ impl DesktopGatewayHttpClient {
             return Err(GatewayHttpError::InvalidEndpoint);
         }
         let authority = Arc::new(DesktopGatewayHttpAuthority {
+            client_core,
             endpoint_id: endpoint.id.clone(),
             sender,
         });
@@ -156,6 +158,7 @@ impl DesktopGatewayHttpClient {
 }
 
 struct DesktopGatewayHttpAuthority {
+    client_core: Arc<pioneer_client::core::ClientCore>,
     endpoint_id: String,
     sender: GatewayWsCommandSender,
 }
@@ -175,6 +178,7 @@ impl GatewayHttpSessionAuthority for DesktopGatewayHttpAuthority {
         {
             return Ok(current);
         }
+        let client_core = self.client_core.clone();
         let endpoint_id = self.endpoint_id.clone();
         let sender = self.sender.clone();
         tokio::task::spawn_blocking(move || {
@@ -183,7 +187,7 @@ impl GatewayHttpSessionAuthority for DesktopGatewayHttpAuthority {
             {
                 return Ok(current);
             }
-            let mut runtime = GatewayRuntime::load()
+            let mut runtime = GatewayRuntime::load(client_core)
                 .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?;
             match runtime
                 .replace_gateway_session_access_after_rejection(

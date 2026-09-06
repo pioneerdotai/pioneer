@@ -32,6 +32,9 @@ pub enum SessionTerminalReason {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SessionLifecycleState {
+    Suspended {
+        metadata: Option<GatewaySessionMetadata>,
+    },
     NoSession,
     NeedsDeviceActivation,
     Refreshing {
@@ -67,6 +70,7 @@ pub enum SessionLifecycleState {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum SessionLifecycleEvent {
+    Suspend,
     NoStoredSession,
     DeviceActivationRequired,
     StoredSessionLoaded(GatewaySessionMetadata),
@@ -153,6 +157,18 @@ impl Default for SessionLifecycle {
 }
 
 impl SessionLifecycle {
+    pub(crate) fn with_generation_floor(next: u64) -> Self {
+        Self {
+            state: SessionLifecycleState::NoSession,
+            next_intent_id: next,
+            next_connection_generation: next,
+        }
+    }
+
+    pub(crate) fn next_generation_floor(&self) -> u64 {
+        self.next_intent_id.max(self.next_connection_generation)
+    }
+
     pub fn state(&self) -> &SessionLifecycleState {
         &self.state
     }
@@ -163,11 +179,34 @@ impl SessionLifecycle {
                 self.state = SessionLifecycleState::NoSession;
                 SessionLifecycleEffect::None
             }
+            SessionLifecycleEvent::Suspend => {
+                let metadata = self.metadata().cloned();
+                self.state = SessionLifecycleState::Suspended { metadata };
+                SessionLifecycleEffect::None
+            }
             SessionLifecycleEvent::DeviceActivationRequired => {
                 self.state = SessionLifecycleState::NeedsDeviceActivation;
                 SessionLifecycleEffect::BeginDeviceActivation
             }
             SessionLifecycleEvent::StoredSessionLoaded(metadata) => {
+                // A durable predecessor may be loaded again after the caller's
+                // transport attempt ended without a response. Resume its intent;
+                // never mint another rotation for the same stored generation.
+                if let SessionLifecycleState::Refreshing {
+                    metadata: current,
+                    intent_id,
+                    ..
+                } = &self.state
+                {
+                    return if current == &metadata {
+                        SessionLifecycleEffect::BeginRefresh {
+                            session_id: current.session_id.clone(),
+                            intent_id: *intent_id,
+                        }
+                    } else {
+                        SessionLifecycleEffect::None
+                    };
+                }
                 self.begin_refresh(metadata, None)
             }
             SessionLifecycleEvent::RefreshGrantReceived {
@@ -384,7 +423,8 @@ impl SessionLifecycle {
             | SessionLifecycleState::AwaitingSecureStorage { metadata, .. }
             | SessionLifecycleState::Connecting { metadata, .. }
             | SessionLifecycleState::Active { metadata, .. } => Some(metadata),
-            SessionLifecycleState::Terminal { metadata, .. } => metadata.as_ref(),
+            SessionLifecycleState::Terminal { metadata, .. }
+            | SessionLifecycleState::Suspended { metadata } => metadata.as_ref(),
             SessionLifecycleState::NoSession | SessionLifecycleState::NeedsDeviceActivation => None,
         }
     }

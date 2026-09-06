@@ -128,7 +128,7 @@ impl PioneerDesktop {
             input,
             mentioned_principal_ids,
         };
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         let target_turn_id = target.presentation.turn_id;
 
         cx.spawn_in(
@@ -215,7 +215,7 @@ impl PioneerDesktop {
                         view.message_mutation_pending = true;
                         cx.notify();
                         Some((
-                            view.gateway.ws_command_sender.clone(),
+                            view.gateway.client_runtime.ws_command_sender().clone(),
                             TurnMessageDeleteParams {
                                 thread_id: presentation.thread_id.clone(),
                                 turn_id: presentation.turn_id.clone(),

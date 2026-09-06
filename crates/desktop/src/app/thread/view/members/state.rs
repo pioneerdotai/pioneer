@@ -87,7 +87,12 @@ impl PioneerDesktop {
         let generation = self.thread_scope_capabilities_refresh_generation;
         let connection_id = self.gateway.ws_connection_id;
         self.thread_scope_capabilities_loading_thread_id = Some(thread_id.clone());
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
+        let authorization_ticket = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .current_auth_ticket();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -151,19 +156,15 @@ impl PioneerDesktop {
 
                             match result {
                                 Ok(snapshot) => {
-                                    if view.gateway.authorization_projections.accept(snapshot)
+                                    if view.gateway.client_runtime.client_core().accept_authorization_projection(authorization_ticket.0, authorization_ticket.1, snapshot)
                                         != pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
                                     {
                                         return ThreadCapabilityRefreshDecision::Retry;
                                     }
-                                    view.gateway.authorization_revision = view
-                                        .gateway
-                                        .authorization_projections
-                                        .accepted_revision();
+
                                     let coherent = view
                                         .gateway
-                                        .authorization_projections
-                                        .snapshot(
+                                        .client_runtime.client_core().authorization_snapshot(
                                             Some(workspace_id.as_str()),
                                             (!is_runtime_draft).then_some(thread_id.as_str()),
                                         );
@@ -178,12 +179,10 @@ impl PioneerDesktop {
                                         );
                                     view.gateway.capability_snapshot = view
                                         .gateway
-                                        .authorization_projections
-                                        .snapshot(Some(workspace_id.as_str()), None)
+                                        .client_runtime.client_core().authorization_snapshot(Some(workspace_id.as_str()), None)
                                         .or_else(|| {
                                             view.gateway
-                                                .authorization_projections
-                                                .snapshot(None, None)
+                                                .client_runtime.client_core().authorization_snapshot(None, None)
                                         });
                                     view.startup.begin(
                                         pioneer_observability::DesktopStartupStage::ComposerPolicyReconcile,
@@ -344,7 +343,7 @@ impl PioneerDesktop {
         };
         self.thread_scope_error = None;
 
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {

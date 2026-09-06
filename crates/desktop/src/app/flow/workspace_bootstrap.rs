@@ -98,7 +98,7 @@ impl PioneerDesktop {
             .and_then(GatewayRuntime::active_workspace_id);
         let persisted_workspace_id =
             workspace_id_for_connection_bootstrap(active_thread_workspace_id, runtime_workspace_id);
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();

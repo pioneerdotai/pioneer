@@ -63,7 +63,7 @@ impl Render for PioneerDesktop {
         let body = if let Some(invitation_join) = invitation_join {
             self.render_desktop_invitation_join(invitation_join, window, cx)
         } else if is_gateway_setup_required {
-            self.render_initial_setup(window, cx)
+            self.gateway.setup_view.clone().into_any_element()
         } else {
             let desktop_entity = cx.entity().clone();
             let content = match self.main_content_view {
@@ -166,7 +166,7 @@ impl Render for PioneerDesktop {
                                         .h_full()
                                         .items_center()
                                         .child(if show_gateway_switcher {
-                                            self.render_gateways_popover(cx)
+                                            self.gateway.switcher_view.clone().into_any_element()
                                         } else {
                                             div().into_any_element()
                                         })

@@ -11,6 +11,7 @@ impl PioneerDesktop {
         activation_code: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
+        let client_core = self.gateway.client_runtime.client_core().clone();
         if source == GatewayOperationSource::AddGatewayDialog {
             self.connect_remote_gateway_from_add_dialog(
                 window,
@@ -23,7 +24,7 @@ impl PioneerDesktop {
             return;
         }
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         let Some(operation_epoch) = self.begin_gateway_operation(
             t!("gateway.status.connecting_remote").to_string(),
@@ -48,14 +49,15 @@ impl PioneerDesktop {
                                 &ws_sender,
                                 threads_to_unsubscribe,
                             );
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
                                 gateway_base_url.as_str(),
                                 Some(activation_code.as_str()),
                             )?;
                             let spec = build_ws_connect_spec(&mut runtime, &endpoint)?;
-                            let connection_id = ws_sender.connect_and_wait(spec)?;
+                            let connection_id =
+                                runtime.start_gateway_session_transport(spec, false)?;
                             runtime.activate_gateway(endpoint.id.as_str())?;
 
                             Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
@@ -99,7 +101,8 @@ impl PioneerDesktop {
         form_state: Option<Entity<GatewaySetupFormState>>,
         close_dialog_on_success: bool,
     ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         let Some(operation_epoch) = self.begin_gateway_operation(
             t!("gateway.status.connecting_remote").to_string(),
             Some(GatewaySetupAction::ConnectRemote),
@@ -118,8 +121,8 @@ impl PioneerDesktop {
                 async move {
                     let staged_result = cx
                         .background_spawn(async move {
-                            let mut runtime =
-                                GatewayRuntime::load().map_err(|error| (None, error))?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())
+                                .map_err(|error| (None, error))?;
                             let endpoint = runtime
                                 .reauthenticate_remote_gateway(
                                     endpoint_id.as_str(),
@@ -144,7 +147,10 @@ impl PioneerDesktop {
                             let _ = this.update_in(&mut cx, |view, window, cx| {
                                 if let Some(runtime) = durable_runtime
                                     && should_apply_gateway_operation_result(
-                                        view.gateway.connection_epoch,
+                                        view.gateway
+                                            .client_runtime
+                                            .client_core()
+                                            .gateway_operation_epoch(),
                                         operation_epoch,
                                     )
                                 {
@@ -177,7 +183,10 @@ impl PioneerDesktop {
                     let mut threads_to_unsubscribe = None;
                     let _ = this.update_in(&mut cx, |view, _window, cx| {
                         if should_apply_gateway_operation_result(
-                            view.gateway.connection_epoch,
+                            view.gateway
+                                .client_runtime
+                                .client_core()
+                                .gateway_operation_epoch(),
                             operation_epoch,
                         ) {
                             threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
@@ -195,10 +204,11 @@ impl PioneerDesktop {
                                 &ws_sender,
                                 threads_to_unsubscribe,
                             );
-                            let connection_id = match ws_sender.connect_and_wait(spec) {
-                                Ok(connection_id) => connection_id,
-                                Err(error) => return Err((runtime, error.into())),
-                            };
+                            let connection_id =
+                                match runtime.start_gateway_session_transport(spec, false) {
+                                    Ok(connection_id) => connection_id,
+                                    Err(error) => return Err((runtime, error.into())),
+                                };
                             if let Err(error) = runtime.activate_gateway(endpoint_id.as_str()) {
                                 return Err((runtime, error));
                             }
@@ -228,7 +238,10 @@ impl PioneerDesktop {
                         }
                         Err((runtime, error)) => {
                             if should_apply_gateway_operation_result(
-                                view.gateway.connection_epoch,
+                                view.gateway
+                                    .client_runtime
+                                    .client_core()
+                                    .gateway_operation_epoch(),
                                 operation_epoch,
                             ) {
                                 // Device activation and secure persistence have
@@ -260,7 +273,8 @@ impl PioneerDesktop {
         activation_code: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         let Some(operation_epoch) = self.begin_gateway_operation(
             t!("gateway.status.connecting_remote").to_string(),
@@ -280,7 +294,7 @@ impl PioneerDesktop {
                 async move {
                     let staged_result = cx
                         .background_spawn(async move {
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let endpoint = runtime.add_remote_gateway(
                                 name.as_str(),
                                 gateway_base_url.as_str(),
@@ -314,7 +328,10 @@ impl PioneerDesktop {
                     let mut threads_to_unsubscribe = None;
                     let _ = this.update_in(&mut cx, |view, _window, cx| {
                         if should_apply_gateway_operation_result(
-                            view.gateway.connection_epoch,
+                            view.gateway
+                                .client_runtime
+                                .client_core()
+                                .gateway_operation_epoch(),
                             operation_epoch,
                         ) {
                             threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
@@ -332,7 +349,8 @@ impl PioneerDesktop {
                                 &ws_sender,
                                 threads_to_unsubscribe,
                             );
-                            let connection_id = ws_sender.connect_and_wait(spec)?;
+                            let connection_id =
+                                runtime.start_gateway_session_transport(spec, false)?;
                             runtime.activate_gateway(endpoint_id.as_str())?;
 
                             Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
@@ -372,7 +390,8 @@ impl PioneerDesktop {
         source: GatewayOperationSource,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         let Some(operation_epoch) = self.begin_gateway_operation(
             t!("gateway.status.starting_local").to_string(),
@@ -426,13 +445,14 @@ impl PioneerDesktop {
                                 &ws_sender,
                                 threads_to_unsubscribe,
                             );
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let local_start = runtime.ensure_local_gateway_started()?;
                             let spec = build_local_ws_connect_spec_with_recovery(
                                 &mut runtime,
                                 &local_start.endpoint,
                             )?;
-                            let connection_id = ws_sender.connect_and_wait(spec)?;
+                            let connection_id =
+                                runtime.start_gateway_session_transport(spec, false)?;
                             runtime.activate_gateway(local_start.endpoint.id.as_str())?;
 
                             Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
@@ -482,7 +502,8 @@ impl PioneerDesktop {
         gateway_base_url: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         let Some(operation_epoch) = self.begin_gateway_operation(
             t!("gateway.status.saving").to_string(),
@@ -502,7 +523,7 @@ impl PioneerDesktop {
                 async move {
                     let staged_result = cx
                         .background_spawn(async move {
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let current =
                                 runtime.endpoint(endpoint_id.as_str()).ok_or_else(|| {
                                     anyhow!(
@@ -569,7 +590,10 @@ impl PioneerDesktop {
                     let mut threads_to_unsubscribe = None;
                     let _ = this.update_in(&mut cx, |view, _window, cx| {
                         if should_apply_gateway_operation_result(
-                            view.gateway.connection_epoch,
+                            view.gateway
+                                .client_runtime
+                                .client_core()
+                                .gateway_operation_epoch(),
                             operation_epoch,
                         ) {
                             threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
@@ -588,17 +612,18 @@ impl PioneerDesktop {
                                 threads_to_unsubscribe,
                             );
 
-                            let ws_connection_id = match ws_sender.connect_and_wait(spec) {
-                                Ok(connection_id) => Some(connection_id),
-                                Err(error) => {
-                                    warn!(
-                                        error = %format!("{error:#}"),
-                                        gateway_id = endpoint.id.as_str(),
-                                        "saved active gateway but failed to reconnect"
-                                    );
-                                    None
-                                }
-                            };
+                            let ws_connection_id =
+                                match runtime.start_gateway_session_transport(spec, false) {
+                                    Ok(connection_id) => Some(connection_id),
+                                    Err(error) => {
+                                        warn!(
+                                            error = %format!("{error:#}"),
+                                            gateway_id = endpoint.id.as_str(),
+                                            "saved active gateway but failed to reconnect"
+                                        );
+                                        None
+                                    }
+                                };
                             runtime.activate_gateway(endpoint.id.as_str())?;
 
                             Ok::<GatewayOperationSuccess, anyhow::Error>(GatewayOperationSuccess {
@@ -633,7 +658,8 @@ impl PioneerDesktop {
         endpoint_id: String,
         form_state: Option<Entity<GatewaySetupFormState>>,
     ) {
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         let Some(operation_epoch) = self.begin_gateway_operation(
             t!("gateway.status.deleting").to_string(),
@@ -653,7 +679,7 @@ impl PioneerDesktop {
                 async move {
                     let staged_result = cx
                         .background_spawn(async move {
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let outcome = runtime.delete_gateway(endpoint_id.as_str())?;
 
                             Ok::<_, anyhow::Error>((runtime, outcome))
@@ -696,7 +722,7 @@ impl PioneerDesktop {
                     let mut threads_to_unsubscribe = None;
                     let _ = this.update_in(&mut cx, |view, _window, cx| {
                         if should_apply_gateway_operation_result(
-                            view.gateway.connection_epoch,
+                            view.gateway.client_runtime.client_core().gateway_operation_epoch(),
                             operation_epoch,
                         ) {
                             threads_to_unsubscribe = Some(view.prepare_gateway_switch(cx));
@@ -735,9 +761,9 @@ impl PioneerDesktop {
                                     };
                                     let connection_id = if endpoint.kind == GatewayEndpointKind::Remote {
                                         ws_connected_ready = false;
-                                        ws_sender.connect_with_retry(spec)?
+                                        runtime.start_gateway_session_transport(spec, true)?
                                     } else {
-                                        ws_sender.connect_and_wait(spec)?
+                                        runtime.start_gateway_session_transport(spec, false)?
                                     };
                                     runtime.activate_gateway(endpoint.id.as_str())?;
                                     Ok((Some(connection_id), ws_connected_ready))
@@ -797,6 +823,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let client_core = self.gateway.client_runtime.client_core().clone();
         let active_gateway_id = self
             .gateway
             .runtime
@@ -823,7 +850,7 @@ impl PioneerDesktop {
             gateway_name = gateway_name
         )
         .to_string();
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         let Some(operation_epoch) = self.begin_gateway_operation(status, None, cx) else {
             return false;
         };
@@ -871,7 +898,7 @@ impl PioneerDesktop {
                                 &ws_sender,
                                 threads_to_unsubscribe,
                             );
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let mut endpoint =
                                 runtime.endpoint(gateway_id.as_str()).ok_or_else(|| {
                                     anyhow!(
@@ -892,9 +919,9 @@ impl PioneerDesktop {
                             };
                             let (connection_id, ws_connected_ready) =
                                 if endpoint.kind == GatewayEndpointKind::Remote {
-                                    (ws_sender.connect_with_retry(spec)?, false)
+                                    (runtime.start_gateway_session_transport(spec, true)?, false)
                                 } else {
-                                    (ws_sender.connect_and_wait(spec)?, true)
+                                    (runtime.start_gateway_session_transport(spec, false)?, true)
                                 };
                             runtime.activate_gateway(endpoint.id.as_str())?;
 
@@ -949,7 +976,13 @@ impl PioneerDesktop {
         form_state: Option<&Entity<GatewaySetupFormState>>,
         cx: &mut Context<Self>,
     ) {
-        if !should_apply_gateway_operation_result(self.gateway.connection_epoch, operation_epoch) {
+        if !should_apply_gateway_operation_result(
+            self.gateway
+                .client_runtime
+                .client_core()
+                .gateway_operation_epoch(),
+            operation_epoch,
+        ) {
             return;
         }
 

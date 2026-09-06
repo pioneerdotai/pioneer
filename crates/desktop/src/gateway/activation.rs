@@ -8,7 +8,7 @@ use pioneer_client::{
     transport::ws::auth_exchange::AuthExchangeClient,
 };
 use pioneer_protocol::{
-    AuthDeviceActivateParams, AuthSecretString, AuthSessionGrant, ClientInstallationDescriptor,
+    AuthDeviceActivateParams, AuthSessionGrant, ClientInstallationDescriptor,
     CredentialStorageOrder, GatewayId, normalize_device_activation_code,
 };
 use zeroize::Zeroizing;
@@ -52,11 +52,7 @@ impl fmt::Display for DesktopSessionSecureStorageError {
 
 impl std::error::Error for DesktopSessionSecureStorageError {}
 
-#[derive(Debug)]
-pub(crate) struct DesktopSessionAccessGrant {
-    pub access_token: AuthSecretString,
-    pub access_expires_at_unix: u64,
-}
+pub(crate) use pioneer_client::gateway::session_refresh::GatewaySessionAccessGrant as DesktopSessionAccessGrant;
 
 pub(crate) fn provision_endpoint_session<F, C, S>(
     registry: &mut GatewayRegistry,
@@ -256,7 +252,9 @@ fn session_from_grant(
         refresh_token: grant.refresh_token,
         pending_refresh_request_id: None,
     };
-    session.validate()?;
+    session
+        .validate()
+        .map_err(super::secrets::desktop_session_validation_error)?;
     Ok((
         session,
         DesktopSessionAccessGrant {

@@ -16,18 +16,27 @@ impl PioneerDesktop {
         &mut self,
         cx: &mut Context<Self>,
     ) {
+        self.gateway.session_binding.synchronize(
+            self.gateway
+                .client_runtime
+                .client_core()
+                .snapshot(&pioneer_client::core::ClientScope::Session),
+        );
         let Some(delay) = self.gateway.runtime.as_ref().and_then(|runtime| {
-            runtime.active_session_refresh_delay(
+            self.gateway.session_binding.refresh_delay(
+                runtime.active_gateway_id()?,
                 unix_timestamp_secs(),
                 DESKTOP_ACCESS_REFRESH_LEEWAY_SECONDS,
             )
         }) else {
             return;
         };
-        let Some(generation) = next_refresh_generation(
-            &mut self.gateway.session_refresh_generation,
-            self.gateway.session_refresh_in_flight,
-        ) else {
+        let Some(generation) = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .schedule_gateway_refresh()
+        else {
             return;
         };
         let delay = delay.max(Duration::from_millis(1));
@@ -131,10 +140,12 @@ impl PioneerDesktop {
         mode: DesktopSessionConnectionMode,
         cx: &mut Context<Self>,
     ) {
-        let Some(generation) = next_refresh_generation(
-            &mut self.gateway.session_refresh_generation,
-            self.gateway.session_refresh_in_flight,
-        ) else {
+        let Some(generation) = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .schedule_gateway_refresh()
+        else {
             return;
         };
         self.refresh_gateway_session_if_current(generation, mode, cx);
@@ -146,8 +157,18 @@ impl PioneerDesktop {
         mode: DesktopSessionConnectionMode,
         cx: &mut Context<Self>,
     ) {
-        if generation != self.gateway.session_refresh_generation
-            || self.gateway.session_refresh_in_flight
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        if generation
+            != self
+                .gateway
+                .client_runtime
+                .client_core()
+                .gateway_refresh_generation()
+            || self
+                .gateway
+                .client_runtime
+                .client_core()
+                .gateway_refresh_in_flight()
         {
             return;
         }
@@ -220,7 +241,14 @@ impl PioneerDesktop {
             return;
         };
         self.discard_deferred_gateway_ws_events();
-        self.gateway.session_refresh_in_flight = true;
+        if !self
+            .gateway
+            .client_runtime
+            .client_core()
+            .start_gateway_refresh(generation)
+        {
+            return;
+        }
         if self.current_active_thread_id().is_some() {
             self.active_thread_resubscribe_pending = true;
         }
@@ -228,7 +256,7 @@ impl PioneerDesktop {
             self.thread_workspace_id(thread_id)
                 .map(|workspace_id| (thread_id.to_owned(), workspace_id.to_owned()))
         });
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -236,7 +264,7 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        let mut runtime = GatewayRuntime::load()?;
+                        let mut runtime = GatewayRuntime::load(client_core.clone())?;
                         let outcome = match mode {
                             DesktopSessionConnectionMode::ReplaceActive => runtime
                                 .replace_gateway_session_access(endpoint_id.as_str(), &sender)?,
@@ -261,10 +289,14 @@ impl PioneerDesktop {
                     })
                     .await;
                 let _ = this.update(&mut cx, |view, cx| {
-                    if generation != view.gateway.session_refresh_generation {
+                    if !view
+                        .gateway
+                        .client_runtime
+                        .client_core()
+                        .finish_gateway_refresh(generation)
+                    {
                         return;
                     }
-                    view.gateway.session_refresh_in_flight = false;
                     match result {
                         Ok((
                             runtime,
@@ -330,7 +362,7 @@ impl PioneerDesktop {
                             view.gateway.connection_state = GatewayConnectionState::Disconnected;
                             view.gateway.error =
                                 Some(desktop_session_terminal_message(terminal.reason));
-                            let _ = view.gateway.ws_command_sender.disconnect();
+                            let _ = view.gateway.client_runtime.ws_command_sender().disconnect();
                         }
                         Err(error) => {
                             view.active_thread_resubscribe_pending = false;
@@ -353,26 +385,9 @@ fn unix_timestamp_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn next_refresh_generation(current: &mut u64, in_flight: bool) -> Option<u64> {
-    if in_flight {
-        return None;
-    }
-    *current = current.wrapping_add(1);
-    Some(*current)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DesktopSessionConnectionMode, next_refresh_generation};
-
-    #[test]
-    fn duplicate_trigger_does_not_invalidate_an_in_flight_refresh() {
-        let mut generation = 7;
-
-        assert_eq!(next_refresh_generation(&mut generation, true), None);
-        assert_eq!(generation, 7);
-        assert_eq!(next_refresh_generation(&mut generation, false), Some(8));
-    }
+    use super::DesktopSessionConnectionMode;
 
     #[test]
     fn connection_modes_keep_replacement_and_recovery_semantics_distinct() {

@@ -671,6 +671,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let client_core = self.gateway.client_runtime.client_core().clone();
         let Some(state) = self.invitation_join.clone() else {
             return;
         };
@@ -725,7 +726,7 @@ impl PioneerDesktop {
                 async move {
                     let result = if let Some(recovery) = pending_recovery {
                         cx.background_spawn(async move {
-                            let mut runtime = GatewayRuntime::load()?;
+                            let mut runtime = GatewayRuntime::load(client_core.clone())?;
                             let endpoint = runtime.recover_invitation_registry(&recovery)?;
                             Ok::<DesktopJoinTaskResult, anyhow::Error>(
                                 DesktopJoinTaskResult::Committed {
@@ -740,7 +741,9 @@ impl PioneerDesktop {
                         let (presentation, profile, gateway_name) =
                             prepared.expect("prepared join");
                         let runtime = match cx
-                            .background_spawn(async move { GatewayRuntime::load() })
+                            .background_spawn(
+                                async move { GatewayRuntime::load(client_core.clone()) },
+                            )
                             .await
                         {
                             Ok(runtime) => runtime,

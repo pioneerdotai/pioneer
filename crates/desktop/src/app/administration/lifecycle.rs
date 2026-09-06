@@ -70,7 +70,7 @@ impl PioneerDesktop {
             .begin(pioneer_observability::DesktopStartupStage::AuthorizationLoad);
         let generation = self.gateway.current_principal_refresh_generation;
         let connection_id = self.gateway.ws_connection_id;
-        let sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
         let workspace_id = self.active_workspace_id().map(str::to_owned);
 
         // A workspace-scoped projection must never remain discoverable after
@@ -100,7 +100,7 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 for attempt in 0..=CURRENT_PRINCIPAL_REFRESH_RETRY_DELAYS.len() {
-                    let request_sender = sender.clone();
+                    let request_core = client_core.clone();
                     let request_workspace_id = workspace_id.clone();
                     #[cfg(feature = "qualification-diagnostics")]
                     if attempt > 0 {
@@ -114,33 +114,9 @@ impl PioneerDesktop {
                     }
                     let result = cx
                         .background_spawn(async move {
-                            let auth = match request_sender.auth_me() {
-                                Ok(auth) => auth,
-                                Err(error) => return Err((None, error)),
-                            };
-                            let snapshot = match request_sender.authorization_capabilities(
-                                pioneer_protocol::AuthorizationCapabilitiesParams {
-                                    workspace_id: request_workspace_id.clone(),
-                                    thread_id: None,
-                                },
-                            ) {
-                                Ok(snapshot) => snapshot,
-                                Err(error) => return Err((Some(auth), error)),
-                            };
-                            if !pioneer_client::authorization::authorization_capability_snapshot_is_compatible(
-                                &snapshot,
-                                &auth.principal.id,
-                                request_workspace_id.as_deref(),
-                                None,
-                            ) {
-                                return Err((
-                                    Some(auth),
-                                    anyhow::anyhow!(
-                                        "Gateway returned an incompatible capability snapshot"
-                                    ),
-                                ));
-                            }
-                            Ok((auth, snapshot))
+                            request_core.refresh_identity_authorization(pioneer_protocol::AuthorizationCapabilitiesParams {
+                                workspace_id: request_workspace_id.clone(), thread_id: None,
+                            })
                         })
                         .await;
 
@@ -161,25 +137,15 @@ impl PioneerDesktop {
                             }
 
                             match result {
-                                Ok((auth, snapshot)) => {
-                                    if view.gateway.authorization_projections.accept(snapshot)
-                                        != pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
-                                    {
-                                        return CurrentPrincipalRefreshDecision::Retry;
-                                    }
-                                    view.gateway.current_auth = Some(auth);
-                                    view.gateway.authorization_revision = view
-                                        .gateway
-                                        .authorization_projections
-                                        .accepted_revision();
+                                Ok((_auth, _snapshot)) => {
+                                    view.gateway.current_auth = view.gateway.client_runtime.client_core().current_auth();
+
                                     view.gateway.capability_snapshot = view
                                         .gateway
-                                        .authorization_projections
-                                        .snapshot(workspace_id.as_deref(), None)
+                                        .client_runtime.client_core().authorization_snapshot(workspace_id.as_deref(), None)
                                         .or_else(|| {
                                             view.gateway
-                                                .authorization_projections
-                                                .snapshot(None, None)
+                                                .client_runtime.client_core().authorization_snapshot(None, None)
                                         });
                                     view.startup.succeed(
                                         pioneer_observability::DesktopStartupStage::AuthorizationLoad,
@@ -213,7 +179,8 @@ impl PioneerDesktop {
                                     cx.notify();
                                     CurrentPrincipalRefreshDecision::Complete
                                 }
-                                Err((auth, error)) => {
+                                Err((_auth, error)) => {
+                                    let auth = view.gateway.client_runtime.client_core().current_auth();
                                     // `auth/me` and the capability projection have different
                                     // failure domains. Preserve a verified identity and any
                                     // still-current projection while a transient snapshot request
@@ -231,11 +198,10 @@ impl PioneerDesktop {
                                         view.sync_settings_sidebar_tree_state(cx);
                                         view.sync_administration_sidebar_tree_state(cx);
                                     }
-                                    view.gateway.current_auth =
-                                        retain_verified_auth_after_capability_failure(
-                                            view.gateway.current_auth.take(),
-                                            auth,
-                                        );
+                                    view.gateway.current_auth = auth;
+                                    view.gateway.capability_snapshot = view.gateway.client_runtime.client_core()
+                                        .authorization_snapshot(workspace_id.as_deref(), None)
+                                        .or_else(|| view.gateway.client_runtime.client_core().authorization_snapshot(None, None));
                                     warn!(
                                         attempt,
                                         error = %format!("{error:#}"),

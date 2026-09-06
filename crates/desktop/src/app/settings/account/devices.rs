@@ -25,13 +25,19 @@ impl PioneerDesktop {
         desktop: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let sessions = self.gateway.auth_sessions.clone();
-        if self.gateway.auth_sessions_loading {
+        let snapshot = self.gateway.client_runtime.client_core().auth_sessions();
+        let sessions = snapshot.sessions;
+        if snapshot.loading {
             v_flex()
                 .p_4()
                 .child(t!("settings.devices.loading").to_string())
                 .into_any_element()
-        } else if let Some(error) = self.gateway.auth_sessions_error.as_ref() {
+        } else if let Some(error) = self
+            .gateway
+            .auth_session_action_error
+            .as_ref()
+            .or(snapshot.error.as_ref())
+        {
             v_flex()
                 .p_4()
                 .gap_2()
@@ -67,33 +73,30 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn refresh_auth_sessions(&mut self, cx: &mut Context<Self>) {
-        if self.gateway.auth_sessions_loading {
+        let core = self.gateway.client_runtime.client_core().clone();
+        if core.auth_sessions().loading {
             return;
         }
         if self.gateway.connection_state != GatewayConnectionState::Connected {
-            self.gateway.auth_sessions_error =
+            self.gateway.auth_session_action_error =
                 Some(t!("settings.gateway_not_connected").to_string());
             return;
         }
-        self.gateway.auth_sessions_loading = true;
-        self.gateway.auth_sessions_error = None;
-        let sender = self.gateway.ws_command_sender.clone();
+        self.gateway.auth_session_action_error = None;
+        let request = match core.request_auth_sessions() {
+            Ok(request) => request,
+            Err(error) => {
+                self.gateway.auth_session_action_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
-                let result = cx
-                    .background_spawn(async move { sender.auth_session_list() })
+                let _ = cx
+                    .background_spawn(async move { core.load_auth_sessions(request) })
                     .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    view.gateway.auth_sessions_loading = false;
-                    match result {
-                        Ok(response) => view.gateway.auth_sessions = response.sessions,
-                        Err(error) => {
-                            view.gateway.auth_sessions_error = Some(format!("{error:#}"));
-                        }
-                    }
-                    cx.notify();
-                });
+                let _ = this.update(&mut cx, |_view, cx| cx.notify());
             }
         })
         .detach();
@@ -147,13 +150,13 @@ impl PioneerDesktop {
     }
 
     fn execute_auth_session_action(&mut self, item: AuthSessionListItem, cx: &mut Context<Self>) {
+        let client_core = self.gateway.client_runtime.client_core().clone();
         if self.gateway.auth_session_action_pending.is_some() {
             return;
         }
         self.gateway.auth_session_action_pending = Some(item.session.id.clone());
-        self.gateway.auth_sessions_error = None;
+        self.gateway.auth_session_action_error = None;
         cx.notify();
-        let sender = self.gateway.ws_command_sender.clone();
         let current_endpoint_id = item.current.then(|| {
             self.gateway
                 .runtime
@@ -174,14 +177,15 @@ impl PioneerDesktop {
                                     "current session action has no endpoint lookup result"
                                 )
                             })??;
-                            let mut runtime = crate::gateway::GatewayRuntime::load()?;
+                            let mut runtime =
+                                crate::gateway::GatewayRuntime::load(client_core.clone())?;
                             let _session_mutation = runtime.begin_session_mutation(&endpoint_id)?;
-                            let response = sender.auth_logout()?;
+                            let response = client_core.logout_auth_session()?;
                             runtime.forget_gateway_session_after_logout(&endpoint_id)?;
                             Ok((response.revoked, Some(runtime)))
                         } else {
-                            sender
-                                .auth_session_revoke(AuthSessionRevokeParams {
+                            client_core
+                                .revoke_auth_session(AuthSessionRevokeParams {
                                     session_id,
                                     expected_status: None,
                                 })
@@ -200,12 +204,11 @@ impl PioneerDesktop {
                         view.administration.clear_for_session_termination();
                         view.member_avatar_state.clear();
                         view.member_workspaces_saving = false;
-                        view.gateway.auth_sessions.clear();
                         view.gateway.ws_connection_id = None;
                         view.gateway.connection_state = GatewayConnectionState::Disconnected;
                         view.gateway.error =
                             Some(t!("gateway.session_terminal.revoked").to_string());
-                        let _ = view.gateway.ws_command_sender.disconnect();
+                        let _ = view.gateway.client_runtime.ws_command_sender().disconnect();
                         cx.notify();
                     }
                     Ok(_) => {
@@ -214,7 +217,7 @@ impl PioneerDesktop {
                     }
                     Err(error) => {
                         view.gateway.auth_session_action_pending = None;
-                        view.gateway.auth_sessions_error = Some(format!("{error:#}"));
+                        view.gateway.auth_session_action_error = Some(format!("{error:#}"));
                         cx.notify();
                     }
                 });
@@ -267,7 +270,7 @@ impl PioneerDesktop {
             state.phase = DeviceActivationFormPhase::Loading;
             cx.notify();
         });
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn_in(
             window,
             move |_this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
@@ -313,7 +316,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         let desktop = cx.entity().clone();
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         window.open_dialog(cx, move |dialog, _window, cx| {
             let phase = activation_state.read(cx).phase.clone();
@@ -576,7 +579,7 @@ mod tests {
         assert!(activation_source.contains("DeviceActivationFormPhase::Loading"));
         assert!(activation_source.contains("DeviceActivationFormPhase::Ready"));
         assert!(activation_source.contains("DeviceActivationFormPhase::Failed"));
-        assert!(!activation_source.contains("auth_sessions_error"));
+        assert!(!activation_source.contains("auth_session_action_error"));
     }
 
     #[::core::prelude::v1::test]

@@ -1,11 +1,31 @@
 use super::PioneerDesktop;
 use gpui_kit::{Context, Window};
 use pioneer_client::state::client_state::GatewayConnectionState;
+use pioneer_client::{
+    core::ClientCore,
+    gateway::session_controller::{StartupStage, StartupStageState},
+};
 use pioneer_observability::{
     DesktopGatewayConnectFailureClass, DesktopPostUpdateStage, DesktopPostUpdateStageGuard,
     DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+fn shared_startup_stage(stage: DesktopStartupStage) -> Option<StartupStage> {
+    Some(match stage {
+        DesktopStartupStage::GatewayRuntimeLoad => StartupStage::GatewayRuntime,
+        DesktopStartupStage::GatewaySessionConnect => StartupStage::GatewaySession,
+        DesktopStartupStage::AuthorizationLoad => StartupStage::Authorization,
+        DesktopStartupStage::WorkspaceLoad => StartupStage::Workspace,
+        DesktopStartupStage::ProviderLoad => StartupStage::Provider,
+        DesktopStartupStage::ThreadTreeLoad => StartupStage::ThreadTree,
+        DesktopStartupStage::ActiveThreadBootstrap => StartupStage::ActiveThreadBootstrap,
+        DesktopStartupStage::ActiveThreadSubscribe => StartupStage::ActiveThreadSubscription,
+        DesktopStartupStage::ThreadCapabilitiesLoad => StartupStage::ThreadCapabilities,
+        _ => return None,
+    })
+}
 
 const fn operational_desktop_outcome() -> DesktopStartupOutcome {
     // Provider/model selection controls whether Composer can submit a turn;
@@ -14,6 +34,7 @@ const fn operational_desktop_outcome() -> DesktopStartupOutcome {
 }
 
 pub(super) struct DesktopStartupCoordinator {
+    core: Arc<ClientCore>,
     trace: DesktopStartupTrace,
     active: HashMap<DesktopStartupStage, DesktopStartupStageGuard>,
     completed: HashSet<DesktopStartupStage>,
@@ -29,8 +50,9 @@ pub(super) struct DesktopStartupCoordinator {
 }
 
 impl DesktopStartupCoordinator {
-    pub(super) fn new(trace: DesktopStartupTrace) -> Self {
+    pub(super) fn new(trace: DesktopStartupTrace, core: Arc<ClientCore>) -> Self {
         Self {
+            core,
             trace,
             active: HashMap::new(),
             completed: HashSet::new(),
@@ -54,6 +76,10 @@ impl DesktopStartupCoordinator {
         if self.finalized || self.completed.contains(&stage) || self.active.contains_key(&stage) {
             return;
         }
+        if let Some(stage) = shared_startup_stage(stage) {
+            self.core
+                .update_startup_stage(stage, StartupStageState::Pending);
+        }
         self.active.insert(stage, self.trace.stage(stage));
         if stage == DesktopStartupStage::GatewaySessionConnect
             && self.post_update_gateway_session.is_none()
@@ -67,6 +93,10 @@ impl DesktopStartupCoordinator {
     pub(super) fn succeed(&mut self, stage: DesktopStartupStage) {
         if let Some(guard) = self.active.remove(&stage) {
             guard.succeed();
+            if let Some(stage) = shared_startup_stage(stage) {
+                self.core
+                    .update_startup_stage(stage, StartupStageState::Succeeded);
+            }
             self.completed.insert(stage);
         }
         if stage == DesktopStartupStage::GatewaySessionConnect
@@ -78,6 +108,10 @@ impl DesktopStartupCoordinator {
 
     pub(super) fn fail(&mut self, stage: DesktopStartupStage) {
         if self.active.remove(&stage).is_some() {
+            if let Some(stage) = shared_startup_stage(stage) {
+                self.core
+                    .update_startup_stage(stage, StartupStageState::Failed);
+            }
             self.completed.insert(stage);
             self.failed.insert(stage);
         }
@@ -87,28 +121,11 @@ impl DesktopStartupCoordinator {
     }
 
     fn terminal_failure_outcome(&self) -> Option<DesktopStartupOutcome> {
-        if self
-            .failed
-            .contains(&DesktopStartupStage::AuthorizationLoad)
-        {
-            // The Desktop client currently exposes no stable machine code that
-            // distinguishes expired credentials from transport/capability
-            // failures, so do not mislabel every exhausted retry as auth.
-            return Some(DesktopStartupOutcome::Degraded);
-        }
-        [
-            DesktopStartupStage::GatewayRuntimeLoad,
-            DesktopStartupStage::GatewaySessionConnect,
-            DesktopStartupStage::WorkspaceLoad,
-            DesktopStartupStage::ProviderLoad,
-            DesktopStartupStage::ThreadTreeLoad,
-            DesktopStartupStage::ActiveThreadBootstrap,
-            DesktopStartupStage::ActiveThreadSubscribe,
-            DesktopStartupStage::ThreadCapabilitiesLoad,
-        ]
-        .into_iter()
-        .any(|stage| self.failed.contains(&stage))
-        .then_some(DesktopStartupOutcome::Degraded)
+        self.core
+            .gateway_session()
+            .startup
+            .has_failed()
+            .then_some(DesktopStartupOutcome::Degraded)
     }
 
     pub(super) fn has_presented_operational_frame(&self) -> bool {
@@ -116,6 +133,9 @@ impl DesktopStartupCoordinator {
     }
 
     fn stage_succeeded(&self, stage: DesktopStartupStage) -> bool {
+        if let Some(stage) = shared_startup_stage(stage) {
+            return self.core.gateway_session().startup.stage_succeeded(stage);
+        }
         self.completed.contains(&stage) && !self.failed.contains(&stage)
     }
 
@@ -123,6 +143,10 @@ impl DesktopStartupCoordinator {
         let active = std::mem::take(&mut self.active);
         for (stage, guard) in active {
             guard.cancel();
+            if let Some(stage) = shared_startup_stage(stage) {
+                self.core
+                    .update_startup_stage(stage, StartupStageState::Cancelled);
+            }
             self.completed.insert(stage);
         }
         self.cancel_gateway_session_diagnostics();
@@ -400,6 +424,7 @@ impl PioneerDesktop {
 #[cfg(test)]
 mod tests {
     use super::DesktopStartupCoordinator;
+    use super::{Arc, ClientCore};
     use pioneer_observability::{
         DesktopStartupOutcome, DesktopStartupStage, DesktopStartupTrace, MobileStartupStage,
     };
@@ -416,7 +441,10 @@ mod tests {
 
     #[test]
     fn mandatory_failures_produce_bounded_terminal_outcomes() {
-        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        let mut startup = DesktopStartupCoordinator::new(
+            DesktopStartupTrace::start(),
+            Arc::new(ClientCore::new()),
+        );
         startup.begin(DesktopStartupStage::AuthorizationLoad);
         startup.fail(DesktopStartupStage::AuthorizationLoad);
         assert_eq!(
@@ -424,7 +452,10 @@ mod tests {
             Some(DesktopStartupOutcome::Degraded)
         );
 
-        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        let mut startup = DesktopStartupCoordinator::new(
+            DesktopStartupTrace::start(),
+            Arc::new(ClientCore::new()),
+        );
         startup.begin(DesktopStartupStage::WorkspaceLoad);
         startup.fail(DesktopStartupStage::WorkspaceLoad);
         assert_eq!(
@@ -443,7 +474,10 @@ mod tests {
 
     #[test]
     fn gateway_settings_failure_is_not_a_desktop_terminal_failure() {
-        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        let mut startup = DesktopStartupCoordinator::new(
+            DesktopStartupTrace::start(),
+            Arc::new(ClientCore::new()),
+        );
         startup.begin(DesktopStartupStage::GatewaySettingsLoad);
         startup.fail(DesktopStartupStage::GatewaySettingsLoad);
 
@@ -452,7 +486,10 @@ mod tests {
 
     #[test]
     fn terminal_branch_cancels_unneeded_stages_without_reporting_failure() {
-        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        let mut startup = DesktopStartupCoordinator::new(
+            DesktopStartupTrace::start(),
+            Arc::new(ClientCore::new()),
+        );
         startup.begin(DesktopStartupStage::GatewaySessionConnect);
 
         startup.cancel_active_stages();
@@ -471,7 +508,10 @@ mod tests {
 
     #[test]
     fn gateway_session_diagnostics_follow_attempt_backoff_and_identity_phases() {
-        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        let mut startup = DesktopStartupCoordinator::new(
+            DesktopStartupTrace::start(),
+            Arc::new(ClientCore::new()),
+        );
         startup.begin(DesktopStartupStage::GatewaySessionConnect);
 
         startup.gateway_session_attempt_started();
@@ -513,7 +553,10 @@ mod tests {
 
     #[test]
     fn cancelling_startup_clears_gateway_session_diagnostics() {
-        let mut startup = DesktopStartupCoordinator::new(DesktopStartupTrace::start());
+        let mut startup = DesktopStartupCoordinator::new(
+            DesktopStartupTrace::start(),
+            Arc::new(ClientCore::new()),
+        );
         startup.begin(DesktopStartupStage::GatewaySessionConnect);
         startup.gateway_session_attempt_started();
 

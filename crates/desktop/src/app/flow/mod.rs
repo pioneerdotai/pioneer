@@ -8,6 +8,7 @@ mod lifecycle_operation;
 mod lifecycle_setup;
 mod notifications_view;
 mod popover_view;
+pub(crate) use popover_view::GatewaySwitcherView;
 mod session_refresh;
 mod task_user_notifications;
 mod thread_list;
@@ -62,3 +63,5 @@ struct GatewayInstallWarningNotification;
 
 #[cfg(test)]
 mod tests;
+
+pub(in crate::app) use ws_events_connection::gateway_status_message_text;

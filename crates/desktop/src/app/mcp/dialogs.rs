@@ -147,7 +147,7 @@ impl PioneerDesktop {
                     Ok((
                         scope.connection_id,
                         scope.workspace_id,
-                        view.gateway.ws_command_sender.clone(),
+                        view.gateway.client_runtime.ws_command_sender().clone(),
                     ))
                 });
                 let (connection_id, workspace_id, ws_sender) = match request {

@@ -256,7 +256,7 @@ impl PioneerDesktop {
         state.last_read_requested_through_turn_id = Some(params.through_turn_id.clone());
         drop(state);
 
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         let requested_turn_id = params.through_turn_id.clone();
         let requested_thread_id = params.thread_id.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {

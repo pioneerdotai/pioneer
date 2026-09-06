@@ -110,7 +110,7 @@ impl PioneerDesktop {
             self.desktop_voice_status_poll_generation.saturating_add(1);
         let generation = self.desktop_voice_status_poll_generation;
         let workspace_id = self.active_workspace_id().map(str::to_owned);
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -357,7 +357,7 @@ impl PioneerDesktop {
             .and_then(|runtime| runtime.active_gateway().map(|gateway| gateway.kind));
         let turn_start_ids = turn_start::plan_turn_start_ids();
         let turn_id = turn_start_ids.turn_id;
-        let gateway_sender = self.gateway.ws_command_sender.clone();
+        let gateway_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         let prepare_request = PrepareVoiceComposerSnapshotRequest {
             authorization_fingerprint,
@@ -389,7 +389,7 @@ impl PioneerDesktop {
                     let mut waited_for_session_refresh = false;
                     loop {
                         match this.update(&mut cx, |view, _| {
-                            view.gateway.session_refresh_in_flight
+                            view.gateway.client_runtime.client_core().gateway_refresh_in_flight()
                         }) {
                             Ok(true) => {
                                 waited_for_session_refresh = true;
@@ -427,7 +427,7 @@ impl PioneerDesktop {
 
                 #[cfg(not(feature = "qualification-diagnostics"))]
                 while this
-                    .update(&mut cx, |view, _| view.gateway.session_refresh_in_flight)
+                    .update(&mut cx, |view, _| view.gateway.client_runtime.client_core().gateway_refresh_in_flight())
                     .unwrap_or(false)
                 {
                     cx.background_executor()
@@ -606,7 +606,7 @@ impl PioneerDesktop {
             return;
         }
 
-        let upload_sender = self.gateway.ws_command_sender.clone();
+        let upload_sender = self.gateway.client_runtime.ws_command_sender().clone();
         self.composer_upload_in_progress = true;
         self.composer_upload_error = None;
         self.reduce_composer_domain(ComposerDomainAction::MarkAttachmentsUploading);

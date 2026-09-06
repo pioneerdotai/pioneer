@@ -457,20 +457,19 @@ impl PioneerDesktop {
         let Some(params) = params else {
             return;
         };
-        let sender = self.gateway.ws_command_sender.clone();
+        let core = self.gateway.client_runtime.client_core().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move { sender.auth_profile_update(params) })
+                    .background_spawn(async move { core.update_auth_profile(params) })
                     .await;
                 match result {
-                    Ok(response) => {
+                    Ok(_) => {
                         let _ = this.update(&mut cx, |view, cx| {
-                            if let Some(auth) = view.gateway.current_auth.as_mut() {
-                                auth.principal = response.principal;
-                            }
+                            view.gateway.current_auth =
+                                view.gateway.client_runtime.client_core().current_auth();
                             view.profile_editor = None;
                             view.profile_editor_input_subscriptions.clear();
                             view.resolve_current_principal_avatar(cx);

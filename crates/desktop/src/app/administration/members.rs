@@ -510,7 +510,7 @@ impl PioneerDesktop {
 
         self.member_workspaces_saving = true;
         self.members_error = None;
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -562,7 +562,7 @@ impl PioneerDesktop {
         }
         self.members_loading = true;
         self.members_error = None;
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -616,7 +616,7 @@ impl PioneerDesktop {
         }
 
         self.members_loading = true;
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -701,7 +701,7 @@ impl PioneerDesktop {
         self.workspace_members_loading
             .extend(workspaces.iter().cloned());
         let loading_workspace_ids = workspaces.clone();
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -757,7 +757,7 @@ impl PioneerDesktop {
         if !self.workspace_members_loading.insert(workspace_id.clone()) {
             return;
         }
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         let loading_workspace_id = workspace_id.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -893,7 +893,7 @@ impl PioneerDesktop {
                 .map(|member| member.status),
             _ => None,
         };
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         let endpoint = self
             .gateway
             .runtime
@@ -1010,7 +1010,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         let state = cx.new(|_| Some(presentation));
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         window.open_dialog(cx, move |dialog, _window, cx| {
             let snapshot = state.read(cx);
             let content = snapshot.as_ref().map(|presentation| {

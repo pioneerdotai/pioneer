@@ -79,7 +79,7 @@ impl PioneerDesktop {
         let params = request.params;
 
         self.thread_artifacts.mark_loading(thread_id.as_str());
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();

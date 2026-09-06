@@ -1,89 +1,45 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+#[cfg(test)]
+use crate::gateway::activation::DesktopSessionAccessGrant;
+#[cfg(test)]
+use pioneer_protocol::CredentialStorageOrder;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use crate::gateway::secrets::DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION;
+use anyhow::{Context, Result};
 use pioneer_client::{
     gateway::endpoint::GatewayBaseUrl,
     gateway::runtime as client_gateway_runtime,
     gateway::session_lifecycle::{
-        GatewaySessionMetadata, SessionLifecycle, SessionLifecycleEffect, SessionLifecycleEvent,
-        SessionTerminalReason, terminal_reason_from_auth_code,
+        GatewaySessionMetadata, SessionLifecycleEvent, SessionTerminalReason,
     },
     transport::ws::{
-        GatewayWsCommandSender, GatewayWsSessionIdentity, GatewayWsSessionSpec,
+        GatewayWsCommandSender,
         auth_exchange::{AuthExchangeClient, AuthExchangeError, AuthExchangeErrorKind},
     },
 };
-use pioneer_protocol::{
-    AuthMeResponse, AuthRefreshGrant, AuthRefreshParams, AuthSessionStatus, ClientKind,
-    CredentialStorageOrder, DeviceStatus, generate_id,
-};
+#[cfg(test)]
+use pioneer_protocol::AuthMeResponse;
+use pioneer_protocol::{AuthRefreshGrant, AuthRefreshParams, ClientKind};
 
 use crate::gateway::{
-    activation::{DesktopSessionAccessGrant, revoke_session_best_effort},
-    is_supported_session_principal_kind,
-    secrets::{
-        DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION, DesktopGatewaySessionSecret,
-        is_valid_refresh_credential,
-    },
+    activation::revoke_session_best_effort, secrets::DesktopGatewaySessionSecret,
 };
 
 use super::GatewayRuntime;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct RefreshSlotKey {
-    registry_path: PathBuf,
-    endpoint_id: String,
-}
-
-static REFRESH_SLOTS: OnceLock<Mutex<HashMap<RefreshSlotKey, Weak<Mutex<RefreshSlot>>>>> =
-    OnceLock::new();
 const TRANSIENT_REFRESH_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(100),
     Duration::from_millis(250),
     Duration::from_millis(500),
 ];
 
-#[derive(Default)]
-struct RefreshSlot {
-    mutation_in_progress: bool,
-}
+pub(crate) use pioneer_client::gateway::session_controller::GatewaySessionMutationGuard as DesktopSessionMutationGuard;
 
-pub(crate) struct DesktopSessionMutationGuard {
-    slot: Arc<Mutex<RefreshSlot>>,
-}
-
-impl Drop for DesktopSessionMutationGuard {
-    fn drop(&mut self) {
-        if let Ok(mut slot) = self.slot.lock() {
-            slot.mutation_in_progress = false;
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DesktopSessionReady {
-    pub spec: GatewayWsSessionSpec,
-    pub metadata: GatewaySessionMetadata,
-    #[cfg(test)]
-    pub connection_generation: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DesktopSessionTerminal {
-    pub metadata: Option<GatewaySessionMetadata>,
-    pub reason: SessionTerminalReason,
-}
-
-#[derive(Debug)]
-pub(crate) enum DesktopSessionPreparation {
-    Ready(DesktopSessionReady),
-    Terminal(DesktopSessionTerminal),
-}
+pub(crate) use pioneer_client::gateway::session_refresh::{
+    GatewaySessionPreparation as DesktopSessionPreparation,
+    GatewaySessionTerminal as DesktopSessionTerminal,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DesktopSessionConnectionOutcome {
@@ -99,65 +55,59 @@ impl GatewayRuntime {
     pub(crate) fn verify_gateway_session_identity(
         &self,
         endpoint_id: &str,
-        sender: &GatewayWsCommandSender,
+        _sender: &GatewayWsCommandSender,
     ) -> Result<Option<SessionTerminalReason>> {
         let endpoint = self
             .endpoint_by_id(endpoint_id)
-            .with_context(|| format!("unknown desktop Gateway endpoint `{endpoint_id}`"))?;
-        let session_ref = endpoint
-            .session_ref
-            .as_deref()
-            .context("desktop Gateway endpoint has no session reference")?;
-        let stored = match self.secrets.get_gateway_session(session_ref) {
-            Ok(Some(stored)) => stored,
-            Ok(None) | Err(_) => {
-                return Ok(Some(SessionTerminalReason::SecureStorageFailed));
-            }
-        };
-
-        let me = sender.auth_me()?;
-        let expected_installation_id = self
+            .context("unknown Gateway endpoint")?;
+        let installation_id = self
             .registry
             .installation_id
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("desktop Gateway registry has no installation id")?;
-        Ok(validate_gateway_session_identity(
-            endpoint.server_gateway_id.as_ref(),
-            expected_installation_id,
-            &stored,
-            &me,
-        ))
+            .context("Gateway installation identity is missing")?;
+        self.client_core.verify_gateway_session_identity(
+            endpoint,
+            installation_id,
+            ClientKind::Desktop,
+        )
+    }
+
+    pub(crate) fn start_gateway_session_transport(
+        &self,
+        spec: pioneer_client::transport::ws::GatewayWsConnectSpec,
+        retry_initial_failure: bool,
+    ) -> Result<u64> {
+        self.client_core
+            .start_gateway_session_transport(spec, retry_initial_failure)
     }
 
     pub(crate) fn prepare_gateway_session(
         &mut self,
         endpoint_id: &str,
     ) -> Result<DesktopSessionPreparation> {
-        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
-            runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)
+        self.with_gateway_session_refresh_slot(endpoint_id, |runtime| {
+            runtime.prepare_gateway_session_locked(endpoint_id)
         })
     }
 
     fn with_gateway_session_refresh_slot<T>(
         &mut self,
         endpoint_id: &str,
-        operation: impl FnOnce(&mut Self, &mut RefreshSlot) -> Result<T>,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        let refresh_slot = refresh_slot(self.registry_path.as_path(), endpoint_id)?;
-        let mut refresh_slot = refresh_slot
-            .lock()
-            .map_err(|_| anyhow::anyhow!("desktop Gateway refresh lock is poisoned"))?;
-        operation(self, &mut refresh_slot)
+        let core = self.client_core.clone();
+        core.with_gateway_session_refresh(endpoint_id, || operation(self))
     }
 
     fn prepare_gateway_session_locked(
         &mut self,
         endpoint_id: &str,
-        refresh_slot: &mut RefreshSlot,
     ) -> Result<DesktopSessionPreparation> {
-        if let Some(reason) = self.terminal_sessions.get(endpoint_id).copied() {
+        if let Some(reason) = self
+            .client_core
+            .gateway_session()
+            .terminal_reason(endpoint_id)
+        {
             return Ok(DesktopSessionPreparation::Terminal(
                 DesktopSessionTerminal {
                     metadata: self.session_metadata(endpoint_id).unwrap_or(None),
@@ -165,13 +115,13 @@ impl GatewayRuntime {
                 },
             ));
         }
-        if refresh_slot.mutation_in_progress {
-            bail!("desktop Gateway session mutation is in progress");
-        }
         let cleanup_timeout = self.timings.startup_timeout;
+        let core = self.client_core.clone();
+        let storage =
+            pioneer_client::gateway::session_refresh::GatewaySessionPlatformStorage(&core);
         self.prepare_gateway_session_serialized(
             endpoint_id,
-            refresh_slot,
+            &storage,
             exchange_refresh,
             |gateway_base_url, access_token, session_id| {
                 revoke_session_best_effort(
@@ -198,7 +148,11 @@ impl GatewayRuntime {
             Duration,
         ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
     {
-        if let Some(reason) = self.terminal_sessions.get(endpoint_id).copied() {
+        if let Some(reason) = self
+            .client_core
+            .gateway_session()
+            .terminal_reason(endpoint_id)
+        {
             return Ok(DesktopSessionPreparation::Terminal(
                 DesktopSessionTerminal {
                     metadata: self.session_metadata(endpoint_id).unwrap_or(None),
@@ -206,90 +160,107 @@ impl GatewayRuntime {
                 },
             ));
         }
-        let slot = refresh_slot(self.registry_path.as_path(), endpoint_id)?;
-        let mut slot = slot
-            .lock()
-            .map_err(|_| anyhow::anyhow!("desktop Gateway refresh lock is poisoned"))?;
-        if slot.mutation_in_progress {
-            bail!("desktop Gateway session mutation is in progress");
-        }
-        self.prepare_gateway_session_serialized(endpoint_id, &mut slot, refresh, |_, _, _| Ok(()))
+        let core = self.client_core.clone();
+        core.with_gateway_session_refresh(endpoint_id, || {
+            let storage = self.secrets.clone();
+            self.prepare_gateway_session_serialized(
+                endpoint_id,
+                &storage,
+                refresh,
+                |_, _, _| Ok(()),
+            )
+        })
     }
 
     pub(crate) fn replace_gateway_session_access(
         &mut self,
         endpoint_id: &str,
-        sender: &GatewayWsCommandSender,
+        _sender: &GatewayWsCommandSender,
     ) -> Result<DesktopSessionConnectionOutcome> {
-        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
-            match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
-                DesktopSessionPreparation::Terminal(terminal) => {
-                    Ok(DesktopSessionConnectionOutcome::Terminal(terminal))
-                }
-                DesktopSessionPreparation::Ready(ready) => {
-                    let expires_at = ready.spec.identity.access_expires_at_unix;
-                    let connection_id =
-                        sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
-                    Ok(DesktopSessionConnectionOutcome::Connected {
-                        connection_id,
-                        metadata: ready.metadata,
-                        access_expires_at_unix: expires_at,
-                    })
-                }
-            }
-        })
+        self.ensure_gateway_session_connection(endpoint_id, None)
     }
 
-    /// Refreshes and replaces an access credential only while the rejected
-    /// generation is still current. The existing per-session refresh slot is
-    /// held through the WS replacement so concurrent WS and HTTP recovery
-    /// paths cannot rotate the refresh credential twice.
+    fn ensure_gateway_session_connection(
+        &self,
+        endpoint_id: &str,
+        rejected_generation: Option<u64>,
+    ) -> Result<DesktopSessionConnectionOutcome> {
+        let endpoint = self
+            .endpoint_by_id(endpoint_id)
+            .cloned()
+            .context("unknown Gateway endpoint")?;
+        let installation_id = self
+            .registry
+            .installation_id
+            .as_deref()
+            .context("Gateway installation identity is missing")?;
+        let storage = pioneer_client::gateway::session_refresh::GatewaySessionPlatformStorage(
+            &self.client_core,
+        );
+        let request = pioneer_client::gateway::session_refresh::GatewaySessionRefreshRequest {
+            endpoint: &endpoint,
+            installation_id,
+            client_kind: ClientKind::Desktop,
+            now_unix: unix_timestamp_secs()?,
+            timeout: self.timings.startup_timeout,
+            ws_timings: client_gateway_runtime::ws_timings_for_endpoint(
+                self.ws_timings,
+                endpoint.kind,
+                Duration::from_secs(5),
+            ),
+            retry_delays: &TRANSIENT_REFRESH_RETRY_DELAYS,
+        };
+        let result = match rejected_generation {
+            Some(rejected) => self
+                .client_core
+                .refresh_gateway_session_after_unauthorized(request, &storage, rejected),
+            None => self.client_core.ensure_gateway_session(request, &storage),
+        };
+        match result {
+            Ok(connected) => Ok(DesktopSessionConnectionOutcome::Connected {
+                connection_id: connected.connection_id, metadata: connected.metadata,
+                access_expires_at_unix: connected.access_expires_at_unix,
+            }),
+            Err(pioneer_client::gateway::session_connection::GatewaySessionConnectionFailure::Terminal { reason }) => {
+                let metadata = match self.client_core.gateway_session().session(endpoint_id) {
+                    Some(pioneer_client::gateway::session_lifecycle::SessionLifecycleState::Terminal { metadata, .. }) => metadata.clone(),
+                    _ => None,
+                };
+                Ok(DesktopSessionConnectionOutcome::Terminal(DesktopSessionTerminal { metadata, reason }))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn replace_gateway_session_access_after_rejection(
         &mut self,
         endpoint_id: &str,
         sender: &GatewayWsCommandSender,
         rejected_generation: u64,
     ) -> Result<Option<DesktopSessionConnectionOutcome>> {
-        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
-            if let Ok(current) = sender.current_gateway_http_access()
-                && current.generation != rejected_generation
-            {
-                return Ok(None);
-            }
-
-            let outcome = match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
-                DesktopSessionPreparation::Terminal(terminal) => {
-                    DesktopSessionConnectionOutcome::Terminal(terminal)
-                }
-                DesktopSessionPreparation::Ready(ready) => {
-                    let expires_at = ready.spec.identity.access_expires_at_unix;
-                    let connection_id =
-                        sender.replace_access_and_wait(ready.spec.into_connect_spec())?;
-                    DesktopSessionConnectionOutcome::Connected {
-                        connection_id,
-                        metadata: ready.metadata,
-                        access_expires_at_unix: expires_at,
-                    }
-                }
-            };
-            Ok(Some(outcome))
-        })
+        if let Ok(current) = sender.current_gateway_http_access()
+            && current.generation != rejected_generation
+        {
+            return Ok(None);
+        }
+        self.ensure_gateway_session_connection(endpoint_id, Some(rejected_generation))
+            .map(Some)
     }
 
     pub(crate) fn recover_gateway_session_access(
         &mut self,
         endpoint_id: &str,
-        sender: &GatewayWsCommandSender,
+        _sender: &GatewayWsCommandSender,
     ) -> Result<DesktopSessionConnectionOutcome> {
-        self.with_gateway_session_refresh_slot(endpoint_id, |runtime, refresh_slot| {
-            match runtime.prepare_gateway_session_locked(endpoint_id, refresh_slot)? {
+        self.with_gateway_session_refresh_slot(endpoint_id, |runtime| {
+            match runtime.prepare_gateway_session_locked(endpoint_id)? {
                 DesktopSessionPreparation::Terminal(terminal) => {
                     Ok(DesktopSessionConnectionOutcome::Terminal(terminal))
                 }
                 DesktopSessionPreparation::Ready(ready) => {
                     let expires_at = ready.spec.identity.access_expires_at_unix;
-                    let connection_id =
-                        sender.connect_with_retry(ready.spec.into_connect_spec())?;
+                    let connection_id = runtime
+                        .start_gateway_session_transport(ready.spec.into_connect_spec(), true)?;
                     Ok(DesktopSessionConnectionOutcome::Connected {
                         connection_id,
                         metadata: ready.metadata,
@@ -304,34 +275,14 @@ impl GatewayRuntime {
         &self,
         endpoint_id: &str,
     ) -> Option<SessionTerminalReason> {
-        self.terminal_sessions.get(endpoint_id).copied()
+        self.client_core
+            .gateway_session()
+            .terminal_reason(endpoint_id)
     }
 
     pub(crate) fn clear_session_terminal_for_explicit_retry(&mut self, endpoint_id: &str) {
-        self.terminal_sessions.remove(endpoint_id);
-        self.access_expiries.remove(endpoint_id);
-    }
-
-    pub(crate) fn active_session_matches(
-        &self,
-        session_id: &pioneer_protocol::AuthSessionId,
-    ) -> bool {
-        self.active_gateway_id()
-            .and_then(|endpoint_id| self.session_metadata(endpoint_id).ok().flatten())
-            .is_some_and(|metadata| metadata.session_id == *session_id)
-    }
-
-    pub(crate) fn mark_active_session_terminal(
-        &mut self,
-        reason: SessionTerminalReason,
-    ) -> Result<Option<DesktopSessionTerminal>> {
-        let Some(endpoint_id) = self.active_gateway_id().map(str::to_owned) else {
-            return Ok(None);
-        };
-        let metadata = self.session_metadata(endpoint_id.as_str()).unwrap_or(None);
-        self.terminal_sessions.insert(endpoint_id.clone(), reason);
-        self.access_expiries.remove(endpoint_id.as_str());
-        Ok(Some(DesktopSessionTerminal { metadata, reason }))
+        self.client_core
+            .reduce_gateway_session_lifecycle(endpoint_id, SessionLifecycleEvent::NoStoredSession);
     }
 
     pub(crate) fn forget_gateway_session_after_logout(&mut self, endpoint_id: &str) -> Result<()> {
@@ -340,10 +291,11 @@ impl GatewayRuntime {
             .with_context(|| format!("unknown desktop Gateway endpoint `{endpoint_id}`"))?
             .session_ref
             .clone();
-        self.access_expiries.remove(endpoint_id);
-        self.terminal_sessions.insert(
-            endpoint_id.to_owned(),
-            SessionTerminalReason::SessionRevoked,
+        self.client_core.reduce_gateway_session_lifecycle(
+            endpoint_id,
+            SessionLifecycleEvent::AuthFailed {
+                reason: SessionTerminalReason::SessionRevoked,
+            },
         );
         if let Some(session_ref) = session_ref.as_deref() {
             self.secrets.delete_gateway_session(session_ref)?;
@@ -352,8 +304,8 @@ impl GatewayRuntime {
     }
 
     pub(crate) fn discard_gateway_session_runtime_state(&mut self, endpoint_id: &str) {
-        self.access_expiries.remove(endpoint_id);
-        self.terminal_sessions.remove(endpoint_id);
+        self.client_core
+            .reduce_gateway_session_lifecycle(endpoint_id, SessionLifecycleEvent::NoStoredSession);
     }
 
     pub(crate) fn active_session_refresh_delay(
@@ -362,18 +314,17 @@ impl GatewayRuntime {
         refresh_leeway_seconds: u64,
     ) -> Option<Duration> {
         let endpoint_id = self.active_gateway_id()?;
-        let expires_at = *self.access_expiries.get(endpoint_id)?;
-        Some(Duration::from_secs(
-            expires_at
-                .saturating_sub(refresh_leeway_seconds)
-                .saturating_sub(now_unix),
-        ))
+        self.client_core.gateway_session().refresh_delay(
+            endpoint_id,
+            now_unix,
+            refresh_leeway_seconds,
+        )
     }
 
     fn prepare_gateway_session_serialized<F, C>(
         &mut self,
         endpoint_id: &str,
-        _refresh_slot: &mut RefreshSlot,
+        storage: &dyn pioneer_client::gateway::session_refresh::GatewaySessionStorage,
         refresh: F,
         cleanup_session: C,
     ) -> Result<DesktopSessionPreparation>
@@ -390,312 +341,31 @@ impl GatewayRuntime {
             .endpoint_by_id(endpoint_id)
             .cloned()
             .with_context(|| format!("unknown desktop Gateway endpoint `{endpoint_id}`"))?;
-        let Some(session_ref) = endpoint.session_ref.clone() else {
-            return Ok(self.enter_terminal(
-                endpoint_id,
-                None,
-                SessionTerminalReason::AuthenticationRequired,
-            ));
-        };
-        let stored = match self.secrets.get_gateway_session(session_ref.as_str()) {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                return Ok(self.enter_terminal(
-                    endpoint_id,
-                    None,
-                    SessionTerminalReason::AuthenticationRequired,
-                ));
-            }
-            Err(_) => {
-                return Ok(self.enter_terminal(
-                    endpoint_id,
-                    None,
-                    SessionTerminalReason::SecureStorageFailed,
-                ));
-            }
-        };
-        if endpoint.server_gateway_id.as_ref() != Some(&stored.gateway_id) {
-            return Ok(self.enter_terminal(
-                endpoint_id,
-                Some(metadata(&stored)),
-                SessionTerminalReason::GatewayIdentityMismatch,
-            ));
-        }
-        let expected_installation_id = self
+        let installation_id = self
             .registry
             .installation_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .context("desktop Gateway registry has no installation id")?;
-        if stored.installation_id != expected_installation_id {
-            return Ok(self.enter_terminal(
-                endpoint_id,
-                Some(metadata(&stored)),
-                SessionTerminalReason::SessionCompromised,
-            ));
-        }
-
-        if unix_timestamp_secs()? >= stored.refresh_expires_at_unix {
-            return Ok(self.enter_terminal(
-                endpoint_id,
-                Some(metadata(&stored)),
-                SessionTerminalReason::SessionExpired,
-            ));
-        }
-        self.refresh_stored_session(
-            endpoint_id,
-            endpoint,
-            session_ref,
-            stored,
-            refresh,
-            cleanup_session,
-        )
-    }
-
-    fn refresh_stored_session<F, C>(
-        &mut self,
-        endpoint_id: &str,
-        endpoint: pioneer_client::gateway::types::GatewayEndpoint,
-        session_ref: String,
-        mut stored: DesktopGatewaySessionSecret,
-        mut refresh: F,
-        mut cleanup_session: C,
-    ) -> Result<DesktopSessionPreparation>
-    where
-        F: FnMut(
-            &GatewayBaseUrl,
-            &str,
-            &str,
-            Duration,
-        ) -> std::result::Result<AuthRefreshGrant, AuthExchangeError>,
-        C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
-    {
-        let mut lifecycle = SessionLifecycle::default();
-        let SessionLifecycleEffect::BeginRefresh { intent_id, .. } = lifecycle.reduce(
-            SessionLifecycleEvent::StoredSessionLoaded(metadata(&stored)),
-        ) else {
-            bail!("shared session lifecycle did not request cold-start refresh");
-        };
-        let refresh_request_id = stored
-            .pending_refresh_request_id
-            .clone()
-            .unwrap_or_else(|| generate_id(pioneer_protocol::REQUEST_ID_LEN));
-        if stored.pending_refresh_request_id.is_none() {
-            stored.pending_refresh_request_id = Some(refresh_request_id.clone());
-            if let Err(error) = self.secrets.put_gateway_session(
-                session_ref.as_str(),
-                &stored,
-                Some(format!("{} session", endpoint.name)),
-            ) {
-                let effect =
-                    lifecycle.reduce(SessionLifecycleEvent::SecureStorageFailed { intent_id });
-                let SessionLifecycleEffect::Stop { reason } = effect else {
-                    return Err(error);
-                };
-                return Ok(self.enter_terminal(endpoint_id, Some(metadata(&stored)), reason));
-            }
-        }
-        let refresh = match {
-            let mut attempt = 0_usize;
-            loop {
-                let result = refresh(
-                    &endpoint.gateway_base_url,
-                    stored.refresh_token.expose_secret(),
-                    refresh_request_id.as_str(),
-                    self.timings.startup_timeout,
-                );
-                let Err(error) = &result else {
-                    break result;
-                };
-                let Some(delay) = TRANSIENT_REFRESH_RETRY_DELAYS.get(attempt).copied() else {
-                    break result;
-                };
-                if !is_transient_refresh_error(error) {
-                    break result;
-                }
-                attempt = attempt.saturating_add(1);
-                std::thread::sleep(delay);
-            }
-        } {
-            Ok(refresh) => refresh,
-            Err(error) => {
-                let Some(reason) = terminal_reason_for_refresh_error(&error) else {
-                    // The predecessor and request id are both durable. A
-                    // retry can recover either a pre-dispatch failure or an
-                    // exchange whose response was lost after server commit.
-                    let effect =
-                        lifecycle.reduce(SessionLifecycleEvent::RefreshTransportLost { intent_id });
-                    if !matches!(
-                        effect,
-                        SessionLifecycleEffect::BeginRefresh {
-                            intent_id: retry_intent,
-                            ..
-                        } if retry_intent == intent_id
-                    ) {
-                        bail!("shared session lifecycle rejected retryable refresh failure");
-                    }
-                    return Err(anyhow::Error::new(error));
-                };
-                let event = match reason {
-                    SessionTerminalReason::RefreshOutcomeUnknown => {
-                        SessionLifecycleEvent::RefreshTransportLost { intent_id }
-                    }
-                    reason => SessionLifecycleEvent::AuthFailed { reason },
-                };
-                let effect = lifecycle.reduce(event);
-                let SessionLifecycleEffect::Stop { reason } = effect else {
-                    bail!("shared session lifecycle did not stop after refresh failure");
-                };
-                return Ok(self.enter_terminal(endpoint_id, Some(metadata(&stored)), reason));
-            }
-        };
-        let cleanup_access = refresh.access_token.clone();
-        let cleanup_session_id = refresh.session.id.clone();
-        let expected_installation_id = self
-            .registry
-            .installation_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("desktop Gateway registry has no installation id")?;
-        let (rotated, access) = match rotated_session(&stored, expected_installation_id, refresh) {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = cleanup_session(
-                    &endpoint.gateway_base_url,
-                    cleanup_access.expose_secret(),
-                    &cleanup_session_id,
-                );
-                let effect = lifecycle.reduce(SessionLifecycleEvent::AuthFailed {
-                    reason: SessionTerminalReason::SessionCompromised,
-                });
-                let SessionLifecycleEffect::Stop { reason } = effect else {
-                    bail!("shared session lifecycle did not stop after invalid refresh grant");
-                };
-                return Ok(self.enter_terminal(endpoint_id, Some(metadata(&stored)), reason));
-            }
-        };
-        self.persist_and_plan_access(
-            endpoint_id,
-            endpoint,
-            session_ref,
-            rotated,
-            access,
-            lifecycle,
-            intent_id,
-            cleanup_session,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn persist_and_plan_access<C>(
-        &mut self,
-        endpoint_id: &str,
-        endpoint: pioneer_client::gateway::types::GatewayEndpoint,
-        session_ref: String,
-        session: DesktopGatewaySessionSecret,
-        access: DesktopSessionAccessGrant,
-        mut lifecycle: SessionLifecycle,
-        intent_id: u64,
-        mut cleanup_session: C,
-    ) -> Result<DesktopSessionPreparation>
-    where
-        C: FnMut(&GatewayBaseUrl, &str, &pioneer_protocol::AuthSessionId) -> Result<()>,
-    {
-        let next_metadata = metadata(&session);
-        let SessionLifecycleEffect::PersistRefreshBeforeAccess { .. } =
-            lifecycle.reduce(SessionLifecycleEvent::RefreshGrantReceived {
-                intent_id,
-                metadata: next_metadata.clone(),
-                access_expires_at_unix: access.access_expires_at_unix,
-            })
-        else {
-            bail!("shared session lifecycle rejected refreshed session metadata");
-        };
-        if let Err(error) = self.secrets.put_gateway_session(
-            session_ref.as_str(),
-            &session,
-            Some(format!("{} session", endpoint.name)),
-        ) {
-            let _ = cleanup_session(
-                &endpoint.gateway_base_url,
-                access.access_token.expose_secret(),
-                &session.session_id,
-            );
-            let effect = lifecycle.reduce(SessionLifecycleEvent::SecureStorageFailed { intent_id });
-            let SessionLifecycleEffect::Stop { reason } = effect else {
-                return Err(error);
-            };
-            return Ok(self.enter_terminal(endpoint_id, Some(next_metadata), reason));
-        }
-        self.finish_durable_access(
-            endpoint_id,
-            endpoint,
-            session,
-            access,
-            lifecycle,
-            intent_id,
-            next_metadata,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn finish_durable_access(
-        &mut self,
-        endpoint_id: &str,
-        endpoint: pioneer_client::gateway::types::GatewayEndpoint,
-        session: DesktopGatewaySessionSecret,
-        access: DesktopSessionAccessGrant,
-        mut lifecycle: SessionLifecycle,
-        intent_id: u64,
-        next_metadata: GatewaySessionMetadata,
-    ) -> Result<DesktopSessionPreparation> {
-        let SessionLifecycleEffect::ConnectWithEphemeralAccess {
-            connection_generation: _connection_generation,
-        } = lifecycle.reduce(SessionLifecycleEvent::SecureStorageCommitted { intent_id })
-        else {
-            bail!("shared session lifecycle did not activate persisted refresh");
-        };
-        self.terminal_sessions.remove(endpoint_id);
-        self.access_expiries
-            .insert(endpoint_id.to_owned(), access.access_expires_at_unix);
-        Ok(DesktopSessionPreparation::Ready(DesktopSessionReady {
-            spec: GatewayWsSessionSpec {
-                endpoint_id: endpoint.id,
-                endpoint_name: endpoint.name,
-                endpoint_kind: endpoint.kind,
-                gateway_base_url: endpoint.gateway_base_url,
-                identity: GatewayWsSessionIdentity {
-                    server_gateway_id: session.gateway_id,
-                    session_id: session.session_id,
-                    device_id: session.device_id,
-                    access_expires_at_unix: access.access_expires_at_unix,
-                    refresh_leeway_seconds: 60,
-                },
-                access_token: access.access_token,
-                timings: client_gateway_runtime::ws_timings_for_endpoint(
+        self.client_core.prepare_gateway_session(
+            pioneer_client::gateway::session_refresh::GatewaySessionRefreshRequest {
+                endpoint: &endpoint,
+                installation_id,
+                client_kind: ClientKind::Desktop,
+                now_unix: unix_timestamp_secs()?,
+                timeout: self.timings.startup_timeout,
+                ws_timings: client_gateway_runtime::ws_timings_for_endpoint(
                     self.ws_timings,
                     endpoint.kind,
                     Duration::from_secs(5),
                 ),
+                retry_delays: &TRANSIENT_REFRESH_RETRY_DELAYS,
             },
-            metadata: next_metadata,
-            #[cfg(test)]
-            connection_generation: _connection_generation,
-        }))
-    }
-
-    fn enter_terminal(
-        &mut self,
-        endpoint_id: &str,
-        metadata: Option<GatewaySessionMetadata>,
-        reason: SessionTerminalReason,
-    ) -> DesktopSessionPreparation {
-        self.terminal_sessions
-            .insert(endpoint_id.to_owned(), reason);
-        self.access_expiries.remove(endpoint_id);
-        DesktopSessionPreparation::Terminal(DesktopSessionTerminal { metadata, reason })
+            storage,
+            refresh,
+            cleanup_session,
+        )
     }
 
     fn session_metadata(&self, endpoint_id: &str) -> Result<Option<GatewaySessionMetadata>> {
@@ -737,54 +407,13 @@ fn exchange_refresh(
     ))
 }
 
+#[cfg(test)]
 fn rotated_session(
     previous: &DesktopGatewaySessionSecret,
-    expected_installation_id: &str,
+    installation_id: &str,
     grant: AuthRefreshGrant,
 ) -> Result<(DesktopGatewaySessionSecret, DesktopSessionAccessGrant)> {
-    if grant.auth_protocol_version != pioneer_protocol::DEVICE_SESSION_AUTH_PROTOCOL_VERSION
-        || grant.credential_storage_order
-            != CredentialStorageOrder::PersistRefreshBeforeActivatingAccess
-        || grant.gateway.id != previous.gateway_id
-        || grant.principal.id != previous.principal_id
-        || !is_supported_session_principal_kind(&grant.principal.kind)
-        || grant.session.id != previous.session_id
-        || grant.session.device_id != previous.device_id
-        || grant.session.token_family_id != previous.token_family_id
-        || grant.device.id != previous.device_id
-        || grant.device.installation_id != expected_installation_id
-        || grant.device.installation_id != previous.installation_id
-        || grant.device.client_kind != pioneer_protocol::ClientKind::Desktop
-        || grant.device.status != pioneer_protocol::DeviceStatus::Active
-        || grant.session.status != pioneer_protocol::AuthSessionStatus::Active
-        || previous.refresh_generation.checked_add(1) != Some(grant.refresh_generation)
-        || grant.session.refresh_generation != grant.refresh_generation
-        || grant.session.refresh_expires_at_unix != grant.refresh_expires_at_unix
-        || grant.access_token.expose_secret().is_empty()
-        || grant.access_expires_at_unix == 0
-        || !is_valid_refresh_credential(grant.refresh_token.expose_secret())
-    {
-        bail!("inconsistent Gateway refresh grant");
-    }
-    Ok((
-        DesktopGatewaySessionSecret {
-            schema_version: DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION,
-            gateway_id: previous.gateway_id.clone(),
-            principal_id: previous.principal_id.clone(),
-            device_id: previous.device_id.clone(),
-            session_id: previous.session_id.clone(),
-            token_family_id: previous.token_family_id.clone(),
-            installation_id: previous.installation_id.clone(),
-            refresh_generation: grant.refresh_generation,
-            refresh_expires_at_unix: grant.refresh_expires_at_unix,
-            refresh_token: grant.refresh_token,
-            pending_refresh_request_id: None,
-        },
-        DesktopSessionAccessGrant {
-            access_token: grant.access_token,
-            access_expires_at_unix: grant.access_expires_at_unix,
-        },
-    ))
+    previous.rotate(installation_id, ClientKind::Desktop, grant)
 }
 
 fn metadata(session: &DesktopGatewaySessionSecret) -> GatewaySessionMetadata {
@@ -797,100 +426,19 @@ fn metadata(session: &DesktopGatewaySessionSecret) -> GatewaySessionMetadata {
     }
 }
 
+#[cfg(test)]
 fn validate_gateway_session_identity(
     pinned_gateway_id: Option<&pioneer_protocol::GatewayId>,
     expected_installation_id: &str,
     stored: &DesktopGatewaySessionSecret,
     me: &AuthMeResponse,
 ) -> Option<SessionTerminalReason> {
-    if pinned_gateway_id != Some(&stored.gateway_id) || me.gateway.id != stored.gateway_id {
-        return Some(SessionTerminalReason::GatewayIdentityMismatch);
-    }
-    if me.principal.id != stored.principal_id
-        || !is_supported_session_principal_kind(&me.principal.kind)
-        || me.device.id != stored.device_id
-        || me.device.installation_id != expected_installation_id
-        || me.device.installation_id != stored.installation_id
-        || me.device.client_kind != ClientKind::Desktop
-        || me.device.status != DeviceStatus::Active
-        || me.session.id != stored.session_id
-        || me.session.device_id != stored.device_id
-        || me.session.token_family_id != stored.token_family_id
-        || me.session.status != AuthSessionStatus::Active
-        || me.session.refresh_generation != stored.refresh_generation
-        || me.session.refresh_expires_at_unix != stored.refresh_expires_at_unix
-    {
-        return Some(SessionTerminalReason::SessionCompromised);
-    }
-    None
-}
-
-fn terminal_reason_for_refresh_error(error: &AuthExchangeError) -> Option<SessionTerminalReason> {
-    if is_transient_refresh_error(error) {
-        return None;
-    }
-    if let Some(reason) = error
-        .code
-        .as_deref()
-        .and_then(terminal_reason_from_auth_code)
-    {
-        return Some(reason);
-    }
-    match error.kind {
-        AuthExchangeErrorKind::TransportBeforeRequest
-        | AuthExchangeErrorKind::Timeout
-        | AuthExchangeErrorKind::Transport
-        | AuthExchangeErrorKind::Protocol => None,
-        AuthExchangeErrorKind::InvalidEndpoint => {
-            Some(SessionTerminalReason::GatewayIdentityMismatch)
-        }
-        AuthExchangeErrorKind::CredentialMethodMismatch | AuthExchangeErrorKind::Server => {
-            Some(SessionTerminalReason::RefreshCredentialInvalid)
-        }
-    }
-}
-
-fn is_transient_refresh_error(error: &AuthExchangeError) -> bool {
-    error.kind == AuthExchangeErrorKind::Server
-        && matches!(
-            error.code.as_deref(),
-            Some("temporarily_unavailable" | "auth_not_ready")
-        )
-}
-
-fn refresh_slot(registry_path: &Path, endpoint_id: &str) -> Result<Arc<Mutex<RefreshSlot>>> {
-    let mut slots = REFRESH_SLOTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .map_err(|_| anyhow::anyhow!("desktop refresh lock registry is poisoned"))?;
-    slots.retain(|_, slot| slot.strong_count() > 0);
-    let key = RefreshSlotKey {
-        registry_path: registry_path.to_path_buf(),
-        endpoint_id: endpoint_id.to_owned(),
-    };
-    if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
-        return Ok(slot);
-    }
-    let slot = Arc::new(Mutex::new(RefreshSlot::default()));
-    slots.insert(key, Arc::downgrade(&slot));
-    Ok(slot)
-}
-
-fn begin_desktop_session_mutation(
-    registry_path: &Path,
-    endpoint_id: &str,
-) -> Result<DesktopSessionMutationGuard> {
-    let slot = refresh_slot(registry_path, endpoint_id)?;
-    {
-        let mut state = slot
-            .lock()
-            .map_err(|_| anyhow::anyhow!("desktop Gateway refresh lock is poisoned"))?;
-        if state.mutation_in_progress {
-            bail!("desktop Gateway session mutation is already in progress");
-        }
-        state.mutation_in_progress = true;
-    }
-    Ok(DesktopSessionMutationGuard { slot })
+    stored.identity_failure(
+        pinned_gateway_id,
+        expected_installation_id,
+        ClientKind::Desktop,
+        me,
+    )
 }
 
 impl GatewayRuntime {
@@ -898,7 +446,7 @@ impl GatewayRuntime {
         &self,
         endpoint_id: &str,
     ) -> Result<DesktopSessionMutationGuard> {
-        begin_desktop_session_mutation(self.registry_path.as_path(), endpoint_id)
+        self.client_core.begin_gateway_session_mutation(endpoint_id)
     }
 }
 
@@ -959,14 +507,13 @@ mod tests {
             .unwrap();
         (
             GatewayRuntime {
+                client_core: std::sync::Arc::new(pioneer_client::core::ClientCore::new()),
                 config,
                 timings,
                 ws_timings,
                 registry_path: std::env::temp_dir().join("unused-session-runtime-registry"),
                 registry,
                 secrets,
-                terminal_sessions: HashMap::new(),
-                access_expiries: HashMap::new(),
             },
             store,
             endpoint_id,
@@ -1190,14 +737,13 @@ mod tests {
     fn sequential_runtime_refreshes_use_the_latest_durable_generation() {
         let (mut first, store, endpoint_id) = fixture();
         let mut second = GatewayRuntime {
+            client_core: std::sync::Arc::new(pioneer_client::core::ClientCore::new()),
             config: first.config.clone(),
             timings: first.timings,
             ws_timings: first.ws_timings,
             registry_path: first.registry_path.clone(),
             registry: first.registry.clone(),
             secrets: DesktopSecrets::new(store),
-            terminal_sessions: HashMap::new(),
-            access_expiries: HashMap::new(),
         };
         let calls = Arc::new(AtomicU64::new(0));
         let first_calls = calls.clone();
@@ -1248,28 +794,6 @@ mod tests {
                 Ok(refresh_grant(1))
             })
             .expect("refresh after mutation");
-    }
-
-    #[test]
-    fn serialized_refresh_operation_holds_the_shared_slot_until_handoff_finishes() {
-        let (mut runtime, _, endpoint_id) = fixture();
-        let slot = refresh_slot(runtime.registry_path.as_path(), endpoint_id.as_str())
-            .expect("shared refresh slot");
-
-        runtime
-            .with_gateway_session_refresh_slot(endpoint_id.as_str(), |_, _| {
-                assert!(
-                    slot.try_lock().is_err(),
-                    "the slot must remain held through credential handoff"
-                );
-                Ok(())
-            })
-            .expect("serialized refresh operation");
-
-        assert!(
-            slot.try_lock().is_ok(),
-            "the slot must be released afterwards"
-        );
     }
 
     #[test]
@@ -1395,14 +919,13 @@ mod tests {
             .pending_refresh_request_id
             .expect("refresh intent persisted before process restart");
         let mut restarted = GatewayRuntime {
+            client_core: std::sync::Arc::new(pioneer_client::core::ClientCore::new()),
             config: first.config.clone(),
             timings: first.timings,
             ws_timings: first.ws_timings,
             registry_path: first.registry_path.clone(),
             registry: first.registry.clone(),
             secrets: DesktopSecrets::new(store),
-            terminal_sessions: HashMap::new(),
-            access_expiries: HashMap::new(),
         };
 
         let prepared = restarted
@@ -1506,14 +1029,13 @@ mod tests {
             })
             .unwrap();
         let mut restarted = GatewayRuntime {
+            client_core: std::sync::Arc::new(pioneer_client::core::ClientCore::new()),
             config: first.config.clone(),
             timings: first.timings,
             ws_timings: first.ws_timings,
             registry_path: first.registry_path.clone(),
             registry: first.registry.clone(),
             secrets: DesktopSecrets::new(store),
-            terminal_sessions: HashMap::new(),
-            access_expiries: HashMap::new(),
         };
         restarted
             .prepare_gateway_session_with_refresh(endpoint_id.as_str(), |_, raw, _, _| {

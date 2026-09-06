@@ -482,7 +482,10 @@ impl PioneerDesktop {
             self.gateway.settings_loading,
             self.gateway.connection_state == GatewayConnectionState::Connected,
             self.gateway.ws_connection_id,
-            self.gateway.connection_epoch,
+            self.gateway
+                .client_runtime
+                .client_core()
+                .gateway_operation_epoch(),
         );
         let scope = match plan {
             gateway_settings::GatewaySettingsRefreshPlan::Send(scope) => scope,
@@ -500,12 +503,12 @@ impl PioneerDesktop {
             &mut self.gateway.settings_error,
         );
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move { ws_sender.gateway_settings_get() })
+                    .background_spawn(async move { client_core.refresh_gateway_settings() })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
@@ -513,19 +516,21 @@ impl PioneerDesktop {
                         connection_id,
                         connection_epoch,
                         view.gateway.ws_connection_id,
-                        view.gateway.connection_epoch,
+                        view.gateway
+                            .client_runtime
+                            .client_core()
+                            .gateway_operation_epoch(),
                     ) {
                         return;
                     }
 
                     match result {
-                        Ok(response) => {
-                            gateway_settings::apply_gateway_settings_get_response(
-                                &mut view.gateway.settings,
-                                &mut view.gateway.settings_loading,
-                                &mut view.gateway.settings_error,
-                                response,
-                            );
+                        Ok(_) => {
+                            let current =
+                                view.gateway.client_runtime.client_core().gateway_settings();
+                            view.gateway.settings = current.settings;
+                            view.gateway.settings_loading = current.loading;
+                            view.gateway.settings_error = current.error;
                             if let Some(settings) = view.gateway.settings.as_ref() {
                                 pioneer_observability::set_telemetry_enabled(
                                     settings.general.telemetry_enabled,
@@ -533,11 +538,11 @@ impl PioneerDesktop {
                             }
                         }
                         Err(error) => {
-                            gateway_settings::apply_gateway_settings_get_error(
-                                &mut view.gateway.settings_loading,
-                                &mut view.gateway.settings_error,
-                                format!("{error:#}"),
-                            );
+                            let current =
+                                view.gateway.client_runtime.client_core().gateway_settings();
+                            view.gateway.settings = current.settings;
+                            view.gateway.settings_loading = current.loading;
+                            view.gateway.settings_error = current.error;
                             warn!(
                                 error = %format!("{error:#}"),
                                 "failed to fetch gateway settings"
@@ -608,7 +613,10 @@ impl PioneerDesktop {
         }
         let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
             self.gateway.ws_connection_id,
-            self.gateway.connection_epoch,
+            self.gateway
+                .client_runtime
+                .client_core()
+                .gateway_operation_epoch(),
         ) else {
             warn!("cannot update Voice Input settings without an active gateway connection");
             return false;
@@ -620,12 +628,12 @@ impl PioneerDesktop {
         self.pending_voice_input_enabled = pending_enabled;
         self.voice_input_action_error = None;
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move { ws_sender.gateway_settings_update(update) })
+                    .background_spawn(async move { client_core.update_gateway_settings(update) })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
@@ -633,7 +641,10 @@ impl PioneerDesktop {
                         connection_id,
                         connection_epoch,
                         view.gateway.ws_connection_id,
-                        view.gateway.connection_epoch,
+                        view.gateway
+                            .client_runtime
+                            .client_core()
+                            .gateway_operation_epoch(),
                     ) {
                         return;
                     }
@@ -643,12 +654,11 @@ impl PioneerDesktop {
                     }
 
                     match result {
-                        Ok(response) => {
-                            gateway_settings::apply_gateway_settings_update_response(
-                                &mut view.gateway.settings,
-                                &mut view.voice_input_action_error,
-                                response,
-                            );
+                        Ok(_) => {
+                            let current =
+                                view.gateway.client_runtime.client_core().gateway_settings();
+                            view.gateway.settings = current.settings;
+                            view.voice_input_action_error = current.error;
                         }
                         Err(error) => {
                             gateway_settings::apply_gateway_settings_update_error(
@@ -683,7 +693,10 @@ impl PioneerDesktop {
         }
         let Some(scope) = gateway_settings::plan_gateway_settings_update_action(
             self.gateway.ws_connection_id,
-            self.gateway.connection_epoch,
+            self.gateway
+                .client_runtime
+                .client_core()
+                .gateway_operation_epoch(),
         ) else {
             warn!("cannot update gateway settings without an active gateway connection");
             return;
@@ -693,18 +706,24 @@ impl PioneerDesktop {
         let reload_cli_provider_snapshot_after_update = update.cli_runtimes.is_some();
         let poll_remote_access_status_after_update = update.remote_access.is_some();
 
-        gateway_settings::apply_optimistic_gateway_settings_update(
-            &mut self.gateway.settings,
-            &mut self.gateway.settings_error,
-            snapshot,
-        );
-
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let client_core = self.gateway.client_runtime.client_core().clone();
+        let generation = match client_core.prepare_gateway_settings_update(Some(snapshot)) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.gateway.settings_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let publication = client_core.gateway_settings();
+        self.gateway.settings = publication.settings;
+        self.gateway.settings_error = publication.error;
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let result = cx
-                    .background_spawn(async move { ws_sender.gateway_settings_update(update) })
+                    .background_spawn(async move {
+                        client_core.execute_gateway_settings_update(generation, update)
+                    })
                     .await;
 
                 let _ = this.update(&mut cx, |view, cx| {
@@ -712,18 +731,20 @@ impl PioneerDesktop {
                         connection_id,
                         connection_epoch,
                         view.gateway.ws_connection_id,
-                        view.gateway.connection_epoch,
+                        view.gateway
+                            .client_runtime
+                            .client_core()
+                            .gateway_operation_epoch(),
                     ) {
                         return;
                     }
 
                     match result {
-                        Ok(response) => {
-                            gateway_settings::apply_gateway_settings_update_response(
-                                &mut view.gateway.settings,
-                                &mut view.gateway.settings_error,
-                                response,
-                            );
+                        Ok(_) => {
+                            let current =
+                                view.gateway.client_runtime.client_core().gateway_settings();
+                            view.gateway.settings = current.settings;
+                            view.gateway.settings_error = current.error;
                             if reload_cli_provider_snapshot_after_update {
                                 view.load_cli_provider_snapshot(cx);
                             }
@@ -789,7 +810,10 @@ impl PioneerDesktop {
                             connection_id,
                             connection_epoch,
                             view.gateway.ws_connection_id,
-                            view.gateway.connection_epoch,
+                            view.gateway
+                                .client_runtime
+                                .client_core()
+                                .gateway_operation_epoch(),
                         ) {
                             return false;
                         }

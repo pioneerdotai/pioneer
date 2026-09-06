@@ -80,7 +80,7 @@ impl PioneerDesktop {
             Ok(params) => params,
             Err(_) => return,
         };
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -141,7 +141,7 @@ impl PioneerDesktop {
             thread_tree::ThreadFolderRenamePlan::Skip(_) => return,
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -220,7 +220,7 @@ impl PioneerDesktop {
             thread_tree::ThreadRenamePlan::Skip(_) => return,
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -286,7 +286,7 @@ impl PioneerDesktop {
             thread_tree::ThreadFolderDeletePlan::Skip(_) => return,
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let delete_params = delete_params.clone();
@@ -409,7 +409,7 @@ impl PioneerDesktop {
             return;
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let params = agents_doc_scope::agents_doc_archive_params_for_summary(
@@ -570,7 +570,7 @@ impl PioneerDesktop {
             thread_tree::ThreadMovePlan::Skip(_) => return,
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let move_params = move_params.clone();
@@ -621,7 +621,7 @@ impl PioneerDesktop {
             thread_tree::ThreadFolderMovePlan::Skip(_) => return,
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let move_params = move_params.clone();

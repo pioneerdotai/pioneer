@@ -1,7 +1,5 @@
 use super::*;
-use pioneer_client::state::reducers::{
-    GatewayConnectionReduction, GatewaySettingsConnectionError, GatewayStatusMessage,
-};
+use pioneer_client::state::reducers::{GatewayConnectionReduction, GatewayStatusMessage};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_connection_reduction(
@@ -10,27 +8,15 @@ impl PioneerDesktop {
         mut cx: Option<&mut Context<Self>>,
     ) {
         let was_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        // Authorization revisions are monotonic only within one Gateway
-        // process/connection epoch. A reconnect can land on a restarted
-        // Gateway whose next revision is lower than the previously observed
-        // value. Access-change delivery can also be missed while the transport
-        // is down, so protected projections must be reloaded from current-ACL
-        // endpoints instead of surviving as readable cache.
-        self.gateway.authorization_revision = None;
-        self.clear_authorization_epoch_cache();
         self.gateway.status = gateway_status_message_text(&reduction.status);
         self.gateway.status_level = reduction.status_level;
         self.gateway.connection_state = reduction.connection_state;
         self.gateway.error = reduction.gateway_error;
 
-        if let Some(settings) = reduction.settings {
-            if settings.clear_settings {
-                self.gateway.settings = None;
-            }
-            self.gateway.settings_loading = settings.loading;
-            self.gateway.settings_error =
-                settings.error.map(gateway_settings_connection_error_text);
-        }
+        let settings = self.gateway.client_runtime.client_core().gateway_settings();
+        self.gateway.settings = settings.settings;
+        self.gateway.settings_loading = settings.loading;
+        self.gateway.settings_error = settings.error;
 
         if let Some(loading) = reduction.thread_list_loading {
             self.thread_list_loading = loading;
@@ -95,15 +81,7 @@ impl PioneerDesktop {
     }
 }
 
-fn gateway_settings_connection_error_text(error: GatewaySettingsConnectionError) -> String {
-    match error {
-        GatewaySettingsConnectionError::GatewayNotConnected => {
-            t!("settings.gateway_not_connected").to_string()
-        }
-    }
-}
-
-pub(in crate::app::flow) fn gateway_status_message_text(status: &GatewayStatusMessage) -> String {
+pub(in crate::app) fn gateway_status_message_text(status: &GatewayStatusMessage) -> String {
     match status {
         GatewayStatusMessage::Connecting => t!("gateway.status.connecting").to_string(),
         GatewayStatusMessage::ConnectingNamed { endpoint_name } => t!(

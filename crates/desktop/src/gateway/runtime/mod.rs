@@ -23,7 +23,7 @@ use pioneer_client::gateway::setup as client_gateway_setup;
 use pioneer_client::gateway::types::{GatewayEndpoint, GatewayRegistry};
 use pioneer_config::AppConfig;
 use pioneer_observability::{DesktopStartupStage, DesktopStartupTrace};
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 use tracing::info;
 
 use pioneer_client::gateway::runtime::ActiveGatewayState;
@@ -61,19 +61,18 @@ pub struct GatewayDeleteOutcome {
 }
 
 pub struct GatewayRuntime {
+    client_core: std::sync::Arc<pioneer_client::core::ClientCore>,
     config: AppConfig,
     timings: GatewayTimings,
     ws_timings: GatewayWsTimings,
     registry_path: PathBuf,
     registry: GatewayRegistry,
     secrets: DesktopSecrets,
-    terminal_sessions:
-        HashMap<String, pioneer_client::gateway::session_lifecycle::SessionTerminalReason>,
-    access_expiries: HashMap<String, u64>,
 }
 
 impl GatewayRuntime {
-    pub fn load() -> Result<Self> {
+    pub fn load(client_core: std::sync::Arc<pioneer_client::core::ClientCore>) -> Result<Self> {
+        anyhow::ensure!(!client_core.is_stopped(), "Client runtime is stopped");
         let config = AppConfig::load().context(t!("errors.config.load_app").to_string())?;
         let runtime_home = config
             .ensure_runtime_home_dir()
@@ -86,14 +85,13 @@ impl GatewayRuntime {
         let loaded_registry = load_registry_for_runtime(&registry_path, &config)?;
 
         let runtime = Self {
+            client_core,
             config,
             timings,
             ws_timings,
             registry_path,
             registry: loaded_registry.registry,
             secrets,
-            terminal_sessions: HashMap::new(),
-            access_expiries: HashMap::new(),
         };
         runtime.purge_retired_desktop_credentials();
 
@@ -520,14 +518,13 @@ impl GatewayRuntime {
         let secrets = DesktopSecrets::new(Arc::new(MemorySecretStore::new()));
 
         Self {
+            client_core: Arc::new(pioneer_client::core::ClientCore::new()),
             config,
             timings,
             ws_timings,
             registry_path,
             registry,
             secrets,
-            terminal_sessions: HashMap::new(),
-            access_expiries: HashMap::new(),
         }
     }
 }

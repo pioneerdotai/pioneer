@@ -41,7 +41,7 @@ impl PioneerDesktop {
             }
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         provider_actions::mark_provider_api_key_action_started(&mut self.providers);
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -119,7 +119,7 @@ impl PioneerDesktop {
             }
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         provider_actions::mark_provider_api_key_action_started(&mut self.providers);
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -184,7 +184,7 @@ impl PioneerDesktop {
             }
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         provider_actions::mark_provider_api_key_action_started(&mut self.providers);
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -253,7 +253,7 @@ impl PioneerDesktop {
             }
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         provider_actions::mark_provider_api_key_action_started(&mut self.providers);
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -317,7 +317,7 @@ impl PioneerDesktop {
             }
         };
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         provider_actions::mark_provider_api_key_action_started(&mut self.providers);
 
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {

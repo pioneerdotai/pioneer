@@ -35,7 +35,7 @@ impl PioneerDesktop {
 
         self.thread_scope_pending = ThreadScopePendingAction::Pending { action };
         self.thread_scope_error = None;
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
@@ -134,7 +134,7 @@ impl PioneerDesktop {
         };
         self.thread_scope_error = None;
 
-        let sender = self.gateway.ws_command_sender.clone();
+        let sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {

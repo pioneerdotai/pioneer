@@ -77,8 +77,7 @@ use gateway::{
     AddAndActivateRemoteGatewayRegistryPlan, AddRemoteGatewayPlan, LoadGatewayRegistryRequest,
     LoadGatewayRegistryResult, PlanActivateGatewayRequest, PlanAddRemoteGatewayRequest,
     PlanDeleteRemoteGatewayRequest, PlanSetGatewayWorkspaceRequest, PlanUpdateRemoteGatewayRequest,
-    RemoteGatewayValidationRequest, gateway_settings_error_code, gateway_settings_get_for_bridge,
-    gateway_settings_update_for_bridge, load_gateway_registry_request,
+    RemoteGatewayValidationRequest, gateway_settings_error_code, load_gateway_registry_request,
     plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
     plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
@@ -158,9 +157,9 @@ use presentation::{
     ClientExecutionDraftReconcileRequest, ClientInvitationListRowRequest,
     ClientMemberPresentationRequest, ClientThreadCreateVisibilityRequest,
     ClientThreadScopeMutationPlanRequest, ClientThreadScopePresentationRequest,
-    accept_authorization_projection, artifact_presentation_policy, current_principal,
-    invitation_list_row, member_presentation, reconcile_execution_draft, session_list_row,
-    thread_create_visibility, thread_scope, thread_scope_mutation_plan,
+    artifact_presentation_policy, current_principal, invitation_list_row, member_presentation,
+    reconcile_execution_draft, session_list_row, thread_create_visibility, thread_scope,
+    thread_scope_mutation_plan,
 };
 pub use presentation::{principal_capabilities, thread_capabilities};
 use serde::{Deserialize, Serialize};
@@ -207,11 +206,10 @@ struct ClientFfiRuntime {
     client_runtime: ClientRuntimeCompatibility,
     client_subscriptions: Mutex<HashMap<ClientScope, ClientSubscription>>,
     active_thread: ClientFfiActiveThreadState,
-    authorization_projection_state: Mutex<AuthorizationProjectionRuntimeState>,
     active_connection_id: Mutex<Option<u64>>,
+    legacy_authorization_generation: Mutex<u64>,
+    legacy_authorization_change_sequence: AtomicU64,
     diagnostics: ClientFfiDiagnostics,
-    gateway_session_lifecycles:
-        Mutex<HashMap<String, pioneer_client::gateway::session_lifecycle::SessionLifecycle>>,
     artifact_downloads: artifacts::ClientFfiArtifactDownloads,
     avatar_cache: ClientFfiAvatarCache,
     invitation_commit_sequence: AtomicU64,
@@ -228,8 +226,32 @@ struct ClientRuntimeCompatibility {
 impl Default for ClientRuntimeCompatibility {
     fn default() -> Self {
         Self {
-            core: Arc::new(ClientCore::new()),
+            core: ClientCore::shared(),
         }
+    }
+}
+
+impl ClientRuntimeCompatibility {
+    fn recv_ws_event(&self) -> Option<pioneer_client::transport::ws::GatewayWsEvent> {
+        self.core
+            .receive_gateway_compatibility_event()
+            .map(|event| event.into_event())
+    }
+    fn drain_applicable_ws_events(
+        &self,
+        active: Option<u64>,
+        first: Option<pioneer_client::transport::ws::GatewayWsEvent>,
+    ) -> Vec<pioneer_client::transport::ws::GatewayWsEvent> {
+        first
+            .into_iter()
+            .chain(
+                self.core
+                    .drain_gateway_compatibility_events()
+                    .into_iter()
+                    .map(|event| event.into_event()),
+            )
+            .filter(|event| pioneer_client::transport::ws::should_apply_ws_event(active, event))
+            .collect()
     }
 }
 
@@ -239,24 +261,6 @@ impl std::ops::Deref for ClientRuntimeCompatibility {
     fn deref(&self) -> &Self::Target {
         self.core.compatibility_runtime()
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AuthorizationProjectionEpoch {
-    gateway_id: String,
-    connection_id: u64,
-}
-
-#[derive(Debug, Default)]
-struct AuthorizationProjectionRuntimeState {
-    epoch: Option<AuthorizationProjectionEpoch>,
-    store: pioneer_client::authorization::AuthorizationProjectionStore,
-}
-
-fn contains_gateway_connection_epoch_boundary(events: &[ClientEvent]) -> bool {
-    events
-        .iter()
-        .any(|event| matches!(event, ClientEvent::GatewayConnectionChanged(_)))
 }
 
 fn contains_session_termination(events: &[ClientEvent]) -> bool {
@@ -282,21 +286,6 @@ fn contains_avatar_authorization_boundary(events: &[ClientEvent]) -> bool {
             )
         )
     })
-}
-
-fn newest_authorization_revision(events: &[ClientEvent]) -> Option<u64> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            ClientEvent::GatewayNotification(
-                pioneer_protocol::GatewayNotification::AccessChanged(notification),
-            ) => Some(notification.authorization_revision),
-            ClientEvent::GatewayNotification(
-                pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(notification),
-            ) => Some(notification.policy_generation.get()),
-            _ => None,
-        })
-        .max()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -465,13 +454,61 @@ impl ClientFfiRuntime {
         })
     }
 
+    fn client_wait_publications(
+        &self,
+        input_json: &str,
+    ) -> Result<client_binding::ClientProcessChangeBatchDto, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request: client_binding::ClientPublicationWaitRequestDto =
+            serde_json::from_str(input_json)
+                .map_err(|error| format!("invalid publication wait: {error}"))?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        let batch = self
+            .client_runtime
+            .core
+            .wait_for_publications(request.after_sequence);
+        self.synchronize_legacy_authorization()
+            .map_err(|error| error.message)?;
+        Ok(client_binding::ClientProcessChangeBatchDto {
+            closed: batch.closed,
+            effects: batch.effects,
+            schema_version: client_binding::CLIENT_BINDING_SCHEMA_VERSION,
+            sequence: batch.sequence,
+            resnapshot: batch.resnapshot,
+            changes: batch
+                .changes
+                .iter()
+                .map(|change| client_binding::ClientProcessChangeSetDto {
+                    sequence: change.sequence(),
+                    predecessor: change.predecessor(),
+                    snapshots: change
+                        .publications()
+                        .iter()
+                        .cloned()
+                        .map(client_binding::snapshot_dto)
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    fn client_shutdown(&self, input_json: &str) -> Result<bool, String> {
+        if input_json != "{}" {
+            return Err("invalid Client shutdown request".into());
+        }
+        self.client_runtime.core.shutdown();
+        self.synchronize_legacy_authorization()
+            .map_err(|error| error.message)?;
+        Ok(true)
+    }
+
     fn client_effect_complete(
         &self,
         input_json: &str,
     ) -> Result<client_binding::ClientTransitionDto, String> {
         self.require_initialized().map_err(|error| error.message)?;
         let request = serde_json::from_str::<client_binding::ClientEffectCompletionDto>(input_json)
-            .map_err(|error| format!("invalid Client effect completion: {error}"))?;
+            .map_err(|_| "invalid Client effect completion".to_owned())?;
         client_binding::validate_schema_version(request.schema_version)?;
         Ok(client_binding::transition_dto(
             self.client_runtime.core.complete_effect(request.completion),
@@ -597,6 +634,15 @@ impl ClientFfiRuntime {
         plan_set_gateway_workspace_registry_request(request).map_err(|error| error.to_string())
     }
 
+    fn gateway_session_validate(
+        &self,
+        input_json: &str,
+    ) -> Result<auth::ClientGatewaySessionValidationResult, String> {
+        let request = serde_json::from_str(input_json)
+            .map_err(|_| "invalid Gateway session validation request".to_owned())?;
+        Ok(auth::validate_gateway_session(request))
+    }
+
     fn gateway_session_lifecycle_reduce(
         &self,
         input_json: &str,
@@ -617,27 +663,14 @@ impl ClientFfiRuntime {
                 auth::INVALID_AUTH_REQUEST_CODE,
             ));
         }
-        let mut lifecycles = self.gateway_session_lifecycles.lock().map_err(|_| {
-            ClientFfiError::new(
-                "Gateway session lifecycle lock is poisoned",
-                ClientFfiError::GENERIC_CODE,
-            )
-        })?;
-        let release_lifecycle = matches!(
-            &request.event,
-            pioneer_client::gateway::session_lifecycle::SessionLifecycleEvent::NoStoredSession
-        );
-        let result = {
-            let lifecycle = lifecycles.entry(endpoint_id.to_owned()).or_default();
-            let effect = lifecycle.reduce(request.event);
-            auth::ClientGatewaySessionLifecycleResult {
-                state: lifecycle.state().clone(),
-                effect,
-            }
+        let transition = self
+            .client_runtime
+            .core
+            .reduce_gateway_session_lifecycle(endpoint_id, request.event);
+        let result = auth::ClientGatewaySessionLifecycleResult {
+            state: transition.state().clone(),
+            effect: transition.effect().clone(),
         };
-        if release_lifecycle {
-            lifecycles.remove(endpoint_id);
-        }
         Ok(result)
     }
 
@@ -750,8 +783,8 @@ impl ClientFfiRuntime {
         parse_empty_auth_request(input_json)?;
         self.require_initialized_and_connected()?;
         self.client_runtime
-            .ws_command_sender()
-            .auth_me()
+            .core
+            .refresh_current_auth()
             .map_err(normal_auth_error)
     }
 
@@ -769,9 +802,10 @@ impl ClientFfiRuntime {
             })?;
         self.require_initialized_and_connected()?;
         self.client_runtime
-            .ws_command_sender()
-            .authorization_capabilities(params)
-            .map_err(normal_auth_error)
+            .core
+            .refresh_identity_authorization(params)
+            .map(|(_, snapshot)| snapshot)
+            .map_err(|(_, error)| normal_auth_error(error))
     }
 
     fn gateway_auth_profile_update(
@@ -784,8 +818,8 @@ impl ClientFfiRuntime {
             })?;
         self.require_initialized_and_connected()?;
         self.client_runtime
-            .ws_command_sender()
-            .auth_profile_update(params)
+            .core
+            .update_auth_profile(params)
             .map_err(normal_auth_error)
     }
 
@@ -796,8 +830,8 @@ impl ClientFfiRuntime {
         parse_empty_auth_request(input_json)?;
         self.require_initialized_and_connected()?;
         self.client_runtime
-            .ws_command_sender()
-            .auth_session_list()
+            .core
+            .refresh_auth_sessions()
             .map_err(normal_auth_error)
     }
 
@@ -814,8 +848,8 @@ impl ClientFfiRuntime {
             })?;
         self.require_initialized_and_connected()?;
         self.client_runtime
-            .ws_command_sender()
-            .auth_session_revoke(params)
+            .core
+            .revoke_auth_session(params)
             .map_err(normal_auth_error)
     }
 
@@ -827,8 +861,8 @@ impl ClientFfiRuntime {
         self.require_initialized_and_connected()?;
         let response = self
             .client_runtime
-            .ws_command_sender()
-            .auth_logout()
+            .core
+            .logout_auth_session()
             .map_err(normal_auth_error)?;
         if let Ok(runtime_home) = self.native_cache_runtime_home() {
             self.avatar_cache.invalidate_all(runtime_home.as_path());
@@ -1302,6 +1336,196 @@ impl ClientFfiRuntime {
             .map_err(administration_rpc_error)
     }
 
+    fn gateway_session_ensure(
+        &self,
+        input_json: &str,
+    ) -> Result<
+        pioneer_client::gateway::session_connection::GatewaySessionConnectionResult,
+        ClientFfiError,
+    > {
+        self.require_initialized()?;
+        let request: auth::ClientGatewaySessionEnsureRequest = serde_json::from_str(input_json)
+            .map_err(|_| {
+                ClientFfiError::new("invalid session request", auth::INVALID_AUTH_REQUEST_CODE)
+            })?;
+        if request.installation_id.trim().is_empty() || request.endpoint.id.trim().is_empty() {
+            return Err(ClientFfiError::new(
+                "invalid session identity",
+                auth::INVALID_AUTH_REQUEST_CODE,
+            ));
+        }
+        let timings = request.timings.to_gateway_ws_timings().map_err(|_| {
+            ClientFfiError::new("invalid session timings", auth::INVALID_AUTH_REQUEST_CODE)
+        })?;
+        let native_request =
+            pioneer_client::gateway::session_refresh::GatewaySessionRefreshRequest {
+                endpoint: &request.endpoint,
+                installation_id: &request.installation_id,
+                client_kind: pioneer_protocol::ClientKind::Mobile,
+                now_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| {
+                        ClientFfiError::new("invalid session clock", ClientFfiError::GENERIC_CODE)
+                    })?
+                    .as_secs(),
+                timeout: std::time::Duration::from_millis(auth::default_exchange_timeout_ms()),
+                ws_timings: timings,
+                retry_delays: &[],
+            };
+        let storage = pioneer_client::gateway::session_refresh::GatewaySessionPlatformStorage(
+            &self.client_runtime.core,
+        );
+        let outcome = match request.rejected_connection_id {
+            Some(id) => self
+                .client_runtime
+                .core
+                .refresh_gateway_session_after_unauthorized(native_request, &storage, id),
+            None => self
+                .client_runtime
+                .core
+                .ensure_gateway_session(native_request, &storage),
+        };
+        let connected = outcome.map_err(|error| {
+            use pioneer_client::gateway::session_connection::GatewaySessionConnectionFailure;
+            let code = match &error {
+                GatewaySessionConnectionFailure::Terminal { reason } => {
+                    serde_json::to_value(reason)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "authentication_terminal".into())
+                }
+                GatewaySessionConnectionFailure::Suspended => "session_suspended".into(),
+                GatewaySessionConnectionFailure::Unavailable { code } => code.clone(),
+            };
+            ClientFfiError::new(error.to_string(), code)
+        })?;
+        let mut active = self.active_connection_id.lock().map_err(|_| {
+            ClientFfiError::new("connection adapter poisoned", ClientFfiError::GENERIC_CODE)
+        })?;
+        if self
+            .client_runtime
+            .ws_command_sender()
+            .current_gateway_http_access()
+            .ok()
+            .map(|access| access.generation)
+            != Some(connected.connection_id)
+            || active.is_some_and(|id| id > connected.connection_id)
+        {
+            return Err(ClientFfiError::new(
+                "session connection was superseded",
+                "session_suspended",
+            ));
+        }
+        if *active != Some(connected.connection_id) {
+            self.synchronize_legacy_authorization()?;
+            if let Ok(runtime_home) = self.native_cache_runtime_home() {
+                self.avatar_cache.invalidate_all(runtime_home.as_path());
+            }
+            *active = Some(connected.connection_id);
+        }
+        Ok(connected)
+    }
+
+    fn authorization_access_change_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::authorization::AccessChangedPlan, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request: client_binding::ClientAccessChangePlanRequestDto =
+            serde_json::from_str(input_json).map_err(|error| error.to_string())?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        self.client_runtime
+            .core
+            .published_access_change_plan(
+                request.connection_generation,
+                request.change_sequence,
+                request.active_workspace_id.as_deref(),
+                request.active_thread_id.as_deref(),
+                &request.known_threads,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn gateway_transport_reserve(&self, input_json: &str) -> Result<u64, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request: client_binding::ClientTransportReserveRequestDto =
+            serde_json::from_str(input_json).map_err(|error| error.to_string())?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        self.client_runtime
+            .core
+            .reserve_gateway_transport(request.exclusive)
+            .map_err(|error| error.to_string())
+    }
+
+    fn gateway_transport_wait(&self, input_json: &str) -> Result<bool, String> {
+        self.require_initialized().map_err(|error| error.message)?;
+        let request: client_binding::ClientTransportLeaseRequestDto =
+            serde_json::from_str(input_json).map_err(|error| error.to_string())?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        Ok(self
+            .client_runtime
+            .core
+            .wait_gateway_transport(request.lease_id))
+    }
+
+    fn gateway_transport_release(&self, input_json: &str) -> Result<bool, String> {
+        let request: client_binding::ClientTransportLeaseRequestDto =
+            serde_json::from_str(input_json).map_err(|error| error.to_string())?;
+        client_binding::validate_schema_version(request.schema_version)?;
+        Ok(self
+            .client_runtime
+            .core
+            .release_gateway_transport(request.lease_id))
+    }
+
+    fn gateway_session_control(&self, input_json: &str) -> Result<bool, ClientFfiError> {
+        self.require_initialized()?;
+        let request: auth::ClientGatewaySessionControlRequest = serde_json::from_str(input_json)
+            .map_err(|_| {
+                ClientFfiError::new("invalid session control", auth::INVALID_AUTH_REQUEST_CODE)
+            })?;
+        use auth::ClientGatewaySessionControlRequest;
+        let endpoint_id = match &request {
+            ClientGatewaySessionControlRequest::Suspend { endpoint_id }
+            | ClientGatewaySessionControlRequest::Clear { endpoint_id }
+            | ClientGatewaySessionControlRequest::Disconnected { endpoint_id, .. }
+            | ClientGatewaySessionControlRequest::Stop { endpoint_id, .. } => endpoint_id,
+        };
+        if endpoint_id.trim().is_empty() || endpoint_id.trim() != endpoint_id {
+            return Err(ClientFfiError::new(
+                "invalid session identity",
+                auth::INVALID_AUTH_REQUEST_CODE,
+            ));
+        }
+        match request {
+            ClientGatewaySessionControlRequest::Suspend { endpoint_id } => self
+                .client_runtime
+                .core
+                .suspend_gateway_session(&endpoint_id),
+            ClientGatewaySessionControlRequest::Clear { endpoint_id } => {
+                self.client_runtime.core.clear_gateway_session(&endpoint_id)
+            }
+            ClientGatewaySessionControlRequest::Stop {
+                endpoint_id,
+                reason,
+            } => self
+                .client_runtime
+                .core
+                .stop_gateway_session(&endpoint_id, reason),
+            ClientGatewaySessionControlRequest::Disconnected {
+                endpoint_id,
+                connection_id,
+            } => {
+                self.client_runtime
+                    .core
+                    .mark_gateway_session_disconnected(&endpoint_id, connection_id);
+                Ok(())
+            }
+        }
+        .map_err(normal_auth_error)?;
+        Ok(true)
+    }
+
     fn gateway_session_replace_access(
         &self,
         input_json: &str,
@@ -1326,24 +1550,10 @@ impl ClientFfiRuntime {
         if let Ok(runtime_home) = self.native_cache_runtime_home() {
             self.avatar_cache.invalidate_all(runtime_home.as_path());
         }
-        let mut authorization_projection_state =
-            self.authorization_projection_state.lock().map_err(|_| {
-                ClientFfiError::new(
-                    "authorization projection state is unavailable",
-                    ClientFfiError::GENERIC_CODE,
-                )
-            })?;
-        authorization_projection_state.store.clear_epoch();
-        authorization_projection_state.epoch = Some(AuthorizationProjectionEpoch {
-            gateway_id,
-            connection_id,
-        });
-        drop(authorization_projection_state);
-        self.active_thread
-            .begin_authorization_epoch()
-            .map_err(|error| {
-                ClientFfiError::new(format!("{error:#}"), ClientFfiError::GENERIC_CODE)
-            })?;
+        self.client_runtime
+            .core
+            .begin_authorization_epoch(Some((gateway_id, connection_id)));
+        self.synchronize_legacy_authorization()?;
         *self.active_connection_id.lock().map_err(|_| {
             ClientFfiError::new(
                 "client ffi connection lock is poisoned",
@@ -1381,15 +1591,6 @@ impl ClientFfiRuntime {
             if !events.is_empty() {
                 #[cfg(not(feature = "qualification-diagnostics"))]
                 {
-                    if let Some(revision) = newest_authorization_revision(events.as_slice()) {
-                        self.authorization_projection_state
-                            .lock()
-                            .map_err(|_| {
-                                "authorization projection state is unavailable".to_owned()
-                            })?
-                            .store
-                            .invalidate_for_revision(revision);
-                    }
                     if contains_session_termination(events.as_slice())
                         || contains_avatar_authorization_boundary(events.as_slice())
                     {
@@ -1403,19 +1604,10 @@ impl ClientFfiRuntime {
                             .map_err(|_| "invitation commit state is unavailable".to_owned())?
                             .clear();
                     }
-                    if contains_gateway_connection_epoch_boundary(events.as_slice()) {
-                        self.authorization_projection_state
-                            .lock()
-                            .map_err(|_| {
-                                "authorization projection state is unavailable".to_owned()
-                            })?
-                            .store
-                            .clear_epoch();
-                        self.active_thread
-                            .begin_authorization_epoch()
-                            .map_err(|error| format!("{error:#}"))?;
-                    }
-                    return Ok(events);
+                    return Ok(events
+                        .into_iter()
+                        .filter(is_feature_compatibility_event)
+                        .collect());
                 }
 
                 #[cfg(feature = "qualification-diagnostics")]
@@ -1430,15 +1622,6 @@ impl ClientFfiRuntime {
                         )
                     );
                     let delivery_result = (|| -> Result<(), String> {
-                        if let Some(revision) = newest_authorization_revision(events.as_slice()) {
-                            self.authorization_projection_state
-                                .lock()
-                                .map_err(|_| {
-                                    "authorization projection state is unavailable".to_owned()
-                                })?
-                                .store
-                                .invalidate_for_revision(revision);
-                        }
                         if contains_session_termination(events.as_slice())
                             || contains_avatar_authorization_boundary(events.as_slice())
                         {
@@ -1449,22 +1632,8 @@ impl ClientFfiRuntime {
                         if contains_session_termination(events.as_slice()) {
                             self.invitation_commits
                                 .lock()
-                                .map_err(|_| {
-                                    "invitation commit state is unavailable".to_owned()
-                                })?
+                                .map_err(|_| "invitation commit state is unavailable".to_owned())?
                                 .clear();
-                        }
-                        if contains_gateway_connection_epoch_boundary(events.as_slice()) {
-                            self.authorization_projection_state
-                                .lock()
-                                .map_err(|_| {
-                                    "authorization projection state is unavailable".to_owned()
-                                })?
-                                .store
-                                .clear_epoch();
-                            self.active_thread
-                                .begin_authorization_epoch()
-                                .map_err(|error| format!("{error:#}"))?;
                         }
                         Ok(())
                     })();
@@ -1482,7 +1651,10 @@ impl ClientFfiRuntime {
                         )
                     );
                     delivery_result?;
-                    return Ok(events);
+                    return Ok(events
+                        .into_iter()
+                        .filter(is_feature_compatibility_event)
+                        .collect());
                 }
             }
         }
@@ -1497,16 +1669,9 @@ impl ClientFfiRuntime {
             .ws_command_sender()
             .disconnect()
             .map_err(|error| format!("{error:#}"))?;
-        self.active_thread
-            .begin_authorization_epoch()
-            .map_err(|error| format!("{error:#}"))?;
-        let mut authorization_projection_state = self
-            .authorization_projection_state
-            .lock()
-            .map_err(|_| "authorization projection state is unavailable".to_owned())?;
-        authorization_projection_state.store.clear_epoch();
-        authorization_projection_state.epoch = None;
-        drop(authorization_projection_state);
+        self.client_runtime.core.begin_authorization_epoch(None);
+        self.synchronize_legacy_authorization()
+            .map_err(|error| error.message)?;
         *self
             .active_connection_id
             .lock()
@@ -1635,25 +1800,25 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<pioneer_protocol::GatewaySettingsGetResponse, ClientFfiError> {
-        let request = serde_json::from_str::<ClientGatewaySettingsGetRequest>(input_json).map_err(
-            |error| {
+        let _request = serde_json::from_str::<ClientGatewaySettingsGetRequest>(input_json)
+            .map_err(|error| {
                 ClientFfiError::new(
                     format!("invalid gateway settings get request: {error}"),
                     gateway::INVALID_GATEWAY_SETTINGS_REQUEST_CODE,
                 )
-            },
-        )?;
+            })?;
         self.require_initialized_and_connected()?;
 
-        gateway_settings_get_for_bridge(&self.client_runtime.ws_command_sender(), request).map_err(
-            |error| {
+        self.client_runtime
+            .core
+            .refresh_gateway_settings()
+            .map_err(|error| {
                 let message = format!("{error:#}");
                 ClientFfiError::new(
                     message.clone(),
                     gateway_settings_error_code(message.as_str()),
                 )
-            },
-        )
+            })
     }
 
     fn gateway_settings_update(
@@ -1669,7 +1834,9 @@ impl ClientFfiRuntime {
             })?;
         self.require_initialized_and_connected()?;
 
-        gateway_settings_update_for_bridge(&self.client_runtime.ws_command_sender(), request)
+        self.client_runtime
+            .core
+            .update_gateway_settings(request.update)
             .map_err(|error| {
                 let message = format!("{error:#}");
                 ClientFfiError::new(
@@ -1714,6 +1881,113 @@ impl ClientFfiRuntime {
                 "client ffi is not initialized",
                 gateway::CLIENT_NOT_INITIALIZED_CODE,
             ));
+        }
+        self.synchronize_legacy_authorization()
+    }
+
+    fn legacy_authorization_stamp(&self) -> (u64, u64) {
+        let publication = self.client_runtime.core.snapshot(
+            &ClientScope::Administration { workspace_id: None },
+        ).and_then(|snapshot| snapshot.typed::<pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication>());
+        publication
+            .map(|snapshot| {
+                (
+                    snapshot.payload().connection_generation,
+                    snapshot.payload().authorization_change_sequence,
+                )
+            })
+            .unwrap_or((
+                self.client_runtime
+                    .core
+                    .authorization_connection_generation(),
+                0,
+            ))
+    }
+
+    fn begin_legacy_projection_read(&self) -> Result<(u64, u64), ClientFfiError> {
+        if self.client_runtime.core.is_stopped() {
+            return Err(ClientFfiError::new(
+                "Client runtime is stopped",
+                ClientFfiError::GENERIC_CODE,
+            ));
+        }
+        self.synchronize_legacy_authorization()?;
+        let stamp = self.legacy_authorization_stamp();
+        if stamp.1
+            != self
+                .legacy_authorization_change_sequence
+                .load(Ordering::Acquire)
+        {
+            return Err(ClientFfiError::new(
+                "authorization publication has not reached the legacy thread binding",
+                ClientFfiError::GENERIC_CODE,
+            ));
+        }
+        Ok(stamp)
+    }
+
+    fn finish_legacy_projection_read(&self, stamp: (u64, u64)) -> Result<(), ClientFfiError> {
+        if self.legacy_authorization_stamp() != stamp {
+            self.active_thread
+                .begin_authorization_epoch()
+                .map_err(|_| {
+                    ClientFfiError::new(
+                        "legacy thread binding unavailable",
+                        ClientFfiError::GENERIC_CODE,
+                    )
+                })?;
+            return Err(ClientFfiError::new(
+                "protected thread result is stale",
+                ClientFfiError::GENERIC_CODE,
+            ));
+        }
+        Ok(())
+    }
+
+    fn synchronize_legacy_authorization(&self) -> Result<(), ClientFfiError> {
+        let generation = self
+            .client_runtime
+            .core
+            .authorization_connection_generation();
+        let mut applied = self.legacy_authorization_generation.lock().map_err(|_| {
+            ClientFfiError::new(
+                "legacy binding cursor poisoned",
+                ClientFfiError::GENERIC_CODE,
+            )
+        })?;
+        if generation > *applied
+            || self.legacy_authorization_stamp().1
+                != self
+                    .legacy_authorization_change_sequence
+                    .load(Ordering::Acquire)
+        {
+            // The native avatar adapter follows accepted authorization publications,
+            // independently of the remaining thread notification delivery.
+            if let Ok(runtime_home) = self.native_cache_runtime_home() {
+                self.avatar_cache.invalidate_all(runtime_home.as_path());
+            }
+        }
+        if generation > *applied {
+            self.invitation_commits
+                .lock()
+                .map_err(|_| {
+                    ClientFfiError::new(
+                        "invitation commit state unavailable",
+                        ClientFfiError::GENERIC_CODE,
+                    )
+                })?
+                .clear();
+            self.active_thread
+                .begin_authorization_epoch()
+                .map_err(|_| {
+                    ClientFfiError::new(
+                        "legacy thread binding unavailable",
+                        ClientFfiError::GENERIC_CODE,
+                    )
+                })?;
+            self.legacy_authorization_change_sequence
+                .store(self.legacy_authorization_stamp().1, Ordering::Release);
+            *applied = generation;
         }
         Ok(())
     }
@@ -2169,17 +2443,39 @@ impl ClientFfiRuntime {
         let request =
             serde_json::from_str::<ClientAuthorizationProjectionAcceptRequest>(input_json)
                 .map_err(|error| format!("invalid authorization projection request: {error}"))?;
-        let mut state = self
-            .authorization_projection_state
-            .lock()
-            .map_err(|_| "authorization projection state is unavailable".to_owned())?;
-        let active_epoch = state.epoch.clone();
-        Ok(accept_authorization_projection(
-            &mut state.store,
-            active_epoch.as_ref().map(|epoch| epoch.gateway_id.as_str()),
-            active_epoch.as_ref().map(|epoch| epoch.connection_id),
-            request,
-        ))
+        let core = &self.client_runtime.core;
+        if !pioneer_client::authorization::authorization_capability_snapshot_is_compatible(
+            &request.snapshot,
+            &request.expected_principal_id,
+            request.workspace_id.as_deref(),
+            request.thread_id.as_deref(),
+        ) {
+            return Ok(ClientAuthorizationProjectionAcceptResult {
+                acceptance:
+                    pioneer_client::authorization::AuthorizationProjectionAcceptance::Incompatible,
+                snapshot: None,
+            });
+        }
+        let acceptance = core.accept_authorization_projection_for_connection(
+            &request.gateway_id,
+            request.connection_id,
+            request.snapshot,
+        );
+        let snapshot = (acceptance
+            == pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted)
+            .then(|| {
+                core.authorization_snapshot(
+                    request.workspace_id.as_deref(),
+                    request.thread_id.as_deref(),
+                )
+                .or_else(|| core.authorization_snapshot(request.workspace_id.as_deref(), None))
+                .or_else(|| core.authorization_snapshot(None, None))
+            })
+            .flatten();
+        Ok(ClientAuthorizationProjectionAcceptResult {
+            acceptance,
+            snapshot,
+        })
     }
 
     fn artifact_presentation_policy(
@@ -2769,36 +3065,76 @@ impl ClientFfiRuntime {
             pioneer_observability::Visibility::NotApplicable,
         ));
 
-        #[cfg(not(feature = "qualification-diagnostics"))]
+        let request = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
+            .map_err(|error| format!("invalid active thread event request: {error}"))?;
+        self.synchronize_legacy_authorization()
+            .map_err(|error| error.message)?;
+        let stamp = self.legacy_authorization_stamp();
+        let publication = self.client_runtime.core.snapshot(
+            &ClientScope::Administration { workspace_id: None },
+        ).and_then(|snapshot| snapshot.typed::<pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication>());
+        let accepted_invalidation = match (&request.event, publication.as_ref()) {
+            (
+                ClientEvent::GatewayNotification(
+                    pioneer_protocol::GatewayNotification::AccessChanged(change),
+                ),
+                Some(publication),
+            ) => publication.payload().access_change.as_ref() == Some(change),
+            (
+                ClientEvent::GatewayNotification(
+                    pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(change),
+                ),
+                Some(publication),
+            ) => publication.payload().policy_change.as_ref() == Some(change),
+            _ => false,
+        };
+        let authorization_input = matches!(
+            &request.event,
+            ClientEvent::GatewayNotification(
+                pioneer_protocol::GatewayNotification::AccessChanged(_)
+                    | pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(_)
+            )
+        );
+        if authorization_input && !accepted_invalidation {
+            return Err("authorization input is not the current Client publication".into());
+        }
+        if !accepted_invalidation {
+            self.begin_legacy_projection_read()
+                .map_err(|error| error.message)?;
+        } else if stamp.1
+            > self
+                .legacy_authorization_change_sequence
+                .load(Ordering::Acquire)
+                .saturating_add(1)
         {
-            let request = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
-                .map_err(|error| format!("invalid active thread event request: {error}"))?;
+            // A collapsed publication history cannot supply all exact eviction
+            // keys. Drop the remaining legacy projections before opening reads.
             self.active_thread
-                .apply_event(&self.client_runtime, request)
-                .map_err(|error| format!("{error:#}"))
+                .begin_authorization_epoch()
+                .map_err(|error| error.to_string())?;
         }
-        #[cfg(feature = "qualification-diagnostics")]
-        {
-            let result = serde_json::from_str::<ClientActiveThreadEventRequest>(input_json)
-                .map_err(|error| format!("invalid active thread event request: {error}"))
-                .and_then(|request| {
-                    self.active_thread
-                        .apply_event(&self.client_runtime, request)
-                        .map_err(|error| format!("{error:#}"))
-                });
-            pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
-                pioneer_observability::Shell::Mobile,
-                pioneer_observability::DeliveryLayer::MobileFfiActiveThreadReducer,
-                pioneer_observability::ClientScope::Thread,
-                if result.is_ok() {
-                    pioneer_observability::DiagnosticAction::Completed
-                } else {
-                    pioneer_observability::DiagnosticAction::Dropped
-                },
-                pioneer_observability::Visibility::NotApplicable,
-            ));
-            result
+        let result = self
+            .active_thread
+            .apply_event(&self.client_runtime, request)
+            .map_err(|error| format!("{error:#}"));
+        self.finish_legacy_projection_read(stamp)
+            .map_err(|error| error.message)?;
+        if result.is_ok() && accepted_invalidation {
+            self.legacy_authorization_change_sequence
+                .store(stamp.1, Ordering::Release);
         }
+        pioneer_observability::record_qualification_diagnostic!(record_client_delivery(
+            pioneer_observability::Shell::Mobile,
+            pioneer_observability::DeliveryLayer::MobileFfiActiveThreadReducer,
+            pioneer_observability::ClientScope::Thread,
+            if result.is_ok() {
+                pioneer_observability::DiagnosticAction::Completed
+            } else {
+                pioneer_observability::DiagnosticAction::Dropped
+            },
+            pioneer_observability::Visibility::NotApplicable,
+        ));
+        result
     }
 
     fn active_thread_send_text(
@@ -2959,6 +3295,24 @@ fn administration_rpc_error(error: anyhow::Error) -> ClientFfiError {
     ClientFfiError::new("Gateway administration request failed", code)
 }
 
+// Session transport and auth control are consumed from scoped Client publications.
+// The remaining events have one legacy feature recipient in the Mobile shell.
+fn is_feature_compatibility_event(event: &ClientEvent) -> bool {
+    !matches!(
+        event,
+        ClientEvent::GatewayConnectionChanged(_)
+            | ClientEvent::GatewayNotification(
+                pioneer_protocol::GatewayNotification::AuthAccessExpiring(_)
+                    | pioneer_protocol::GatewayNotification::AuthSessionRevoked(_)
+                    | pioneer_protocol::GatewayNotification::AccessChanged(_)
+                    | pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(_)
+                    | pioneer_protocol::GatewayNotification::GatewayVoiceInputStatusChanged(_)
+                    | pioneer_protocol::GatewayNotification::GatewayRemoteAccessStatusChanged(_)
+                    | pioneer_protocol::GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(_)
+            )
+    )
+}
+
 fn normal_auth_error(error: anyhow::Error) -> ClientFfiError {
     let message = format!("{error:#}");
     let code = [
@@ -3010,8 +3364,28 @@ where
     };
 
     into_ffi_typed_response_with_diagnostics(&client.runtime.diagnostics, operation_name, || {
-        operation(&client.runtime, input_json.as_str())
+        let stamp = if is_legacy_protected_operation(operation_name) {
+            Some(client.runtime.begin_legacy_projection_read()?)
+        } else {
+            None
+        };
+        let result = operation(&client.runtime, input_json.as_str());
+        if let Some(stamp) = stamp {
+            client.runtime.finish_legacy_projection_read(stamp)?;
+        }
+        result
     })
+}
+
+fn is_legacy_protected_operation(operation: &str) -> bool {
+    (operation.starts_with("active_thread_") && operation != "active_thread_apply_event")
+        || matches!(
+            operation,
+            "thread_timeline_page"
+                | "turn_work_page"
+                | "turn_work_items_get"
+                | "prepare_voice_composer_snapshot"
+        )
 }
 
 fn ffi_client_json_response<T, F>(
@@ -3034,7 +3408,24 @@ where
     };
 
     into_ffi_response_with_diagnostics(&client.runtime.diagnostics, operation_name, || {
-        operation(&client.runtime, input_json.as_str())
+        let stamp = if is_legacy_protected_operation(operation_name) {
+            Some(
+                client
+                    .runtime
+                    .begin_legacy_projection_read()
+                    .map_err(|error| error.message)?,
+            )
+        } else {
+            None
+        };
+        let result = operation(&client.runtime, input_json.as_str());
+        if let Some(stamp) = stamp {
+            client
+                .runtime
+                .finish_legacy_projection_read(stamp)
+                .map_err(|error| error.message)?;
+        }
+        result
     })
 }
 
@@ -3143,6 +3534,15 @@ ffi_client_json_method!(
     client_scoped_snapshot
 );
 ffi_client_json_method!(pioneer_client_ffi_client_change_batch, client_change_batch);
+ffi_client_json_method!(
+    pioneer_client_ffi_client_wait_publications,
+    client_wait_publications
+);
+ffi_client_json_method!(pioneer_client_ffi_client_shutdown, client_shutdown);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_session_validate,
+    gateway_session_validate
+);
 ffi_client_json_method!(
     pioneer_client_ffi_client_effect_complete,
     client_effect_complete
@@ -3300,6 +3700,14 @@ ffi_client_json_typed_method!(
 ffi_client_json_typed_method!(
     pioneer_client_ffi_thread_participant_remove,
     thread_participant_remove
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_session_ensure,
+    gateway_session_ensure
+);
+ffi_client_json_typed_method!(
+    pioneer_client_ffi_gateway_session_control,
+    gateway_session_control
 );
 ffi_client_json_typed_method!(
     pioneer_client_ffi_gateway_session_replace_access,
@@ -4237,6 +4645,41 @@ mod tests {
     }
 
     #[test]
+    fn session_boundary_rejects_malformed_control_without_work_or_credential_echo() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").unwrap();
+        for input in [
+            r#"{"kind":"suspend","endpoint_id":" "}"#,
+            r#"{"kind":"clear","endpoint_id":"endpoint","credential":"synthetic-secret"}"#,
+        ] {
+            let error = runtime.gateway_session_control(input).unwrap_err();
+            assert_eq!(error.code, auth::INVALID_AUTH_REQUEST_CODE);
+            assert!(!error.message.contains("synthetic-secret"));
+        }
+        assert!(
+            runtime
+                .client_runtime
+                .core
+                .gateway_session()
+                .connections
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .client_runtime
+                .core
+                .gateway_session()
+                .session("endpoint")
+                .is_none()
+        );
+        let error = runtime
+            .client_effect_complete(r#"{"schema_version":1,"completion":"synthetic-secret"}"#)
+            .unwrap_err();
+        assert!(!error.contains("synthetic-secret"));
+        runtime.client_shutdown("{}").unwrap();
+    }
+
+    #[test]
     fn no_stored_session_releases_the_endpoint_lifecycle_entry() {
         let runtime = ClientFfiRuntime::default();
         runtime.initialize("{}").expect("initialize client");
@@ -4260,14 +4703,14 @@ mod tests {
                 .as_str(),
             )
             .expect("store lifecycle");
-        assert_eq!(
-            runtime
-                .gateway_session_lifecycles
-                .lock()
-                .expect("lifecycle lock")
-                .len(),
-            1
-        );
+        let session =
+            || {
+                runtime.client_runtime.core.snapshot(&ClientScope::Session)
+            .expect("session publication")
+            .typed::<pioneer_client::gateway::session_controller::GatewaySessionPublication>()
+            .expect("typed session publication").payload()
+            };
+        assert!(session().session(endpoint_id).is_some());
 
         runtime
             .gateway_session_lifecycle_reduce(
@@ -4279,13 +4722,7 @@ mod tests {
                 .as_str(),
             )
             .expect("release lifecycle");
-        assert!(
-            runtime
-                .gateway_session_lifecycles
-                .lock()
-                .expect("lifecycle lock")
-                .is_empty()
-        );
+        assert!(session().session(endpoint_id).is_none());
     }
 
     #[test]
@@ -4927,19 +5364,136 @@ mod tests {
     }
 
     #[test]
-    fn gateway_connection_event_starts_a_new_authorization_revision_epoch() {
-        assert!(contains_gateway_connection_epoch_boundary(&[
-            ClientEvent::GatewayConnectionChanged(contracts::ClientGatewayConnectionEvent {
+    fn protected_native_reads_wait_for_accepted_invalidation_and_reject_late_results() {
+        use pioneer_client::core::*;
+        use pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication;
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").unwrap();
+        let publish = |sequence| {
+            let change: pioneer_protocol::AuthorizationProjectionChangedNotification =
+                serde_json::from_value(serde_json::json!({
+                    "policy_generation": sequence,
+                    "change": "role_assignment",
+                    "affected": {"scope": "global"},
+                }))
+                .unwrap();
+            let authority = ClientMutationAuthority::for_test();
+            let revision = if sequence == 4 { 3 } else { sequence };
+            runtime.client_runtime.core.publish(
+                &authority,
+                ClientScope::Administration { workspace_id: None },
+                ClientRevisions::new(
+                    DomainRevision::new(revision),
+                    PresentationRevision::new(revision),
+                    ContentRevision::new(revision),
+                    ScopedRevision::new(revision),
+                ),
+                Arc::new(IdentityAuthorizationPublication {
+                    authorization_change_sequence: sequence,
+                    policy_change: Some(change.clone()),
+                    ..Default::default()
+                }),
+                vec![],
+            );
+            serde_json::to_string(&ClientActiveThreadEventRequest {
+                event: ClientEvent::GatewayNotification(
+                    pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(change),
+                ),
+                expanded_keys: vec![],
+            })
+            .unwrap()
+        };
+        assert!(runtime.begin_legacy_projection_read().is_ok());
+        let first = publish(1);
+        assert!(runtime.begin_legacy_projection_read().is_err());
+        runtime.active_thread_apply_event(&first).unwrap();
+        let stamp = runtime.begin_legacy_projection_read().unwrap();
+        let second = publish(2);
+        assert!(runtime.finish_legacy_projection_read(stamp).is_err());
+        assert!(runtime.begin_legacy_projection_read().is_err());
+        assert!(runtime.active_thread_apply_event(&first).is_err());
+        runtime.active_thread_apply_event(&second).unwrap();
+        assert!(runtime.begin_legacy_projection_read().is_ok());
+        let skipped = publish(4);
+        runtime.active_thread_apply_event(&skipped).unwrap();
+        assert!(runtime.begin_legacy_projection_read().is_ok());
+    }
+
+    #[test]
+    fn transport_lease_boundary_rejects_malformed_versions_and_releases_on_shutdown() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").unwrap();
+        assert!(
+            runtime
+                .gateway_transport_reserve(r#"{"schema_version":2,"exclusive":true}"#)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .gateway_transport_reserve(r#"{"schema_version":1,"exclusive":true,"extra":1}"#)
+                .is_err()
+        );
+        let lease = runtime
+            .gateway_transport_reserve(r#"{"schema_version":1,"exclusive":true}"#)
+            .unwrap();
+        let request = serde_json::json!({"schema_version":1,"lease_id":lease}).to_string();
+        assert!(runtime.gateway_transport_wait(&request).unwrap());
+        runtime.client_shutdown("{}").unwrap();
+        assert!(!runtime.gateway_transport_release(&request).unwrap());
+        assert!(
+            runtime
+                .gateway_transport_reserve(r#"{"schema_version":1,"exclusive":true}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_thread_binding_applies_each_client_authorization_fence_once() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize("{}").unwrap();
+        let revision = || {
+            runtime
+                .active_thread
+                .snapshot(Default::default())
+                .unwrap()
+                .session_revision
+        };
+        let initial = revision();
+        runtime
+            .client_runtime
+            .core
+            .begin_authorization_epoch(Some(("synthetic".into(), 1)));
+        runtime.require_initialized().unwrap();
+        let applied = revision();
+        assert!(applied > initial);
+        runtime.require_initialized().unwrap();
+        runtime.synchronize_legacy_authorization().unwrap();
+        assert_eq!(revision(), applied);
+        runtime
+            .client_runtime
+            .core
+            .begin_authorization_epoch(Some(("synthetic".into(), 1)));
+        runtime.synchronize_legacy_authorization().unwrap();
+        assert_eq!(revision(), applied);
+        runtime
+            .client_runtime
+            .core
+            .invalidate_authorization_revision(2);
+        runtime.synchronize_legacy_authorization().unwrap();
+        assert_eq!(revision(), applied);
+        runtime
+            .client_runtime
+            .core
+            .begin_authorization_epoch(Some(("synthetic".into(), 2)));
+        runtime.synchronize_legacy_authorization().unwrap();
+        assert!(revision() > applied);
+        assert!(!is_feature_compatibility_event(
+            &ClientEvent::GatewayConnectionChanged(contracts::ClientGatewayConnectionEvent {
                 connection_state: GatewayConnectionState::Connected,
                 gateway_error: None,
-            }),
-        ]));
-        assert!(!contains_gateway_connection_epoch_boundary(&[
-            ClientEvent::Error(contracts::ClientErrorEvent {
-                message: "unrelated".to_owned(),
-                code: None,
-            }),
-        ]));
+            })
+        ));
+        runtime.client_shutdown("{}").unwrap();
     }
 
     #[test]
@@ -4975,3 +5529,21 @@ mod tests {
         ]));
     }
 }
+
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_transport_reserve,
+    gateway_transport_reserve
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_transport_wait,
+    gateway_transport_wait
+);
+ffi_client_json_method!(
+    pioneer_client_ffi_gateway_transport_release,
+    gateway_transport_release
+);
+
+ffi_client_json_method!(
+    pioneer_client_ffi_authorization_access_change_plan,
+    authorization_access_change_plan
+);

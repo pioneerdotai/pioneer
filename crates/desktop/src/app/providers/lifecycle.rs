@@ -76,7 +76,7 @@ impl PioneerDesktop {
             .begin(pioneer_observability::DesktopStartupStage::ProviderLoad);
         self.providers.mark_refresh_started();
 
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         let workspace_id = request.params.workspace_id.clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
@@ -155,7 +155,7 @@ impl PioneerDesktop {
         };
 
         self.providers.mark_cli_runtime_snapshot_load_started();
-        let ws_sender = self.gateway.ws_command_sender.clone();
+        let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
         cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             let workspace_id = request.params.workspace_id.clone();

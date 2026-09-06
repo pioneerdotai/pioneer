@@ -85,10 +85,50 @@ pub struct GatewayWsCommandSender {
     command_tx: UnboundedSender<GatewayWsCommand>,
     next_connection_id: Arc<AtomicU64>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
+    connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
 }
 
 #[derive(Clone)]
 pub struct GatewayWsClient {
     command_sender: GatewayWsCommandSender,
     event_rx: Arc<Mutex<Receiver<GatewayWsEvent>>>,
+}
+
+#[derive(Default)]
+struct GatewayConnectionGenerations {
+    active: Option<u64>,
+    pending: Option<u64>,
+    retiring: Option<u64>,
+}
+
+struct GatewayConnectionAttempt<'a> {
+    sender: &'a GatewayWsCommandSender,
+    id: u64,
+}
+
+impl GatewayConnectionAttempt<'_> {
+    fn complete(self, access: Option<GatewayHttpAccess>) -> Result<u64> {
+        let mut generations = self
+            .sender
+            .connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+        if generations.pending != Some(self.id) {
+            return Err(anyhow!("Gateway connection operation superseded"));
+        }
+        self.sender.replace_http_session_access(access)?;
+        generations.active = Some(self.id);
+        generations.pending = None;
+        Ok(self.id)
+    }
+}
+
+impl Drop for GatewayConnectionAttempt<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut generations) = self.sender.connection_generations.lock() {
+            if generations.pending == Some(self.id) {
+                generations.pending = None;
+            }
+        }
+    }
 }
