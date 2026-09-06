@@ -36,7 +36,13 @@ pub fn model_selection_from_selector(
         .model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty())?;
-    Some(GatewaySelfImprovementModelSelection { provider, model })
+    GatewaySelfImprovementModelSelection {
+        provider,
+        model,
+        reasoning_effort: selection.selected_reasoning_effort,
+    }
+    .normalized()
+    .ok()
 }
 
 pub fn model_selection_display_label(
@@ -108,6 +114,7 @@ mod tests {
         GatewaySelfImprovementModelSelection {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: None,
         }
     }
 
@@ -218,5 +225,31 @@ mod tests {
             })
             .is_none()
         );
+    }
+    #[test]
+    fn selector_reasoning_round_trips_and_provider_default_remains_distinct() {
+        for effort in [None, Some("high"), Some("none")] {
+            let selected = model_selection_from_selector(ModelSelectorSelection {
+                provider: Some("openrouter".to_owned()),
+                model: Some("model".to_owned()),
+                selected_reasoning_effort: effort.map(str::to_owned),
+            })
+            .unwrap();
+            assert_eq!(selected.reasoning_effort.as_deref(), effort);
+            let plan = model_update_plan(
+                Some(&snapshot()),
+                SelfImprovementModelSetting::Default,
+                Some(selected.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.snapshot.self_improvement.default_model,
+                Some(selected.clone())
+            );
+            assert_eq!(
+                plan.update.self_improvement.unwrap().default_model,
+                Some(selected)
+            );
+        }
     }
 }

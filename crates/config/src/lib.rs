@@ -663,6 +663,8 @@ pub struct GatewaySelfImprovementConfig {
 pub struct GatewaySelfImprovementModelSelectionConfig {
     pub provider: String,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -670,6 +672,8 @@ pub struct GatewaySelfImprovementModelSelectionConfig {
 struct GatewaySelfImprovementModelSelectionConfigWire {
     provider: String,
     model: String,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for GatewaySelfImprovementModelSelectionConfig {
@@ -688,6 +692,19 @@ impl<'de> Deserialize<'de> for GatewaySelfImprovementModelSelectionConfig {
         Ok(Self {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: wire
+                .reasoning_effort
+                .map(|effort| {
+                    let effort = effort.trim();
+                    if effort.is_empty() {
+                        Err(serde::de::Error::custom(
+                            "self-improvement reasoning effort must not be empty",
+                        ))
+                    } else {
+                        Ok(effort.to_owned())
+                    }
+                })
+                .transpose()?,
         })
     }
 }
@@ -5118,5 +5135,28 @@ token_refresh_leeway_seconds = 300
         } else {
             "pioneer".to_owned()
         }
+    }
+    #[test]
+    fn self_improvement_reasoning_config_roundtrip() {
+        use crate::GatewaySelfImprovementModelSelectionConfig;
+
+        for effort in [None, Some("high"), Some("none")] {
+            let model = GatewaySelfImprovementModelSelectionConfig {
+                provider: "openrouter".to_owned(),
+                model: "model".to_owned(),
+                reasoning_effort: effort.map(str::to_owned),
+            };
+            let encoded = toml::to_string(&model).unwrap();
+            assert_eq!(
+                toml::from_str::<GatewaySelfImprovementModelSelectionConfig>(&encoded).unwrap(),
+                model
+            );
+        }
+        assert!(
+            toml::from_str::<GatewaySelfImprovementModelSelectionConfig>(
+                "provider = 'openrouter'\nmodel = 'model'\nreasoning_effort = ''"
+            )
+            .is_err()
+        );
     }
 }

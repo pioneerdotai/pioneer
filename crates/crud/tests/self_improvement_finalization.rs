@@ -77,8 +77,10 @@ fn run_input() -> NewSelfImprovementRun {
         source_upper_inclusive: 1,
         learner_provider: "openai".to_owned(),
         learner_model: "gpt-5.4".to_owned(),
+        learner_reasoning_effort: None,
         reviewer_provider: "openai".to_owned(),
         reviewer_model: "gpt-5.4".to_owned(),
+        reviewer_reasoning_effort: None,
         pipeline_contract_version: "self-improvement-v1".to_owned(),
     }
 }
@@ -88,8 +90,10 @@ fn authority() -> SelfImprovementFinalizationAuthority {
         effective_enabled: true,
         learner_provider: "openai".to_owned(),
         learner_model: "gpt-5.4".to_owned(),
+        learner_reasoning_effort: None,
         reviewer_provider: "openai".to_owned(),
         reviewer_model: "gpt-5.4".to_owned(),
+        reviewer_reasoning_effort: None,
         pipeline_contract_version: "self-improvement-v1".to_owned(),
     }
 }
@@ -181,8 +185,10 @@ async fn claimed_action_input(
                 source_upper_inclusive,
                 learner_provider: "openai".to_owned(),
                 learner_model: "gpt-5.4".to_owned(),
+                learner_reasoning_effort: None,
                 reviewer_provider: "openai".to_owned(),
                 reviewer_model: "gpt-5.4".to_owned(),
+                reviewer_reasoning_effort: None,
                 pipeline_contract_version: "self-improvement-v1".to_owned(),
             },
             now,

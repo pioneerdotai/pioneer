@@ -2,6 +2,8 @@ pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
+mod m20260906_000001_self_improvement_reasoning;
+
 pub mod stable_skill_id;
 
 mod m20260313_125253_create_workspace_table;
@@ -125,6 +127,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260902_000003_turn_work_owner::Migration),
             Box::new(m20260904_000001_recovery_episode_invariant::Migration),
             Box::new(m20260905_000001_memory_identity::Migration),
+            Box::new(m20260906_000001_self_improvement_reasoning::Migration),
         ]
     }
 }

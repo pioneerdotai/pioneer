@@ -6,7 +6,9 @@ use pioneer_crud::{
     SelfImprovementFinalOutcome, SelfImprovementFrozenSourceRange, SelfImprovementNoChangeReason,
 };
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage, SkillId};
-use pioneer_provider::{ChatMessage, ChatRequest, ProviderRegistry, TokenUsage};
+use pioneer_provider::{
+    ChatMessage, ChatRequest, ProviderRegistry, ProviderTermination, ReasoningConfig, TokenUsage,
+};
 use pioneer_skills::{AgentSkillRuntimeEntry, ensure_agent_skill_overlay_capacity};
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +31,6 @@ use super::validation::{
 
 pub(crate) const MAX_MODEL_INPUT_BYTES: usize = 512 * 1024;
 const MAX_MODEL_OUTPUT_BYTES: usize = 128 * 1024;
-pub(crate) const MAX_MODEL_OUTPUT_TOKENS: u32 = 4096;
 const MAX_OBSERVATIONS: usize = 32;
 const MAX_EVIDENCE_PER_OBSERVATION: usize = 8;
 const MAX_OBSERVATION_KEY_CHARS: usize = 128;
@@ -54,6 +55,7 @@ pub(crate) enum ModelContractErrorKind {
     ProviderUnavailable,
     InputTooLarge,
     Transport,
+    IncompleteResponse,
     OutputTooLarge,
     MalformedJson,
     ContractRejected,
@@ -1018,16 +1020,51 @@ impl<'a> LearnerReviewerClient<'a> {
                     ChatMessage::user(untrusted_data),
                 ],
                 temperature: Some(0.0),
-                max_tokens: Some(MAX_MODEL_OUTPUT_TOKENS),
+                max_tokens: None,
                 tools: None,
                 tool_choice: None,
                 parallel_tool_calls: None,
-                reasoning: None,
+                reasoning: selection
+                    .reasoning_effort
+                    .as_deref()
+                    .map(|effort| {
+                        pioneer_protocol::ReasoningEffort::from_str(effort)
+                            .map(ReasoningConfig::effort)
+                            .ok_or_else(|| {
+                                ModelContractError::new(
+                                    stage,
+                                    ModelContractErrorKind::ProviderUnavailable,
+                                    "invalid_reasoning_effort",
+                                )
+                            })
+                    })
+                    .transpose()?,
                 compiled_prompt: None,
             })
             .await
             .map_err(|error| ModelContractError::provider_transport(stage, &error))?;
         let usage = ModelCallUsage::from(response.usage);
+        let reason = match response.termination {
+            ProviderTermination::Complete if response.tool_calls.is_empty() => None,
+            ProviderTermination::Length => Some("model_output_token_limit"),
+            ProviderTermination::ContentFiltered | ProviderTermination::Safety => {
+                Some("model_response_filtered")
+            }
+            ProviderTermination::Cancelled => Some("model_response_cancelled"),
+            ProviderTermination::ProviderError => Some("model_provider_error"),
+            ProviderTermination::ToolCalls | ProviderTermination::Complete => {
+                Some("unexpected_model_tool_calls")
+            }
+            ProviderTermination::Unknown(_) => Some("model_termination_unknown"),
+        };
+        if let Some(reason) = reason {
+            return Err(ModelContractError::new(
+                stage,
+                ModelContractErrorKind::IncompleteResponse,
+                reason,
+            )
+            .with_usage(usage));
+        }
         if response.text.len() > MAX_MODEL_OUTPUT_BYTES {
             return Err(ModelContractError::new(
                 stage,
@@ -1383,6 +1420,7 @@ mod tests {
 
     struct ScriptedProvider {
         responses: Mutex<VecDeque<String>>,
+        terminations: Mutex<VecDeque<ProviderTermination>>,
         requests: Mutex<Vec<ChatRequest>>,
     }
 
@@ -1390,6 +1428,7 @@ mod tests {
         fn new(responses: impl IntoIterator<Item = String>) -> Self {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
+                terminations: Mutex::new(VecDeque::new()),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -1422,7 +1461,12 @@ mod tests {
                 }),
                 reasoning_content: None,
                 provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
+                termination: self
+                    .terminations
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ProviderTermination::Complete),
                 tool_calls: Vec::new(),
             })
         }
@@ -2325,6 +2369,7 @@ mod tests {
         GatewaySelfImprovementModelSelectionConfig {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: None,
         }
     }
 
@@ -2475,7 +2520,8 @@ mod tests {
                 .to_owned(),
         ]));
         let registry = ProviderRegistry::with_provider("scripted", provider.clone());
-        let default_model = model("scripted", "one-model");
+        let mut default_model = model("scripted", "one-model");
+        default_model.reasoning_effort = Some("high".to_owned());
         let client = LearnerReviewerClient::new(&registry, "workspace-one", &default_model, None);
         let history = history(
             [
@@ -2511,7 +2557,12 @@ mod tests {
             provider
                 .requests()
                 .iter()
-                .all(|request| request.model == "one-model")
+                .all(|request| request.model == "one-model"
+                    && request.max_tokens.is_none()
+                    && request.reasoning
+                        == Some(ReasoningConfig::effort(
+                            pioneer_protocol::ReasoningEffort::High
+                        )))
         );
     }
 
@@ -3106,5 +3157,48 @@ mod tests {
             existing[0].version_id, "BBBBBBBBBBBBBBBBBBBBB",
             "capacity rejection must not hide or mutate the active card"
         );
+    }
+    #[tokio::test]
+    async fn calls_delegate_token_limit_and_distinguish_incomplete_answers_before_json() {
+        for (termination, reason) in [
+            (ProviderTermination::Length, "model_output_token_limit"),
+            (ProviderTermination::ProviderError, "model_provider_error"),
+            (ProviderTermination::Cancelled, "model_response_cancelled"),
+            (ProviderTermination::Safety, "model_response_filtered"),
+            (
+                ProviderTermination::ContentFiltered,
+                "model_response_filtered",
+            ),
+            (
+                ProviderTermination::ToolCalls,
+                "unexpected_model_tool_calls",
+            ),
+            (
+                ProviderTermination::Unknown("new".to_owned()),
+                "model_termination_unknown",
+            ),
+        ] {
+            // Even syntactically complete JSON cannot make an incomplete response successful.
+            let provider = Arc::new(ScriptedProvider::new([
+                r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+            ]));
+            provider.terminations.lock().unwrap().push_back(termination);
+            let registry = ProviderRegistry::with_provider("scripted", provider.clone());
+            let selection = model("scripted", "learner");
+            let client = LearnerReviewerClient::new(&registry, "workspace-one", &selection, None);
+            let history = history([HistoryEvidenceRole::NewAnchor; 2], "Verified.");
+            let error = client.analyze_chunk(&history, None).await.unwrap_err();
+            assert_eq!(error.kind, ModelContractErrorKind::IncompleteResponse);
+            assert_eq!(error.reason_code, reason);
+            assert_eq!(error.usage.provider_calls, 1);
+            let requests = provider.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "do not retry a truncated reply as malformed JSON"
+            );
+            assert_eq!(requests[0].max_tokens, None);
+            assert_eq!(requests[0].reasoning, None);
+        }
     }
 }

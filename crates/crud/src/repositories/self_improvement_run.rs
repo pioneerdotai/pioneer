@@ -126,8 +126,10 @@ pub async fn insert_pending<C: ConnectionTrait>(
         next_attempt_at: Set(Some(now)),
         learner_provider: Set(input.learner_provider.clone()),
         learner_model: Set(input.learner_model.clone()),
+        learner_reasoning_effort: Set(input.learner_reasoning_effort.clone()),
         reviewer_provider: Set(input.reviewer_provider.clone()),
         reviewer_model: Set(input.reviewer_model.clone()),
+        reviewer_reasoning_effort: Set(input.reviewer_reasoning_effort.clone()),
         pipeline_contract_version: Set(input.pipeline_contract_version.clone()),
         analysis_cursor_json: Set(None),
         analysis_digest_json: Set(None),
@@ -265,8 +267,16 @@ pub async fn requeue_failed<C: ConnectionTrait>(
         .filter(self_improvement_run::Column::LeaseExpiresAt.is_null())
         .filter(self_improvement_run::Column::LearnerProvider.eq(run.learner_provider.clone()))
         .filter(self_improvement_run::Column::LearnerModel.eq(run.learner_model.clone()))
+        .filter(optional_reasoning_condition(
+            self_improvement_run::Column::LearnerReasoningEffort,
+            run.learner_reasoning_effort.as_deref(),
+        ))
         .filter(self_improvement_run::Column::ReviewerProvider.eq(run.reviewer_provider.clone()))
         .filter(self_improvement_run::Column::ReviewerModel.eq(run.reviewer_model.clone()))
+        .filter(optional_reasoning_condition(
+            self_improvement_run::Column::ReviewerReasoningEffort,
+            run.reviewer_reasoning_effort.as_deref(),
+        ))
         .filter(
             self_improvement_run::Column::PipelineContractVersion
                 .eq(run.pipeline_contract_version.clone()),
@@ -302,8 +312,10 @@ pub async fn reset_unfinished_authority<C: ConnectionTrait>(
     }
     if run.learner_provider == authority.learner_provider
         && run.learner_model == authority.learner_model
+        && run.learner_reasoning_effort == authority.learner_reasoning_effort
         && run.reviewer_provider == authority.reviewer_provider
         && run.reviewer_model == authority.reviewer_model
+        && run.reviewer_reasoning_effort == authority.reviewer_reasoning_effort
         && run.pipeline_contract_version == authority.pipeline_contract_version
     {
         bail!(
@@ -328,8 +340,16 @@ pub async fn reset_unfinished_authority<C: ConnectionTrait>(
         .add(self_improvement_run::Column::Status.eq(run.status.clone()))
         .add(self_improvement_run::Column::LearnerProvider.eq(run.learner_provider.clone()))
         .add(self_improvement_run::Column::LearnerModel.eq(run.learner_model.clone()))
+        .add(optional_reasoning_condition(
+            self_improvement_run::Column::LearnerReasoningEffort,
+            run.learner_reasoning_effort.as_deref(),
+        ))
         .add(self_improvement_run::Column::ReviewerProvider.eq(run.reviewer_provider.clone()))
         .add(self_improvement_run::Column::ReviewerModel.eq(run.reviewer_model.clone()))
+        .add(optional_reasoning_condition(
+            self_improvement_run::Column::ReviewerReasoningEffort,
+            run.reviewer_reasoning_effort.as_deref(),
+        ))
         .add(
             self_improvement_run::Column::PipelineContractVersion
                 .eq(run.pipeline_contract_version.clone()),
@@ -378,12 +398,20 @@ pub async fn reset_unfinished_authority<C: ConnectionTrait>(
             Expr::value(authority.learner_model.clone()),
         )
         .col_expr(
+            self_improvement_run::Column::LearnerReasoningEffort,
+            Expr::value(authority.learner_reasoning_effort.clone()),
+        )
+        .col_expr(
             self_improvement_run::Column::ReviewerProvider,
             Expr::value(authority.reviewer_provider.clone()),
         )
         .col_expr(
             self_improvement_run::Column::ReviewerModel,
             Expr::value(authority.reviewer_model.clone()),
+        )
+        .col_expr(
+            self_improvement_run::Column::ReviewerReasoningEffort,
+            Expr::value(authority.reviewer_reasoning_effort.clone()),
         )
         .col_expr(
             self_improvement_run::Column::PipelineContractVersion,
@@ -486,8 +514,16 @@ pub fn fence_condition(fence: &SelfImprovementRunFence, now: DateTimeWithTimeZon
         .add(self_improvement_run::Column::ClaimedBy.eq(fence.claimed_by.clone()))
         .add(self_improvement_run::Column::LearnerProvider.eq(fence.learner_provider.clone()))
         .add(self_improvement_run::Column::LearnerModel.eq(fence.learner_model.clone()))
+        .add(optional_reasoning_condition(
+            self_improvement_run::Column::LearnerReasoningEffort,
+            fence.learner_reasoning_effort.as_deref(),
+        ))
         .add(self_improvement_run::Column::ReviewerProvider.eq(fence.reviewer_provider.clone()))
         .add(self_improvement_run::Column::ReviewerModel.eq(fence.reviewer_model.clone()))
+        .add(optional_reasoning_condition(
+            self_improvement_run::Column::ReviewerReasoningEffort,
+            fence.reviewer_reasoning_effort.as_deref(),
+        ))
         .add(
             self_improvement_run::Column::PipelineContractVersion
                 .eq(fence.pipeline_contract_version.clone()),
@@ -531,8 +567,10 @@ pub fn model_matches_fence(
             .is_some_and(|expires| expires > &now)
         && run.learner_provider == fence.learner_provider
         && run.learner_model == fence.learner_model
+        && run.learner_reasoning_effort == fence.learner_reasoning_effort
         && run.reviewer_provider == fence.reviewer_provider
         && run.reviewer_model == fence.reviewer_model
+        && run.reviewer_reasoning_effort == fence.reviewer_reasoning_effort
         && run.pipeline_contract_version == fence.pipeline_contract_version
 }
 
@@ -914,8 +952,10 @@ pub fn record_from_model(model: self_improvement_run::Model) -> SelfImprovementR
         next_attempt_at_unix: model.next_attempt_at.map(|value| value.timestamp()),
         learner_provider: model.learner_provider,
         learner_model: model.learner_model,
+        learner_reasoning_effort: model.learner_reasoning_effort,
         reviewer_provider: model.reviewer_provider,
         reviewer_model: model.reviewer_model,
+        reviewer_reasoning_effort: model.reviewer_reasoning_effort,
         pipeline_contract_version: model.pipeline_contract_version,
         analysis_cursor_json: model.analysis_cursor_json,
         analysis_digest_json: model.analysis_digest_json,
@@ -945,5 +985,15 @@ mod tests {
         assert!(validate_persisted_error("").is_err());
         assert!(validate_persisted_error("provider\nsecret").is_err());
         assert!(validate_persisted_error(&"x".repeat(LAST_ERROR_MAX_BYTES + 1)).is_err());
+    }
+}
+
+fn optional_reasoning_condition(
+    column: self_improvement_run::Column,
+    value: Option<&str>,
+) -> sea_orm::sea_query::SimpleExpr {
+    match value {
+        Some(value) => column.eq(value),
+        None => column.is_null(),
     }
 }

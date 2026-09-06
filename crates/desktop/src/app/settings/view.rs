@@ -550,7 +550,17 @@ impl PioneerDesktop {
                 title: t!("settings.self_improvement.model.dialog_title").to_string(),
                 selected_provider,
                 selected_model,
-                selected_reasoning_effort: None,
+                selected_reasoning_effort: self.gateway.settings.as_ref().and_then(|settings| {
+                    match setting {
+                        SelfImprovementModelSetting::Default => {
+                            settings.self_improvement.default_model.as_ref()
+                        }
+                        SelfImprovementModelSetting::Reviewer => {
+                            settings.self_improvement.reviewer_model.as_ref()
+                        }
+                    }
+                    .and_then(|selection| selection.reasoning_effort.clone())
+                }),
                 mode: ProviderModelSelectorMode::SelfImprovement,
                 workspace_id,
                 ws_sender: self.gateway.client_runtime.ws_command_sender().clone(),

@@ -109,7 +109,6 @@ impl ResumableHistoryAnalysis {
         self.digest.validated.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn chunk_rejection_reason_code(
         &self,
         chunk_index: u32,
@@ -144,6 +143,7 @@ impl ResumableHistoryAnalysis {
         self.validate_counts()
     }
 
+    #[cfg(test)]
     pub(crate) fn record_contract_rejected(
         &mut self,
         chunk: &SelfImprovementHistoryChunk,
@@ -360,6 +360,7 @@ fn validate_chunk_terminal_codes(codes: &[u8], chunk_count: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn rejection_terminal_code(reason_code: &str) -> Result<u8> {
     match reason_code {
         "model_output_too_large" => Ok(CHUNK_TERMINAL_OUTPUT_TOO_LARGE),
@@ -464,8 +465,10 @@ mod tests {
             next_attempt_at_unix: None,
             learner_provider: "provider".to_owned(),
             learner_model: "model".to_owned(),
+            learner_reasoning_effort: None,
             reviewer_provider: "provider".to_owned(),
             reviewer_model: "model".to_owned(),
+            reviewer_reasoning_effort: None,
             pipeline_contract_version: "contract".to_owned(),
             analysis_cursor_json: None,
             analysis_digest_json: None,

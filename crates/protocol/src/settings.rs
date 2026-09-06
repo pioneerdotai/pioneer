@@ -222,6 +222,9 @@ pub struct GatewaySelfImprovementSettings {
 pub struct GatewaySelfImprovementModelSelection {
     pub provider: String,
     pub model: String,
+    /// None delegates to the provider; `none` explicitly disables reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl GatewaySelfImprovementModelSelection {
@@ -236,6 +239,14 @@ impl GatewaySelfImprovementModelSelection {
         Ok(Self {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: self
+                .reasoning_effort
+                .map(|effort| {
+                    crate::ReasoningEffort::canonical_value(&effort)
+                        .map(str::to_owned)
+                        .ok_or_else(|| "invalid self-improvement reasoning effort".to_owned())
+                })
+                .transpose()?,
         })
     }
 }
@@ -907,6 +918,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelection {
                 provider: "openai".to_owned(),
                 model: "gpt-5.4".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -1295,5 +1307,33 @@ mod tests {
         ] {
             assert_eq!(phase.coarse_voice_status(), expected);
         }
+    }
+    #[test]
+    fn self_improvement_reasoning_defaults_normalizes_and_rejects_unknown_efforts() {
+        let legacy: GatewaySelfImprovementModelSelection =
+            serde_json::from_str(r#"{"provider":"openrouter","model":"model"}"#).unwrap();
+        assert_eq!(legacy.reasoning_effort, None);
+        for (raw, expected) in [("High", "high"), ("off", "none"), ("extra-high", "xhigh")] {
+            let normalized = GatewaySelfImprovementModelSelection {
+                reasoning_effort: Some(raw.to_owned()),
+                ..legacy.clone()
+            }
+            .normalized()
+            .unwrap();
+            assert_eq!(normalized.reasoning_effort.as_deref(), Some(expected));
+            let encoded = serde_json::to_string(&normalized).unwrap();
+            assert_eq!(
+                serde_json::from_str::<GatewaySelfImprovementModelSelection>(&encoded).unwrap(),
+                normalized
+            );
+        }
+        assert!(
+            GatewaySelfImprovementModelSelection {
+                reasoning_effort: Some("unknown".to_owned()),
+                ..legacy
+            }
+            .normalized()
+            .is_err()
+        );
     }
 }

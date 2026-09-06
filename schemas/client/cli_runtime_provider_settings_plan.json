@@ -509,6 +509,13 @@
         },
         "provider": {
           "type": "string"
+        },
+        "reasoning_effort": {
+          "description": "None delegates to the provider; `none` explicitly disables reasoning.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,

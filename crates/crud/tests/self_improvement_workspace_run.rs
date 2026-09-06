@@ -219,8 +219,10 @@ fn new_run(
         source_upper_inclusive,
         learner_provider: "openai".to_owned(),
         learner_model: "gpt-5.4".to_owned(),
+        learner_reasoning_effort: None,
         reviewer_provider: "openai".to_owned(),
         reviewer_model: "gpt-5.4".to_owned(),
+        reviewer_reasoning_effort: None,
         pipeline_contract_version: "self-improvement-v1".to_owned(),
     }
 }
@@ -784,8 +786,10 @@ async fn failed_requeue_and_authority_reset_atomically_require_an_active_workspa
         effective_enabled: true,
         learner_provider: "openai".to_owned(),
         learner_model: "gpt-5.5".to_owned(),
+        learner_reasoning_effort: None,
         reviewer_provider: "openai".to_owned(),
         reviewer_model: "gpt-5.5".to_owned(),
+        reviewer_reasoning_effort: None,
         pipeline_contract_version: "self-improvement-v2".to_owned(),
     };
     assert_eq!(
@@ -1033,4 +1037,77 @@ async fn stale_state_rejects_run_creation_and_invalid_checkpoint_payloads() {
         .await
         .expect_err("invalid checkpoint JSON must reject");
     assert!(format!("{invalid_json:#}").contains("valid JSON"));
+}
+
+#[tokio::test]
+async fn reasoning_is_persisted_and_part_of_every_run_fence() {
+    let (database, store) = migrated_store().await;
+    let state = store
+        .activate_self_improvement_workspace("ws_run_a", NOW)
+        .await
+        .unwrap();
+    insert_source(&database, "ws_run_a", "reasoning", NOW + 1).await;
+    let mut input = new_run("ws_run_a", state.activation_epoch, 0, 1);
+    input.learner_reasoning_effort = Some("high".to_owned());
+    input.reviewer_reasoning_effort = Some("none".to_owned());
+    let run = store
+        .create_or_get_self_improvement_run(input, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(run.learner_reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(run.reviewer_reasoning_effort.as_deref(), Some("none"));
+    let claimed = store
+        .claim_available_self_improvement_run(
+            "ws_run_a",
+            &run.id,
+            state.activation_epoch,
+            "worker",
+            NOW + 3,
+            NOW + 100,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = claimed.fence().unwrap();
+    let mut forged = fence.clone();
+    forged.learner_reasoning_effort = None;
+    assert_eq!(
+        store
+            .heartbeat_self_improvement_run(&forged, NOW + 4, NOW + 101)
+            .await
+            .unwrap(),
+        SelfImprovementRunMutationResult::LostAuthority
+    );
+    let replacement = SelfImprovementFinalizationAuthority {
+        effective_enabled: true,
+        learner_provider: run.learner_provider.clone(),
+        learner_model: run.learner_model.clone(),
+        learner_reasoning_effort: Some("low".to_owned()),
+        reviewer_provider: run.reviewer_provider.clone(),
+        reviewer_model: run.reviewer_model.clone(),
+        reviewer_reasoning_effort: None,
+        pipeline_contract_version: run.pipeline_contract_version.clone(),
+    };
+    assert_eq!(
+        store
+            .reset_unfinished_self_improvement_run_authority(&claimed, &replacement, NOW + 5)
+            .await
+            .unwrap(),
+        SelfImprovementRunMutationResult::Applied
+    );
+    assert_eq!(
+        store
+            .save_self_improvement_run_checkpoint(&fence, "{}", "{}", NOW + 6)
+            .await
+            .unwrap(),
+        SelfImprovementRunMutationResult::LostAuthority
+    );
+    let reset = store
+        .get_self_improvement_run("ws_run_a", &run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reset.learner_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(reset.reviewer_reasoning_effort, None);
+    assert_eq!(reset.source_upper_inclusive, run.source_upper_inclusive);
 }

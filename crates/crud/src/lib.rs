@@ -459,8 +459,10 @@ pub struct NewSelfImprovementRun {
     pub source_upper_inclusive: i64,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
 }
 
@@ -480,8 +482,10 @@ pub struct SelfImprovementRunRecord {
     pub next_attempt_at_unix: Option<i64>,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
     pub analysis_cursor_json: Option<String>,
     pub analysis_digest_json: Option<String>,
@@ -507,8 +511,10 @@ pub struct SelfImprovementRunFence {
     pub claimed_by: String,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
 }
 
@@ -523,8 +529,10 @@ pub struct SelfImprovementFinalizationAuthority {
     pub effective_enabled: bool,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
 }
 
@@ -666,8 +674,10 @@ impl SelfImprovementRunRecord {
             claimed_by: self.claimed_by.clone()?,
             learner_provider: self.learner_provider.clone(),
             learner_model: self.learner_model.clone(),
+            learner_reasoning_effort: self.learner_reasoning_effort.clone(),
             reviewer_provider: self.reviewer_provider.clone(),
             reviewer_model: self.reviewer_model.clone(),
+            reviewer_reasoning_effort: self.reviewer_reasoning_effort.clone(),
             pipeline_contract_version: self.pipeline_contract_version.clone(),
         })
     }

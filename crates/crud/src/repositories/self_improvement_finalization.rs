@@ -833,8 +833,10 @@ fn run_matches_fence(
         && super::self_improvement_run::model_matches_fence(run, &input.fence, now)
         && run.learner_provider == input.authority.learner_provider
         && run.learner_model == input.authority.learner_model
+        && run.learner_reasoning_effort == input.authority.learner_reasoning_effort
         && run.reviewer_provider == input.authority.reviewer_provider
         && run.reviewer_model == input.authority.reviewer_model
+        && run.reviewer_reasoning_effort == input.authority.reviewer_reasoning_effort
         && run.pipeline_contract_version == input.authority.pipeline_contract_version
 }
 
