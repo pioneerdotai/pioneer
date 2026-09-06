@@ -25,6 +25,18 @@ pub fn configuration_is_incomplete(settings: &GatewaySelfImprovementSettings) ->
     settings.enabled && settings.default_model.is_none()
 }
 
+/// Never show a cached operational status from a different workspace.
+pub fn status_for_workspace<'a>(
+    snapshot: Option<&'a GatewaySettingsSnapshot>,
+    workspace_id: Option<&str>,
+) -> Option<&'a pioneer_protocol::GatewaySelfImprovementStatus> {
+    let workspace_id = workspace_id?;
+    snapshot?
+        .self_improvement_status
+        .as_ref()
+        .filter(|status| status.workspace_id == workspace_id)
+}
+
 pub fn model_selection_from_selector(
     selection: ModelSelectorSelection,
 ) -> Option<GatewaySelfImprovementModelSelection> {
@@ -36,7 +48,13 @@ pub fn model_selection_from_selector(
         .model
         .map(|model| model.trim().to_owned())
         .filter(|model| !model.is_empty())?;
-    Some(GatewaySelfImprovementModelSelection { provider, model })
+    GatewaySelfImprovementModelSelection {
+        provider,
+        model,
+        reasoning_effort: selection.selected_reasoning_effort,
+    }
+    .normalized()
+    .ok()
 }
 
 pub fn model_selection_display_label(
@@ -104,15 +122,45 @@ mod tests {
         GatewayGeneralSettings, GatewayMemorySettings, GatewaySettingsSnapshot,
     };
 
+    #[test]
+    fn status_is_read_only_and_never_crosses_workspace_boundaries() {
+        let mut current = snapshot();
+        current.self_improvement_status = Some(pioneer_protocol::GatewaySelfImprovementStatus {
+            workspace_id: "a".into(),
+            phase: pioneer_protocol::SelfImprovementPhase::Waiting,
+            reason: pioneer_protocol::SelfImprovementStatusReason::NoNewSources,
+            observed_at_unix: 10,
+            last_run_at_unix: None,
+            last_result: None,
+            next_scheduled_at_unix: Some(86400),
+            next_retry_at_unix: None,
+            progress: None,
+        });
+        assert!(status_for_workspace(Some(&current), Some("a")).is_some());
+        assert!(status_for_workspace(Some(&current), Some("b")).is_none());
+        assert!(status_for_workspace(Some(&current), None).is_none());
+        let update = enabled_update_plan(Some(&current), true).unwrap();
+        let serialized = serde_json::to_value(update.update).unwrap();
+        assert!(serialized.get("self_improvement_status").is_none());
+        let mut old_wire = serde_json::to_value(&current).unwrap();
+        old_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("self_improvement_status");
+        let old: GatewaySettingsSnapshot = serde_json::from_value(old_wire).unwrap();
+        assert!(old.self_improvement_status.is_none());
+    }
     fn selection(provider: &str, model: &str) -> GatewaySelfImprovementModelSelection {
         GatewaySelfImprovementModelSelection {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: None,
         }
     }
 
     fn snapshot() -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
             self_improvement: GatewaySelfImprovementSettings {
@@ -218,5 +266,31 @@ mod tests {
             })
             .is_none()
         );
+    }
+    #[test]
+    fn selector_reasoning_round_trips_and_provider_default_remains_distinct() {
+        for effort in [None, Some("high"), Some("none")] {
+            let selected = model_selection_from_selector(ModelSelectorSelection {
+                provider: Some("openrouter".to_owned()),
+                model: Some("model".to_owned()),
+                selected_reasoning_effort: effort.map(str::to_owned),
+            })
+            .unwrap();
+            assert_eq!(selected.reasoning_effort.as_deref(), effort);
+            let plan = model_update_plan(
+                Some(&snapshot()),
+                SelfImprovementModelSetting::Default,
+                Some(selected.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.snapshot.self_improvement.default_model,
+                Some(selected.clone())
+            );
+            assert_eq!(
+                plan.update.self_improvement.unwrap().default_model,
+                Some(selected)
+            );
+        }
     }
 }

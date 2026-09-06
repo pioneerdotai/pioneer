@@ -2,6 +2,68 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::VoiceStatus;
+
+/// Bounded operational projection; contains no history, prompts, or provider error payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewaySelfImprovementStatus {
+    pub workspace_id: String,
+    pub phase: SelfImprovementPhase,
+    pub reason: SelfImprovementStatusReason,
+    pub observed_at_unix: i64,
+    pub last_run_at_unix: Option<i64>,
+    pub last_result: Option<SelfImprovementStatusReason>,
+    pub next_scheduled_at_unix: Option<i64>,
+    pub next_retry_at_unix: Option<i64>,
+    pub progress: Option<SelfImprovementProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelfImprovementProgress {
+    pub processed_chunks: u32,
+    pub total_chunks: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfImprovementPhase {
+    Disabled,
+    Unavailable,
+    Waiting,
+    Running,
+    Retrying,
+    Failed,
+    NoChange,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfImprovementStatusReason {
+    Disabled,
+    ModelUnavailable,
+    WorkerUnavailable,
+    Preparing,
+    NoNewSources,
+    AwaitingSchedule,
+    Analyzing,
+    Finalizing,
+    Pending,
+    Recovering,
+    Timeout,
+    OutputLimit,
+    InvalidResponse,
+    ProviderError,
+    ResponseFiltered,
+    NoCandidate,
+    ReviewerRejected,
+    ValidationRejected,
+    Created,
+    Updated,
+    RolledBack,
+    Cancelled,
+    Unknown,
+}
 use crate::turn::CLIAgentRuntimeKind;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -53,6 +115,9 @@ pub struct GatewaySettingsUpdateResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsSnapshot {
+    /// Read-only status of learning in the connection's workspace. Absent on older gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_improvement_status: Option<GatewaySelfImprovementStatus>,
     #[serde(default)]
     pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
@@ -222,6 +287,9 @@ pub struct GatewaySelfImprovementSettings {
 pub struct GatewaySelfImprovementModelSelection {
     pub provider: String,
     pub model: String,
+    /// None delegates to the provider; `none` explicitly disables reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl GatewaySelfImprovementModelSelection {
@@ -236,6 +304,14 @@ impl GatewaySelfImprovementModelSelection {
         Ok(Self {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: self
+                .reasoning_effort
+                .map(|effort| {
+                    crate::ReasoningEffort::canonical_value(&effort)
+                        .map(str::to_owned)
+                        .ok_or_else(|| "invalid self-improvement reasoning effort".to_owned())
+                })
+                .transpose()?,
         })
     }
 }
@@ -907,6 +983,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelection {
                 provider: "openai".to_owned(),
                 model: "gpt-5.4".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -928,6 +1005,7 @@ mod tests {
     #[test]
     fn settings_snapshot_roundtrips_thread_episodic_settings() {
         let snapshot = GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: Default::default(),
             self_improvement: Default::default(),
@@ -1084,6 +1162,7 @@ mod tests {
     #[test]
     fn gateway_settings_snapshot_reports_vector_key_presence_without_secret_values() {
         let snapshot = GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
             self_improvement: GatewaySelfImprovementSettings::default(),
@@ -1295,5 +1374,33 @@ mod tests {
         ] {
             assert_eq!(phase.coarse_voice_status(), expected);
         }
+    }
+    #[test]
+    fn self_improvement_reasoning_defaults_normalizes_and_rejects_unknown_efforts() {
+        let legacy: GatewaySelfImprovementModelSelection =
+            serde_json::from_str(r#"{"provider":"openrouter","model":"model"}"#).unwrap();
+        assert_eq!(legacy.reasoning_effort, None);
+        for (raw, expected) in [("High", "high"), ("off", "none"), ("extra-high", "xhigh")] {
+            let normalized = GatewaySelfImprovementModelSelection {
+                reasoning_effort: Some(raw.to_owned()),
+                ..legacy.clone()
+            }
+            .normalized()
+            .unwrap();
+            assert_eq!(normalized.reasoning_effort.as_deref(), Some(expected));
+            let encoded = serde_json::to_string(&normalized).unwrap();
+            assert_eq!(
+                serde_json::from_str::<GatewaySelfImprovementModelSelection>(&encoded).unwrap(),
+                normalized
+            );
+        }
+        assert!(
+            GatewaySelfImprovementModelSelection {
+                reasoning_effort: Some("unknown".to_owned()),
+                ..legacy
+            }
+            .normalized()
+            .is_err()
+        );
     }
 }

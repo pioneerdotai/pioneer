@@ -108,6 +108,22 @@ impl HookHandler for MemoryPostTurnExtractorHook {
 
         let context = memory_turn_context_from_post_turn_request(&request, input, &config)?;
 
+        // External runtimes have no ProviderRegistry-backed thread model.
+        // Do not invent a fallback provider (or retry an invalid configuration).
+        if config.model.as_ref().or(input.model.as_ref()).is_none()
+            || config
+                .provider_name
+                .as_ref()
+                .or(input.model_provider.as_ref())
+                .is_none()
+        {
+            response.diagnostics.push(memory_safe_warning_diagnostic(
+                "memory.post_turn_extractor.model_unavailable",
+                "Post-turn extraction requires an API model: select a custom proactive-writes model when the turn runs through CLI.",
+            ));
+            return Ok(response);
+        }
+
         let manifest = match write_provider
             .load_memory_manifest(
                 context.clone(),

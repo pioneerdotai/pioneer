@@ -23,6 +23,44 @@ struct ServiceHarness {
 }
 
 impl ServiceHarness {
+    async fn persistent(temp_dir: TempDir) -> Self {
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            temp_dir.path().join("control.sqlite").display()
+        );
+        let connection = Database::connect(&url).await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = Arc::new(CrudStore::new(connection));
+        let backend = Arc::new(MemvidMemoryBackend::new(
+            store.clone(),
+            MemvidMemoryBackendConfig::new(temp_dir.path().join("capsules")),
+        ));
+        let service = MemoryService::new(
+            store.clone(),
+            backend.clone(),
+            MemoryServiceConfig::default(),
+        );
+        Self {
+            _temp_dir: temp_dir,
+            store,
+            backend,
+            service,
+        }
+    }
+
+    async fn reopen(self) -> Self {
+        let Self {
+            _temp_dir,
+            store,
+            backend,
+            service,
+        } = self;
+        drop(service);
+        drop(backend);
+        drop(store);
+        Self::persistent(_temp_dir).await
+    }
+
     async fn new() -> Self {
         let connection = Database::connect("sqlite::memory:")
             .await
@@ -103,6 +141,258 @@ fn capsule_path(storage_uri: &str) -> PathBuf {
             .strip_prefix("file://")
             .expect("memvid file URI"),
     )
+}
+
+struct FirstPutBarrier {
+    inner: Arc<MemvidMemoryBackend>,
+    arrivals: std::sync::atomic::AtomicUsize,
+    barrier: tokio::sync::Barrier,
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for FirstPutBarrier {
+    async fn put(
+        &self,
+        request: BackendPutRequest,
+    ) -> anyhow::Result<pioneer_memory::BackendPutResult> {
+        let index = self
+            .arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let result = self.inner.put(request).await?;
+        if index < 2 {
+            self.barrier.wait().await;
+        }
+        Ok(result)
+    }
+    async fn get(
+        &self,
+        request: pioneer_memory::BackendGetRequest,
+    ) -> anyhow::Result<Option<pioneer_memory::BackendPayload>> {
+        self.inner.get(request).await
+    }
+    async fn search(
+        &self,
+        request: pioneer_memory::BackendSearchRequest,
+    ) -> anyhow::Result<Vec<pioneer_memory::BackendSearchHit>> {
+        self.inner.search(request).await
+    }
+    async fn delete(
+        &self,
+        request: pioneer_memory::BackendDeleteRequest,
+    ) -> anyhow::Result<pioneer_memory::BackendDeleteResult> {
+        self.inner.delete(request).await
+    }
+}
+
+#[tokio::test]
+async fn concurrent_first_keyed_puts_publish_one_consistent_memvid_identity() {
+    let harness = ServiceHarness::new().await;
+    let backend = Arc::new(FirstPutBarrier {
+        inner: harness.backend.clone(),
+        arrivals: std::sync::atomic::AtomicUsize::new(0),
+        barrier: tokio::sync::Barrier::new(2),
+    });
+    let first = MemoryService::new(
+        harness.store.clone(),
+        backend.clone(),
+        MemoryServiceConfig::default(),
+    );
+    let second = MemoryService::new(
+        harness.store.clone(),
+        backend,
+        MemoryServiceConfig::default(),
+    );
+    let (a, b) = tokio::join!(
+        first.remember(
+            user_context(200),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("race.key"),
+                "Concurrent fact A"
+            )
+        ),
+        second.remember(
+            user_context(200),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("race.key"),
+                "Concurrent fact B"
+            )
+        ),
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_eq!(a.record.id, b.record.id);
+    assert_ne!(a.created, b.created);
+    let reopened_backend = Arc::new(MemvidMemoryBackend::new(
+        harness.store.clone(),
+        MemvidMemoryBackendConfig::new(harness._temp_dir.path().join("capsules")),
+    ));
+    let reopened = MemoryService::new(
+        harness.store.clone(),
+        reopened_backend,
+        MemoryServiceConfig::default(),
+    );
+    let records = reopened
+        .list(user_context(201), MemoryListParams::default())
+        .await
+        .unwrap()
+        .records;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, a.record.id);
+    assert!(
+        reopened
+            .get_by_key(
+                user_context(201),
+                scope(MemoryScopeKind::User, "default"),
+                None,
+                "race.key".to_owned()
+            )
+            .await
+            .unwrap()
+            .record
+            .is_some()
+    );
+    let hits = reopened
+        .search(
+            user_context(201),
+            MemorySearchParams {
+                query: "Concurrent fact".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(
+        harness
+            .store
+            .get_agent_memory_record(&a.record.id, true)
+            .await
+            .unwrap()
+            .unwrap()
+            .repair_status,
+        "ok"
+    );
+    let events = harness
+        .store
+        .list_agent_memory_events(&a.record.id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_kind == "created")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_kind == "updated")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_replacement_publication_keeps_old_memvid_record_active() {
+    use sea_orm::ConnectionTrait;
+    let harness = ServiceHarness::persistent(tempfile::tempdir().unwrap()).await;
+    let old = harness
+        .service
+        .remember(
+            user_context(300),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("replacement.key"),
+                "Original fact",
+            ),
+        )
+        .await
+        .unwrap();
+    // Failure occurs after the supersede UPDATE but before replacement INSERT,
+    // inside the actual SQL publication transaction, not in a mock service.
+    harness.store.database_connection().execute_unprepared(
+        "CREATE TRIGGER fail_memory_replacement BEFORE INSERT ON agent_memory WHEN NEW.content_preview = 'Replacement fact' BEGIN SELECT RAISE(ABORT, 'injected replacement publication failure'); END;"
+    ).await.unwrap();
+    let mut params = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("replacement.key"),
+        "Replacement fact",
+    );
+    params.supersedes = Some(old.record.id.clone());
+    assert!(
+        harness
+            .service
+            .remember(user_context(301), params.clone())
+            .await
+            .is_err()
+    );
+    let harness = harness.reopen().await;
+    let still_active = harness
+        .service
+        .get_by_key(
+            user_context(302),
+            scope(MemoryScopeKind::User, "default"),
+            None,
+            "replacement.key".to_owned(),
+        )
+        .await
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(still_active.id, old.record.id);
+    assert_eq!(still_active.content, "Original fact");
+    assert_eq!(
+        harness
+            .store
+            .list_agent_memory_events(&old.record.id, 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_kind == "superseded")
+            .count(),
+        0
+    );
+    harness
+        .store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER fail_memory_replacement")
+        .await
+        .unwrap();
+    let replaced = harness
+        .service
+        .remember(user_context(303), params)
+        .await
+        .unwrap();
+    let harness = harness.reopen().await;
+    assert_ne!(replaced.record.id, old.record.id);
+    assert_eq!(
+        harness
+            .store
+            .get_agent_memory_record(&old.record.id, true)
+            .await
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .as_deref(),
+        Some(replaced.record.id.as_str())
+    );
+    let current = harness
+        .service
+        .get_by_key(
+            user_context(304),
+            scope(MemoryScopeKind::User, "default"),
+            None,
+            "replacement.key".to_owned(),
+        )
+        .await
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(current.id, replaced.record.id);
+    assert_eq!(current.content, "Replacement fact");
 }
 
 #[tokio::test]
@@ -187,6 +477,150 @@ async fn remember_get_and_list_use_memvid_payloads() {
         .expect("list");
     assert_eq!(listed.records.len(), 1);
     assert_eq!(listed.records[0].content, full_content);
+}
+
+struct PauseAfterPayload {
+    inner: Arc<MemvidMemoryBackend>,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for PauseAfterPayload {
+    async fn put(
+        &self,
+        request: BackendPutRequest,
+    ) -> anyhow::Result<pioneer_memory::BackendPutResult> {
+        self.inner.put(request).await?;
+        self.ready.notify_one();
+        std::future::pending().await
+    }
+    async fn get(
+        &self,
+        request: pioneer_memory::BackendGetRequest,
+    ) -> anyhow::Result<Option<pioneer_memory::BackendPayload>> {
+        self.inner.get(request).await
+    }
+    async fn search(
+        &self,
+        request: pioneer_memory::BackendSearchRequest,
+    ) -> anyhow::Result<Vec<pioneer_memory::BackendSearchHit>> {
+        self.inner.search(request).await
+    }
+    async fn delete(
+        &self,
+        request: pioneer_memory::BackendDeleteRequest,
+    ) -> anyhow::Result<pioneer_memory::BackendDeleteResult> {
+        self.inner.delete(request).await
+    }
+}
+
+#[tokio::test]
+async fn cancellation_after_payload_leaves_old_owner_and_recoverable_orphan() {
+    let harness = ServiceHarness::persistent(tempfile::tempdir().unwrap()).await;
+    let old = harness
+        .service
+        .remember(
+            user_context(800),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("cancel.key"),
+                "Cancellation marker old",
+            ),
+        )
+        .await
+        .unwrap();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let paused = MemoryService::new(
+        harness.store.clone(),
+        Arc::new(PauseAfterPayload {
+            inner: harness.backend.clone(),
+            ready: ready.clone(),
+        }),
+        MemoryServiceConfig::default(),
+    );
+    let mut replacement = remember_params(
+        scope(MemoryScopeKind::User, "default"),
+        Some("cancel.key"),
+        "Cancellation marker new",
+    );
+    replacement.supersedes = Some(old.record.id.clone());
+    let writer = tokio::spawn(async move { paused.remember(user_context(801), replacement).await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), ready.notified())
+        .await
+        .unwrap();
+    // Filesystem preparation must not occupy the serialized SQL writer.
+    let maintenance = MemoryService::new(
+        Arc::new(harness.store.with_maintenance_access()),
+        harness.backend.clone(),
+        MemoryServiceConfig::default(),
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        maintenance.remember(
+            user_context(802),
+            remember_params(
+                scope(MemoryScopeKind::User, "default"),
+                Some("other.key"),
+                "Independent maintenance fact",
+            ),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(maintenance);
+    writer.abort();
+    assert!(writer.await.unwrap_err().is_cancelled());
+    let harness = harness.reopen().await;
+    let current = harness
+        .service
+        .get_by_key(
+            user_context(803),
+            scope(MemoryScopeKind::User, "default"),
+            None,
+            "cancel.key".to_owned(),
+        )
+        .await
+        .unwrap()
+        .record
+        .unwrap();
+    assert_eq!(current.id, old.record.id);
+    assert_eq!(current.content, "Cancellation marker old");
+    let hits = harness
+        .service
+        .search(
+            user_context(804),
+            MemorySearchParams {
+                query: "Cancellation marker".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !hits
+            .hits
+            .iter()
+            .any(|hit| hit.record.content == "Cancellation marker new")
+    );
+    let jobs = harness
+        .service
+        .claim_due_repair_jobs(805, 60, "cancel_repair", 10)
+        .await
+        .unwrap();
+    assert!(
+        jobs.iter()
+            .any(|job| job.job_kind == "backend_stale_payload")
+    );
+    for job in jobs {
+        let result = harness
+            .service
+            .process_repair_job(&job.id, "cancel_repair", 806)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, "completed");
+    }
 }
 
 #[tokio::test]

@@ -9,6 +9,13 @@
     "provider_budget": {
       "$ref": "#/$defs/ExecutionCheckpointProviderBudgetSummary"
     },
+    "requested_tool_names": {
+      "description": "Explicit request_tools selections for this turn, not authorization grants.\nResume must revalidate these names against the current tool registry and policy.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "schema_version": {
       "type": "integer",
       "format": "uint32",

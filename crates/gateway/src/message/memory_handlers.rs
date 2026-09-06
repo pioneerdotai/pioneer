@@ -770,9 +770,19 @@ impl MessageProcessor {
                 allow_secret_like: false,
                 allow_regulated: false,
             });
-            context.source_access = MemorySourceAccessPolicy::accessible_threads(
-                accessible_threads.into_iter().map(|thread| thread.id),
-            );
+            let thread_ids = accessible_threads
+                .into_iter()
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>();
+            context.source_access =
+                MemorySourceAccessPolicy::accessible_threads(thread_ids.clone()).with_owned_scopes(
+                    thread_ids
+                        .into_iter()
+                        .map(|key| pioneer_protocol::MemoryScope {
+                            kind: MemoryScopeKind::Thread,
+                            key,
+                        }),
+                );
         }
         Ok(context)
     }

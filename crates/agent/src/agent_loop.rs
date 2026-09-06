@@ -8,16 +8,14 @@ use super::{
 use crate::chat;
 use crate::hooks::{
     AgentToolBundleArtifactStore, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
-    AgentTurnPostTurnSummary, DurablePostTurnHookRuntimeSnapshot, EffectiveTurnPolicySet,
-    EffectiveTurnPromptContextSet,
+    AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
 };
 use futures_util::FutureExt;
-use pioneer_hooks::{HookPhase, HookRuntime, TurnPostTurnStatus};
+use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{
     AgentDurableEvent, ExecutionWindowStatus, NativeTerminalEffectGate, NativeTerminalEffectKind,
-    NativeTerminalEffectPayload, NativeTerminalEffectPreparation,
-    NativeTerminalEffectPreparationFailure, NativeTerminalEffectSpec, RecoveryAttemptContext,
-    ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot,
+    NativeTerminalEffectPayload, NativeTerminalEffectPreparation, NativeTerminalEffectSpec,
+    RecoveryAttemptContext, ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot,
     TurnExecutionWindowBlockedNotification, TurnExecutionWindowContinuedNotification,
     TurnPermissionProfileSnapshot, UserInput,
 };
@@ -1797,8 +1795,6 @@ fn terminal_effect_preparation(
     cleanup_reason: Option<String>,
 ) -> NativeTerminalEffectPreparation {
     const MAX_ATTEMPTS: u16 = 5;
-    // Leave envelope headroom below CRUD's 256 KiB admission limit.
-    const MAX_HOOK_EFFECT_PAYLOAD_BYTES: usize = 255 * 1024;
     const MAX_CLEANUP_REASON_CHARS: usize = 4_096;
 
     let mut effects = Vec::with_capacity(2);
@@ -1808,56 +1804,14 @@ fn terminal_effect_preparation(
             .post_turn_hook_dispatch_policy
             .should_dispatch(dispatch.status())
     {
-        let gate = if dispatch.awaits_task_result_acceptance() {
-            NativeTerminalEffectGate::AcceptedTaskResult
-        } else {
-            NativeTerminalEffectGate::TerminalCommit
-        };
-        let durable_payload = (|| -> Result<_, NativeTerminalEffectPreparationFailure> {
-            let request = serde_json::to_value(
-                dispatch
-                    .into_durable_phase_request()
-                    .map_err(|_| NativeTerminalEffectPreparationFailure::InvalidHookRequest)?,
-            )
-            .map_err(|_| NativeTerminalEffectPreparationFailure::InvalidHookRequest)?;
-            let runtime = runtime_snapshot
+        effects.push(crate::post_turn::prepare_dispatch_effect(
+            turn_id,
+            runtime_snapshot
                 .hook_runtime
                 .as_ref()
-                .ok_or(NativeTerminalEffectPreparationFailure::HookRuntimeUnavailable)?;
-            let subscriptions = runtime
-                .subscriptions()
-                .subscriptions_for_phase(HookPhase::TurnPostTurn)
-                .map_err(|_| {
-                    NativeTerminalEffectPreparationFailure::SubscriptionSnapshotUnavailable
-                })?;
-            let runtime_snapshot =
-                DurablePostTurnHookRuntimeSnapshot::capture(runtime, subscriptions).map_err(
-                    |_| NativeTerminalEffectPreparationFailure::HandlerSnapshotUnavailable,
-                )?;
-            let runtime_snapshot = serde_json::to_value(runtime_snapshot)
-                .map_err(|_| NativeTerminalEffectPreparationFailure::SnapshotSerializationFailed)?;
-            let payload = NativeTerminalEffectPayload::PostTurnHook {
-                request,
-                runtime_snapshot,
-            };
-            let encoded = serde_json::to_vec(&payload)
-                .map_err(|_| NativeTerminalEffectPreparationFailure::PayloadSerializationFailed)?;
-            if encoded.len() > MAX_HOOK_EFFECT_PAYLOAD_BYTES {
-                return Err(NativeTerminalEffectPreparationFailure::PayloadTooLarge);
-            }
-            Ok(payload)
-        })();
-        let payload = match durable_payload {
-            Ok(payload) => payload,
-            Err(failure) => NativeTerminalEffectPayload::PostTurnHookPreparationFailed { failure },
-        };
-        effects.push(NativeTerminalEffectSpec {
-            effect_id: format!("{turn_id}:terminal-effect:post-turn"),
-            effect_kind: NativeTerminalEffectKind::PostTurnHook,
-            gate,
-            payload,
-            max_attempts: MAX_ATTEMPTS,
-        });
+                .expect("checked hook runtime"),
+            dispatch,
+        ));
     }
 
     if runtime_snapshot.task_tool_provider.is_some()

@@ -51,6 +51,14 @@ impl LegacyScreenAdapter {
                 self.skills_poller.take();
             }
         }
+        if active
+            && self.main_content_view() == MainContentView::Settings
+            && self.settings_content_view() == SettingsContentView::SelfImprovement
+        {
+            self.start_self_improvement_status_poll(cx);
+        } else {
+            self.self_improvement_status_poll.take();
+        }
         let thread_active = active && self.main_content_view() == MainContentView::Threads;
         if !thread_active && self.desktop_voice_composer.is_active() {
             self.cancel_desktop_voice_hold("route_inactive", cx);
@@ -79,6 +87,7 @@ impl LegacyScreenAdapter {
             self.desktop_voice_status_poll_generation.wrapping_add(1);
         self.mcp_poller.take();
         self.skills_poller.take();
+        self.self_improvement_status_poll.take();
         self.thread_binding_task.take();
         self.thread_bindings.clear();
         self.gateway.compatibility_task.take();

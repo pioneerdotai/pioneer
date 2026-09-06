@@ -11,6 +11,7 @@ pub struct Model {
     pub turn_id: String,
     pub thread_id: String,
     pub projected_through_sequence: i64,
+    pub receipts_compacted_through_sequence: i64,
     pub status: String,
     pub blocking_event_id: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

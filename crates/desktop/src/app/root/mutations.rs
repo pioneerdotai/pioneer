@@ -187,6 +187,7 @@ impl PioneerDesktop {
         self.navigation_intent(NavigationIntent::Navigate { destination });
         crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
         self.reconcile_route_activity(cx);
+
         self.rebuild_sidebar_tree_state(cx);
     }
 

@@ -18,6 +18,8 @@ pub async fn ensure<C: ConnectionTrait>(
             activation_epoch: Set(0),
             cursor_source_id: Set(0),
             effective_enabled_at: Set(None),
+            history_backfill_after_event_id: Set(None),
+            history_backfill_complete: Set(false),
             created_at: Set(now),
             updated_at: Set(now),
         },
@@ -55,17 +57,12 @@ pub async fn find<C: ConnectionTrait>(
 pub async fn activate_if_inactive<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
-    baseline_source_id: i64,
     effective_enabled_at: DateTimeWithTimeZone,
 ) -> Result<bool> {
     let affected = self_improvement_workspace_state::Entity::update_many()
         .col_expr(
             self_improvement_workspace_state::Column::ActivationEpoch,
             Expr::col(self_improvement_workspace_state::Column::ActivationEpoch).add(1),
-        )
-        .col_expr(
-            self_improvement_workspace_state::Column::CursorSourceId,
-            Expr::value(baseline_source_id),
         )
         .col_expr(
             self_improvement_workspace_state::Column::EffectiveEnabledAt,

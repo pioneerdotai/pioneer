@@ -723,6 +723,7 @@ impl GatewaySettings {
     ) -> pioneer_protocol::GatewaySettingsSnapshot {
         let general = self.effective_general_settings(config);
         pioneer_protocol::GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general,
             memory: self.effective_memory_settings(&config.memory).to_protocol(),
             self_improvement: self_improvement_settings_to_protocol(
@@ -2054,6 +2055,7 @@ fn self_improvement_model_selection_from_protocol(
     Ok(GatewaySelfImprovementModelSelectionConfig {
         provider: selection.provider,
         model: selection.model,
+        reasoning_effort: selection.reasoning_effort,
     })
 }
 
@@ -2079,6 +2081,7 @@ fn self_improvement_model_selection_to_protocol(
     pioneer_protocol::GatewaySelfImprovementModelSelection {
         provider: selection.provider.clone(),
         model: selection.model.clone(),
+        reasoning_effort: selection.reasoning_effort.clone(),
     }
 }
 
@@ -3033,12 +3036,14 @@ model = "gpt-5.4"
                             pioneer_protocol::GatewaySelfImprovementModelSelection {
                                 provider: " openai ".to_owned(),
                                 model: " gpt-5.4 ".to_owned(),
+                                reasoning_effort: None,
                             },
                         ),
                         reviewer_model: Some(
                             pioneer_protocol::GatewaySelfImprovementModelSelection {
                                 provider: " anthropic ".to_owned(),
                                 model: " claude-sonnet ".to_owned(),
+                                reasoning_effort: None,
                             },
                         ),
                     }),
@@ -3115,12 +3120,14 @@ model = "gpt-5.4"
                             pioneer_protocol::GatewaySelfImprovementModelSelection {
                                 provider: "openai".to_owned(),
                                 model: "gpt-5.4".to_owned(),
+                                reasoning_effort: None,
                             },
                         ),
                         reviewer_model: Some(
                             pioneer_protocol::GatewaySelfImprovementModelSelection {
                                 provider: "anthropic".to_owned(),
                                 model: "claude-sonnet".to_owned(),
+                                reasoning_effort: None,
                             },
                         ),
                     }),
@@ -3202,6 +3209,7 @@ model = "gpt-5.4"
                             pioneer_protocol::GatewaySelfImprovementModelSelection {
                                 provider: "openai".to_owned(),
                                 model: "   ".to_owned(),
+                                reasoning_effort: None,
                             },
                         ),
                         reviewer_model: None,

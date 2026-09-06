@@ -478,7 +478,9 @@ fn argument_command(arguments: &JsonValue) -> Vec<String> {
     Vec::new()
 }
 
-fn protocol_outcome_from_tool_outcome(outcome: &ToolOutcome) -> pioneer_protocol::ToolOutcome {
+pub(super) fn protocol_outcome_from_tool_outcome(
+    outcome: &ToolOutcome,
+) -> pioneer_protocol::ToolOutcome {
     pioneer_protocol::ToolOutcome {
         status: match outcome.status {
             pioneer_tools::ToolOutcomeStatus::Ok => pioneer_protocol::ToolOutcomeStatus::Ok,

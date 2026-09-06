@@ -83,7 +83,7 @@ struct AuthorizationCounters {
     stale: AtomicU64,
     capability_filtered: AtomicU64,
     subscription_evicted: AtomicU64,
-    private_source_rejected: AtomicU64,
+    ineligible_source_rejected: AtomicU64,
     unavailable: AtomicU64,
 }
 
@@ -96,7 +96,7 @@ static AUTHORIZATION_COUNTERS: AuthorizationCounters = AuthorizationCounters {
     stale: AtomicU64::new(0),
     capability_filtered: AtomicU64::new(0),
     subscription_evicted: AtomicU64::new(0),
-    private_source_rejected: AtomicU64::new(0),
+    ineligible_source_rejected: AtomicU64::new(0),
     unavailable: AtomicU64::new(0),
 };
 
@@ -337,15 +337,15 @@ pub(crate) fn record_stale_policy_revision(
     );
 }
 
-pub(crate) fn record_private_self_improvement_source_rejection() {
+pub(crate) fn record_ineligible_self_improvement_source_rejection() {
     AUTHORIZATION_COUNTERS
-        .private_source_rejected
+        .ineligible_source_rejected
         .fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
         authorization_action = "self_improvement_overlay_project",
         authorization_resource_kind = "learned_skill_source",
         authorization_decision = "filter",
-        authorization_reason = "source_not_workspace_visible",
+        authorization_reason = "source_thread_ineligible",
         authorization_audit_class = "derived_data",
         "authorization lifecycle metric"
     );
@@ -369,7 +369,7 @@ pub(crate) fn authorization_counter_snapshot() -> [u64; 10] {
             .subscription_evicted
             .load(Ordering::Relaxed),
         AUTHORIZATION_COUNTERS
-            .private_source_rejected
+            .ineligible_source_rejected
             .load(Ordering::Relaxed),
         AUTHORIZATION_COUNTERS.unavailable.load(Ordering::Relaxed),
     ]
@@ -421,11 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_counters_cover_subscription_and_private_source_rejections() {
+    fn lifecycle_counters_cover_subscription_and_ineligible_source_rejections() {
         let before = authorization_counter_snapshot();
         record_subscription_evictions(2);
         record_stale_policy_revision(7, 8, "member", "member", &"a".repeat(64), &"b".repeat(64));
-        record_private_self_improvement_source_rejection();
+        record_ineligible_self_improvement_source_rejection();
         let after = authorization_counter_snapshot();
 
         assert_eq!(after[5], before[5] + 1);

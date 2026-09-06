@@ -60,6 +60,38 @@ fn durable_terminal_effect_claim_requires_a_complete_text_fence() {
 }
 
 #[test]
+fn post_turn_correction_retains_explicit_target_through_the_write_contract() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    raw["facts"][0]["target_memory_id"] = serde_json::json!("existing_manifest_record");
+    let parsed = parse_memory_post_turn_extractor_json(
+        &raw.to_string(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .unwrap();
+    let params = memory_semantic_write_params_from_extracted_fact(
+        0,
+        parsed.facts.into_iter().next().unwrap(),
+        &test_memory_turn_context(),
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryPostTurnExtractorConfig::default(),
+        MemorySourceContextKind::DirectUserConversation,
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .unwrap();
+    assert_eq!(
+        params.target_memory_id.as_deref(),
+        Some("existing_manifest_record")
+    );
+    assert_eq!(params.scope.kind, MemoryScopeKind::User);
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
+}
+
+#[test]
 fn strict_json_parser_accepts_typed_semantic_fact() {
     let parsed = parse_memory_post_turn_extractor_json(
         valid_post_turn_extractor_json().as_str(),
@@ -1125,6 +1157,38 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
         diagnostic.code.as_str() == "memory.post_turn_extractor.completed"
             && diagnostic.message.as_str().contains("write_successes=1")
     }));
+}
+
+#[tokio::test]
+async fn post_turn_without_api_model_reports_configuration_diagnostic_without_provider_call() {
+    let write = Arc::new(TestMemoryWriteProvider::default());
+    let extractor = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write.clone()),
+        extractor_provider: Some(extractor.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    if let pioneer_hooks::HookInputPayload::TurnPostTurn(input) = &mut request.input.payload {
+        input.model = None;
+        input.model_provider = None;
+    }
+    let response = hook.execute(request).await.unwrap();
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "memory.post_turn_extractor.model_unavailable")
+    );
+    assert_eq!(extractor.call_count(), 0);
+    assert_eq!(write.manifest_call_count(), 0);
+    assert_eq!(write.write_call_count(), 0);
 }
 
 #[tokio::test]

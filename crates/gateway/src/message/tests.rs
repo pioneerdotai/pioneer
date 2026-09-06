@@ -179,6 +179,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 
+mod cli_post_turn;
 mod member_client_harness;
 
 fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
@@ -4553,6 +4554,17 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
     let enabled: pioneer_protocol::GatewaySettingsUpdateResponse =
         serde_json::from_value(enable_response.result).expect("enabled settings response");
     assert!(enabled.settings.self_improvement.enabled);
+    let status = enabled
+        .settings
+        .self_improvement_status
+        .as_ref()
+        .expect("runtime status");
+    assert_eq!(status.workspace_id, workspace_id);
+    assert_eq!(
+        status.reason,
+        pioneer_protocol::SelfImprovementStatusReason::NoNewSources
+    );
+    assert!(status.next_scheduled_at_unix.is_some());
     assert_eq!(
         enabled
             .settings
@@ -4586,6 +4598,17 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
     let peer_response = recv_response_by_id(&mut other_rx, peer_get_id.as_str()).await;
     let peer: pioneer_protocol::GatewaySettingsGetResponse =
         serde_json::from_value(peer_response.result).expect("peer settings response");
+    let peer_status = peer
+        .settings
+        .self_improvement_status
+        .as_ref()
+        .expect("peer runtime status");
+    assert_eq!(peer_status.workspace_id, other_workspace.id);
+    assert_eq!(
+        peer_status.phase,
+        pioneer_protocol::SelfImprovementPhase::Disabled
+    );
+    assert!(peer_status.next_scheduled_at_unix.is_none());
     assert_eq!(
         peer.settings.self_improvement,
         pioneer_protocol::GatewaySelfImprovementSettings::default(),
@@ -5989,6 +6012,7 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
         .set_connection_workspace(connection_id, Some(workspace_id.clone()))
         .await;
     let mut settings_snapshot = pioneer_protocol::GatewaySettingsSnapshot {
+        self_improvement_status: None,
         general: Default::default(),
         memory: Default::default(),
         self_improvement: Default::default(),
@@ -18776,6 +18800,88 @@ async fn failed_child_task_run_opens_recovery_without_candidate_impl() {
 }
 
 #[test]
+fn detached_task_block_preserves_child_reason_in_parent_timeline() {
+    run_standard_stack_message_test("detached child block reason", async {
+        let provider = Arc::new(HangingChildProvider::new());
+        let providers = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        ));
+        let (workspaces, store, workspace_id) = setup_workspace_manager().await;
+        let processor = Arc::new(MessageProcessor::new(
+            Arc::new(ThreadManager::new("test-model", "openai")),
+            providers,
+            Arc::new(SessionManager::new()),
+            workspaces,
+            store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_context_budget(),
+            test_tool_loop_config(),
+        ));
+        processor.bind_task_bridge().await;
+        processor.start_task_event_listener().await;
+        let parent = "thr_detached_block_reason";
+        let mut params = test_task_create_params(
+            &workspace_id,
+            parent,
+            "turn_detached_block_reason",
+            "Blocked child",
+            3,
+        );
+        params.lifecycle_policy = Some(TaskLifecyclePolicy {
+            attachment: TaskAttachmentMode::Detached,
+            on_parent_cancel: TaskParentTerminalAction::KeepRunning,
+            on_parent_failure: TaskParentTerminalAction::KeepRunning,
+            completion: TaskCompletionBehavior::CompleteOnTerminalRun,
+        });
+        let response = create_task_for_test(&processor, params)
+            .await
+            .expect("create task");
+        let run = response.run.expect("run");
+        let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
+        for _ in 0..100 {
+            if provider.child_main_call_count() > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(provider.child_main_call_count() > 0);
+        let reason =
+            "failed to open CLI runtime thread: cannot resume paginated thread with stale path";
+        processor
+            .mark_turn_blocked(
+                lineage.child_thread_id.clone(),
+                lineage.child_turn_id.clone(),
+                reason.to_owned(),
+            )
+            .await;
+        assert_eq!(
+            wait_for_turn_status(store.clone(), parent, &run.id, TurnStatus::Blocked).await,
+            TurnStatus::Blocked
+        );
+        let (_, occurrence) = store
+            .get_turn(parent, &run.id)
+            .await
+            .expect("parent lookup")
+            .expect("parent");
+        assert_eq!(occurrence.error.as_deref(), Some(reason));
+        // A repeated durable reconciliation must not replace the useful cause
+        // with the generic child_turn_blocked classification.
+        processor
+            .reconcile_terminal_task_child_turns(10)
+            .await
+            .expect("reconcile");
+        let (_, occurrence) = store
+            .get_turn(parent, &run.id)
+            .await
+            .expect("parent lookup")
+            .expect("parent");
+        assert_eq!(occurrence.error.as_deref(), Some(reason));
+    });
+}
+
+#[test]
 fn blocked_execution_window_recovery_blocks_child_task_run_without_failure() {
     run_standard_stack_message_test(
         "blocked execution window child Task recovery",
@@ -20549,6 +20655,251 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
     );
 
     let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation() {
+    run_gateway_message_test("composer-cli-skill-pack", || async {
+        for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+            for select_pack in [true, false] {
+                let mut harness =
+                    setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
+                let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).unwrap();
+                let skill_ids =
+                    ["A", "B"].map(|id| pioneer_protocol::SkillId::new(id.repeat(21)).unwrap());
+                let children = skill_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, skill_id)| {
+                        let slug = format!("packed-{index}");
+                        let path =
+                            write_test_skill(&harness.user_root, &slug, "", "selected skill body");
+                        SkillInstallationRecord {
+                            skill_id: skill_id.clone(),
+                            owner: Some("tests".to_owned()),
+                            slug: slug.clone(),
+                            version: None,
+                            source_kind: "user".to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_ref: format!("test:{slug}"),
+                            install_path: path.display().to_string(),
+                            trust_level: "community".to_owned(),
+                            fingerprint: format!("fingerprint:{slug}"),
+                            updated_at_unix: 1,
+                            pack_id: Some(pack_id.clone()),
+                            pack_member_key: Some(slug),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                harness
+                    .crud_store
+                    .insert_skill_pack_installation_with_children(
+                        &SkillPackInstallationRecord {
+                            pack_id: pack_id.clone(),
+                            name: "Selected Pack".to_owned(),
+                            scope_key: harness.workspace_id.clone(),
+                            source_kind: "user".to_owned(),
+                            created_at_unix: 1,
+                            updated_at_unix: 1,
+                        },
+                        &children,
+                    )
+                    .await
+                    .unwrap();
+                harness
+                    .cli_session
+                    .enable_projected_mcp_metadata(harness.crud_store.clone())
+                    .await;
+                let processor = Arc::new(harness.processor);
+                processor.bind_task_bridge().await;
+                processor.start_task_event_listener().await;
+                let parent = "thr_composer_cli_pack";
+                let source = "turn_composer_cli_pack";
+                let model = match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => "gpt-5",
+                    CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                };
+                let thread = harness
+                    .thread_manager
+                    .thread_start_seeded(
+                        harness.connection_id,
+                        harness.workspace_id.clone(),
+                        ThreadStartParams {
+                            thread_id: parent.to_owned(),
+                            workspace_id: harness.workspace_id.clone(),
+                            name: None,
+                            model: Some(model.to_owned()),
+                            model_provider: Some("openai".to_owned()),
+                            sandbox: Some(SandboxMode::FullAccess),
+                            mode: Some(ThreadMode::Agent),
+                            origin_kind: Some(ThreadOriginKind::Collaborative),
+                            sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                            visibility: None,
+                            agent_nickname: None,
+                            agent_role: None,
+                        },
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                harness
+                    .crud_store
+                    .upsert_thread_model(
+                        &thread.response.thread,
+                        pioneer_protocol::PersistedActorRef::System,
+                    )
+                    .await
+                    .unwrap();
+                let capabilities = if select_pack {
+                    vec![TurnCapability {
+                        id: pioneer_protocol::skill_pack_capability_key(&pack_id),
+                        kind: TurnCapabilityKind::SkillPack {
+                            pack_id: pack_id.clone(),
+                        },
+                        label: Some("Selected Pack".to_owned()),
+                    }]
+                } else {
+                    skill_ids
+                        .iter()
+                        .map(|skill_id| TurnCapability {
+                            id: pioneer_protocol::skill_capability_key(skill_id),
+                            kind: TurnCapabilityKind::Skill {
+                                skill_id: skill_id.clone(),
+                                pack_id: Some(pack_id.clone()),
+                            },
+                            label: None,
+                        })
+                        .collect()
+                };
+                let request_id = generate_test_request_id("pack", "composer");
+                harness
+                    .cli_session
+                    .set_next_native_turn_id("native_pack_turn".to_owned())
+                    .await;
+                let context = processor
+                    .session_manager
+                    .connection_context(harness.connection_id)
+                    .await
+                    .unwrap();
+                processor.clone().process_owned_request(context, json!({
+                    "jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
+                        "thread_id":parent, "turn_id":source,
+                        "input":[{"type":"text","text":"use selected skills"}],
+                        "capabilities":capabilities, "model":model, "mode":"Agent",
+                        "execution_backend":{"type":"cliAgentRuntime","runtime_id":harness.runtime_id,"runtime_kind":runtime_kind},
+                        "permission_profile":{"mode":"full_access"}
+                    }
+                }).to_string()).await;
+                let response = recv_response_by_id(&mut harness.rx, &request_id).await;
+                let _: pioneer_protocol::TurnStartResponse =
+                    serde_json::from_value(response.result).unwrap();
+                let tasks = processor
+                    .task_runtime
+                    .service()
+                    .list_tasks(pioneer_protocol::TaskListParams {
+                        workspace_id: harness.workspace_id.clone(),
+                        owner_kind: Some(TaskOwnerKind::Thread),
+                        owner_id: Some(parent.to_owned()),
+                        limit: Some(10),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(tasks.tasks.len(), 1);
+                let starts = wait_for_cli_runtime_turn_starts(&harness.cli_session, 1).await;
+                let task = harness
+                    .crud_store
+                    .get_task(&tasks.tasks[0].id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    starts.len(),
+                    1,
+                    "{runtime_kind:?} select_pack={select_pack}: {:?}",
+                    task.task.error
+                );
+                let run = &task.runs[0];
+                let lineage =
+                    wait_for_child_lineage_for_run(harness.crud_store.clone(), &run.id).await;
+                let mut bound_ids = harness
+                    .crud_store
+                    .list_turn_skill_bindings(&lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|binding| binding.skill_id)
+                    .collect::<Vec<_>>();
+                bound_ids.sort();
+                assert_eq!(
+                    bound_ids,
+                    skill_ids.to_vec(),
+                    "pack and individual selection must bind exactly the same skills"
+                );
+                let authorization = processor
+                    .load_turn_execution_authorization_context(&lineage.child_turn_id)
+                    .await
+                    .expect("child authorization");
+                assert_eq!(
+                    authorization.granted_skill_ids(),
+                    skill_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    "admission must grant the expanded members, not a pack or additional skills"
+                );
+                let events = harness
+                    .crud_store
+                    .get_turn_item_events(&lineage.child_thread_id, &lineage.child_turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let attachments = events
+                    .events
+                    .iter()
+                    .find_map(|event| match &event.payload {
+                        TurnItemEventPayload::ItemCompleted {
+                            item: TurnItem::UserMessage { attachments, .. },
+                            ..
+                        } => Some(attachments),
+                        _ => None,
+                    })
+                    .expect("hidden CLI user message");
+                if select_pack {
+                    assert!(
+                        matches!(attachments.as_slice(), [UserMessageAttachment::SkillPack { capability }] if capability.pack_id == pack_id)
+                    );
+                } else {
+                    assert_eq!(attachments.len(), 2);
+                    assert!(attachments.iter().all(|attachment| matches!(
+                        attachment,
+                        UserMessageAttachment::Skill { .. }
+                    )));
+                }
+                complete_recorded_cli_task_turn(
+                    &processor,
+                    &harness.cli_manager,
+                    &harness.workspace_id,
+                    &harness.runtime_id,
+                    parent,
+                    &starts[0].native_thread_id,
+                    "native_pack_turn",
+                    r#"<task_result>{"summary":"skills completed"}</task_result>"#,
+                )
+                .await;
+                assert_eq!(
+                    wait_for_task_status(
+                        harness.crud_store.clone(),
+                        &task.task.id,
+                        TaskStatus::Completed
+                    )
+                    .await,
+                    TaskStatus::Completed
+                );
+            }
+        }
+    });
 }
 
 #[test]
@@ -32728,7 +33079,11 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         )
         .await
         .expect("post-native source rows must load");
-    assert_eq!(post_native_sources.len(), 3);
+    assert_eq!(
+        post_native_sources.len(),
+        1,
+        "the two sources consumed by learning must not be selected again"
+    );
     assert!(post_native_sources.iter().any(|source| {
         source.turn_id == "turn_native_agent_skill" && source.task_delivery_id.is_some()
     }));
@@ -35246,7 +35601,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, _rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -35266,10 +35621,24 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let turn_id = "turn_cli_projection_backlog";
     let native_thread_id = "native_thread_cli_projection_backlog";
     let native_turn_id = "native_turn_cli_projection_backlog";
-    start_loaded_thread_and_turn_for_cli_runtime_test(
+    materialize_cli_runtime_turn_with_text(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "start",
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
         &processor,
         connection_id,
-        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
         workspace_id.as_str(),
         thread_id,
         turn_id,
@@ -35302,11 +35671,12 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let db = crud_store.database_connection();
     let predecessor = turn_event_projection_state::Entity::find()
         .filter(turn_event_projection_state::Column::TurnId.eq(turn_id))
-        .filter(turn_event_projection_state::Column::Sequence.eq(1))
+        .filter(turn_event_projection_state::Column::Status.eq("projected"))
+        .order_by_desc(turn_event_projection_state::Column::Sequence)
         .one(&db)
         .await
-        .expect("turn/start projection state should load")
-        .expect("turn/start projection state should exist");
+        .expect("last startup projection state should load")
+        .expect("last startup projection state should exist");
     turn_event_projection_state::Entity::update_many()
         .col_expr(
             turn_event_projection_state::Column::Status,
@@ -35328,6 +35698,17 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         .exec(&db)
         .await
         .expect("predecessor should be queued for replay");
+
+    // Recreate an unprojected prefix in both the receipt and authoritative watermark.
+    pioneer_entity::turn_event_projection_stream_state::Entity::update_many()
+        .col_expr(
+            pioneer_entity::turn_event_projection_stream_state::Column::ProjectedThroughSequence,
+            Expr::value(predecessor.sequence - 1),
+        )
+        .filter(pioneer_entity::turn_event_projection_stream_state::Column::TurnId.eq(turn_id))
+        .exec(&db)
+        .await
+        .expect("predecessor watermark should be reset for replay");
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
@@ -35388,15 +35769,29 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     .await
     .expect("deferred projection should return to pending state");
     assert_eq!(deferred_projection.attempt_count, 0);
+    assert_eq!(deferred_projection.sequence, predecessor.sequence + 1);
 
     let replay = crud_store
-        .replay_due_turn_event_projections(now.timestamp().saturating_add(10), 64)
+        .replay_due_turn_event_projections(now.timestamp().saturating_add(10), 1)
         .await
         .expect("ordered projection replay should succeed");
-    assert!(
-        replay.projected >= 2,
-        "ordered replay should project the repaired predecessor and its dependent event: {replay:#?}"
+    assert_eq!(
+        replay.projected, 1,
+        "the first replay quantum must project only the predecessor: {replay:#?}"
     );
+    assert_eq!(replay.failed, 0);
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "deferred_reasoning_item")
+            .await
+            .expect("dependent item lookup should succeed")
+            .is_none()
+    );
+    let replay = crud_store
+        .replay_due_turn_event_projections(now.timestamp().saturating_add(20), 1)
+        .await
+        .expect("next replay quantum should project the dependent event");
+    assert_eq!(replay.projected, 1);
     assert_eq!(replay.failed, 0);
     assert!(
         crud_store
@@ -40172,12 +40567,13 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
         json!("grandchild-native-approval"),
     )
     .await;
-    let page_before = request_thread_timeline_page_for_test(
+    let page_before = request_thread_timeline_page_for_test_at_anchor(
         &processor,
         connection_id,
         &mut rx,
         root_thread_id,
         "clipermrootbefore0001",
+        "newest",
     )
     .await;
     let proxy = page_before
@@ -40243,12 +40639,13 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
     );
     drop(responses);
 
-    let page_after = request_thread_timeline_page_for_test(
+    let page_after = request_thread_timeline_page_for_test_at_anchor(
         &processor,
         connection_id,
         &mut rx,
         root_thread_id,
         "clipermrootafter00001",
+        "newest",
     )
     .await;
     assert!(
@@ -41823,6 +42220,13 @@ async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_
 async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_turn() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
+    let processor = Arc::new(processor);
+    let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(post_turn_calls.clone()),
+    )
+    .await;
     *cli_session.turn_liveness_probe.lock().await =
         Some(CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired);
     *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
@@ -41877,6 +42281,15 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
         .expect("turn lookup should succeed")
         .expect("turn should exist");
     assert_eq!(turn.status, TurnStatus::Completed);
+    processor
+        .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_turn_calls.lock().unwrap().len(),
+        1,
+        "snapshot completion runs the shared post-turn hook"
+    );
     assert!(
         processor
             .cli_runtime_command_heartbeats
@@ -42166,7 +42579,31 @@ async fn seed_cli_runtime_approval_turn_for_runtime(
     turn_id: &str,
     native_thread_id: &str,
 ) {
-    materialize_cli_runtime_approval_turn(crud_store, workspace_id, thread_id, turn_id).await;
+    seed_cli_runtime_turn_with_text(
+        crud_store,
+        workspace_id,
+        runtime_id,
+        runtime_kind,
+        thread_id,
+        turn_id,
+        native_thread_id,
+        "approval",
+    )
+    .await;
+}
+
+async fn seed_cli_runtime_turn_with_text(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+    thread_id: &str,
+    turn_id: &str,
+    native_thread_id: &str,
+    user_text: &str,
+) {
+    materialize_cli_runtime_turn_with_text(crud_store, workspace_id, thread_id, turn_id, user_text)
+        .await;
     persist_test_cli_execution_authorization_context(
         crud_store,
         workspace_id,
@@ -42223,6 +42660,23 @@ async fn materialize_cli_runtime_approval_turn(
     thread_id: &str,
     turn_id: &str,
 ) {
+    materialize_cli_runtime_turn_with_text(
+        crud_store,
+        workspace_id,
+        thread_id,
+        turn_id,
+        "approval",
+    )
+    .await;
+}
+
+async fn materialize_cli_runtime_turn_with_text(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    user_text: &str,
+) {
     ensure_test_superuser_execution_authority(crud_store).await;
     let execution_principal = authenticated_test_superuser();
     let now_secs = chrono::Utc::now().timestamp();
@@ -42267,7 +42721,7 @@ async fn materialize_cli_runtime_approval_turn(
             SandboxMode::FullAccess,
             &turn,
             &[UserInput::Text {
-                text: "approval".to_owned(),
+                text: user_text.to_owned(),
                 text_elements: Vec::new(),
             }],
             pioneer_protocol::PersistedActorRef::Principal(
@@ -48220,6 +48674,25 @@ async fn request_thread_timeline_page_for_test(
     thread_id: &str,
     request_id: &str,
 ) -> pioneer_protocol::ThreadTimelinePageResponse {
+    request_thread_timeline_page_for_test_at_anchor(
+        processor,
+        connection_id,
+        rx,
+        thread_id,
+        request_id,
+        "oldest",
+    )
+    .await
+}
+
+async fn request_thread_timeline_page_for_test_at_anchor(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    thread_id: &str,
+    request_id: &str,
+    anchor: &str,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
     processor
         .process_request_for_connection(
             connection_id,
@@ -48229,7 +48702,7 @@ async fn request_thread_timeline_page_for_test(
                 "method": "thread/timeline/page",
                 "params": {
                     "threadId": thread_id,
-                    "anchor": { "kind": "oldest" },
+                    "anchor": { "kind": anchor },
                     "limit": 100
                 }
             })
@@ -59688,6 +60161,8 @@ async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
         );
         assert!(configured.spec.parameters.is_object());
         assert!(!configured.spec.description.trim().is_empty());
+        assert!(configured.spec.description.contains("Current execution"));
+        assert!(configured.spec.description.contains("Unavailable scopes:"));
     }
     let search = bundle
         .specs
@@ -59778,6 +60253,111 @@ async fn memory_remember_tool_accepts_recurring_instruction_category() {
         Some("recurring_instruction.concise_direct_answers")
     );
 
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_namespace_update_and_cleanup_preserve_the_selected_record() {
+    let harness = setup_memory_gateway_harness("namespace_contract", true).await;
+    let tools = built_memory_tools(&harness, "namespace_contract").await;
+    let mut seeds = Vec::new();
+    for namespace in ["default", "project-a", "project-b"] {
+        seeds.push(
+            execute_memory_tool_payload(
+                &tools,
+                "memory_remember",
+                &format!("seed_{namespace}"),
+                json!({
+                    "scope": "thread", "namespace": namespace, "key": "baseline",
+                    "category": "project_fact", "content": format!("Original fact for {namespace}")
+                }),
+            )
+            .await,
+        );
+    }
+    let updated = execute_memory_tool_payload(
+        &tools,
+        "memory_remember",
+        "update_project_a",
+        json!({
+            "scope": "thread", "namespace": "project-a", "key": "baseline",
+            "category": "project_fact", "content": "Corrected project A fact"
+        }),
+    )
+    .await;
+    assert_eq!(updated["memoryId"], seeds[1]["memoryId"]);
+    assert_eq!(updated["namespace"], "project-a");
+    let listed = execute_memory_tool_payload(
+        &tools,
+        "memory_list",
+        "inventory_namespace",
+        json!({"scopes":["thread"]}),
+    )
+    .await;
+    assert_eq!(listed["records"].as_array().unwrap().len(), 3);
+    for (index, namespace) in ["default", "project-a", "project-b"].iter().enumerate() {
+        let record = execute_memory_tool_payload(
+            &tools,
+            "memory_get",
+            &format!("get_{namespace}"),
+            json!({
+                "scope":"thread", "namespace":namespace, "key":"baseline"
+            }),
+        )
+        .await;
+        assert_eq!(record["record"]["namespace"], *namespace);
+        assert_eq!(record["record"]["memoryId"], seeds[index]["memoryId"]);
+        assert_eq!(
+            record["record"]["content"],
+            if index == 1 {
+                json!("Corrected project A fact")
+            } else {
+                seeds[index]["content"].clone()
+            }
+        );
+        assert_eq!(record["record"]["recallEligibility"]["eligible"], true);
+    }
+    // Explicitly addressed correction must not silently move the record.
+    let error = execute_memory_tool_error(
+        &tools,
+        "memory_remember",
+        "wrong_namespace",
+        json!({
+            "memoryId": updated["memoryId"], "namespace":"project-b",
+            "category":"project_fact", "content":"Wrong namespace correction"
+        }),
+    )
+    .await;
+    assert!(matches!(error, ToolError::InvalidArguments(_)));
+    let forgotten = execute_memory_tool_payload(
+        &tools,
+        "memory_forget",
+        "cleanup_other_namespace",
+        json!({
+            "scope":"thread", "namespace":"project-b", "key":"baseline"
+        }),
+    )
+    .await;
+    assert_eq!(
+        forgotten["forgottenMemoryIds"],
+        json!([seeds[2]["memoryId"]])
+    );
+    let current = execute_memory_tool_payload(
+        &tools,
+        "memory_get",
+        "verify_updated_survives",
+        json!({"memoryId":updated["memoryId"]}),
+    )
+    .await;
+    assert_eq!(current["record"]["content"], "Corrected project A fact");
+    let default = execute_memory_tool_payload(
+        &tools,
+        "memory_get",
+        "verify_default_unchanged",
+        json!({"scope":"thread","key":"baseline"}),
+    )
+    .await;
+    assert_eq!(default["record"]["memoryId"], seeds[0]["memoryId"]);
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
@@ -60090,6 +60670,115 @@ async fn chat_mode_russian_remember_does_not_mutate_agent_memory_impl() {
         "chat mode must not persist memory dynamic tool calls"
     );
 
+    let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_owner_facts_survive_a_new_thread() {
+    use pioneer_memory::hooks::{AgentMemoryWriteProvider, MemoryManifestRequest};
+    let harness = setup_memory_gateway_harness("owner_cross_thread", true).await;
+    let first = built_memory_tools(&harness, "owner_first").await;
+    let second = built_memory_tools(&harness, "owner_second").await;
+    let provider =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
+
+    // Omit scope deliberately: personal and project facts must use their
+    // normal user/workspace defaults, not silently fall back to thread memory.
+    for (category, scope, key, content) in [
+        ("identity", "user", "user_name", "Меня зовут Александр."),
+        (
+            "project_fact",
+            "workspace",
+            "project_name",
+            "Проект называется Pioneer.",
+        ),
+    ] {
+        let remembered = execute_memory_tool_payload(
+            &first,
+            "memory_remember",
+            &format!("remember_{key}"),
+            json!({"category": category, "key": key, "content": content}),
+        )
+        .await;
+        assert_eq!(remembered.pointer("/scope/kind"), Some(&json!(scope)));
+        let recalled = execute_memory_tool_payload(
+            &second,
+            "memory_get",
+            &format!("get_{key}"),
+            json!({"scope": scope, "key": key}),
+        )
+        .await;
+        assert_eq!(recalled.pointer("/record/content"), Some(&json!(content)));
+        assert_eq!(
+            recalled.pointer("/record/provenance/source_thread_id"),
+            Some(&json!(
+                memory_tool_context(&harness, "owner_first").thread_id
+            )),
+        );
+        let recall = provider
+            .recall_memory(
+                memory_tool_context(&harness, "owner_second"),
+                MemoryRecallRequest {
+                    query: content.to_owned(),
+                    categories: Vec::new(),
+                    top_k: Some(5),
+                    max_chars: Some(1000),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            recall
+                .items
+                .iter()
+                .any(|item| json!(item.memory_id) == remembered["memoryId"])
+        );
+        let manifest = provider
+            .load_memory_manifest(
+                memory_tool_context(&harness, "owner_second"),
+                MemoryManifestRequest {
+                    max_items: 10,
+                    max_item_chars: 500,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .active
+                .iter()
+                .any(|item| json!(item.memory_id) == remembered["memoryId"])
+        );
+        let inventory = execute_memory_tool_payload(
+            &second,
+            "memory_list",
+            &format!("list_{key}"),
+            json!({"scopes": [scope]}),
+        )
+        .await;
+        assert!(
+            inventory["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| { record["memoryId"] == remembered["memoryId"] })
+        );
+        execute_memory_tool_payload(
+            &second,
+            "memory_forget",
+            &format!("forget_{key}"),
+            json!({"scope": scope, "key": key, "reason": "User requested forgetting"}),
+        )
+        .await;
+        let forgotten = execute_memory_tool_payload(
+            &first,
+            "memory_get",
+            &format!("get_forgotten_{key}"),
+            json!({"scope": scope, "key": key}),
+        )
+        .await;
+        assert_eq!(forgotten["record"], serde_json::Value::Null);
+    }
     let _ = std::fs::remove_dir_all(harness.runtime_home);
 }
 
@@ -60513,6 +61202,62 @@ async fn memory_tool_search_calls_memory_service_and_returns_filtered_hits() {
     assert!(hit.get("provenance").is_some());
 
     let _ = std::fs::remove_dir_all(harness.runtime_home);
+}
+
+#[tokio::test]
+async fn memory_tool_addressed_correction_preserves_generated_key_across_turns() {
+    let harness = setup_memory_gateway_harness("addressed_correction", true).await;
+    let first = built_memory_tools(&harness, "addressed_first").await;
+    let second = built_memory_tools(&harness, "addressed_second").await;
+    let seed = execute_memory_tool_payload(
+        &first,
+        "memory_remember",
+        "addressed_seed",
+        json!({"content":"User's name is Alexey.","category":"identity","scope":"user"}),
+    )
+    .await;
+    let id = seed["memoryId"].as_str().unwrap();
+    let read = execute_memory_tool_payload(
+        &second,
+        "memory_get",
+        "addressed_read",
+        json!({"memoryId":id}),
+    )
+    .await;
+    let key = read["record"]["key"].as_str().unwrap();
+    let updated = execute_memory_tool_payload(
+        &second,
+        "memory_remember",
+        "addressed_update",
+        json!({"memoryId":id,"content":"User's name is Alexander.","category":"identity"}),
+    )
+    .await;
+    let new_id = updated["memoryId"].as_str().unwrap();
+    assert_ne!(id, new_id);
+    let by_key = execute_memory_tool_payload(
+        &first,
+        "memory_get",
+        "addressed_key",
+        json!({"scope":"user","key":key}),
+    )
+    .await;
+    assert_eq!(by_key["record"]["memoryId"], new_id);
+    assert_eq!(by_key["record"]["content"], "User's name is Alexander.");
+    let _ = execute_memory_tool_error(
+        &second,
+        "memory_remember",
+        "addressed_wrong_key",
+        json!({"memoryId":new_id,"key":"different","content":"wrong","category":"identity"}),
+    )
+    .await;
+    let list = execute_memory_tool_payload(
+        &second,
+        "memory_list",
+        "addressed_inventory",
+        json!({"scopes":["user"]}),
+    )
+    .await;
+    assert_eq!(list["records"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

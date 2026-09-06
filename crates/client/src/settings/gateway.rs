@@ -468,6 +468,7 @@ mod tests {
 
     fn snapshot(keepawake: bool) -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings {
                 keepawake,
                 ..Default::default()

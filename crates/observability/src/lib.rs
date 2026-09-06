@@ -190,11 +190,24 @@ pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
 }
 
 pub fn init_tracing(sentry_enabled: bool) {
+    init_tracing_with_writer(sentry_enabled, std::io::stdout);
+}
+
+/// Initializes tracing while reserving stdout for a machine-readable protocol.
+pub fn init_tracing_to_stderr(sentry_enabled: bool) {
+    init_tracing_with_writer(sentry_enabled, std::io::stderr);
+}
+
+fn init_tracing_with_writer<W>(sentry_enabled: bool, make_writer: W)
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("rmcp::service", LevelFilter::WARN);
 
     let format_layer = tracing_subscriber::fmt::layer()
+        .with_writer(make_writer)
         .with_target(false)
         .without_time()
         .with_filter(filter.clone());

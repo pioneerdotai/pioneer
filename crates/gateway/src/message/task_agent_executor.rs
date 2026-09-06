@@ -1633,9 +1633,7 @@ impl TaskAgentExecutor {
             launch.model = Some(effective_model.model.clone());
             launch.model_provider = Some(effective_model.model_provider.clone());
         }
-        let normalized_composer_capabilities = if cli_runtime_backend.is_none()
-            && let Some(launch) = composer_launch.as_mut()
-        {
+        let normalized_composer_capabilities = if let Some(launch) = composer_launch.as_mut() {
             let normalized = processor
                 .normalize_turn_skill_capabilities(
                     context.workspace_id.as_str(),
@@ -1644,7 +1642,12 @@ impl TaskAgentExecutor {
                 .await
                 .map_err(|message| anyhow!(message))
                 .context("failed to normalize composer work capabilities")?;
-            launch.capabilities = normalized.execution.clone();
+            // Admission needs the expanded Skill IDs for every backend. CLI
+            // preparation still owns attachment presentation, so retain the
+            // original pack there until its own normalization/materialization.
+            if cli_runtime_backend.is_none() {
+                launch.capabilities = normalized.execution.clone();
+            }
             Some(normalized)
         } else {
             None
@@ -1872,7 +1875,10 @@ impl TaskAgentExecutor {
                 effective_model_provider.as_str(),
                 effective_model.model.as_str(),
                 child_execution_backend.as_ref(),
-                turn_params.capabilities.as_slice(),
+                normalized_composer_capabilities
+                    .as_ref()
+                    .map(|normalized| normalized.execution.as_slice())
+                    .unwrap_or(turn_params.capabilities.as_slice()),
                 &child_security_snapshot.permission_profile,
                 child_turn_id.as_str(),
             )
@@ -5953,12 +5959,7 @@ impl TaskAgentExecutor {
             )
             .await?;
         handle.block_run(Some(error), blocked_at).await?;
-        mark_task_run_occurrence_turn_blocked(
-            &processor,
-            &child_runtime.lineage,
-            "child_turn_blocked",
-        )
-        .await?;
+        mark_task_run_occurrence_turn_blocked(&processor, &child_runtime.lineage, reason).await?;
         Ok(())
     }
 
@@ -6454,21 +6455,12 @@ fn task_hook_runtime_context(
     parent: &TaskParentRuntimeContext,
     task_run_turn_kind: TaskRunTurnKind,
 ) -> AgentTurnHookRuntimeContext {
-    if task_attachment(task) == TaskAttachmentMode::Detached {
-        if task_run_turn_kind == TaskRunTurnKind::Review {
-            AgentTurnHookRuntimeContext::task_in_conversation(
-                task.id.clone(),
-                parent.parent_thread_id.clone(),
-            )
-        } else {
-            AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
-                task.id.clone(),
-                parent.parent_thread_id.clone(),
-            )
-        }
-    } else {
-        AgentTurnHookRuntimeContext::task(task.id.clone())
-    }
+    AgentTurnHookRuntimeContext::for_task_turn(
+        &task.id,
+        task_attachment(task),
+        task_run_turn_kind,
+        &parent.parent_thread_id,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

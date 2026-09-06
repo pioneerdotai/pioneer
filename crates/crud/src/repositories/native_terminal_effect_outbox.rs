@@ -156,6 +156,51 @@ pub async fn prepare<C: ConnectionTrait>(
     prepare_with_policy(db, prepared, now, true).await
 }
 
+/// A terminal adapter retries the same observed completion after reconnect.
+/// Its first durable hook snapshot wins; never refresh it from live settings.
+pub async fn post_turn_batch_exists<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    batch_id: &str,
+) -> Result<bool> {
+    Ok(native_terminal_effect_outbox::Entity::find_by_id(format!(
+        "{turn_id}:terminal-effect:post-turn"
+    ))
+    .filter(native_terminal_effect_outbox::Column::TurnId.eq(turn_id))
+    .filter(native_terminal_effect_outbox::Column::BatchId.eq(batch_id))
+    .filter(native_terminal_effect_outbox::Column::Status.ne(STATUS_SUPERSEDED))
+    .count(db)
+    .await?
+        != 0)
+}
+
+/// Called inside the writer transaction. Preserve unrelated cleanup obligations
+/// and recheck the read-side existence hint under the serialized writer.
+pub async fn prepare_post_turn_once<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedNativeTerminalEffectPreparation,
+    now: DateTimeWithTimeZone,
+) -> Result<()> {
+    let input = &prepared.preparation;
+    if input.effects.len() != 1
+        || input.effects[0].effect_kind != NativeTerminalEffectKind::PostTurnHook
+        || input.effects[0].effect_id != format!("{}:terminal-effect:post-turn", input.turn_id)
+    {
+        bail!("post-turn preparation requires exactly one canonical hook obligation");
+    }
+    if let Some(existing) =
+        native_terminal_effect_outbox::Entity::find_by_id(input.effects[0].effect_id.clone())
+            .one(db)
+            .await?
+    {
+        validate_existing_identity(&existing, input, &input.effects[0])?;
+        if existing.batch_id == input.batch_id && existing.status != STATUS_SUPERSEDED {
+            return Ok(());
+        }
+    }
+    prepare_with_policy(db, prepared, now, false).await
+}
+
 /// Merge a recovery-owned obligation without superseding a hook/cleanup plan
 /// already prepared by the live actor. This is used only inside the canonical
 /// recovery terminalization transaction.

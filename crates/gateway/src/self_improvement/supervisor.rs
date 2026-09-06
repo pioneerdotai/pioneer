@@ -34,16 +34,16 @@ use super::history::{
 };
 use super::learner::{
     ActiveSkillModelInput, LearnerReviewerClient, MAX_CHUNK_CONTRACT_ATTEMPTS,
-    MAX_LIFECYCLE_CONTRACT_ATTEMPTS, MAX_MODEL_INPUT_BYTES, MAX_MODEL_OUTPUT_TOKENS,
-    ModelCallResult, ModelCallUsage, ModelContractError, ModelContractErrorKind, ReviewDecision,
-    no_candidate_final_outcome, pre_review_skill_candidate_policy, reviewed_skill_final_outcome,
+    MAX_LIFECYCLE_CONTRACT_ATTEMPTS, MAX_MODEL_INPUT_BYTES, ModelCallResult, ModelCallUsage,
+    ModelContractError, ModelContractErrorKind, ReviewDecision, no_candidate_final_outcome,
+    pre_review_skill_candidate_policy, reviewed_skill_final_outcome,
 };
 use super::settings::{
     AuthoritativeSelfImprovementSettings, resolve_authoritative_settings_for_workspace,
 };
 use super::validation::AuthorizedAgentSkillTarget;
 
-const PIPELINE_CONTRACT_VERSION: &str = "self-improvement-v3";
+const PIPELINE_CONTRACT_VERSION: &str = "self-improvement-v4";
 const RUN_STATUS_PENDING: &str = "pending";
 const RUN_STATUS_RUNNING: &str = "running";
 const RUN_STATUS_FAILED: &str = "failed";
@@ -55,8 +55,6 @@ const MAX_CHUNK_STEPS_PER_WAKE: u32 = 2;
 const MAX_PROVIDER_CALLS_PER_WAKE: u32 = 6;
 const MAX_INPUT_TOKENS_PER_WAKE: u64 =
     MAX_PROVIDER_CALLS_PER_WAKE as u64 * MAX_MODEL_INPUT_BYTES as u64;
-const MAX_OUTPUT_TOKENS_PER_WAKE: u64 =
-    MAX_PROVIDER_CALLS_PER_WAKE as u64 * MAX_MODEL_OUTPUT_TOKENS as u64;
 const BUDGET_YIELD_RETRY_SECONDS: i64 = 1;
 const OVERDUE_RETRY_POLL_DELAY: Duration = Duration::from_secs(1);
 const MAX_CONCURRENT_WORKSPACES: usize = 4;
@@ -129,7 +127,11 @@ impl WakeBudget {
         Self {
             started_at: Instant::now(),
             chunk_steps: 0,
-            usage: ModelCallUsage::default(),
+            usage: ModelCallUsage {
+                provider_calls: 0,
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+            },
         }
     }
 
@@ -138,7 +140,6 @@ impl WakeBudget {
             && self.can_reserve(
                 MAX_CHUNK_CONTRACT_ATTEMPTS,
                 CHUNK_ANALYSIS_MAX_TOKEN_UPPER_BOUND as u64,
-                MAX_MODEL_OUTPUT_TOKENS as u64,
             )
             && self.remaining_wall_clock()
                 >= PROVIDER_CALL_TIMEOUT.saturating_mul(MAX_CHUNK_CONTRACT_ATTEMPTS)
@@ -148,7 +149,6 @@ impl WakeBudget {
         self.can_reserve(
             MAX_LIFECYCLE_CONTRACT_ATTEMPTS.saturating_mul(2),
             MAX_MODEL_INPUT_BYTES as u64,
-            MAX_MODEL_OUTPUT_TOKENS as u64,
         ) && self.remaining_wall_clock()
             >= PROVIDER_CALL_TIMEOUT
                 .saturating_mul(MAX_LIFECYCLE_CONTRACT_ATTEMPTS.saturating_mul(2))
@@ -156,32 +156,16 @@ impl WakeBudget {
 
     fn record_chunk_step(&mut self, usage: ModelCallUsage) -> Result<()> {
         self.chunk_steps = self.chunk_steps.saturating_add(1);
-        self.record_usage(
-            usage,
-            CHUNK_ANALYSIS_MAX_TOKEN_UPPER_BOUND as u64,
-            MAX_MODEL_OUTPUT_TOKENS as u64,
-        )
+        self.record_usage(usage, CHUNK_ANALYSIS_MAX_TOKEN_UPPER_BOUND as u64)
     }
 
     fn record_general_call(&mut self, usage: ModelCallUsage) -> Result<()> {
-        self.record_usage(
-            usage,
-            MAX_MODEL_INPUT_BYTES as u64,
-            MAX_MODEL_OUTPUT_TOKENS as u64,
-        )
+        self.record_usage(usage, MAX_MODEL_INPUT_BYTES as u64)
     }
 
-    fn record_usage(
-        &mut self,
-        usage: ModelCallUsage,
-        input_tokens_per_call: u64,
-        output_tokens_per_call: u64,
-    ) -> Result<()> {
+    fn record_usage(&mut self, usage: ModelCallUsage, input_tokens_per_call: u64) -> Result<()> {
         let charged_input = usage.input_tokens.unwrap_or_else(|| {
             input_tokens_per_call.saturating_mul(u64::from(usage.provider_calls))
-        });
-        let charged_output = usage.output_tokens.unwrap_or_else(|| {
-            output_tokens_per_call.saturating_mul(u64::from(usage.provider_calls))
         });
         self.usage.provider_calls = self
             .usage
@@ -193,27 +177,19 @@ impl WakeBudget {
                 .unwrap_or_default()
                 .saturating_add(charged_input),
         );
-        self.usage.output_tokens = Some(
-            self.usage
-                .output_tokens
-                .unwrap_or_default()
-                .saturating_add(charged_output),
-        );
+        self.usage.output_tokens = match (self.usage.output_tokens, usage.output_tokens) {
+            (Some(total), Some(tokens)) => Some(total.saturating_add(tokens)),
+            _ => None,
+        };
         if self.usage.provider_calls > MAX_PROVIDER_CALLS_PER_WAKE
             || self.usage.input_tokens.unwrap_or(u64::MAX) > MAX_INPUT_TOKENS_PER_WAKE
-            || self.usage.output_tokens.unwrap_or(u64::MAX) > MAX_OUTPUT_TOKENS_PER_WAKE
         {
             bail!("self-improvement provider usage exceeded the reserved wake budget");
         }
         Ok(())
     }
 
-    fn can_reserve(
-        &self,
-        provider_calls: u32,
-        input_tokens_per_call: u64,
-        output_tokens_per_call: u64,
-    ) -> bool {
+    fn can_reserve(&self, provider_calls: u32, input_tokens_per_call: u64) -> bool {
         self.usage
             .provider_calls
             .checked_add(provider_calls)
@@ -224,12 +200,6 @@ impl WakeBudget {
                 .unwrap_or_default()
                 .checked_add(input_tokens_per_call.saturating_mul(u64::from(provider_calls)))
                 .is_some_and(|tokens| tokens <= MAX_INPUT_TOKENS_PER_WAKE)
-            && self
-                .usage
-                .output_tokens
-                .unwrap_or_default()
-                .checked_add(output_tokens_per_call.saturating_mul(u64::from(provider_calls)))
-                .is_some_and(|tokens| tokens <= MAX_OUTPUT_TOKENS_PER_WAKE)
     }
 
     fn remaining_wall_clock(&self) -> Duration {
@@ -610,14 +580,18 @@ impl SelfImprovementSupervisor {
             effective_enabled: true,
             learner_provider: default_model.provider.clone(),
             learner_model: default_model.model.clone(),
+            learner_reasoning_effort: default_model.reasoning_effort.clone(),
             reviewer_provider: reviewer_model.provider.clone(),
             reviewer_model: reviewer_model.model.clone(),
+            reviewer_reasoning_effort: reviewer_model.reasoning_effort.clone(),
             pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
         };
         if run.learner_provider == authority.learner_provider
             && run.learner_model == authority.learner_model
+            && run.learner_reasoning_effort == authority.learner_reasoning_effort
             && run.reviewer_provider == authority.reviewer_provider
             && run.reviewer_model == authority.reviewer_model
+            && run.reviewer_reasoning_effort == authority.reviewer_reasoning_effort
             && run.pipeline_contract_version == authority.pipeline_contract_version
         {
             return Ok(());
@@ -636,8 +610,12 @@ impl SelfImprovementSupervisor {
                     matches!(current.status.as_str(), "completed" | "cancelled")
                         || (current.learner_provider == authority.learner_provider
                             && current.learner_model == authority.learner_model
+                            && current.learner_reasoning_effort
+                                == authority.learner_reasoning_effort
                             && current.reviewer_provider == authority.reviewer_provider
                             && current.reviewer_model == authority.reviewer_model
+                            && current.reviewer_reasoning_effort
+                                == authority.reviewer_reasoning_effort
                             && current.pipeline_contract_version
                                 == authority.pipeline_contract_version)
                 }) {
@@ -728,6 +706,21 @@ impl SelfImprovementSupervisor {
     }
 
     async fn process_workspace(&self, workspace_id: &str, now_unix: i64) -> Result<()> {
+        // At most 1,024 historical completion events per wake; the existing daily worker
+        // gradually discovers old history without a new job system or user-facing action.
+        for _ in 0..32 {
+            if self
+                .maintenance_store
+                .backfill_self_improvement_history(workspace_id)
+                .await?
+                == 0
+            {
+                break;
+            }
+        }
+        self.maintenance_store
+            .reconcile_self_improvement_history_cursor(workspace_id)
+            .await?;
         let state = self
             .maintenance_store
             .get_self_improvement_workspace_state(workspace_id)
@@ -794,8 +787,10 @@ impl SelfImprovementSupervisor {
                     source_upper_inclusive,
                     learner_provider: default_model.provider.clone(),
                     learner_model: default_model.model.clone(),
+                    learner_reasoning_effort: default_model.reasoning_effort.clone(),
                     reviewer_provider: reviewer_model.provider.clone(),
                     reviewer_model: reviewer_model.model.clone(),
+                    reviewer_reasoning_effort: reviewer_model.reasoning_effort.clone(),
                     pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
                 },
                 now_unix,
@@ -815,6 +810,12 @@ impl SelfImprovementSupervisor {
         now_unix: i64,
     ) -> Result<()> {
         if run.status == RUN_STATUS_FAILED {
+            if run.last_error.as_deref().is_some_and(|error| {
+                error == "provider_termination:model_output_token_limit"
+                    || error.starts_with("max_output_tokens:")
+            }) {
+                return Ok(());
+            }
             if !is_later_utc_date(run.updated_at_unix, now_unix)? {
                 return Ok(());
             }
@@ -1000,9 +1001,52 @@ impl SelfImprovementSupervisor {
             .maintenance_store
             .list_canonical_turn_events_for_self_improvement(&frozen_range)
             .await?;
-        let snapshot = build_model_safe_full_thread_snapshot(&frozen_range, canonical.as_slice())?;
+        let processed_history_date = self
+            .maintenance_store
+            .self_improvement_processed_history_date(&run.workspace_id)
+            .await?;
+        let mut snapshot =
+            build_model_safe_full_thread_snapshot(&frozen_range, canonical.as_slice())?;
+        if processed_history_date.is_some_and(|date| {
+            frozen_range
+                .anchors
+                .iter()
+                .any(|source| source.parent_turn_created_at_unix < date)
+        }) {
+            let recent = self
+                .maintenance_store
+                .recent_processed_self_improvement_sources(&run.workspace_id)
+                .await?;
+            if let (Some(first), Some(last)) = (recent.first(), recent.last()) {
+                let ids = recent
+                    .iter()
+                    .map(|source| source.turn_id.clone())
+                    .collect::<HashSet<_>>();
+                let context_range = SelfImprovementFrozenSourceRange::new(
+                    &run.workspace_id,
+                    first.id - 1,
+                    last.id,
+                    recent,
+                )?;
+                let records = self
+                    .maintenance_store
+                    .list_canonical_turn_events_for_self_improvement(&context_range)
+                    .await?;
+                let context = build_model_safe_full_thread_snapshot(&context_range, &records)?;
+                super::history::append_corroboration_context(&mut snapshot, context, &ids)?;
+            }
+        }
         let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())?;
         let mut analysis = ResumableHistoryAnalysis::restore(&run, chunks.as_slice())?;
+        for index in 0..analysis.next_chunk_index() {
+            if analysis.chunk_rejection_reason_code(index)?.is_some() {
+                return Err(run_execution_error(
+                    RunFailureDisposition::FailWithoutInfrastructureRetry,
+                    "model_contract",
+                    "legacy_checkpoint_contains_rejected_chunks",
+                ));
+            }
+        }
         info!(
             run_id = %run.id,
             workspace_id = %run.workspace_id,
@@ -1017,10 +1061,12 @@ impl SelfImprovementSupervisor {
         let default_model = GatewaySelfImprovementModelSelectionConfig {
             provider: run.learner_provider.clone(),
             model: run.learner_model.clone(),
+            reasoning_effort: run.learner_reasoning_effort.clone(),
         };
         let reviewer_model = GatewaySelfImprovementModelSelectionConfig {
             provider: run.reviewer_provider.clone(),
             model: run.reviewer_model.clone(),
+            reasoning_effort: run.reviewer_reasoning_effort.clone(),
         };
         let client = LearnerReviewerClient::new(
             self.provider_registry.as_ref(),
@@ -1051,19 +1097,6 @@ impl SelfImprovementSupervisor {
                     log_model_usage(&run, "chunk_analysis", result.usage);
                     wake_budget.record_chunk_step(result.usage)?;
                     analysis.record_validated(chunk, result.value)?;
-                }
-                Err(error) if is_chunk_contract_exhaustion(&error) => {
-                    log_model_usage(&run, "chunk_analysis", error.usage);
-                    wake_budget.record_chunk_step(error.usage)?;
-                    analysis.record_contract_rejected(chunk, error.reason_code)?;
-                    info!(
-                        run_id = %run.id,
-                        workspace_id = %run.workspace_id,
-                        chunk_index = chunk.chunk_index,
-                        chunk_fingerprint = %chunk.fingerprint,
-                        reason_code = error.reason_code,
-                        "self-improvement chunk contract exhausted"
-                    );
                 }
                 Err(error) => {
                     log_model_usage(&run, "chunk_analysis", error.usage);
@@ -1159,6 +1192,7 @@ impl SelfImprovementSupervisor {
         let active_inputs = active
             .iter()
             .map(|snapshot| ActiveSkillModelInput {
+                evidence_latest_at_unix: snapshot.lifecycle_evidence_latest_at_unix,
                 skill_id: snapshot.skill_id.to_string(),
                 version_id: snapshot.version.id.clone(),
                 rollback_parent_version_id: snapshot.version.parent_version_id.clone(),
@@ -1183,6 +1217,26 @@ impl SelfImprovementSupervisor {
         let prospective_skill_id = SkillId::new(generate_id(SKILL_ID_LEN))
             .context("generated an invalid Agent skill ID")?;
         let prospective_version_id = generate_id(SKILL_ID_LEN);
+        let temporal_context = super::learner::TemporalLearningContext {
+            // Backfill/discovery order is not chronology. Also protect the newer
+            // tasks in this same batch before the first completed run exists.
+            recent_task_started_at_unix: processed_history_date
+                .into_iter()
+                .chain(
+                    frozen_range
+                        .anchors
+                        .iter()
+                        .map(|source| source.parent_turn_created_at_unix),
+                )
+                .chain(
+                    active_inputs
+                        .iter()
+                        .filter_map(|skill| skill.evidence_latest_at_unix),
+                )
+                .max(),
+            active_skills: active_inputs.clone(),
+        };
+        let client = client.with_temporal_context(&temporal_context);
         let candidate = match self
             .lifecycle_contract_call_with_lease(&fence, &lease_clock, "synthesis", || {
                 client.synthesize_validated_candidate(
@@ -1223,27 +1277,6 @@ impl SelfImprovementSupervisor {
                         &run,
                         SelfImprovementFinalOutcome::NoChange {
                             reason: SelfImprovementNoChangeReason::HostValidationRejected,
-                            reason_codes: vec![error.reason_code.to_owned()],
-                        },
-                        lease_clock.now_unix(),
-                    )
-                    .await;
-            }
-            Err(error) if is_retryable_lifecycle_contract_error(&error) => {
-                log_model_usage(&run, "synthesis", error.usage);
-                wake_budget.record_general_call(error.usage)?;
-                info!(
-                    run_id = %run.id,
-                    workspace_id = %run.workspace_id,
-                    candidate_present = false,
-                    reason_code = error.reason_code,
-                    "self-improvement synthesis contract exhausted"
-                );
-                return self
-                    .finalize(
-                        &run,
-                        SelfImprovementFinalOutcome::NoChange {
-                            reason: SelfImprovementNoChangeReason::ModelContractRejected,
                             reason_codes: vec![error.reason_code.to_owned()],
                         },
                         lease_clock.now_unix(),
@@ -1297,26 +1330,6 @@ impl SelfImprovementSupervisor {
                                 &run,
                                 SelfImprovementFinalOutcome::NoChange {
                                     reason: SelfImprovementNoChangeReason::HostValidationRejected,
-                                    reason_codes: vec![error.reason_code.to_owned()],
-                                },
-                                lease_clock.now_unix(),
-                            )
-                            .await;
-                    }
-                    Err(error) if is_retryable_lifecycle_contract_error(&error) => {
-                        log_model_usage(&run, "review", error.usage);
-                        wake_budget.record_general_call(error.usage)?;
-                        info!(
-                            run_id = %run.id,
-                            workspace_id = %run.workspace_id,
-                            reason_code = error.reason_code,
-                            "self-improvement review contract exhausted"
-                        );
-                        return self
-                            .finalize(
-                                &run,
-                                SelfImprovementFinalOutcome::NoChange {
-                                    reason: SelfImprovementNoChangeReason::ModelContractRejected,
                                     reason_codes: vec![error.reason_code.to_owned()],
                                 },
                                 lease_clock.now_unix(),
@@ -1481,12 +1494,16 @@ impl SelfImprovementSupervisor {
             learner_model: current_default
                 .map(|model| model.model.clone())
                 .unwrap_or_default(),
+            learner_reasoning_effort: current_default
+                .and_then(|model| model.reasoning_effort.clone()),
             reviewer_provider: current_reviewer
                 .map(|model| model.provider.clone())
                 .unwrap_or_default(),
             reviewer_model: current_reviewer
                 .map(|model| model.model.clone())
                 .unwrap_or_default(),
+            reviewer_reasoning_effort: current_reviewer
+                .and_then(|model| model.reasoning_effort.clone()),
             pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
         };
         let result = self
@@ -1585,6 +1602,17 @@ fn model_contract_error(error: ModelContractError) -> anyhow::Error {
             error.reason_code,
         );
     }
+    if error.kind == ModelContractErrorKind::IncompleteResponse {
+        let disposition = if matches!(
+            error.reason_code,
+            "model_provider_error" | "model_response_cancelled" | "model_termination_unknown"
+        ) {
+            RunFailureDisposition::RetryInfrastructure
+        } else {
+            RunFailureDisposition::FailWithoutInfrastructureRetry
+        };
+        return run_execution_error(disposition, "provider_termination", error.reason_code);
+    }
     if error.kind == ModelContractErrorKind::ProviderUnavailable {
         return run_execution_error(
             RunFailureDisposition::FailWithoutInfrastructureRetry,
@@ -1599,16 +1627,6 @@ fn model_contract_error(error: ModelContractError) -> anyhow::Error {
     )
 }
 
-fn is_chunk_contract_exhaustion(error: &ModelContractError) -> bool {
-    error.stage == super::learner::ModelContractStage::ChunkAnalysis
-        && matches!(
-            error.kind,
-            ModelContractErrorKind::OutputTooLarge
-                | ModelContractErrorKind::MalformedJson
-                | ModelContractErrorKind::ContractRejected
-        )
-}
-
 fn is_retryable_lifecycle_contract_error(error: &ModelContractError) -> bool {
     matches!(
         error.kind,
@@ -1619,10 +1637,7 @@ fn is_retryable_lifecycle_contract_error(error: &ModelContractError) -> bool {
 }
 
 fn is_lifecycle_host_rejection(error: &ModelContractError) -> bool {
-    matches!(
-        error.kind,
-        ModelContractErrorKind::InputTooLarge | ModelContractErrorKind::HostValidationRejected
-    )
+    matches!(error.kind, ModelContractErrorKind::HostValidationRejected)
 }
 
 fn classify_execution_failure(error: &anyhow::Error) -> RunExecutionFailure {
@@ -1719,7 +1734,7 @@ fn next_supervisor_delay(now: DateTime<Utc>, retry_at_unix: Option<i64>) -> Dura
     daily.min(retry)
 }
 
-fn next_daily_utc_delay(now: DateTime<Utc>) -> Duration {
+pub(super) fn next_daily_utc_delay(now: DateTime<Utc>) -> Duration {
     let Some(next_date) = now.date_naive().succ_opt() else {
         return Duration::from_secs(24 * 60 * 60);
     };
@@ -1811,6 +1826,7 @@ mod tests {
 
     struct ScriptedLearningProvider {
         responses: StdMutex<VecDeque<String>>,
+        terminations: StdMutex<VecDeque<pioneer_provider::ProviderTermination>>,
         requests: StdMutex<Vec<ChatRequest>>,
     }
 
@@ -1872,6 +1888,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 responses: StdMutex::new(VecDeque::new()),
+                terminations: StdMutex::new(VecDeque::new()),
                 requests: StdMutex::new(Vec::new()),
             }
         }
@@ -1950,7 +1967,12 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
                 provider_replay_state: None,
-                termination: pioneer_provider::ProviderTermination::Complete,
+                termination: self
+                    .terminations
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(pioneer_provider::ProviderTermination::Complete),
                 tool_calls: Vec::new(),
             })
         }
@@ -2358,13 +2380,13 @@ mod tests {
             .database_connection()
             .execute_unprepared(
                 format!(
-                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    "UPDATE thread SET access_class = 'private' WHERE id = '{}'",
                     thread_id
                 )
                 .as_str(),
             )
             .await
-            .expect("self-improvement source fixture must be workspace-visible");
+            .expect("private source fixture must participate in workspace learning");
         let persisted = turn::Entity::find_by_id(turn_id)
             .one(&store.database_connection())
             .await
@@ -2442,8 +2464,10 @@ mod tests {
                     source_upper_inclusive: anchors.last().unwrap().id,
                     learner_provider: "learning".to_owned(),
                     learner_model: "learner".to_owned(),
+                    learner_reasoning_effort: None,
                     reviewer_provider: "learning".to_owned(),
                     reviewer_model: "reviewer".to_owned(),
+                    reviewer_reasoning_effort: None,
                     pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
                 },
                 ENABLED_AT + 4,
@@ -2646,10 +2670,7 @@ mod tests {
             RunFailureDisposition::LostAuthority
         );
 
-        for kind in [
-            ModelContractErrorKind::InputTooLarge,
-            ModelContractErrorKind::HostValidationRejected,
-        ] {
+        for kind in [ModelContractErrorKind::HostValidationRejected] {
             assert!(is_lifecycle_host_rejection(&ModelContractError {
                 stage: super::super::learner::ModelContractStage::Synthesis,
                 kind,
@@ -2714,12 +2735,24 @@ mod tests {
             "input-token exhaustion must prevent another provider call"
         );
 
-        let mut output_exhausted = WakeBudget::new();
-        output_exhausted.usage.output_tokens = Some(MAX_OUTPUT_TOKENS_PER_WAKE);
-        assert!(
-            !output_exhausted.can_start_chunk(),
-            "output-token exhaustion must prevent another provider call"
-        );
+        let mut output_unlimited = WakeBudget::new();
+        output_unlimited
+            .record_general_call(ModelCallUsage {
+                provider_calls: 1,
+                input_tokens: Some(10),
+                output_tokens: Some(1_000_000),
+            })
+            .expect("output usage is measured, not capped");
+        assert!(output_unlimited.can_start_chunk());
+        assert_eq!(output_unlimited.usage.output_tokens, Some(1_000_000));
+        output_unlimited
+            .record_general_call(ModelCallUsage {
+                provider_calls: 1,
+                input_tokens: Some(10),
+                output_tokens: None,
+            })
+            .unwrap();
+        assert!(output_unlimited.usage.output_tokens.is_none());
 
         let mut wall_clock_exhausted = WakeBudget::new();
         wall_clock_exhausted.started_at = Instant::now()
@@ -2755,12 +2788,23 @@ mod tests {
         let default_model = GatewaySelfImprovementModelSelectionConfig {
             provider: "learning".to_owned(),
             model: "model-a".to_owned(),
+            reasoning_effort: None,
         };
         let current = GatewaySelfImprovementConfig {
             enabled: true,
             default_model: Some(default_model.clone()),
             reviewer_model: None,
         };
+        let mut changed_reasoning = current.clone();
+        changed_reasoning
+            .default_model
+            .as_mut()
+            .unwrap()
+            .reasoning_effort = Some("high".to_owned());
+        assert!(settings_change_invalidates_execution(
+            &current,
+            &changed_reasoning
+        ));
         let explicit_same_reviewer = GatewaySelfImprovementConfig {
             enabled: true,
             default_model: Some(default_model.clone()),
@@ -2784,6 +2828,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "model-b".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             }
@@ -2796,6 +2841,7 @@ mod tests {
                 reviewer_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "reviewer".to_owned(),
                     model: "reviewer-model".to_owned(),
+                    reasoning_effort: None,
                 }),
             }
         ));
@@ -2879,6 +2925,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner-model".to_owned(),
+                    reasoning_effort: Some("high".to_owned()),
                 }),
                 reviewer_model: None,
             },
@@ -3053,6 +3100,16 @@ mod tests {
             .expect("run count must decode");
         assert_eq!(run_count, 1, "repeated wakes must reuse one logical row");
 
+        assert!(
+            learning_provider
+                .requests()
+                .iter()
+                .all(|request| request.max_tokens.is_none()
+                    && request.reasoning
+                        == Some(pioneer_provider::ReasoningConfig::effort(
+                            pioneer_protocol::ReasoningEffort::High
+                        )))
+        );
         let active = store
             .list_active_agent_skill_versions(WORKSPACE)
             .await
@@ -3229,6 +3286,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -3463,6 +3521,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                 provider: "blocking-learning".to_owned(),
                 model: "learner".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -3580,10 +3639,25 @@ mod tests {
             .expect("cancelled run count must exist")
             .try_get::<i64>("", "value")
             .expect("cancelled run count must decode");
+        let created = database
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS total, COUNT(DISTINCT workspace_id) AS workspaces FROM self_improvement_run".to_owned(),
+            ))
+            .await.expect("created runs must query").expect("aggregate must exist");
+        let total = created.try_get::<i64>("", "total").unwrap();
         assert_eq!(
-            cancelled_count,
-            workspace_ids.len() as i64,
-            "every workspace must own and cancel exactly its logical run as bounded slots drain"
+            cancelled_count, total,
+            "every created run must be cancelled when its owned branch is joined"
+        );
+        assert_eq!(
+            total,
+            created.try_get::<i64>("", "workspaces").unwrap(),
+            "bounded dispatch must not create duplicate workspace runs"
+        );
+        assert!(
+            (provider.request_count() as i64..=workspace_ids.len() as i64).contains(&total),
+            "every started provider call needs a run; a workspace disabled during discovery may have none"
         );
     }
 
@@ -3612,6 +3686,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                 provider: "learning".to_owned(),
                 model: "learner".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -3671,8 +3746,10 @@ mod tests {
                     source_upper_inclusive: blocked_sources[0].id,
                     learner_provider: "learning".to_owned(),
                     learner_model: "learner".to_owned(),
+                    learner_reasoning_effort: None,
                     reviewer_provider: "learning".to_owned(),
                     reviewer_model: "learner".to_owned(),
+                    reviewer_reasoning_effort: None,
                     pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
                 },
                 ENABLED_AT + 2,
@@ -3752,6 +3829,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                 provider: "workspace-selective-learning".to_owned(),
                 model: "learner".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -3897,6 +3975,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "releasable-learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -4011,6 +4090,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -4059,8 +4139,10 @@ mod tests {
                     source_upper_inclusive: source_upper,
                     learner_provider: "learning".to_owned(),
                     learner_model: "learner".to_owned(),
+                    learner_reasoning_effort: None,
                     reviewer_provider: "learning".to_owned(),
                     reviewer_model: "learner".to_owned(),
+                    reviewer_reasoning_effort: None,
                     pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
                 },
                 wake_at,
@@ -4115,6 +4197,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -4283,7 +4366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_chunk_exhaustion_becomes_a_terminal_no_change_range() {
+    async fn malformed_chunk_exhaustion_fails_without_advancing_workspace_cursor() {
         let (database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
         provider.set_responses([
@@ -4301,6 +4384,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -4337,13 +4421,13 @@ mod tests {
             completed
                 .try_get::<String>("", "status")
                 .expect("status must decode"),
-            "completed"
+            "failed"
         );
-        assert_eq!(
+        assert!(
             completed
-                .try_get::<String>("", "outcome")
-                .expect("outcome must decode"),
-            "no_change"
+                .try_get::<Option<String>>("", "outcome")
+                .unwrap()
+                .is_none()
         );
         assert!(
             completed
@@ -4364,12 +4448,12 @@ mod tests {
                 .expect("contract-exhausted state must query")
                 .expect("contract-exhausted state must exist")
                 .cursor_source_id,
-            1
+            0
         );
     }
 
     #[tokio::test]
-    async fn synthesis_review_contract_exhaustion_and_reviewer_rejection_are_terminal_no_change() {
+    async fn synthesis_review_errors_preserve_progress_while_reviewer_rejection_is_no_change() {
         for mode in ["synthesis_contract", "review_contract", "reviewer_reject"] {
             let (database, store, workspace_manager) = test_store().await;
             let provider = Arc::new(ScriptedLearningProvider::new());
@@ -4386,6 +4470,7 @@ mod tests {
                     default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                         provider: "learning".to_owned(),
                         model: "learner".to_owned(),
+                        reasoning_effort: None,
                     }),
                     reviewer_model: None,
                 },
@@ -4515,7 +4600,7 @@ mod tests {
                     .expect("contract workspace state")
                     .expect("contract workspace row")
                     .cursor_source_id,
-                upper
+                if mode == "reviewer_reject" { upper } else { 0 }
             );
             assert!(
                 store
@@ -4534,12 +4619,32 @@ mod tests {
                 .expect("contract run row");
             assert_eq!(
                 row.try_get::<String>("", "status").expect("status"),
-                "completed"
+                if mode == "reviewer_reject" {
+                    "completed"
+                } else {
+                    "failed"
+                }
             );
-            assert_eq!(
-                row.try_get::<String>("", "outcome").expect("outcome"),
-                "no_change"
-            );
+            if mode != "reviewer_reject" {
+                assert!(
+                    row.try_get::<Option<String>>("", "outcome")
+                        .unwrap()
+                        .is_none()
+                );
+                let failed = store
+                    .get_oldest_unresolved_self_improvement_run(WORKSPACE, 1)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(failed.analysis_cursor_json.is_some());
+                assert!(failed.analysis_digest_json.is_some());
+                assert_eq!(
+                    failed.last_error.as_deref(),
+                    Some("model_contract:malformed_model_json")
+                );
+                continue;
+            }
+            assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "no_change");
             let summary: serde_json::Value = serde_json::from_str(
                 row.try_get::<String>("", "result_summary")
                     .expect("result summary")
@@ -4551,7 +4656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_chunk_driver_resumes_after_rejected_middle_chunk_without_tail_loss() {
+    async fn multi_chunk_driver_retries_failed_middle_without_losing_prefix_or_tail() {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider(
@@ -4567,6 +4672,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -4630,10 +4736,10 @@ mod tests {
             "{malformed-middle".to_owned(),
             "{malformed-middle".to_owned(),
         ]);
-        for chunk_index in 2..chunks.len() {
+        for chunk_index in 1..chunks.len() {
             responses.push(
                 serde_json::json!({
-                    "digestRevision": u32::try_from(chunk_index)
+                    "digestRevision": u32::try_from(chunk_index + 1)
                         .expect("fixture revision must fit u32"),
                     "observations": []
                 })
@@ -4651,15 +4757,18 @@ mod tests {
             .await
             .expect("pending run must query")
             .expect("pending run must remain");
-        assert_eq!(pending.status, RUN_STATUS_PENDING);
-        assert_eq!(pending.attempt_count, 0, "budget yield is not a failure");
+        assert_eq!(pending.status, RUN_STATUS_FAILED);
+        assert_eq!(
+            pending.last_error.as_deref(),
+            Some("model_contract:malformed_model_json")
+        );
         let cursor = pending
             .analysis_cursor_json
             .as_deref()
             .expect("budget yield must preserve its exact cursor");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(cursor).expect("cursor must be valid JSON")["nextChunkIndex"],
-            serde_json::json!(2)
+            serde_json::json!(1)
         );
         let digest = pending
             .analysis_digest_json
@@ -4667,13 +4776,8 @@ mod tests {
             .expect("budget yield must preserve its bounded digest");
         let checkpoint = ResumableHistoryAnalysis::restore(&pending, chunks.as_slice())
             .expect("bounded checkpoint and exact deterministic plan must restore");
-        assert_eq!(checkpoint.next_chunk_index(), 2);
-        assert_eq!(
-            checkpoint
-                .chunk_rejection_reason_code(1)
-                .expect("middle chunk terminal marker must decode"),
-            Some("malformed_model_json")
-        );
+        assert_eq!(checkpoint.next_chunk_index(), 1);
+
         assert!(!digest.contains("malformed-middle"));
         assert!(!digest.contains(FINAL_TAIL));
         assert_eq!(
@@ -4682,9 +4786,8 @@ mod tests {
         );
 
         let run_id = pending.id.clone();
-        let mut wake_at = pending
-            .next_attempt_at_unix
-            .expect("budget yield must schedule the nearest wake");
+        // The next daily attempt resumes the same failed range, not a new run.
+        let mut wake_at = ENABLED_AT + 24 * 60 * 60;
         for _ in 0..chunks.len() {
             supervisor
                 .wake_once(wake_at)
@@ -4723,7 +4826,7 @@ mod tests {
             upper
         );
         let requests = provider.requests();
-        assert_eq!(requests.len(), chunks.len() + 2);
+        assert_eq!(requests.len(), chunks.len() + 3);
         let requested_chunk_indexes = requests
             .iter()
             .map(|request| {
@@ -4741,7 +4844,7 @@ mod tests {
                     .expect("chunk index must be present")
             })
             .collect::<Vec<_>>();
-        let mut expected_indexes = vec![0, 1, 1, 1];
+        let mut expected_indexes = vec![0, 1, 1, 1, 1];
         expected_indexes.extend(
             (2..chunks.len()).map(|index| u64::try_from(index).expect("fixture index must fit")),
         );
@@ -4761,191 +4864,248 @@ mod tests {
 
     #[tokio::test]
     async fn restart_after_checkpoint_repeats_only_the_uncommitted_chunk() {
-        let (database, store, workspace_manager) = test_store().await;
-        let provider = Arc::new(ScriptedLearningProvider::new());
-        let registry = Arc::new(ProviderRegistry::with_provider(
-            "learning",
-            provider.clone(),
-        ));
-        let supervisor = test_supervisor(
-            store.clone(),
-            registry,
-            workspace_manager,
-            GatewaySelfImprovementConfig {
-                enabled: true,
-                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
-                    provider: "learning".to_owned(),
-                    model: "learner".to_owned(),
-                }),
-                reviewer_model: None,
-            },
-            1024 * 1024,
-        );
-        supervisor
-            .reconcile_all(ENABLED_AT)
-            .await
-            .expect("workspace must activate");
-        let long_history = "checkpoint-crash ".repeat(
-            super::super::history::HISTORY_CHUNK_MAX_SERIALIZED_BYTES.saturating_mul(3) / 17,
-        );
-        project_completed_source_turn(
-            store.as_ref(),
-            "thread_checkpoint_crash",
-            "turn_checkpoint_crash",
-            long_history.as_str(),
-            ENABLED_AT + 1,
-        )
-        .await;
-
-        let state = store
-            .get_self_improvement_workspace_state(WORKSPACE)
-            .await
-            .expect("workspace state must query")
-            .expect("workspace state must exist");
-        let sources = store
-            .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
-            .await
-            .expect("checkpoint sources must query");
-        let upper = sources.last().expect("checkpoint source must exist").id;
-        let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
-            .expect("checkpoint range must freeze");
-        let canonical = store
-            .list_canonical_turn_events_for_self_improvement(&frozen)
-            .await
-            .expect("checkpoint canonical history must load");
-        let snapshot = build_model_safe_full_thread_snapshot(&frozen, canonical.as_slice())
-            .expect("checkpoint snapshot must build");
-        let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())
-            .expect("checkpoint chunks must plan");
-        assert!(chunks.len() > 1, "fixture must create multiple chunks");
-
-        provider.set_responses([serde_json::json!({
-            "digestRevision": 1,
-            "observations": []
-        })
-        .to_string()]);
-        supervisor
-            .wake_once(ENABLED_AT + 2)
-            .await
-            .expect("provider interruption must remain contained to the workspace");
-        let pending = store
-            .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
-            .await
-            .expect("interrupted run must query")
-            .expect("interrupted run must remain retryable");
-        assert_eq!(pending.status, RUN_STATUS_PENDING);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                pending
-                    .analysis_cursor_json
-                    .as_deref()
-                    .expect("first committed chunk must be checkpointed")
-            )
-            .expect("checkpoint cursor must decode")["nextChunkIndex"],
-            serde_json::json!(1)
-        );
-        let first_attempt = provider.requests();
-        assert_eq!(
-            first_attempt.len(),
-            2,
-            "the second provider call is the simulated uncommitted interruption"
-        );
-        let request_payload = |request: &ChatRequest| {
-            request
-                .messages
-                .iter()
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let committed_chunk_payload = request_payload(&first_attempt[0]);
-        let interrupted_chunk_payload = request_payload(&first_attempt[1]);
-        assert_ne!(committed_chunk_payload, interrupted_chunk_payload);
-
-        provider.set_responses((1..chunks.len()).map(|revision| {
-            serde_json::json!({
-                "digestRevision": u32::try_from(revision + 1)
-                    .expect("fixture revision must fit u32"),
-                "observations": []
-            })
-            .to_string()
-        }));
-        let run_id = pending.id.clone();
-        for _ in 0..=chunks.len() {
-            let current = store
-                .get_self_improvement_run(WORKSPACE, run_id.as_str())
-                .await
-                .expect("resumed run must query")
-                .expect("resumed run must exist");
-            if current.status == "completed" {
-                break;
-            }
+        for failure in ["transport", "length", "provider_error", "malformed"] {
+            let (database, store, workspace_manager) = test_store().await;
+            let provider = Arc::new(ScriptedLearningProvider::new());
+            let registry = Arc::new(ProviderRegistry::with_provider(
+                "learning",
+                provider.clone(),
+            ));
+            let supervisor = test_supervisor(
+                store.clone(),
+                registry,
+                workspace_manager,
+                GatewaySelfImprovementConfig {
+                    enabled: true,
+                    default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                        provider: "learning".to_owned(),
+                        model: "learner".to_owned(),
+                        reasoning_effort: None,
+                    }),
+                    reviewer_model: None,
+                },
+                1024 * 1024,
+            );
             supervisor
-                .wake_once(
-                    current
-                        .next_attempt_at_unix
-                        .unwrap_or(current.updated_at_unix.saturating_add(1)),
-                )
+                .reconcile_all(ENABLED_AT)
                 .await
-                .expect("resumed checkpoint wake must execute");
-        }
+                .expect("workspace must activate");
+            let long_history = "checkpoint-crash ".repeat(
+                super::super::history::HISTORY_CHUNK_MAX_SERIALIZED_BYTES.saturating_mul(3) / 17,
+            );
+            project_completed_source_turn(
+                store.as_ref(),
+                "thread_checkpoint_crash",
+                "turn_checkpoint_crash",
+                long_history.as_str(),
+                ENABLED_AT + 1,
+            )
+            .await;
 
-        let completed = store
-            .get_self_improvement_run(WORKSPACE, run_id.as_str())
-            .await
-            .expect("completed run must query")
-            .expect("completed run must exist");
-        assert_eq!(completed.status, "completed");
-        let all_requests = provider.requests();
-        assert_eq!(
-            all_requests.len(),
-            chunks.len() + 1,
-            "only the uncommitted provider call may repeat"
-        );
-        let all_payloads = all_requests.iter().map(request_payload).collect::<Vec<_>>();
-        assert_eq!(
-            all_payloads
-                .iter()
-                .filter(|payload| **payload == committed_chunk_payload)
-                .count(),
-            1,
-            "the committed prefix must never replay"
-        );
-        assert_eq!(
-            all_payloads
-                .iter()
-                .filter(|payload| **payload == interrupted_chunk_payload)
-                .count(),
-            2,
-            "only the last uncommitted chunk may be retried"
-        );
-        assert_eq!(
-            store
+            let state = store
                 .get_self_improvement_workspace_state(WORKSPACE)
                 .await
-                .expect("completed state must query")
-                .expect("completed state must exist")
-                .cursor_source_id,
-            upper
-        );
-        assert_eq!(
-            database
-                .query_one_raw(Statement::from_string(
-                    DatabaseBackend::Sqlite,
-                    "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
-                ))
+                .expect("workspace state must query")
+                .expect("workspace state must exist");
+            let sources = store
+                .list_self_improvement_source_turns_after(WORKSPACE, 0, ENABLED_AT, 10)
                 .await
-                .expect("run count must query")
-                .expect("run count must exist")
-                .try_get::<i64>("", "value")
-                .expect("run count must decode"),
-            1,
-            "restart must reuse the same frozen daily run"
-        );
+                .expect("checkpoint sources must query");
+            let upper = sources.last().expect("checkpoint source must exist").id;
+            let frozen = SelfImprovementFrozenSourceRange::new(WORKSPACE, 0, upper, sources)
+                .expect("checkpoint range must freeze");
+            let canonical = store
+                .list_canonical_turn_events_for_self_improvement(&frozen)
+                .await
+                .expect("checkpoint canonical history must load");
+            let snapshot = build_model_safe_full_thread_snapshot(&frozen, canonical.as_slice())
+                .expect("checkpoint snapshot must build");
+            let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())
+                .expect("checkpoint chunks must plan");
+            assert!(chunks.len() > 1, "fixture must create multiple chunks");
+
+            provider.set_responses([serde_json::json!({
+                "digestRevision": 1,
+                "observations": []
+            })
+            .to_string()]);
+
+            if failure != "transport" {
+                let mut responses =
+                    vec![serde_json::json!({"digestRevision":1,"observations":[]}).to_string()];
+                if failure == "malformed" {
+                    responses.extend(vec!["{malformed".to_owned(); 3]);
+                } else {
+                    responses.push(
+                        serde_json::json!({"digestRevision":2,"observations":[]}).to_string(),
+                    );
+                    provider.terminations.lock().unwrap().extend([
+                        pioneer_provider::ProviderTermination::Complete,
+                        if failure == "length" {
+                            pioneer_provider::ProviderTermination::Length
+                        } else {
+                            pioneer_provider::ProviderTermination::ProviderError
+                        },
+                    ]);
+                }
+                provider.set_responses(responses);
+            }
+            supervisor
+                .wake_once(ENABLED_AT + 2)
+                .await
+                .expect("provider interruption must remain contained to the workspace");
+            let pending = store
+                .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
+                .await
+                .expect("interrupted run must query")
+                .expect("interrupted run must remain retryable");
+            assert_eq!(
+                pending.status,
+                if matches!(failure, "length" | "malformed") {
+                    RUN_STATUS_FAILED
+                } else {
+                    RUN_STATUS_PENDING
+                }
+            );
+            if failure == "length" {
+                let count = provider.requests().len();
+                supervisor
+                    .wake_once(ENABLED_AT + 24 * 60 * 60)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    provider.requests().len(),
+                    count,
+                    "token exhaustion must not blindly retry next day"
+                );
+                assert_eq!(
+                    pending.last_error.as_deref(),
+                    Some("provider_termination:model_output_token_limit")
+                );
+            }
+            if matches!(failure, "length" | "malformed") {
+                // Explicit retry models operator recovery; it must retain the completed prefix.
+                assert_eq!(
+                    store
+                        .requeue_failed_self_improvement_run(&pending, ENABLED_AT + 3)
+                        .await
+                        .unwrap(),
+                    SelfImprovementRunMutationResult::Applied
+                );
+            }
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    pending
+                        .analysis_cursor_json
+                        .as_deref()
+                        .expect("first committed chunk must be checkpointed")
+                )
+                .expect("checkpoint cursor must decode")["nextChunkIndex"],
+                serde_json::json!(1)
+            );
+            let first_attempt = provider.requests();
+            assert_eq!(
+                first_attempt.len(),
+                if failure == "malformed" { 4 } else { 2 },
+                "the second provider call is the simulated uncommitted interruption"
+            );
+            let request_payload = |request: &ChatRequest| {
+                request
+                    .messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let committed_chunk_payload = request_payload(&first_attempt[0]);
+            let interrupted_chunk_payload = request_payload(&first_attempt[1]);
+            assert_ne!(committed_chunk_payload, interrupted_chunk_payload);
+
+            provider.set_responses((1..chunks.len()).map(|revision| {
+                serde_json::json!({
+                    "digestRevision": u32::try_from(revision + 1)
+                        .expect("fixture revision must fit u32"),
+                    "observations": []
+                })
+                .to_string()
+            }));
+            let run_id = pending.id.clone();
+            for _ in 0..=chunks.len() {
+                let current = store
+                    .get_self_improvement_run(WORKSPACE, run_id.as_str())
+                    .await
+                    .expect("resumed run must query")
+                    .expect("resumed run must exist");
+                if current.status == "completed" {
+                    break;
+                }
+                supervisor
+                    .wake_once(
+                        current
+                            .next_attempt_at_unix
+                            .unwrap_or(current.updated_at_unix.saturating_add(1)),
+                    )
+                    .await
+                    .expect("resumed checkpoint wake must execute");
+            }
+
+            let completed = store
+                .get_self_improvement_run(WORKSPACE, run_id.as_str())
+                .await
+                .expect("completed run must query")
+                .expect("completed run must exist");
+            assert_eq!(completed.status, "completed");
+            let all_requests = provider.requests();
+            assert_eq!(
+                all_requests.len(),
+                chunks.len() + if failure == "malformed" { 3 } else { 1 },
+                "only the uncommitted provider call may repeat"
+            );
+            let all_payloads = all_requests.iter().map(request_payload).collect::<Vec<_>>();
+            assert_eq!(
+                all_payloads
+                    .iter()
+                    .filter(|payload| **payload == committed_chunk_payload)
+                    .count(),
+                1,
+                "the committed prefix must never replay"
+            );
+            assert_eq!(
+                all_payloads
+                    .iter()
+                    .filter(|payload| **payload == interrupted_chunk_payload)
+                    .count(),
+                if failure == "malformed" { 4 } else { 2 },
+                "only the last uncommitted chunk may be retried"
+            );
+            assert_eq!(
+                store
+                    .get_self_improvement_workspace_state(WORKSPACE)
+                    .await
+                    .expect("completed state must query")
+                    .expect("completed state must exist")
+                    .cursor_source_id,
+                upper
+            );
+            assert_eq!(
+                database
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Sqlite,
+                        "SELECT COUNT(*) AS value FROM self_improvement_run".to_owned(),
+                    ))
+                    .await
+                    .expect("run count must query")
+                    .expect("run count must exist")
+                    .try_get::<i64>("", "value")
+                    .expect("run count must decode"),
+                1,
+                "restart must reuse the same frozen daily run"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn workspace_scoped_reconciliation_is_idempotent_and_reenable_baselines_disabled_history()
+    async fn workspace_scoped_reconciliation_is_idempotent_and_reenable_preserves_disabled_history()
     {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
@@ -4985,6 +5145,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                 provider: "learning".to_owned(),
                 model: "learner".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -4998,7 +5159,7 @@ mod tests {
             .expect("active state lookup must succeed")
             .expect("active state must exist");
         assert_eq!(first_epoch.activation_epoch, 1);
-        assert_eq!(first_epoch.cursor_source_id, 1);
+        assert_eq!(first_epoch.cursor_source_id, 0);
         assert_eq!(first_epoch.effective_enabled_at_unix, Some(ENABLED_AT + 1));
 
         let new_workspace = workspace_manager_for_new_workspace
@@ -5052,7 +5213,7 @@ mod tests {
             .expect("idempotent state must exist");
         assert_eq!(still_first_epoch.activation_epoch, 1);
         assert_eq!(
-            still_first_epoch.cursor_source_id, 1,
+            still_first_epoch.cursor_source_id, 0,
             "already-active reconciliation must not move the cursor"
         );
 
@@ -5094,8 +5255,8 @@ mod tests {
             .expect("re-enabled state must exist");
         assert_eq!(second_epoch.activation_epoch, 2);
         assert_eq!(
-            second_epoch.cursor_source_id, 3,
-            "active and disabled-window history must be baselined on re-enable"
+            second_epoch.cursor_source_id, 0,
+            "active and disabled-window history must remain available on re-enable"
         );
 
         project_completed_source_turn(
@@ -5106,7 +5267,7 @@ mod tests {
             ENABLED_AT + 5,
         )
         .await;
-        assert!(
+        assert_eq!(
             store
                 .list_self_improvement_source_turns_after(
                     WORKSPACE,
@@ -5118,8 +5279,9 @@ mod tests {
                 )
                 .await
                 .expect("late-projected source lookup must succeed")
-                .is_empty(),
-            "a turn completed while disabled must stay excluded even if projected after re-enable"
+                .len(),
+            4,
+            "late-projected history and disabled-window history must be included"
         );
 
         supervisor
@@ -5144,8 +5306,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_startup_reconciliation_baselines_the_uncertain_window() {
-        let (_database, store, workspace_manager) = test_store().await;
+    async fn late_old_history_receives_recent_completed_tasks_as_context_not_new_anchors() {
+        let (database, store, workspace_manager) = test_store().await;
+        let provider = Arc::new(ScriptedLearningProvider::new());
+        provider.set_responses([
+            r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+            r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+        ]);
+        let registry = Arc::new(ProviderRegistry::with_provider(
+            "learning",
+            provider.clone(),
+        ));
+        let supervisor = test_supervisor(
+            store.clone(),
+            registry,
+            workspace_manager,
+            GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "learning".into(),
+                    model: "learner".into(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            },
+            1024 * 1024,
+        );
+        supervisor.reconcile_all(ENABLED_AT).await.unwrap();
+        project_completed_source_turn(
+            &store,
+            "recent_thread",
+            "recent_turn",
+            "Deploy through CI.",
+            ENABLED_AT + 1,
+        )
+        .await;
+        database.execute_unprepared(&format!("UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'recent_turn'; UPDATE turn_event SET created_at = datetime({}, 'unixepoch') WHERE turn_id = 'recent_turn' AND event_type != 'turn/completed'", ENABLED_AT, ENABLED_AT)).await.unwrap();
+        supervisor.wake_once(ENABLED_AT + 10).await.unwrap();
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(
+            store
+                .self_improvement_processed_history_date(WORKSPACE)
+                .await
+                .unwrap(),
+            Some(ENABLED_AT)
+        );
+        project_completed_source_turn(
+            &store,
+            "old_thread",
+            "old_turn",
+            "Deploy manually.",
+            ENABLED_AT - 31_536_000,
+        )
+        .await;
+        database.execute_unprepared(&format!("UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'old_turn'; UPDATE turn_event SET created_at = datetime({}, 'unixepoch') WHERE turn_id = 'old_turn' AND event_type != 'turn/completed'", ENABLED_AT - 31_536_001, ENABLED_AT - 31_536_001)).await.unwrap();
+        supervisor.wake_once(ENABLED_AT + 86_400).await.unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let input: serde_json::Value = serde_json::from_str(
+            &requests[1]
+                .messages
+                .iter()
+                .find(|message| message.role == Role::User)
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        let threads = input["history"]["threads"].as_array().unwrap();
+        let turns = threads
+            .iter()
+            .flat_map(|thread| thread["turns"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        for (turn_id, role, date) in [
+            ("old_turn", "new_anchor", ENABLED_AT - 31_536_001),
+            ("recent_turn", "context_only", ENABLED_AT),
+        ] {
+            let turn = turns
+                .iter()
+                .find(|turn| turn["turn_id"] == turn_id)
+                .unwrap();
+            assert!(turn["blocks"].as_array().unwrap().iter().all(|block| {
+                block["evidence_role"] == role
+                    && block["event_created_at_unix"]
+                        .as_i64()
+                        .is_some_and(|value| (date..=date + 1).contains(&value))
+            }));
+        }
+        assert_eq!(
+            store
+                .self_improvement_processed_history_date(WORKSPACE)
+                .await
+                .unwrap(),
+            Some(ENABLED_AT)
+        );
+        assert!(
+            store
+                .list_active_agent_skill_versions(WORKSPACE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_startup_automatically_learns_pre_activation_history() {
+        let (database, store, workspace_manager) = test_store().await;
         project_completed_source_turn(
             store.as_ref(),
             "thread_uncertain_startup",
@@ -5154,6 +5419,11 @@ mod tests {
             ENABLED_AT,
         )
         .await;
+        // The old private-thread filter never indexed this otherwise valid completion.
+        database
+            .execute_unprepared("DELETE FROM self_improvement_source_turn")
+            .await
+            .expect("legacy missing source fixture must apply");
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider(
             "learning",
@@ -5168,6 +5438,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -5185,8 +5456,8 @@ mod tests {
             .expect("startup state must exist");
         assert_eq!(state.activation_epoch, 1);
         assert_eq!(
-            state.cursor_source_id, 1,
-            "uncertain-window history must enter the privacy-safe startup baseline"
+            state.cursor_source_id, 0,
+            "startup must preserve previously unprocessed workspace history"
         );
         assert_eq!(state.effective_enabled_at_unix, Some(ENABLED_AT + 1));
 
@@ -5195,16 +5466,16 @@ mod tests {
             .await
             .expect("post-reconciliation wake must be safe");
         assert!(
-            provider.requests().is_empty(),
-            "startup-baselined history must never be sent retroactively"
+            !provider.requests().is_empty(),
+            "old history must be learned without a separate user action"
         );
         assert!(
             store
-                .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
+                .get_latest_self_improvement_run(WORKSPACE, state.activation_epoch)
                 .await
                 .expect("startup run lookup must succeed")
-                .is_none(),
-            "startup baseline must not create a run"
+                .is_some(),
+            "historical learning must create a normal run"
         );
         assert!(
             supervisor
@@ -5316,6 +5587,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                 provider: "blocking-learning".to_owned(),
                 model: "learner".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -5482,6 +5754,7 @@ mod tests {
             default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                 provider: "learning-old".to_owned(),
                 model: "old-model".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -5538,6 +5811,7 @@ mod tests {
                     default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                         provider: "learning-new".to_owned(),
                         model: "new-model".to_owned(),
+                        reasoning_effort: None,
                     }),
                     reviewer_model: None,
                 },
@@ -5655,6 +5929,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "learning".to_owned(),
                     model: "learner".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -5701,8 +5976,10 @@ mod tests {
                     source_upper_inclusive: sources[0].id,
                     learner_provider: "learning".to_owned(),
                     learner_model: "learner".to_owned(),
+                    learner_reasoning_effort: None,
                     reviewer_provider: "learning".to_owned(),
                     reviewer_model: "learner".to_owned(),
+                    reviewer_reasoning_effort: None,
                     pipeline_contract_version: "self-improvement-v0".to_owned(),
                 },
                 ENABLED_AT + 2,
@@ -5953,6 +6230,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "local".to_owned(),
                     model: "local-model".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -5961,6 +6239,7 @@ mod tests {
                 default_model: Some(GatewaySelfImprovementModelSelectionConfig {
                     provider: "cli_runtime:codex".to_owned(),
                     model: "codex-model".to_owned(),
+                    reasoning_effort: None,
                 }),
                 reviewer_model: None,
             },
@@ -6010,5 +6289,123 @@ mod tests {
                 .expect("run count must decode");
             assert_eq!(run_count, 0);
         }
+    }
+    #[tokio::test]
+    async fn provider_timeout_preserves_checkpoint_and_reports_stage() {
+        let (_database, store, workspaces) = test_store().await;
+        let registry = Arc::new(ProviderRegistry::with_provider(
+            "learning",
+            Arc::new(ScriptedLearningProvider::new()),
+        ));
+        let desired = GatewaySelfImprovementConfig {
+            enabled: true,
+            default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                provider: "learning".to_owned(),
+                model: "learner".to_owned(),
+                reasoning_effort: None,
+            }),
+            reviewer_model: None,
+        };
+        let supervisor = test_supervisor(store.clone(), registry, workspaces, desired, 1024 * 1024);
+        supervisor.reconcile_all(ENABLED_AT).await.unwrap();
+        project_completed_source_turn(
+            &store,
+            "timeout-thread",
+            "timeout-turn",
+            "Completed source",
+            ENABLED_AT + 1,
+        )
+        .await;
+        let state = store
+            .get_self_improvement_workspace_state(WORKSPACE)
+            .await
+            .unwrap()
+            .unwrap();
+        let run = store
+            .create_or_get_self_improvement_run(
+                NewSelfImprovementRun {
+                    workspace_id: WORKSPACE.to_owned(),
+                    activation_epoch: state.activation_epoch,
+                    scheduled_date_utc: DateTime::<Utc>::from_timestamp(ENABLED_AT + 2, 0)
+                        .unwrap()
+                        .format("%Y-%m-%d")
+                        .to_string(),
+                    source_lower_exclusive: 0,
+                    source_upper_inclusive: 1,
+                    learner_provider: "learning".to_owned(),
+                    learner_model: "learner".to_owned(),
+                    learner_reasoning_effort: None,
+                    reviewer_provider: "learning".to_owned(),
+                    reviewer_model: "learner".to_owned(),
+                    reviewer_reasoning_effort: None,
+                    pipeline_contract_version: PIPELINE_CONTRACT_VERSION.to_owned(),
+                },
+                ENABLED_AT + 2,
+            )
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_available_self_improvement_run(
+                WORKSPACE,
+                &run.id,
+                state.activation_epoch,
+                "timeout-worker",
+                ENABLED_AT + 2,
+                ENABLED_AT + RUN_LEASE_SECONDS,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let fence = claimed.fence().unwrap();
+        let cursor = r#"{"nextChunkIndex":1}"#;
+        let digest = r#"{"validated":{"observations":[]}}"#;
+        store
+            .save_self_improvement_run_checkpoint(&fence, cursor, digest, ENABLED_AT + 2)
+            .await
+            .unwrap();
+        let clock = RunLeaseClock::new(ENABLED_AT + 2);
+        let entered = Notify::new();
+        let call = supervisor.provider_call_with_lease(&fence, &clock, "review", async {
+            entered.notify_one();
+            std::future::pending::<Result<()>>().await
+        });
+        tokio::pin!(call);
+        tokio::select! {
+            _ = entered.notified() => {},
+            _ = &mut call => panic!("provider must remain pending"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(PROVIDER_CALL_TIMEOUT + Duration::from_secs(1)).await;
+        let error = call.await.unwrap_err();
+        tokio::time::resume();
+        assert_eq!(
+            classify_execution_failure(&error).reason_code,
+            "review_timeout"
+        );
+        supervisor
+            .handle_execution_failure(&claimed, error, ENABLED_AT + 2, PROVIDER_CALL_TIMEOUT)
+            .await
+            .unwrap();
+        let pending = store
+            .get_self_improvement_run(WORKSPACE, &run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, RUN_STATUS_PENDING);
+        assert_eq!(
+            pending.last_error.as_deref(),
+            Some("provider_timeout:review_timeout")
+        );
+        assert_eq!(pending.analysis_cursor_json.as_deref(), Some(cursor));
+        assert_eq!(pending.analysis_digest_json.as_deref(), Some(digest));
+        assert_eq!(
+            store
+                .get_self_improvement_workspace_state(WORKSPACE)
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor_source_id,
+            0
+        );
     }
 }

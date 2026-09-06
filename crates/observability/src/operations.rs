@@ -726,6 +726,21 @@ pub enum GatewayOperationStage {
     AuthMePrincipalLoad,
     AuthMeAvatarLoad,
     ResilienceReadModelRepair,
+    ResilienceReadModelCheckpointLoad,
+    ResilienceReadModelCheckpointReset,
+    ResilienceReadModelFullScanBatchLoad,
+    ResilienceReadModelFullScanBatchEvaluate,
+    ResilienceReadModelFullScanBatchCommit,
+    ResilienceReadModelFullScanComplete,
+    ResilienceReadModelIncrementalBegin,
+    ResilienceReadModelIncrementalDirtyBatchLoad,
+    ResilienceReadModelIncrementalSourceBatchLoad,
+    ResilienceReadModelIncrementalBatchEvaluate,
+    ResilienceReadModelIncrementalBatchCommit,
+    ResilienceReadModelIncrementalComplete,
+    ResilienceReadModelRunningAttempts,
+    ResilienceReadModelTerminalTasks,
+    ResilienceReadModelTerminalRuns,
     ResilienceDeadlineBackfill,
     ResilienceAdmissionLeaseReconcile,
     ResilienceTaskRuntimeStart,
@@ -784,6 +799,29 @@ impl GatewayOperationStage {
             Self::AuthMePrincipalLoad => "principal.load",
             Self::AuthMeAvatarLoad => "avatar.load",
             Self::ResilienceReadModelRepair => "read_model.repair",
+            Self::ResilienceReadModelCheckpointLoad => "read_model.checkpoint.load",
+            Self::ResilienceReadModelCheckpointReset => "read_model.checkpoint.reset",
+            Self::ResilienceReadModelFullScanBatchLoad => "read_model.full_scan.batch.load",
+            Self::ResilienceReadModelFullScanBatchEvaluate => "read_model.full_scan.batch.evaluate",
+            Self::ResilienceReadModelFullScanBatchCommit => "read_model.full_scan.batch.commit",
+            Self::ResilienceReadModelFullScanComplete => "read_model.full_scan.complete",
+            Self::ResilienceReadModelIncrementalBegin => "read_model.incremental.begin",
+            Self::ResilienceReadModelIncrementalDirtyBatchLoad => {
+                "read_model.incremental.dirty_batch.load"
+            }
+            Self::ResilienceReadModelIncrementalSourceBatchLoad => {
+                "read_model.incremental.source_batch.load"
+            }
+            Self::ResilienceReadModelIncrementalBatchEvaluate => {
+                "read_model.incremental.batch.evaluate"
+            }
+            Self::ResilienceReadModelIncrementalBatchCommit => {
+                "read_model.incremental.batch.commit"
+            }
+            Self::ResilienceReadModelIncrementalComplete => "read_model.incremental.complete",
+            Self::ResilienceReadModelRunningAttempts => "read_model.running_attempts.repair",
+            Self::ResilienceReadModelTerminalTasks => "read_model.terminal_tasks.repair",
+            Self::ResilienceReadModelTerminalRuns => "read_model.terminal_runs.repair",
             Self::ResilienceDeadlineBackfill => "deadlines.backfill",
             Self::ResilienceAdmissionLeaseReconcile => "admission_leases.reconcile",
             Self::ResilienceTaskRuntimeStart => "task_runtime.start",
@@ -840,6 +878,9 @@ impl GatewayOperationStage {
 /// identifiers and request data are deliberately excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayOperationItemKind {
+    ReadModelRepairDetected,
+    ReadModelRepairRepaired,
+    ReadModelRepairRemaining,
     ThreadTreePersistedThreads,
     ThreadTreeRuntimeThreads,
     ThreadTreeReturnedThreads,
@@ -858,6 +899,9 @@ pub enum GatewayOperationItemKind {
 impl GatewayOperationItemKind {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::ReadModelRepairDetected => "read_model.repair.detected",
+            Self::ReadModelRepairRepaired => "read_model.repair.repaired",
+            Self::ReadModelRepairRemaining => "read_model.repair.remaining",
             Self::ThreadTreePersistedThreads => "thread_tree.threads.persisted",
             Self::ThreadTreeRuntimeThreads => "thread_tree.threads.runtime",
             Self::ThreadTreeReturnedThreads => "thread_tree.threads.returned",
@@ -878,6 +922,9 @@ impl GatewayOperationItemKind {
 
     const fn span_attribute(self) -> &'static str {
         match self {
+            Self::ReadModelRepairDetected => "read_model.repair.detected.count",
+            Self::ReadModelRepairRepaired => "read_model.repair.repaired.count",
+            Self::ReadModelRepairRemaining => "read_model.repair.remaining.count",
             Self::ThreadTreePersistedThreads => "thread_tree.threads.persisted.count",
             Self::ThreadTreeRuntimeThreads => "thread_tree.threads.runtime.count",
             Self::ThreadTreeReturnedThreads => "thread_tree.threads.returned.count",
@@ -909,6 +956,7 @@ struct GatewayOperationStageRecord {
     started_at: SystemTime,
     elapsed: Duration,
     outcome: OperationStageOutcome,
+    operations: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -961,6 +1009,7 @@ impl GatewayOperationTimeline {
         started_at: SystemTime,
         elapsed: Duration,
         outcome: OperationStageOutcome,
+        operations: Option<u64>,
     ) {
         let mut state = self.lock();
         if !state.finalized {
@@ -969,6 +1018,7 @@ impl GatewayOperationTimeline {
                 started_at,
                 elapsed,
                 outcome,
+                operations,
             });
         }
     }
@@ -1044,6 +1094,22 @@ impl GatewayOperationTrace {
         self.timeline.record_items(kind, count);
     }
 
+    pub fn record_stage_timing(
+        &self,
+        stage: GatewayOperationStage,
+        started_at: SystemTime,
+        elapsed: Duration,
+        operations: u64,
+    ) {
+        self.timeline.record_stage(
+            stage.as_str(),
+            started_at,
+            elapsed,
+            OperationStageOutcome::Ok,
+            Some(operations.max(1)),
+        );
+    }
+
     pub fn set_variant(&self, variant: GatewayOperationVariant) {
         self.timeline.set_variant(variant);
     }
@@ -1101,6 +1167,7 @@ impl GatewayOperationStageGuard {
             self.started_at,
             self.started_instant.elapsed(),
             outcome,
+            None,
         );
     }
 }
@@ -1212,6 +1279,12 @@ fn emit_gateway_operation(snapshot: &GatewayOperationSnapshot) {
             KeyValue::new("operation.stage", stage.name),
             KeyValue::new("outcome", stage.outcome.as_str()),
         ];
+        if let Some(operations) = stage.operations {
+            stage_attributes.push(KeyValue::new(
+                "operation.stage.occurrences",
+                i64::try_from(operations).unwrap_or(i64::MAX),
+            ));
+        }
         if let Some(variant) = snapshot.variant {
             stage_attributes.push(KeyValue::new("operation.variant", variant.as_str()));
         }
@@ -1264,6 +1337,10 @@ mod tests {
             GatewayOperationStage::DatabasePayloadCompression.as_str(),
             "payload.compress"
         );
+        assert_eq!(
+            GatewayOperationStage::ResilienceReadModelIncrementalBatchCommit.as_str(),
+            "read_model.incremental.batch.commit"
+        );
         assert_eq!(GatewayOperation::AuthMe.span_name(), "gateway.auth.me");
         assert_eq!(
             GatewayOperation::ThreadOpen.span_name(),
@@ -1294,6 +1371,10 @@ mod tests {
             "thread_timeline.blocks.returned.count"
         );
         assert_eq!(
+            GatewayOperationItemKind::ReadModelRepairRepaired.span_attribute(),
+            "read_model.repair.repaired.count"
+        );
+        assert_eq!(
             GatewayOperationStage::AuthMePrincipalLoad.as_str(),
             "principal.load"
         );
@@ -1315,6 +1396,25 @@ mod tests {
         assert_eq!(state.stages.len(), 2);
         assert_eq!(state.stages[0].outcome, OperationStageOutcome::Ok);
         assert_eq!(state.stages[1].outcome, OperationStageOutcome::Error);
+    }
+
+    #[test]
+    fn gateway_operation_records_aggregated_stage_occurrences() {
+        let trace = GatewayOperationTrace::start(GatewayOperation::ResilienceInitialize);
+        trace.record_stage_timing(
+            GatewayOperationStage::ResilienceReadModelFullScanBatchLoad,
+            std::time::SystemTime::UNIX_EPOCH,
+            std::time::Duration::from_millis(12),
+            3,
+        );
+        let timeline = trace.timeline.clone();
+
+        trace.finish_success();
+
+        let state = timeline.lock();
+        assert_eq!(state.stages.len(), 1);
+        assert_eq!(state.stages[0].operations, Some(3));
+        assert_eq!(state.stages[0].name, "read_model.full_scan.batch.load");
     }
 
     #[test]

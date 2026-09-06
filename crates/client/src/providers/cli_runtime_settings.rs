@@ -606,6 +606,7 @@ mod tests {
 
     fn snapshot(instances: Vec<GatewayCliRuntimeInstanceSettings>) -> GatewaySettingsSnapshot {
         GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
             self_improvement: Default::default(),

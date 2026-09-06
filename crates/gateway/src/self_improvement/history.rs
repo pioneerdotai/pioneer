@@ -20,7 +20,7 @@ pub(crate) const HISTORY_CHUNK_MAX_SERIALIZED_BYTES: usize =
     CHUNK_ANALYSIS_MAX_REQUEST_INPUT_BYTES - CHUNK_ANALYSIS_NON_HISTORY_RESERVE_BYTES;
 pub(crate) const HISTORY_CHUNK_MAX_TOKEN_UPPER_BOUND: usize =
     CHUNK_ANALYSIS_MAX_TOKEN_UPPER_BOUND - CHUNK_ANALYSIS_NON_HISTORY_TOKEN_RESERVE;
-const HISTORY_SCHEMA_VERSION: u32 = 2;
+const HISTORY_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HistoryChunkLimits {
@@ -90,6 +90,7 @@ pub(crate) enum SelfImprovementHistoryContent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SelfImprovementHistoryBlock {
+    pub event_created_at_unix: i64,
     pub block_key: String,
     pub event_id: String,
     pub event_thread_id: String,
@@ -439,6 +440,47 @@ pub(crate) fn build_model_safe_full_thread_snapshot(
         source_upper_inclusive,
         threads,
     })
+}
+
+/// Add only the selected completed exchanges, never an unfinished sibling or the
+/// entire historical thread. Existing frozen anchors retain their role and body.
+pub(crate) fn append_corroboration_context(
+    snapshot: &mut SelfImprovementHistorySnapshot,
+    context: SelfImprovementHistorySnapshot,
+    selected_turn_ids: &HashSet<String>,
+) -> Result<()> {
+    if snapshot.workspace_id != context.workspace_id {
+        bail!("corroboration context workspace mismatch");
+    }
+    let mut represented = snapshot
+        .threads
+        .iter()
+        .flat_map(|thread| thread.turns.iter())
+        .map(|turn| turn.turn_id.clone())
+        .collect::<HashSet<_>>();
+    for mut thread in context.threads {
+        thread.turns.retain(|turn| {
+            selected_turn_ids.contains(&turn.turn_id) && represented.insert(turn.turn_id.clone())
+        });
+        for turn in &mut thread.turns {
+            for block in &mut turn.blocks {
+                block.evidence_role = HistoryEvidenceRole::ContextOnly;
+            }
+        }
+        if thread.turns.is_empty() {
+            continue;
+        }
+        if let Some(existing) = snapshot
+            .threads
+            .iter_mut()
+            .find(|existing| existing.thread_id == thread.thread_id)
+        {
+            existing.turns.extend(thread.turns);
+        } else {
+            snapshot.threads.push(thread);
+        }
+    }
+    Ok(())
 }
 
 struct LogicalHistoryExchange {
@@ -1330,6 +1372,7 @@ fn block(
     content: SelfImprovementHistoryContent,
 ) -> SelfImprovementHistoryBlock {
     SelfImprovementHistoryBlock {
+        event_created_at_unix: record.created_at.timestamp(),
         block_key: input_index.map_or_else(
             || record.event_id.clone(),
             |index| format!("{}:input:{index}", record.event_id),
@@ -1813,6 +1856,35 @@ mod tests {
             Some(SelfImprovementHistoryContent::AssistantMessage { text, .. })
                 if text == "exact completed assistant message"
         ));
+    }
+
+    #[test]
+    fn corroboration_preserves_original_dates_and_never_becomes_a_new_anchor() {
+        let range = frozen_range(6, &[source(7, "turn_new", "new-terminal")]);
+        let records = history_records("secret");
+        let context = build_model_safe_full_thread_snapshot(&range, &records).unwrap();
+        let mut snapshot = context.clone();
+        snapshot.threads.clear();
+        let selected = HashSet::from(["turn_new".to_owned()]);
+        append_corroboration_context(&mut snapshot, context.clone(), &selected).unwrap();
+        append_corroboration_context(&mut snapshot, context.clone(), &selected).unwrap();
+        assert_eq!(snapshot.threads.len(), 1);
+        assert_eq!(snapshot.threads[0].turns.len(), 1);
+        for block in &snapshot.threads[0].turns[0].blocks {
+            assert_eq!(block.evidence_role, HistoryEvidenceRole::ContextOnly);
+            assert_eq!(
+                block.event_created_at_unix,
+                records
+                    .iter()
+                    .find(|record| record.event_id == block.event_id)
+                    .unwrap()
+                    .created_at
+                    .timestamp()
+            );
+        }
+        let mut foreign = context;
+        foreign.workspace_id = "another-workspace".into();
+        assert!(append_corroboration_context(&mut snapshot, foreign, &selected).is_err());
     }
 
     #[test]

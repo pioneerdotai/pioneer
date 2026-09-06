@@ -217,6 +217,7 @@ pub(crate) fn memory_recall_quality_signals_for_row(
         Err(_) => (Default::default(), false),
     };
     let audit = audit_memory_record_quality(&MemoryRecord {
+        recall_eligibility: None,
         id: row.id.clone(),
         scope: row.scope.clone(),
         namespace: Some(row.namespace.clone()),

@@ -1917,21 +1917,36 @@ pub fn cleanup_codex_generation_overlay(
     })
 }
 
-/// Recovers a stale Codex rollout path through the durable shared home used
-/// behind a generation overlay. An existing path needs no override because
-/// Codex should resume it by thread id. Once a generation has been removed,
-/// the lexical `CODEX_HOME/sessions` path is stale while the rollout itself is
-/// still present in the shared home, so the caller must explicitly resume the
-/// durable path.
+/// Resolves the selected rollout to durable storage. For a removed generation,
+/// restore only its storage alias: paginated Codex verifies the requested path
+/// against its persisted path and loads model context through that persisted
+/// path before opening the writer. Passing a different path alone is insufficient.
+/// The canonical override lets the resumed writer persist a durable path.
+/// Storage aliases must remain available for historical rollout references;
+/// they contain no process configuration, credentials, or MCP bootstrap state.
 pub fn recover_codex_stale_rollout_path(
     descriptor: &CodexGenerationOverlayDescriptor,
     persisted_path: &Path,
 ) -> Result<Option<PathBuf>, CodexShadowHomeError> {
     let persisted_path = normalize_absolute_codex_path(persisted_path)?;
+    let logical_thread_root = descriptor
+        .effective_home_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            CodexShadowHomeError::new("Codex generation overlay has no logical thread root")
+        })?;
+    if persisted_path.starts_with(&descriptor.managed_root_path)
+        && !persisted_path.starts_with(logical_thread_root)
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex rollout path is outside the logical thread overlay",
+        ));
+    }
     match fs::canonicalize(persisted_path.as_path()) {
         Ok(canonical_path) => {
             validate_codex_shared_rollout_path(descriptor, canonical_path.as_path())?;
-            return Ok(None);
+            return Ok(Some(canonical_path));
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
@@ -1943,13 +1958,6 @@ pub fn recover_codex_stale_rollout_path(
         }
     }
 
-    let logical_thread_root = descriptor
-        .effective_home_path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| {
-            CodexShadowHomeError::new("Codex generation overlay has no logical thread root")
-        })?;
     let relative = persisted_path
         .strip_prefix(logical_thread_root)
         .map_err(|_| {
@@ -1997,7 +2005,30 @@ pub fn recover_codex_stale_rollout_path(
             error,
         )
     })?;
-    validate_codex_shared_rollout_path(descriptor, canonical_path.as_path()).map(Some)
+    let canonical_path = validate_codex_shared_rollout_path(descriptor, canonical_path.as_path())?;
+    // Derive the alias only from the exact persisted generation path in this
+    // logical thread, never by searching rollouts by thread id or file name.
+    // Do not overwrite existing entries or follow symlinked parent directories.
+    let retired_overlay = logical_thread_root.join(boot).join(generation);
+    ensure_codex_directory_no_follow(retired_overlay.as_path(), true)?;
+    ensure_codex_shadow_symlink(
+        descriptor.shared_home_path.as_path(),
+        retired_overlay.as_path(),
+        storage,
+    )?;
+    let restored_path = fs::canonicalize(persisted_path.as_path()).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "verify restored Codex rollout alias",
+            persisted_path.as_path(),
+            error,
+        )
+    })?;
+    if restored_path != canonical_path {
+        return Err(CodexShadowHomeError::new(
+            "restored Codex rollout alias does not resolve to the selected shared rollout",
+        ));
+    }
+    Ok(Some(canonical_path))
 }
 
 fn validate_codex_shared_rollout_path(
@@ -11761,7 +11792,7 @@ while read line; do :; done
         assert_eq!(
             recover_codex_stale_rollout_path(&first, persisted_generation_path.as_path())
                 .expect("live generation path should validate"),
-            None,
+            Some(fs::canonicalize(shared_rollout.as_path()).expect("canonical shared rollout")),
         );
 
         cleanup_codex_generation_overlay(&first).expect("clean first overlay");
@@ -11777,6 +11808,24 @@ while read line; do :; done
                 .expect("stale generation path should rebase to shared storage"),
             Some(fs::canonicalize(shared_rollout.as_path()).expect("canonical shared rollout"))
         );
+        assert_eq!(
+            fs::canonicalize(&persisted_generation_path).expect("restored selected alias"),
+            fs::canonicalize(&shared_rollout).expect("durable rollout")
+        );
+        assert_eq!(
+            fs::read_dir(&first.effective_home_path)
+                .expect("retired generation")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("sessions")],
+            "recovery must not resurrect credentials, config, or MCP bootstrap"
+        );
+        assert_eq!(
+            recover_codex_stale_rollout_path(&second, &persisted_generation_path)
+                .expect("idempotent alias repair"),
+            recover_codex_stale_rollout_path(&second, &shared_rollout)
+                .expect("durable path needs no repair")
+        );
 
         let (_, other_thread) = codex_generation_app_server_process_config(
             &config,
@@ -11791,6 +11840,27 @@ while read line; do :; done
             error
                 .to_string()
                 .contains("outside the logical thread overlay")
+        );
+
+        // Never redirect an existing alias or create storage for an absent
+        // selected rollout. A missing file is not authority to choose another.
+        let absent = second.effective_home_path.join("sessions/missing.jsonl");
+        assert!(recover_codex_stale_rollout_path(&second, &absent).is_err());
+        let alias = first.effective_home_path.join("sessions");
+        fs::remove_file(&alias).expect("remove test alias");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        std::os::unix::fs::symlink(&outside, &alias).expect("conflicting alias");
+        assert!(recover_codex_stale_rollout_path(&second, &persisted_generation_path).is_err());
+        assert_eq!(fs::read_link(&alias).expect("preserved alias"), outside);
+        fs::remove_file(&alias).expect("remove conflicting test alias");
+        fs::remove_dir(&first.effective_home_path).expect("empty retired test directory");
+        std::os::unix::fs::symlink(&outside, &first.effective_home_path)
+            .expect("symlinked retired generation");
+        assert!(recover_codex_stale_rollout_path(&second, &persisted_generation_path).is_err());
+        assert_eq!(
+            fs::read_dir(&outside).expect("outside untouched").count(),
+            0
         );
 
         cleanup_codex_generation_overlay(&second).expect("clean second overlay");

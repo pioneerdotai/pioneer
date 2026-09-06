@@ -95,6 +95,13 @@ pub(crate) fn validate_authoritative_selections_for_workspace(
         let Some(selection) = selection else {
             continue;
         };
+        if selection
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|effort| pioneer_protocol::ReasoningEffort::from_str(effort).is_none())
+        {
+            anyhow::bail!("invalid self-improvement {field} reasoning effort");
+        }
         let provider = match workspace_id {
             Some(workspace_id) => provider_registry
                 .get_or_create_for_workspace(workspace_id, selection.provider.as_str()),
@@ -122,6 +129,10 @@ fn eligible_selection(
 ) -> bool {
     !selection.provider.trim().is_empty()
         && !selection.model.trim().is_empty()
+        && selection
+            .reasoning_effort
+            .as_deref()
+            .is_none_or(|effort| pioneer_protocol::ReasoningEffort::from_str(effort).is_some())
         && capabilities_for(selection.provider.as_str()).is_some_and(|capabilities| {
             model_provider_is_eligible(selection.provider.as_str(), &capabilities)
         })
@@ -144,6 +155,7 @@ mod tests {
         GatewaySelfImprovementModelSelectionConfig {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: None,
         }
     }
 

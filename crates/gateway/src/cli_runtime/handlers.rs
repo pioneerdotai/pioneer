@@ -5726,6 +5726,8 @@ impl MessageProcessor {
                     }
                 )
             });
+        self.prepare_cli_post_turn_hook(binding, generation, final_item.as_ref())
+            .await?;
         let Some(final_item) = final_item else {
             debug!(
                 workspace_id = binding.workspace_id.as_str(),

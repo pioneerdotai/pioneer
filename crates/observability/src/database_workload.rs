@@ -37,10 +37,11 @@ pub enum DatabaseWorkload {
     SkillsWatch,
     EpisodicMaintenance,
     ZstdMaintenance,
+    ProjectionReceiptCleanup,
 }
 
 impl DatabaseWorkload {
-    pub const CARDINALITY: usize = 17;
+    pub const CARDINALITY: usize = 18;
 
     const fn index(self) -> usize {
         match self {
@@ -61,6 +62,7 @@ impl DatabaseWorkload {
             Self::SkillsWatch => 14,
             Self::EpisodicMaintenance => 15,
             Self::ZstdMaintenance => 16,
+            Self::ProjectionReceiptCleanup => 17,
         }
     }
 
@@ -83,6 +85,7 @@ impl DatabaseWorkload {
             Self::SkillsWatch => "skills.watch",
             Self::EpisodicMaintenance => "episodic.maintenance",
             Self::ZstdMaintenance => "zstd.maintenance",
+            Self::ProjectionReceiptCleanup => "projection.receipt_cleanup",
         }
     }
 }
@@ -441,6 +444,7 @@ mod tests {
             DatabaseWorkload::SkillsWatch,
             DatabaseWorkload::EpisodicMaintenance,
             DatabaseWorkload::ZstdMaintenance,
+            DatabaseWorkload::ProjectionReceiptCleanup,
         ];
         assert_eq!(workloads.len(), DatabaseWorkload::CARDINALITY);
         assert_eq!(
@@ -463,6 +467,7 @@ mod tests {
                 "skills.watch",
                 "episodic.maintenance",
                 "zstd.maintenance",
+                "projection.receipt_cleanup",
             ]
         );
     }

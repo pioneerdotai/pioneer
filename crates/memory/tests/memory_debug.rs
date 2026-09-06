@@ -178,6 +178,7 @@ fn semantic_write_params(
         source_context_kind: Some(MemorySourceContextKind::DirectUserConversation),
         disposition: Some(disposition),
         client_provided_key: None,
+        target_memory_id: None,
         confidence: Some(0.95),
         importance: Some(0.7),
         metadata: BTreeMap::new(),

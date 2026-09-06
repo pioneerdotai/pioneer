@@ -195,9 +195,9 @@ impl RenderOnce for SelectorPopoverTrigger {
                         crate::qualification_diagnostics::spinner!(
                             pioneer_observability::AnimationSourceId::SharedModelSelector,
                         )
-                            .with_size(gpui_kit::component::Size::Small)
-                            .color(theme.muted_foreground)
-                            .into_any_element()
+                        .with_size(gpui_kit::component::Size::Small)
+                        .color(theme.muted_foreground)
+                        .into_any_element()
                     } else {
                         div()
                             .text_sm()
@@ -545,10 +545,7 @@ impl PioneerDesktop {
     fn reasoning_effort_rows(
         state: &ModelSelectorDialogState,
     ) -> Vec<provider_presentation::ReasoningEffortRow> {
-        if matches!(
-            state.mode,
-            ProviderModelSelectorMode::Transcription | ProviderModelSelectorMode::SelfImprovement
-        ) {
+        if matches!(state.mode, ProviderModelSelectorMode::Transcription) {
             return Vec::new();
         }
         let selector = state.selector.borrow();

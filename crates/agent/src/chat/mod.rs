@@ -47,9 +47,9 @@ use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_hooks::{
     HookActorKind, HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
-    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolErrorClass,
-    TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus, TurnPostTurnToolStatus,
-    TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolEventSummary,
+    TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput,
 };
 use pioneer_memory::hooks::{
     MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
@@ -102,8 +102,8 @@ use pioneer_tools::{
     RequestToolsResult, ToolErrorClass, ToolEventPayload, ToolLoopBudgetExceeded,
     ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction,
     ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressPreflightDecision, ToolOutcome,
-    ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController,
-    ToolRetryDecision, ToolRetryObservation, build_builtin_tools_with_security_snapshot,
+    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
+    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
     build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
@@ -409,6 +409,40 @@ fn apply_request_tools_results_to_visible_tools(
     added
 }
 
+fn record_requested_tool_names(names: &mut Vec<String>, results: &[ExecutedToolResult]) {
+    for result in results {
+        if let Some(request) = &result.request_tools_result {
+            names.extend(
+                request
+                    .added
+                    .values()
+                    .chain(request.already_visible.values())
+                    .flatten()
+                    .cloned(),
+            );
+        }
+    }
+    names.sort();
+    names.dedup();
+}
+
+fn restored_requested_tool_names(
+    context: Option<&ExecutionCheckpointContext>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Vec<String> {
+    context
+        .filter(|context| {
+            let payload = &context.payload;
+            payload.workspace_id == workspace_id
+                && payload.thread_id == thread_id
+                && payload.turn_id == turn_id
+        })
+        .map(|context| context.payload.requested_tool_names.clone())
+        .unwrap_or_default()
+}
+
 fn apply_review_required_tools_to_visible_tools(
     visible_tool_names: &mut Vec<String>,
     observations: &[ReviewRequiredTaskObservation],
@@ -494,6 +528,7 @@ fn append_text_fragment(target: &mut String, fragment: &str) {
 }
 
 fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnToolEventSummary {
+    let outcome = tooling::protocol_outcome_from_tool_outcome(&result.outcome);
     TurnPostTurnToolEventSummary {
         item_id: result.item_id.clone(),
         item_type: format!("{:?}", result.item_type),
@@ -504,8 +539,8 @@ fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnTool
         } else {
             TurnPostTurnToolStatus::Failed
         },
-        outcome_status: Some(post_turn_tool_outcome_status(result.outcome.status)),
-        error_class: result.outcome.error_class.map(post_turn_tool_error_class),
+        outcome_status: Some(post_turn_tool_outcome_status(outcome.status)),
+        error_class: outcome.error_class.map(post_turn_tool_error_class),
     }
 }
 
@@ -524,31 +559,7 @@ fn post_turn_domain_event_summary_from_tool(
     }
 }
 
-fn post_turn_tool_outcome_status(status: ToolOutcomeStatus) -> TurnPostTurnToolOutcomeStatus {
-    match status {
-        ToolOutcomeStatus::Ok => TurnPostTurnToolOutcomeStatus::Ok,
-        ToolOutcomeStatus::RecoverableError => TurnPostTurnToolOutcomeStatus::RecoverableError,
-        ToolOutcomeStatus::FatalError => TurnPostTurnToolOutcomeStatus::FatalError,
-        ToolOutcomeStatus::PartialSuccess => TurnPostTurnToolOutcomeStatus::PartialSuccess,
-    }
-}
-
-fn post_turn_tool_error_class(error_class: ToolErrorClass) -> TurnPostTurnToolErrorClass {
-    match error_class {
-        ToolErrorClass::InvalidArguments => TurnPostTurnToolErrorClass::InvalidArguments,
-        ToolErrorClass::NotFound => TurnPostTurnToolErrorClass::NotFound,
-        ToolErrorClass::ToolNotVisible => TurnPostTurnToolErrorClass::ToolNotVisible,
-        ToolErrorClass::PermissionDenied => TurnPostTurnToolErrorClass::PermissionDenied,
-        ToolErrorClass::CommandNotFound => TurnPostTurnToolErrorClass::CommandNotFound,
-        ToolErrorClass::Timeout => TurnPostTurnToolErrorClass::Timeout,
-        ToolErrorClass::Cancelled => TurnPostTurnToolErrorClass::Cancelled,
-        ToolErrorClass::ExecutionFailed => TurnPostTurnToolErrorClass::ExecutionFailed,
-        ToolErrorClass::NeedsNarrowing => TurnPostTurnToolErrorClass::NeedsNarrowing,
-        ToolErrorClass::Internal => TurnPostTurnToolErrorClass::Internal,
-        ToolErrorClass::OutputTruncated => TurnPostTurnToolErrorClass::OutputTruncated,
-        ToolErrorClass::Unknown => TurnPostTurnToolErrorClass::Unknown,
-    }
-}
+use crate::post_turn::{post_turn_tool_error_class, post_turn_tool_outcome_status};
 
 #[derive(Debug, Clone)]
 pub(super) enum ChatTurnError {
@@ -738,6 +749,7 @@ fn build_execution_window_continuation(
     exhausted_observed: Option<u64>,
     reason_code: &str,
     tool_no_progress: ExecutionCheckpointToolNoProgressState,
+    requested_tool_names: &[String],
 ) -> ExecutionWindowContinuation {
     let exhausted_window_id = execution_window_runtime_id(turn_id, stats.window_index);
     let checkpoint_id = execution_window_checkpoint_runtime_id(exhausted_window_id.as_str());
@@ -758,6 +770,7 @@ fn build_execution_window_continuation(
         Vec::new(),
     );
     payload.tool_no_progress = tool_no_progress;
+    payload.requested_tool_names = requested_tool_names.to_vec();
 
     ExecutionWindowContinuation {
         reason,
@@ -781,6 +794,7 @@ fn build_budget_execution_window_continuation(
     stats: &ChatExecutionWindowStats,
     budget_exceeded: &ToolLoopBudgetExceeded,
     tool_no_progress: ExecutionCheckpointToolNoProgressState,
+    requested_tool_names: &[String],
 ) -> ExecutionWindowContinuation {
     build_execution_window_continuation(
         workspace_id,
@@ -795,6 +809,7 @@ fn build_budget_execution_window_continuation(
         Some(u64::from(budget_exceeded.observed)),
         budget_exceeded.reason.code(),
         tool_no_progress,
+        requested_tool_names,
     )
 }
 
@@ -808,6 +823,7 @@ fn build_failure_execution_window_continuation(
     stats: &ChatExecutionWindowStats,
     error: &ChatTurnError,
     tool_no_progress: ExecutionCheckpointToolNoProgressState,
+    requested_tool_names: &[String],
 ) -> Option<ExecutionWindowContinuation> {
     let (reason, reason_code) = match error {
         ChatTurnError::ProviderFailure { .. } => (
@@ -830,6 +846,7 @@ fn build_failure_execution_window_continuation(
                 stats,
                 error,
                 tool_no_progress,
+                requested_tool_names,
             );
         }
     };
@@ -847,6 +864,7 @@ fn build_failure_execution_window_continuation(
         None,
         reason_code,
         tool_no_progress,
+        requested_tool_names,
     ))
 }
 
@@ -4104,8 +4122,18 @@ async fn execute_agent_provider_response(
     )
     .await;
 
-    let initial_visibility =
-        compute_agent_turn_final_visible_tools(router.as_ref(), &turn_preflight, &[]);
+    let mut requested_tool_names = restored_requested_tool_names(
+        execution_checkpoint_context.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+    );
+    let initial_visibility = compute_agent_turn_final_visible_tools(
+        router.as_ref(),
+        &turn_preflight,
+        &requested_tool_names,
+    );
+    requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
 
     warn_final_visible_tool_diagnostics(
         thread_id,
@@ -4574,6 +4602,7 @@ async fn execute_agent_provider_response(
                     &window_stats,
                     &budget_exceeded,
                     tool_no_progress_guard.checkpoint_state(),
+                    &requested_tool_names,
                 );
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
@@ -4961,6 +4990,7 @@ async fn execute_agent_provider_response(
                         &window_stats,
                         &budget_exceeded,
                         tool_no_progress_guard.checkpoint_state(),
+                        &requested_tool_names,
                     );
                     emit_execution_window_exhausted_and_checkpointed(
                         workspace_id,
@@ -6213,6 +6243,7 @@ async fn execute_agent_provider_response(
                 &executed_results,
                 router.as_ref(),
             );
+            record_requested_tool_names(&mut requested_tool_names, &executed_results);
 
             for result in &executed_results {
                 record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
@@ -6447,6 +6478,7 @@ async fn execute_agent_provider_response(
                 &window_stats,
                 &error,
                 tool_no_progress_guard.checkpoint_state(),
+                &requested_tool_names,
             ) {
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
@@ -7179,6 +7211,7 @@ mod tests {
                     details: Vec::new(),
                 },
                 tool_no_progress: Default::default(),
+                requested_tool_names: Vec::new(),
                 strict_obligations: Vec::new(),
             },
         }
@@ -7220,6 +7253,7 @@ mod tests {
             Some(1),
             "max_agent_rounds_per_window",
             state.clone(),
+            &[],
         );
 
         assert_eq!(continuation.checkpoint_payload.tool_no_progress, state);
@@ -8189,6 +8223,112 @@ mod tests {
                 visible.contains(&(*name).to_owned()),
                 "memory domain tool `{name}` must be visible next round"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn requested_tools_survive_checkpoint_roundtrip_and_revalidate_on_resume() {
+        let built = build_tools_with_extension_names(BuiltinToolDomain::Memory.tool_names());
+        let mut request = request_tools_result_for_added(
+            "memory",
+            ["memory_remember".to_owned(), "memory_forget".to_owned()],
+        );
+        request
+            .already_visible
+            .insert("memory".to_owned(), vec!["memory_get".to_owned()]);
+        let results = vec![request_tools_executed_result(request)];
+        let mut names = Vec::new();
+        super::record_requested_tool_names(&mut names, &results);
+        super::record_requested_tool_names(&mut names, &results);
+        assert_eq!(
+            names,
+            vec!["memory_forget", "memory_get", "memory_remember"]
+        );
+
+        for reason in [
+            ExecutionWindowExhaustionReason::ProviderFailureContinuation,
+            ExecutionWindowExhaustionReason::MaxAgentRoundsPerWindow,
+            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+        ] {
+            let continuation = build_execution_window_continuation(
+                "workspace",
+                "thread",
+                "turn",
+                &[],
+                "model",
+                "provider",
+                &ChatExecutionWindowStats::new(1),
+                reason,
+                None,
+                None,
+                "test",
+                Default::default(),
+                &names,
+            );
+            let bytes = serde_json::to_vec(&continuation.checkpoint_payload).unwrap();
+            let mut context = execution_checkpoint_context_fixture();
+            context.payload = serde_json::from_slice(&bytes).unwrap();
+            let restored =
+                super::restored_requested_tool_names(Some(&context), "workspace", "thread", "turn");
+            assert_eq!(restored, names);
+            for (workspace, thread, turn) in [
+                ("other", "thread", "turn"),
+                ("workspace", "other", "turn"),
+                ("workspace", "thread", "other"),
+            ] {
+                assert!(
+                    super::restored_requested_tool_names(Some(&context), workspace, thread, turn)
+                        .is_empty()
+                );
+            }
+            assert!(
+                super::restored_requested_tool_names(None, "workspace", "thread", "turn")
+                    .is_empty()
+            );
+            built
+                .router
+                .set_blocked_tool_names([("memory_forget".to_owned(), "revoked".to_owned())]);
+            let mut restored = restored;
+            restored.push("removed_tool".to_owned());
+            let visible = built
+                .router
+                .compute_final_visible_tools(&[], &[], &restored);
+            assert!(
+                visible
+                    .visible_tools
+                    .contains(&"memory_remember".to_owned())
+            );
+            assert!(visible.visible_tools.contains(&"memory_get".to_owned()));
+            assert!(!visible.visible_tools.contains(&"memory_forget".to_owned()));
+            assert!(!visible.visible_tools.contains(&"removed_tool".to_owned()));
+            built
+                .router
+                .set_model_visible_tools(&visible.visible_tools)
+                .await;
+            assert!(
+                built
+                    .router
+                    .model_visible_specs()
+                    .await
+                    .iter()
+                    .any(|spec| spec.name == "memory_remember")
+            );
+
+            for (name, allowed) in [("memory_remember", true), ("memory_forget", false)] {
+                let call = built
+                    .router
+                    .build_model_tool_call(pioneer_tools::RawToolCall {
+                        call_id: "restored_call".to_owned(),
+                        tool_name: name.to_owned(),
+                        arguments: "{}".to_owned(),
+                    })
+                    .await;
+                assert_eq!(call.is_ok(), allowed);
+            }
+            let mut old = serde_json::to_value(&context.payload).unwrap();
+            old.as_object_mut().unwrap().remove("requested_tool_names");
+            let old: ExecutionCheckpointPayload = serde_json::from_value(old).unwrap();
+            assert!(old.requested_tool_names.is_empty());
         }
     }
 

@@ -12,6 +12,8 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
+pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcome;
+
 pub use events::{
     AppendedTurnEvent, CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload, TurnWorkOwner,
 };
@@ -208,7 +210,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, warn};
 
 use crate::convention::{
@@ -459,8 +461,10 @@ pub struct NewSelfImprovementRun {
     pub source_upper_inclusive: i64,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
 }
 
@@ -480,8 +484,10 @@ pub struct SelfImprovementRunRecord {
     pub next_attempt_at_unix: Option<i64>,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
     pub analysis_cursor_json: Option<String>,
     pub analysis_digest_json: Option<String>,
@@ -507,8 +513,10 @@ pub struct SelfImprovementRunFence {
     pub claimed_by: String,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
 }
 
@@ -523,13 +531,24 @@ pub struct SelfImprovementFinalizationAuthority {
     pub effective_enabled: bool,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillEvidenceTime {
+    /// Oldest of the newest supporting message dates, one per selected observation.
+    pub confirmed_at_unix: i64,
+    /// Newest actual supporting message, never the time of learning/version creation.
+    pub latest_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedAgentSkillCreate {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
     pub skill_id: SkillId,
     pub version_id: String,
     pub slug: String,
@@ -545,6 +564,7 @@ pub struct AcceptedAgentSkillCreate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedAgentSkillUpdate {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
     pub skill_id: SkillId,
     pub expected_active_version_id: String,
     pub version_id: String,
@@ -562,6 +582,7 @@ pub struct AcceptedAgentSkillUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedAgentSkillRollback {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
     pub skill_id: SkillId,
     pub expected_active_version_id: String,
     pub target_parent_version_id: String,
@@ -631,6 +652,7 @@ pub enum FinalizeSelfImprovementRunResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSkillVersionRecord {
+    pub evidence_latest_at_unix: Option<i64>,
     pub id: String,
     pub version_number: i64,
     pub source_run_id: Option<String>,
@@ -648,6 +670,8 @@ pub struct AgentSkillVersionRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSkillVersionSnapshotRecord {
+    /// Latest evidence supporting the current lifecycle decision, including rollback.
+    pub lifecycle_evidence_latest_at_unix: Option<i64>,
     pub skill_id: SkillId,
     pub workspace_id: String,
     pub slug: String,
@@ -666,8 +690,10 @@ impl SelfImprovementRunRecord {
             claimed_by: self.claimed_by.clone()?,
             learner_provider: self.learner_provider.clone(),
             learner_model: self.learner_model.clone(),
+            learner_reasoning_effort: self.learner_reasoning_effort.clone(),
             reviewer_provider: self.reviewer_provider.clone(),
             reviewer_model: self.reviewer_model.clone(),
+            reviewer_reasoning_effort: self.reviewer_reasoning_effort.clone(),
             pipeline_contract_version: self.pipeline_contract_version.clone(),
         })
     }
@@ -1753,6 +1779,104 @@ pub struct RepairSummary {
     pub detected: usize,
     pub repaired: usize,
     pub remaining: usize,
+}
+
+/// Stable, bounded phases of deterministic read-model repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadModelRepairStage {
+    TerminalPayloadCheckpointLoad,
+    TerminalPayloadCheckpointReset,
+    TerminalPayloadFullScanBatchLoad,
+    TerminalPayloadFullScanBatchEvaluate,
+    TerminalPayloadFullScanBatchCommit,
+    TerminalPayloadFullScanComplete,
+    TerminalPayloadIncrementalBegin,
+    TerminalPayloadIncrementalDirtyBatchLoad,
+    TerminalPayloadIncrementalSourceBatchLoad,
+    TerminalPayloadIncrementalBatchEvaluate,
+    TerminalPayloadIncrementalBatchCommit,
+    TerminalPayloadIncrementalComplete,
+    TerminalTurnRunningAttempts,
+    TerminalTasksMissingCompletedAt,
+    TerminalRunsMissingCompletedAt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadModelRepairStageTiming {
+    pub stage: ReadModelRepairStage,
+    pub started_at: SystemTime,
+    pub duration: Duration,
+    pub operations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadModelRepairReport {
+    pub summary: RepairSummary,
+    pub stage_timings: Vec<ReadModelRepairStageTiming>,
+}
+
+#[derive(Debug)]
+struct ReadModelRepairStageAggregate {
+    started_at: SystemTime,
+    duration: Duration,
+    operations: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReadModelRepairTimings {
+    stages: BTreeMap<ReadModelRepairStage, ReadModelRepairStageAggregate>,
+}
+
+impl ReadModelRepairTimings {
+    async fn observe<T>(
+        &mut self,
+        stage: ReadModelRepairStage,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let started_at = SystemTime::now();
+        let started = Instant::now();
+        let result = operation.await;
+        self.record(stage, started_at, started.elapsed());
+        result
+    }
+
+    fn observe_sync<T>(
+        &mut self,
+        stage: ReadModelRepairStage,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let started_at = SystemTime::now();
+        let started = Instant::now();
+        let result = operation();
+        self.record(stage, started_at, started.elapsed());
+        result
+    }
+
+    fn record(&mut self, stage: ReadModelRepairStage, started_at: SystemTime, duration: Duration) {
+        self.stages
+            .entry(stage)
+            .and_modify(|aggregate| {
+                aggregate.duration = aggregate.duration.saturating_add(duration);
+                aggregate.operations = aggregate.operations.saturating_add(1);
+            })
+            .or_insert(ReadModelRepairStageAggregate {
+                started_at,
+                duration,
+                operations: 1,
+            });
+    }
+
+    fn into_stage_timings(self) -> Vec<ReadModelRepairStageTiming> {
+        self.stages
+            .into_iter()
+            .map(|(stage, aggregate)| ReadModelRepairStageTiming {
+                stage,
+                started_at: aggregate.started_at,
+                duration: aggregate.duration,
+                operations: aggregate.operations,
+            })
+            .collect()
+    }
 }
 
 const READ_MODEL_REPAIR_BATCH_SIZE: u64 = 32;
@@ -3085,6 +3209,28 @@ impl CrudStore {
         repositories::agent_skill::list_active_versions(&self.connection, workspace_id).await
     }
 
+    pub async fn self_improvement_processed_history_date(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<i64>> {
+        repositories::self_improvement_source_turn::processed_history_date(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn recent_processed_self_improvement_sources(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        repositories::self_improvement_source_turn::recent_processed_sources(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
     pub async fn get_agent_skill_version(
         &self,
         workspace_id: &str,
@@ -3172,24 +3318,10 @@ impl CrudStore {
                 return Err(error);
             }
 
-            let baseline_source_id = match repositories::self_improvement_source_turn::source_head(
-                &transaction,
-                workspace_id.as_str(),
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
             if let Err(error) =
                 repositories::self_improvement_workspace_state::activate_if_inactive(
                     &transaction,
                     workspace_id.as_str(),
-                    baseline_source_id,
                     effective_enabled_at,
                 )
                 .await
@@ -3307,6 +3439,121 @@ impl CrudStore {
             .await
     }
 
+    /// One bounded background discovery page. No LLM calls; canonical completions missing
+    /// from the old source index are restored through the normal source authority checks.
+    pub async fn backfill_self_improvement_history(&self, workspace_id: &str) -> Result<usize> {
+        let maintenance = self.with_maintenance_access();
+        let Some(mut state) = repositories::self_improvement_workspace_state::find(
+            &maintenance.connection,
+            workspace_id,
+        )
+        .await?
+        else {
+            return Ok(0);
+        };
+        if state.effective_enabled_at.is_none() || state.history_backfill_complete {
+            return Ok(0);
+        }
+        let events = repositories::self_improvement_history::discover(
+            &maintenance.connection,
+            workspace_id,
+            state.history_backfill_after_event_id.as_deref(),
+            32,
+        )
+        .await?;
+        let mut scanned = 0;
+        // Even an empty page commits a fenced completion marker. Each event gets a short
+        // atomic write; the writer is released between events and before parsing the next page.
+        for event in events
+            .iter()
+            .map(Some)
+            .chain(events.is_empty().then_some(None))
+        {
+            let applied = maintenance
+                .run_serialized_write(|| async {
+                    let transaction = maintenance.connection.begin().await?;
+                    let result =
+                        repositories::self_improvement_history::apply(&transaction, &state, event)
+                            .await;
+                    match result {
+                        Ok(applied) => {
+                            transaction.commit().await?;
+                            Ok(applied)
+                        }
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            Err(error)
+                        }
+                    }
+                })
+                .await?;
+            if !applied {
+                break;
+            }
+            if let Some(event) = event {
+                state.history_backfill_after_event_id = Some(event.id.clone());
+                scanned += 1;
+            }
+        }
+        Ok(scanned)
+    }
+
+    /// Recover sources skipped by the former activation baseline without replaying completed
+    /// run ranges. Unresolved runs retain their original frozen bounds and checkpoints.
+    pub async fn reconcile_self_improvement_history_cursor(
+        &self,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let maintenance = self.with_maintenance_access();
+        let Some(state) = repositories::self_improvement_workspace_state::find(
+            &maintenance.connection,
+            workspace_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        if state.effective_enabled_at.is_none() || state.cursor_source_id == 0 {
+            return Ok(());
+        }
+        let sources = repositories::self_improvement_source_turn::list_after_cursor(
+            &maintenance.connection,
+            workspace_id,
+            0,
+            0,
+            1,
+        )
+        .await?;
+        let Some(earliest) = sources
+            .first()
+            .map(|source| source.id)
+            .filter(|id| *id <= state.cursor_source_id)
+        else {
+            return Ok(());
+        };
+        maintenance
+            .run_serialized_write(|| async {
+                let transaction = maintenance.connection.begin().await?;
+                let result = repositories::self_improvement_history::rewind_idle(
+                    &transaction,
+                    &state,
+                    earliest,
+                )
+                .await;
+                match result {
+                    Ok(()) => {
+                        transaction.commit().await?;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            })
+            .await
+    }
+
     pub async fn list_self_improvement_source_turns_after(
         &self,
         workspace_id: &str,
@@ -3347,6 +3594,21 @@ impl CrudStore {
     ) -> Result<Vec<CanonicalTurnEventRecord>> {
         repositories::canonical_turn_event::list_for_frozen_range(&self.connection, frozen_range)
             .await
+    }
+
+    /// Read-only, workspace/activation-scoped summary source for the settings surface.
+    pub async fn get_latest_self_improvement_run(
+        &self,
+        workspace_id: &str,
+        activation_epoch: i64,
+    ) -> Result<Option<SelfImprovementRunRecord>> {
+        repositories::self_improvement_run::find_latest(
+            &self.connection,
+            workspace_id,
+            activation_epoch,
+        )
+        .await
+        .map(|run| run.map(repositories::self_improvement_run::record_from_model))
     }
 
     pub async fn get_self_improvement_run(
@@ -4084,6 +4346,74 @@ impl CrudStore {
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
+        .await
+    }
+
+    /// Performs at most one bounded receipt cleanup batch for one stream.
+    /// Discovery uses maintenance readers; only revalidation and deletion hold
+    /// the serialized writer. A persisted per-stream boundary makes restart safe.
+    pub async fn cleanup_projection_receipts_quantum(
+        &self,
+        after_turn_id: Option<&str>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
+        use repositories::projection_receipt_cleanup as cleanup;
+        self.run_background_database_quantum(|| async {
+            if !cleanup::backfill_ready(&self.connection).await? {
+                return Ok(ProjectionReceiptCleanupOutcome::default());
+            }
+            let mut outcome = ProjectionReceiptCleanupOutcome {
+                backfill_ready: true,
+                ..Default::default()
+            };
+            let Some(stream) = cleanup::next_stream(&self.connection, after_turn_id).await? else {
+                return Ok(outcome);
+            };
+            outcome.last_turn_id = Some(stream.turn_id.clone());
+            let prepared = match cleanup::prepare(&self.connection, stream).await {
+                Ok(prepared) => prepared,
+                Err(error) if is_anyhow_sqlite_lock(&error) => return Err(error),
+                Err(_) => {
+                    outcome.deferred = true;
+                    outcome.failed = true;
+                    return Ok(outcome);
+                }
+            };
+            outcome.deferred = prepared.deferred;
+            if prepared.is_empty() {
+                return Ok(outcome);
+            }
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin projection receipt cleanup quantum")?;
+            match cleanup::apply(&transaction, &prepared).await {
+                Ok(deleted) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit projection receipt cleanup quantum")?;
+                    outcome.rows_deleted = deleted;
+                    if deleted > 0 {
+                        outcome.source_bytes = prepared.source_bytes;
+                    } else {
+                        outcome.deferred = true;
+                    }
+                }
+                Err(error) => {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back projection receipt cleanup quantum")?;
+                    if is_anyhow_sqlite_lock(&error) {
+                        return Err(error);
+                    }
+                    outcome.deferred = true;
+                    outcome.failed = true;
+                }
+            }
+            Ok(outcome)
+        })
         .await
     }
 
@@ -7991,6 +8321,212 @@ impl CrudStore {
         .await
     }
 
+    /// Publish a prepared memory payload. The expected active ID fences the
+    /// read/put/publish gap: an INSERT race cannot attach B's frame to row A.
+    /// Supersession and replacement publication share this SQL-only transaction.
+    /// None means the active identity changed; the caller must reload/retry.
+    pub async fn publish_agent_memory_record(
+        &self,
+        record: NewAgentMemoryControlRecord,
+        expected_active_id: Option<String>,
+        supersedes: Option<String>,
+        canonical_identity: Option<pioneer_protocol::MemoryCanonicalKey>,
+        now_unix: i64,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        let memory_id = record
+            .id
+            .clone()
+            .context("memory publication requires an id")?;
+        let resolved = self.resolve_memory_scope(record.scope.clone()).await?;
+        let namespace = crate::memory::normalized_memory_namespace(record.namespace.as_deref())?;
+        let key = crate::memory::normalized_optional_memory_key(record.key.clone())?;
+        let event_kind = if expected_active_id.is_some() && supersedes.is_none() {
+            MEMORY_EVENT_UPDATED
+        } else {
+            MEMORY_EVENT_CREATED
+        };
+        let publication_event = agent_memory_event::prepare_memory_event(memory_event_for_record(
+            None,
+            memory_id.clone(),
+            resolved.workspace_id.clone(),
+            event_kind,
+            now_unix,
+        ));
+        let superseded_event = supersedes.as_ref().map(|id| {
+            agent_memory_event::prepare_memory_event(memory_event_for_record(
+                None,
+                id.clone(),
+                resolved.workspace_id.clone(),
+                MEMORY_EVENT_SUPERSEDED,
+                now_unix,
+            ))
+        });
+        self.run_serialized_write(|| {
+            let record = record.clone();
+            let resolved = resolved.clone();
+            let namespace = namespace.clone();
+            let key = key.clone();
+            let memory_id = memory_id.clone();
+            let expected_active_id = expected_active_id.clone();
+            let supersedes = supersedes.clone();
+            let publication_event = publication_event.clone();
+            let superseded_event = superseded_event.clone();
+            let canonical_identity = canonical_identity.clone();
+            async move {
+                let tx = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("begin memory publication")?;
+                // Only thread/task ownership is mutable state used by scope
+                // preparation. Revalidate it inside the publication boundary.
+                let current_workspace = match resolved.scope.kind {
+                    MemoryScopeKind::Thread => Some(
+                        pioneer_entity::thread::Entity::find_by_id(resolved.scope.key.clone())
+                            .one(&tx)
+                            .await?
+                            .context("memory thread disappeared")?
+                            .workspace_id,
+                    ),
+                    MemoryScopeKind::Task => Some(
+                        pioneer_entity::task::Entity::find_by_id(resolved.scope.key.clone())
+                            .one(&tx)
+                            .await?
+                            .context("memory task disappeared")?
+                            .workspace_id,
+                    ),
+                    _ => resolved.workspace_id.clone(),
+                };
+                if current_workspace != resolved.workspace_id {
+                    bail!("memory scope ownership changed during publication");
+                }
+                let current = if let Some(id) = supersedes.as_deref() {
+                    agent_memory::find_memory_by_id(&tx, id, false).await?
+                } else if let Some(key) = key.as_deref() {
+                    agent_memory::find_active_memory_by_scoped_key(&tx, &resolved, &namespace, key)
+                        .await?
+                } else if let Some(id) = expected_active_id.as_deref() {
+                    agent_memory::find_memory_by_id(&tx, id, false).await?
+                } else {
+                    None
+                };
+                if current.as_ref().map(|row| row.id.as_str()) != expected_active_id.as_deref() {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+                let now = unix_to_datetime(now_unix);
+                if let Some(old) = current.as_ref() {
+                    if old.scope_kind
+                        != crate::convention::memory_scope_kind_to_db(resolved.scope.kind)
+                        || old.scope_key_hash != resolved.scope_key_hash
+                        || old.workspace_id != resolved.workspace_id
+                    {
+                        bail!("memory replacement must retain its owning scope");
+                    }
+                }
+                if let Some(id) = supersedes.as_deref() {
+                    if expected_active_id.as_deref() != Some(id) {
+                        bail!("supersession must replace the expected active record");
+                    }
+                    agent_memory::mark_memory_superseded(&tx, id, &memory_id, now)
+                        .await?
+                        .context("superseded memory disappeared")?;
+                    agent_memory_event::append_prepared_memory_event(
+                        &tx,
+                        superseded_event.expect("supersession event"),
+                    )
+                    .await?;
+                }
+                let row = if supersedes.is_some() || key.is_none() {
+                    agent_memory::insert_memory_record(&tx, record, resolved.clone(), now).await?
+                } else {
+                    agent_memory::upsert_active_memory_record(&tx, record, resolved.clone(), now)
+                        .await?
+                };
+                if row.id != memory_id {
+                    bail!("memory publication identity mismatch");
+                }
+                if let Some(old_id) = supersedes.as_deref() {
+                    repositories::agent_memory_identity::transfer(&tx, old_id, &memory_id).await?;
+                }
+                if let Some(identity) = canonical_identity.as_ref() {
+                    repositories::agent_memory_identity::bind(
+                        &tx,
+                        &resolved,
+                        &identity.namespace,
+                        &identity.key,
+                        &memory_id,
+                    )
+                    .await?;
+                }
+                agent_memory_event::append_prepared_memory_event(&tx, publication_event).await?;
+                tx.commit().await.context("commit memory publication")?;
+                Ok(Some(crate::memory::agent_memory_control_record_from_model(
+                    row,
+                )?))
+            }
+        })
+        .await
+    }
+
+    pub async fn get_agent_memory_by_identity(
+        &self,
+        scope: MemoryScope,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<AgentMemoryControlRecord>> {
+        let resolved = self.resolve_memory_scope(scope).await?;
+        let namespace = crate::memory::normalized_memory_namespace(Some(namespace))?;
+        let key = crate::memory::normalized_memory_key(key)?;
+        let id = repositories::agent_memory_identity::lookup(
+            &self.connection,
+            &resolved,
+            &namespace,
+            &key,
+        )
+        .await?;
+        match id {
+            Some(id) => self.get_agent_memory_record(&id, false).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Bind an unchanged duplicate only while it is still the active target.
+    pub async fn bind_agent_memory_identity(
+        &self,
+        memory_id: &str,
+        identity: pioneer_protocol::MemoryCanonicalKey,
+    ) -> Result<()> {
+        let resolved = self.resolve_memory_scope(identity.scope.clone()).await?;
+        self.run_serialized_write(|| {
+            let resolved = resolved.clone();
+            let identity = identity.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                let row = agent_memory::find_memory_by_id(&tx, memory_id, false)
+                    .await?
+                    .context("identity target is no longer active")?;
+                if row.scope_kind != crate::convention::memory_scope_kind_to_db(resolved.scope.kind)
+                    || row.scope_key_hash != resolved.scope_key_hash
+                    || row.workspace_id != resolved.workspace_id
+                {
+                    bail!("identity target scope mismatch");
+                }
+                repositories::agent_memory_identity::bind(
+                    &tx,
+                    &resolved,
+                    &identity.namespace,
+                    &identity.key,
+                    memory_id,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
     pub async fn get_agent_memory_record(
         &self,
         memory_id: &str,
@@ -8114,6 +8650,28 @@ impl CrudStore {
         rows.into_iter()
             .map(crate::memory::agent_memory_control_record_from_model)
             .collect()
+    }
+
+    /// Read one bounded inventory page. The caller carries the last scanned
+    /// (created_at, id), including rows later hidden by payload/read policy.
+    pub async fn list_agent_memory_record_page(
+        &self,
+        filter: AgentMemoryListFilter,
+        before: Option<(i64, String)>,
+        now_unix: i64,
+    ) -> Result<Vec<AgentMemoryControlRecord>> {
+        let resolved = self.resolve_memory_scopes(filter.scopes.clone()).await?;
+        agent_memory::list_memory_record_page(
+            &self.connection,
+            filter,
+            resolved,
+            unix_to_datetime(now_unix),
+            before,
+        )
+        .await?
+        .into_iter()
+        .map(crate::memory::agent_memory_control_record_from_model)
+        .collect()
     }
 
     pub async fn mark_agent_memory_deleted(
@@ -16040,6 +16598,22 @@ impl CrudStore {
         Ok(inputs)
     }
 
+    pub async fn post_turn_tool_summaries(
+        &self,
+        turn_id: &str,
+        limit: usize,
+    ) -> Result<Vec<repositories::turn::PostTurnToolSummary>> {
+        turn::post_turn_tool_summaries(&self.connection, turn_id, limit).await
+    }
+
+    pub async fn post_turn_user_text(
+        &self,
+        turn_id: &str,
+        max_chars: usize,
+    ) -> Result<(String, bool)> {
+        turn::post_turn_user_text(&self.connection, turn_id, max_chars).await
+    }
+
     pub async fn get_turn_inputs_for_turns(
         &self,
         turn_ids: &[String],
@@ -21436,28 +22010,66 @@ WHERE id IN (SELECT event_id FROM candidates)
     }
 
     pub async fn repair_deterministic_read_model_violations(&self) -> Result<RepairSummary> {
-        let maintenance = self.with_maintenance_access();
-        let mut summary = RepairSummary::default();
-        summary.merge(maintenance.repair_terminal_turn_item_payloads().await?);
-        summary.merge(maintenance.repair_terminal_turn_running_attempts().await?);
-        summary.merge(
-            maintenance
-                .repair_terminal_tasks_missing_completed_at()
-                .await?,
-        );
-        summary.merge(
-            maintenance
-                .repair_terminal_runs_missing_completed_at()
-                .await?,
-        );
-        Ok(summary)
+        Ok(self
+            .repair_deterministic_read_model_violations_with_timings()
+            .await?
+            .summary)
     }
 
-    async fn repair_terminal_turn_item_payloads(&self) -> Result<RepairSummary> {
+    pub async fn repair_deterministic_read_model_violations_with_timings(
+        &self,
+    ) -> Result<ReadModelRepairReport> {
+        let maintenance = self.with_maintenance_access();
+        let mut timings = ReadModelRepairTimings::default();
         let mut summary = RepairSummary::default();
-        let checkpoint = self.ensure_terminal_payload_repair_checkpoint().await?;
+        summary.merge(
+            maintenance
+                .repair_terminal_turn_item_payloads(&mut timings)
+                .await?,
+        );
+        summary.merge(
+            timings
+                .observe(
+                    ReadModelRepairStage::TerminalTurnRunningAttempts,
+                    maintenance.repair_terminal_turn_running_attempts(),
+                )
+                .await?,
+        );
+        summary.merge(
+            timings
+                .observe(
+                    ReadModelRepairStage::TerminalTasksMissingCompletedAt,
+                    maintenance.repair_terminal_tasks_missing_completed_at(),
+                )
+                .await?,
+        );
+        summary.merge(
+            timings
+                .observe(
+                    ReadModelRepairStage::TerminalRunsMissingCompletedAt,
+                    maintenance.repair_terminal_runs_missing_completed_at(),
+                )
+                .await?,
+        );
+        Ok(ReadModelRepairReport {
+            summary,
+            stage_timings: timings.into_stage_timings(),
+        })
+    }
+
+    async fn repair_terminal_turn_item_payloads(
+        &self,
+        timings: &mut ReadModelRepairTimings,
+    ) -> Result<RepairSummary> {
+        let mut summary = RepairSummary::default();
+        let checkpoint = self
+            .ensure_terminal_payload_repair_checkpoint(timings)
+            .await?;
         if checkpoint.full_scan_status == read_model_repair::STATUS_RUNNING {
-            summary.merge(self.run_terminal_payload_full_scan(checkpoint).await?);
+            summary.merge(
+                self.run_terminal_payload_full_scan(checkpoint, timings)
+                    .await?,
+            );
         } else if checkpoint.full_scan_status != read_model_repair::STATUS_COMPLETED {
             bail!(
                 "unsupported read-model repair full-scan status `{}`",
@@ -21465,15 +22077,18 @@ WHERE id IN (SELECT event_id FROM candidates)
             );
         }
 
-        let checkpoint = self
-            .load_terminal_payload_repair_checkpoint()
+        let checkpoint = timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadCheckpointLoad,
+                self.load_terminal_payload_repair_checkpoint(),
+            )
             .await?
             .context("terminal payload repair checkpoint disappeared after full scan")?;
         let resumed_incremental =
             checkpoint.incremental_status == read_model_repair::STATUS_RUNNING;
         if resumed_incremental {
             summary.merge(
-                self.run_terminal_payload_incremental_pass(checkpoint)
+                self.run_terminal_payload_incremental_pass(checkpoint, timings)
                     .await?,
             );
         } else if checkpoint.incremental_status != read_model_repair::STATUS_COMPLETED {
@@ -21486,7 +22101,10 @@ WHERE id IN (SELECT event_id FROM candidates)
         // A crashed process may have left a pass whose high-watermark predates
         // later writes. Finish that pass first, then take one fresh snapshot in
         // the same startup so those writes do not wait for another restart.
-        summary.merge(self.start_terminal_payload_incremental_pass().await?);
+        summary.merge(
+            self.start_terminal_payload_incremental_pass(timings)
+                .await?,
+        );
         Ok(summary)
     }
 
@@ -21505,48 +22123,62 @@ WHERE id IN (SELECT event_id FROM candidates)
 
     async fn ensure_terminal_payload_repair_checkpoint(
         &self,
+        timings: &mut ReadModelRepairTimings,
     ) -> Result<read_model_repair::Checkpoint> {
-        let existing = self.load_terminal_payload_repair_checkpoint().await?;
+        let existing = timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadCheckpointLoad,
+                self.load_terminal_payload_repair_checkpoint(),
+            )
+            .await?;
         if existing.as_ref().is_some_and(|checkpoint| {
             checkpoint.algorithm_version == READ_MODEL_REPAIR_ALGORITHM_VERSION
         }) {
             return existing.context("checked read-model repair checkpoint is missing");
         }
 
-        self.run_background_database_quantum(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin read-model repair checkpoint transaction")?;
-            let high_watermark = pioneer_entity::turn_item::Entity::find()
-                .filter(pioneer_entity::turn_item::Column::Status.is_in([
-                    TURN_ITEM_STATUS_COMPLETED,
-                    TURN_ITEM_STATUS_FAILED,
-                    TURN_ITEM_STATUS_TIMED_OUT,
-                    TURN_ITEM_STATUS_CANCELLED,
-                ]))
-                .order_by_desc(pioneer_entity::turn_item::Column::Id)
-                .one(&transaction)
-                .await
-                .context("failed to load terminal turn_item repair high-watermark")?
-                .map(|row| row.id);
-            read_model_repair::reset_full_scan(
-                &transaction,
-                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                READ_MODEL_REPAIR_ALGORITHM_VERSION,
-                high_watermark.as_deref(),
+        timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadCheckpointReset,
+                self.run_background_database_quantum(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin read-model repair checkpoint transaction")?;
+                    let high_watermark = pioneer_entity::turn_item::Entity::find()
+                        .filter(pioneer_entity::turn_item::Column::Status.is_in([
+                            TURN_ITEM_STATUS_COMPLETED,
+                            TURN_ITEM_STATUS_FAILED,
+                            TURN_ITEM_STATUS_TIMED_OUT,
+                            TURN_ITEM_STATUS_CANCELLED,
+                        ]))
+                        .order_by_desc(pioneer_entity::turn_item::Column::Id)
+                        .one(&transaction)
+                        .await
+                        .context("failed to load terminal turn_item repair high-watermark")?
+                        .map(|row| row.id);
+                    read_model_repair::reset_full_scan(
+                        &transaction,
+                        read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                        READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                        high_watermark.as_deref(),
+                    )
+                    .await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit read-model repair checkpoint transaction")?;
+                    Ok(())
+                }),
             )
             .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit read-model repair checkpoint transaction")?;
-            Ok(())
-        })
-        .await?;
 
-        self.load_terminal_payload_repair_checkpoint()
+        timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadCheckpointLoad,
+                self.load_terminal_payload_repair_checkpoint(),
+            )
             .await?
             .context("initialized read-model repair checkpoint is missing")
     }
@@ -21554,30 +22186,35 @@ WHERE id IN (SELECT event_id FROM candidates)
     async fn run_terminal_payload_full_scan(
         &self,
         checkpoint: read_model_repair::Checkpoint,
+        timings: &mut ReadModelRepairTimings,
     ) -> Result<RepairSummary> {
         if checkpoint.algorithm_version != READ_MODEL_REPAIR_ALGORITHM_VERSION {
             bail!("cannot run terminal payload full scan for a stale algorithm version");
         }
         let Some(high_watermark) = checkpoint.full_scan_high_watermark_id else {
-            self.run_background_database_quantum(|| async {
-                let transaction = self
-                    .connection
-                    .begin()
-                    .await
-                    .context("failed to begin empty read-model full-scan completion")?;
-                read_model_repair::complete_full_scan(
-                    &transaction,
-                    read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                    READ_MODEL_REPAIR_ALGORITHM_VERSION,
+            timings
+                .observe(
+                    ReadModelRepairStage::TerminalPayloadFullScanComplete,
+                    self.run_background_database_quantum(|| async {
+                        let transaction = self
+                            .connection
+                            .begin()
+                            .await
+                            .context("failed to begin empty read-model full-scan completion")?;
+                        read_model_repair::complete_full_scan(
+                            &transaction,
+                            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                            READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                        )
+                        .await?;
+                        transaction
+                            .commit()
+                            .await
+                            .context("failed to commit empty read-model full scan")?;
+                        Ok(())
+                    }),
                 )
                 .await?;
-                transaction
-                    .commit()
-                    .await
-                    .context("failed to commit empty read-model full scan")?;
-                Ok(())
-            })
-            .await?;
             return Ok(RepairSummary::default());
         };
 
@@ -21586,32 +22223,35 @@ WHERE id IN (SELECT event_id FROM candidates)
         loop {
             let cursor_for_query = cursor.clone();
             let high_watermark_for_query = high_watermark.clone();
-            let rows = self
-                .run_background_database_quantum(|| {
-                    let cursor = cursor_for_query.clone();
-                    let high_watermark = high_watermark_for_query.clone();
-                    async move {
-                        let query = pioneer_entity::turn_item::Entity::find()
-                            .filter(pioneer_entity::turn_item::Column::Status.is_in([
-                                TURN_ITEM_STATUS_COMPLETED,
-                                TURN_ITEM_STATUS_FAILED,
-                                TURN_ITEM_STATUS_TIMED_OUT,
-                                TURN_ITEM_STATUS_CANCELLED,
-                            ]))
-                            .filter(pioneer_entity::turn_item::Column::Id.lte(high_watermark))
-                            .order_by_asc(pioneer_entity::turn_item::Column::Id)
-                            .limit(READ_MODEL_REPAIR_BATCH_SIZE);
-                        let query = if let Some(cursor) = cursor {
-                            query.filter(pioneer_entity::turn_item::Column::Id.gt(cursor))
-                        } else {
+            let rows = timings
+                .observe(
+                    ReadModelRepairStage::TerminalPayloadFullScanBatchLoad,
+                    self.run_background_database_quantum(|| {
+                        let cursor = cursor_for_query.clone();
+                        let high_watermark = high_watermark_for_query.clone();
+                        async move {
+                            let query = pioneer_entity::turn_item::Entity::find()
+                                .filter(pioneer_entity::turn_item::Column::Status.is_in([
+                                    TURN_ITEM_STATUS_COMPLETED,
+                                    TURN_ITEM_STATUS_FAILED,
+                                    TURN_ITEM_STATUS_TIMED_OUT,
+                                    TURN_ITEM_STATUS_CANCELLED,
+                                ]))
+                                .filter(pioneer_entity::turn_item::Column::Id.lte(high_watermark))
+                                .order_by_asc(pioneer_entity::turn_item::Column::Id)
+                                .limit(READ_MODEL_REPAIR_BATCH_SIZE);
+                            let query = if let Some(cursor) = cursor {
+                                query.filter(pioneer_entity::turn_item::Column::Id.gt(cursor))
+                            } else {
+                                query
+                            };
                             query
-                        };
-                        query
-                            .all(&self.connection)
-                            .await
-                            .context("failed to load terminal turn_item repair batch")
-                    }
-                })
+                                .all(&self.connection)
+                                .await
+                                .context("failed to load terminal turn_item repair batch")
+                        }
+                    }),
+                )
                 .await?;
             if rows.is_empty() {
                 break;
@@ -21623,42 +22263,49 @@ WHERE id IN (SELECT event_id FROM candidates)
 
             // JSON decoding and terminalization are deliberately outside the
             // database quantum so foreground requests can use SQLite.
-            let mut repairs = Vec::new();
-            for row in rows {
-                if let Some(payload_json) = repaired_terminal_turn_item_payload(&row)? {
-                    repairs.push((row, payload_json));
-                }
-            }
+            let repairs = timings.observe_sync(
+                ReadModelRepairStage::TerminalPayloadFullScanBatchEvaluate,
+                || {
+                    let mut repairs = Vec::new();
+                    for row in rows {
+                        if let Some(payload_json) = repaired_terminal_turn_item_payload(&row)? {
+                            repairs.push((row, payload_json));
+                        }
+                    }
+                    Ok(repairs)
+                },
+            )?;
             summary.detected = summary.detected.saturating_add(repairs.len());
 
             let repairs_for_write = repairs.clone();
             let cursor_for_write = next_cursor.clone();
-            let repaired = self
-                .run_background_database_quantum(|| {
-                    let repairs = repairs_for_write.clone();
-                    let cursor = cursor_for_write.clone();
-                    async move {
-                        let transaction =
-                            self.connection.begin().await.context(
+            let repaired = timings
+                .observe(
+                    ReadModelRepairStage::TerminalPayloadFullScanBatchCommit,
+                    self.run_background_database_quantum(|| {
+                        let repairs = repairs_for_write.clone();
+                        let cursor = cursor_for_write.clone();
+                        async move {
+                            let transaction = self.connection.begin().await.context(
                                 "failed to begin terminal turn_item full-scan transaction",
                             )?;
-                        let repaired = self
-                            .apply_terminal_turn_item_payload_repairs(&transaction, repairs)
+                            let repaired = self
+                                .apply_terminal_turn_item_payload_repairs(&transaction, repairs)
+                                .await?;
+                            read_model_repair::advance_full_scan_cursor(
+                                &transaction,
+                                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                                cursor.as_str(),
+                            )
                             .await?;
-                        read_model_repair::advance_full_scan_cursor(
-                            &transaction,
-                            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                            READ_MODEL_REPAIR_ALGORITHM_VERSION,
-                            cursor.as_str(),
-                        )
-                        .await?;
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit terminal turn_item full-scan transaction")?;
-                        Ok(repaired)
-                    }
-                })
+                            transaction.commit().await.context(
+                                "failed to commit terminal turn_item full-scan transaction",
+                            )?;
+                            Ok(repaired)
+                        }
+                    }),
+                )
                 .await?;
             summary.repaired = summary.repaired.saturating_add(repaired);
             summary.remaining = summary
@@ -21667,67 +22314,87 @@ WHERE id IN (SELECT event_id FROM candidates)
             cursor = Some(next_cursor);
         }
 
-        self.run_background_database_quantum(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin read-model full-scan completion")?;
-            read_model_repair::complete_full_scan(
-                &transaction,
-                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+        timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadFullScanComplete,
+                self.run_background_database_quantum(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin read-model full-scan completion")?;
+                    read_model_repair::complete_full_scan(
+                        &transaction,
+                        read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                        READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                    )
+                    .await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit read-model full-scan completion")?;
+                    Ok(())
+                }),
             )
             .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit read-model full-scan completion")?;
-            Ok(())
-        })
-        .await?;
         Ok(summary)
     }
 
-    async fn start_terminal_payload_incremental_pass(&self) -> Result<RepairSummary> {
-        let checkpoint = self
-            .load_terminal_payload_repair_checkpoint()
+    async fn start_terminal_payload_incremental_pass(
+        &self,
+        timings: &mut ReadModelRepairTimings,
+    ) -> Result<RepairSummary> {
+        let checkpoint = timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadCheckpointLoad,
+                self.load_terminal_payload_repair_checkpoint(),
+            )
             .await?
             .context("terminal payload repair checkpoint is missing")?;
         if checkpoint.incremental_status != read_model_repair::STATUS_COMPLETED {
             bail!("cannot start an incremental repair pass while another pass is running");
         }
-        self.run_background_database_quantum(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin incremental repair checkpoint transaction")?;
-            let high_watermark = read_model_repair::current_change_generation(&transaction).await?;
-            read_model_repair::begin_incremental_pass(
-                &transaction,
-                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                READ_MODEL_REPAIR_ALGORITHM_VERSION,
-                high_watermark,
+        timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadIncrementalBegin,
+                self.run_background_database_quantum(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin incremental repair checkpoint transaction")?;
+                    let high_watermark =
+                        read_model_repair::current_change_generation(&transaction).await?;
+                    read_model_repair::begin_incremental_pass(
+                        &transaction,
+                        read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                        READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                        high_watermark,
+                    )
+                    .await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit incremental repair checkpoint transaction")?;
+                    Ok(())
+                }),
             )
             .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit incremental repair checkpoint transaction")?;
-            Ok(())
-        })
-        .await?;
-        let checkpoint = self
-            .load_terminal_payload_repair_checkpoint()
+        let checkpoint = timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadCheckpointLoad,
+                self.load_terminal_payload_repair_checkpoint(),
+            )
             .await?
             .context("started incremental repair checkpoint is missing")?;
-        self.run_terminal_payload_incremental_pass(checkpoint).await
+        self.run_terminal_payload_incremental_pass(checkpoint, timings)
+            .await
     }
 
     async fn run_terminal_payload_incremental_pass(
         &self,
         checkpoint: read_model_repair::Checkpoint,
+        timings: &mut ReadModelRepairTimings,
     ) -> Result<RepairSummary> {
         if checkpoint.algorithm_version != READ_MODEL_REPAIR_ALGORITHM_VERSION
             || checkpoint.incremental_status != read_model_repair::STATUS_RUNNING
@@ -21743,16 +22410,19 @@ WHERE id IN (SELECT event_id FROM candidates)
         let mut summary = RepairSummary::default();
 
         loop {
-            let dirty_rows = self
-                .run_background_database_quantum(|| async {
-                    read_model_repair::list_dirty_turn_items(
-                        &self.connection,
-                        cursor,
-                        high_watermark,
-                        READ_MODEL_REPAIR_BATCH_SIZE,
-                    )
-                    .await
-                })
+            let dirty_rows = timings
+                .observe(
+                    ReadModelRepairStage::TerminalPayloadIncrementalDirtyBatchLoad,
+                    self.run_background_database_quantum(|| async {
+                        read_model_repair::list_dirty_turn_items(
+                            &self.connection,
+                            cursor,
+                            high_watermark,
+                            READ_MODEL_REPAIR_BATCH_SIZE,
+                        )
+                        .await
+                    }),
+                )
                 .await?;
             if dirty_rows.is_empty() {
                 break;
@@ -21765,97 +22435,109 @@ WHERE id IN (SELECT event_id FROM candidates)
                 .iter()
                 .map(|row| row.turn_item_id.clone())
                 .collect::<Vec<_>>();
-            let source_rows = self
-                .run_background_database_quantum(|| {
-                    let ids = ids.clone();
-                    async move {
-                        pioneer_entity::turn_item::Entity::find()
-                            .filter(pioneer_entity::turn_item::Column::Id.is_in(ids))
-                            .all(&self.connection)
-                            .await
-                            .context("failed to load dirty turn_items for incremental repair")
-                    }
-                })
+            let source_rows = timings
+                .observe(
+                    ReadModelRepairStage::TerminalPayloadIncrementalSourceBatchLoad,
+                    self.run_background_database_quantum(|| {
+                        let ids = ids.clone();
+                        async move {
+                            pioneer_entity::turn_item::Entity::find()
+                                .filter(pioneer_entity::turn_item::Column::Id.is_in(ids))
+                                .all(&self.connection)
+                                .await
+                                .context("failed to load dirty turn_items for incremental repair")
+                        }
+                    }),
+                )
                 .await?;
 
             // Payload parsing remains outside both the SQLite permit and the
             // write transaction. Only dirty terminal rows pay this CPU cost.
-            let mut repairs = HashMap::new();
-            for row in source_rows {
-                if let Some(payload_json) = repaired_terminal_turn_item_payload(&row)? {
-                    repairs.insert(row.id.clone(), (row, payload_json));
-                }
-            }
+            let repairs = timings.observe_sync(
+                ReadModelRepairStage::TerminalPayloadIncrementalBatchEvaluate,
+                || {
+                    let mut repairs = HashMap::new();
+                    for row in source_rows {
+                        if let Some(payload_json) = repaired_terminal_turn_item_payload(&row)? {
+                            repairs.insert(row.id.clone(), (row, payload_json));
+                        }
+                    }
+                    Ok(repairs)
+                },
+            )?;
             summary.detected = summary.detected.saturating_add(repairs.len());
 
             let dirty_for_write = dirty_rows.clone();
             let repairs_for_write = repairs.clone();
             let previous_cursor = cursor;
-            let repaired = self
-                .run_background_database_quantum(|| {
-                    let dirty_rows = dirty_for_write.clone();
-                    let repairs = repairs_for_write.clone();
-                    async move {
-                        let transaction = self.connection.begin().await.context(
-                            "failed to begin incremental terminal payload repair transaction",
-                        )?;
-                        let mut repaired = 0usize;
-                        for dirty in &dirty_rows {
-                            if let Some((row, payload_json)) = repairs.get(&dirty.turn_item_id) {
-                                let applied = self
-                                    .apply_one_terminal_turn_item_payload_repair(
-                                        &transaction,
-                                        row,
-                                        payload_json,
-                                    )
-                                    .await?;
-                                if applied {
-                                    repaired = repaired.saturating_add(1);
-                                    // The repair UPDATE itself fires the dirty
-                                    // trigger. No other writer can interleave
-                                    // inside this transaction, so remove that
-                                    // self-generated entry as well.
-                                    read_model_repair::clear_dirty_turn_item(
+            let repaired = timings
+                .observe(
+                    ReadModelRepairStage::TerminalPayloadIncrementalBatchCommit,
+                    self.run_background_database_quantum(|| {
+                        let dirty_rows = dirty_for_write.clone();
+                        let repairs = repairs_for_write.clone();
+                        async move {
+                            let transaction = self.connection.begin().await.context(
+                                "failed to begin incremental terminal payload repair transaction",
+                            )?;
+                            let mut repaired = 0usize;
+                            for dirty in &dirty_rows {
+                                if let Some((row, payload_json)) = repairs.get(&dirty.turn_item_id) {
+                                    let applied = self
+                                        .apply_one_terminal_turn_item_payload_repair(
+                                            &transaction,
+                                            row,
+                                            payload_json,
+                                        )
+                                        .await?;
+                                    if applied {
+                                        repaired = repaired.saturating_add(1);
+                                        // The repair UPDATE itself fires the dirty
+                                        // trigger. No other writer can interleave
+                                        // inside this transaction, so remove that
+                                        // self-generated entry as well.
+                                        read_model_repair::clear_dirty_turn_item(
+                                            &transaction,
+                                            dirty.turn_item_id.as_str(),
+                                        )
+                                        .await?;
+                                    }
+                                } else {
+                                    read_model_repair::clear_dirty_turn_item_if_unchanged(
                                         &transaction,
                                         dirty.turn_item_id.as_str(),
+                                        dirty.generation,
                                     )
                                     .await?;
                                 }
-                            } else {
-                                read_model_repair::clear_dirty_turn_item_if_unchanged(
+                            }
+                            let unconsumed =
+                                read_model_repair::count_dirty_turn_items_in_window(
                                     &transaction,
-                                    dirty.turn_item_id.as_str(),
-                                    dirty.generation,
+                                    previous_cursor,
+                                    next_cursor,
                                 )
                                 .await?;
+                            if unconsumed != 0 {
+                                bail!(
+                                    "incremental terminal payload repair retained {unconsumed} rows before its next cursor"
+                                );
                             }
-                        }
-                        let unconsumed =
-                            read_model_repair::count_dirty_turn_items_in_window(
+                            read_model_repair::advance_incremental_cursor(
                                 &transaction,
-                                previous_cursor,
+                                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                                READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                                high_watermark,
                                 next_cursor,
                             )
                             .await?;
-                        if unconsumed != 0 {
-                            bail!(
-                                "incremental terminal payload repair retained {unconsumed} rows before its next cursor"
-                            );
+                            transaction.commit().await.context(
+                                "failed to commit incremental terminal payload repair transaction",
+                            )?;
+                            Ok(repaired)
                         }
-                        read_model_repair::advance_incremental_cursor(
-                            &transaction,
-                            read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                            READ_MODEL_REPAIR_ALGORITHM_VERSION,
-                            high_watermark,
-                            next_cursor,
-                        )
-                        .await?;
-                        transaction.commit().await.context(
-                            "failed to commit incremental terminal payload repair transaction",
-                        )?;
-                        Ok(repaired)
-                    }
-                })
+                    }),
+                )
                 .await?;
             summary.repaired = summary.repaired.saturating_add(repaired);
             summary.remaining = summary
@@ -21864,26 +22546,30 @@ WHERE id IN (SELECT event_id FROM candidates)
             cursor = next_cursor;
         }
 
-        self.run_background_database_quantum(|| async {
-            let transaction = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin incremental repair completion")?;
-            read_model_repair::complete_incremental_pass(
-                &transaction,
-                read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
-                READ_MODEL_REPAIR_ALGORITHM_VERSION,
-                high_watermark,
+        timings
+            .observe(
+                ReadModelRepairStage::TerminalPayloadIncrementalComplete,
+                self.run_background_database_quantum(|| async {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin incremental repair completion")?;
+                    read_model_repair::complete_incremental_pass(
+                        &transaction,
+                        read_model_repair::TERMINAL_TURN_ITEM_PAYLOAD_REPAIR_KEY,
+                        READ_MODEL_REPAIR_ALGORITHM_VERSION,
+                        high_watermark,
+                    )
+                    .await?;
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit incremental repair completion")?;
+                    Ok(())
+                }),
             )
             .await?;
-            transaction
-                .commit()
-                .await
-                .context("failed to commit incremental repair completion")?;
-            Ok(())
-        })
-        .await?;
         Ok(summary)
     }
 
@@ -23061,6 +23747,45 @@ WHERE id IN (SELECT event_id FROM candidates)
                         Err(error)
                     }
                 }
+            }
+        })
+        .await
+    }
+
+    pub async fn post_turn_batch_exists(&self, turn_id: &str, batch_id: &str) -> Result<bool> {
+        native_terminal_effect_outbox::post_turn_batch_exists(&self.connection, turn_id, batch_id)
+            .await
+    }
+
+    pub async fn prepare_cli_post_turn_once(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        expected_cli_attempt_index: i64,
+        now_unix: i64,
+    ) -> Result<()> {
+        let turn_id = preparation.turn_id.clone();
+        let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
+        self.run_serialized_write(|| {
+            let prepared = prepared.clone();
+            let turn_id = turn_id.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                // Transcript preparation happens outside DB capacity. Fence
+                // the attempt so obsolete callbacks cannot replace its successor.
+                let attempt = cli_runtime_binding::latest_turn_attempt(&tx, &turn_id)
+                    .await?
+                    .context("CLI post-turn attempt is missing")?;
+                if i64::from(attempt.attempt_index) != expected_cli_attempt_index {
+                    bail!("CLI post-turn preparation belongs to an obsolete attempt");
+                }
+                native_terminal_effect_outbox::prepare_post_turn_once(
+                    &tx,
+                    prepared,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
             }
         })
         .await
@@ -40394,7 +41119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claimed_recovery_job_cannot_activate_while_turn_has_active_recovery() {
+    async fn unresolved_recovery_episode_rejects_duplicate_jobs_for_turn() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -40406,7 +41131,7 @@ mod tests {
         let turn_id = "turn_single_active_recovery";
 
         for index in 0..2 {
-            store
+            let enqueued = store
                 .enqueue_recovery_job(
                     turn_id.to_owned(),
                     format!("reasoning_{index}"),
@@ -40424,25 +41149,27 @@ mod tests {
                     serde_json::json!({}),
                     1_700_000_000,
                 )
-                .await
-                .expect("job should enqueue");
+                .await;
+            if index == 0 {
+                enqueued.expect("first recovery episode should enqueue");
+            } else {
+                let error = enqueued.expect_err("a second unresolved episode must be rejected");
+                assert!(
+                    format!("{error:#}").contains("UNIQUE constraint failed: recovery_job.turn_id")
+                );
+            }
         }
 
         let claimed = store
             .claim_due_recovery_jobs(1_700_000_001, 45, 2)
             .await
             .expect("jobs should claim");
-        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed.len(), 1);
 
         let first_token = claimed[0]
             .claim_token
             .as_deref()
             .expect("first claimed job should have claim token");
-        let second_token = claimed[1]
-            .claim_token
-            .as_deref()
-            .expect("second claimed job should have claim token");
-
         assert!(matches!(
             store
                 .mark_claimed_recovery_job_active(
@@ -40455,41 +41182,18 @@ mod tests {
                 .expect("first job should activate"),
             ClaimedRecoveryActivation::Activated
         ));
-        assert!(matches!(
-            store
-                .mark_claimed_recovery_job_active(
-                    claimed[1].id.as_str(),
-                    second_token,
-                    "recovery_attempt_2",
-                    1_700_000_001,
-                )
-                .await
-                .expect("second job should be blocked"),
-            ClaimedRecoveryActivation::BlockedByActiveRecovery
-        ));
-
-        assert!(
-            store
-                .release_claimed_recovery_job(
-                    claimed[1].id.as_str(),
-                    second_token,
-                    1_700_000_003,
-                    Some("another recovery is already active for this turn".to_owned()),
-                    1_700_000_001,
-                )
-                .await
-                .expect("blocked job should release")
-        );
-
-        let second = store
-            .get_recovery_job(claimed[1].id.as_str())
+        let first = store
+            .get_recovery_job(claimed[0].id.as_str())
             .await
             .expect("job should reload")
             .expect("job should exist");
-        assert_eq!(second.status, RecoveryJobStatus::Pending);
-        assert_eq!(second.run_count, 0);
-        assert!(second.claim_token.is_none());
-        assert!(second.active_attempt_id.is_none());
+        assert_eq!(first.status, RecoveryJobStatus::Active);
+        assert_eq!(first.run_count, claimed[0].run_count);
+        assert!(first.claim_token.is_none());
+        assert_eq!(
+            first.active_attempt_id.as_deref(),
+            Some("recovery_attempt_1")
+        );
     }
 
     #[tokio::test]
@@ -40881,6 +41585,95 @@ mod tests {
                 .count(),
             2,
             "turn/items must still read full durable item events"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_remains_idempotent_after_projection_receipt_cleanup() {
+        let store = test_store_with_workspace("ws_receipt_cleanup").await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread("ws_receipt_cleanup", "thread_receipt_cleanup", timestamp);
+        let turn = sample_turn("turn_receipt_cleanup");
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        crate::upsert_projection_meta(
+            &store.connection,
+            crate::ProjectionMetaRecord {
+                projection_key: "turn_event_projection_stream_state_backfill".into(),
+                projection_version: 3,
+                status: crate::PROJECTION_META_STATUS_COMPLETE.into(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let cleanup = store.with_maintenance_access();
+        assert_eq!(
+            cleanup
+                .cleanup_projection_receipts_quantum(None)
+                .await
+                .unwrap()
+                .rows_deleted,
+            1
+        );
+        let before = store
+            .get_turn_event_projection_stream_state(&turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("idempotent materialization must not require a compacted receipt");
+        let after = store
+            .get_turn_event_projection_stream_state(&turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.projected_through_sequence,
+            before.projected_through_sequence
+        );
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn.id.clone())
+                )
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            1
         );
     }
 
@@ -42514,6 +43307,17 @@ mod tests {
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_terminal_cleanup";
         let store = test_store_with_zstd_turn_items().await;
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Terminal cleanup test".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(unix_to_datetime(timestamp)),
+            updated_at: Set(unix_to_datetime(timestamp)),
+        })
+        .exec(&store.connection)
+        .await
+        .expect("workspace required by terminal projections should exist");
         let thread_id = "thr_turn_terminal_cleanup";
         let turn_id = "turn_turn_terminal_cleanup";
         let item_id = "item_turn_terminal_cleanup";
@@ -42843,12 +43647,24 @@ mod tests {
             )
         }));
 
-        let summary = store
-            .repair_deterministic_read_model_violations()
+        let report = store
+            .repair_deterministic_read_model_violations_with_timings()
             .await
             .expect("repair should succeed");
+        let summary = &report.summary;
         assert!(summary.detected > super::READ_MODEL_REPAIR_BATCH_SIZE as usize);
         assert_eq!(summary.remaining, 0);
+        let full_scan_commits = report
+            .stage_timings
+            .iter()
+            .find(|timing| {
+                timing.stage == super::ReadModelRepairStage::TerminalPayloadFullScanBatchCommit
+            })
+            .expect("full-scan commit timing should be reported");
+        assert!(full_scan_commits.operations >= 2);
+        assert!(report.stage_timings.iter().any(|timing| {
+            timing.stage == super::ReadModelRepairStage::TerminalPayloadIncrementalComplete
+        }));
 
         assert!(
             store

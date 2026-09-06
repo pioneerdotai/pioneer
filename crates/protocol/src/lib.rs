@@ -263,12 +263,13 @@ pub use memory::{
     MemoryIntent, MemoryLifecycleActor, MemoryLifecycleActorKind, MemoryLifecycleReasonCode,
     MemoryLifecycleTransitionKind, MemoryLifetimeClass, MemoryListParams, MemoryListResponse,
     MemoryOwnershipClass, MemoryProvenance, MemoryQualityAction, MemoryQualityDecision,
-    MemoryQualityReasonCode, MemoryRecord, MemoryRememberParams, MemoryRememberResponse,
-    MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind, MemorySearchHit,
-    MemorySearchParams, MemorySearchResponse, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySemanticWriteRoute,
-    MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
-    MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemoryQualityReasonCode, MemoryRecallEligibility, MemoryRecord, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySemanticWriteRoute, MemorySemanticWriteRouteInfo, MemorySensitivity,
+    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
+    MemoryWriteEvidence, MemoryWriteRelation,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
 pub use patch_history::{
@@ -302,9 +303,9 @@ pub use settings::{
     GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
     GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
-    GatewaySelfImprovementSettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
-    GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
-    GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
+    GatewaySelfImprovementSettings, GatewaySelfImprovementStatus, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
     GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
     GatewayThreadEpisodicVectorRefillStatus,
@@ -312,7 +313,8 @@ pub use settings::{
     GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
     GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
     GatewayVoiceInputSettings, GatewayVoiceInputSettingsUpdate,
-    GatewayVoiceInputStatusChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, SelfImprovementPhase, SelfImprovementProgress,
+    SelfImprovementStatusReason,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,

@@ -1116,7 +1116,10 @@ fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Re
 
 fn parse_start_output(stdout: &[u8]) -> StartOutput {
     serde_json::from_slice::<StartOutput>(stdout).unwrap_or_else(|_| StartOutput {
-        warnings: Vec::new(),
+        warnings: vec![InstallWarning::new(
+            "gateway_start_output_parse_failed",
+            "gateway start command succeeded but returned invalid JSON; detailed service stage timings are unavailable",
+        )],
         stage_timings: Vec::new(),
     })
 }
@@ -2115,13 +2118,17 @@ mod tests {
     }
 
     #[test]
-    fn ignores_missing_or_invalid_start_output_fields() {
+    fn handles_missing_or_invalid_start_output_fields() {
         let missing = parse_start_output(br#"{"phase":"started"}"#);
         assert!(missing.warnings.is_empty());
         assert!(missing.stage_timings.is_empty());
 
         let invalid = parse_start_output(b"not json");
-        assert!(invalid.warnings.is_empty());
+        assert_eq!(invalid.warnings.len(), 1);
+        assert_eq!(
+            invalid.warnings[0].code,
+            "gateway_start_output_parse_failed"
+        );
         assert!(invalid.stage_timings.is_empty());
     }
 

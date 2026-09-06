@@ -22,6 +22,103 @@ use crate::convention::{
 use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const DB_ID_LEN: usize = 21;
+
+/// Metadata only: no command arguments, tool output or provider prompt.
+pub struct PostTurnToolSummary {
+    pub item_id: String,
+    pub item_type: pioneer_protocol::TurnItemType,
+    pub tool_name: String,
+    pub attempt_number: u32,
+    pub success: bool,
+    pub outcome_status: Option<pioneer_protocol::ToolOutcomeStatus>,
+    pub error_class: Option<pioneer_protocol::ToolErrorClass>,
+}
+
+pub async fn post_turn_tool_summaries<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    limit: usize,
+) -> Result<Vec<PostTurnToolSummary>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT item_id, item_type, active_attempt_number, \
+         substr(json_extract(payload, '$.toolName'), 1, 160) AS tool_name, \
+         json_extract(payload, '$.success') AS success, \
+         json_extract(payload, '$.outcome.status') AS outcome_status, \
+         json_extract(payload, '$.outcome.errorClass') AS error_class \
+         FROM turn_item WHERE turn_id = ? AND status IN ('completed', 'failed') \
+         AND json_type(payload, '$.toolName') = 'text' \
+         AND json_type(payload, '$.success') IN ('true', 'false') \
+         ORDER BY created_at ASC, item_id ASC LIMIT ?",
+            [turn_id.into(), (limit.clamp(1, 129) as i64).into()],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let outcome: Option<String> = row.try_get("", "outcome_status")?;
+            let error: Option<String> = row.try_get("", "error_class")?;
+            Ok(PostTurnToolSummary {
+                item_id: row.try_get("", "item_id")?,
+                item_type: crate::convention::turn_item_type_from_db(
+                    &row.try_get::<String>("", "item_type")?,
+                )
+                .context("unknown post-turn tool item type")?,
+                tool_name: row.try_get("", "tool_name")?,
+                attempt_number: u32::try_from(row.try_get::<i64>("", "active_attempt_number")?)?,
+                success: row.try_get::<i64>("", "success")? != 0,
+                outcome_status: outcome
+                    .map(|v| serde_json::from_value(serde_json::Value::String(v)))
+                    .transpose()?,
+                error_class: error
+                    .map(|v| serde_json::from_value(serde_json::Value::String(v)))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// Bounded original user messages for post-turn processing. Read the canonical
+/// turn input, never a CLI prompt with injected instructions/history. Text extraction
+/// in SQLite avoids loading attachments and unbounded message payloads.
+pub async fn post_turn_user_text<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    max_chars: usize,
+) -> Result<(String, bool)> {
+    let max_chars = max_chars.clamp(1, 32_768);
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT substr(text, 1, ?) AS text, length(text) AS char_count \
+         FROM turn_input WHERE turn_id = ? AND input_type = 'text' \
+         ORDER BY input_index ASC LIMIT 65",
+            [(max_chars as i64).into(), turn_id.into()],
+        ))
+        .await
+        .context("failed to read bounded post-turn user messages")?;
+    let mut truncated = rows.len() > 64;
+    let mut text = String::new();
+    let mut remaining = max_chars;
+    for row in rows.into_iter().take(64) {
+        let part: String = row.try_get("", "text")?;
+        let char_count: i64 = row.try_get("", "char_count")?;
+        if !text.is_empty() && !part.is_empty() {
+            if remaining > 0 {
+                text.push('\n');
+                remaining -= 1;
+            } else {
+                truncated = true;
+            }
+        }
+        let kept: String = part.chars().take(remaining).collect();
+        let count = kept.chars().count();
+        truncated |= char_count > count as i64;
+        text.push_str(&kept);
+        remaining -= count;
+    }
+    Ok((text, truncated))
+}
 const TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES: usize = 1_048_576;
 const TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES: usize = 4_096;
 

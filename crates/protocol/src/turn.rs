@@ -2495,6 +2495,10 @@ pub struct ExecutionCheckpointPayload {
         skip_serializing_if = "ExecutionCheckpointToolNoProgressState::is_empty"
     )]
     pub tool_no_progress: ExecutionCheckpointToolNoProgressState,
+    /// Explicit request_tools selections for this turn, not authorization grants.
+    /// Resume must revalidate these names against the current tool registry and policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strict_obligations: Vec<ExecutionCheckpointStrictObligation>,
 }
@@ -2791,6 +2795,7 @@ pub fn build_execution_checkpoint_payload(
         provider_budget,
         tools,
         tool_no_progress: ExecutionCheckpointToolNoProgressState::default(),
+        requested_tool_names: Vec::new(),
         strict_obligations: obligations,
     }
 }

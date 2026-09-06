@@ -1,5 +1,6 @@
 mod account;
 mod lifecycle;
+mod self_improvement_status;
 mod sidebar;
 mod view;
 

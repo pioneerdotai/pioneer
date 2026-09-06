@@ -206,8 +206,11 @@ async fn authorize_memory_execution(
                 current.authorization().decision(),
             );
             Ok(MemoryExecutionBoundary {
-                scoped_collaboration: current.resource_boundary()
-                    == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule,
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|_| "memory principal policy is unavailable".to_owned())?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
         Err(_) => {
@@ -246,8 +249,11 @@ async fn authorize_post_turn_memory_execution(
                 current.authorization().decision(),
             );
             Ok(MemoryExecutionBoundary {
-                scoped_collaboration: current.resource_boundary()
-                    == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule,
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|_| "post-turn memory principal policy is unavailable".to_owned())?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
         Err(_) => {
@@ -416,7 +422,7 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
             });
         }
-        let can_read = authorize_memory_execution(
+        let read_boundary = authorize_memory_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
@@ -424,18 +430,16 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             context.principal_id.as_deref(),
             MemoryExecutionAccess::Read,
         )
-        .await
-        .is_ok();
-        let can_upsert = authorize_memory_upsert_execution(
+        .await;
+        let upsert_boundary = authorize_memory_upsert_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
             context.turn_id.as_str(),
             context.principal_id.as_deref(),
         )
-        .await
-        .is_ok();
-        let can_forget = authorize_memory_execution(
+        .await;
+        let forget_boundary = authorize_memory_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
@@ -443,22 +447,34 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             context.principal_id.as_deref(),
             MemoryExecutionAccess::Forget,
         )
-        .await
-        .is_ok();
+        .await;
 
         let handler = Arc::new(MemoryToolHandler { processor, context });
         let mut bundle = ToolExtensionBundle::default();
-        for configured in memory_tool_specs() {
+        for mut configured in memory_tool_specs() {
             let name = configured.spec.name.clone();
-            let allowed = match name.as_str() {
-                MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => can_read,
-                MEMORY_REMEMBER_TOOL => can_upsert,
-                MEMORY_FORGET_TOOL => can_forget,
-                _ => false,
+            let boundary = match name.as_str() {
+                MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => {
+                    read_boundary.as_ref().ok()
+                }
+                MEMORY_REMEMBER_TOOL => upsert_boundary.as_ref().ok(),
+                MEMORY_FORGET_TOOL => forget_boundary.as_ref().ok(),
+                _ => None,
             };
-            if !allowed {
+            let Some(boundary) = boundary else {
                 continue;
-            }
+            };
+            let operation = handler
+                .operation_context(None, boundary.scoped_collaboration)
+                .map_err(|error| error.to_string())?;
+            configured.spec.description.push(' ');
+            configured
+                .spec
+                .description
+                .push_str(&operation.tool_scope_contract(matches!(
+                    name.as_str(),
+                    MEMORY_REMEMBER_TOOL | MEMORY_FORGET_TOOL
+                )));
             bundle.specs.push(configured);
             bundle.handlers.push((name, handler.clone()));
         }
@@ -979,6 +995,8 @@ impl MemoryToolHandler {
         let scopes = self.scopes_for_kinds(&input.scopes)?;
         let context = self.operation_context(None, scoped_collaboration)?;
 
+        validate_read_scopes(&context, &scopes)?;
+
         let response = self
             .processor
             .memory_runtime()
@@ -1017,6 +1035,7 @@ impl MemoryToolHandler {
             .clamp(1, MAX_LIST_LIMIT);
         let scopes = self.scopes_for_kinds(&input.scopes)?;
         let context = self.operation_context(None, scoped_collaboration)?;
+        validate_read_scopes(&context, &scopes)?;
 
         let response = self
             .processor
@@ -1059,6 +1078,11 @@ impl MemoryToolHandler {
 
         let context = self.operation_context(None, scoped_collaboration)?;
         let response = if let Some(memory_id) = memory_id {
+            if input.namespace.is_some() || input.scope.is_some() {
+                return Err(ToolError::invalid_arguments(
+                    "scope and namespace apply only to key lookup",
+                ));
+            }
             self.processor
                 .memory_runtime()
                 .service()
@@ -1076,10 +1100,11 @@ impl MemoryToolHandler {
                 ToolError::invalid_arguments("scope is required for key lookup in Phase 09")
             })?;
             let scope = self.scope_for_kind(scope_kind)?;
+            validate_read_scopes(&context, std::slice::from_ref(&scope))?;
             self.processor
                 .memory_runtime()
                 .service()
-                .get_by_key(context, scope, None, key)
+                .get_by_key(context, scope, input.namespace, key)
                 .await
         }
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
@@ -1097,16 +1122,67 @@ impl MemoryToolHandler {
         let idempotency_key = invocation.idempotency_key.clone();
         let input: MemoryRememberToolInput = decode_tool_args(invocation)?;
         let content = required_string(Some(input.content.as_str()), "content")?;
-        let scope = match input.scope {
+        let mut scope = match input.scope {
             Some(kind) => self.mutation_scope_for_kind(kind, scoped_collaboration)?,
             None => {
                 self.default_mutation_scope_for_category(input.category, scoped_collaboration)?
             }
         };
-        let key = optional_trimmed(input.key)
+        let mut key = optional_trimmed(input.key.clone())
             .or_else(|| Some(stable_memory_key(input.category, content.as_str())));
         let actor = assistant_actor(&self.context);
         let context = self.operation_context(Some(actor.clone()), scoped_collaboration)?;
+        let mut namespace = input.namespace.clone();
+        if let Some(memory_id) = input.memory_id.as_deref() {
+            let target = self
+                .processor
+                .memory_runtime()
+                .service()
+                .get(
+                    context.clone(),
+                    MemoryGetParams {
+                        memory_id: memory_id.to_owned(),
+                        include_deleted: false,
+                    },
+                )
+                .await
+                .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+                .record
+                .ok_or_else(|| {
+                    ToolError::invalid_arguments("memory correction target is unavailable")
+                })?;
+            if input.scope.is_some_and(|kind| kind != target.scope.kind)
+                || input.namespace.as_ref().is_some_and(|namespace| {
+                    let namespace = namespace.trim();
+                    let namespace = if namespace.is_empty() {
+                        "default"
+                    } else {
+                        namespace
+                    };
+                    namespace != target.namespace.as_deref().unwrap_or("default")
+                })
+                || input
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| Some(key.trim()) != target.key.as_deref())
+            {
+                return Err(ToolError::invalid_arguments(
+                    "memoryId correction must preserve the target scope, namespace and key",
+                ));
+            }
+            // Reading a record does not grant mutation authority. Resolve the
+            // target against the same mutation policy used for keyed writes.
+            let permitted =
+                self.mutation_scope_for_kind(target.scope.kind, scoped_collaboration)?;
+            if permitted != target.scope {
+                return Err(ToolError::invalid_arguments(
+                    "memory correction target is outside the current mutation scope",
+                ));
+            }
+            scope = target.scope;
+            key = target.key;
+            namespace = target.namespace;
+        }
         let source_context_kind = input
             .source_context
             .unwrap_or(MemoryToolSourceContext::DirectUserConversation)
@@ -1127,7 +1203,7 @@ impl MemoryToolHandler {
                 MemoryRememberParams {
                     scope,
                     category: input.category,
-                    namespace: None,
+                    namespace,
                     key,
                     content,
                     sensitivity: input.sensitivity,
@@ -1136,7 +1212,7 @@ impl MemoryToolHandler {
                     provenance: Some(provenance),
                     source_context_kind: Some(source_context_kind),
                     idempotency_key,
-                    supersedes: None,
+                    supersedes: input.memory_id,
                     metadata: BTreeMap::new(),
                 },
             )
@@ -1169,6 +1245,11 @@ impl MemoryToolHandler {
         }
 
         let target = if let Some(memory_id) = memory_id {
+            if input.namespace.is_some() || input.scope.is_some() {
+                return Err(ToolError::invalid_arguments(
+                    "scope and namespace apply only to key forget",
+                ));
+            }
             MemoryForgetTarget::Id { memory_id }
         } else {
             let key = key.expect("checked above");
@@ -1177,7 +1258,7 @@ impl MemoryToolHandler {
             })?;
             MemoryForgetTarget::ScopedKey {
                 scope: self.mutation_scope_for_kind(scope_kind, scoped_collaboration)?,
-                namespace: None,
+                namespace: input.namespace,
                 key,
             }
         };
@@ -1395,6 +1476,8 @@ struct MemoryListToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryGetToolInput {
     #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
     memory_id: Option<String>,
     #[serde(default)]
     key: Option<String>,
@@ -1405,6 +1488,10 @@ struct MemoryGetToolInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryRememberToolInput {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    memory_id: Option<String>,
     content: String,
     category: MemoryCategory,
     #[serde(default)]
@@ -1426,6 +1513,8 @@ struct MemoryRememberToolInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryForgetToolInput {
+    #[serde(default)]
+    namespace: Option<String>,
     #[serde(default)]
     memory_id: Option<String>,
     #[serde(default)]
@@ -1478,7 +1567,7 @@ fn memory_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         memory_tool_spec(
             MEMORY_REMEMBER_TOOL,
-            "Store durable memory only when the user explicitly asks or when memory policy allows. Do not use for one-off commands, temporary debugging state, raw logs or secrets unless explicitly requested and policy allows.",
+            "Store durable memory only when the user explicitly asks or when memory policy allows. Every call requires both content and category, including updates by key and corrections by memoryId; neither address supplies these fields. Do not use for one-off commands, temporary debugging state, raw logs or secrets unless explicitly requested and policy allows.",
             memory_remember_schema(),
             safe_mutation_recovery(),
         ),
@@ -1523,6 +1612,20 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
         can_resume: false,
         max_wall_clock_secs: None,
     }
+}
+
+fn validate_read_scopes(
+    context: &MemoryOperationContext,
+    scopes: &[MemoryScope],
+) -> Result<(), ToolError> {
+    for scope in scopes {
+        if let Some(reason) = context.scope_read_denial(scope) {
+            return Err(ToolError::invalid_arguments(format!(
+                "scope_not_authorized: {reason}; this describes execution policy, not whether a record exists"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn memory_search_schema() -> JsonValue {
@@ -1574,6 +1677,7 @@ fn memory_get_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
+            "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. Use with scope and key, not memoryId." },
             "memoryId": { "type": "string" },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() }
@@ -1586,8 +1690,10 @@ fn memory_remember_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
-            "content": { "type": "string", "minLength": 1 },
-            "category": { "type": "string", "enum": category_values() },
+            "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. With memoryId, must match the target namespace." },
+            "memoryId": { "type": "string", "description": "Existing active record to correct. Preserves its namespace and key; scope/namespace/key, if provided, must match. Read the record first." },
+            "content": { "type": "string", "minLength": 1, "description": "Required full content to save, including on updates and corrections." },
+            "category": { "type": "string", "enum": category_values(), "description": "Required on every call, including updates by key and corrections by memoryId. Not inferred from the address or existing record." },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() },
             "sensitivity": { "type": "string", "enum": sensitivity_values() },
@@ -1605,6 +1711,7 @@ fn memory_forget_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
+            "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. Use with scope and key, not memoryId." },
             "memoryId": { "type": "string" },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() },
@@ -1733,6 +1840,10 @@ fn search_hit_output(hit: &MemorySearchHit, include_provenance: bool) -> JsonVal
     let mut object = JsonMap::new();
     object.insert("memoryId".to_owned(), JsonValue::String(record.id.clone()));
     object.insert("scope".to_owned(), to_json_value(&record.scope));
+    object.insert(
+        "namespace".to_owned(),
+        json!(record.namespace.as_deref().unwrap_or("default")),
+    );
     object.insert("category".to_owned(), to_json_value(&record.category));
     object.insert(
         "key".to_owned(),
@@ -1748,6 +1859,10 @@ fn search_hit_output(hit: &MemorySearchHit, include_provenance: bool) -> JsonVal
     );
     object.insert("score".to_owned(), to_json_value(&hit.score));
     object.insert("matchedTerms".to_owned(), to_json_value(&hit.matched_terms));
+    object.insert(
+        "recallEligibility".to_owned(),
+        to_json_value(&record.recall_eligibility),
+    );
     object.insert("updatedAt".to_owned(), JsonValue::from(record.updated_at));
     object.insert(
         "sourceContextKind".to_owned(),
@@ -1794,6 +1909,10 @@ fn record_output(
     let mut object = JsonMap::new();
     object.insert("memoryId".to_owned(), JsonValue::String(record.id.clone()));
     object.insert("scope".to_owned(), to_json_value(&record.scope));
+    object.insert(
+        "namespace".to_owned(),
+        json!(record.namespace.as_deref().unwrap_or("default")),
+    );
     object.insert("category".to_owned(), to_json_value(&record.category));
     object.insert(
         "key".to_owned(),
@@ -1806,6 +1925,10 @@ fn record_output(
         );
     }
     object.insert("status".to_owned(), to_json_value(&record.status));
+    object.insert(
+        "recallEligibility".to_owned(),
+        to_json_value(&record.recall_eligibility),
+    );
     object.insert("confidence".to_owned(), json!(record.confidence));
     object.insert("importance".to_owned(), json!(record.importance));
     object.insert("sensitivity".to_owned(), to_json_value(&record.sensitivity));
@@ -1850,6 +1973,112 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_remember_requires_content_and_category_for_all_write_addresses() {
+        let spec = memory_tool_specs()
+            .into_iter()
+            .find(|s| s.spec.name == MEMORY_REMEMBER_TOOL)
+            .unwrap()
+            .spec;
+        assert_eq!(spec.parameters["required"], json!(["content", "category"]));
+        for address in [
+            json!({}),
+            json!({"key":"name","scope":"user"}),
+            json!({"memoryId":"existing"}),
+        ] {
+            let mut payload = address;
+            payload["content"] = json!("User is Alexander.");
+            payload["category"] = json!("identity");
+            assert!(serde_json::from_value::<MemoryRememberToolInput>(payload.clone()).is_ok());
+            for field in ["content", "category"] {
+                let mut missing = payload.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                let error = serde_json::from_value::<MemoryRememberToolInput>(missing).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("missing field `{field}`"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn memory_scope_diagnostics_are_policy_only_and_schemas_keep_namespace() {
+        let context = MemoryOperationContext {
+            workspace_id: Some("workspace".into()),
+            allow_global_user: false,
+            ..Default::default()
+        };
+        let error = validate_read_scopes(
+            &context,
+            &[MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("scope_not_authorized: global_user_memory_unavailable")
+        );
+        assert!(validate_read_scopes(&context, &[]).is_ok());
+        let mut owner = context;
+        owner.allow_global_user = true;
+        assert!(
+            validate_read_scopes(
+                &owner,
+                &[MemoryScope {
+                    kind: MemoryScopeKind::User,
+                    key: "default".into(),
+                }]
+            )
+            .is_ok()
+        );
+        for schema in [
+            memory_get_schema(),
+            memory_remember_schema(),
+            memory_forget_schema(),
+        ] {
+            assert_eq!(schema["properties"]["namespace"]["type"], "string");
+        }
+    }
+
+    #[test]
+    fn memory_record_output_preserves_audit_only_eligibility() {
+        let record: MemoryRecord = serde_json::from_value(json!({
+            "id":"record", "scope":{"kind":"user","key":"default"},
+            "namespace":"audit", "category":"identity", "key":"name",
+            "content":"Unverified claim", "status":"active", "confidence":0.5,
+            "importance":0.5, "sensitivity":"normal", "provenance":{},
+            "created_at":1, "updated_at":1,
+            "recall_eligibility":{"eligible":false,"reason":"suppress_quarantined_or_audit_only"}
+        }))
+        .unwrap();
+        let output = record_output(&record, true, true);
+        assert_eq!(output["status"], "active");
+        assert_eq!(output["namespace"], "audit");
+        assert_eq!(output["recallEligibility"]["eligible"], false);
+        assert_eq!(
+            output["recallEligibility"]["reason"],
+            "suppress_quarantined_or_audit_only"
+        );
+        let inventory = list_output(&[record], None, false);
+        assert_eq!(
+            inventory["records"][0]["recallEligibility"],
+            output["recallEligibility"]
+        );
+        // The public record protocol also accepts older responses with no assessment.
+        let legacy = json!({
+            "id":"legacy", "scope":{"kind":"user","key":"default"},
+            "category":"identity", "content":"Legacy claim", "status":"active",
+            "confidence":0.5, "importance":0.5, "sensitivity":"normal",
+            "provenance":{}, "created_at":1, "updated_at":1
+        });
+        let record: MemoryRecord = serde_json::from_value(legacy).unwrap();
+        assert!(record.recall_eligibility.is_none());
+        assert!(record_output(&record, true, false)["recallEligibility"].is_null());
+    }
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use futures_util::stream::{self, BoxStream};

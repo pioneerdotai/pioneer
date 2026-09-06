@@ -1,3 +1,4 @@
+mod projection_receipt_cleanup;
 mod zstd_payload_compression;
 
 use pioneer_crud::CrudStore;
@@ -8,5 +9,8 @@ pub(crate) async fn run(
     cancellation: tokio_util::sync::CancellationToken,
 ) {
     let crud_store = Arc::new(crud_store.with_maintenance_access());
-    zstd_payload_compression::run(crud_store, cancellation).await;
+    tokio::join!(
+        zstd_payload_compression::run(crud_store.clone(), cancellation.clone()),
+        projection_receipt_cleanup::run(crud_store, cancellation),
+    );
 }

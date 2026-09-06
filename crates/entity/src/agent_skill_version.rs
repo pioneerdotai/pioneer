@@ -31,6 +31,7 @@ pub struct Model {
     pub fingerprint: String,
     #[sea_orm(column_type = "Text")]
     pub source_turn_ids_json: String,
+    pub evidence_latest_at_unix: Option<i64>,
     pub created_at: DateTimeWithTimeZone,
     #[sea_orm(
         belongs_to,

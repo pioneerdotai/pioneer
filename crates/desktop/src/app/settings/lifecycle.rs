@@ -62,6 +62,8 @@ impl PioneerDesktop {
         self.profile_editor = None;
         self.profile_editor_input_subscriptions.clear();
         self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSettingsRoute { route: content_view });
+        self.self_improvement_status_poll = None;
+
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
         match content_view {

@@ -25,8 +25,10 @@ pub struct Model {
     pub next_attempt_at: Option<DateTimeWithTimeZone>,
     pub learner_provider: String,
     pub learner_model: String,
+    pub learner_reasoning_effort: Option<String>,
     pub reviewer_provider: String,
     pub reviewer_model: String,
+    pub reviewer_reasoning_effort: Option<String>,
     pub pipeline_contract_version: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub analysis_cursor_json: Option<String>,
