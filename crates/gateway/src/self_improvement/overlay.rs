@@ -81,9 +81,9 @@ pub(crate) async fn load_scoped_agent_skill_overlay(
         match eligibility {
             pioneer_crud::MemberLearnedVersionEligibility::Eligible => eligible.push(entry),
             pioneer_crud::MemberLearnedVersionEligibility::Ineligible(
-                pioneer_crud::LearnedVersionIneligibleReason::SourceNotWorkspaceVisible,
+                pioneer_crud::LearnedVersionIneligibleReason::SourceThreadIneligible,
             ) => {
-                crate::authorization::record_private_self_improvement_source_rejection();
+                crate::authorization::record_ineligible_self_improvement_source_rejection();
             }
             pioneer_crud::MemberLearnedVersionEligibility::Ineligible(_) => {}
         }
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_overlay_requires_explicit_policy_and_workspace_only_provenance() {
+    async fn member_overlay_accepts_private_sources_with_workspace_membership_and_policy() {
         use pioneer_crud::WorkspaceSkillPolicyRecord;
         use sea_orm::ConnectionTrait;
 
@@ -363,11 +363,12 @@ mod tests {
             )
             .await
             .expect("source thread must become private");
-        assert!(
+        assert_eq!(
             load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
                 .await
-                .expect("private provenance must fail closed without error")
-                .is_empty()
+                .expect("private source skills must remain available to workspace members")
+                .len(),
+            1
         );
         store
             .database_connection()

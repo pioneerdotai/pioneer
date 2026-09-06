@@ -222,9 +222,15 @@ async fn scalar_i64(database: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn accepted_create_is_atomic_active_and_idempotent() {
+async fn accepted_create_from_private_source_is_atomic_active_and_idempotent() {
     let (database, store) = setup().await;
     let input = claimed_input(&store).await;
+    database
+        .execute_unprepared(
+            "UPDATE thread SET access_class = 'private' WHERE id = 'thread_finalize'",
+        )
+        .await
+        .expect("changing the source to private must not prevent publication");
     assert_eq!(
         store
             .finalize_self_improvement_run(input.clone(), NOW + 3)
@@ -293,15 +299,15 @@ async fn accepted_create_is_atomic_active_and_idempotent() {
 }
 
 #[tokio::test]
-async fn accepted_version_fails_closed_if_source_loses_workspace_visibility() {
+async fn accepted_version_fails_closed_if_source_becomes_internal() {
     let (database, store) = setup().await;
     let input = claimed_input(&store).await;
     database
         .execute_unprepared(
-            "UPDATE thread SET access_class = 'private' WHERE id = 'thread_finalize'",
+            "UPDATE thread SET access_class = 'internal' WHERE id = 'thread_finalize'",
         )
         .await
-        .expect("source thread must become private");
+        .expect("source thread must become internal");
 
     assert_eq!(
         store

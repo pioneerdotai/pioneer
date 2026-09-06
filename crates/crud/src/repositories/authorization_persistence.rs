@@ -7,8 +7,7 @@ use pioneer_entity::{
     thread_lineage, thread_membership, turn, workspace, workspace_membership,
 };
 use pioneer_protocol::{
-    GatewayId, PrincipalKind, PrincipalStatus, RoleKey, ThreadOriginKind, ThreadSidebarVisibility,
-    TurnKind, TurnOrigin, TurnStatus,
+    GatewayId, PrincipalKind, PrincipalStatus, RoleKey, TurnKind, TurnOrigin, TurnStatus,
 };
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
@@ -16,10 +15,7 @@ use sea_orm::{
 
 use super::identity::{actor_ref_from_db, principal_kind_from_db, principal_status_from_db};
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
-use crate::convention::{
-    thread_origin_kind_from_db, thread_sidebar_visibility_from_db, turn_kind_from_db,
-    turn_origin_from_db, turn_status_from_db,
-};
+use crate::convention::{turn_kind_from_db, turn_origin_from_db, turn_status_from_db};
 
 const MAX_AUTHORIZATION_DIAGNOSTICS: usize = 8;
 const MAX_SOURCE_TURN_IDS_JSON_BYTES: usize = 64 * 1024;
@@ -107,7 +103,7 @@ pub enum LearnedVersionIneligibleReason {
     MixedWorkspace,
     MissingSourceThread,
     SourceThreadScopeMismatch,
-    SourceNotWorkspaceVisible,
+    SourceThreadIneligible,
     MissingSourceTurn,
     SourceTurnScopeMismatch,
     SourceTurnIneligible,
@@ -227,23 +223,9 @@ pub async fn derive_member_learned_version_eligibility<C: ConnectionTrait>(
                 LearnedVersionIneligibleReason::SourceThreadScopeMismatch,
             ));
         }
-        if persisted_thread_access_class_from_db(source_thread.access_class.as_str()).ok()
-            != Some(PersistedThreadAccessClass::Workspace)
-            || thread_sidebar_visibility_from_db(source_thread.sidebar_visibility.as_str())
-                != Some(ThreadSidebarVisibility::Visible)
-            || !thread_origin_kind_from_db(source_thread.origin_kind.as_str()).is_some_and(
-                |origin| {
-                    matches!(
-                        origin,
-                        ThreadOriginKind::Collaborative
-                            | ThreadOriginKind::DirectMessage
-                            | ThreadOriginKind::User
-                    )
-                },
-            )
-        {
+        if !super::self_improvement_source_turn::eligible_source_thread(source_thread) {
             return Ok(MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::SourceNotWorkspaceVisible,
+                LearnedVersionIneligibleReason::SourceThreadIneligible,
             ));
         }
         let Some(source_turn) = turns.get(source.turn_id.as_str()) else {
@@ -1029,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learned_eligibility_requires_complete_workspace_visible_provenance() {
+    async fn learned_eligibility_accepts_private_provenance_but_preserves_source_integrity() {
         let database = base_database(false).await;
         add_learned_version_fixture(&database).await;
         assert_eq!(
@@ -1052,9 +1034,7 @@ mod tests {
             derive_member_learned_version_eligibility(&database, WORKSPACE_ID, VERSION_ID)
                 .await
                 .unwrap(),
-            MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::SourceNotWorkspaceVisible
-            )
+            MemberLearnedVersionEligibility::Eligible
         );
 
         thread::Entity::update_many()
@@ -1079,7 +1059,7 @@ mod tests {
                 .await
                 .unwrap(),
             MemberLearnedVersionEligibility::Ineligible(
-                LearnedVersionIneligibleReason::SourceNotWorkspaceVisible
+                LearnedVersionIneligibleReason::SourceThreadIneligible
             )
         );
 

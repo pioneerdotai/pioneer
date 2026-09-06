@@ -4,9 +4,7 @@ use anyhow::{Context, Result, bail};
 use pioneer_entity::{
     agent_skill, agent_skill_version, self_improvement_run, self_improvement_workspace_state,
 };
-use pioneer_protocol::{
-    ThreadOriginKind, ThreadSidebarVisibility, TurnKind, TurnOrigin, TurnStatus,
-};
+use pioneer_protocol::{ThreadSidebarVisibility, TurnKind, TurnOrigin, TurnStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -20,8 +18,8 @@ use super::agent_skill::{
     apply_create_in_caller_transaction, apply_rollback_in_caller_transaction,
     apply_update_in_caller_transaction, prepare_agent_skill_version,
 };
-use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_to_db};
 use super::self_improvement_run::STATUS_COMPLETED;
+use super::self_improvement_source_turn::{source_access_classes, source_origins};
 use crate::{
     AcceptedAgentSkillCreate, FinalizeSelfImprovementRunInput, FinalizeSelfImprovementRunResult,
     SelfImprovementFinalOutcome, SelfImprovementFinalizationConflict,
@@ -439,11 +437,11 @@ fn prepare_source_turn_check(
            AND cited_turn.status = ? \
            AND cited_turn.turn_kind = ? \
            AND cited_turn.origin = ? \
-           AND source_thread.access_class = ? \
+           AND source_thread.access_class IN (?, ?) \
            AND source_thread.sidebar_visibility = ? \
            AND source_thread.origin_kind IN (?, ?, ?)"
     );
-    let mut values = Vec::with_capacity(source_turn_ids.len() + 10);
+    let mut values = Vec::with_capacity(source_turn_ids.len() + 12);
     values.push(source_lower_exclusive.into());
     values.push(source_upper_inclusive.into());
     values.push(workspace_id.to_owned().into());
@@ -451,17 +449,11 @@ fn prepare_source_turn_check(
     values.push(crate::convention::turn_status_to_db(TurnStatus::Completed).into());
     values.push(crate::convention::turn_kind_to_db(TurnKind::Conversation).into());
     values.push(crate::convention::turn_origin_to_db(TurnOrigin::User).into());
-    values.push(persisted_thread_access_class_to_db(PersistedThreadAccessClass::Workspace).into());
+    values.extend(source_access_classes().into_iter().map(Into::into));
     values.push(
         crate::convention::thread_sidebar_visibility_to_db(ThreadSidebarVisibility::Visible).into(),
     );
-    for origin in [
-        ThreadOriginKind::Collaborative,
-        ThreadOriginKind::DirectMessage,
-        ThreadOriginKind::User,
-    ] {
-        values.push(crate::convention::thread_origin_kind_to_db(origin).into());
-    }
+    values.extend(source_origins().into_iter().map(Into::into));
     Ok(Some(PreparedSourceTurnCheck {
         source_lower_exclusive,
         source_upper_inclusive,

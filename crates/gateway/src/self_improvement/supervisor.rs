@@ -2358,13 +2358,13 @@ mod tests {
             .database_connection()
             .execute_unprepared(
                 format!(
-                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    "UPDATE thread SET access_class = 'private' WHERE id = '{}'",
                     thread_id
                 )
                 .as_str(),
             )
             .await
-            .expect("self-improvement source fixture must be workspace-visible");
+            .expect("private source fixture must participate in workspace learning");
         let persisted = turn::Entity::find_by_id(turn_id)
             .one(&store.database_connection())
             .await

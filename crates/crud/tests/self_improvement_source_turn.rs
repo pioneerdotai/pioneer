@@ -106,13 +106,13 @@ async fn start_turn(store: &CrudStore, thread: &Thread, turn: &Turn) {
             .database_connection()
             .execute_unprepared(
                 format!(
-                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    "UPDATE thread SET access_class = 'private' WHERE id = '{}'",
                     thread.id
                 )
                 .as_str(),
             )
             .await
-            .expect("self-improvement source fixture must be workspace-visible");
+            .expect("private conversation must participate in workspace learning");
     }
 }
 
@@ -334,14 +334,21 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
     );
     let eligible_turn = turn("turn_eligible_a1", TurnKind::Conversation, TurnOrigin::User);
     start_turn(&store, &eligible_thread, &eligible_turn).await;
+    database
+        .execute_unprepared(
+            "UPDATE thread SET access_class = 'workspace' WHERE id = 'thread_eligible_a'",
+        )
+        .await
+        .expect("shared conversation must participate alongside private conversations");
     complete_turn(&store, &eligible_thread, eligible_turn, START_AT + 1).await;
 
-    let private_thread = thread(
+    let mut private_thread = thread(
         "ws_source_a",
         "thread_private_source",
         ThreadOriginKind::User,
         START_AT + 2,
     );
+    private_thread.model_provider = "cli_runtime:codex".to_owned();
     let private_turn = turn(
         "turn_private_source",
         TurnKind::Conversation,
@@ -363,15 +370,16 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
              WHERE turn_id = 'turn_private_source'",
         )
         .await,
-        0,
-        "private source must be excluded before entering the immutable source ledger"
+        1,
+        "private conversations must enter the workspace learning source ledger"
     );
 
     let first = store
         .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
         .await
         .expect("source range must load");
-    assert_eq!(first.len(), 1);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[1].turn_id, "turn_private_source");
     assert_eq!(first[0].turn_id, "turn_eligible_a1");
     assert_eq!(first[0].task_delivery_id, None);
     assert_eq!(first[0].terminal_at_unix, START_AT + 1);
@@ -396,7 +404,7 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
             .await
             .expect("source range after replay")
             .len(),
-        1,
+        2,
         "replay must not duplicate the source identity"
     );
 
@@ -489,7 +497,7 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
             .self_improvement_source_head("ws_source_a")
             .await
             .expect("workspace A head"),
-        first[0].id,
+        first[1].id,
         "ineligible, failed, and incomplete turns must not advance the ledger"
     );
 
@@ -517,7 +525,7 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
         .list_self_improvement_source_turns_after("ws_source_a", 0, 0, 10)
         .await
         .expect("workspace A source range");
-    assert_eq!(all_a.len(), 2);
+    assert_eq!(all_a.len(), 3);
     assert!(all_a[0].id < all_a[1].id);
     assert!(all_a.iter().all(|row| row.workspace_id == "ws_source_a"));
     assert_eq!(
@@ -532,14 +540,14 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
             .list_self_improvement_source_turns_after("ws_source_a", all_a[0].id, 0, 10)
             .await
             .expect("range after cursor"),
-        vec![all_a[1].clone()]
+        vec![all_a[1].clone(), all_a[2].clone()]
     );
     assert!(
         store
             .list_self_improvement_source_turns_after(
                 "ws_source_a",
                 0,
-                all_a[1].terminal_at_unix + 1,
+                all_a[2].terminal_at_unix + 1,
                 10,
             )
             .await

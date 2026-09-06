@@ -82,7 +82,7 @@ pub(crate) async fn prepare_completed_source_turn<C: ConnectionTrait>(
             notification.workspace_id
         );
     }
-    if !workspace_visible_source_thread(&thread) {
+    if !eligible_source_thread(&thread) {
         return Ok(None);
     }
 
@@ -155,7 +155,7 @@ pub(crate) async fn prepare_completed_collaborative_source_exchange<C: Connectio
             notification.thread_id
         );
     }
-    if !workspace_visible_source_thread(&parent_thread) {
+    if !eligible_source_thread(&parent_thread) {
         return Ok(None);
     }
     if parent_thread.origin_kind != thread_origin_kind_to_db(ThreadOriginKind::Collaborative) {
@@ -668,17 +668,13 @@ pub async fn list_after_cursor<C: ConnectionTrait>(
         )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(
-            thread::Column::AccessClass.eq(persisted_thread_access_class_to_db(
-                PersistedThreadAccessClass::Workspace,
-            )),
-        )
+        .filter(thread::Column::AccessClass.is_in(source_access_classes()))
         .filter(
             thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
                 ThreadSidebarVisibility::Visible,
             )),
         )
-        .filter(thread::Column::OriginKind.is_in(workspace_visible_source_origins()))
+        .filter(thread::Column::OriginKind.is_in(source_origins()))
         .filter(self_improvement_source_turn::Column::Id.gt(cursor_source_id))
         .filter(
             self_improvement_source_turn::Column::TerminalAt
@@ -718,17 +714,13 @@ pub async fn list_frozen_range<C: ConnectionTrait>(
         )
         .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
-        .filter(
-            thread::Column::AccessClass.eq(persisted_thread_access_class_to_db(
-                PersistedThreadAccessClass::Workspace,
-            )),
-        )
+        .filter(thread::Column::AccessClass.is_in(source_access_classes()))
         .filter(
             thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
                 ThreadSidebarVisibility::Visible,
             )),
         )
-        .filter(thread::Column::OriginKind.is_in(workspace_visible_source_origins()))
+        .filter(thread::Column::OriginKind.is_in(source_origins()))
         .filter(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
         .filter(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
         .filter(
@@ -817,11 +809,10 @@ async fn records_from_models<C: ConnectionTrait>(
                             model.id, model.thread_id
                         )
                     })?;
-            if source_thread.workspace_id != workspace_id
-                || !workspace_visible_source_thread(source_thread)
+            if source_thread.workspace_id != workspace_id || !eligible_source_thread(source_thread)
             {
                 bail!(
-                    "self-improvement source `{}` is no longer workspace-visible",
+                    "self-improvement source `{}` is no longer eligible",
                     model.id
                 );
             }
@@ -851,7 +842,7 @@ async fn records_from_models<C: ConnectionTrait>(
         .collect()
 }
 
-fn workspace_visible_source_origins() -> Vec<String> {
+pub(super) fn source_origins() -> Vec<String> {
     [
         ThreadOriginKind::Collaborative,
         ThreadOriginKind::DirectMessage,
@@ -862,11 +853,27 @@ fn workspace_visible_source_origins() -> Vec<String> {
     .collect()
 }
 
-fn workspace_visible_source_thread(model: &thread::Model) -> bool {
-    persisted_thread_access_class_from_db(model.access_class.as_str()).ok()
-        == Some(PersistedThreadAccessClass::Workspace)
-        && thread_sidebar_visibility_from_db(model.sidebar_visibility.as_str())
-            == Some(ThreadSidebarVisibility::Visible)
+pub(super) fn source_access_classes() -> Vec<&'static str> {
+    [
+        PersistedThreadAccessClass::Private,
+        PersistedThreadAccessClass::Workspace,
+    ]
+    .into_iter()
+    .map(persisted_thread_access_class_to_db)
+    .collect()
+}
+
+// Self-improvement is shared within the workspace, including experience from
+// private conversations. Internal execution threads contribute through their
+// verified parent exchange, never as duplicate independent source anchors.
+// DirectMessage currently represents an agent conversation; a future human-only
+// DM must be distinguished explicitly rather than inferred from private access.
+pub(super) fn eligible_source_thread(model: &thread::Model) -> bool {
+    matches!(
+        persisted_thread_access_class_from_db(model.access_class.as_str()).ok(),
+        Some(PersistedThreadAccessClass::Private | PersistedThreadAccessClass::Workspace)
+    ) && thread_sidebar_visibility_from_db(model.sidebar_visibility.as_str())
+        == Some(ThreadSidebarVisibility::Visible)
         && thread_origin_kind_from_db(model.origin_kind.as_str()).is_some_and(|origin| {
             matches!(
                 origin,
