@@ -35601,7 +35601,7 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
-    let (tx, mut rx) = mpsc::channel(64);
+    let (tx, _rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -35621,10 +35621,24 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let turn_id = "turn_cli_projection_backlog";
     let native_thread_id = "native_thread_cli_projection_backlog";
     let native_turn_id = "native_turn_cli_projection_backlog";
-    start_loaded_thread_and_turn_for_cli_runtime_test(
+    materialize_cli_runtime_turn_with_text(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+        "start",
+    )
+    .await;
+    subscribe_test_connection_to_materialized_thread(
         &processor,
         connection_id,
-        &mut rx,
+        workspace_id.as_str(),
+        thread_id,
+    )
+    .await;
+    persist_test_execution_authorization_context(
+        &processor,
+        connection_id,
         workspace_id.as_str(),
         thread_id,
         turn_id,
@@ -35657,11 +35671,12 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     let db = crud_store.database_connection();
     let predecessor = turn_event_projection_state::Entity::find()
         .filter(turn_event_projection_state::Column::TurnId.eq(turn_id))
-        .filter(turn_event_projection_state::Column::Sequence.eq(1))
+        .filter(turn_event_projection_state::Column::Status.eq("projected"))
+        .order_by_desc(turn_event_projection_state::Column::Sequence)
         .one(&db)
         .await
-        .expect("turn/start projection state should load")
-        .expect("turn/start projection state should exist");
+        .expect("last startup projection state should load")
+        .expect("last startup projection state should exist");
     turn_event_projection_state::Entity::update_many()
         .col_expr(
             turn_event_projection_state::Column::Status,
@@ -35683,6 +35698,17 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         .exec(&db)
         .await
         .expect("predecessor should be queued for replay");
+
+    // Recreate an unprojected prefix in both the receipt and authoritative watermark.
+    pioneer_entity::turn_event_projection_stream_state::Entity::update_many()
+        .col_expr(
+            pioneer_entity::turn_event_projection_stream_state::Column::ProjectedThroughSequence,
+            Expr::value(predecessor.sequence - 1),
+        )
+        .filter(pioneer_entity::turn_event_projection_stream_state::Column::TurnId.eq(turn_id))
+        .exec(&db)
+        .await
+        .expect("predecessor watermark should be reset for replay");
 
     let key = CLIAgentRuntimeSessionKey::new(workspace_id, "codex", thread_id)
         .expect("session key should build");
@@ -35743,15 +35769,29 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
     .await
     .expect("deferred projection should return to pending state");
     assert_eq!(deferred_projection.attempt_count, 0);
+    assert_eq!(deferred_projection.sequence, predecessor.sequence + 1);
 
     let replay = crud_store
-        .replay_due_turn_event_projections(now.timestamp().saturating_add(10), 64)
+        .replay_due_turn_event_projections(now.timestamp().saturating_add(10), 1)
         .await
         .expect("ordered projection replay should succeed");
-    assert!(
-        replay.projected >= 2,
-        "ordered replay should project the repaired predecessor and its dependent event: {replay:#?}"
+    assert_eq!(
+        replay.projected, 1,
+        "the first replay quantum must project only the predecessor: {replay:#?}"
     );
+    assert_eq!(replay.failed, 0);
+    assert!(
+        crud_store
+            .get_turn_item(turn_id, "deferred_reasoning_item")
+            .await
+            .expect("dependent item lookup should succeed")
+            .is_none()
+    );
+    let replay = crud_store
+        .replay_due_turn_event_projections(now.timestamp().saturating_add(20), 1)
+        .await
+        .expect("next replay quantum should project the dependent event");
+    assert_eq!(replay.projected, 1);
     assert_eq!(replay.failed, 0);
     assert!(
         crud_store
@@ -40527,12 +40567,13 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
         json!("grandchild-native-approval"),
     )
     .await;
-    let page_before = request_thread_timeline_page_for_test(
+    let page_before = request_thread_timeline_page_for_test_at_anchor(
         &processor,
         connection_id,
         &mut rx,
         root_thread_id,
         "clipermrootbefore0001",
+        "newest",
     )
     .await;
     let proxy = page_before
@@ -40598,12 +40639,13 @@ async fn grandchild_cli_runtime_approval_projects_to_root_and_root_denial_reache
     );
     drop(responses);
 
-    let page_after = request_thread_timeline_page_for_test(
+    let page_after = request_thread_timeline_page_for_test_at_anchor(
         &processor,
         connection_id,
         &mut rx,
         root_thread_id,
         "clipermrootafter00001",
+        "newest",
     )
     .await;
     assert!(
@@ -48632,6 +48674,25 @@ async fn request_thread_timeline_page_for_test(
     thread_id: &str,
     request_id: &str,
 ) -> pioneer_protocol::ThreadTimelinePageResponse {
+    request_thread_timeline_page_for_test_at_anchor(
+        processor,
+        connection_id,
+        rx,
+        thread_id,
+        request_id,
+        "oldest",
+    )
+    .await
+}
+
+async fn request_thread_timeline_page_for_test_at_anchor(
+    processor: &MessageProcessor,
+    connection_id: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    thread_id: &str,
+    request_id: &str,
+    anchor: &str,
+) -> pioneer_protocol::ThreadTimelinePageResponse {
     processor
         .process_request_for_connection(
             connection_id,
@@ -48641,7 +48702,7 @@ async fn request_thread_timeline_page_for_test(
                 "method": "thread/timeline/page",
                 "params": {
                     "threadId": thread_id,
-                    "anchor": { "kind": "oldest" },
+                    "anchor": { "kind": anchor },
                     "limit": 100
                 }
             })

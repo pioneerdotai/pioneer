@@ -19,15 +19,17 @@ pub const PROJECTION_STATUS_EXHAUSTED: &str = "exhausted";
 
 const CLAIM_TOKEN_LEN: usize = 21;
 const OBSERVE_PROJECTED_WATERMARK_SQL: &str = r#"
-WITH ordered_events AS (
+WITH compaction AS (SELECT ? AS floor),
+ordered_events AS (
     SELECT
         event.id,
         event.turn_id,
         event.sequence,
-        ROW_NUMBER() OVER (ORDER BY event.sequence) AS expected_sequence
+        (SELECT floor FROM compaction)
+            + ROW_NUMBER() OVER (ORDER BY event.sequence) AS expected_sequence
     FROM turn_event AS event
     WHERE event.turn_id = ?
-      AND event.sequence > 0
+      AND event.sequence > (SELECT floor FROM compaction)
 ),
 evaluated_events AS (
     SELECT
@@ -50,7 +52,7 @@ SELECT COALESCE(
                 THEN expected_sequence - 1
         END
     ),
-    COUNT(*)
+    (SELECT floor FROM compaction) + COUNT(*)
 ) AS projected_through_sequence
 FROM evaluated_events
 "#;
@@ -347,7 +349,9 @@ pub async fn is_projected<C: ConnectionTrait>(
             && receipt.status == PROJECTION_STATUS_PROJECTED
     });
 
-    if projected_by_watermark != projected_by_receipt {
+    let receipt_was_compacted =
+        receipt.is_none() && sequence <= stream.receipts_compacted_through_sequence;
+    if projected_by_watermark != projected_by_receipt && !receipt_was_compacted {
         tracing::warn!(
             event_id,
             turn_id,
@@ -608,8 +612,9 @@ pub async fn mark_projected_claimed(
 }
 
 /// Initializes or observes the watermark against the contiguous canonical
-/// prefix whose retained projection receipts are all `projected`. It never
-/// mutates those receipts.
+/// prefix whose retained projection receipts are all `projected`, starting
+/// after the atomically persisted compaction boundary. Deleted receipts can
+/// no longer independently verify that older prefix. Never mutates receipts.
 pub async fn backfill_projected_watermark<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -618,15 +623,22 @@ pub async fn backfill_projected_watermark<C: ConnectionTrait>(
     let stream = super::turn_event_projection_stream_state::find(db, turn_id)
         .await?
         .with_context(|| format!("projection stream state for Turn `{turn_id}` is missing"))?;
-    if stream.projected_through_sequence < 0 {
-        anyhow::bail!("projection watermark for Turn `{turn_id}` is negative");
+    if stream.receipts_compacted_through_sequence < 0
+        || stream.projected_through_sequence < stream.receipts_compacted_through_sequence
+    {
+        anyhow::bail!(
+            "projection compaction boundary for Turn `{turn_id}` is outside its watermark"
+        );
     }
 
     let observed_projected_through_sequence = db
         .query_one_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             OBSERVE_PROJECTED_WATERMARK_SQL,
-            [turn_id.to_owned().into()],
+            [
+                stream.receipts_compacted_through_sequence.into(),
+                turn_id.to_owned().into(),
+            ],
         ))
         .await
         .with_context(|| {

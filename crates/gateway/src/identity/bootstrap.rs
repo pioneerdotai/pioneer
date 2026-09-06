@@ -516,11 +516,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("gateway.db"));
         let mut options = ConnectOptions::new(url);
-        options.max_connections(4);
+        options.max_connections(1);
         let database = Database::connect(options)
             .await
             .expect("connect sqlite file");
         Migrator::up(&database, None).await.expect("run migrations");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(database);
 
         let (first, second) =
             tokio::join!(bootstrap_identity(&database), bootstrap_identity(&database));

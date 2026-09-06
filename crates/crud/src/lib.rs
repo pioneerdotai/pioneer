@@ -12,6 +12,8 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
+pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcome;
+
 pub use events::{
     AppendedTurnEvent, CanonicalTurnEventPayload, CanonicalTurnStartedEventPayload, TurnWorkOwner,
 };
@@ -4344,6 +4346,74 @@ impl CrudStore {
             DEFAULT_LOCK_RETRY_ATTEMPTS,
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
+        .await
+    }
+
+    /// Performs at most one bounded receipt cleanup batch for one stream.
+    /// Discovery uses maintenance readers; only revalidation and deletion hold
+    /// the serialized writer. A persisted per-stream boundary makes restart safe.
+    pub async fn cleanup_projection_receipts_quantum(
+        &self,
+        after_turn_id: Option<&str>,
+    ) -> Result<ProjectionReceiptCleanupOutcome> {
+        use repositories::projection_receipt_cleanup as cleanup;
+        self.run_background_database_quantum(|| async {
+            if !cleanup::backfill_ready(&self.connection).await? {
+                return Ok(ProjectionReceiptCleanupOutcome::default());
+            }
+            let mut outcome = ProjectionReceiptCleanupOutcome {
+                backfill_ready: true,
+                ..Default::default()
+            };
+            let Some(stream) = cleanup::next_stream(&self.connection, after_turn_id).await? else {
+                return Ok(outcome);
+            };
+            outcome.last_turn_id = Some(stream.turn_id.clone());
+            let prepared = match cleanup::prepare(&self.connection, stream).await {
+                Ok(prepared) => prepared,
+                Err(error) if is_anyhow_sqlite_lock(&error) => return Err(error),
+                Err(_) => {
+                    outcome.deferred = true;
+                    outcome.failed = true;
+                    return Ok(outcome);
+                }
+            };
+            outcome.deferred = prepared.deferred;
+            if prepared.is_empty() {
+                return Ok(outcome);
+            }
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin projection receipt cleanup quantum")?;
+            match cleanup::apply(&transaction, &prepared).await {
+                Ok(deleted) => {
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit projection receipt cleanup quantum")?;
+                    outcome.rows_deleted = deleted;
+                    if deleted > 0 {
+                        outcome.source_bytes = prepared.source_bytes;
+                    } else {
+                        outcome.deferred = true;
+                    }
+                }
+                Err(error) => {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("failed to roll back projection receipt cleanup quantum")?;
+                    if is_anyhow_sqlite_lock(&error) {
+                        return Err(error);
+                    }
+                    outcome.deferred = true;
+                    outcome.failed = true;
+                }
+            }
+            Ok(outcome)
+        })
         .await
     }
 
@@ -41049,7 +41119,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claimed_recovery_job_cannot_activate_while_turn_has_active_recovery() {
+    async fn unresolved_recovery_episode_rejects_duplicate_jobs_for_turn() {
         let connection = Database::connect("sqlite::memory:")
             .await
             .expect("must connect to sqlite memory");
@@ -41061,7 +41131,7 @@ mod tests {
         let turn_id = "turn_single_active_recovery";
 
         for index in 0..2 {
-            store
+            let enqueued = store
                 .enqueue_recovery_job(
                     turn_id.to_owned(),
                     format!("reasoning_{index}"),
@@ -41079,25 +41149,27 @@ mod tests {
                     serde_json::json!({}),
                     1_700_000_000,
                 )
-                .await
-                .expect("job should enqueue");
+                .await;
+            if index == 0 {
+                enqueued.expect("first recovery episode should enqueue");
+            } else {
+                let error = enqueued.expect_err("a second unresolved episode must be rejected");
+                assert!(
+                    format!("{error:#}").contains("UNIQUE constraint failed: recovery_job.turn_id")
+                );
+            }
         }
 
         let claimed = store
             .claim_due_recovery_jobs(1_700_000_001, 45, 2)
             .await
             .expect("jobs should claim");
-        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed.len(), 1);
 
         let first_token = claimed[0]
             .claim_token
             .as_deref()
             .expect("first claimed job should have claim token");
-        let second_token = claimed[1]
-            .claim_token
-            .as_deref()
-            .expect("second claimed job should have claim token");
-
         assert!(matches!(
             store
                 .mark_claimed_recovery_job_active(
@@ -41110,41 +41182,18 @@ mod tests {
                 .expect("first job should activate"),
             ClaimedRecoveryActivation::Activated
         ));
-        assert!(matches!(
-            store
-                .mark_claimed_recovery_job_active(
-                    claimed[1].id.as_str(),
-                    second_token,
-                    "recovery_attempt_2",
-                    1_700_000_001,
-                )
-                .await
-                .expect("second job should be blocked"),
-            ClaimedRecoveryActivation::BlockedByActiveRecovery
-        ));
-
-        assert!(
-            store
-                .release_claimed_recovery_job(
-                    claimed[1].id.as_str(),
-                    second_token,
-                    1_700_000_003,
-                    Some("another recovery is already active for this turn".to_owned()),
-                    1_700_000_001,
-                )
-                .await
-                .expect("blocked job should release")
-        );
-
-        let second = store
-            .get_recovery_job(claimed[1].id.as_str())
+        let first = store
+            .get_recovery_job(claimed[0].id.as_str())
             .await
             .expect("job should reload")
             .expect("job should exist");
-        assert_eq!(second.status, RecoveryJobStatus::Pending);
-        assert_eq!(second.run_count, 0);
-        assert!(second.claim_token.is_none());
-        assert!(second.active_attempt_id.is_none());
+        assert_eq!(first.status, RecoveryJobStatus::Active);
+        assert_eq!(first.run_count, claimed[0].run_count);
+        assert!(first.claim_token.is_none());
+        assert_eq!(
+            first.active_attempt_id.as_deref(),
+            Some("recovery_attempt_1")
+        );
     }
 
     #[tokio::test]
@@ -41536,6 +41585,95 @@ mod tests {
                 .count(),
             2,
             "turn/items must still read full durable item events"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_remains_idempotent_after_projection_receipt_cleanup() {
+        let store = test_store_with_workspace("ws_receipt_cleanup").await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread("ws_receipt_cleanup", "thread_receipt_cleanup", timestamp);
+        let turn = sample_turn("turn_receipt_cleanup");
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().fixed_offset();
+        crate::upsert_projection_meta(
+            &store.connection,
+            crate::ProjectionMetaRecord {
+                projection_key: "turn_event_projection_stream_state_backfill".into(),
+                projection_version: 3,
+                status: crate::PROJECTION_META_STATUS_COMPLETE.into(),
+                source_thread_count: 0,
+                source_turn_count: 0,
+                source_turn_item_count: 0,
+                source_turn_event_count: 0,
+                last_error: None,
+                backfill_started_at: Some(now),
+                backfilled_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let cleanup = store.with_maintenance_access();
+        assert_eq!(
+            cleanup
+                .cleanup_projection_receipts_quantum(None)
+                .await
+                .unwrap()
+                .rows_deleted,
+            1
+        );
+        let before = store
+            .get_turn_event_projection_stream_state(&turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .expect("idempotent materialization must not require a compacted receipt");
+        let after = store
+            .get_turn_event_projection_stream_state(&turn.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.projected_through_sequence,
+            before.projected_through_sequence
+        );
+        assert_eq!(
+            pioneer_entity::turn_event_projection_state::Entity::find()
+                .filter(
+                    pioneer_entity::turn_event_projection_state::Column::TurnId.eq(turn.id.clone())
+                )
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            pioneer_entity::turn_event::Entity::find()
+                .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            1
         );
     }
 
@@ -43169,6 +43307,17 @@ mod tests {
         let timestamp = 1_700_000_000;
         let workspace_id = "ws_turn_terminal_cleanup";
         let store = test_store_with_zstd_turn_items().await;
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(workspace_id.to_owned()),
+            name: Set("Terminal cleanup test".to_owned()),
+            is_active: Set(true),
+            is_current: Set(true),
+            created_at: Set(unix_to_datetime(timestamp)),
+            updated_at: Set(unix_to_datetime(timestamp)),
+        })
+        .exec(&store.connection)
+        .await
+        .expect("workspace required by terminal projections should exist");
         let thread_id = "thr_turn_terminal_cleanup";
         let turn_id = "turn_turn_terminal_cleanup";
         let item_id = "item_turn_terminal_cleanup";

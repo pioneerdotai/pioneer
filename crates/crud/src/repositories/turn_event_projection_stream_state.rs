@@ -18,6 +18,7 @@ pub async fn ensure_healthy<C: ConnectionTrait>(
             turn_id: Set(turn_id.to_owned()),
             thread_id: Set(thread_id.to_owned()),
             projected_through_sequence: Set(0),
+            receipts_compacted_through_sequence: Set(0),
             status: Set(STREAM_STATUS_HEALTHY.to_owned()),
             blocking_event_id: Set(None),
             last_error: Set(None),

@@ -65,6 +65,7 @@ mod m20260902_000002_turn_event_projection_watermark;
 mod m20260902_000003_turn_work_owner;
 mod m20260904_000001_recovery_episode_invariant;
 mod m20260905_000001_memory_identity;
+mod m20260906_000003_projection_receipt_cleanup;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -130,6 +131,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000001_memory_identity::Migration),
             Box::new(m20260906_000001_self_improvement_reasoning::Migration),
             Box::new(m20260906_000002_self_improvement_history_backfill::Migration),
+            Box::new(m20260906_000003_projection_receipt_cleanup::Migration),
         ]
     }
 }

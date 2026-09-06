@@ -8949,7 +8949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_active_recovery_cancels_pending_jobs_before_claiming_more_work() {
+    async fn terminal_active_recovery_exhausts_after_duplicate_pending_job_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_terminal_active_cancels_pending";
         let active_job = coordinator
@@ -8967,7 +8967,7 @@ mod tests {
             .into_job();
         let _active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
-        let pending_job = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_duplicate".to_owned(),
@@ -8986,7 +8986,11 @@ mod tests {
                 1_700_000_000,
             )
             .await
-            .expect("duplicate pending job should enqueue for regression setup");
+            .expect_err("a second unresolved recovery episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let events = coordinator
             .run_ready_jobs(1_700_000_901, 64)
@@ -8998,16 +9002,23 @@ mod tests {
             [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
                 if outcome.job_id == active_job.id
         ));
-        let pending = crud_store
-            .get_recovery_job(pending_job.id.as_str())
+        let active = crud_store
+            .get_recovery_job(active_job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pending.status, RecoveryJobStatus::Cancelled);
+        assert_eq!(active.status, RecoveryJobStatus::Exhausted);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn claimed_pending_job_does_not_terminalize_while_turn_has_active_recovery() {
+    async fn duplicate_terminal_job_is_rejected_while_turn_has_active_recovery() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_pending_waits_for_active_recovery";
         let active_job = coordinator
@@ -9025,7 +9036,7 @@ mod tests {
             .into_job();
         let active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
-        let pending_terminal_job = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_terminal_duplicate".to_owned(),
@@ -9044,7 +9055,11 @@ mod tests {
                 1_700_000_001,
             )
             .await
-            .expect("duplicate terminal pending job should enqueue for regression setup");
+            .expect_err("a second unresolved terminal episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let events = coordinator
             .run_ready_jobs(1_700_000_002, 64)
@@ -9062,13 +9077,13 @@ mod tests {
             active.active_attempt_id.as_deref(),
             Some(active_attempt_id.as_str())
         );
-        let pending = crud_store
-            .get_recovery_job(pending_terminal_job.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.status, RecoveryJobStatus::Pending);
-        assert_eq!(pending.run_count, 0);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9216,7 +9231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_completion_cancels_other_pending_recovery_jobs() {
+    async fn turn_completion_succeeds_after_duplicate_pending_recovery_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_completion_cancels_pending";
         let active_job = coordinator
@@ -9235,7 +9250,7 @@ mod tests {
         let active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
 
-        let stale_pending = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_stale".to_owned(),
@@ -9254,7 +9269,11 @@ mod tests {
                 1_700_000_001,
             )
             .await
-            .expect("stale pending job should enqueue for regression setup");
+            .expect_err("a second unresolved recovery episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -9266,12 +9285,19 @@ mod tests {
             [RecoveryCoordinatorEvent::RecoverySucceeded { job_id, .. }] if job_id == &active_job.id
         ));
 
-        let stale = crud_store
-            .get_recovery_job(stale_pending.id.as_str())
+        let active = crud_store
+            .get_recovery_job(active_job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stale.status, RecoveryJobStatus::Cancelled);
+        assert_eq!(active.status, RecoveryJobStatus::Succeeded);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9294,7 +9320,7 @@ mod tests {
         let active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
 
-        let stale_pending = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_stale".to_owned(),
@@ -9313,7 +9339,11 @@ mod tests {
                 1_700_000_001,
             )
             .await
-            .expect("stale pending job should enqueue for regression setup");
+            .expect_err("a second unresolved recovery episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -9342,15 +9372,12 @@ mod tests {
         );
         assert!(active.active_attempt_id.is_none());
 
-        let stale = crud_store
-            .get_recovery_job(stale_pending.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stale.status, RecoveryJobStatus::Cancelled);
         assert_eq!(
-            stale.last_error.as_deref(),
-            Some("turn blocked; pending recovery jobs cancelled")
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
         );
     }
 

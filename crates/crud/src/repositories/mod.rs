@@ -30,6 +30,7 @@ pub mod patch_history;
 pub mod policy;
 pub(crate) mod policy_generation;
 pub(crate) mod principal_avatar;
+pub(crate) mod projection_receipt_cleanup;
 pub(crate) mod read_model_repair;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
