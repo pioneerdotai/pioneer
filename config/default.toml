@@ -291,6 +291,9 @@ active_recall_enabled = true
 tools_enabled = true
 proactive_writes_enabled = true
 background_extraction_enabled = true
+# "thread" reuses a native API model. CLI turns have no API thread-model fallback;
+# for extraction on CLI turns select a custom API model in memory settings, e.g.
+# proactive_writes_model = { source = "custom", model_provider = "openrouter", model = "your-api-model" }
 proactive_writes_model = "thread"
 debug_trace_enabled = false
 strict_diagnostics_enabled = false

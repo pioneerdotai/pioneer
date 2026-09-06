@@ -7116,6 +7116,119 @@ async fn phase_12_post_turn_hook_receives_tool_event_summaries() {
 }
 
 #[tokio::test]
+async fn external_post_turn_preparation_reuses_native_ownership_and_dispatch_policy() {
+    use crate::post_turn::CompletedTurnHookInput;
+    use pioneer_hooks::{TurnPostTurnHookInput, TurnPostTurnHookInputLimits, TurnPostTurnStatus};
+    use pioneer_protocol::{
+        NativeTerminalEffectGate, NativeTerminalEffectPayload, TaskAttachmentMode, TaskRunTurnKind,
+    };
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "capture",
+            Arc::new(CaptureAgentProvider::default()),
+        )),
+        test_tool_loop_config(),
+    );
+    assert!(manager.capture_post_turn_runtime().await.unwrap().is_none());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_for_phase(
+            calls.clone(),
+            HookPhase::TurnPostTurn,
+            HookAwaitPolicy::Blocking,
+            HookFailurePolicy::BestEffort,
+        )))
+        .await;
+    let runtime = manager.capture_post_turn_runtime().await.unwrap().unwrap();
+    for (attachment, kind, expected_gate) in [
+        (
+            TaskAttachmentMode::Detached,
+            TaskRunTurnKind::Review,
+            NativeTerminalEffectGate::TerminalCommit,
+        ),
+        (
+            TaskAttachmentMode::Detached,
+            TaskRunTurnKind::Initial,
+            NativeTerminalEffectGate::AcceptedTaskResult,
+        ),
+        (
+            TaskAttachmentMode::Attached,
+            TaskRunTurnKind::Initial,
+            NativeTerminalEffectGate::TerminalCommit,
+        ),
+    ] {
+        let turn = CompletedTurnHookInput {
+            workspace_id: "ws".into(),
+            thread_id: "hidden".into(),
+            turn_id: "turn".into(),
+            runtime_context: AgentTurnHookRuntimeContext::for_task_turn(
+                "task",
+                attachment,
+                kind,
+                "conversation",
+            ),
+            input: TurnPostTurnHookInput::from_parts(
+                TurnPostTurnStatus::Succeeded,
+                Some("user"),
+                Some("assistant"),
+                None::<String>,
+                vec![],
+                vec![],
+                TurnPostTurnHookInputLimits::default(),
+            ),
+        };
+        let effect = runtime
+            .prepare_completed_turn_hook(turn)
+            .await
+            .unwrap()
+            .unwrap()
+            .effects
+            .remove(0);
+        assert_eq!(effect.gate, expected_gate);
+        let NativeTerminalEffectPayload::PostTurnHook { request, .. } = effect.payload else {
+            panic!("valid hook payload expected")
+        };
+        assert_eq!(request.pointer("/context/task_id"), Some(&json!("task")));
+        assert_eq!(
+            request.pointer("/context/thread_id"),
+            Some(&json!("hidden"))
+        );
+        if attachment == TaskAttachmentMode::Detached {
+            assert_eq!(
+                request.pointer("/context/conversation_thread_id"),
+                Some(&json!("conversation"))
+            );
+        }
+    }
+    let failed = CompletedTurnHookInput {
+        workspace_id: "ws".into(),
+        thread_id: "hidden".into(),
+        turn_id: "failed".into(),
+        runtime_context: AgentTurnHookRuntimeContext::default(),
+        input: TurnPostTurnHookInput::from_parts(
+            TurnPostTurnStatus::Failed,
+            Some("user"),
+            None::<String>,
+            Some("error"),
+            vec![],
+            vec![],
+            TurnPostTurnHookInputLimits::default(),
+        ),
+    };
+    assert!(
+        runtime
+            .prepare_completed_turn_hook(failed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        snapshot_hook_calls(&calls).is_empty(),
+        "preparation must not execute post-turn side effects"
+    );
+}
+
+#[tokio::test]
 async fn turn_completes_when_tool_event_trace_outlives_tool_runtime() {
     let retained_traces = Arc::new(std::sync::Mutex::new(Vec::<ToolEventTrace>::new()));
     let handler: Arc<dyn ToolHandler> = Arc::new(RetainingTraceHandler {

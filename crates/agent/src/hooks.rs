@@ -175,6 +175,23 @@ impl Default for AgentTurnHookRuntimeContext {
 }
 
 impl AgentTurnHookRuntimeContext {
+    pub fn for_task_turn(
+        task_id: &str,
+        attachment: pioneer_protocol::TaskAttachmentMode,
+        turn_kind: pioneer_protocol::TaskRunTurnKind,
+        conversation_thread_id: &str,
+    ) -> Self {
+        if attachment == pioneer_protocol::TaskAttachmentMode::Detached {
+            if turn_kind == pioneer_protocol::TaskRunTurnKind::Review {
+                Self::task_in_conversation(task_id, conversation_thread_id)
+            } else {
+                Self::accepted_result_candidate_in_conversation(task_id, conversation_thread_id)
+            }
+        } else {
+            Self::task(task_id)
+        }
+    }
+
     pub fn task(task_id: impl Into<String>) -> Self {
         let task_id = task_id.into();
         Self {
@@ -417,22 +434,51 @@ impl AgentTurnPostTurnHookDispatch {
                 == AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance
     }
 
-    pub(super) fn into_durable_phase_request(mut self) -> Result<HookPhaseRequest, HookIdError> {
-        if self.awaits_task_result_acceptance() {
-            // The durable outbox gate guarantees this request cannot run until
-            // the candidate is accepted. Persist the accepted-result feature
-            // flag now so restart replay builds the exact same hook request.
-            self.context.runtime_context.post_turn_dispatch_mode =
-                AgentTurnPostTurnDispatchMode::AcceptedTaskResult;
-        }
-        build_phase_request_with_input(
-            &self.context,
-            HookPhase::TurnPostTurn,
+    pub(super) fn into_durable_phase_request(self) -> Result<HookPhaseRequest, HookIdError> {
+        build_post_turn_phase_request(
+            self.context,
             &self.policy_set,
             &self.prompt_context_set,
-            HookInput::turn_post_turn(self.summary.into_hook_input()),
+            self.summary.into_hook_input(),
         )
+        .1
     }
+}
+
+pub(super) fn build_post_turn_phase_request(
+    mut context: AgentTurnHookContext,
+    policies: &EffectiveTurnPolicySet,
+    prompt_context: &EffectiveTurnPromptContextSet,
+    input: TurnPostTurnHookInput,
+) -> (
+    pioneer_protocol::NativeTerminalEffectGate,
+    Result<HookPhaseRequest, HookIdError>,
+) {
+    let gated = input.status == TurnPostTurnStatus::Succeeded
+        && context.runtime_context.post_turn_dispatch_mode
+            == AgentTurnPostTurnDispatchMode::AwaitTaskResultAcceptance;
+    if gated {
+        // The durable outbox gate guarantees this request cannot run until
+        // the candidate is accepted. Persist the accepted-result feature
+        // flag now so restart replay builds the exact same hook request.
+        context.runtime_context.post_turn_dispatch_mode =
+            AgentTurnPostTurnDispatchMode::AcceptedTaskResult;
+    }
+    let request = build_phase_request_with_input(
+        &context,
+        HookPhase::TurnPostTurn,
+        policies,
+        prompt_context,
+        HookInput::turn_post_turn(input),
+    );
+    (
+        if gated {
+            pioneer_protocol::NativeTerminalEffectGate::AcceptedTaskResult
+        } else {
+            pioneer_protocol::NativeTerminalEffectGate::TerminalCommit
+        },
+        request,
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

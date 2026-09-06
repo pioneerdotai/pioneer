@@ -6455,21 +6455,12 @@ fn task_hook_runtime_context(
     parent: &TaskParentRuntimeContext,
     task_run_turn_kind: TaskRunTurnKind,
 ) -> AgentTurnHookRuntimeContext {
-    if task_attachment(task) == TaskAttachmentMode::Detached {
-        if task_run_turn_kind == TaskRunTurnKind::Review {
-            AgentTurnHookRuntimeContext::task_in_conversation(
-                task.id.clone(),
-                parent.parent_thread_id.clone(),
-            )
-        } else {
-            AgentTurnHookRuntimeContext::accepted_result_candidate_in_conversation(
-                task.id.clone(),
-                parent.parent_thread_id.clone(),
-            )
-        }
-    } else {
-        AgentTurnHookRuntimeContext::task(task.id.clone())
-    }
+    AgentTurnHookRuntimeContext::for_task_turn(
+        &task.id,
+        task_attachment(task),
+        task_run_turn_kind,
+        &parent.parent_thread_id,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

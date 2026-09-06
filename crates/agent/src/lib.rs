@@ -10,6 +10,7 @@ mod hooks;
 mod manager_recovery;
 #[cfg(test)]
 mod manager_tests;
+pub mod post_turn;
 
 use pioneer_hooks::{HookMetadataKey, HookPhase, HookPhaseRequest, HookRuntime, HookValue};
 use pioneer_protocol::{

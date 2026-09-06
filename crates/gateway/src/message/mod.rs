@@ -8,6 +8,7 @@ mod artifact_tools;
 mod artifacts;
 mod auth_handlers;
 mod binary;
+mod cli_post_turn;
 #[path = "../cli_runtime/handlers.rs"]
 mod cli_runtime;
 mod dispatch;

@@ -16268,6 +16268,22 @@ impl CrudStore {
         Ok(inputs)
     }
 
+    pub async fn post_turn_tool_summaries(
+        &self,
+        turn_id: &str,
+        limit: usize,
+    ) -> Result<Vec<repositories::turn::PostTurnToolSummary>> {
+        turn::post_turn_tool_summaries(&self.connection, turn_id, limit).await
+    }
+
+    pub async fn post_turn_user_text(
+        &self,
+        turn_id: &str,
+        max_chars: usize,
+    ) -> Result<(String, bool)> {
+        turn::post_turn_user_text(&self.connection, turn_id, max_chars).await
+    }
+
     pub async fn get_turn_inputs_for_turns(
         &self,
         turn_ids: &[String],
@@ -23289,6 +23305,45 @@ WHERE id IN (SELECT event_id FROM candidates)
                         Err(error)
                     }
                 }
+            }
+        })
+        .await
+    }
+
+    pub async fn post_turn_batch_exists(&self, turn_id: &str, batch_id: &str) -> Result<bool> {
+        native_terminal_effect_outbox::post_turn_batch_exists(&self.connection, turn_id, batch_id)
+            .await
+    }
+
+    pub async fn prepare_cli_post_turn_once(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        expected_cli_attempt_index: i64,
+        now_unix: i64,
+    ) -> Result<()> {
+        let turn_id = preparation.turn_id.clone();
+        let prepared = native_terminal_effect_outbox::prepare_input(preparation)?;
+        self.run_serialized_write(|| {
+            let prepared = prepared.clone();
+            let turn_id = turn_id.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                // Transcript preparation happens outside DB capacity. Fence
+                // the attempt so obsolete callbacks cannot replace its successor.
+                let attempt = cli_runtime_binding::latest_turn_attempt(&tx, &turn_id)
+                    .await?
+                    .context("CLI post-turn attempt is missing")?;
+                if i64::from(attempt.attempt_index) != expected_cli_attempt_index {
+                    bail!("CLI post-turn preparation belongs to an obsolete attempt");
+                }
+                native_terminal_effect_outbox::prepare_post_turn_once(
+                    &tx,
+                    prepared,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(())
             }
         })
         .await

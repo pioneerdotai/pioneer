@@ -179,6 +179,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tokio::time::{Duration, sleep, timeout};
 
+mod cli_post_turn;
 mod member_client_harness;
 
 fn default_test_permission_profile() -> pioneer_protocol::TurnPermissionProfileSnapshot {
@@ -42150,6 +42151,13 @@ async fn cli_runtime_command_heartbeat_does_not_renew_without_confirmed_runtime_
 async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_turn() {
     let (processor, _connection_id, _rx, workspace_id, crud_store, cli_session) =
         cli_runtime_approval_processor().await;
+    let processor = Arc::new(processor);
+    let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    install_recoverable_test_hook_runtime(
+        &processor,
+        task_post_turn_recording_hook_runtime(post_turn_calls.clone()),
+    )
+    .await;
     *cli_session.turn_liveness_probe.lock().await =
         Some(CLIAgentRuntimeTurnLivenessProbe::SnapshotRequired);
     *cli_session.turn_observation.lock().await = Some(CLIAgentRuntimeTurnObservation {
@@ -42204,6 +42212,15 @@ async fn cli_runtime_command_terminal_snapshot_stops_heartbeat_and_finalizes_tur
         .expect("turn lookup should succeed")
         .expect("turn should exist");
     assert_eq!(turn.status, TurnStatus::Completed);
+    processor
+        .process_due_native_terminal_effects(chrono::Utc::now().timestamp(), 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_turn_calls.lock().unwrap().len(),
+        1,
+        "snapshot completion runs the shared post-turn hook"
+    );
     assert!(
         processor
             .cli_runtime_command_heartbeats
@@ -42493,7 +42510,31 @@ async fn seed_cli_runtime_approval_turn_for_runtime(
     turn_id: &str,
     native_thread_id: &str,
 ) {
-    materialize_cli_runtime_approval_turn(crud_store, workspace_id, thread_id, turn_id).await;
+    seed_cli_runtime_turn_with_text(
+        crud_store,
+        workspace_id,
+        runtime_id,
+        runtime_kind,
+        thread_id,
+        turn_id,
+        native_thread_id,
+        "approval",
+    )
+    .await;
+}
+
+async fn seed_cli_runtime_turn_with_text(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    runtime_id: &str,
+    runtime_kind: &str,
+    thread_id: &str,
+    turn_id: &str,
+    native_thread_id: &str,
+    user_text: &str,
+) {
+    materialize_cli_runtime_turn_with_text(crud_store, workspace_id, thread_id, turn_id, user_text)
+        .await;
     persist_test_cli_execution_authorization_context(
         crud_store,
         workspace_id,
@@ -42550,6 +42591,23 @@ async fn materialize_cli_runtime_approval_turn(
     thread_id: &str,
     turn_id: &str,
 ) {
+    materialize_cli_runtime_turn_with_text(
+        crud_store,
+        workspace_id,
+        thread_id,
+        turn_id,
+        "approval",
+    )
+    .await;
+}
+
+async fn materialize_cli_runtime_turn_with_text(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    user_text: &str,
+) {
     ensure_test_superuser_execution_authority(crud_store).await;
     let execution_principal = authenticated_test_superuser();
     let now_secs = chrono::Utc::now().timestamp();
@@ -42594,7 +42652,7 @@ async fn materialize_cli_runtime_approval_turn(
             SandboxMode::FullAccess,
             &turn,
             &[UserInput::Text {
-                text: "approval".to_owned(),
+                text: user_text.to_owned(),
                 text_elements: Vec::new(),
             }],
             pioneer_protocol::PersistedActorRef::Principal(

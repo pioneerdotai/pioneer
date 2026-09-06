@@ -47,9 +47,9 @@ use futures_util::{StreamExt, stream};
 use pioneer_config::AppConfig;
 use pioneer_hooks::{
     HookActorKind, HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
-    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolErrorClass,
-    TurnPostTurnToolEventSummary, TurnPostTurnToolOutcomeStatus, TurnPostTurnToolStatus,
-    TurnPrePolicyHookInput, TurnPrePromptCompileHookInput, TurnPrePromptContextHookInput,
+    TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolEventSummary,
+    TurnPostTurnToolStatus, TurnPrePolicyHookInput, TurnPrePromptCompileHookInput,
+    TurnPrePromptContextHookInput,
 };
 use pioneer_memory::hooks::{
     MemoryEpisodicRecallCapabilities, MemoryTurnContext, MemoryTurnPolicy,
@@ -102,8 +102,8 @@ use pioneer_tools::{
     RequestToolsResult, ToolErrorClass, ToolEventPayload, ToolLoopBudgetExceeded,
     ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction,
     ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressPreflightDecision, ToolOutcome,
-    ToolOutcomeStatus, ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController,
-    ToolRetryDecision, ToolRetryObservation, build_builtin_tools_with_security_snapshot,
+    ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
+    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
     build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
@@ -494,6 +494,7 @@ fn append_text_fragment(target: &mut String, fragment: &str) {
 }
 
 fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnToolEventSummary {
+    let outcome = tooling::protocol_outcome_from_tool_outcome(&result.outcome);
     TurnPostTurnToolEventSummary {
         item_id: result.item_id.clone(),
         item_type: format!("{:?}", result.item_type),
@@ -504,8 +505,8 @@ fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnTool
         } else {
             TurnPostTurnToolStatus::Failed
         },
-        outcome_status: Some(post_turn_tool_outcome_status(result.outcome.status)),
-        error_class: result.outcome.error_class.map(post_turn_tool_error_class),
+        outcome_status: Some(post_turn_tool_outcome_status(outcome.status)),
+        error_class: outcome.error_class.map(post_turn_tool_error_class),
     }
 }
 
@@ -524,31 +525,7 @@ fn post_turn_domain_event_summary_from_tool(
     }
 }
 
-fn post_turn_tool_outcome_status(status: ToolOutcomeStatus) -> TurnPostTurnToolOutcomeStatus {
-    match status {
-        ToolOutcomeStatus::Ok => TurnPostTurnToolOutcomeStatus::Ok,
-        ToolOutcomeStatus::RecoverableError => TurnPostTurnToolOutcomeStatus::RecoverableError,
-        ToolOutcomeStatus::FatalError => TurnPostTurnToolOutcomeStatus::FatalError,
-        ToolOutcomeStatus::PartialSuccess => TurnPostTurnToolOutcomeStatus::PartialSuccess,
-    }
-}
-
-fn post_turn_tool_error_class(error_class: ToolErrorClass) -> TurnPostTurnToolErrorClass {
-    match error_class {
-        ToolErrorClass::InvalidArguments => TurnPostTurnToolErrorClass::InvalidArguments,
-        ToolErrorClass::NotFound => TurnPostTurnToolErrorClass::NotFound,
-        ToolErrorClass::ToolNotVisible => TurnPostTurnToolErrorClass::ToolNotVisible,
-        ToolErrorClass::PermissionDenied => TurnPostTurnToolErrorClass::PermissionDenied,
-        ToolErrorClass::CommandNotFound => TurnPostTurnToolErrorClass::CommandNotFound,
-        ToolErrorClass::Timeout => TurnPostTurnToolErrorClass::Timeout,
-        ToolErrorClass::Cancelled => TurnPostTurnToolErrorClass::Cancelled,
-        ToolErrorClass::ExecutionFailed => TurnPostTurnToolErrorClass::ExecutionFailed,
-        ToolErrorClass::NeedsNarrowing => TurnPostTurnToolErrorClass::NeedsNarrowing,
-        ToolErrorClass::Internal => TurnPostTurnToolErrorClass::Internal,
-        ToolErrorClass::OutputTruncated => TurnPostTurnToolErrorClass::OutputTruncated,
-        ToolErrorClass::Unknown => TurnPostTurnToolErrorClass::Unknown,
-    }
-}
+use crate::post_turn::{post_turn_tool_error_class, post_turn_tool_outcome_status};
 
 #[derive(Debug, Clone)]
 pub(super) enum ChatTurnError {

@@ -1160,6 +1160,38 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
 }
 
 #[tokio::test]
+async fn post_turn_without_api_model_reports_configuration_diagnostic_without_provider_call() {
+    let write = Arc::new(TestMemoryWriteProvider::default());
+    let extractor = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write.clone()),
+        extractor_provider: Some(extractor.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    if let pioneer_hooks::HookInputPayload::TurnPostTurn(input) = &mut request.input.payload {
+        input.model = None;
+        input.model_provider = None;
+    }
+    let response = hook.execute(request).await.unwrap();
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "memory.post_turn_extractor.model_unavailable")
+    );
+    assert_eq!(extractor.call_count(), 0);
+    assert_eq!(write.manifest_call_count(), 0);
+    assert_eq!(write.write_call_count(), 0);
+}
+
+#[tokio::test]
 async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_provenance() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
