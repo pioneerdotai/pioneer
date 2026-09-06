@@ -744,7 +744,13 @@ fn parse_install_command_output(
     command_started_at: SystemTime,
 ) -> (Vec<GatewayInstallWarning>, Vec<GatewayInstallStageTiming>) {
     let Ok(parsed) = serde_json::from_str::<InstallCommandOutput>(stdout) else {
-        return (Vec::new(), Vec::new());
+        return (
+            vec![GatewayInstallWarning {
+                code: "gateway_command_output_parse_failed".to_owned(),
+                message: "Gateway command succeeded but returned invalid JSON; detailed stage timings are unavailable".to_owned(),
+            }],
+            Vec::new(),
+        );
     };
     let warnings = normalize_install_warnings(parsed.warnings);
     let stage_timings = parsed
@@ -1155,6 +1161,15 @@ mod tests {
             command_started_at + Duration::from_millis(10)
         );
         assert!(timings[0].succeeded);
+    }
+
+    #[test]
+    fn invalid_gateway_command_json_is_reported() {
+        let (warnings, timings) = parse_install_command_output("not json", SystemTime::UNIX_EPOCH);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "gateway_command_output_parse_failed");
+        assert!(timings.is_empty());
     }
 
     #[test]

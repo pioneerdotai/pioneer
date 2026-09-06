@@ -7,7 +7,7 @@ use anyhow::Result;
 use pioneer_config::InstallManagedBy;
 use serde_json::json;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use tracing::warn;
 
@@ -25,13 +25,17 @@ pub fn main_entry() {
     // The service loads its persisted telemetry preference inside the Gateway.
     // Keep external reporting closed until then so an existing opt-out also
     // covers the service bootstrap performed by this shared CLI binary.
-    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(service::SERVICE_MODE_ARG)) {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new(service::SERVICE_MODE_ARG)) {
         pioneer_observability::set_telemetry_enabled(false);
     }
 
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Shared);
-    pioneer_observability::init_tracing(sentry_guard.is_some());
+    if requests_json_output(env::args_os().skip(1)) {
+        pioneer_observability::init_tracing_to_stderr(sentry_guard.is_some());
+    } else {
+        pioneer_observability::init_tracing(sentry_guard.is_some());
+    }
 
     if let Err(error) = run() {
         if is_usage_error(&error) {
@@ -48,6 +52,10 @@ pub fn main_entry() {
         drop(sentry_guard);
         std::process::exit(1);
     }
+}
+
+fn requests_json_output(args: impl Iterator<Item = OsString>) -> bool {
+    args.into_iter().any(|arg| arg == OsStr::new("--json"))
 }
 
 fn dispatch_hidden_cli_mcp_stdio(args: impl Iterator<Item = OsString>) -> Option<i32> {
@@ -613,6 +621,17 @@ mod tests {
             .expect("ordinary args")
             .is_none()
         );
+    }
+
+    #[test]
+    fn json_commands_reserve_stdout_for_the_machine_protocol() {
+        assert!(requests_json_output(
+            [OsString::from("start"), OsString::from("--json")].into_iter()
+        ));
+        assert!(requests_json_output(
+            [OsString::from("install"), OsString::from("--json")].into_iter()
+        ));
+        assert!(!requests_json_output([OsString::from("start")].into_iter()));
     }
 
     #[test]

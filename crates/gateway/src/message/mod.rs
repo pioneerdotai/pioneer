@@ -68,6 +68,61 @@ enum TaskChildReconciliationOrigin {
     DurableBackground,
 }
 
+fn gateway_stage_for_read_model_repair(
+    stage: pioneer_crud::ReadModelRepairStage,
+) -> pioneer_observability::GatewayOperationStage {
+    use pioneer_crud::ReadModelRepairStage as RepairStage;
+    use pioneer_observability::GatewayOperationStage as OperationStage;
+
+    match stage {
+        RepairStage::TerminalPayloadCheckpointLoad => {
+            OperationStage::ResilienceReadModelCheckpointLoad
+        }
+        RepairStage::TerminalPayloadCheckpointReset => {
+            OperationStage::ResilienceReadModelCheckpointReset
+        }
+        RepairStage::TerminalPayloadFullScanBatchLoad => {
+            OperationStage::ResilienceReadModelFullScanBatchLoad
+        }
+        RepairStage::TerminalPayloadFullScanBatchEvaluate => {
+            OperationStage::ResilienceReadModelFullScanBatchEvaluate
+        }
+        RepairStage::TerminalPayloadFullScanBatchCommit => {
+            OperationStage::ResilienceReadModelFullScanBatchCommit
+        }
+        RepairStage::TerminalPayloadFullScanComplete => {
+            OperationStage::ResilienceReadModelFullScanComplete
+        }
+        RepairStage::TerminalPayloadIncrementalBegin => {
+            OperationStage::ResilienceReadModelIncrementalBegin
+        }
+        RepairStage::TerminalPayloadIncrementalDirtyBatchLoad => {
+            OperationStage::ResilienceReadModelIncrementalDirtyBatchLoad
+        }
+        RepairStage::TerminalPayloadIncrementalSourceBatchLoad => {
+            OperationStage::ResilienceReadModelIncrementalSourceBatchLoad
+        }
+        RepairStage::TerminalPayloadIncrementalBatchEvaluate => {
+            OperationStage::ResilienceReadModelIncrementalBatchEvaluate
+        }
+        RepairStage::TerminalPayloadIncrementalBatchCommit => {
+            OperationStage::ResilienceReadModelIncrementalBatchCommit
+        }
+        RepairStage::TerminalPayloadIncrementalComplete => {
+            OperationStage::ResilienceReadModelIncrementalComplete
+        }
+        RepairStage::TerminalTurnRunningAttempts => {
+            OperationStage::ResilienceReadModelRunningAttempts
+        }
+        RepairStage::TerminalTasksMissingCompletedAt => {
+            OperationStage::ResilienceReadModelTerminalTasks
+        }
+        RepairStage::TerminalRunsMissingCompletedAt => {
+            OperationStage::ResilienceReadModelTerminalRuns
+        }
+    }
+}
+
 use crate::hook_runtime::GatewayHookRuntimeBuilder;
 use crate::keep_awake::GatewayKeepAwake;
 use crate::prompt_hooks::agents_doc_prompt_hook_package;
@@ -2239,10 +2294,31 @@ impl MessageProcessor {
             trace.stage(pioneer_observability::GatewayOperationStage::ResilienceReadModelRepair);
         match background
             .crud_store
-            .repair_deterministic_read_model_violations()
+            .repair_deterministic_read_model_violations_with_timings()
             .await
         {
-            Ok(summary) => {
+            Ok(report) => {
+                for timing in report.stage_timings {
+                    trace.record_stage_timing(
+                        gateway_stage_for_read_model_repair(timing.stage),
+                        timing.started_at,
+                        timing.duration,
+                        timing.operations,
+                    );
+                }
+                let summary = report.summary;
+                trace.record_items(
+                    pioneer_observability::GatewayOperationItemKind::ReadModelRepairDetected,
+                    u64::try_from(summary.detected).unwrap_or(u64::MAX),
+                );
+                trace.record_items(
+                    pioneer_observability::GatewayOperationItemKind::ReadModelRepairRepaired,
+                    u64::try_from(summary.repaired).unwrap_or(u64::MAX),
+                );
+                trace.record_items(
+                    pioneer_observability::GatewayOperationItemKind::ReadModelRepairRemaining,
+                    u64::try_from(summary.remaining).unwrap_or(u64::MAX),
+                );
                 repair_stage.succeed();
                 if summary.remaining > 0 {
                     warn!(
