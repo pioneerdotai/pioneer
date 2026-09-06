@@ -155,7 +155,7 @@ impl PioneerDesktop {
                                     let capabilities =
                                         view.principal_presentation_capabilities();
                                     if capability_content_requires_threads_fallback(
-                                        view.main_content_view,
+                                        view.main_content_view(),
                                         capabilities.can_manage_capabilities,
                                         capabilities.can_use_mcp,
                                     )
@@ -163,7 +163,7 @@ impl PioneerDesktop {
                                         view.set_main_content_view(MainContentView::Threads, cx);
                                     }
                                     if !capabilities.can_manage_workspace
-                                        && view.main_content_view == MainContentView::AgentsDoc
+                                        && view.main_content_view() == MainContentView::AgentsDoc
                                     {
                                         view.active_agents_doc_editor_scope = None;
                                         view.agents_doc_editor = None;
@@ -173,7 +173,7 @@ impl PioneerDesktop {
                                     view.refresh_task_user_notifications(cx);
                                     view.sync_settings_sidebar_tree_state(cx);
                                     view.sync_administration_sidebar_tree_state(cx);
-                                    if view.main_content_view == MainContentView::Administration {
+                                    if view.main_content_view() == MainContentView::Administration {
                                         view.refresh_current_administration_content(cx);
                                     }
                                     cx.notify();
@@ -304,7 +304,7 @@ impl PioneerDesktop {
         content_view: AdministrationContentView,
         cx: &mut Context<Self>,
     ) {
-        self.administration_content_view = content_view;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetAdministrationRoute { route: content_view });
         self.sync_administration_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Administration, cx);
         self.refresh_current_administration_content(cx);
@@ -331,17 +331,17 @@ impl PioneerDesktop {
 
         if !items
             .iter()
-            .any(|(content_view, _)| *content_view == self.administration_content_view)
+            .any(|(content_view, _)| *content_view == self.administration_content_view())
         {
-            self.administration_content_view = items
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetAdministrationRoute { route: items
                 .first()
                 .map(|(content_view, _)| *content_view)
-                .unwrap_or(AdministrationContentView::Members);
+                .unwrap_or(AdministrationContentView::Members) });
         }
 
         let selected_ix = items
             .iter()
-            .position(|(content_view, _)| *content_view == self.administration_content_view);
+            .position(|(content_view, _)| *content_view == self.administration_content_view());
         let administration_tree_state = self.administration_tree_state.clone();
         administration_tree_state.update(cx, |state, cx| {
             state.set_items(
@@ -356,7 +356,7 @@ impl PioneerDesktop {
         &mut self,
         cx: &mut Context<Self>,
     ) {
-        match self.administration_content_view {
+        match self.administration_content_view() {
             AdministrationContentView::Members => {
                 self.refresh_members(false, cx);
                 self.refresh_all_workspace_members(cx);

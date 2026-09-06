@@ -182,6 +182,7 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    Navigation { intent: crate::navigation::NavigationIntent, expected_revision: Option<u64> },
     RefreshTimeline {
         thread_id: String,
     },
@@ -1191,6 +1192,7 @@ impl ClientCore {
 
     pub fn shared() -> Arc<Self> {
         let core = Arc::new(Self::new());
+        core.initialize_navigation();
         let (presentation_sender, presentation_receiver) = std::sync::mpsc::sync_channel(1);
         *core
             .presentation_sender
@@ -1409,6 +1411,12 @@ impl ClientCore {
         })
     }
 
+    pub(crate) fn navigation_outcome(&self, outcome: ClientTransitionOutcome) -> ClientTransition {
+        let mut partitions = self.partitions.lock().expect("client partitions poisoned");
+        partitions.transition_sequence.advance();
+        Self::transition_without_publication(&partitions, outcome)
+    }
+
     pub fn dispatch(&self, intent: ClientIntent) -> ClientTransition {
         if self.is_stopped() {
             let mut partitions = self.partitions.lock().expect("client partitions poisoned");
@@ -1419,6 +1427,7 @@ impl ClientCore {
             );
         }
         match &intent {
+            ClientIntent::Navigation { intent, expected_revision } => return self.navigate(intent.clone(), *expected_revision),
             ClientIntent::RefreshTimeline { thread_id } => {
                 self.refresh_thread_timeline(thread_id);
             }
@@ -1877,6 +1886,7 @@ impl ClientCore {
                 .lock()
                 .expect("thread registry poisoned");
             registry.fence_presentations(principal.clone());
+            registry.reset_navigation();
             registry
         });
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
@@ -1924,11 +1934,15 @@ impl ClientCore {
             next_revisions(&identity_scope),
             Arc::new(projections.clone()),
         )];
+        if let Some(registry) = presentation_fence.as_mut() {
+            if let Some(navigation) = registry.navigation_change() { drafts.push(navigation); }
+        }
         if evict_protected {
             for scope in partitions.publications.keys() {
                 if matches!(
                     scope,
-                    ClientScope::Session
+                    ClientScope::Navigation
+                        | ClientScope::Session
                         | ClientScope::DesktopUpdate
                         | ClientScope::OnboardingInvitation
                 ) || scope == &identity_scope
@@ -2549,6 +2563,9 @@ mod tests {
         assert!(lagging.changes[0].publications().iter().all(|publication| {
             publication.scope() == &identity
                 || publication.snapshot().serialized_payload().is_null()
+                || (publication.scope() == &ClientScope::Navigation
+                    && publication.snapshot().serialized_payload().as_ref()
+                        == &serde_json::to_value(crate::navigation::ClientNavigationState::default()).unwrap())
         }));
         let retained = core.snapshot(&identity).unwrap().snapshot();
         core.invalidate_authorization_revision(6);

@@ -51,7 +51,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match self.administration_content_view {
+        match self.administration_content_view() {
             AdministrationContentView::Members => self.render_administration_members(window, cx),
             AdministrationContentView::Invitations => {
                 self.render_administration_invitations(window, cx)

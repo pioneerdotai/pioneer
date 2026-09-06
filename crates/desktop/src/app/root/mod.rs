@@ -2,6 +2,9 @@ mod composer_domain;
 mod desktop_update;
 mod model_selection;
 mod mutations;
+mod route_lifecycle;
+mod presentation_events;
+pub(crate) use presentation_events::{FrameChanged, SidebarChanged};
 mod queries;
 mod state;
 mod view;
@@ -153,32 +156,8 @@ impl GatewaySetupFormMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MainContentView {
-    Threads,
-    AgentsDoc,
-    Providers,
-    Administration,
-    Mcp,
-    McpDetails,
-    Skills,
-    SkillDetails,
-    Settings,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum AdministrationContentView {
-    Members,
-    Invitations,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SettingsContentView {
-    General,
-    Account,
-    Memory,
-    SelfImprovement,
-}
+pub(super) use crate::desktop_navigation::MainRoute as MainContentView;
+pub(super) use pioneer_client::navigation::{AdministrationRoute as AdministrationContentView, SettingsRoute as SettingsContentView, TaskThreadLineage as TaskThreadNavigationEntry};
 
 pub(super) struct GatewayCoordinator {
     pub(super) setup_view: Entity<crate::app::initial::InitialGatewaySetupView>,
@@ -328,14 +307,6 @@ impl Default for DesktopVoiceComposerState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct TaskThreadNavigationEntry {
-    pub(super) parent_thread_id: String,
-    pub(super) child_thread_id: String,
-    pub(super) workspace_id: String,
-    pub(super) title: String,
-}
-
 #[derive(Clone)]
 pub(super) struct DesktopComposerEditTarget {
     pub(super) presentation: UserMessagePresentation,
@@ -346,7 +317,12 @@ pub(super) struct DesktopComposerEditTarget {
     pub(super) conflicted: bool,
 }
 
-pub struct PioneerDesktop {
+pub(crate) struct LegacyScreenAdapter {
+    pub(super) window_active: bool,
+    frame_presentation: Option<presentation_events::FramePresentation>,
+    pub(super) navigation_input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>,
+    pub(super) navigation: Arc<crate::desktop_navigation::DesktopNavigationStore>,
+    pub(super) shell_state: Entity<crate::shell_state::ShellStateStore>,
     pub(super) startup: DesktopStartupCoordinator,
     pub(super) invitation_join: Option<Entity<DesktopInvitationJoinState>>,
     pub(super) invitation_join_input_subscriptions: Vec<Subscription>,
@@ -362,8 +338,6 @@ pub struct PioneerDesktop {
     pub(super) thread_folder_expanded: HashMap<String, bool>,
     pub(super) thread_tree_selected_node_id: Option<String>,
     pub(super) thread_tree_state: Entity<TreeState>,
-    pub(super) administration_content_view: AdministrationContentView,
-    pub(super) settings_content_view: SettingsContentView,
     pub(super) profile_editor: Option<Entity<ProfileEditorState>>,
     pub(super) profile_editor_input_subscriptions: Vec<Subscription>,
     pub(super) administration: AdministrationCache,
@@ -392,10 +366,7 @@ pub struct PioneerDesktop {
     pub(super) provider_tree_state: Entity<TreeState>,
     pub(super) thread_list_loading: bool,
     pub(super) thread_list_refresh_requested: bool,
-    pub(super) active_thread_id: Option<String>,
     pub(super) active_thread_resubscribe_pending: bool,
-    pub(super) task_thread_navigation_stack: Vec<TaskThreadNavigationEntry>,
-    pub(super) preferred_workspace_id: Option<String>,
     pub(super) workspaces: Vec<Workspace>,
     pub(super) workspaces_loading: bool,
     pub(super) workspaces_error: Option<String>,
@@ -446,17 +417,15 @@ pub struct PioneerDesktop {
     pub(super) composer_model_selection_manually_selected: bool,
     pub(super) composer_model_display_cache: HashMap<ProviderModelDisplayKey, Option<String>>,
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,
-    pub(super) main_content_view: MainContentView,
     pub(super) providers: ProviderListState,
     pub(super) mcp_servers: Vec<McpListItem>,
-    pub(super) mcp_selected_server_id: Option<String>,
     pub(super) mcp_server_details: Option<McpServerDetailsResponse>,
     pub(super) mcp_loading: bool,
     pub(super) mcp_details_loading: bool,
     pub(super) mcp_error: Option<String>,
     pub(super) mcp_refresh_requested: bool,
     pub(super) mcp_details_refresh_requested: bool,
-    pub(super) mcp_poller_started: bool,
+    pub(super) mcp_poller: Option<gpui_kit::Task<()>>,
     pub(super) mcp_pending_actions: HashSet<String>,
     pub(super) mcp_list_scroll_handle: VirtualListScrollHandle,
     pub(super) mcp_details_expanded_sections: HashSet<String>,
@@ -472,9 +441,8 @@ pub struct PioneerDesktop {
     pub(super) skills_upload_progress: Option<SkillUploadProgress>,
     pub(super) skills_upload_cancel_token: Option<Arc<AtomicBool>>,
     pub(super) skills_refresh_requested: bool,
-    pub(super) skills_poller_started: bool,
+    pub(super) skills_poller: Option<gpui_kit::Task<()>>,
     pub(super) skills_pending_actions: HashSet<SkillId>,
-    pub(super) selected_skill_target: Option<SkillId>,
     pub(super) skills_list_scroll_handle: VirtualListScrollHandle,
     pub(super) skills_details_expanded_sections: HashSet<String>,
     pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
@@ -504,6 +472,7 @@ pub struct PioneerDesktop {
     pub(super) thread_artifacts_sidebar_width: Pixels,
     pub(super) gateway_setup_form_state: Entity<GatewaySetupFormState>,
     pub(super) gateway: GatewayCoordinator,
-    pub(super) show_sidebar: bool,
-    pub(super) sidebar_panel_width: Pixels,
 }
+
+// Internal compatibility name refers to the same retained owner.
+pub(super) use LegacyScreenAdapter as PioneerDesktop;

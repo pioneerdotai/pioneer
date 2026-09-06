@@ -5,7 +5,7 @@ use pioneer_client::state::snapshot::ActiveThreadStatusSnapshot;
 
 impl PioneerDesktop {
     pub(in crate::app) fn should_show_active_thread_status(&self) -> bool {
-        self.main_content_view == MainContentView::Threads
+        self.main_content_view() == MainContentView::Threads
             && self.current_active_thread_id().is_some()
     }
 

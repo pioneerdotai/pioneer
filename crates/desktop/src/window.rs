@@ -2,7 +2,7 @@ use crate::{
     settings::{self, WindowOpenState, WindowThemePreference},
     state::{self, WindowState},
 };
-use gpui_kit::{App, Bounds, Context, Window, WindowBounds, point, px, size};
+use gpui_kit::{App, Bounds, Window, WindowBounds, point, px, size};
 use tracing::warn;
 
 const DEFAULT_RESTORE_WIDTH: f32 = 1280.0;
@@ -23,22 +23,6 @@ pub(crate) fn initial_window_bounds(cx: &mut App) -> WindowBounds {
     }
 }
 
-pub(crate) fn install_window_state_persistence<T: 'static>(
-    window: &mut Window,
-    cx: &mut Context<T>,
-) {
-    // Persist on every move/resize so quitting the app still keeps latest window size.
-    cx.observe_window_bounds(window, |_, window, cx| {
-        persist_window_settings(window, cx);
-    })
-    .detach();
-
-    window.on_window_should_close(cx, |window: &mut Window, cx: &mut App| {
-        persist_window_settings(window, cx);
-        true
-    });
-}
-
 pub(crate) fn persist_theme_preference(
     _window: &Window,
     theme: WindowThemePreference,
@@ -52,7 +36,7 @@ pub(crate) fn persist_theme_preference(
     }
 }
 
-fn persist_window_settings(window: &Window, cx: &mut App) {
+pub(crate) fn persist_window_settings(window: &Window, cx: &mut App) {
     let state = window_state_from_window_bounds(window.window_bounds());
     if let Err(error) = state::set_window(cx, state) {
         warn!(

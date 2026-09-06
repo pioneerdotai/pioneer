@@ -166,15 +166,15 @@ pub struct ThreadRegistry {
     demands: HashMap<ClientScope, ClientDemand>,
     timeline_subscription_counts: HashMap<String, usize>,
     pending_requests: PendingRequestRegistry,
-    active_thread_id: Option<String>,
-    drafts: HashMap<String, String>,
-    last_active: HashMap<String, String>,
+    pub(crate) navigation: crate::navigation::ClientNavigationState,
+    pub(crate) navigation_revision: u64,
+    pub(crate) navigation_publication: Option<Arc<crate::navigation::ClientNavigationState>>,
     start: ThreadStartCoordinator,
     start_requested: bool,
     ready_resume: VecDeque<String>,
     ready_resume_set: HashSet<String>,
     clock: u64,
-    session_revision: u64,
+    pub(crate) session_revision: u64,
     invalidation_revision: Option<u64>,
     last_access: Option<(
         pioneer_protocol::AccessChangedNotification,
@@ -766,15 +766,11 @@ impl ClientCore {
         registry.stores.remove(id);
         registry.catalog.remove(id);
         registry.placements.remove(id);
-        registry.drafts.retain(|_, value| value != id);
-        registry.last_active.retain(|_, value| value != id);
+        registry.navigation.remove_thread(id);
         registry.ready_resume.retain(|value| value != id);
         registry.ready_resume_set.remove(id);
-        if registry.active_thread_id.as_deref() == Some(id) {
-            registry.active_thread_id = None;
-            registry.session_revision += 1;
-        }
-        let mut drafts = registry.retire(id);
+        let mut drafts = registry.navigation_change().into_iter().collect::<Vec<_>>();
+        drafts.extend(registry.retire(id));
         drafts.extend(registry.retire_summary(id));
         self.transition(
             &ClientMutationAuthority { _private: () },
@@ -810,6 +806,8 @@ impl ClientCore {
             std::mem::take(&mut registry.timeline_subscription_counts);
         let clock = registry.clock.saturating_add(1);
         let session_revision = registry.session_revision.saturating_add(1);
+        let navigation_revision = registry.navigation_revision;
+        let navigation_publication = registry.navigation_publication.take();
         *registry = ThreadRegistry {
             current_principal_id,
             presentation_revisions,
@@ -820,8 +818,11 @@ impl ClientCore {
             timeline_subscription_counts,
             subscription_counts: subscriptions,
             session_revision,
+            navigation_revision,
+            navigation_publication,
             ..Default::default()
         };
+        self.publish_navigation(&mut registry);
         self.transition(
             &ClientMutationAuthority { _private: () },
             drafts,
@@ -1063,7 +1064,7 @@ impl ClientCore {
         self.thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .active_thread_id
+            .navigation.active_thread_id
             .clone()
     }
     pub fn thread_session_revision(&self) -> u64 {
@@ -1073,60 +1074,22 @@ impl ClientCore {
             .session_revision
     }
     pub fn activate_thread(&self, id: Option<&str>, workspace: Option<&str>) {
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        let next = id.map(str::to_owned);
-        if registry.active_thread_id != next {
-            registry.active_thread_id = next.clone();
-            registry.session_revision += 1;
-        }
-        if let (Some(id), Some(workspace)) = (next, workspace) {
-            if registry.last_active.get(workspace) != Some(&id) {
-                registry.last_active.insert(workspace.to_owned(), id);
-                registry.session_revision += 1;
-            }
-        }
+        self.navigate(crate::navigation::NavigationIntent::SelectThread {
+            workspace_id: workspace.map(str::to_owned), thread_id: id.map(str::to_owned),
+        }, None);
     }
     pub fn thread_workspace_draft(&self, workspace: &str) -> Option<String> {
-        let registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        registry
-            .drafts
-            .get(workspace)
-            .filter(|id| registry.stores.contains_key(*id))
-            .cloned()
+        let registry = self.thread_registry.lock().expect("thread registry poisoned");
+        registry.navigation.drafts.get(workspace).filter(|id| registry.stores.contains_key(*id)).cloned()
     }
     pub fn thread_workspace_last_active(&self, workspace: &str) -> Option<String> {
-        self.thread_registry
-            .lock()
-            .expect("thread registry poisoned")
-            .last_active
-            .get(workspace)
-            .cloned()
+        self.navigation_snapshot().last_active(workspace).map(str::to_owned)
     }
     pub fn remember_thread_draft(&self, workspace: &str, id: Option<String>) {
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        if super::session::remember_thread_for_workspace(&mut registry.drafts, workspace, id) {
-            registry.session_revision += 1;
-        }
+        self.navigate(crate::navigation::NavigationIntent::RememberDraft { workspace_id: workspace.to_owned(), thread_id: id }, None);
     }
     pub fn promote_thread(&self, id: &str) -> bool {
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        let changed = super::session::clear_thread_markers(&mut registry.drafts, id);
-        if changed {
-            registry.session_revision += 1;
-        }
-        changed
+        self.navigate(crate::navigation::NavigationIntent::PromoteThread { thread_id: id.to_owned() }, None).outcome() == crate::core::ClientTransitionOutcome::Changed
     }
     pub fn apply_thread_conversation_event(
         &self,
@@ -1292,20 +1255,17 @@ impl ClientCore {
                 return plan.clone();
             }
         }
-        let (active, revision) = {
+        let (active, workspace, revision) = {
             let registry = self
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
             (
-                registry.active_thread_id.clone(),
+                registry.navigation.active_thread_id.clone(),
+                registry.navigation.workspace_id.clone(),
                 registry.invalidation_revision,
             )
         };
-        let workspace = active
-            .as_deref()
-            .and_then(|id| self.thread_coordinator_snapshot(id))
-            .map(|c| c.workspace_id.clone());
         let scopes = self
             .thread_coordinator_snapshots()
             .into_iter()
@@ -1342,8 +1302,8 @@ impl ClientCore {
                     .thread_registry
                     .lock()
                     .expect("thread registry poisoned");
-                registry.drafts.remove(&plan.workspace_id);
-                registry.last_active.remove(&plan.workspace_id);
+                registry.navigation.remove_workspace(&plan.workspace_id);
+                self.publish_navigation(&mut registry);
             }
         }
         if plan.apply {
@@ -1783,8 +1743,8 @@ impl ThreadRegistry {
             .stores
             .iter()
             .filter(|(id, store)| {
-                self.active_thread_id.as_ref() != Some(id)
-                    && !self.drafts.values().any(|draft| draft == *id)
+                self.navigation.active_thread_id.as_ref() != Some(id)
+                    && !self.navigation.drafts.values().any(|draft| draft == *id)
                     && self.start.pending_thread_id.as_ref() != Some(id)
                     && !self.ready_resume_set.contains(*id)
                     && store.subscriptions == 0
@@ -1916,13 +1876,7 @@ impl ClientCore {
             .to_vec()
     }
     pub fn remember_thread_last_active(&self, workspace: &str, id: Option<String>) {
-        let mut registry = self
-            .thread_registry
-            .lock()
-            .expect("thread registry poisoned");
-        if super::session::remember_thread_for_workspace(&mut registry.last_active, workspace, id) {
-            registry.session_revision += 1;
-        }
+        self.navigate(crate::navigation::NavigationIntent::RememberLast { workspace_id: workspace.to_owned(), thread_id: id }, None);
     }
 }
 
@@ -4000,7 +3954,7 @@ impl ClientCore {
                 .lock()
                 .expect("thread registry poisoned");
             anyhow::ensure!(!self.is_stopped(), "Thread creation cancelled");
-            if let Some(id) = registry.drafts.get(workspace).cloned() {
+            if let Some(id) = registry.navigation.drafts.get(workspace).cloned() {
                 return Ok(id);
             }
             let plan = super::start::begin_thread_start_attempt(
@@ -4064,12 +4018,13 @@ impl ClientCore {
             .expect("retained draft")
             .coordinator
             .set_snapshot(reduction.thread);
-        registry.drafts.insert(workspace.to_owned(), id.clone());
-        registry
-            .last_active
-            .insert(workspace.to_owned(), id.clone());
-        registry.active_thread_id = Some(id.clone());
-        registry.session_revision += 1;
+        registry.navigation.apply(crate::navigation::NavigationIntent::RememberDraft {
+            workspace_id: workspace.to_owned(), thread_id: Some(id.clone()),
+        });
+        registry.navigation.apply(crate::navigation::NavigationIntent::SelectThread {
+            workspace_id: Some(workspace.to_owned()), thread_id: Some(id.clone()),
+        });
+        self.publish_navigation(&mut registry);
         let drafts = registry.publish(&id);
         self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
         Ok(id)

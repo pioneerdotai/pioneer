@@ -61,7 +61,7 @@ impl PioneerDesktop {
         }
         self.profile_editor = None;
         self.profile_editor_input_subscriptions.clear();
-        self.settings_content_view = content_view;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSettingsRoute { route: content_view });
         self.sync_settings_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Settings, cx);
         match content_view {
@@ -111,13 +111,13 @@ impl PioneerDesktop {
         }
         if !items
             .iter()
-            .any(|(content_view, _)| *content_view == self.settings_content_view)
+            .any(|(content_view, _)| *content_view == self.settings_content_view())
         {
-            self.settings_content_view = SettingsContentView::Account;
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSettingsRoute { route: SettingsContentView::Account });
         }
         let selected_ix = items
             .iter()
-            .position(|(content_view, _)| *content_view == self.settings_content_view);
+            .position(|(content_view, _)| *content_view == self.settings_content_view());
         let settings_tree_state = self.settings_tree_state.clone();
         settings_tree_state.update(cx, |state, cx| {
             state.set_items(
@@ -1035,8 +1035,10 @@ mod tests {
             .split("pub(in crate::app) fn apply_gateway_settings_update")
             .nth(1)
             .expect("common settings update exists");
-        assert!(common_update.contains("apply_optimistic_gateway_settings_update"));
-        assert!(common_update.contains("apply_gateway_settings_update_response"));
+        assert!(common_update.contains("prepare_gateway_settings_update(Some(snapshot))"));
+        assert!(common_update.contains("execute_gateway_settings_update(generation, update)"));
+        assert!(common_update.contains("settings_action_matches_connection"));
+        assert!(common_update.contains("view.gateway.settings = current.settings"));
     }
 
     #[::core::prelude::v1::test]
@@ -1050,8 +1052,10 @@ mod tests {
             .next()
             .expect("Voice Input update function body exists");
 
-        assert!(voice_update_fn.contains("gateway_settings_update(update)"));
-        assert!(voice_update_fn.contains("apply_gateway_settings_update_response"));
+        assert!(voice_update_fn.contains("client_core.update_gateway_settings(update)"));
+        assert!(voice_update_fn.contains("settings_action_matches_connection"));
+        assert!(voice_update_fn.contains("view.gateway.settings = current.settings"));
+        assert!(voice_update_fn.contains("view.voice_input_action_error = current.error"));
         assert!(voice_update_fn.contains("apply_gateway_settings_update_error"));
         assert!(!voice_update_fn.contains("apply_optimistic_gateway_settings_update"));
     }

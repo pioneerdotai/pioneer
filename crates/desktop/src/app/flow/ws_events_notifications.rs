@@ -3,8 +3,11 @@ use crate::app::root::{AdministrationContentView, DesktopVoiceComposerState, Mai
 use crate::audio::capture::DesktopVoiceCaptureErrorKind;
 use pioneer_client::administration::{AdministrationEvent, AdministrationRefetch};
 use pioneer_client::authorization::{
-    AccessChangedPlan, ThreadAuthorizationScope, plan_access_changed,
+    AccessChangedPlan,
+
 };
+#[cfg(test)]
+use pioneer_client::authorization::{ThreadAuthorizationScope, plan_access_changed};
 use pioneer_client::notifications::router::{
     ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeSnapshotReduction,
     SkillsRefreshReduction, ThreadArtifactsRefreshReduction, WorkspacePreferenceReduction,
@@ -44,7 +47,7 @@ impl PioneerDesktop {
             preferred_workspace_id: self.preferred_workspace_id(),
             workspaces: self.workspaces(),
             mcp_workspace_id: mcp_workspace.as_deref(),
-            mcp_selected_server_id: self.mcp_selected_server_id.as_deref(),
+            mcp_selected_server_id: self.navigation_input.mcp_server_id(),
             mcp_details_loaded: self.mcp_server_details.is_some(),
         };
         let reduction = self
@@ -140,10 +143,10 @@ impl PioneerDesktop {
                 self.apply_mcp_refresh_reduction(reduction);
             }
             ClientRuntimeNotification::McpServerStatusChanged(reduction) => {
-                self.apply_mcp_server_status_changed_reduction(reduction);
+                self.apply_mcp_server_status_changed_reduction(reduction, cx);
             }
             ClientRuntimeNotification::McpServerCatalogChanged(reduction) => {
-                self.apply_mcp_server_catalog_changed_reduction(reduction);
+                self.apply_mcp_server_catalog_changed_reduction(reduction, cx);
             }
             ClientRuntimeNotification::ThreadArtifactsRefresh(reduction) => {
                 self.apply_thread_artifacts_refresh_reduction(reduction, cx);
@@ -216,23 +219,23 @@ impl PioneerDesktop {
         for effect in effects {
             match effect {
                 AdministrationRefetch::InvitationList
-                    if self.main_content_view == MainContentView::Administration
-                        && self.administration_content_view
+                    if self.main_content_view() == MainContentView::Administration
+                        && self.administration_content_view()
                             == AdministrationContentView::Invitations =>
                 {
                     self.refresh_invitations(false, cx);
                 }
                 AdministrationRefetch::MemberDirectory => {
                     self.members_error = None;
-                    if self.main_content_view == MainContentView::Administration
-                        && self.administration_content_view == AdministrationContentView::Members
+                    if self.main_content_view() == MainContentView::Administration
+                        && self.administration_content_view() == AdministrationContentView::Members
                     {
                         self.refresh_members(false, cx);
                     }
                 }
                 AdministrationRefetch::WorkspaceMembers { workspace_id }
-                    if self.main_content_view == MainContentView::Administration
-                        && self.administration_content_view
+                    if self.main_content_view() == MainContentView::Administration
+                        && self.administration_content_view()
                             == AdministrationContentView::Members =>
                 {
                     self.refresh_workspace_members(workspace_id, cx);
@@ -248,16 +251,9 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) {
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
-        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
-        let known_threads =
-            desktop_thread_authorization_scopes(&self.thread_coordinator_snapshots());
-        let plan = plan_access_changed(
-            &notification,
-            None,
-            active_workspace_id.as_deref(),
-            active_thread_id.as_deref(),
-            known_threads.as_slice(),
-        );
+        // The Client plan records selection before the authorization fence. A navigation
+        // publication may already have cleared selection when this binding runs.
+        let plan = self.gateway.client_runtime.client_core().apply_thread_access_change(&notification);
         if !plan.apply {
             return;
         }
@@ -278,9 +274,10 @@ impl PioneerDesktop {
             self.message_mutation_pending = false;
         }
         if notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked {
+            let mut preferred = self.preferred_workspace_id().map(str::to_owned);
             apply_desktop_workspace_catalog_invalidation(
                 &mut self.workspaces,
-                &mut self.preferred_workspace_id,
+                &mut preferred,
                 &plan,
             );
         }
@@ -301,18 +298,14 @@ impl PioneerDesktop {
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
         let workspace_access_lost = workspace_wide
             && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
-        if workspace_wide && active_workspace_id.as_deref() == Some(plan.workspace_id.as_str()) {
+        if workspace_wide && (plan.clear_active_workspace || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str())) {
             // Membership/role changes fence every provider projection from
             // the previous authorization generation. The shared client
             // effect below reloads both catalogs through current-ACL APIs.
             self.providers.clear_for_workspace_switch();
             self.sync_open_model_selector_cli_runtime_snapshot();
         }
-        self.task_thread_navigation_stack.retain(|entry| {
-            !(workspace_access_lost && entry.workspace_id == plan.workspace_id)
-                && !invalidated_thread_ids.contains(entry.parent_thread_id.as_str())
-                && !invalidated_thread_ids.contains(entry.child_thread_id.as_str())
-        });
+
 
         if workspace_access_lost {
             let removed_folder_ids = self
@@ -340,8 +333,8 @@ impl PioneerDesktop {
         if active_editor_lost {
             self.active_agents_doc_editor_scope = None;
             self.agents_doc_editor = None;
-            if self.main_content_view == MainContentView::AgentsDoc {
-                self.main_content_view = MainContentView::Threads;
+            if self.main_content_view() == MainContentView::AgentsDoc {
+                self.set_main_content_view(MainContentView::Threads, cx);
             }
         }
 
@@ -378,7 +371,7 @@ impl PioneerDesktop {
         }
 
         let affected_workspace_is_active =
-            active_workspace_id.as_deref() == Some(plan.workspace_id.as_str());
+            plan.clear_active_workspace || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str());
         if affected_workspace_is_active
             && (workspace_access_lost || !plan.invalidate_thread_ids.is_empty())
         {
@@ -577,6 +570,7 @@ fn desktop_authorization_projection_effects(
     }
 }
 
+#[cfg(test)]
 fn desktop_thread_authorization_scopes(
     coordinators: &std::collections::HashMap<String, crate::app::thread::ThreadCoordinator>,
 ) -> Vec<ThreadAuthorizationScope> {

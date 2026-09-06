@@ -33,7 +33,7 @@ impl PioneerDesktop {
         pioneer_observability::record_qualification_diagnostic!(record_render(
             pioneer_observability::RenderRegion::Skills
         ));
-        let Some(skill_id) = self.selected_skill_target.clone() else {
+        let Some(skill_id) = self.navigation_input.skill_id().cloned() else {
             return v_flex()
                 .size_full()
                 .bg(cx.theme().background)
@@ -84,8 +84,8 @@ impl PioneerDesktop {
         let fingerprint_short = skill_summary.fingerprint_short.clone();
         let status_color = Self::status_color(skill_summary.status_tone, cx);
         let owner = skill_summary.slug.owner.as_deref();
-        let meta_grid_columns = self.skill_details_meta_grid_columns(window);
-        let diagnostics_grid_columns = self.skill_details_diagnostics_grid_columns(window);
+        let meta_grid_columns = self.skill_details_meta_grid_columns(window, cx);
+        let diagnostics_grid_columns = self.skill_details_diagnostics_grid_columns(window, cx);
         let detail_diagnostics =
             skill_presentation::skill_detail_diagnostics(&skill, health_detail.as_ref());
         self.sync_skill_diagnostics_tables(detail_diagnostics.recent_audit.as_slice(), cx);
@@ -315,10 +315,10 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    fn skill_details_meta_grid_columns(&self, window: &Window) -> u16 {
+    fn skill_details_meta_grid_columns(&self, window: &Window, cx: &App) -> u16 {
         let viewport_width = window.viewport_size().width;
-        let sidebar_width = if self.show_sidebar {
-            self.sidebar_panel_width
+        let sidebar_width = if self.shell_state.read(cx).sidebar_visible() {
+            self.shell_state.read(cx).sidebar_width()
         } else {
             px(0.)
         };
@@ -337,10 +337,10 @@ impl PioneerDesktop {
         2
     }
 
-    fn skill_details_diagnostics_grid_columns(&self, window: &Window) -> u16 {
+    fn skill_details_diagnostics_grid_columns(&self, window: &Window, cx: &App) -> u16 {
         let viewport_width = window.viewport_size().width;
-        let sidebar_width = if self.show_sidebar {
-            self.sidebar_panel_width
+        let sidebar_width = if self.shell_state.read(cx).sidebar_visible() {
+            self.shell_state.read(cx).sidebar_width()
         } else {
             px(0.)
         };

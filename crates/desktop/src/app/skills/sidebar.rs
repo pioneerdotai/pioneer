@@ -129,7 +129,7 @@ impl PioneerDesktop {
     pub(crate) fn render_skill_details_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let desktop_entity = cx.entity().clone();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        let selected_skill = self.selected_skill_target.as_ref().and_then(|skill_id| {
+        let selected_skill = self.navigation_input.skill_id().and_then(|skill_id| {
             skill_catalog::find_skill(self.installed_skills.as_slice(), skill_id).cloned()
         });
         let is_pending = selected_skill

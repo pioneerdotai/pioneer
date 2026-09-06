@@ -445,7 +445,7 @@ impl PioneerDesktop {
         }
         let context = pioneer_client::runtime::ClientRuntimeWsEventContext {
             queue_skills_refresh: matches!(
-                self.main_content_view,
+                self.main_content_view(),
                 MainContentView::Skills | MainContentView::SkillDetails
             ),
             should_resume_in_flight_turn: self.should_resume_in_flight_turn(),

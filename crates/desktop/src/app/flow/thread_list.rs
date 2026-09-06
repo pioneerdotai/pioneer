@@ -99,7 +99,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.task_thread_navigation_stack.clear();
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::ClearLineage);
         self.set_main_content_view(MainContentView::Threads, cx);
         self.activate_thread_with_draft_restore(thread_id.clone(), window, cx);
 
@@ -145,15 +145,7 @@ impl PioneerDesktop {
         };
 
         self.remember_active_thread_draft(cx);
-        self.task_thread_navigation_stack
-            .retain(|entry| entry.child_thread_id != child_thread_id);
-        self.task_thread_navigation_stack
-            .push(TaskThreadNavigationEntry {
-                parent_thread_id,
-                child_thread_id: child_thread_id.clone(),
-                workspace_id: workspace_id.clone(),
-                title,
-            });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::PushTaskThread { entry: TaskThreadNavigationEntry::new(parent_thread_id, child_thread_id.clone(), workspace_id.clone(), title) });
         self.set_main_content_view(MainContentView::Threads, cx);
         self.set_active_thread_id(Some(child_thread_id.clone()));
         self.clear_composer(window, cx);
@@ -179,29 +171,30 @@ impl PioneerDesktop {
     }
 
     pub(crate) fn close_task_child_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.task_thread_navigation_stack.pop() else {
+        let Some(entry) = self.navigation_input.lineage().last().cloned() else {
             return;
         };
-        self.set_active_thread_id(Some(entry.parent_thread_id.clone()));
-        self.restore_thread_draft(entry.parent_thread_id.as_str(), window, cx);
-        self.set_preferred_workspace_id(Some(entry.workspace_id.clone()));
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::PopTaskThread);
+        self.set_active_thread_id(Some(entry.parent_thread_id().to_owned()));
+        self.restore_thread_draft(entry.parent_thread_id(), window, cx);
+        self.set_preferred_workspace_id(Some(entry.workspace_id().to_owned()));
 
         if let Some(connection_id) = self.gateway.ws_connection_id {
             self.ensure_thread_subscription(
-                entry.parent_thread_id.clone(),
-                entry.workspace_id.clone(),
+                entry.parent_thread_id().to_owned(),
+                entry.workspace_id().to_owned(),
                 connection_id,
                 cx,
             );
             self.refresh_cli_runtime_thread_binding(
-                entry.parent_thread_id.clone(),
-                entry.workspace_id,
+                entry.parent_thread_id().to_owned(),
+                entry.workspace_id().to_owned(),
                 connection_id,
                 cx,
             );
         }
 
-        self.ensure_thread_semantic_timeline_loaded(entry.parent_thread_id.as_str(), cx);
+        self.ensure_thread_semantic_timeline_loaded(entry.parent_thread_id(), cx);
         cx.notify();
     }
 

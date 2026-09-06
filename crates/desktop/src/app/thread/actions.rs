@@ -325,7 +325,7 @@ impl PioneerDesktop {
         } else {
             selected_provider.clone()
         };
-        let Some(thread_id) = self.active_thread_id.clone() else {
+        let Some(thread_id) = self.navigation_input.active_thread_id().map(str::to_owned) else {
             return;
         };
         let composer_execution_mode = self
@@ -622,7 +622,7 @@ impl PioneerDesktop {
         if !self.can_cancel_active_thread_agent_presentation() {
             return;
         }
-        let Some(thread_id) = self.active_thread_id.clone() else {
+        let Some(thread_id) = self.navigation_input.active_thread_id().map(str::to_owned) else {
             return;
         };
         let core = self.gateway.client_runtime.client_core().clone();

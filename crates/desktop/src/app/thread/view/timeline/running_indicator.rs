@@ -183,11 +183,13 @@ pub(crate) struct RunningDinoView {
     frame_index: usize,
     last_rendered_at: Instant,
     clock_active: bool,
+    clock_task: Option<gpui_kit::Task<()>>,
+    suspended: bool,
     reduce_motion: bool,
 }
 
 impl RunningDinoView {
-    fn new(assets_loader: Arc<RunningDinoAssetLoader>) -> Self {
+    fn new(assets_loader: Arc<RunningDinoAssetLoader>, active: bool) -> Self {
         Self {
             assets_loader,
             assets: None,
@@ -195,6 +197,8 @@ impl RunningDinoView {
             frame_index: 0,
             last_rendered_at: Instant::now(),
             clock_active: false,
+            clock_task: None,
+            suspended: !active,
             reduce_motion: false,
         }
     }
@@ -237,7 +241,7 @@ impl RunningDinoView {
     }
 
     fn ensure_clock(&mut self, cx: &mut Context<Self>) {
-        if self.clock_active || self.reduce_motion || self.assets.is_none() {
+        if self.suspended || self.clock_active || self.reduce_motion || self.assets.is_none() {
             return;
         }
         self.clock_active = true;
@@ -251,7 +255,7 @@ impl RunningDinoView {
             pioneer_observability::DiagnosticAction::Scheduled,
             pioneer_observability::Visibility::NotApplicable,
         ));
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        self.clock_task = Some(cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 let mut delay = first_delay;
@@ -315,8 +319,7 @@ impl RunningDinoView {
                     ));
                 }
             }
-        })
-        .detach();
+        }));
     }
 }
 
@@ -356,20 +359,24 @@ pub(crate) struct RunningElapsedView {
     show_dino: bool,
     last_rendered_at: Instant,
     clock_active: bool,
+    clock_task: Option<gpui_kit::Task<()>>,
+    suspended: bool,
 }
 
 impl RunningElapsedView {
-    fn new(started_at_unix_ms: i64, show_dino: bool) -> Self {
+    fn new(started_at_unix_ms: i64, show_dino: bool, active: bool) -> Self {
         Self {
             started_at_unix_ms,
             show_dino,
             last_rendered_at: Instant::now(),
             clock_active: false,
+            clock_task: None,
+            suspended: !active,
         }
     }
 
     fn ensure_clock(&mut self, cx: &mut Context<Self>) {
-        if self.clock_active {
+        if self.suspended || self.clock_active {
             return;
         }
         self.clock_active = true;
@@ -379,7 +386,7 @@ impl RunningElapsedView {
             pioneer_observability::DiagnosticAction::Scheduled,
             pioneer_observability::Visibility::NotApplicable,
         ));
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        self.clock_task = Some(cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 loop {
@@ -434,8 +441,7 @@ impl RunningElapsedView {
                     ));
                 }
             }
-        })
-        .detach();
+        }));
     }
 }
 
@@ -480,6 +486,7 @@ struct RunningElapsedViewEntry {
 }
 
 pub(crate) struct RunningIndicatorViewCache {
+    active: bool,
     assets_loader: Arc<RunningDinoAssetLoader>,
     dino: HashMap<String, CachedIndicatorView<RunningDinoView>>,
     elapsed: HashMap<String, RunningElapsedViewEntry>,
@@ -488,6 +495,7 @@ pub(crate) struct RunningIndicatorViewCache {
 impl Default for RunningIndicatorViewCache {
     fn default() -> Self {
         Self {
+            active: true,
             assets_loader: Arc::default(),
             dino: HashMap::new(),
             elapsed: HashMap::new(),
@@ -496,6 +504,26 @@ impl Default for RunningIndicatorViewCache {
 }
 
 impl RunningIndicatorViewCache {
+    pub(in crate::app) fn set_active(&mut self, active: bool, cx: &mut App) {
+        self.active = active;
+        for entry in self.dino.values() {
+            entry.view.update(cx, |view, cx| {
+                if view.suspended == !active { return; }
+                view.suspended = !active;
+                if !active { view.clock_task.take(); view.clock_active = false; }
+                else { cx.notify(); }
+            });
+        }
+        for entry in self.elapsed.values() {
+            entry.cached.view.update(cx, |view, cx| {
+                if view.suspended == !active { return; }
+                view.suspended = !active;
+                if !active { view.clock_task.take(); view.clock_active = false; }
+                else { cx.notify(); }
+            });
+        }
+    }
+
     fn prune(&mut self, now: Instant) {
         self.dino
             .retain(|_, entry| now.duration_since(entry.last_used) <= INDICATOR_CACHE_TTL);
@@ -533,7 +561,7 @@ impl PioneerDesktop {
         }
 
         let assets_loader = cache.assets_loader.clone();
-        let view = cx.new(|_| RunningDinoView::new(assets_loader));
+        let view = cx.new(|_| RunningDinoView::new(assets_loader, cache.active));
         cache.dino.insert(
             activity_id,
             CachedIndicatorView {
@@ -562,7 +590,7 @@ impl PioneerDesktop {
             return entry.cached.view.clone();
         }
 
-        let view = cx.new(|_| RunningElapsedView::new(started_at_unix_ms, show_dino));
+        let view = cx.new(|_| RunningElapsedView::new(started_at_unix_ms, show_dino, cache.active));
         cache.elapsed.insert(
             activity_id,
             RunningElapsedViewEntry {
@@ -659,6 +687,51 @@ impl PioneerDesktop {
 mod tests {
     use super::{decode_running_dino_assets, next_elapsed_tick_delay};
     use std::time::Duration;
+
+    #[gpui_kit::test]
+    fn warm_route_retains_clock_owner_but_cancels_work_until_remount(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext;
+        use super::{CachedIndicatorView, RunningElapsedView, RunningElapsedViewEntry, RunningIndicatorViewCache};
+        let weak = cx.update(|cx| {
+            let mut cache = RunningIndicatorViewCache::default();
+            cache.set_active(false, cx);
+            let inactive = cx.new(|cx| {
+                let mut view = RunningElapsedView::new(1_000, false, cache.active);
+                view.ensure_clock(cx);
+                view
+            });
+            assert!(inactive.read(cx).clock_task.is_none());
+            assert!(inactive.read(cx).suspended);
+
+            let view = cx.new(|cx| {
+                let mut view = RunningElapsedView::new(1_000, false, true);
+                view.ensure_clock(cx);
+                view
+            });
+            let identity = view.entity_id();
+            let weak = view.downgrade();
+            cache.elapsed.insert("thread/turn".into(), RunningElapsedViewEntry {
+                started_at_unix_ms: 1_000, show_dino: false,
+                cached: CachedIndicatorView { view, last_used: std::time::Instant::now() },
+            });
+            cache.set_active(false, cx);
+            let retained = &cache.elapsed["thread/turn"].cached.view;
+            assert_eq!(retained.entity_id(), identity);
+            assert!(retained.read(cx).suspended);
+            assert!(retained.read(cx).clock_task.is_none());
+            retained.update(cx, |view, cx| view.ensure_clock(cx));
+            assert!(retained.read(cx).clock_task.is_none());
+            cache.set_active(true, cx);
+            let retained = &cache.elapsed["thread/turn"].cached.view;
+            assert_eq!(retained.entity_id(), identity);
+            retained.update(cx, |view, cx| view.ensure_clock(cx));
+            assert!(retained.read(cx).clock_task.is_some());
+            drop(cache);
+            weak
+        });
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn running_dino_is_split_into_static_frames_at_embedded_cadence() {

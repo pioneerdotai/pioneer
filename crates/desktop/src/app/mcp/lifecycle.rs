@@ -25,7 +25,7 @@ impl PioneerDesktop {
         {
             return;
         }
-        self.mcp_selected_server_id = None;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::Mcp, cx);
         self.ensure_mcp_poller(cx);
@@ -48,7 +48,7 @@ impl PioneerDesktop {
             return;
         }
 
-        self.mcp_selected_server_id = Some(server_id);
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: Some(server_id) });
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::McpDetails, cx);
         self.ensure_mcp_poller(cx);
@@ -66,7 +66,7 @@ impl PioneerDesktop {
         let server_id =
             mcp_list::resolve_mcp_server_id_from_timeline(self.mcp_servers.as_slice(), server_id);
 
-        self.mcp_selected_server_id = Some(server_id);
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: Some(server_id) });
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::McpDetails, cx);
         self.ensure_mcp_poller(cx);
@@ -79,7 +79,7 @@ impl PioneerDesktop {
             .principal_presentation_capabilities()
             .can_manage_capabilities;
         if !can_manage_capabilities {
-            self.mcp_selected_server_id = None;
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
             self.mcp_server_details = None;
         }
         self.set_main_content_view(mcp_details_return_view(can_manage_capabilities), cx);
@@ -128,6 +128,7 @@ impl PioneerDesktop {
         let workspace_id = scope.workspace_id;
 
         self.mcp_loading = true;
+        cx.emit(crate::app::SidebarChanged);
         self.mcp_error = None;
 
         let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
@@ -146,12 +147,13 @@ impl PioneerDesktop {
                     }
 
                     view.mcp_loading = false;
+                    cx.emit(crate::app::SidebarChanged);
                     match result {
                         Ok(response) => {
                             let reduction = mcp_list::reduce_mcp_list_refresh_success(
                                 std::mem::take(&mut view.mcp_servers),
                                 std::mem::take(&mut view.mcp_pending_actions),
-                                view.mcp_selected_server_id.take(),
+                                view.navigation_input.mcp_server_id().map(str::to_owned),
                                 view.mcp_server_details.take(),
                                 response.servers,
                             );
@@ -193,7 +195,7 @@ impl PioneerDesktop {
         let connection_id = scope.connection_id;
         let workspace_id = scope.workspace_id;
 
-        let Some(server_id) = self.mcp_selected_server_id.clone() else {
+        let Some(server_id) = self.navigation_input.mcp_server_id().map(str::to_owned) else {
             self.mcp_details_loading = false;
             return;
         };
@@ -224,11 +226,11 @@ impl PioneerDesktop {
                         Ok(details) => {
                             let reduction = mcp_details::reduce_mcp_details_refresh_success(
                                 std::mem::take(&mut view.mcp_servers),
-                                view.mcp_selected_server_id.take(),
+                                view.navigation_input.mcp_server_id().map(str::to_owned),
                                 view.mcp_server_details.take(),
                                 details,
                             );
-                            view.apply_mcp_details_refresh_success_reduction(reduction);
+                            view.apply_mcp_details_refresh_success_reduction(reduction, cx);
                         }
                         Err(error) => {
                             let details = format!("{error:#}");
@@ -260,7 +262,9 @@ impl PioneerDesktop {
     pub(in crate::app) fn apply_mcp_server_status_changed_reduction(
         &mut self,
         reduction: McpServerStatusChangedReduction,
+        cx: &mut Context<Self>,
     ) {
+        cx.emit(crate::app::SidebarChanged);
         if !reduction.workspace_matches {
             return;
         }
@@ -281,7 +285,9 @@ impl PioneerDesktop {
     pub(in crate::app) fn apply_mcp_server_catalog_changed_reduction(
         &mut self,
         reduction: McpServerCatalogChangedReduction,
+        cx: &mut Context<Self>,
     ) {
+        cx.emit(crate::app::SidebarChanged);
         if !reduction.workspace_matches {
             return;
         }
@@ -339,18 +345,19 @@ impl PioneerDesktop {
         reduction: mcp_list::McpListRefreshSuccessReduction,
         cx: &mut Context<Self>,
     ) {
+        cx.emit(crate::app::SidebarChanged);
         self.mcp_servers = reduction.servers;
         self.mcp_pending_actions = reduction.pending_actions;
-        self.mcp_selected_server_id = reduction.selected_server_id;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: reduction.selected_server_id });
         self.mcp_server_details = reduction.server_details;
         self.mcp_error = None;
 
         if reduction.application.selected_still_present
-            && self.main_content_view == MainContentView::McpDetails
+            && self.main_content_view() == MainContentView::McpDetails
         {
             self.refresh_mcp_server_details(cx);
         } else if reduction.application.selected_removed
-            && self.main_content_view == MainContentView::McpDetails
+            && self.main_content_view() == MainContentView::McpDetails
         {
             self.set_main_content_view(MainContentView::Mcp, cx);
         }
@@ -366,9 +373,11 @@ impl PioneerDesktop {
     fn apply_mcp_details_refresh_success_reduction(
         &mut self,
         reduction: mcp_details::McpDetailsRefreshSuccessReduction,
+        cx: &mut Context<Self>,
     ) {
+        cx.emit(crate::app::SidebarChanged);
         self.mcp_servers = reduction.servers;
-        self.mcp_selected_server_id = reduction.selected_server_id;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: reduction.selected_server_id });
         self.mcp_server_details = reduction.server_details;
         self.mcp_error = None;
     }
@@ -380,13 +389,15 @@ impl PioneerDesktop {
         self.mcp_error = Some(reduction.error);
     }
 
-    fn ensure_mcp_poller(&mut self, cx: &mut Context<Self>) {
-        if self.mcp_poller_started {
+    pub(in crate::app) fn ensure_mcp_poller(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.activity(self.main_content_view(), self.window_active) != crate::desktop_navigation::RouteActivity::Active {
+            return;
+        }
+        if self.mcp_poller.is_some() {
             return;
         }
 
-        self.mcp_poller_started = true;
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        self.mcp_poller = Some(cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 loop {
@@ -406,12 +417,12 @@ impl PioneerDesktop {
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if matches!(
-                            view.main_content_view,
+                            view.main_content_view(),
                             MainContentView::Mcp | MainContentView::McpDetails
                         ) && view.gateway.connection_state == GatewayConnectionState::Connected
                         {
                             view.queue_mcp_refresh();
-                            if view.main_content_view == MainContentView::McpDetails {
+                            if view.main_content_view() == MainContentView::McpDetails {
                                 view.queue_mcp_details_refresh();
                             }
                             pioneer_observability::record_qualification_diagnostic!(
@@ -434,8 +445,7 @@ impl PioneerDesktop {
                     }
                 }
             }
-        })
-        .detach();
+        }));
     }
 }
 
