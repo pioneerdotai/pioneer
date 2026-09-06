@@ -25,11 +25,12 @@ impl PioneerDesktop {
         let can_manage = self
             .principal_presentation_capabilities()
             .can_manage_capabilities;
-        if !can_manage && self.providers.filter() == ProviderFilter::Cli {
-            self.providers.set_filter(ProviderFilter::Api);
+        if !can_manage && self.navigation_input.providers_route() == ProviderFilter::Cli {
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetProvidersRoute { filter: ProviderFilter::Api });
+        crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
         }
         let selected_ix = Some(selectors::provider_filter_tree_index(
-            self.providers.filter(),
+            self.navigation_input.providers_route(),
         ));
         let provider_tree_state = self.provider_tree_state.clone();
         provider_tree_state.update(cx, |state, cx| {
@@ -53,7 +54,8 @@ impl PioneerDesktop {
         {
             return;
         }
-        self.providers.set_filter(filter);
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetProvidersRoute { filter: filter });
+        crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
         self.sync_provider_sidebar_tree_state(cx);
         cx.notify();
     }

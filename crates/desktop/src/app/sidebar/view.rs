@@ -60,15 +60,16 @@ actions!(sidebar_thread_menu, [SidebarThreadRename]);
 
 impl PioneerDesktop {
     pub(in crate::app) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
+        cx.emit(crate::app::SidebarChanged);
         let model = self.build_sidebar_tree_model();
         let selected_ix = if matches!(
-            self.main_content_view,
+            self.main_content_view(),
             MainContentView::Threads | MainContentView::AgentsDoc
         ) {
-            let selected_node_id = if self.main_content_view == MainContentView::AgentsDoc {
+            let selected_node_id = if self.main_content_view() == MainContentView::AgentsDoc {
                 self.selected_thread_tree_node_id().map(str::to_owned)
             } else if let Some(navigation) = self.active_task_thread_navigation() {
-                Some(thread_node_key(navigation.parent_thread_id.as_str()))
+                Some(thread_node_key(navigation.parent_thread_id()))
             } else {
                 self.current_active_thread_id()
                     .map(thread_node_key)
@@ -134,7 +135,7 @@ impl PioneerDesktop {
             self.build_sidebar_tree_model().visible_node_ids.len() as f32 * TREE_ROW_HEIGHT_PX;
         let tree_state = self.thread_tree_state().clone();
         let desktop_update_panel = self.render_desktop_update_sidebar_panel(cx);
-        let is_new_thread_active = self.main_content_view == MainContentView::Threads
+        let is_new_thread_active = self.main_content_view() == MainContentView::Threads
             && match (
                 self.current_active_thread_id(),
                 self.draft_thread_id().as_deref(),

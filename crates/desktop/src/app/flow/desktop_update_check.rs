@@ -39,6 +39,7 @@ impl PioneerDesktop {
 
         if self.desktop_update != DesktopUpdateUiState::Checking {
             self.desktop_update = DesktopUpdateUiState::Checking;
+            cx.emit(crate::app::SidebarChanged);
             cx.notify();
         }
 
@@ -63,6 +64,7 @@ impl PioneerDesktop {
                 let _ = this.update(&mut cx, |view, cx| {
                     if view.desktop_update != downloading_state {
                         view.desktop_update = downloading_state;
+                        cx.emit(crate::app::SidebarChanged);
                         cx.notify();
                     }
                 });
@@ -97,6 +99,7 @@ fn update_desktop_update_state(
     let _ = this.update(cx, |view, cx| {
         if view.desktop_update != next_state {
             view.desktop_update = next_state;
+            cx.emit(crate::app::SidebarChanged);
             cx.notify();
         }
     });

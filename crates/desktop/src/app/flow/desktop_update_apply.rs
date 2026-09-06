@@ -78,6 +78,7 @@ impl PioneerDesktop {
                 self.desktop_update = DesktopUpdateUiState::Applying {
                     version: target_version,
                 };
+                cx.emit(crate::app::SidebarChanged);
                 cx.notify();
                 cx.quit();
             }

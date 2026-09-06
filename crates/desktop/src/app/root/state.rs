@@ -1,7 +1,7 @@
 use super::*;
 use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::components::member_picker::{MemberPickerDelegate, new_member_picker_state};
-use crate::{state, window};
+use crate::state;
 use gpui_kit::component::table::TableState;
 use pioneer_client::composer::{
     model_selection::default_composer_turn_mode, permissions::default_composer_permission_mode,
@@ -12,8 +12,9 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
         startup_trace: pioneer_observability::DesktopStartupTrace,
+        navigation: Arc<crate::desktop_navigation::DesktopNavigationStore>,
+        shell_state: Entity<crate::shell_state::ShellStateStore>,
     ) -> Self {
-        window::install_window_state_persistence(window, cx);
 
         let gateway_setup_form_state = cx.new(|cx| {
             GatewaySetupFormState::new(
@@ -85,6 +86,11 @@ impl PioneerDesktop {
         });
 
         let mut view = Self {
+            window_active: window.is_window_active(),
+            frame_presentation: None,
+            navigation_input: navigation.snapshot().navigation().clone(),
+            navigation,
+            shell_state,
             startup: DesktopStartupCoordinator::new(
                 startup_trace,
                 client_runtime.client_core().clone(),
@@ -100,8 +106,6 @@ impl PioneerDesktop {
             thread_folder_expanded: state::thread_folders_expanded_for_workspace(cx, None),
             thread_tree_selected_node_id: None,
             thread_tree_state,
-            administration_content_view: AdministrationContentView::Members,
-            settings_content_view: SettingsContentView::Account,
             profile_editor: None,
             profile_editor_input_subscriptions: Vec::new(),
             administration: AdministrationCache::default(),
@@ -130,10 +134,7 @@ impl PioneerDesktop {
             provider_tree_state,
             thread_list_loading: false,
             thread_list_refresh_requested: false,
-            active_thread_id: None,
             active_thread_resubscribe_pending: false,
-            task_thread_navigation_stack: Vec::new(),
-            preferred_workspace_id: None,
             workspaces: Vec::new(),
             workspaces_loading: false,
             workspaces_error: None,
@@ -181,17 +182,15 @@ impl PioneerDesktop {
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),
             composer_model_display_loading_key: None,
-            main_content_view: MainContentView::Threads,
             providers: Default::default(),
             mcp_servers: Vec::new(),
-            mcp_selected_server_id: None,
             mcp_server_details: None,
             mcp_loading: false,
             mcp_details_loading: false,
             mcp_error: None,
             mcp_refresh_requested: false,
             mcp_details_refresh_requested: false,
-            mcp_poller_started: false,
+            mcp_poller: None,
             mcp_pending_actions: HashSet::new(),
             mcp_list_scroll_handle: VirtualListScrollHandle::new(),
             mcp_details_expanded_sections: HashSet::new(),
@@ -207,9 +206,8 @@ impl PioneerDesktop {
             skills_upload_progress: None,
             skills_upload_cancel_token: None,
             skills_refresh_requested: false,
-            skills_poller_started: false,
+            skills_poller: None,
             skills_pending_actions: HashSet::new(),
-            selected_skill_target: None,
             skills_list_scroll_handle: VirtualListScrollHandle::new(),
             skills_details_expanded_sections: HashSet::new(),
             skills_audit_table_state,
@@ -240,8 +238,6 @@ impl PioneerDesktop {
             show_thread_members_sidebar: false,
             thread_artifacts_sidebar_width: px(340.),
             gateway_setup_form_state,
-            show_sidebar: true,
-            sidebar_panel_width: px(320.),
             gateway: GatewayCoordinator {
                 compatibility_task: None,
                 settings_task: None,
@@ -379,6 +375,11 @@ impl PioneerDesktop {
         })
         .detach();
 
+        cx.observe_in(&cx.entity(), window, |view, _, window, cx| {
+            view.reconcile_desktop_startup_readiness(window, cx);
+            view.publish_frame_changes(cx);
+        }).detach();
+        cx.defer_in(window, |view, window, cx| view.reconcile_desktop_startup_readiness(window, cx));
         view.sync_settings_sidebar_tree_state(cx);
         view.sync_administration_sidebar_tree_state(cx);
         view.sync_provider_sidebar_tree_state(cx);

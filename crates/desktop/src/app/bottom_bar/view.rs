@@ -1,5 +1,8 @@
+use crate::desktop_navigation::{
+    OpenAdministration, OpenMcp, OpenProviders, OpenSettings, OpenSkills, OpenThreads,
+};
 use crate::{
-    app::root::{MainContentView, PioneerDesktop, SettingsContentView},
+    app::root::{MainContentView, PioneerDesktop},
     assets::PioneerIconName,
 };
 use gpui_kit::component::{
@@ -8,7 +11,7 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
-    pub(crate) fn render_bottom_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_bottom_bar(&self, action_region: &FocusHandle, cx: &mut Context<Self>) -> AnyElement {
         pioneer_observability::record_qualification_diagnostic!(record_render(
             pioneer_observability::RenderRegion::BottomBar
         ));
@@ -16,20 +19,20 @@ impl PioneerDesktop {
             .principal_presentation_capabilities()
             .can_manage_capabilities;
         let is_threads_view_active = matches!(
-            self.main_content_view,
+            self.main_content_view(),
             MainContentView::Threads | MainContentView::AgentsDoc
         );
-        let show_thread_artifacts_button = self.main_content_view == MainContentView::Threads;
-        let is_providers_view_active = self.main_content_view == MainContentView::Providers;
+        let show_thread_artifacts_button = self.main_content_view() == MainContentView::Threads;
+        let is_providers_view_active = self.main_content_view() == MainContentView::Providers;
         let is_administration_view_active =
-            self.main_content_view == MainContentView::Administration;
-        let is_settings_view_active = self.main_content_view == MainContentView::Settings;
+            self.main_content_view() == MainContentView::Administration;
+        let is_settings_view_active = self.main_content_view() == MainContentView::Settings;
         let is_mcp_view_active = matches!(
-            self.main_content_view,
+            self.main_content_view(),
             MainContentView::Mcp | MainContentView::McpDetails
         );
         let is_skills_view_active = matches!(
-            self.main_content_view,
+            self.main_content_view(),
             MainContentView::Skills | MainContentView::SkillDetails
         );
         let show_status_button = self.should_show_active_thread_status();
@@ -57,17 +60,7 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if matches!(
-                                    view.main_content_view,
-                                    MainContentView::Threads | MainContentView::AgentsDoc
-                                ) {
-                                    view.show_sidebar = !view.show_sidebar;
-                                } else {
-                                    view.set_main_content_view(MainContentView::Threads, cx);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenThreads, window, cx) }),
                     )
                     .child(Separator::vertical().h_4().mx_0p5())
                     .child(
@@ -83,14 +76,7 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if view.main_content_view == MainContentView::Providers {
-                                    view.show_sidebar = !view.show_sidebar;
-                                } else {
-                                    view.open_providers_screen_from_bottom_bar(cx);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenProviders, window, cx) }),
                     )
                     .when(can_manage_capabilities, |this| {
                         this.child(
@@ -106,14 +92,7 @@ impl PioneerDesktop {
                                             this.opacity(1.0).text_color(cx.theme().blue)
                                         }),
                                 )
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    if view.main_content_view == MainContentView::Mcp {
-                                        view.show_sidebar = !view.show_sidebar;
-                                    } else {
-                                        view.open_mcp_screen_from_bottom_bar(cx);
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenMcp, window, cx) }),
                         )
                     })
                     .child(
@@ -129,14 +108,7 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if view.main_content_view == MainContentView::Skills {
-                                    view.show_sidebar = !view.show_sidebar;
-                                } else {
-                                    view.open_skills_screen_from_bottom_bar(cx);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenSkills, window, cx) }),
                     )
                     .child(Separator::vertical().h_4().mx_0p5())
                     .child(
@@ -152,14 +124,7 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if view.main_content_view == MainContentView::Administration {
-                                    view.show_sidebar = !view.show_sidebar;
-                                } else {
-                                    view.open_administration_screen_from_bottom_bar(cx);
-                                }
-                                cx.notify();
-                            })),
+                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenAdministration, window, cx) }),
                     )
                     .child(
                         Button::new("bottom-bar-open-settings")
@@ -174,17 +139,7 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                if view.main_content_view == MainContentView::Settings {
-                                    view.show_sidebar = !view.show_sidebar;
-                                } else {
-                                    view.open_settings_content_from_sidebar(
-                                        SettingsContentView::Account,
-                                        cx,
-                                    );
-                                }
-                                cx.notify();
-                            })),
+                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenSettings, window, cx) }),
                     ),
             )
             .child(

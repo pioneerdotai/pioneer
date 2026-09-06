@@ -427,7 +427,7 @@ impl PioneerDesktop {
     }
 
     fn refresh_workspace_bound_screens_after_switch(&mut self, cx: &mut Context<Self>) {
-        match self.main_content_view {
+        match self.main_content_view() {
             MainContentView::Skills | MainContentView::SkillDetails => {
                 self.queue_skills_refresh();
                 self.refresh_installed_skills(cx);
@@ -435,7 +435,7 @@ impl PioneerDesktop {
             MainContentView::Mcp | MainContentView::McpDetails => {
                 self.queue_mcp_refresh();
                 self.refresh_mcp_servers(cx);
-                if self.mcp_selected_server_id.is_some() {
+                if self.navigation_input.mcp_server_id().is_some() {
                     self.queue_mcp_details_refresh();
                 }
             }

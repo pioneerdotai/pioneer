@@ -264,7 +264,7 @@ impl PioneerDesktop {
 
     fn active_thread_header_title(&self) -> String {
         if let Some(navigation) = self.active_task_thread_navigation() {
-            return navigation.title.clone();
+            return navigation.title().to_owned();
         }
 
         let Some(active_thread_id) = self.current_active_thread_id() else {

@@ -15,7 +15,7 @@ const SKILLS_POLL_INTERVAL_SECS: u64 = 20;
 
 impl PioneerDesktop {
     pub(in crate::app) fn open_skills_screen_from_bottom_bar(&mut self, cx: &mut Context<Self>) {
-        self.selected_skill_target = None;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None });
         self.set_main_content_view(MainContentView::Skills, cx);
         self.ensure_skills_poller(cx);
         self.refresh_installed_skills(cx);
@@ -33,7 +33,7 @@ impl PioneerDesktop {
             return;
         }
 
-        self.selected_skill_target = Some(skill_id);
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: Some(skill_id) });
         self.set_main_content_view(MainContentView::SkillDetails, cx);
     }
 
@@ -94,6 +94,7 @@ impl PioneerDesktop {
         let workspace_id = scope.workspace_id;
 
         self.skills_loading = true;
+        cx.emit(crate::app::SidebarChanged);
         self.skills_error = None;
 
         let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
@@ -118,13 +119,14 @@ impl PioneerDesktop {
                     }
 
                     view.skills_loading = false;
+                    cx.emit(crate::app::SidebarChanged);
 
                     match result {
                         Ok(snapshot) => {
                             let reduction = skill_catalog::reduce_skills_catalog_refresh_success(
                                 snapshot,
                                 std::mem::take(&mut view.skills_pending_actions),
-                                view.selected_skill_target.clone(),
+                                view.navigation_input.skill_id().cloned(),
                             );
                             view.apply_skills_catalog_refresh_success_reduction(reduction, cx);
                         }
@@ -219,16 +221,17 @@ impl PioneerDesktop {
                 .iter()
                 .any(|row| &row.pack.id == pack_id)
         });
+        cx.emit(crate::app::SidebarChanged);
         self.skills_catalog = reduction.catalog;
         self.installed_skills = reduction.installed;
         self.skills_management = reduction.management;
         self.skills_health_details = reduction.health_details;
         self.skills_pending_actions = reduction.pending_actions;
-        self.selected_skill_target = reduction.selected_target;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: reduction.selected_target });
         self.skills_error = None;
 
         if reduction.selected_target_cleared {
-            if self.main_content_view == MainContentView::SkillDetails {
+            if self.main_content_view() == MainContentView::SkillDetails {
                 self.set_main_content_view(MainContentView::Skills, cx);
             }
         }
@@ -241,13 +244,15 @@ impl PioneerDesktop {
         self.skills_error = Some(reduction.error);
     }
 
-    fn ensure_skills_poller(&mut self, cx: &mut Context<Self>) {
-        if self.skills_poller_started {
+    pub(in crate::app) fn ensure_skills_poller(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.activity(self.main_content_view(), self.window_active) != crate::desktop_navigation::RouteActivity::Active {
+            return;
+        }
+        if self.skills_poller.is_some() {
             return;
         }
 
-        self.skills_poller_started = true;
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        self.skills_poller = Some(cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 loop {
@@ -267,7 +272,7 @@ impl PioneerDesktop {
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if matches!(
-                            view.main_content_view,
+                            view.main_content_view(),
                             MainContentView::Skills | MainContentView::SkillDetails
                         ) && view.gateway.connection_state == GatewayConnectionState::Connected
                         {
@@ -292,7 +297,6 @@ impl PioneerDesktop {
                     }
                 }
             }
-        })
-        .detach();
+        }));
     }
 }

@@ -475,7 +475,7 @@ impl PioneerDesktop {
             self.active_agents_doc_editor_scope = None;
             self.agents_doc_editor = None;
             self.set_thread_tree_selected_node_id(None);
-            if self.main_content_view == MainContentView::AgentsDoc {
+            if self.main_content_view() == MainContentView::AgentsDoc {
                 self.set_main_content_view(MainContentView::Threads, cx);
                 return;
             }

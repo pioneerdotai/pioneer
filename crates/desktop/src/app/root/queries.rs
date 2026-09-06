@@ -193,8 +193,12 @@ impl PioneerDesktop {
         &self.thread_tree_state
     }
 
+    pub(in crate::app) fn main_content_view(&self) -> MainContentView { self.navigation.snapshot().route() }
+    pub(in crate::app) fn administration_content_view(&self) -> AdministrationContentView { self.navigation_input.administration_route() }
+    pub(in crate::app) fn settings_content_view(&self) -> SettingsContentView { self.navigation_input.settings_route() }
+
     pub(in crate::app) fn current_active_thread_id(&self) -> Option<&str> {
-        self.active_thread_id.as_deref()
+        self.navigation_input.active_thread_id()
     }
 
     pub(in crate::app) fn draft_thread_id(&self) -> Option<String> {
@@ -210,13 +214,13 @@ impl PioneerDesktop {
         &self,
     ) -> Option<&TaskThreadNavigationEntry> {
         let active_thread_id = self.current_active_thread_id()?;
-        self.task_thread_navigation_stack
+        self.navigation_input.lineage()
             .last()
-            .filter(|entry| entry.child_thread_id == active_thread_id)
+            .filter(|entry| entry.child_thread_id() == active_thread_id)
     }
 
     pub(in crate::app) fn preferred_workspace_id(&self) -> Option<&str> {
-        self.preferred_workspace_id.as_deref()
+        self.navigation_input.workspace_id()
     }
 
     pub(in crate::app) fn workspaces(&self) -> &[Workspace] {
@@ -244,10 +248,7 @@ impl PioneerDesktop {
     }
 
     pub(crate) fn active_workspace_id(&self) -> Option<&str> {
-        workspace_selectors::resolve_active_workspace_id(
-            self.preferred_workspace_id(),
-            self.workspaces(),
-        )
+        self.navigation_input.workspace_id()
     }
 
     pub(in crate::app) fn active_workspace(&self) -> Option<&Workspace> {
@@ -301,11 +302,11 @@ impl PioneerDesktop {
         self.thread_coordinator(thread_id)
             .map(|coordinator| coordinator.workspace_id.clone())
             .or_else(|| {
-                self.task_thread_navigation_stack
+                self.navigation_input.lineage()
                     .iter()
                     .rev()
-                    .find(|entry| entry.child_thread_id == thread_id)
-                    .map(|entry| entry.workspace_id.clone())
+                    .find(|entry| entry.child_thread_id() == thread_id)
+                    .map(|entry| entry.workspace_id().to_owned())
             })
     }
 
@@ -405,9 +406,9 @@ impl PioneerDesktop {
         );
         thread_ids.retain(|thread_id| {
             !self
-                .task_thread_navigation_stack
+                .navigation_input.lineage()
                 .iter()
-                .any(|entry| entry.child_thread_id == *thread_id)
+                .any(|entry| entry.child_thread_id() == *thread_id)
         });
         thread_ids
     }

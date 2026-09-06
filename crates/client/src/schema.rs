@@ -41,6 +41,8 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
+        schema_doc!("client_navigation_state.json", crate::navigation::ClientNavigationState),
+        schema_doc!("navigation_intent.json", crate::navigation::NavigationIntent),
         schema_doc!(
             "gateway_settings_store.json",
             crate::gateway::settings_store::GatewaySettingsStore

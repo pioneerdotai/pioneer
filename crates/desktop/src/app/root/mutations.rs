@@ -6,10 +6,40 @@ use pioneer_client::composer::draft::{
 };
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::state::reducers as client_state_reducers;
-use pioneer_client::threads::{session as thread_session, tree as thread_tree};
+use pioneer_client::threads::tree as thread_tree;
 use tracing::warn;
 
 impl PioneerDesktop {
+    pub(in crate::app) fn navigation_intent(&mut self, intent: pioneer_client::navigation::NavigationIntent) {
+        let core = self.gateway.client_runtime.client_core();
+        core.navigate(intent, None);
+        self.install_navigation_input(core.navigation_snapshot());
+    }
+
+    fn install_navigation_input(&mut self, input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>) -> bool {
+        if std::sync::Arc::ptr_eq(&self.navigation_input, &input) { return false; }
+        let changed = self.navigation_input.active_thread_id() != input.active_thread_id();
+        self.thread_bindings.select(if matches!(input.destination(), pioneer_client::navigation::SemanticDestination::Threads) { input.active_thread_id() } else { None });
+        self.navigation_input = input;
+        if changed {
+            self.composer_edit_target = None;
+            self.invalidate_active_thread_capability_projection();
+            self.thread_members_thread_id = None;
+            self.thread_members.clear();
+            self.thread_members_loading = false;
+            self.active_thread_resubscribe_pending = self.current_active_thread_id().is_some()
+                && self.gateway.connection_state == GatewayConnectionState::Connected;
+            self.reset_composer_model_selection_for_active_thread();
+        }
+        true
+    }
+
+    pub(crate) fn apply_navigation_publication(&mut self, input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>, cx: &mut Context<Self>) {
+        let changed = self.install_navigation_input(input);
+        self.reconcile_route_activity(cx);
+        if changed { cx.notify(); }
+    }
+
     pub(in crate::app) fn reconcile_composer_draft_with_capabilities(&mut self) {
         let Some(policy) = self
             .gateway
@@ -142,30 +172,29 @@ impl PioneerDesktop {
         view: MainContentView,
         cx: &mut Context<Self>,
     ) {
-        self.main_content_view = view;
-        if view != MainContentView::Settings {
-            self.self_improvement_status_poll = None;
-        }
+        use pioneer_client::navigation::{NavigationIntent, SemanticDestination};
+        let destination = match view {
+            MainContentView::Threads => SemanticDestination::Threads,
+            MainContentView::AgentsDoc => SemanticDestination::AgentsDocument,
+            MainContentView::Providers => SemanticDestination::Providers { filter: self.navigation_input.providers_route() },
+            MainContentView::Administration => SemanticDestination::Administration { route: self.navigation_input.administration_route() },
+            MainContentView::Settings => SemanticDestination::Settings { route: self.navigation_input.settings_route() },
+            MainContentView::Mcp => SemanticDestination::Mcp { server_id: None },
+            MainContentView::McpDetails => SemanticDestination::Mcp { server_id: self.navigation_input.mcp_server_id().map(str::to_owned) },
+            MainContentView::Skills => SemanticDestination::Skills { skill_id: None },
+            MainContentView::SkillDetails => SemanticDestination::Skills { skill_id: self.navigation_input.skill_id().cloned() },
+        };
+        self.navigation_intent(NavigationIntent::Navigate { destination });
+        crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
+        self.reconcile_route_activity(cx);
+
         self.rebuild_sidebar_tree_state(cx);
     }
 
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
-        self.gateway
-            .client_runtime
-            .client_core()
-            .activate_thread(thread_id.as_deref(), self.active_workspace_id());
-        self.thread_bindings.select(thread_id.as_deref());
-        let changed = thread_session::set_active_thread_id(&mut self.active_thread_id, thread_id);
-        if changed {
-            self.composer_edit_target = None;
-            self.invalidate_active_thread_capability_projection();
-            self.thread_members_thread_id = None;
-            self.thread_members.clear();
-            self.thread_members_loading = false;
-            self.active_thread_resubscribe_pending = self.active_thread_id.is_some()
-                && self.gateway.connection_state == GatewayConnectionState::Connected;
-            self.reset_composer_model_selection_for_active_thread();
-        }
+        let workspace_id = thread_id.as_deref().and_then(|id| self.thread_workspace_id(id))
+            .or_else(|| self.active_workspace_id().map(str::to_owned));
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SelectThread { workspace_id, thread_id });
     }
 
     pub(in crate::app) fn set_draft_thread_id(&mut self, thread_id: Option<String>) {
@@ -189,7 +218,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn set_preferred_workspace_id(&mut self, workspace_id: Option<String>) {
-        self.preferred_workspace_id = workspace_id;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SelectWorkspace { workspace_id });
     }
 
     pub(in crate::app) fn load_thread_folder_expansion_for_workspace(
@@ -240,7 +269,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn remember_active_thread_draft(&mut self, cx: &Context<Self>) {
-        let Some(thread_id) = self.active_thread_id.as_ref().map(ToOwned::to_owned) else {
+        let Some(thread_id) = self.navigation_input.active_thread_id().map(str::to_owned) else {
             return;
         };
 
@@ -306,7 +335,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current_thread_id = self.active_thread_id.clone();
+        let current_thread_id = self.navigation_input.active_thread_id().map(str::to_owned);
         let current_draft = current_thread_id.as_ref().and_then(|_| {
             self.composer_edit_target
                 .is_none()
@@ -344,7 +373,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn clear_composer_payload_for_thread(&mut self, thread_id: &str) {
-        if self.active_thread_id.as_deref() == Some(thread_id) {
+        if self.navigation_input.active_thread_id() == Some(thread_id) {
             self.composer_edit_target = None;
             self.reduce_composer_domain(ComposerDomainAction::ClearPayload);
             self.composer_upload_in_progress = false;
@@ -545,7 +574,7 @@ impl PioneerDesktop {
         self.providers.clear_for_workspace_switch();
         self.sync_open_model_selector_cli_runtime_snapshot();
         self.mcp_servers.clear();
-        self.mcp_selected_server_id = None;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
         self.mcp_server_details = None;
         self.mcp_loading = false;
         self.mcp_details_loading = false;
@@ -561,7 +590,7 @@ impl PioneerDesktop {
         self.skills_error = None;
         self.skills_refresh_requested = false;
         self.skills_pending_actions.clear();
-        self.selected_skill_target = None;
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None });
         self.composer_capabilities.clear();
         self.composer_skill_selections.clear();
         self.composer_attachments.clear();
@@ -578,10 +607,10 @@ impl PioneerDesktop {
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
         if !matches!(
-            self.main_content_view,
+            self.main_content_view(),
             MainContentView::Settings | MainContentView::Threads
         ) {
-            self.main_content_view = MainContentView::Threads;
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::Navigate { destination: pioneer_client::navigation::SemanticDestination::Threads });
         }
     }
 
@@ -594,7 +623,7 @@ impl PioneerDesktop {
         self.workspaces_error = None;
         self.set_active_thread_id(None);
         self.clear_thread_conversations();
-        self.task_thread_navigation_stack.clear();
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::ClearLineage);
         self.gateway
             .client_runtime
             .client_core()

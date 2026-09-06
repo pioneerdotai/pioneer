@@ -82,6 +82,7 @@ pub mod gateway;
 pub mod ids;
 mod local_file;
 pub mod mcp;
+pub mod navigation;
 pub mod notifications;
 pub mod platform;
 pub mod providers;

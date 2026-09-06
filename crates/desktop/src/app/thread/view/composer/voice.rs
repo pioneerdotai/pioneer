@@ -311,7 +311,7 @@ impl PioneerDesktop {
             return;
         }
 
-        let Some(thread_id) = self.active_thread_id.clone() else {
+        let Some(thread_id) = self.navigation_input.active_thread_id().map(str::to_owned) else {
             self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
             cx.notify();
             return;
@@ -710,7 +710,7 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(super) fn cancel_desktop_voice_hold(&mut self, reason: &str, cx: &mut Context<Self>) {
+    pub(in crate::app) fn cancel_desktop_voice_hold(&mut self, reason: &str, cx: &mut Context<Self>) {
         if let Some(mut flow) = self.desktop_voice_capture.take()
             && let Err(error) = flow.release_cancel()
         {
@@ -1017,16 +1017,23 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn composer_voice_status_event_converges_without_restart_or_stale_poll_override() {
-        let source = include_str!("../../../flow/ws_events_notifications.rs");
+        let source = include_str!("../../../flow/ws_events_pump.rs");
         let handler = source
-            .split("fn apply_voice_input_status_changed")
+            .split("let settings = self.gateway.settings_binding.clone();")
             .nth(1)
-            .expect("Voice Input status handler exists")
-            .split("fn apply_thread_started_reduction")
+            .expect("settings publication binding exists")
+            .split("let identity = self.gateway.identity_binding.clone();")
             .next()
-            .expect("Voice Input status handler body exists");
+            .expect("settings publication consumer exists");
+        assert!(handler.contains("view.gateway.settings = publication.settings.clone()"));
+        assert!(handler.contains("let voice_changed = voice != publication.voice_input"));
+        assert!(handler.contains("if voice_changed"));
         assert!(handler.contains("settings.runtime.phase.coarse_voice_status()"));
         assert!(handler.contains("desktop_voice_status_poll_generation.saturating_add(1)"));
-        assert!(handler.contains("current.voice_input = settings"));
+        let polling = include_str!("voice.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production polling source exists");
+        assert!(polling.contains("view.desktop_voice_status_poll_generation != generation"));
     }
 }

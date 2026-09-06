@@ -4424,6 +4424,52 @@ mod tests {
     }
 
     #[test]
+    fn navigation_binding_matches_direct_rust_for_selection_destinations_and_fences() {
+        use pioneer_client::navigation::{NavigationIntent, SemanticDestination, TaskThreadLineage, AdministrationRoute, SettingsRoute};
+        use pioneer_client::providers::selectors::ProviderFilter;
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+        let direct = pioneer_client::core::ClientCore::shared();
+        let intents = vec![
+            NavigationIntent::SelectWorkspace { workspace_id: Some("workspace".into()) },
+            NavigationIntent::RememberDraft { workspace_id: "workspace".into(), thread_id: Some("draft".into()) },
+            NavigationIntent::SelectThread { workspace_id: Some("workspace".into()), thread_id: Some("parent".into()) },
+            NavigationIntent::PushTaskThread { entry: TaskThreadLineage::new("parent".into(), "child".into(), "workspace".into(), "Task".into()) },
+            NavigationIntent::PopTaskThread,
+            NavigationIntent::PopTaskThread,
+            NavigationIntent::Navigate { destination: SemanticDestination::Providers { filter: ProviderFilter::Connected } },
+            NavigationIntent::Navigate { destination: SemanticDestination::Administration { route: AdministrationRoute::Invitations } },
+            NavigationIntent::Navigate { destination: SemanticDestination::Mcp { server_id: Some("server".into()) } },
+            NavigationIntent::Navigate { destination: SemanticDestination::Skills { skill_id: None } },
+            NavigationIntent::Navigate { destination: SemanticDestination::Settings { route: SettingsRoute::Memory } },
+            NavigationIntent::PromoteThread { thread_id: "draft".into() },
+            NavigationIntent::PromoteThread { thread_id: "draft".into() },
+            NavigationIntent::SelectThread { workspace_id: None, thread_id: Some(" ".into()) },
+            NavigationIntent::Reset,
+            NavigationIntent::Reset,
+        ];
+        for intent in intents {
+            let request = client_binding::ClientIntentDispatchDto {
+                schema_version: 1,
+                intent: pioneer_client::core::ClientIntent::Navigation { intent, expected_revision: None },
+            };
+            let direct_result = direct.dispatch(request.intent.clone());
+            let ffi_result = runtime.client_intent_dispatch(&serde_json::to_string(&request).unwrap()).unwrap();
+            assert_eq!(ffi_result, client_binding::transition_dto(direct_result));
+            let ffi = runtime.client_scoped_snapshot(r#"{"schema_version":1,"scope":{"kind":"navigation"}}"#).unwrap().unwrap();
+            assert_eq!(ffi, client_binding::snapshot_dto(direct.snapshot(&ClientScope::Navigation).unwrap()));
+        }
+        let stale = r#"{"schema_version":1,"intent":{"kind":"navigation","intent":{"kind":"reset"},"expected_revision":0}}"#;
+        assert_eq!(runtime.client_intent_dispatch(stale).unwrap().outcome, pioneer_client::core::ClientTransitionOutcome::Stale);
+        for core in [&direct, &runtime.client_runtime.core] {
+            core.activate_thread(Some("protected"), Some("workspace"));
+            core.begin_authorization_epoch(None);
+            assert_eq!(core.navigation_snapshot().active_thread_id(), None);
+            assert!(core.snapshot(&ClientScope::Navigation).unwrap().typed::<pioneer_client::navigation::ClientNavigationState>().is_some());
+        }
+    }
+
+    #[test]
     fn client_binding_rejects_unknown_schema_versions() {
         let runtime = ClientFfiRuntime::default();
         runtime.initialize("{}").unwrap();
@@ -4444,7 +4490,7 @@ mod tests {
     #[test]
     fn client_binding_replays_independent_core_outputs_and_bounded_delivery() {
         use pioneer_client::core::*;
-        let direct = Arc::new(ClientCore::new());
+        let direct = ClientCore::shared();
         let runtime = ClientFfiRuntime::default();
         runtime.initialize("{}").unwrap();
         assert!(!Arc::ptr_eq(&direct, &runtime.client_runtime.core));
@@ -4548,7 +4594,7 @@ mod tests {
         }
         assert_eq!(actual.changes, expected);
         assert!(
-            matches!(actual.changes.as_slice(), [client_binding::ClientChangeDto::ResnapshotRequired { latest_sequence, .. }] if latest_sequence.get() == 70)
+            matches!(actual.changes.as_slice(), [client_binding::ClientChangeDto::ResnapshotRequired { latest_sequence, .. }] if *latest_sequence == direct.snapshot(&scope).unwrap().snapshot().sequence())
         );
         assert!(
             runtime

@@ -190,6 +190,14 @@ impl DesktopClientBindingRouter {
         })
     }
 
+    pub(super) fn deliver_pending(&self, core: &ClientCore) {
+        for (target, publication) in self.drain(core) {
+            if let Some(registration) = target.upgrade() {
+                if let Some(sink) = registration.sink.upgrade() { sink.publish(publication); }
+            }
+        }
+    }
+
     pub(super) fn shutdown(&mut self) {
         let mut routes = self.routes.borrow_mut();
         routes.active = false;

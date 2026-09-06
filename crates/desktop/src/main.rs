@@ -4,6 +4,9 @@ extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
 mod app;
+mod desktop_navigation;
+mod desktop_shell;
+mod shell_state;
 mod assets;
 mod audio;
 mod client_runtime;
@@ -36,7 +39,7 @@ use tracing::error;
 use pioneer_config::AppConfig;
 use pioneer_protocol::{InvitationPresentation, PioneerAppUrlScheme};
 
-use app::PioneerDesktop;
+use app::LegacyScreenAdapter;
 
 #[derive(Clone)]
 struct DesktopHttpClient {
@@ -245,9 +248,15 @@ fn main() {
             let mut desktop = None;
             let window_handle = cx
                 .open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| PioneerDesktop::new(window, cx, startup.clone()));
-                    desktop = Some(view.clone());
-                    cx.new(|cx| Root::new(view, window, cx))
+                    client_runtime::DesktopRuntimeCoordinator::install(cx);
+                    let registrar = cx.global::<client_runtime::DesktopRuntimeCoordinator>().registrar();
+                    let navigation = desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+                    client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
+                    let layout = cx.new(|cx| shell_state::ShellStateStore::new(window, cx));
+                    let legacy = cx.new(|cx| LegacyScreenAdapter::new(window, cx, startup.clone(), navigation.clone(), layout.clone()));
+                    desktop = Some(legacy.downgrade());
+                    let shell = cx.new(|cx| desktop_shell::DesktopShellView::new(legacy, navigation, layout, window, cx));
+                    cx.new(|cx| Root::new(shell, window, cx))
                 })
                 .context(t!("errors.window.open_failed").to_string())?;
             window_stage.succeed();

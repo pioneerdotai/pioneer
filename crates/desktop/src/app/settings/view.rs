@@ -77,7 +77,7 @@ impl PioneerDesktop {
             return self.render_profile_editor(editor, window, cx);
         }
 
-        match self.settings_content_view {
+        match self.settings_content_view() {
             SettingsContentView::General => self.render_settings_general(window, cx),
             SettingsContentView::Account => self.render_settings_account(window, cx),
             SettingsContentView::Memory => self.render_settings_memory(window, cx),

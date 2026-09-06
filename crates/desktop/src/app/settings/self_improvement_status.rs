@@ -8,7 +8,10 @@ use pioneer_protocol::{SelfImprovementPhase as Phase, SelfImprovementStatusReaso
 use std::time::Duration;
 
 impl PioneerDesktop {
-    pub(super) fn start_self_improvement_status_poll(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn start_self_improvement_status_poll(&mut self, cx: &mut Context<Self>) {
+        if self.self_improvement_status_poll.is_some() {
+            return;
+        }
         self.self_improvement_status_poll =
             Some(cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
@@ -16,8 +19,8 @@ impl PioneerDesktop {
                     loop {
                         cx.background_executor().timer(Duration::from_secs(5)).await;
                         let keep_polling = this.update(&mut cx, |view, cx| {
-                            if view.main_content_view != MainContentView::Settings
-                                || view.settings_content_view
+                            if view.main_content_view() != MainContentView::Settings
+                                || view.settings_content_view()
                                     != SettingsContentView::SelfImprovement
                             {
                                 return false;

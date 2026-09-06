@@ -88,7 +88,7 @@ impl PioneerDesktop {
                             mcp_actions::McpActionTarget::new(name.clone()),
                         ),
                         outcome,
-                        view.mcp_selected_server_id.as_deref(),
+                        view.navigation_input.mcp_server_id(),
                     );
                     if reduction.rollback_policy
                         && let Some((prev_enabled, prev_implicit)) = previous_policy
@@ -176,7 +176,7 @@ impl PioneerDesktop {
                             mcp_actions::McpActionTarget::new(name.clone()),
                         ),
                         outcome,
-                        view.mcp_selected_server_id.as_deref(),
+                        view.navigation_input.mcp_server_id(),
                     );
                     view.apply_mcp_action_finish_reduction(reduction, cx);
 
@@ -259,7 +259,7 @@ impl PioneerDesktop {
                             mcp_actions::McpActionTarget::new(name.clone()),
                         ),
                         outcome,
-                        view.mcp_selected_server_id.as_deref(),
+                        view.navigation_input.mcp_server_id(),
                     );
                     view.apply_mcp_action_finish_reduction(reduction, cx);
 
@@ -306,11 +306,9 @@ impl PioneerDesktop {
             reduction.pending.pending,
         );
         if reduction.clear_selected_details {
-            mcp_actions::apply_mcp_uninstall_success(
-                &mut self.mcp_selected_server_id,
-                &mut self.mcp_server_details,
-            );
-            if self.main_content_view == MainContentView::McpDetails {
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
+            self.mcp_server_details = None;
+            if self.main_content_view() == MainContentView::McpDetails {
                 self.set_main_content_view(MainContentView::Mcp, cx);
             }
         }

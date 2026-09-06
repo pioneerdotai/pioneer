@@ -89,7 +89,7 @@ impl PioneerDesktop {
             .can_manage_capabilities;
         let selected = mcp_details::selected_mcp_server(
             self.mcp_servers.as_slice(),
-            self.mcp_selected_server_id.as_deref(),
+            self.navigation_input.mcp_server_id(),
         )
         .cloned();
         let is_pending = selected

@@ -31,6 +31,16 @@ impl DesktopRuntimeCoordinator {
         let binding_router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));
         let registrar = DesktopClientBindingRouter::registrar(&binding_router, &core, cx);
         let quit = cx.on_app_quit(|cx| {
+            for handle in cx.windows() {
+                let _ = handle.update(cx, |root, window, cx| {
+                    if let Ok(root) = root.clone().downcast::<gpui_kit::component::Root>() {
+                        let content = root.read(cx).view().clone();
+                        if let Ok(shell) = content.downcast::<crate::desktop_shell::DesktopShellView>() {
+                            shell.update(cx, |shell, cx| shell.close(window, cx));
+                        }
+                    }
+                });
+            }
             let mut owner = cx.remove_global::<Self>();
             owner
                 .binding_router
@@ -55,6 +65,12 @@ impl DesktopRuntimeCoordinator {
             _effect_router: effect_router,
             _quit: quit,
         });
+    }
+
+    /// Deliver already committed publications after a synchronous UI command.
+    pub(crate) fn deliver_pending(cx: &App) {
+        let owner = cx.global::<Self>();
+        owner.binding_router.read(cx).deliver_pending(&owner.core);
     }
 
     pub(crate) fn core(&self) -> Arc<ClientCore> {

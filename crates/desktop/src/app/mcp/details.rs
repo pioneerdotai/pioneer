@@ -28,7 +28,7 @@ impl PioneerDesktop {
         let details = self.mcp_server_details.as_ref();
         let server = mcp_details::mcp_details_server(
             self.mcp_servers.as_slice(),
-            self.mcp_selected_server_id.as_deref(),
+            self.navigation_input.mcp_server_id(),
             details,
         );
 
@@ -59,7 +59,7 @@ impl PioneerDesktop {
             .can_manage_capabilities;
         let desktop_entity = cx.entity().clone();
         let status_color = Self::mcp_status_color(server.status, cx);
-        let meta_grid_columns = self.mcp_details_meta_grid_columns(window);
+        let meta_grid_columns = self.mcp_details_meta_grid_columns(window, cx);
 
         v_flex()
             .size_full()
@@ -193,10 +193,10 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    fn mcp_details_meta_grid_columns(&self, window: &Window) -> u16 {
+    fn mcp_details_meta_grid_columns(&self, window: &Window, cx: &App) -> u16 {
         let viewport_width = window.viewport_size().width;
-        let sidebar_width = if self.show_sidebar {
-            self.sidebar_panel_width
+        let sidebar_width = if self.shell_state.read(cx).sidebar_visible() {
+            self.shell_state.read(cx).sidebar_width()
         } else {
             px(0.)
         };

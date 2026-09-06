@@ -59,7 +59,7 @@ impl PioneerDesktop {
         let configured_provider_names = self.providers.configured_names().clone();
         let cli_runtimes = self.providers.cli_runtimes().to_vec();
         let expanded_cli_runtime_ids = self.providers.expanded_cli_runtime_ids().clone();
-        let provider_filter = self.providers.filter();
+        let provider_filter = self.navigation_input.providers_route();
         let show_api_providers = selectors::provider_filter_shows_api_providers(provider_filter);
         let show_cli_providers = selectors::provider_filter_shows_cli_providers(provider_filter);
         let screen_title = match provider_filter {
@@ -72,7 +72,7 @@ impl PioneerDesktop {
         } else {
             t!("providers.screen.description").to_string()
         };
-        let grid_columns = self.provider_grid_columns(window);
+        let grid_columns = self.provider_grid_columns(window, cx);
         let visible_providers = provider_catalog_entries()
             .enumerate()
             .filter(|(_, provider)| {
@@ -282,10 +282,10 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    fn provider_grid_columns(&self, window: &Window) -> u16 {
+    fn provider_grid_columns(&self, window: &Window, cx: &App) -> u16 {
         let viewport_width = window.viewport_size().width;
-        let sidebar_width = if self.show_sidebar {
-            self.sidebar_panel_width
+        let sidebar_width = if self.shell_state.read(cx).sidebar_visible() {
+            self.shell_state.read(cx).sidebar_width()
         } else {
             px(0.)
         };
