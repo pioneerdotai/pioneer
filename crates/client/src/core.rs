@@ -182,6 +182,24 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    RefreshTimeline {
+        thread_id: String,
+    },
+    SetTimelineExpansion {
+        thread_id: String,
+        row_ids: Vec<String>,
+        collapsed_row_ids: Vec<String>,
+    },
+    TimelineViewport {
+        thread_id: String,
+        row_ids: Vec<String>,
+        source_revision: u64,
+        threshold: usize,
+        before: bool,
+        after: bool,
+        work: bool,
+        presented_rows: bool,
+    },
     SetScopeDemand {
         scope: ClientScope,
         demand: ClientDemand,
@@ -339,12 +357,30 @@ pub enum ClientTransitionOutcome {
     Rejected,
 }
 
+struct SerializedClientPayload {
+    value: std::sync::OnceLock<Arc<serde_json::Value>>,
+    encode: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
+}
+impl SerializedClientPayload {
+    fn eager(value: serde_json::Value) -> Self {
+        Self {
+            value: std::sync::OnceLock::from(Arc::new(value)),
+            encode: None,
+        }
+    }
+    fn get(&self) -> Arc<serde_json::Value> {
+        self.value
+            .get_or_init(|| Arc::new(self.encode.as_ref().expect("deferred payload encoder")()))
+            .clone()
+    }
+}
+
 pub struct ClientSnapshot {
     scope: ClientScope,
     revisions: ClientRevisions,
     sequence: ClientChangeSequence,
     payload: Arc<dyn Any + Send + Sync>,
-    serialized_payload: Arc<serde_json::Value>,
+    serialized_payload: Arc<SerializedClientPayload>,
 }
 
 impl ClientSnapshot {
@@ -371,7 +407,7 @@ impl ClientSnapshot {
     }
 
     pub fn serialized_payload(&self) -> Arc<serde_json::Value> {
-        Arc::clone(&self.serialized_payload)
+        self.serialized_payload.get()
     }
 
     pub fn payload<T>(&self) -> Option<Arc<T>>
@@ -447,6 +483,7 @@ pub struct ClientChangeSet {
     sequence: ClientChangeSequence,
     predecessor: Option<ClientChangeSequence>,
     publications: Arc<[ClientPublicationReference]>,
+    timeline_changes: Arc<[crate::timeline::presentation::TimelineChangeSet]>,
 }
 
 impl ClientChangeSet {
@@ -455,6 +492,7 @@ impl ClientChangeSet {
             sequence: ClientChangeSequence::ZERO,
             predecessor: None,
             publications: Arc::from([]),
+            timeline_changes: Arc::from([]),
         })
     }
 
@@ -464,6 +502,10 @@ impl ClientChangeSet {
 
     pub const fn predecessor(&self) -> Option<ClientChangeSequence> {
         self.predecessor
+    }
+
+    pub fn timeline_changes(&self) -> &[crate::timeline::presentation::TimelineChangeSet] {
+        &self.timeline_changes
     }
 
     pub fn publications(&self) -> &[ClientPublicationReference] {
@@ -645,6 +687,8 @@ pub struct ClientCore {
     pub(crate) thread_request_sender:
         Mutex<Option<std::sync::mpsc::Sender<crate::threads::registry::ThreadControllerRequest>>>,
     thread_request_task: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(crate) presentation_sender: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    presentation_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub(crate) thread_registry: Mutex<crate::threads::registry::ThreadRegistry>,
     pub(crate) identity_authorization:
         Mutex<crate::gateway::identity_authorization::IdentityAuthorizationStore>,
@@ -667,6 +711,13 @@ pub struct ClientCore {
 impl Drop for ClientCore {
     fn drop(&mut self) {
         self.shutdown();
+        if let Ok(task) = self.presentation_task.get_mut() {
+            if let Some(task) = task.take() {
+                if task.thread().id() != std::thread::current().id() {
+                    let _ = task.join();
+                }
+            }
+        }
         if let Ok(task) = self.thread_request_task.get_mut() {
             if let Some(task) = task.take() {
                 if task.thread().id() != std::thread::current().id() {
@@ -691,10 +742,21 @@ pub struct ClientMutationAuthority {
 }
 
 pub struct ClientPublicationDraft {
+    timeline_change: Option<crate::timeline::presentation::TimelineChangeSet>,
     scope: ClientScope,
     revisions: ClientRevisions,
     payload: Arc<dyn Any + Send + Sync>,
-    serialized_payload: Arc<serde_json::Value>,
+    serialized_payload: Arc<SerializedClientPayload>,
+}
+
+impl ClientPublicationDraft {
+    pub(crate) fn with_timeline_change(
+        mut self,
+        change: crate::timeline::presentation::TimelineChangeSet,
+    ) -> Self {
+        self.timeline_change = Some(change);
+        self
+    }
 }
 
 impl ClientMutationAuthority {
@@ -703,6 +765,27 @@ impl ClientMutationAuthority {
     #[cfg(feature = "test-support")]
     pub fn for_test() -> Self {
         Self { _private: () }
+    }
+
+    pub(crate) fn timeline_publication(
+        &self,
+        snapshot: Arc<crate::timeline::presentation::TimelineSnapshot>,
+    ) -> ClientPublicationDraft {
+        let payload = snapshot.clone();
+        ClientPublicationDraft {
+            timeline_change: None,
+            scope: ClientScope::Timeline {
+                thread_id: snapshot.thread_id().to_owned(),
+            },
+            revisions: crate::threads::registry::revisions(snapshot.revision()),
+            payload: snapshot,
+            serialized_payload: Arc::new(SerializedClientPayload {
+                value: std::sync::OnceLock::new(),
+                encode: Some(Box::new(move || {
+                    serde_json::to_value(payload.as_ref()).expect("timeline snapshot serializes")
+                })),
+            }),
+        }
     }
 
     pub fn publication<T>(
@@ -717,10 +800,11 @@ impl ClientMutationAuthority {
         let serialized_payload = serde_json::to_value(payload.as_ref())
             .expect("Client publication payloads must be serializable");
         ClientPublicationDraft {
+            timeline_change: None,
             scope,
             revisions,
             payload,
-            serialized_payload: Arc::new(serialized_payload),
+            serialized_payload: Arc::new(SerializedClientPayload::eager(serialized_payload)),
         }
     }
 }
@@ -738,6 +822,8 @@ impl ClientCore {
             thread_registry: Mutex::default(),
             thread_request_sender: Mutex::default(),
             thread_request_task: Mutex::default(),
+            presentation_sender: Mutex::default(),
+            presentation_task: Mutex::default(),
             identity_authorization: Mutex::default(),
             session_refresh_slots: Mutex::default(),
             session_transport: Mutex::default(),
@@ -960,6 +1046,7 @@ impl ClientCore {
             .is_none_or(|first| first.predecessor().unwrap_or_default() > after);
         let changes = if gap {
             vec![Arc::new(ClientChangeSet {
+                timeline_changes: Arc::from([]),
                 sequence,
                 predecessor: Some(after),
                 publications: Arc::from(
@@ -995,6 +1082,10 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.presentation_sender
+            .lock()
+            .expect("presentation sender poisoned")
+            .take();
         self.thread_request_sender
             .lock()
             .expect("thread request sender poisoned")
@@ -1100,6 +1191,34 @@ impl ClientCore {
 
     pub fn shared() -> Arc<Self> {
         let core = Arc::new(Self::new());
+        let (presentation_sender, presentation_receiver) = std::sync::mpsc::sync_channel(1);
+        *core
+            .presentation_sender
+            .lock()
+            .expect("presentation sender poisoned") = Some(presentation_sender);
+        let weak_presentation = Arc::downgrade(&core);
+        *core
+            .presentation_task
+            .lock()
+            .expect("presentation task poisoned") = Some(
+            std::thread::Builder::new()
+                .name("client-thread-presentation".into())
+                .spawn(move || {
+                    while presentation_receiver.recv().is_ok() {
+                        // A fixed window has bounded latency even during a continuous stream.
+                        std::thread::sleep(std::time::Duration::from_millis(8));
+                        while presentation_receiver.try_recv().is_ok() {}
+                        let Some(core) = weak_presentation.upgrade() else {
+                            break;
+                        };
+                        if core.is_stopped() {
+                            break;
+                        }
+                        core.materialize_demanded_timelines();
+                    }
+                })
+                .expect("Client presentation task could not start"),
+        );
         let (sender, receiver) = std::sync::mpsc::channel();
         *core
             .thread_request_sender
@@ -1291,11 +1410,67 @@ impl ClientCore {
     }
 
     pub fn dispatch(&self, intent: ClientIntent) -> ClientTransition {
+        if self.is_stopped() {
+            let mut partitions = self.partitions.lock().expect("client partitions poisoned");
+            partitions.transition_sequence.advance();
+            return Self::transition_without_publication(
+                &partitions,
+                ClientTransitionOutcome::Rejected,
+            );
+        }
+        match &intent {
+            ClientIntent::RefreshTimeline { thread_id } => {
+                self.refresh_thread_timeline(thread_id);
+            }
+            ClientIntent::SetTimelineExpansion {
+                thread_id,
+                row_ids,
+                collapsed_row_ids,
+            } => {
+                self.set_thread_timeline_expansion(thread_id, row_ids, collapsed_row_ids);
+            }
+            ClientIntent::TimelineViewport {
+                thread_id,
+                row_ids,
+                source_revision,
+                threshold,
+                before,
+                after,
+                work,
+                presented_rows,
+            } => {
+                for action in self.plan_thread_timeline_viewport(
+                    thread_id,
+                    *source_revision,
+                    row_ids,
+                    *threshold,
+                    *before,
+                    *after,
+                    *work,
+                    *presented_rows,
+                ) {
+                    self.schedule_thread_semantic_request(action);
+                }
+            }
+            ClientIntent::SetScopeDemand { .. } => {}
+        }
         let ClientIntent::SetScopeDemand {
             scope: thread_scope,
             demand: thread_demand,
             ..
-        } = &intent;
+        } = &intent
+        else {
+            let mut partitions = self.partitions.lock().expect("client partitions poisoned");
+            partitions.transition_sequence.advance();
+            return Self::transition_without_publication(
+                &partitions,
+                if self.is_stopped() {
+                    ClientTransitionOutcome::Rejected
+                } else {
+                    ClientTransitionOutcome::Changed
+                },
+            );
+        };
         let (thread_scope, thread_demand) = (thread_scope.clone(), *thread_demand);
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         partitions.transition_sequence.advance();
@@ -1325,6 +1500,7 @@ impl ClientCore {
                     ClientTransitionOutcome::Changed
                 }
             },
+            _ => unreachable!("timeline intent handled"),
         };
         let transition = Self::transition_without_publication(&partitions, outcome);
         drop(partitions);
@@ -1486,7 +1662,15 @@ impl ClientCore {
         effects: Vec<ClientEffectPlan>,
     ) -> ClientTransition {
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
-        self.commit_publications(&mut partitions, drafts, effects)
+        let wake_presentation = drafts
+            .iter()
+            .any(|draft| matches!(draft.scope, ClientScope::Thread { .. }));
+        let transition = self.commit_publications(&mut partitions, drafts, effects);
+        drop(partitions);
+        if wake_presentation {
+            self.wake_thread_presentation();
+        }
+        transition
     }
 
     fn commit_publications(
@@ -1530,8 +1714,9 @@ impl ClientCore {
                                 ClientTransitionOutcome::Stale,
                             );
                         }
-                        if draft.serialized_payload.as_ref()
-                            == current.serialized_payload().as_ref()
+                        if (draft.timeline_change.is_none() || draft.revisions == current_revisions)
+                            && draft.serialized_payload.get().as_ref()
+                                == current.serialized_payload().as_ref()
                         {
                             continue;
                         }
@@ -1633,6 +1818,10 @@ impl ClientCore {
             partitions.change_sequence.advance();
             let predecessor = partitions.latest_change_sequence;
             let sequence = partitions.change_sequence;
+            let timeline_changes = changed_drafts
+                .iter()
+                .filter_map(|d| d.timeline_change.clone())
+                .collect::<Vec<_>>();
             let publications = changed_drafts
                 .into_iter()
                 .map(|draft| {
@@ -1654,6 +1843,7 @@ impl ClientCore {
                 sequence,
                 predecessor,
                 publications: Arc::from(publications),
+                timeline_changes: Arc::from(timeline_changes),
             });
             let transition = ClientTransition {
                 sequence: partitions.transition_sequence,
@@ -1677,6 +1867,18 @@ impl ClientCore {
         projections: &crate::gateway::identity_authorization::IdentityAuthorizationPublication,
         evict_protected: bool,
     ) -> ClientTransition {
+        let principal = projections
+            .current_auth
+            .as_ref()
+            .map(|auth| auth.principal.id.as_str().to_owned());
+        let mut presentation_fence = evict_protected.then(|| {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            registry.fence_presentations(principal.clone());
+            registry
+        });
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         if !evict_protected && partitions.publications
             .get(&ClientScope::Administration { workspace_id: None })
@@ -1764,7 +1966,14 @@ impl ClientCore {
                 }
             }
         }
-        self.commit_publications(&mut partitions, drafts, vec![])
+        let transition = self.commit_publications(&mut partitions, drafts, vec![]);
+        drop(partitions);
+        if let Some(registry) = presentation_fence.as_mut() {
+            registry.synchronize_publication_revisions(transition.changes().publications());
+        }
+        drop(presentation_fence);
+        self.update_thread_presentation_identity(principal);
+        transition
     }
 
     fn deliver_change_set(&self, change_set: &ClientChangeSet) {

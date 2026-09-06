@@ -1,0 +1,3902 @@
+{
+  "batch": {
+    "changes": [
+      {
+        "predecessor": 6,
+        "sequence": 7,
+        "snapshots": [
+          {
+            "payload": {
+              "cli_binding": null,
+              "current_principal_id": null,
+              "execution_revision": 1,
+              "history_loaded": false,
+              "history_loading": false,
+              "pending_requests": [
+                {
+                  "kind": "permission_approval",
+                  "message": "policy_requires_approval",
+                  "native_request_id": "approval",
+                  "origin": {
+                    "origin": "native_permission_gate"
+                  },
+                  "payload": {
+                    "request": {
+                      "action": "shell_command",
+                      "reason": "policy_requires_approval",
+                      "request_id": "approval",
+                      "scope_hash": "approval-scope",
+                      "thread_id": "a",
+                      "tool_name": "exec_command",
+                      "turn_id": "running",
+                      "workspace_id": "ws"
+                    },
+                    "source": "native_permission_gate"
+                  },
+                  "request_id": "approval",
+                  "thread_id": "a",
+                  "title": "exec_command",
+                  "turn_id": "running",
+                  "workspace_id": "ws"
+                }
+              ],
+              "placement": null,
+              "projection": {
+                "composer_locked": false,
+                "in_flight_turn_id": null,
+                "last_error": null,
+                "pending_request_id": null,
+                "permission_audit": [],
+                "phase_label": "idle",
+                "revision": 0,
+                "turns": []
+              },
+              "subscription_failed": false,
+              "thread": {
+                "created_at": 1,
+                "id": "a",
+                "mode": "Chat",
+                "model": "gpt-5.4",
+                "model_provider": "openai",
+                "origin_kind": "user",
+                "preview": "",
+                "sidebar_visibility": "visible",
+                "status": "Idle",
+                "turns": [],
+                "updated_at": 2,
+                "workspace_id": "ws"
+              },
+              "workspace_id": "ws"
+            },
+            "revisions": {
+              "content": 6,
+              "domain": 6,
+              "presentation": 6,
+              "scoped": 6
+            },
+            "schema_version": 1,
+            "scope": {
+              "kind": "thread",
+              "thread_id": "a"
+            },
+            "sequence": 7
+          }
+        ],
+        "timeline_changes": []
+      },
+      {
+        "predecessor": 7,
+        "sequence": 8,
+        "snapshots": [
+          {
+            "payload": {
+              "generation": 1,
+              "groups": [
+                {
+                  "author": null,
+                  "current_principal": false,
+                  "first_row": 0,
+                  "has_running": false,
+                  "id": "user",
+                  "last_row": 0,
+                  "user_message": true
+                },
+                {
+                  "author": null,
+                  "current_principal": false,
+                  "first_row": 1,
+                  "has_running": false,
+                  "id": "deleted",
+                  "last_row": 1,
+                  "user_message": true
+                },
+                {
+                  "author": null,
+                  "current_principal": false,
+                  "first_row": 2,
+                  "has_running": false,
+                  "id": "semantic-turn-work-group::work",
+                  "last_row": 11,
+                  "user_message": false
+                },
+                {
+                  "author": null,
+                  "current_principal": false,
+                  "first_row": 12,
+                  "has_running": false,
+                  "id": "task-block",
+                  "last_row": 12,
+                  "user_message": false
+                },
+                {
+                  "author": null,
+                  "current_principal": false,
+                  "first_row": 13,
+                  "has_running": true,
+                  "id": "timeline-pending-request::approval",
+                  "last_row": 14,
+                  "user_message": false
+                }
+              ],
+              "has_loaded_page": true,
+              "page": {
+                "after_cursor": null,
+                "before_cursor": {
+                  "value": "before"
+                },
+                "has_more_after": false,
+                "has_more_before": true
+              },
+              "revision": 2,
+              "source_revision": 6,
+              "status": "Ready",
+              "thread_id": "a"
+            },
+            "revisions": {
+              "content": 2,
+              "domain": 2,
+              "presentation": 2,
+              "scoped": 2
+            },
+            "schema_version": 1,
+            "scope": {
+              "kind": "timeline",
+              "thread_id": "a"
+            },
+            "sequence": 8
+          }
+        ],
+        "timeline_changes": [
+          {
+            "from_revision": 1,
+            "generation": 1,
+            "inserted": [],
+            "order": null,
+            "removed": [],
+            "replaced": [
+              {
+                "anchor_item_id": null,
+                "content": {
+                  "attachments": [],
+                  "capability_rejections": [],
+                  "collapsed": true,
+                  "command": null,
+                  "edited_timestamp": 2000,
+                  "file_output": null,
+                  "final_status": null,
+                  "kind": "UserMessage",
+                  "markdown": null,
+                  "streaming": false,
+                  "system_label": null,
+                  "task_timeline": false,
+                  "text": "replacement",
+                  "timestamp": 1000,
+                  "tool": null
+                },
+                "content_revision": 2,
+                "id": "user",
+                "item": {
+                  "completed_at_unix_ms": 2000,
+                  "final_markdown": null,
+                  "final_text": "replacement",
+                  "id": "user-input",
+                  "item": {
+                    "id": "user-input",
+                    "text": "replacement",
+                    "type": "userMessage"
+                  },
+                  "item_type": "user_message",
+                  "opaque_meta": null,
+                  "partial_markdown": null,
+                  "partial_text": "replacement",
+                  "started_at_unix_ms": 1000,
+                  "status": "Completed",
+                  "timeline_origin": null,
+                  "turn_id": "input",
+                  "updated_at_unix_ms": 2000
+                },
+                "metadata_revision": 1,
+                "revision": 2,
+                "semantic_id": {
+                  "TopLevelBlock": {
+                    "block_id": "user"
+                  }
+                },
+                "turn_id": "input",
+                "value": {
+                  "Timeline": {
+                    "key": "user",
+                    "kind": {
+                      "UserMessage": {
+                        "presentation": {
+                          "block_id": "user",
+                          "deleted": false,
+                          "edited": false,
+                          "item_id": "user-input",
+                          "mode": "Message",
+                          "revision": 0,
+                          "thread_id": "a",
+                          "turn_id": "input",
+                          "workspace_id": "ws"
+                        },
+                        "timeline_index": 0
+                      }
+                    }
+                  }
+                }
+              }
+            ],
+            "thread_id": "a",
+            "to_revision": 2
+          }
+        ]
+      }
+    ],
+    "closed": false,
+    "effects": [],
+    "resnapshot": false,
+    "schema_version": 1,
+    "sequence": 8
+  },
+  "delta": {
+    "from_revision": 1,
+    "generation": 1,
+    "inserted": [],
+    "order": null,
+    "removed": [],
+    "replaced": [
+      {
+        "anchor_item_id": null,
+        "content": {
+          "attachments": [],
+          "capability_rejections": [],
+          "collapsed": true,
+          "command": null,
+          "edited_timestamp": 2000,
+          "file_output": null,
+          "final_status": null,
+          "kind": "UserMessage",
+          "markdown": null,
+          "streaming": false,
+          "system_label": null,
+          "task_timeline": false,
+          "text": "replacement",
+          "timestamp": 1000,
+          "tool": null
+        },
+        "content_revision": 2,
+        "id": "user",
+        "item": {
+          "completed_at_unix_ms": 2000,
+          "final_markdown": null,
+          "final_text": "replacement",
+          "id": "user-input",
+          "item": {
+            "id": "user-input",
+            "text": "replacement",
+            "type": "userMessage"
+          },
+          "item_type": "user_message",
+          "opaque_meta": null,
+          "partial_markdown": null,
+          "partial_text": "replacement",
+          "started_at_unix_ms": 1000,
+          "status": "Completed",
+          "timeline_origin": null,
+          "turn_id": "input",
+          "updated_at_unix_ms": 2000
+        },
+        "metadata_revision": 1,
+        "revision": 2,
+        "semantic_id": {
+          "TopLevelBlock": {
+            "block_id": "user"
+          }
+        },
+        "turn_id": "input",
+        "value": {
+          "Timeline": {
+            "key": "user",
+            "kind": {
+              "UserMessage": {
+                "presentation": {
+                  "block_id": "user",
+                  "deleted": false,
+                  "edited": false,
+                  "item_id": "user-input",
+                  "mode": "Message",
+                  "revision": 0,
+                  "thread_id": "a",
+                  "turn_id": "input",
+                  "workspace_id": "ws"
+                },
+                "timeline_index": 0
+              }
+            }
+          }
+        }
+      }
+    ],
+    "thread_id": "a",
+    "to_revision": 2
+  },
+  "header": {
+    "payload": {
+      "generation": 1,
+      "groups": [
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 0,
+          "has_running": false,
+          "id": "user",
+          "last_row": 0,
+          "user_message": true
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 1,
+          "has_running": false,
+          "id": "deleted",
+          "last_row": 1,
+          "user_message": true
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 2,
+          "has_running": false,
+          "id": "semantic-turn-work-group::work",
+          "last_row": 11,
+          "user_message": false
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 12,
+          "has_running": false,
+          "id": "task-block",
+          "last_row": 12,
+          "user_message": false
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 13,
+          "has_running": true,
+          "id": "timeline-pending-request::approval",
+          "last_row": 14,
+          "user_message": false
+        }
+      ],
+      "has_loaded_page": true,
+      "page": {
+        "after_cursor": null,
+        "before_cursor": {
+          "value": "before"
+        },
+        "has_more_after": false,
+        "has_more_before": true
+      },
+      "revision": 2,
+      "source_revision": 6,
+      "status": "Ready",
+      "thread_id": "a"
+    },
+    "revisions": {
+      "content": 2,
+      "domain": 2,
+      "presentation": 2,
+      "scoped": 2
+    },
+    "schema_version": 1,
+    "scope": {
+      "kind": "timeline",
+      "thread_id": "a"
+    },
+    "sequence": 8
+  },
+  "initial": {
+    "payload": {
+      "generation": 1,
+      "groups": [
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 0,
+          "has_running": false,
+          "id": "user",
+          "last_row": 0,
+          "user_message": true
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 1,
+          "has_running": false,
+          "id": "deleted",
+          "last_row": 1,
+          "user_message": true
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 2,
+          "has_running": false,
+          "id": "semantic-turn-work-group::work",
+          "last_row": 11,
+          "user_message": false
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 12,
+          "has_running": false,
+          "id": "task-block",
+          "last_row": 12,
+          "user_message": false
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 13,
+          "has_running": true,
+          "id": "timeline-pending-request::approval",
+          "last_row": 14,
+          "user_message": false
+        }
+      ],
+      "has_loaded_page": true,
+      "page": {
+        "after_cursor": null,
+        "before_cursor": {
+          "value": "before"
+        },
+        "has_more_after": false,
+        "has_more_before": true
+      },
+      "revision": 1,
+      "rows": [
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "UserMessage",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "initial",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "user",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "initial",
+            "id": "user-input",
+            "item": {
+              "id": "user-input",
+              "text": "initial",
+              "type": "userMessage"
+            },
+            "item_type": "user_message",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "initial",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "input",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "user"
+            }
+          },
+          "turn_id": "input",
+          "value": {
+            "Timeline": {
+              "key": "user",
+              "kind": {
+                "UserMessage": {
+                  "presentation": {
+                    "block_id": "user",
+                    "deleted": false,
+                    "edited": false,
+                    "item_id": "user-input",
+                    "mode": "Message",
+                    "revision": 0,
+                    "thread_id": "a",
+                    "turn_id": "input",
+                    "workspace_id": "ws"
+                  },
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "UserMessage",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "deleted",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "deleted-input",
+            "item": {
+              "id": "deleted-input",
+              "text": "",
+              "type": "userMessage"
+            },
+            "item_type": "user_message",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "deleted",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "deleted"
+            }
+          },
+          "turn_id": "deleted",
+          "value": {
+            "Timeline": {
+              "key": "deleted",
+              "kind": {
+                "UserMessage": {
+                  "presentation": {
+                    "block_id": "deleted",
+                    "deleted": true,
+                    "edited": false,
+                    "item_id": "deleted-input",
+                    "mode": "Message",
+                    "revision": 0,
+                    "thread_id": "a",
+                    "turn_id": "deleted",
+                    "workspace_id": "ws"
+                  },
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": null,
+          "content_revision": 1,
+          "id": "semantic-turn-work-group::work",
+          "item": null,
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "work-block"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "semantic-turn-work-group::work",
+              "kind": {
+                "TurnWorkToggle": {
+                  "anchor_entry_id": "work-block",
+                  "elapsed_ms": 1000,
+                  "is_open": true,
+                  "state": "completed",
+                  "toggle_key": "semantic-turn-work-group::work"
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "Reasoning",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "reasoning",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-0",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "reasoning",
+            "id": "reasoning",
+            "item": {
+              "content": [],
+              "id": "reasoning",
+              "summary": [
+                "reasoning"
+              ],
+              "type": "reasoning"
+            },
+            "item_type": "reasoning",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "reasoning",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-0"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-0",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "SystemEvent",
+            "markdown": null,
+            "streaming": false,
+            "system_label": {
+              "Attempt": {
+                "attempt": 2
+              }
+            },
+            "task_timeline": false,
+            "text": "retry",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-1",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "retry",
+            "id": "event",
+            "item": {
+              "code": "item_retry_scheduled",
+              "details": {
+                "attempt_no": 2
+              },
+              "id": "event",
+              "level": "warning",
+              "message": "retry",
+              "type": "systemEvent"
+            },
+            "item_type": "system_event",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "retry",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-1"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-1",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": {
+              "command": "printf hello",
+              "duration_ms": null,
+              "exit_code": null,
+              "output": {
+                "text": "hello\nworld    !",
+                "truncated": false
+              },
+              "terminal_output": {
+                "text": "hello\nworld    !",
+                "truncated": false
+              },
+              "timed_out": null,
+              "truncated": false
+            },
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "CommandExecution",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-2",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "commandExecution",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "command": [],
+              "display": {
+                "kind": "shell",
+                "stdout": "hello\r\nworld\t!",
+                "truncated": false
+              },
+              "id": "commandExecution",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "commandExecution",
+              "type": "commandExecution"
+            },
+            "item_type": "command_execution",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-2"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-2",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": {
+              "text": "changed\n",
+              "truncated": false
+            },
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "FileChange",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-3",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "fileChange",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "changedFiles": [
+                "a.txt"
+              ],
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "fileChange",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "stdout": "changed\r\n",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "fileChange",
+              "type": "fileChange"
+            },
+            "item_type": "file_change",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-3"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-3",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "WebSearch",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": null,
+              "bytes": null,
+              "detail": "query",
+              "host": null,
+              "mcp": null,
+              "result_count": 0,
+              "result_text": null,
+              "task_review": null,
+              "url": null
+            }
+          },
+          "content_revision": 1,
+          "id": "work-4",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "webSearch",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "webSearch",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "results": [],
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "webSearch",
+              "type": "webSearch"
+            },
+            "item_type": "web_search",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-4"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-4",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "WebFetch",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": null,
+              "bytes": null,
+              "detail": "https://example.test:8443/path",
+              "host": "example.test:8443",
+              "mcp": null,
+              "result_count": null,
+              "result_text": null,
+              "task_review": null,
+              "url": "https://example.test:8443/path"
+            }
+          },
+          "content_revision": 1,
+          "id": "work-5",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "webFetch",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "webFetch",
+              "links": [],
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "webFetch",
+              "type": "webFetch"
+            },
+            "item_type": "web_fetch",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-5"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-5",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "Download",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": null,
+              "bytes": null,
+              "detail": "https://example.test:8443/path",
+              "host": "example.test:8443",
+              "mcp": null,
+              "result_count": null,
+              "result_text": null,
+              "task_review": null,
+              "url": "https://example.test:8443/path"
+            }
+          },
+          "content_revision": 1,
+          "id": "work-6",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "download",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "download",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "download",
+              "type": "download"
+            },
+            "item_type": "download",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-6"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-6",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "DynamicToolCall",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": {
+                "text": "{\n  \"cmd\": \"sh -lc 'printf hello'\",\n  \"query\": \"query\",\n  \"url\": \"https://example.test:8443/path\"\n}",
+                "truncated": false
+              },
+              "bytes": null,
+              "detail": "",
+              "host": null,
+              "mcp": null,
+              "result_count": null,
+              "result_text": null,
+              "task_review": null,
+              "url": null
+            }
+          },
+          "content_revision": 1,
+          "id": "work-7",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "dynamicToolCall",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "dynamicToolCall",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "dynamicToolCall",
+              "type": "dynamicToolCall"
+            },
+            "item_type": "dynamic_tool_call",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-7"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-7",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "AgentMessage",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "answer",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "answer",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "answer",
+            "id": "answer",
+            "item": {
+              "id": "answer",
+              "text": "answer",
+              "type": "agentMessage"
+            },
+            "item_type": "agent_message",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "answer",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "answer"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "answer",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": false,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "Task",
+            "markdown": null,
+            "streaming": true,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "Background analysis",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "task-block",
+          "item": {
+            "completed_at_unix_ms": null,
+            "final_markdown": null,
+            "final_text": null,
+            "id": "task-anchor",
+            "item": {
+              "attachment": "detached",
+              "createdAt": 1,
+              "depth": 0,
+              "executorKind": "agent",
+              "id": "task-anchor",
+              "maxDepth": 3,
+              "status": "running",
+              "taskId": "task",
+              "title": "Background analysis",
+              "triggerKind": "immediate",
+              "type": "task",
+              "updatedAt": 2
+            },
+            "item_type": "task",
+            "opaque_meta": {
+              "attachment": "detached",
+              "runId": null,
+              "taskId": "task"
+            },
+            "partial_markdown": null,
+            "partial_text": "Background analysis",
+            "started_at_unix_ms": 1000,
+            "status": "Running",
+            "timeline_origin": null,
+            "turn_id": "task-turn",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "task-block"
+            }
+          },
+          "turn_id": "task-turn",
+          "value": {
+            "Timeline": {
+              "key": "task-block",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": null,
+          "content_revision": 1,
+          "id": "timeline-pending-request::approval",
+          "item": null,
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": null,
+          "turn_id": "running",
+          "value": {
+            "PendingRequest": {
+              "author": null,
+              "key": "timeline-pending-request::approval",
+              "request": {
+                "kind": "permission_approval",
+                "message": "policy_requires_approval",
+                "native_request_id": "approval",
+                "origin": {
+                  "origin": "native_permission_gate"
+                },
+                "payload": {
+                  "request": {
+                    "action": "shell_command",
+                    "reason": "policy_requires_approval",
+                    "request_id": "approval",
+                    "scope_hash": "approval-scope",
+                    "thread_id": "a",
+                    "tool_name": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  },
+                  "source": "native_permission_gate"
+                },
+                "request_id": "approval",
+                "thread_id": "a",
+                "title": "exec_command",
+                "turn_id": "running",
+                "workspace_id": "ws"
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": null,
+          "content_revision": 1,
+          "id": "semantic-turn-state::running::running",
+          "item": null,
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "running"
+            }
+          },
+          "turn_id": "running",
+          "value": {
+            "Timeline": {
+              "key": "semantic-turn-state::running::running",
+              "kind": {
+                "RunningTurn": {
+                  "started_at_unix_ms": 1000,
+                  "state": "running",
+                  "turn_id": "running"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "source_revision": 5,
+      "status": "Ready",
+      "thread_id": "a"
+    },
+    "revisions": {
+      "content": 1,
+      "domain": 1,
+      "presentation": 1,
+      "scoped": 1
+    },
+    "schema_version": 1,
+    "scope": {
+      "kind": "timeline",
+      "thread_id": "a"
+    },
+    "sequence": 6
+  },
+  "next": {
+    "payload": {
+      "generation": 1,
+      "groups": [
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 0,
+          "has_running": false,
+          "id": "user",
+          "last_row": 0,
+          "user_message": true
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 1,
+          "has_running": false,
+          "id": "deleted",
+          "last_row": 1,
+          "user_message": true
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 2,
+          "has_running": false,
+          "id": "semantic-turn-work-group::work",
+          "last_row": 11,
+          "user_message": false
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 12,
+          "has_running": false,
+          "id": "task-block",
+          "last_row": 12,
+          "user_message": false
+        },
+        {
+          "author": null,
+          "current_principal": false,
+          "first_row": 13,
+          "has_running": true,
+          "id": "timeline-pending-request::approval",
+          "last_row": 14,
+          "user_message": false
+        }
+      ],
+      "has_loaded_page": true,
+      "page": {
+        "after_cursor": null,
+        "before_cursor": {
+          "value": "before"
+        },
+        "has_more_after": false,
+        "has_more_before": true
+      },
+      "revision": 2,
+      "rows": [
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "UserMessage",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "replacement",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 2,
+          "id": "user",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "replacement",
+            "id": "user-input",
+            "item": {
+              "id": "user-input",
+              "text": "replacement",
+              "type": "userMessage"
+            },
+            "item_type": "user_message",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "replacement",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "input",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 2,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "user"
+            }
+          },
+          "turn_id": "input",
+          "value": {
+            "Timeline": {
+              "key": "user",
+              "kind": {
+                "UserMessage": {
+                  "presentation": {
+                    "block_id": "user",
+                    "deleted": false,
+                    "edited": false,
+                    "item_id": "user-input",
+                    "mode": "Message",
+                    "revision": 0,
+                    "thread_id": "a",
+                    "turn_id": "input",
+                    "workspace_id": "ws"
+                  },
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "UserMessage",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "deleted",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "deleted-input",
+            "item": {
+              "id": "deleted-input",
+              "text": "",
+              "type": "userMessage"
+            },
+            "item_type": "user_message",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "deleted",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "deleted"
+            }
+          },
+          "turn_id": "deleted",
+          "value": {
+            "Timeline": {
+              "key": "deleted",
+              "kind": {
+                "UserMessage": {
+                  "presentation": {
+                    "block_id": "deleted",
+                    "deleted": true,
+                    "edited": false,
+                    "item_id": "deleted-input",
+                    "mode": "Message",
+                    "revision": 0,
+                    "thread_id": "a",
+                    "turn_id": "deleted",
+                    "workspace_id": "ws"
+                  },
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": null,
+          "content_revision": 1,
+          "id": "semantic-turn-work-group::work",
+          "item": null,
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "work-block"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "semantic-turn-work-group::work",
+              "kind": {
+                "TurnWorkToggle": {
+                  "anchor_entry_id": "work-block",
+                  "elapsed_ms": 1000,
+                  "is_open": true,
+                  "state": "completed",
+                  "toggle_key": "semantic-turn-work-group::work"
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "Reasoning",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "reasoning",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-0",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "reasoning",
+            "id": "reasoning",
+            "item": {
+              "content": [],
+              "id": "reasoning",
+              "summary": [
+                "reasoning"
+              ],
+              "type": "reasoning"
+            },
+            "item_type": "reasoning",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "reasoning",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-0"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-0",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "SystemEvent",
+            "markdown": null,
+            "streaming": false,
+            "system_label": {
+              "Attempt": {
+                "attempt": 2
+              }
+            },
+            "task_timeline": false,
+            "text": "retry",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-1",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "retry",
+            "id": "event",
+            "item": {
+              "code": "item_retry_scheduled",
+              "details": {
+                "attempt_no": 2
+              },
+              "id": "event",
+              "level": "warning",
+              "message": "retry",
+              "type": "systemEvent"
+            },
+            "item_type": "system_event",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "retry",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-1"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-1",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": {
+              "command": "printf hello",
+              "duration_ms": null,
+              "exit_code": null,
+              "output": {
+                "text": "hello\nworld    !",
+                "truncated": false
+              },
+              "terminal_output": {
+                "text": "hello\nworld    !",
+                "truncated": false
+              },
+              "timed_out": null,
+              "truncated": false
+            },
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "CommandExecution",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-2",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "commandExecution",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "command": [],
+              "display": {
+                "kind": "shell",
+                "stdout": "hello\r\nworld\t!",
+                "truncated": false
+              },
+              "id": "commandExecution",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "commandExecution",
+              "type": "commandExecution"
+            },
+            "item_type": "command_execution",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-2"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-2",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": {
+              "text": "changed\n",
+              "truncated": false
+            },
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "FileChange",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "work-3",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "fileChange",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "changedFiles": [
+                "a.txt"
+              ],
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "fileChange",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "stdout": "changed\r\n",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "fileChange",
+              "type": "fileChange"
+            },
+            "item_type": "file_change",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-3"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-3",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "WebSearch",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": null,
+              "bytes": null,
+              "detail": "query",
+              "host": null,
+              "mcp": null,
+              "result_count": 0,
+              "result_text": null,
+              "task_review": null,
+              "url": null
+            }
+          },
+          "content_revision": 1,
+          "id": "work-4",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "webSearch",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "webSearch",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "results": [],
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "webSearch",
+              "type": "webSearch"
+            },
+            "item_type": "web_search",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-4"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-4",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "WebFetch",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": null,
+              "bytes": null,
+              "detail": "https://example.test:8443/path",
+              "host": "example.test:8443",
+              "mcp": null,
+              "result_count": null,
+              "result_text": null,
+              "task_review": null,
+              "url": "https://example.test:8443/path"
+            }
+          },
+          "content_revision": 1,
+          "id": "work-5",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "webFetch",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "webFetch",
+              "links": [],
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "webFetch",
+              "type": "webFetch"
+            },
+            "item_type": "web_fetch",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-5"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-5",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "Download",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": null,
+              "bytes": null,
+              "detail": "https://example.test:8443/path",
+              "host": "example.test:8443",
+              "mcp": null,
+              "result_count": null,
+              "result_text": null,
+              "task_review": null,
+              "url": "https://example.test:8443/path"
+            }
+          },
+          "content_revision": 1,
+          "id": "work-6",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "download",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "download",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "download",
+              "type": "download"
+            },
+            "item_type": "download",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-6"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-6",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": {
+              "kind": "Completed",
+              "successful": true
+            },
+            "kind": "DynamicToolCall",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "",
+            "timestamp": 1000,
+            "tool": {
+              "arguments_text": {
+                "text": "{\n  \"cmd\": \"sh -lc 'printf hello'\",\n  \"query\": \"query\",\n  \"url\": \"https://example.test:8443/path\"\n}",
+                "truncated": false
+              },
+              "bytes": null,
+              "detail": "",
+              "host": null,
+              "mcp": null,
+              "result_count": null,
+              "result_text": null,
+              "task_review": null,
+              "url": null
+            }
+          },
+          "content_revision": 1,
+          "id": "work-7",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "",
+            "id": "dynamicToolCall",
+            "item": {
+              "arguments": {
+                "cmd": "sh -lc 'printf hello'",
+                "query": "query",
+                "url": "https://example.test:8443/path"
+              },
+              "display": {
+                "kind": "hidden"
+              },
+              "id": "dynamicToolCall",
+              "outputPolicy": {
+                "deltas": {
+                  "mode": "disabled"
+                },
+                "llm": {
+                  "mode": "summary_only"
+                },
+                "llmRetention": {
+                  "mode": "do_not_retain"
+                },
+                "recovery": {
+                  "mode": "none"
+                },
+                "storage": {
+                  "mode": "none"
+                },
+                "timeline": {
+                  "max_bytes": 10000,
+                  "mode": "full"
+                }
+              },
+              "status": "completed",
+              "storage": {
+                "kind": "none"
+              },
+              "success": true,
+              "toolName": "dynamicToolCall",
+              "type": "dynamicToolCall"
+            },
+            "item_type": "dynamic_tool_call",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TurnWorkItem": {
+              "turn_id": "work",
+              "work_item_id": "work-7"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "work-7",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": true,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "AgentMessage",
+            "markdown": null,
+            "streaming": false,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "answer",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "answer",
+          "item": {
+            "completed_at_unix_ms": 2000,
+            "final_markdown": null,
+            "final_text": "answer",
+            "id": "answer",
+            "item": {
+              "id": "answer",
+              "text": "answer",
+              "type": "agentMessage"
+            },
+            "item_type": "agent_message",
+            "opaque_meta": null,
+            "partial_markdown": null,
+            "partial_text": "answer",
+            "started_at_unix_ms": 1000,
+            "status": "Completed",
+            "timeline_origin": null,
+            "turn_id": "work",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "answer"
+            }
+          },
+          "turn_id": "work",
+          "value": {
+            "Timeline": {
+              "key": "answer",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": {
+            "attachments": [],
+            "capability_rejections": [],
+            "collapsed": false,
+            "command": null,
+            "edited_timestamp": 2000,
+            "file_output": null,
+            "final_status": null,
+            "kind": "Task",
+            "markdown": null,
+            "streaming": true,
+            "system_label": null,
+            "task_timeline": false,
+            "text": "Background analysis",
+            "timestamp": 1000,
+            "tool": null
+          },
+          "content_revision": 1,
+          "id": "task-block",
+          "item": {
+            "completed_at_unix_ms": null,
+            "final_markdown": null,
+            "final_text": null,
+            "id": "task-anchor",
+            "item": {
+              "attachment": "detached",
+              "createdAt": 1,
+              "depth": 0,
+              "executorKind": "agent",
+              "id": "task-anchor",
+              "maxDepth": 3,
+              "status": "running",
+              "taskId": "task",
+              "title": "Background analysis",
+              "triggerKind": "immediate",
+              "type": "task",
+              "updatedAt": 2
+            },
+            "item_type": "task",
+            "opaque_meta": {
+              "attachment": "detached",
+              "runId": null,
+              "taskId": "task"
+            },
+            "partial_markdown": null,
+            "partial_text": "Background analysis",
+            "started_at_unix_ms": 1000,
+            "status": "Running",
+            "timeline_origin": null,
+            "turn_id": "task-turn",
+            "updated_at_unix_ms": 2000
+          },
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "task-block"
+            }
+          },
+          "turn_id": "task-turn",
+          "value": {
+            "Timeline": {
+              "key": "task-block",
+              "kind": {
+                "Item": {
+                  "timeline_index": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": null,
+          "content_revision": 1,
+          "id": "timeline-pending-request::approval",
+          "item": null,
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": null,
+          "turn_id": "running",
+          "value": {
+            "PendingRequest": {
+              "author": null,
+              "key": "timeline-pending-request::approval",
+              "request": {
+                "kind": "permission_approval",
+                "message": "policy_requires_approval",
+                "native_request_id": "approval",
+                "origin": {
+                  "origin": "native_permission_gate"
+                },
+                "payload": {
+                  "request": {
+                    "action": "shell_command",
+                    "reason": "policy_requires_approval",
+                    "request_id": "approval",
+                    "scope_hash": "approval-scope",
+                    "thread_id": "a",
+                    "tool_name": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  },
+                  "source": "native_permission_gate"
+                },
+                "request_id": "approval",
+                "thread_id": "a",
+                "title": "exec_command",
+                "turn_id": "running",
+                "workspace_id": "ws"
+              }
+            }
+          }
+        },
+        {
+          "anchor_item_id": null,
+          "content": null,
+          "content_revision": 1,
+          "id": "semantic-turn-state::running::running",
+          "item": null,
+          "metadata_revision": 1,
+          "revision": 1,
+          "semantic_id": {
+            "TopLevelBlock": {
+              "block_id": "running"
+            }
+          },
+          "turn_id": "running",
+          "value": {
+            "Timeline": {
+              "key": "semantic-turn-state::running::running",
+              "kind": {
+                "RunningTurn": {
+                  "started_at_unix_ms": 1000,
+                  "state": "running",
+                  "turn_id": "running"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "source_revision": 6,
+      "status": "Ready",
+      "thread_id": "a"
+    },
+    "revisions": {
+      "content": 2,
+      "domain": 2,
+      "presentation": 2,
+      "scoped": 2
+    },
+    "schema_version": 1,
+    "scope": {
+      "kind": "timeline",
+      "thread_id": "a"
+    },
+    "sequence": 8
+  },
+  "pending_positions": {
+    "empty": {
+      "expected": [
+        "pending"
+      ],
+      "snapshot": {
+        "payload": {
+          "generation": 1,
+          "groups": [
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 0,
+              "has_running": false,
+              "id": "timeline-pending-request::approval",
+              "last_row": 0,
+              "user_message": false
+            }
+          ],
+          "has_loaded_page": true,
+          "page": {
+            "after_cursor": null,
+            "before_cursor": null,
+            "has_more_after": false,
+            "has_more_before": false
+          },
+          "revision": 1,
+          "rows": [
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "timeline-pending-request::approval",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": null,
+              "turn_id": "running",
+              "value": {
+                "PendingRequest": {
+                  "author": null,
+                  "key": "timeline-pending-request::approval",
+                  "request": {
+                    "kind": "permission_approval",
+                    "message": "policy_requires_approval",
+                    "native_request_id": "approval",
+                    "origin": {
+                      "origin": "native_permission_gate"
+                    },
+                    "payload": {
+                      "request": {
+                        "action": "shell_command",
+                        "reason": "policy_requires_approval",
+                        "request_id": "approval",
+                        "scope_hash": "approval-scope",
+                        "thread_id": "a",
+                        "tool_name": "exec_command",
+                        "turn_id": "running",
+                        "workspace_id": "ws"
+                      },
+                      "source": "native_permission_gate"
+                    },
+                    "request_id": "approval",
+                    "thread_id": "a",
+                    "title": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  }
+                }
+              }
+            }
+          ],
+          "source_revision": 6,
+          "status": "Ready",
+          "thread_id": "a"
+        },
+        "revisions": {
+          "content": 1,
+          "domain": 1,
+          "presentation": 1,
+          "scoped": 1
+        },
+        "schema_version": 1,
+        "scope": {
+          "kind": "timeline",
+          "thread_id": "a"
+        },
+        "sequence": 7
+      }
+    },
+    "leading": {
+      "expected": [
+        "pending",
+        "running",
+        "user"
+      ],
+      "snapshot": {
+        "payload": {
+          "generation": 1,
+          "groups": [
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 0,
+              "has_running": false,
+              "id": "timeline-pending-request::approval",
+              "last_row": 0,
+              "user_message": false
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 1,
+              "has_running": true,
+              "id": "semantic-turn-state::turn-0::block-0",
+              "last_row": 1,
+              "user_message": false
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 2,
+              "has_running": false,
+              "id": "block-1",
+              "last_row": 2,
+              "user_message": true
+            }
+          ],
+          "has_loaded_page": true,
+          "page": {
+            "after_cursor": null,
+            "before_cursor": null,
+            "has_more_after": false,
+            "has_more_before": false
+          },
+          "revision": 1,
+          "rows": [
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "timeline-pending-request::approval",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": null,
+              "turn_id": "running",
+              "value": {
+                "PendingRequest": {
+                  "author": null,
+                  "key": "timeline-pending-request::approval",
+                  "request": {
+                    "kind": "permission_approval",
+                    "message": "policy_requires_approval",
+                    "native_request_id": "approval",
+                    "origin": {
+                      "origin": "native_permission_gate"
+                    },
+                    "payload": {
+                      "request": {
+                        "action": "shell_command",
+                        "reason": "policy_requires_approval",
+                        "request_id": "approval",
+                        "scope_hash": "approval-scope",
+                        "thread_id": "a",
+                        "tool_name": "exec_command",
+                        "turn_id": "running",
+                        "workspace_id": "ws"
+                      },
+                      "source": "native_permission_gate"
+                    },
+                    "request_id": "approval",
+                    "thread_id": "a",
+                    "title": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "semantic-turn-state::turn-0::block-0",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-0"
+                }
+              },
+              "turn_id": "turn-0",
+              "value": {
+                "Timeline": {
+                  "key": "semantic-turn-state::turn-0::block-0",
+                  "kind": {
+                    "RunningTurn": {
+                      "started_at_unix_ms": 1000,
+                      "state": "running",
+                      "turn_id": "turn-0"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": {
+                "attachments": [],
+                "capability_rejections": [],
+                "collapsed": true,
+                "command": null,
+                "edited_timestamp": 2000,
+                "file_output": null,
+                "final_status": null,
+                "kind": "UserMessage",
+                "markdown": null,
+                "streaming": false,
+                "system_label": null,
+                "task_timeline": false,
+                "text": "text",
+                "timestamp": 1000,
+                "tool": null
+              },
+              "content_revision": 1,
+              "id": "block-1",
+              "item": {
+                "completed_at_unix_ms": 2000,
+                "final_markdown": null,
+                "final_text": "text",
+                "id": "block-1",
+                "item": {
+                  "id": "block-1",
+                  "text": "text",
+                  "type": "userMessage"
+                },
+                "item_type": "user_message",
+                "opaque_meta": null,
+                "partial_markdown": null,
+                "partial_text": "text",
+                "started_at_unix_ms": 1000,
+                "status": "Completed",
+                "timeline_origin": null,
+                "turn_id": "turn-1",
+                "updated_at_unix_ms": 2000
+              },
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-1"
+                }
+              },
+              "turn_id": "turn-1",
+              "value": {
+                "Timeline": {
+                  "key": "block-1",
+                  "kind": {
+                    "UserMessage": {
+                      "presentation": {
+                        "block_id": "block-1",
+                        "deleted": false,
+                        "edited": false,
+                        "item_id": "block-1",
+                        "mode": "Message",
+                        "revision": 0,
+                        "thread_id": "a",
+                        "turn_id": "turn-1",
+                        "workspace_id": "ws"
+                      },
+                      "timeline_index": 0
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "source_revision": 6,
+          "status": "Ready",
+          "thread_id": "a"
+        },
+        "revisions": {
+          "content": 1,
+          "domain": 1,
+          "presentation": 1,
+          "scoped": 1
+        },
+        "schema_version": 1,
+        "scope": {
+          "kind": "timeline",
+          "thread_id": "a"
+        },
+        "sequence": 7
+      }
+    },
+    "middle": {
+      "expected": [
+        "user",
+        "pending",
+        "running",
+        "user"
+      ],
+      "snapshot": {
+        "payload": {
+          "generation": 1,
+          "groups": [
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 0,
+              "has_running": false,
+              "id": "block-0",
+              "last_row": 0,
+              "user_message": true
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 1,
+              "has_running": false,
+              "id": "timeline-pending-request::approval",
+              "last_row": 1,
+              "user_message": false
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 2,
+              "has_running": true,
+              "id": "semantic-turn-state::turn-1::block-1",
+              "last_row": 2,
+              "user_message": false
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 3,
+              "has_running": false,
+              "id": "block-2",
+              "last_row": 3,
+              "user_message": true
+            }
+          ],
+          "has_loaded_page": true,
+          "page": {
+            "after_cursor": null,
+            "before_cursor": null,
+            "has_more_after": false,
+            "has_more_before": false
+          },
+          "revision": 1,
+          "rows": [
+            {
+              "anchor_item_id": null,
+              "content": {
+                "attachments": [],
+                "capability_rejections": [],
+                "collapsed": true,
+                "command": null,
+                "edited_timestamp": 2000,
+                "file_output": null,
+                "final_status": null,
+                "kind": "UserMessage",
+                "markdown": null,
+                "streaming": false,
+                "system_label": null,
+                "task_timeline": false,
+                "text": "text",
+                "timestamp": 1000,
+                "tool": null
+              },
+              "content_revision": 1,
+              "id": "block-0",
+              "item": {
+                "completed_at_unix_ms": 2000,
+                "final_markdown": null,
+                "final_text": "text",
+                "id": "block-0",
+                "item": {
+                  "id": "block-0",
+                  "text": "text",
+                  "type": "userMessage"
+                },
+                "item_type": "user_message",
+                "opaque_meta": null,
+                "partial_markdown": null,
+                "partial_text": "text",
+                "started_at_unix_ms": 1000,
+                "status": "Completed",
+                "timeline_origin": null,
+                "turn_id": "turn-0",
+                "updated_at_unix_ms": 2000
+              },
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-0"
+                }
+              },
+              "turn_id": "turn-0",
+              "value": {
+                "Timeline": {
+                  "key": "block-0",
+                  "kind": {
+                    "UserMessage": {
+                      "presentation": {
+                        "block_id": "block-0",
+                        "deleted": false,
+                        "edited": false,
+                        "item_id": "block-0",
+                        "mode": "Message",
+                        "revision": 0,
+                        "thread_id": "a",
+                        "turn_id": "turn-0",
+                        "workspace_id": "ws"
+                      },
+                      "timeline_index": 0
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "timeline-pending-request::approval",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": null,
+              "turn_id": "running",
+              "value": {
+                "PendingRequest": {
+                  "author": null,
+                  "key": "timeline-pending-request::approval",
+                  "request": {
+                    "kind": "permission_approval",
+                    "message": "policy_requires_approval",
+                    "native_request_id": "approval",
+                    "origin": {
+                      "origin": "native_permission_gate"
+                    },
+                    "payload": {
+                      "request": {
+                        "action": "shell_command",
+                        "reason": "policy_requires_approval",
+                        "request_id": "approval",
+                        "scope_hash": "approval-scope",
+                        "thread_id": "a",
+                        "tool_name": "exec_command",
+                        "turn_id": "running",
+                        "workspace_id": "ws"
+                      },
+                      "source": "native_permission_gate"
+                    },
+                    "request_id": "approval",
+                    "thread_id": "a",
+                    "title": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "semantic-turn-state::turn-1::block-1",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-1"
+                }
+              },
+              "turn_id": "turn-1",
+              "value": {
+                "Timeline": {
+                  "key": "semantic-turn-state::turn-1::block-1",
+                  "kind": {
+                    "RunningTurn": {
+                      "started_at_unix_ms": 1000,
+                      "state": "running",
+                      "turn_id": "turn-1"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": {
+                "attachments": [],
+                "capability_rejections": [],
+                "collapsed": true,
+                "command": null,
+                "edited_timestamp": 2000,
+                "file_output": null,
+                "final_status": null,
+                "kind": "UserMessage",
+                "markdown": null,
+                "streaming": false,
+                "system_label": null,
+                "task_timeline": false,
+                "text": "text",
+                "timestamp": 1000,
+                "tool": null
+              },
+              "content_revision": 1,
+              "id": "block-2",
+              "item": {
+                "completed_at_unix_ms": 2000,
+                "final_markdown": null,
+                "final_text": "text",
+                "id": "block-2",
+                "item": {
+                  "id": "block-2",
+                  "text": "text",
+                  "type": "userMessage"
+                },
+                "item_type": "user_message",
+                "opaque_meta": null,
+                "partial_markdown": null,
+                "partial_text": "text",
+                "started_at_unix_ms": 1000,
+                "status": "Completed",
+                "timeline_origin": null,
+                "turn_id": "turn-2",
+                "updated_at_unix_ms": 2000
+              },
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-2"
+                }
+              },
+              "turn_id": "turn-2",
+              "value": {
+                "Timeline": {
+                  "key": "block-2",
+                  "kind": {
+                    "UserMessage": {
+                      "presentation": {
+                        "block_id": "block-2",
+                        "deleted": false,
+                        "edited": false,
+                        "item_id": "block-2",
+                        "mode": "Message",
+                        "revision": 0,
+                        "thread_id": "a",
+                        "turn_id": "turn-2",
+                        "workspace_id": "ws"
+                      },
+                      "timeline_index": 0
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "source_revision": 6,
+          "status": "Ready",
+          "thread_id": "a"
+        },
+        "revisions": {
+          "content": 1,
+          "domain": 1,
+          "presentation": 1,
+          "scoped": 1
+        },
+        "schema_version": 1,
+        "scope": {
+          "kind": "timeline",
+          "thread_id": "a"
+        },
+        "sequence": 7
+      }
+    },
+    "tail": {
+      "expected": [
+        "user",
+        "pending"
+      ],
+      "snapshot": {
+        "payload": {
+          "generation": 1,
+          "groups": [
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 0,
+              "has_running": false,
+              "id": "block-0",
+              "last_row": 0,
+              "user_message": true
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 1,
+              "has_running": false,
+              "id": "timeline-pending-request::approval",
+              "last_row": 1,
+              "user_message": false
+            }
+          ],
+          "has_loaded_page": true,
+          "page": {
+            "after_cursor": null,
+            "before_cursor": null,
+            "has_more_after": false,
+            "has_more_before": false
+          },
+          "revision": 1,
+          "rows": [
+            {
+              "anchor_item_id": null,
+              "content": {
+                "attachments": [],
+                "capability_rejections": [],
+                "collapsed": true,
+                "command": null,
+                "edited_timestamp": 2000,
+                "file_output": null,
+                "final_status": null,
+                "kind": "UserMessage",
+                "markdown": null,
+                "streaming": false,
+                "system_label": null,
+                "task_timeline": false,
+                "text": "text",
+                "timestamp": 1000,
+                "tool": null
+              },
+              "content_revision": 1,
+              "id": "block-0",
+              "item": {
+                "completed_at_unix_ms": 2000,
+                "final_markdown": null,
+                "final_text": "text",
+                "id": "block-0",
+                "item": {
+                  "id": "block-0",
+                  "text": "text",
+                  "type": "userMessage"
+                },
+                "item_type": "user_message",
+                "opaque_meta": null,
+                "partial_markdown": null,
+                "partial_text": "text",
+                "started_at_unix_ms": 1000,
+                "status": "Completed",
+                "timeline_origin": null,
+                "turn_id": "turn-0",
+                "updated_at_unix_ms": 2000
+              },
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-0"
+                }
+              },
+              "turn_id": "turn-0",
+              "value": {
+                "Timeline": {
+                  "key": "block-0",
+                  "kind": {
+                    "UserMessage": {
+                      "presentation": {
+                        "block_id": "block-0",
+                        "deleted": false,
+                        "edited": false,
+                        "item_id": "block-0",
+                        "mode": "Message",
+                        "revision": 0,
+                        "thread_id": "a",
+                        "turn_id": "turn-0",
+                        "workspace_id": "ws"
+                      },
+                      "timeline_index": 0
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "timeline-pending-request::approval",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": null,
+              "turn_id": "running",
+              "value": {
+                "PendingRequest": {
+                  "author": null,
+                  "key": "timeline-pending-request::approval",
+                  "request": {
+                    "kind": "permission_approval",
+                    "message": "policy_requires_approval",
+                    "native_request_id": "approval",
+                    "origin": {
+                      "origin": "native_permission_gate"
+                    },
+                    "payload": {
+                      "request": {
+                        "action": "shell_command",
+                        "reason": "policy_requires_approval",
+                        "request_id": "approval",
+                        "scope_hash": "approval-scope",
+                        "thread_id": "a",
+                        "tool_name": "exec_command",
+                        "turn_id": "running",
+                        "workspace_id": "ws"
+                      },
+                      "source": "native_permission_gate"
+                    },
+                    "request_id": "approval",
+                    "thread_id": "a",
+                    "title": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  }
+                }
+              }
+            }
+          ],
+          "source_revision": 6,
+          "status": "Ready",
+          "thread_id": "a"
+        },
+        "revisions": {
+          "content": 1,
+          "domain": 1,
+          "presentation": 1,
+          "scoped": 1
+        },
+        "schema_version": 1,
+        "scope": {
+          "kind": "timeline",
+          "thread_id": "a"
+        },
+        "sequence": 7
+      }
+    },
+    "trailing": {
+      "expected": [
+        "user",
+        "pending",
+        "running",
+        "running"
+      ],
+      "snapshot": {
+        "payload": {
+          "generation": 1,
+          "groups": [
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 0,
+              "has_running": false,
+              "id": "block-0",
+              "last_row": 0,
+              "user_message": true
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 1,
+              "has_running": false,
+              "id": "timeline-pending-request::approval",
+              "last_row": 1,
+              "user_message": false
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 2,
+              "has_running": true,
+              "id": "semantic-turn-state::turn-1::block-1",
+              "last_row": 2,
+              "user_message": false
+            },
+            {
+              "author": null,
+              "current_principal": false,
+              "first_row": 3,
+              "has_running": true,
+              "id": "semantic-turn-state::turn-2::block-2",
+              "last_row": 3,
+              "user_message": false
+            }
+          ],
+          "has_loaded_page": true,
+          "page": {
+            "after_cursor": null,
+            "before_cursor": null,
+            "has_more_after": false,
+            "has_more_before": false
+          },
+          "revision": 1,
+          "rows": [
+            {
+              "anchor_item_id": null,
+              "content": {
+                "attachments": [],
+                "capability_rejections": [],
+                "collapsed": true,
+                "command": null,
+                "edited_timestamp": 2000,
+                "file_output": null,
+                "final_status": null,
+                "kind": "UserMessage",
+                "markdown": null,
+                "streaming": false,
+                "system_label": null,
+                "task_timeline": false,
+                "text": "text",
+                "timestamp": 1000,
+                "tool": null
+              },
+              "content_revision": 1,
+              "id": "block-0",
+              "item": {
+                "completed_at_unix_ms": 2000,
+                "final_markdown": null,
+                "final_text": "text",
+                "id": "block-0",
+                "item": {
+                  "id": "block-0",
+                  "text": "text",
+                  "type": "userMessage"
+                },
+                "item_type": "user_message",
+                "opaque_meta": null,
+                "partial_markdown": null,
+                "partial_text": "text",
+                "started_at_unix_ms": 1000,
+                "status": "Completed",
+                "timeline_origin": null,
+                "turn_id": "turn-0",
+                "updated_at_unix_ms": 2000
+              },
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-0"
+                }
+              },
+              "turn_id": "turn-0",
+              "value": {
+                "Timeline": {
+                  "key": "block-0",
+                  "kind": {
+                    "UserMessage": {
+                      "presentation": {
+                        "block_id": "block-0",
+                        "deleted": false,
+                        "edited": false,
+                        "item_id": "block-0",
+                        "mode": "Message",
+                        "revision": 0,
+                        "thread_id": "a",
+                        "turn_id": "turn-0",
+                        "workspace_id": "ws"
+                      },
+                      "timeline_index": 0
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "timeline-pending-request::approval",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": null,
+              "turn_id": "running",
+              "value": {
+                "PendingRequest": {
+                  "author": null,
+                  "key": "timeline-pending-request::approval",
+                  "request": {
+                    "kind": "permission_approval",
+                    "message": "policy_requires_approval",
+                    "native_request_id": "approval",
+                    "origin": {
+                      "origin": "native_permission_gate"
+                    },
+                    "payload": {
+                      "request": {
+                        "action": "shell_command",
+                        "reason": "policy_requires_approval",
+                        "request_id": "approval",
+                        "scope_hash": "approval-scope",
+                        "thread_id": "a",
+                        "tool_name": "exec_command",
+                        "turn_id": "running",
+                        "workspace_id": "ws"
+                      },
+                      "source": "native_permission_gate"
+                    },
+                    "request_id": "approval",
+                    "thread_id": "a",
+                    "title": "exec_command",
+                    "turn_id": "running",
+                    "workspace_id": "ws"
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "semantic-turn-state::turn-1::block-1",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-1"
+                }
+              },
+              "turn_id": "turn-1",
+              "value": {
+                "Timeline": {
+                  "key": "semantic-turn-state::turn-1::block-1",
+                  "kind": {
+                    "RunningTurn": {
+                      "started_at_unix_ms": 1000,
+                      "state": "running",
+                      "turn_id": "turn-1"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "anchor_item_id": null,
+              "content": null,
+              "content_revision": 1,
+              "id": "semantic-turn-state::turn-2::block-2",
+              "item": null,
+              "metadata_revision": 1,
+              "revision": 1,
+              "semantic_id": {
+                "TopLevelBlock": {
+                  "block_id": "block-2"
+                }
+              },
+              "turn_id": "turn-2",
+              "value": {
+                "Timeline": {
+                  "key": "semantic-turn-state::turn-2::block-2",
+                  "kind": {
+                    "RunningTurn": {
+                      "started_at_unix_ms": 1000,
+                      "state": "running",
+                      "turn_id": "turn-2"
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "source_revision": 6,
+          "status": "Ready",
+          "thread_id": "a"
+        },
+        "revisions": {
+          "content": 1,
+          "domain": 1,
+          "presentation": 1,
+          "scoped": 1
+        },
+        "schema_version": 1,
+        "scope": {
+          "kind": "timeline",
+          "thread_id": "a"
+        },
+        "sequence": 7
+      }
+    }
+  }
+}

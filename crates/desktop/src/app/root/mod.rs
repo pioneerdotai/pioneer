@@ -18,7 +18,7 @@ use crate::{
         thread::{
             ThreadCoordinator,
             message_revisions::DesktopMessageRevisionDialogState,
-            view::timeline::{RunningIndicatorViewCache, TimelineLayoutIndex, TimelineRenderModel},
+            view::timeline::{RunningIndicatorViewCache, TimelineLayoutIndex},
         },
     },
     audio::{
@@ -233,19 +233,15 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) cached_render_tail_entry_id: Option<String>,
     pub(super) cached_render_tail_fingerprint: u64,
     pub(super) cached_render_model_fingerprint: u64,
+    pub cached_render_expanded_revision: u64,
     pub(super) cached_render_principal_id: Option<String>,
     pub(super) cached_render_task_child_thread: bool,
     pub(super) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
     pub(super) cached_timeline_layout_index: Option<Rc<TimelineLayoutIndex>>,
-    pub(super) cached_semantic_model_active_thread_id: Option<String>,
-    pub(super) cached_semantic_model_revision: u64,
-    pub(super) cached_semantic_model: Option<TimelineRenderModel>,
     pub(super) expanded_revision: u64,
     pub(super) pending_scroll_anchor: Option<TimelineScrollAnchor>,
     pub(super) semantic_prefetch_scroll_generation: u64,
     pub(super) semantic_prefetch_consumed_scroll_generation: u64,
-    pub(super) running_turn_indicator_fallback_turn_id: Option<String>,
-    pub(super) running_turn_indicator_fallback_started_at_unix_ms: Option<i64>,
 }
 
 pub(super) struct TimelineScrollAnchor {

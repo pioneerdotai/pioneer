@@ -105,6 +105,8 @@ pub struct ClientPublicationWaitRequestDto {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientProcessChangeSetDto {
+    #[serde(default)]
+    pub timeline_changes: Vec<pioneer_client::timeline::presentation::TimelineChangeSet>,
     pub sequence: ClientChangeSequence,
     pub predecessor: Option<ClientChangeSequence>,
     pub snapshots: Vec<ClientScopedSnapshotDto>,
@@ -141,12 +143,25 @@ pub fn validate_schema_version(schema_version: u32) -> Result<(), String> {
 
 pub fn snapshot_dto(publication: ClientPublicationReference) -> ClientScopedSnapshotDto {
     let snapshot = publication.snapshot();
+    let mut payload = snapshot.serialized_payload().as_ref().clone();
+    if matches!(snapshot.scope(), ClientScope::Thread { .. }) {
+        if let Some(fields) = payload.as_object_mut() {
+            fields.remove("semantic");
+        }
+        if let Some(projection) = payload
+            .get_mut("projection")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            projection.remove("items");
+            projection.remove("timeline");
+        }
+    }
     ClientScopedSnapshotDto {
         schema_version: CLIENT_BINDING_SCHEMA_VERSION,
         sequence: snapshot.sequence(),
         scope: snapshot.scope().clone(),
         revisions: snapshot.revisions(),
-        payload: snapshot.serialized_payload().as_ref().clone(),
+        payload,
     }
 }
 
@@ -239,4 +254,26 @@ pub struct ClientAccessChangePlanRequestDto {
     pub active_workspace_id: Option<String>,
     pub active_thread_id: Option<String>,
     pub known_threads: Vec<pioneer_client::authorization::ThreadAuthorizationScope>,
+}
+
+/// Steady-state timeline delivery carries a header plus exact row changes.
+pub fn publication_dto(
+    publication: ClientPublicationReference,
+    incremental: bool,
+) -> ClientScopedSnapshotDto {
+    if !incremental {
+        return snapshot_dto(publication);
+    }
+    let snapshot = publication.snapshot();
+    let payload = publication
+        .typed::<pioneer_client::timeline::presentation::TimelineSnapshot>()
+        .map(|snapshot| snapshot.payload().serialized_header())
+        .unwrap_or_else(|| snapshot.serialized_payload().as_ref().clone());
+    ClientScopedSnapshotDto {
+        schema_version: CLIENT_BINDING_SCHEMA_VERSION,
+        sequence: snapshot.sequence(),
+        scope: snapshot.scope().clone(),
+        revisions: snapshot.revisions(),
+        payload,
+    }
 }

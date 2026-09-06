@@ -530,13 +530,18 @@ impl ClientFfiRuntime {
                 .changes
                 .iter()
                 .map(|change| client_binding::ClientProcessChangeSetDto {
+                    timeline_changes: change.timeline_changes().to_vec(),
                     sequence: change.sequence(),
                     predecessor: change.predecessor(),
                     snapshots: change
                         .publications()
                         .iter()
                         .cloned()
-                        .map(client_binding::snapshot_dto)
+                        .map(|publication| {
+                            let incremental = matches!(publication.scope(), pioneer_client::core::ClientScope::Timeline { thread_id }
+                                if change.timeline_changes().iter().any(|delta| &delta.thread_id == thread_id));
+                            client_binding::publication_dto(publication, incremental)
+                        })
                         .collect(),
                 })
                 .collect(),
@@ -5604,3 +5609,6 @@ ffi_client_json_method!(
     pioneer_client_ffi_authorization_access_change_plan,
     authorization_access_change_plan
 );
+
+#[cfg(test)]
+mod timeline_publication_tests;

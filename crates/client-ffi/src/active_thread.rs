@@ -26,15 +26,7 @@ use pioneer_client::{
     security::{ClientSecurityDiagnosticRow, ClientTurnSecuritySummary, security_diagnostic_rows},
     state::selectors as client_selectors,
     threads::{coordinator::ThreadCoordinator, session as thread_session},
-    timeline::{
-        render_fingerprint::render_fingerprint_hex,
-        rows::TimelineRow,
-        semantic::{
-            SemanticTimelineCachePatch, SemanticTimelineState, expand_turn_work,
-            flatten_semantic_timeline,
-        },
-        semantic_render::{SEMANTIC_TURN_WORK_GROUP_PREFIX, render_semantic_timeline_rows},
-    },
+    timeline::{rows::TimelineRow, semantic::SemanticTimelineCachePatch},
     transport::ws::command_sender as ws_commands,
     turns::{
         cancel as turn_cancel,
@@ -1061,7 +1053,7 @@ fn snapshot_from_inner(
 fn snapshot_for_thread_from_inner(
     inner: &pioneer_client::core::ClientCore,
     thread_id: Option<&str>,
-    expanded_keys: &[String],
+    _expanded_keys: &[String],
 ) -> ClientActiveThreadSnapshot {
     let Some(thread_id) = thread_id else {
         return ClientActiveThreadSnapshot {
@@ -1087,8 +1079,7 @@ fn snapshot_for_thread_from_inner(
     let workspace_id = coordinator.workspace_id.clone();
     let draft_thread_id = inner.thread_workspace_draft(&workspace_id);
     let last_active_thread_id = inner.thread_workspace_last_active(&workspace_id);
-    let (projection, rows, row_render_fingerprints) =
-        render_active_thread_timeline(&domain, thread_id, &coordinator, expanded_keys);
+    let (projection, rows, row_render_fingerprints) = thread_metadata_projection(&coordinator);
     let active_turn_security_summary = active_turn_security_summary(&projection);
     let active_turn_security_diagnostics = active_turn_security_summary
         .as_ref()
@@ -1126,11 +1117,8 @@ fn active_turn_security_summary(
         .and_then(|turn_id| projection.turn_security_summary(turn_id).cloned())
 }
 
-fn render_active_thread_timeline(
-    domain: &pioneer_client::threads::registry::ThreadDomainSnapshot,
-    thread_id: &str,
+fn thread_metadata_projection(
     coordinator: &ThreadCoordinator,
-    expanded_keys: &[String],
 ) -> (
     ConversationViewState,
     Vec<TimelineRow>,
@@ -1139,46 +1127,7 @@ fn render_active_thread_timeline(
     let mut projection = coordinator.conversation.projection().clone();
     projection.items.clear();
     projection.timeline.clear();
-
-    if let Some(thread) = coordinator.thread() {
-        for turn in &thread.turns {
-            projection.upsert_turn_snapshot_metadata(turn);
-        }
-    }
-
-    let mut semantic_timelines = (*domain.semantic()).clone();
-    apply_expanded_turn_work_keys(&mut semantic_timelines, thread_id, expanded_keys);
-
-    let Some(semantic_rows) = flatten_semantic_timeline(&semantic_timelines, thread_id) else {
-        return (projection, Vec::new(), HashMap::new());
-    };
-
-    let model = render_semantic_timeline_rows(semantic_rows.rows.as_slice(), projection);
-    (
-        model.projection,
-        model.rows,
-        model
-            .row_render_fingerprints
-            .into_iter()
-            .map(|(key, fingerprint)| (key, render_fingerprint_hex(fingerprint)))
-            .collect(),
-    )
-}
-
-fn apply_expanded_turn_work_keys(
-    state: &mut SemanticTimelineState,
-    thread_id: &str,
-    expanded_keys: &[String],
-) {
-    for key in expanded_keys {
-        let Some(turn_id) = key.strip_prefix(SEMANTIC_TURN_WORK_GROUP_PREFIX) else {
-            continue;
-        };
-        if turn_id.is_empty() {
-            continue;
-        }
-        expand_turn_work(state, thread_id.to_owned(), turn_id.to_owned());
-    }
+    (projection, Vec::new(), HashMap::new())
 }
 
 fn non_empty_string(value: Option<String>) -> Option<String> {
@@ -2618,7 +2567,7 @@ mod tests {
     fn collaborative_parent_optimistic_snapshot_does_not_flash_foreground_running_row() {
         let mut collaborative = thread("thread_a", "ws_a");
         collaborative.origin_kind = ThreadOriginKind::Collaborative;
-        let inner = pioneer_client::core::ClientCore::new();
+        let inner = Arc::new(pioneer_client::core::ClientCore::new());
         inner.activate_thread(Some("thread_a"), None);
         install_coordinator(
             &inner,
@@ -2654,20 +2603,23 @@ mod tests {
             ))
         );
 
-        let snapshot = snapshot_from_inner(&inner, &[]);
-        assert_eq!(snapshot.row_render_fingerprints.len(), snapshot.rows.len());
-        assert!(
-            snapshot
-                .row_render_fingerprints
-                .values()
-                .all(|fingerprint| fingerprint.len() == 16)
+        let _subscription = inner.subscribe(
+            pioneer_client::core::ClientScope::Timeline {
+                thread_id: "thread_a".into(),
+            },
+            std::num::NonZeroUsize::new(8).unwrap(),
         );
+        let snapshot = inner
+            .thread_presentation_snapshot("thread_a")
+            .unwrap()
+            .timeline();
+        assert!(snapshot.rows().iter().any(|row| matches!(row.value(), pioneer_client::timeline::presentation::TimelineRenderRow::Timeline(row) if matches!(row.kind, pioneer_client::timeline::rows::TimelineRowKind::UserMessage { .. }))));
+        assert!(snapshot.rows().iter().all(|row| !matches!(row.value(), pioneer_client::timeline::presentation::TimelineRenderRow::Timeline(row) if matches!(row.kind, pioneer_client::timeline::rows::TimelineRowKind::RunningTurn(_)))));
+        let metadata = snapshot_from_inner(&inner, &[]);
         assert!(
-            snapshot.rows.iter().all(|row| !matches!(
-                &row.kind,
-                pioneer_client::timeline::rows::TimelineRowKind::RunningTurn(_)
-            )),
-            "mobile boundary must expose the optimistic user row without a foreground running row"
+            metadata.rows.is_empty()
+                && metadata.projection.items.is_empty()
+                && metadata.projection.timeline.is_empty()
         );
     }
 

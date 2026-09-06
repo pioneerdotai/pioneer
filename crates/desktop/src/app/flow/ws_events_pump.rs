@@ -22,7 +22,7 @@ impl PioneerDesktop {
                     let mut summary_changed = false;
                     for change in changes {
                         match change.scope() {
-                            pioneer_client::core::ClientScope::Thread {thread_id} => visible_changed |= view.current_active_thread_id() == Some(thread_id.as_str()),
+                            pioneer_client::core::ClientScope::Thread {thread_id} | pioneer_client::core::ClientScope::Timeline {thread_id} => visible_changed |= view.current_active_thread_id() == Some(thread_id.as_str()),
                             pioneer_client::core::ClientScope::SidebarSummary {workspace_id, ..} => {
                                 summary_changed |= view.active_workspace_id() == Some(workspace_id.as_str());
                                 if let Some(summary) = change.typed::<pioneer_client::threads::registry::SidebarSummaryChanged>() {

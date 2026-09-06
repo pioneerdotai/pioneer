@@ -23,6 +23,10 @@ macro_rules! schema_doc {
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "timeline_snapshot.json",
+            pioneer_client::timeline::presentation::TimelineSnapshot
+        ),
+        schema_doc!(
             "client_gateway_session_validation_request.json",
             crate::auth::ClientGatewaySessionValidationRequest
         ),

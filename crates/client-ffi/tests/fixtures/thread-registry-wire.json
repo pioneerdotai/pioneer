@@ -3,6 +3,7 @@
         {
             "payload": {
                 "cli_binding": null,
+                "current_principal_id": null,
                 "execution_revision": 1,
                 "history_loaded": false,
                 "history_loading": false,
@@ -11,17 +12,12 @@
                 "projection": {
                     "composer_locked": false,
                     "in_flight_turn_id": null,
-                    "items": [],
                     "last_error": null,
                     "pending_request_id": null,
                     "permission_audit": [],
                     "phase_label": "idle",
                     "revision": 0,
-                    "timeline": [],
                     "turns": []
-                },
-                "semantic": {
-                    "threads_by_id": {}
                 },
                 "subscription_failed": false,
                 "thread": {
@@ -56,6 +52,7 @@
         {
             "payload": {
                 "cli_binding": null,
+                "current_principal_id": null,
                 "execution_revision": 1,
                 "history_loaded": false,
                 "history_loading": false,
@@ -64,17 +61,12 @@
                 "projection": {
                     "composer_locked": false,
                     "in_flight_turn_id": null,
-                    "items": [],
                     "last_error": null,
                     "pending_request_id": null,
                     "permission_audit": [],
                     "phase_label": "idle",
                     "revision": 0,
-                    "timeline": [],
                     "turns": []
-                },
-                "semantic": {
-                    "threads_by_id": {}
                 },
                 "subscription_failed": false,
                 "thread": {
@@ -111,6 +103,7 @@
         {
             "payload": {
                 "cli_binding": null,
+                "current_principal_id": null,
                 "execution_revision": 1,
                 "history_loaded": false,
                 "history_loading": false,
@@ -119,17 +112,12 @@
                 "projection": {
                     "composer_locked": false,
                     "in_flight_turn_id": null,
-                    "items": [],
                     "last_error": null,
                     "pending_request_id": null,
                     "permission_audit": [],
                     "phase_label": "idle",
                     "revision": 0,
-                    "timeline": [],
                     "turns": []
-                },
-                "semantic": {
-                    "threads_by_id": {}
                 },
                 "subscription_failed": false,
                 "thread": {
@@ -164,6 +152,7 @@
         {
             "payload": {
                 "cli_binding": null,
+                "current_principal_id": null,
                 "execution_revision": 1,
                 "history_loaded": false,
                 "history_loading": false,
@@ -172,17 +161,12 @@
                 "projection": {
                     "composer_locked": false,
                     "in_flight_turn_id": null,
-                    "items": [],
                     "last_error": null,
                     "pending_request_id": null,
                     "permission_audit": [],
                     "phase_label": "idle",
                     "revision": 0,
-                    "timeline": [],
                     "turns": []
-                },
-                "semantic": {
-                    "threads_by_id": {}
                 },
                 "subscription_failed": false,
                 "thread": {
