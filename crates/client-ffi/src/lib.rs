@@ -97,6 +97,8 @@ use pending_requests::{
     pending_request_presentation_for_bridge, plan_pending_request_response_for_bridge,
 };
 use pioneer_client::gateway::invitation::InvitationSessionCommitState;
+#[cfg(test)]
+use pioneer_client::timeline::semantic::WorkPageMergeMode;
 use pioneer_client::{
     agents_doc::content::{
         AgentsDocSaveErrorKind, agents_doc_get_params, agents_doc_save_error_kind,
@@ -122,12 +124,13 @@ use pioneer_client::{
     },
     runtime::ClientRuntime,
     timeline::rows::{MessageRevisionPagePresentation, project_message_revision_page},
-    timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode},
     workspaces::{
         actions::WorkspaceBootstrapSuccessReduction,
         bootstrap::{WorkspaceBootstrapRequest, bootstrap_workspace_catalog},
     },
 };
+#[cfg(test)]
+use pioneer_protocol::TimelinePageAnchor;
 use pioneer_protocol::{
     CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
     CLIRuntimeListResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
@@ -142,14 +145,13 @@ use pioneer_protocol::{
     TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
     ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams,
     ThreadAgentsDocSaveResponse, ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams,
-    ThreadTimelinePageResponse, TimelinePageAnchor, TurnMessageDeleteParams,
-    TurnMessageDeleteResponse, TurnMessageEditParams, TurnMessageEditResponse,
-    TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
-    TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
-    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
-    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
-    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
-    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
+    ThreadTimelinePageResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
+    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageRevisionsPageParams,
+    TurnMessageRevisionsPageResponse, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams,
+    VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
+    VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
 use presentation::{
     ClientArtifactPresentationPolicyRequest, ClientAuthorizationProjectionAcceptRequest,
@@ -185,7 +187,6 @@ use threads::{
     ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
     ThreadTreeRefreshRequest, client_thread_tree_level, refresh_thread_tree,
 };
-use timeline::{thread_timeline_page, turn_work_items_get, turn_work_page};
 use workspaces::{
     WorkspaceCreateRequest, WorkspaceCreateResult, WorkspaceRenameRequest, WorkspaceRenameResult,
     WorkspaceSwitchRequest, WorkspaceSwitchResult, create_workspace, rename_workspace,
@@ -200,7 +201,6 @@ pub struct PioneerClientFfi {
     runtime: ClientFfiRuntime,
 }
 
-#[derive(Default)]
 struct ClientFfiRuntime {
     config: Mutex<Option<ClientFfiConfig>>,
     client_runtime: ClientRuntimeCompatibility,
@@ -215,6 +215,27 @@ struct ClientFfiRuntime {
     invitation_commit_sequence: AtomicU64,
     invitation_commits:
         Mutex<HashMap<String, pioneer_client::gateway::invitation::InvitationSessionCommit>>,
+}
+
+impl Default for ClientFfiRuntime {
+    fn default() -> Self {
+        let client_runtime = ClientRuntimeCompatibility::default();
+        let active_thread = ClientFfiActiveThreadState::new(client_runtime.core.clone());
+        Self {
+            client_runtime,
+            active_thread,
+            config: Default::default(),
+            client_subscriptions: Default::default(),
+            active_connection_id: Default::default(),
+            legacy_authorization_generation: Default::default(),
+            legacy_authorization_change_sequence: Default::default(),
+            diagnostics: Default::default(),
+            artifact_downloads: Default::default(),
+            avatar_cache: Default::default(),
+            invitation_commit_sequence: Default::default(),
+            invitation_commits: Default::default(),
+        }
+    }
 }
 
 /// Frozen route used only by capabilities whose mutable owner has not moved
@@ -398,9 +419,34 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<client_binding::ClientIntentDispatchDto>(input_json)
             .map_err(|error| format!("invalid Client intent request: {error}"))?;
         client_binding::validate_schema_version(request.schema_version)?;
-        Ok(client_binding::transition_dto(
-            self.client_runtime.core.dispatch(request.intent),
-        ))
+        let release_scope = match &request.intent {
+            pioneer_client::core::ClientIntent::SetScopeDemand {
+                scope,
+                demand: pioneer_client::core::ClientDemand::Suspended,
+                ..
+            } if matches!(
+                scope,
+                ClientScope::Thread { .. } | ClientScope::Timeline { .. }
+            ) =>
+            {
+                Some(scope.clone())
+            }
+            _ => None,
+        };
+        let transition = self.client_runtime.core.dispatch(request.intent);
+        if matches!(
+            transition.outcome(),
+            pioneer_client::core::ClientTransitionOutcome::Changed
+                | pioneer_client::core::ClientTransitionOutcome::Noop
+        ) {
+            if let Some(scope) = release_scope {
+                self.client_subscriptions
+                    .lock()
+                    .map_err(|_| "Client subscription registry lock is poisoned".to_owned())?
+                    .remove(&scope);
+            }
+        }
+        Ok(client_binding::transition_dto(transition))
     }
 
     fn client_scoped_snapshot(
@@ -412,7 +458,12 @@ impl ClientFfiRuntime {
             serde_json::from_str::<client_binding::ClientScopedSnapshotRequestDto>(input_json)
                 .map_err(|error| format!("invalid Client scoped snapshot request: {error}"))?;
         client_binding::validate_schema_version(request.schema_version)?;
-        self.ensure_client_subscription(request.scope.clone())?;
+        if !matches!(
+            request.scope,
+            ClientScope::Thread { .. } | ClientScope::Timeline { .. }
+        ) {
+            self.ensure_client_subscription(request.scope.clone())?;
+        }
         Ok(self
             .client_runtime
             .core
@@ -538,7 +589,12 @@ impl ClientFfiRuntime {
             serde_json::from_str::<client_binding::ClientSequenceGapResnapshotDto>(input_json)
                 .map_err(|error| format!("invalid Client sequence-gap resnapshot: {error}"))?;
         client_binding::validate_schema_version(request.schema_version)?;
-        self.ensure_client_subscription(request.scope.clone())?;
+        if !matches!(
+            request.scope,
+            ClientScope::Thread { .. } | ClientScope::Timeline { .. }
+        ) {
+            self.ensure_client_subscription(request.scope.clone())?;
+        }
         Ok(self
             .client_runtime
             .core
@@ -2825,15 +2881,10 @@ impl ClientFfiRuntime {
                 )
             })?;
 
-        let merge_mode = thread_timeline_page_merge_mode(&params.anchor);
-        let page = thread_timeline_page(&self.client_runtime.ws_command_sender(), params)?;
-        self.active_thread
-            .apply_thread_timeline_page(page.clone(), merge_mode)
-            .map_err(|error| {
-                ClientFfiError::new(format!("{error:#}"), timeline::TIMELINE_ERROR_VALIDATION)
-            })?;
-
-        Ok(page)
+        self.client_runtime
+            .core
+            .fetch_thread_timeline_page(&self.client_runtime.ws_command_sender(), params)
+            .map_err(timeline::map_timeline_page_error)
     }
 
     fn turn_message_edit(
@@ -2906,15 +2957,10 @@ impl ClientFfiRuntime {
             )
         })?;
 
-        let merge_mode = turn_work_page_merge_mode(&params.anchor);
-        let page = turn_work_page(&self.client_runtime.ws_command_sender(), params)?;
-        self.active_thread
-            .apply_turn_work_page(page.clone(), merge_mode)
-            .map_err(|error| {
-                ClientFfiError::new(format!("{error:#}"), timeline::TIMELINE_ERROR_VALIDATION)
-            })?;
-
-        Ok(page)
+        self.client_runtime
+            .core
+            .fetch_turn_work_page(&self.client_runtime.ws_command_sender(), params)
+            .map_err(timeline::map_timeline_page_error)
     }
 
     fn turn_work_items_get(
@@ -2929,14 +2975,10 @@ impl ClientFfiRuntime {
                 )
             })?;
 
-        let response = turn_work_items_get(&self.client_runtime.ws_command_sender(), params)?;
-        self.active_thread
-            .apply_turn_work_items_get_response(response.clone())
-            .map_err(|error| {
-                ClientFfiError::new(format!("{error:#}"), timeline::TIMELINE_ERROR_VALIDATION)
-            })?;
-
-        Ok(response)
+        self.client_runtime
+            .core
+            .fetch_turn_work_items(&self.client_runtime.ws_command_sender(), params)
+            .map_err(timeline::map_timeline_page_error)
     }
 
     fn agents_doc_get(&self, input_json: &str) -> Result<ThreadAgentsDocGetResponse, String> {
@@ -3196,16 +3238,6 @@ impl ClientFfiRuntime {
     }
 }
 
-fn thread_timeline_page_merge_mode(anchor: &TimelinePageAnchor) -> TopLevelPageMergeMode {
-    match anchor {
-        TimelinePageAnchor::Before { .. } => TopLevelPageMergeMode::MergeBefore,
-        TimelinePageAnchor::After { .. } => TopLevelPageMergeMode::MergeAfter,
-        TimelinePageAnchor::Newest
-        | TimelinePageAnchor::Oldest
-        | TimelinePageAnchor::Around { .. } => TopLevelPageMergeMode::Merge,
-    }
-}
-
 fn parse_empty_auth_request(input_json: &str) -> Result<(), ClientFfiError> {
     let value = serde_json::from_str::<serde_json::Value>(input_json).map_err(|_| {
         ClientFfiError::new("invalid auth request", auth::INVALID_AUTH_REQUEST_CODE)
@@ -3332,6 +3364,7 @@ fn normal_auth_error(error: anyhow::Error) -> ClientFfiError {
     ClientFfiError::new(message, code)
 }
 
+#[cfg(test)]
 fn turn_work_page_merge_mode(anchor: &TimelinePageAnchor) -> WorkPageMergeMode {
     match anchor {
         TimelinePageAnchor::Newest | TimelinePageAnchor::After { .. } => {
@@ -4302,6 +4335,30 @@ mod tests {
             .expect("initialize");
 
         assert!(result.initialized);
+    }
+
+    #[test]
+    fn thread_snapshot_reads_do_not_pin_stores_and_suspended_demand_releases_legacy_queue() {
+        let runtime = ClientFfiRuntime::default();
+        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+        let scope = ClientScope::Thread {
+            thread_id: "synthetic".into(),
+        };
+        runtime
+            .client_scoped_snapshot(
+                r#"{"schema_version":1,"scope":{"kind":"thread","thread_id":"synthetic"}}"#,
+            )
+            .unwrap();
+        assert!(runtime.client_subscriptions.lock().unwrap().is_empty());
+        runtime.ensure_client_subscription(scope.clone()).unwrap();
+        runtime.client_intent_dispatch(r#"{"schema_version":1,"intent":{"kind":"set_scope_demand","scope":{"kind":"thread","thread_id":"synthetic"},"demand":"suspended","generation":1}}"#).unwrap();
+        assert!(
+            !runtime
+                .client_subscriptions
+                .lock()
+                .unwrap()
+                .contains_key(&scope)
+        );
     }
 
     #[test]

@@ -17,7 +17,6 @@ mod thread_start_queue;
 mod thread_start_scope;
 mod turn_resume_execute;
 mod turn_resume_queue;
-mod turn_resume_schedule;
 mod workspace_bootstrap;
 mod workspace_switch;
 mod ws_events_connection;

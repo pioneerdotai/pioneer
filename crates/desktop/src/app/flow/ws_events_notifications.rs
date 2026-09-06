@@ -7,16 +7,14 @@ use pioneer_client::authorization::{
 };
 use pioneer_client::notifications::router::{
     ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeSnapshotReduction,
-    ConversationEventReduction, SkillsRefreshReduction, ThreadArtifactsRefreshReduction,
-    ThreadClosedReduction, ThreadStartedReduction, ThreadUpdatedReduction, TurnLifecycleReduction,
-    WorkspacePreferenceReduction, WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
+    SkillsRefreshReduction, ThreadArtifactsRefreshReduction, WorkspacePreferenceReduction,
+    WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
 };
 use pioneer_client::providers::list::CliRuntimeSnapshotUpdate;
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
 use pioneer_client::voice::{VoiceFinalizeUiAction, VoiceSessionResultReduction};
 use pioneer_client::workspaces::selectors as workspace_selectors;
 use pioneer_protocol::{VoiceError, VoiceSessionOutcome};
-use std::time::Instant;
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(
@@ -24,27 +22,21 @@ impl PioneerDesktop {
         notification: GatewayNotification,
         cx: &mut Context<Self>,
     ) {
-        let timeline_input = match &notification {
-            GatewayNotification::ItemDelta(notification) => Some((
-                notification.delta.len(),
-                notification
-                    .markdown
-                    .as_ref()
-                    .map(|document| document.blocks.len()),
-                if notification.markdown.is_some() {
-                    pioneer_observability::DesktopTimelineContentKind::Markdown
-                } else {
-                    pioneer_observability::DesktopTimelineContentKind::PlainText
-                },
-            )),
-            _ => None,
-        };
+        if self
+            .gateway
+            .client_runtime
+            .client_core()
+            .apply_thread_notification(notification.clone())
+        {
+            return;
+        }
         let active_workspace = self.active_workspace_scope_for_notifications();
         let mcp_workspace = self.mcp_workspace_scope();
         let notification_thread_workspace_matches =
             self.notification_thread_workspace_matches(&notification);
+        let start = self.thread_start_coordinator();
         let context = ClientRuntimeNotificationContext {
-            pending_thread_id: self.thread_start_coordinator().pending_thread_id.as_deref(),
+            pending_thread_id: start.pending_thread_id.as_deref(),
             active_thread_id: self.current_active_thread_id(),
             active_workspace_id: active_workspace.as_deref(),
             notification_thread_workspace_matches,
@@ -55,51 +47,12 @@ impl PioneerDesktop {
             mcp_selected_server_id: self.mcp_selected_server_id.as_deref(),
             mcp_details_loaded: self.mcp_server_details.is_some(),
         };
-        let reduce_started = timeline_input.map(|_| Instant::now());
         let reduction = self
             .gateway
             .client_runtime
             .reduce_gateway_notification(notification, context);
-        if let (Some((input_bytes, block_count, content)), Some(started)) =
-            (timeline_input, reduce_started.as_ref())
-        {
-            pioneer_observability::record_desktop_timeline_stage(
-                pioneer_observability::DesktopTimelineStageMetric {
-                    stage: pioneer_observability::DesktopTimelineStage::NotificationReduce,
-                    cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
-                    content,
-                    outcome: if reduction.is_some() {
-                        pioneer_observability::DesktopTimelineOutcome::Ok
-                    } else {
-                        pioneer_observability::DesktopTimelineOutcome::Skipped
-                    },
-                    elapsed: started.elapsed(),
-                    input_bytes: Some(input_bytes),
-                    block_count,
-                    row_count: None,
-                },
-            );
-        }
-        let Some(reduction) = reduction else {
-            return;
-        };
-        let apply_started = timeline_input.map(|_| Instant::now());
-        self.apply_gateway_notification_reduction(reduction, cx);
-        if let (Some((input_bytes, block_count, content)), Some(started)) =
-            (timeline_input, apply_started.as_ref())
-        {
-            pioneer_observability::record_desktop_timeline_stage(
-                pioneer_observability::DesktopTimelineStageMetric {
-                    stage: pioneer_observability::DesktopTimelineStage::NotificationApply,
-                    cache: pioneer_observability::DesktopTimelineCacheStatus::NotApplicable,
-                    content,
-                    outcome: pioneer_observability::DesktopTimelineOutcome::Ok,
-                    elapsed: started.elapsed(),
-                    input_bytes: Some(input_bytes),
-                    block_count,
-                    row_count: None,
-                },
-            );
+        if let Some(reduction) = reduction {
+            self.apply_gateway_notification_reduction(reduction, cx);
         }
     }
 
@@ -169,24 +122,14 @@ impl PioneerDesktop {
             ClientRuntimeNotification::AdministrationChanged(event) => {
                 self.apply_administration_event(event, cx);
             }
-            ClientRuntimeNotification::ThreadStarted(reduction) => {
-                self.apply_thread_started_reduction(reduction);
-            }
-            ClientRuntimeNotification::TurnLifecycle(reduction) => {
-                self.apply_turn_lifecycle_reduction(reduction, Some(cx));
-            }
-            ClientRuntimeNotification::ConversationEvent(reduction) => {
-                self.apply_conversation_event_reduction(reduction);
-            }
-            ClientRuntimeNotification::ThreadClosed(reduction) => {
-                self.apply_thread_closed_reduction(reduction);
-            }
+            ClientRuntimeNotification::ThreadStarted(_) => {}
+            ClientRuntimeNotification::TurnLifecycle(_) => {}
+            ClientRuntimeNotification::ConversationEvent(_) => {}
+            ClientRuntimeNotification::ThreadClosed(_) => {}
             ClientRuntimeNotification::WorkspaceRefresh(reduction) => {
                 self.apply_workspace_refresh_reduction(reduction);
             }
-            ClientRuntimeNotification::ThreadUpdated(reduction) => {
-                self.apply_thread_updated_reduction(reduction, cx);
-            }
+            ClientRuntimeNotification::ThreadUpdated(_) => {}
             ClientRuntimeNotification::ThreadParticipantsChanged(notification) => {
                 self.apply_thread_participants_changed_notification(notification, cx);
             }
@@ -211,21 +154,15 @@ impl PioneerDesktop {
             ClientRuntimeNotification::ArtifactDeletedRefresh(reduction) => {
                 self.apply_artifact_deleted_refresh_reduction(reduction, cx);
             }
-            ClientRuntimeNotification::SemanticTimeline(update) => {
-                self.apply_semantic_timeline_live_update(update, cx);
-            }
+            ClientRuntimeNotification::SemanticTimeline(_) => {}
             ClientRuntimeNotification::VoiceSessionResult(reduction) => {
                 self.apply_voice_session_result_reduction(reduction, cx);
             }
             ClientRuntimeNotification::CLIRuntimeSnapshot(reduction) => {
                 self.apply_cli_runtime_snapshot_reduction(reduction, cx);
             }
-            ClientRuntimeNotification::CLIRuntimePendingRequests(reduction) => {
-                self.apply_pending_requests_reduction(reduction, cx);
-            }
-            ClientRuntimeNotification::PendingRequests { reduction } => {
-                self.apply_pending_requests_reduction(reduction, cx);
-            }
+            ClientRuntimeNotification::CLIRuntimePendingRequests(_) => {}
+            ClientRuntimeNotification::PendingRequests { .. } => {}
             ClientRuntimeNotification::TaskUserNotificationDelivered(notification) => {
                 self.apply_task_user_notification_delivered(notification, cx);
             }
@@ -312,7 +249,8 @@ impl PioneerDesktop {
     ) {
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
-        let known_threads = desktop_thread_authorization_scopes(&self.thread_coordinators);
+        let known_threads =
+            desktop_thread_authorization_scopes(&self.thread_coordinator_snapshots());
         let plan = plan_access_changed(
             &notification,
             None,
@@ -375,20 +313,6 @@ impl PioneerDesktop {
                 && !invalidated_thread_ids.contains(entry.parent_thread_id.as_str())
                 && !invalidated_thread_ids.contains(entry.child_thread_id.as_str())
         });
-        self.ready_turn_resume_threads
-            .retain(|thread_id| !invalidated_thread_ids.contains(thread_id.as_str()));
-        self.ready_turn_resume_thread_set
-            .retain(|thread_id| !invalidated_thread_ids.contains(thread_id.as_str()));
-        self.last_active_thread_by_workspace
-            .retain(|workspace_id, thread_id| {
-                !(workspace_access_lost && workspace_id == &plan.workspace_id)
-                    && !invalidated_thread_ids.contains(thread_id.as_str())
-            });
-        self.draft_thread_by_workspace
-            .retain(|workspace_id, thread_id| {
-                !(workspace_access_lost && workspace_id == &plan.workspace_id)
-                    && !invalidated_thread_ids.contains(thread_id.as_str())
-            });
 
         if workspace_access_lost {
             let removed_folder_ids = self
@@ -422,7 +346,10 @@ impl PioneerDesktop {
         }
 
         if workspace_access_lost {
-            self.pending_requests.apply(
+            self.gateway
+                .client_runtime
+                .client_core()
+                .apply_pending_requests(
                 pioneer_client::cli_runtime::approvals::PendingRequestsReduction::ClearWorkspace {
                     workspace_id: plan.workspace_id.clone(),
                 },
@@ -491,163 +418,6 @@ impl PioneerDesktop {
         cx.notify();
     }
 
-    fn apply_thread_started_reduction(&mut self, reduction: ThreadStartedReduction) {
-        self.upsert_thread_snapshot(reduction.thread);
-        self.upsert_thread_for_workspace(
-            reduction.thread_id.as_str(),
-            reduction.workspace_id.as_str(),
-        );
-
-        if let Some(thread_id) = reduction.set_draft_thread_id {
-            self.set_draft_thread_id(Some(thread_id));
-        }
-        if let Some(thread_id) = reduction.set_active_thread_id {
-            self.set_active_thread_id(Some(thread_id));
-        }
-        if let Some(workspace_id) = reduction.set_preferred_workspace_id {
-            self.set_preferred_workspace_id(Some(workspace_id));
-        }
-        if let Some(workspace_id) = reduction.persist_active_gateway_workspace_id {
-            self.persist_active_gateway_workspace_id(workspace_id);
-        }
-        if reduction.reset_thread_start {
-            self.reset_thread_start_state();
-        }
-        if reduction.clear_thread_start_queue {
-            self.clear_thread_start_queue();
-        }
-        if reduction.queue_thread_list_refresh {
-            self.queue_thread_list_refresh();
-        }
-        if reduction.sync_composer_model_selection {
-            self.sync_composer_model_selection_for_active_thread();
-        }
-    }
-
-    fn apply_turn_lifecycle_reduction(
-        &mut self,
-        reduction: TurnLifecycleReduction,
-        mut cx: Option<&mut Context<Self>>,
-    ) {
-        let thread_id = reduction.thread_id.clone();
-        if reduction.promote_thread_from_draft {
-            self.promote_thread_from_draft(thread_id.as_str());
-        }
-        if reduction.queue_thread_list_refresh {
-            self.queue_thread_list_refresh();
-        }
-        if let Some(status) = reduction.thread_status
-            && let Some(coordinator) = self.thread_coordinator_mut(thread_id.as_str())
-            && let Some(thread) = coordinator.thread_mut()
-        {
-            thread.status = status;
-        }
-        self.upsert_thread_conversation_mut(thread_id.as_str(), reduction.workspace_id.as_str())
-            .apply(reduction.conversation_event.clone());
-        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
-            &mut self.semantic_timelines,
-            reduction.workspace_id.as_str(),
-            &reduction.conversation_event,
-            pioneer_client::timeline::labels::now_unix_ms(),
-        ) {
-            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
-            if let Some(cx) = cx.as_deref_mut() {
-                cx.notify();
-            }
-        }
-        let terminal_work_reconciliation =
-            pioneer_client::timeline::semantic::terminal_turn_work_reconciliation(
-                &self.semantic_timelines,
-                &reduction.conversation_event,
-            );
-        if let (Some(reconciliation), Some(cx)) = (terminal_work_reconciliation, cx.as_deref_mut())
-        {
-            self.request_semantic_turn_work_items(
-                reconciliation.thread_id,
-                reconciliation.turn_id,
-                reconciliation.running_work_item_ids,
-                cx,
-            );
-        }
-        if reduction.tick_conversation
-            && let Some(conversation) = self.thread_conversation_mut(thread_id.as_str())
-        {
-            let _ = conversation.tick();
-        }
-        if reduction.reset_thread_resume {
-            self.reset_thread_resume_state(thread_id.as_str());
-        }
-        if reduction.refresh_thread_artifacts
-            && let Some(cx) = cx.as_deref_mut()
-        {
-            self.refresh_thread_artifacts(thread_id.clone(), true, cx);
-        }
-        if reduction.sync_composer_model_selection {
-            self.sync_composer_model_selection_for_active_thread();
-        }
-        if let Some(pending_reduction) = reduction.pending_requests
-            && self.pending_requests.apply(pending_reduction)
-            && let Some(cx) = cx.as_deref_mut()
-        {
-            cx.notify();
-        }
-    }
-
-    fn apply_conversation_event_reduction(&mut self, reduction: ConversationEventReduction) {
-        self.upsert_thread_conversation_mut(
-            reduction.thread_id.as_str(),
-            reduction.workspace_id.as_str(),
-        )
-        .apply(reduction.conversation_event.clone());
-        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
-            &mut self.semantic_timelines,
-            reduction.workspace_id.as_str(),
-            &reduction.conversation_event,
-            pioneer_client::timeline::labels::now_unix_ms(),
-        ) {
-            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
-        }
-    }
-
-    fn apply_thread_closed_reduction(&mut self, reduction: ThreadClosedReduction) {
-        if let Some(pending_reduction) = reduction.pending_requests {
-            self.pending_requests.apply(pending_reduction);
-        }
-        if reduction.remove_thread_conversation {
-            self.remove_thread_conversation(reduction.thread_id.as_str());
-        }
-        if reduction.clear_active_thread_if_matches {
-            let _ = self.clear_active_thread_if_matches(reduction.thread_id.as_str());
-        }
-        if reduction.queue_thread_list_refresh {
-            self.queue_thread_list_refresh();
-        }
-    }
-
-    fn apply_thread_updated_reduction(
-        &mut self,
-        reduction: ThreadUpdatedReduction,
-        cx: &mut Context<Self>,
-    ) {
-        let affected_workspace_is_active =
-            self.active_workspace_id() == Some(reduction.workspace_id.as_str());
-        if let Some(placement) = reduction.placement {
-            self.thread_placements
-                .insert(reduction.thread_id.clone(), placement);
-        }
-        self.upsert_thread_snapshot(reduction.thread);
-        self.upsert_thread_for_workspace(
-            reduction.thread_id.as_str(),
-            reduction.workspace_id.as_str(),
-        );
-        if reduction.sync_composer_model_selection {
-            self.sync_composer_model_selection_for_active_thread();
-        }
-        if affected_workspace_is_active {
-            self.rebuild_sidebar_tree_state(cx);
-        }
-    }
-
     fn apply_workspace_refresh_reduction(&mut self, reduction: WorkspaceRefreshReduction) {
         if reduction.queue_thread_list_refresh {
             self.queue_thread_list_refresh();
@@ -706,68 +476,6 @@ impl PioneerDesktop {
         }
     }
 
-    fn apply_semantic_timeline_live_update(
-        &mut self,
-        update: pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate,
-        cx: &mut Context<Self>,
-    ) {
-        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
-        let mut refetch_thread_id = None;
-        let mut reconcile_work_items = None;
-        match &update {
-            pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::ThreadTimelineBlocksChanged(notification)
-                if active_thread_id.as_deref() == Some(notification.thread_id.as_str())
-                    && !notification.changed_block_ids.is_empty() =>
-            {
-                refetch_thread_id = Some(notification.thread_id.clone());
-            }
-            pioneer_client::timeline::semantic::SemanticTimelineLiveUpdate::TurnWorkItemsChanged(notification)
-                if active_thread_id.as_deref() == Some(notification.thread_id.as_str()) =>
-            {
-                reconcile_work_items = Some((
-                    notification.thread_id.clone(),
-                    notification.turn_id.clone(),
-                    notification.changed_work_item_ids.clone(),
-                ));
-            }
-            _ => {}
-        }
-
-        let semantic_changed =
-            pioneer_client::timeline::semantic::apply_semantic_timeline_live_update(
-                &mut self.semantic_timelines,
-                update,
-            );
-        if !semantic_changed {
-            return;
-        }
-        self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
-        cx.notify();
-
-        if let Some(thread_id) = refetch_thread_id {
-            self.request_semantic_thread_newest_page(thread_id, cx);
-        }
-        if let Some((thread_id, turn_id, work_item_ids)) = reconcile_work_items
-            && self.should_refetch_semantic_turn_work(thread_id.as_str(), turn_id.as_str())
-        {
-            self.request_semantic_turn_work_items(thread_id, turn_id, work_item_ids, cx);
-        }
-    }
-
-    fn should_refetch_semantic_turn_work(&self, thread_id: &str, turn_id: &str) -> bool {
-        self.semantic_timelines
-            .thread(thread_id)
-            .and_then(|thread| {
-                thread.cached_turn_work_block(turn_id).map(|work| {
-                    pioneer_client::timeline::semantic::resolve_work_expanded(
-                        work,
-                        &thread.expansion,
-                    )
-                })
-            })
-            .unwrap_or(false)
-    }
-
     fn apply_cli_runtime_snapshot_reduction(
         &mut self,
         reduction: CLIRuntimeSnapshotReduction,
@@ -808,27 +516,12 @@ impl PioneerDesktop {
     pub(in crate::app) fn apply_pending_requests_reduction(
         &mut self,
         reduction: pioneer_client::cli_runtime::approvals::PendingRequestsReduction,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        let resolved_request_id = match &reduction {
-            pioneer_client::cli_runtime::approvals::PendingRequestsReduction::Resolved {
-                request_id,
-            } => Some(request_id.clone()),
-            _ => None,
-        };
-        let pending_changed = self.pending_requests.apply(reduction);
-        let semantic_changed = resolved_request_id.is_some_and(|request_id| {
-            pioneer_client::timeline::semantic::remove_pending_request_blocks(
-                &mut self.semantic_timelines,
-                request_id.as_str(),
-            )
-        });
-        if semantic_changed {
-            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
-        }
-        if pending_changed || semantic_changed {
-            cx.notify();
-        }
+        self.gateway
+            .client_runtime
+            .client_core()
+            .apply_pending_requests(reduction);
     }
 
     fn active_workspace_scope_for_notifications(&self) -> Option<String> {

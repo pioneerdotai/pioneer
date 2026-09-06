@@ -211,7 +211,7 @@ impl PioneerDesktop {
             return;
         };
         let update_params = match thread_tree::plan_thread_rename(
-            &self.thread_coordinators,
+            &self.thread_coordinator_snapshots(),
             Some(workspace_id.as_str()),
             thread_id.as_str(),
             new_name.as_str(),
@@ -560,7 +560,7 @@ impl PioneerDesktop {
             return;
         };
         let move_params = match thread_tree::plan_thread_move(
-            &self.thread_coordinators,
+            &self.thread_coordinator_snapshots(),
             &self.thread_folders,
             Some(workspace_id.as_str()),
             thread_id.as_str(),

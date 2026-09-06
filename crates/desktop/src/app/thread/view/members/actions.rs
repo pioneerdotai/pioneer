@@ -21,7 +21,7 @@ impl PioneerDesktop {
         }
         let Some(thread) = self
             .thread_coordinator(thread_id.as_str())
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
         else {
             return;
         };
@@ -105,7 +105,7 @@ impl PioneerDesktop {
         };
         let Some(thread) = self
             .thread_coordinator(thread_id.as_str())
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
         else {
             return;
         };

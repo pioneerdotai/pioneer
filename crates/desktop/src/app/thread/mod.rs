@@ -1,4 +1,5 @@
 mod actions;
+pub(in crate::app) mod binding;
 mod message_mutations;
 pub(in crate::app) mod message_revisions;
 pub(crate) mod view;

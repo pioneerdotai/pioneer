@@ -123,9 +123,24 @@ impl PioneerDesktop {
         if self.gateway.connection_state.is_transitioning()
             || self.workspaces_loading
             || (self.thread_list_loading && self.current_active_thread_id().is_none())
-            || self.thread_start_requested
-            || self.thread_start.in_progress
-            || self.thread_start.pending_thread_id.is_some()
+            || self
+                .gateway
+                .client_runtime
+                .client_core()
+                .thread_start_requested()
+            || self
+                .gateway
+                .client_runtime
+                .client_core()
+                .thread_start_snapshot()
+                .in_progress
+            || self
+                .gateway
+                .client_runtime
+                .client_core()
+                .thread_start_snapshot()
+                .pending_thread_id
+                .is_some()
         {
             return true;
         }
@@ -203,12 +218,13 @@ impl PioneerDesktop {
         let active_thread_id = self.current_active_thread_id()?;
         let active_workspace_id = self
             .active_workspace_id()
+            .map(str::to_owned)
             .or_else(|| self.thread_workspace_id(active_thread_id));
 
         client_selectors::resolve_composer_model_selection_from(
             Some(active_thread_id),
-            active_workspace_id,
-            &self.thread_coordinators,
+            active_workspace_id.as_deref(),
+            &self.thread_coordinator_snapshots(),
         )
     }
 }

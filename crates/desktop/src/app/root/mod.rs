@@ -8,7 +8,6 @@ mod view;
 
 use crate::{
     app::{
-        conversation::Conversation,
         editor::AgentsDocEditor,
         gateway_setup::{GatewaySetupDialogState, GatewaySetupFormState},
         invitation_join::DesktopInvitationJoinState,
@@ -47,7 +46,7 @@ pub(super) use pioneer_client::{
     artifacts::preview::ArtifactPreviewImagePaths as ThreadArtifactPreviewImagePaths,
     artifacts::state::{ThreadArtifactFilter, ThreadArtifactsState},
     authorization::ThreadPresentationCapabilities,
-    cli_runtime::approvals::{PendingRequest, PendingRequestState},
+    cli_runtime::approvals::PendingRequest,
     composer::capabilities::{
         ComposerCapability, ComposerCapabilityKind, ComposerCapabilityTarget,
     },
@@ -66,11 +65,8 @@ pub(super) use pioneer_client::{
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
     tasks::review::TaskReviewActionState,
     threads::scope::ThreadScopePendingAction,
-    threads::{resume::ThreadResumeCoordinator, start::ThreadStartCoordinator},
+    threads::start::ThreadStartCoordinator,
     timeline::rows::UserMessagePresentation,
-    timeline::semantic::{
-        SemanticTimelineRequestAction, SemanticTimelineRequestKey, SemanticTimelineState,
-    },
 };
 use pioneer_protocol::{
     ArtifactRef, AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
@@ -85,7 +81,7 @@ pub(crate) use queries::{
 };
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -358,7 +354,6 @@ pub struct PioneerDesktop {
     pub(super) startup: DesktopStartupCoordinator,
     pub(super) invitation_join: Option<Entity<DesktopInvitationJoinState>>,
     pub(super) invitation_join_input_subscriptions: Vec<Subscription>,
-    pub(super) thread_coordinators: HashMap<String, ThreadCoordinator>,
     /// Authoritative per-thread counts from `thread/tree`; never derived from
     /// the locally loaded timeline window.
     pub(super) thread_unread: HashMap<String, u64>,
@@ -403,15 +398,12 @@ pub struct PioneerDesktop {
     pub(super) thread_list_refresh_requested: bool,
     pub(super) active_thread_id: Option<String>,
     pub(super) active_thread_resubscribe_pending: bool,
-    pub(super) draft_thread_id: Option<String>,
     pub(super) task_thread_navigation_stack: Vec<TaskThreadNavigationEntry>,
     pub(super) preferred_workspace_id: Option<String>,
     pub(super) workspaces: Vec<Workspace>,
     pub(super) workspaces_loading: bool,
     pub(super) workspaces_error: Option<String>,
     pub(super) workspace_action_in_progress: bool,
-    pub(super) last_active_thread_by_workspace: HashMap<String, String>,
-    pub(super) draft_thread_by_workspace: HashMap<String, String>,
     pub(super) composer_state: Entity<TextareaState>,
     pub(super) composer_input_subscription: Option<Subscription>,
     pub(super) composer_mention_select: Entity<ComboboxState<MemberPickerDelegate>>,
@@ -460,8 +452,6 @@ pub struct PioneerDesktop {
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,
     pub(super) main_content_view: MainContentView,
     pub(super) providers: ProviderListState,
-    pub(super) pending_requests: PendingRequestState,
-    pub(super) cli_runtime_thread_bindings: HashMap<String, CLIRuntimeThreadBinding>,
     pub(super) mcp_servers: Vec<McpListItem>,
     pub(super) mcp_selected_server_id: Option<String>,
     pub(super) mcp_server_details: Option<McpServerDetailsResponse>,
@@ -493,20 +483,15 @@ pub struct PioneerDesktop {
     pub(super) skills_details_expanded_sections: HashSet<String>,
     pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
     pub(super) composer_draft_lifecycle: ComposerDraftLifecycleState,
-    pub(super) thread_start: ThreadStartCoordinator,
-    pub(super) thread_start_requested: bool,
     pub(super) pending_thread_create_visibility: ThreadVisibility,
+    pub(super) thread_bindings: std::sync::Arc<crate::app::thread::binding::ThreadBindings>,
+    pub(super) thread_binding_task: Option<gpui_kit::Task<()>>,
     pub(super) thread_timeline_scroll_handle: VirtualListScrollHandle,
     pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
     pub(super) running_indicator_views: RefCell<RunningIndicatorViewCache>,
     pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
     pub(super) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,
-    pub(super) semantic_timelines: SemanticTimelineState,
-    pub(super) semantic_timeline_revision: u64,
-    pub(super) semantic_timeline_in_flight: HashSet<SemanticTimelineRequestKey>,
-    pub(super) semantic_timeline_pending:
-        HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
     pub(super) task_review_actions: TaskReviewActionState,
     pub(super) task_user_notifications_workspace_id: Option<String>,
     pub(super) task_user_notifications: Vec<TaskUserNotification>,
@@ -521,8 +506,6 @@ pub struct PioneerDesktop {
     pub(super) show_thread_artifacts_sidebar: bool,
     pub(super) show_thread_members_sidebar: bool,
     pub(super) thread_artifacts_sidebar_width: Pixels,
-    pub(super) ready_turn_resume_threads: VecDeque<String>,
-    pub(super) ready_turn_resume_thread_set: HashSet<String>,
     pub(super) gateway_setup_form_state: Entity<GatewaySetupFormState>,
     pub(super) gateway: GatewayCoordinator,
     pub(super) show_sidebar: bool,

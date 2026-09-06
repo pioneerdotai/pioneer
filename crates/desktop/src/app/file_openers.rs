@@ -159,7 +159,7 @@ impl PioneerDesktop {
     fn file_opener_thread_scope(&self, thread_id: &str) -> Option<FileOpenerThreadScope> {
         let workspace_id = self.thread_workspace_id(thread_id)?;
         Some(FileOpenerThreadScope {
-            workspace: self.file_opener_workspace_scope(workspace_id)?,
+            workspace: self.file_opener_workspace_scope(&workspace_id)?,
             thread_id: thread_id.to_owned(),
         })
     }

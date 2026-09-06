@@ -10,3 +10,5 @@ pub mod session;
 pub mod start;
 pub mod title;
 pub mod tree;
+
+pub mod registry;

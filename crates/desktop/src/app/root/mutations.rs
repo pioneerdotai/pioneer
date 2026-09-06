@@ -6,12 +6,21 @@ use pioneer_client::composer::draft::{
 };
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::state::reducers as client_state_reducers;
-use pioneer_client::threads::{
-    resume as thread_resume, session as thread_session, start as thread_start, tree as thread_tree,
-};
+use pioneer_client::threads::{session as thread_session, tree as thread_tree};
 use tracing::warn;
 
 impl PioneerDesktop {
+    pub(in crate::app) fn thread_semantic_mutation(
+        &self,
+        id: &str,
+    ) -> pioneer_client::threads::registry::ThreadTimelineMutation<'_> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .existing_thread_timeline_mutation(id)
+            .expect("known thread scope")
+    }
+
     pub(in crate::app) fn reconcile_composer_draft_with_capabilities(&mut self) {
         let Some(policy) = self
             .gateway
@@ -149,6 +158,11 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .activate_thread(thread_id.as_deref(), self.active_workspace_id());
+        self.thread_bindings.select(thread_id.as_deref());
         let changed = thread_session::set_active_thread_id(&mut self.active_thread_id, thread_id);
         if changed {
             self.composer_edit_target = None;
@@ -162,44 +176,24 @@ impl PioneerDesktop {
         }
     }
 
-    pub(in crate::app) fn clear_active_thread_if_matches(&mut self, thread_id: &str) -> bool {
-        let changed =
-            thread_session::clear_active_thread_if_matches(&mut self.active_thread_id, thread_id);
-        if changed {
-            self.composer_edit_target = None;
-            self.reset_composer_model_selection_for_active_thread();
-        }
-        changed
-    }
-
     pub(in crate::app) fn set_draft_thread_id(&mut self, thread_id: Option<String>) {
-        thread_session::set_draft_thread_id(&mut self.draft_thread_id, thread_id);
+        if let Some(workspace) = self.active_workspace_id() {
+            self.gateway
+                .client_runtime
+                .client_core()
+                .remember_thread_draft(workspace, thread_id);
+        }
     }
 
     pub(in crate::app) fn clear_draft_thread_if_matches(&mut self, thread_id: &str) -> bool {
-        thread_session::clear_draft_thread_if_matches(&mut self.draft_thread_id, thread_id)
-    }
-
-    pub(in crate::app) fn promote_thread_from_draft(&mut self, thread_id: &str) -> bool {
-        if !thread_session::promote_thread_from_draft(&mut self.draft_thread_id, thread_id) {
-            return false;
-        }
-
-        if self.current_active_thread_id() == Some(thread_id) {
-            // A connection-owned draft has no persisted thread projection.
-            // Materialization changes that without changing the thread id, so
-            // force a fresh server snapshot instead of retaining the draft's
-            // fail-closed empty projection.
-            self.invalidate_active_thread_capability_projection();
-        }
-        self.request_thread_start_if_needed();
-        true
+        self.gateway
+            .client_runtime
+            .client_core()
+            .promote_thread(thread_id)
     }
 
     pub(in crate::app) fn resolve_existing_draft_thread_id(&mut self) -> Option<String> {
-        thread_session::resolve_existing_draft_thread_id(&mut self.draft_thread_id, |thread_id| {
-            self.thread_coordinators.contains_key(thread_id)
-        })
+        self.draft_thread_id()
     }
 
     pub(in crate::app) fn set_preferred_workspace_id(&mut self, workspace_id: Option<String>) {
@@ -236,11 +230,10 @@ impl PioneerDesktop {
         workspace_id: &str,
         thread_id: Option<String>,
     ) {
-        thread_session::remember_thread_for_workspace(
-            &mut self.last_active_thread_by_workspace,
-            workspace_id,
-            thread_id,
-        );
+        self.gateway
+            .client_runtime
+            .client_core()
+            .remember_thread_last_active(workspace_id, thread_id);
     }
 
     pub(in crate::app) fn remember_draft_thread_for_workspace(
@@ -248,11 +241,10 @@ impl PioneerDesktop {
         workspace_id: &str,
         thread_id: Option<String>,
     ) {
-        thread_session::remember_thread_for_workspace(
-            &mut self.draft_thread_by_workspace,
-            workspace_id,
-            thread_id,
-        );
+        self.gateway
+            .client_runtime
+            .client_core()
+            .remember_thread_draft(workspace_id, thread_id);
     }
 
     pub(in crate::app) fn remember_active_thread_draft(&mut self, cx: &Context<Self>) {
@@ -370,101 +362,108 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn reset_thread_start_state(&mut self) {
-        client_state_reducers::reset_thread_start_coordinator(&mut self.thread_start);
+        client_state_reducers::reset_thread_start_coordinator(
+            &mut self
+                .gateway
+                .client_runtime
+                .client_core()
+                .thread_start_mutation(),
+        );
         self.pending_thread_create_visibility = pioneer_protocol::ThreadVisibility::Private;
     }
 
-    pub(in crate::app) fn thread_start_coordinator_mut(&mut self) -> &mut ThreadStartCoordinator {
-        &mut self.thread_start
+    pub(in crate::app) fn thread_start_coordinator_mut(
+        &self,
+    ) -> pioneer_client::threads::registry::ThreadStartMutation<'_> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_start_mutation()
     }
 
     pub(in crate::app) fn enqueue_thread_start_request(&mut self) {
-        thread_start::enqueue_thread_start_request(&mut self.thread_start_requested);
+        self.gateway
+            .client_runtime
+            .client_core()
+            .enqueue_thread_start();
     }
 
     pub(in crate::app) fn dequeue_thread_start_request(&mut self) -> bool {
-        thread_start::dequeue_thread_start_request(&mut self.thread_start_requested)
+        self.gateway
+            .client_runtime
+            .client_core()
+            .take_thread_start()
     }
 
     pub(in crate::app) fn clear_thread_start_queue(&mut self) {
-        thread_start::clear_thread_start_request(&mut self.thread_start_requested);
+        self.gateway
+            .client_runtime
+            .client_core()
+            .clear_thread_start_request();
     }
 
     pub(in crate::app) fn enqueue_turn_resume_thread(&mut self, thread_id: String) {
-        thread_resume::enqueue_turn_resume_thread(
-            &mut self.ready_turn_resume_threads,
-            &mut self.ready_turn_resume_thread_set,
-            thread_id,
-        );
+        self.gateway
+            .client_runtime
+            .client_core()
+            .enqueue_thread_resume(thread_id);
     }
 
     pub(in crate::app) fn dequeue_turn_resume_thread(&mut self) -> Option<String> {
-        thread_resume::dequeue_turn_resume_thread(
-            &mut self.ready_turn_resume_threads,
-            &mut self.ready_turn_resume_thread_set,
-        )
+        self.gateway
+            .client_runtime
+            .client_core()
+            .take_thread_resume()
     }
 
     pub(in crate::app) fn clear_turn_resume_queue(&mut self) {
-        thread_resume::clear_turn_resume_queue(
-            &mut self.ready_turn_resume_threads,
-            &mut self.ready_turn_resume_thread_set,
-        );
+        self.gateway
+            .client_runtime
+            .client_core()
+            .clear_thread_resume_queue();
     }
 
     pub(in crate::app) fn upsert_thread_coordinator(
-        &mut self,
+        &self,
         thread_id: &str,
         workspace_id: &str,
-    ) -> &mut ThreadCoordinator {
-        client_state_reducers::upsert_thread_coordinator_in(
-            &mut self.thread_coordinators,
-            thread_id,
-            workspace_id,
-        )
+    ) -> pioneer_client::threads::registry::ThreadMutation<'_> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_mutation(thread_id, workspace_id)
+            .expect("known thread scope")
     }
 
-    pub(in crate::app) fn upsert_thread_snapshot(
-        &mut self,
-        thread: Thread,
-    ) -> &mut ThreadCoordinator {
+    pub(in crate::app) fn upsert_thread_snapshot(&mut self, thread: Thread) {
         let scope_changed = self
-            .thread_coordinators
-            .get(thread.id.as_str())
-            .and_then(ThreadCoordinator::thread)
-            .is_some_and(|current| current.visibility != thread.visibility);
+            .thread_coordinator(&thread.id)
+            .is_some_and(|coordinator| {
+                coordinator
+                    .thread()
+                    .is_some_and(|current| current.visibility != thread.visibility)
+            });
         if scope_changed && self.current_active_thread_id() == Some(thread.id.as_str()) {
             self.thread_members_thread_id = None;
             self.invalidate_active_thread_capability_projection();
             self.thread_members.clear();
         }
-        client_state_reducers::upsert_thread_snapshot_in(&mut self.thread_coordinators, thread)
-    }
-
-    pub(in crate::app) fn thread_conversation_mut(
-        &mut self,
-        thread_id: &str,
-    ) -> Option<&mut Conversation> {
-        self.thread_coordinators
-            .get_mut(thread_id)
-            .map(|coordinator| &mut coordinator.conversation)
-    }
-
-    pub(in crate::app) fn upsert_thread_conversation_mut(
-        &mut self,
-        thread_id: &str,
-        workspace_id: &str,
-    ) -> &mut Conversation {
-        &mut self
-            .upsert_thread_coordinator(thread_id, workspace_id)
-            .conversation
+        self.thread_bindings
+            .track_summary(&thread.workspace_id, &thread.id);
+        self.gateway
+            .client_runtime
+            .client_core()
+            .upsert_thread(thread);
     }
 
     pub(in crate::app) fn thread_coordinator_mut(
-        &mut self,
+        &self,
         thread_id: &str,
-    ) -> Option<&mut ThreadCoordinator> {
-        self.thread_coordinators.get_mut(thread_id)
+    ) -> Option<pioneer_client::threads::registry::ThreadMutation<'_>> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .existing_thread_mutation(thread_id)
     }
 
     pub(in crate::app) fn queue_thread_list_refresh(&mut self) {
@@ -477,33 +476,27 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn remove_thread_conversation(&mut self, thread_id: &str) {
         self.thread_unread.remove(thread_id);
-        let workspace_id = self.thread_workspace_id(thread_id).map(str::to_owned);
-        client_state_reducers::remove_thread_scoped_entries(
-            thread_id,
-            &mut self.draft_thread_id,
-            &mut self.thread_coordinators,
-            &mut self.thread_placements,
-        );
+        let workspace_id = self.thread_workspace_id(thread_id);
+        self.thread_bindings.remove(thread_id);
+        self.gateway
+            .client_runtime
+            .client_core()
+            .remove_thread_store(thread_id);
+        self.gateway
+            .client_runtime
+            .client_core()
+            .promote_thread(thread_id);
+        self.thread_placements.remove(thread_id);
         self.clear_thread_draft(thread_id);
-        if pioneer_client::timeline::semantic::remove_thread_semantic_timeline(
-            &mut self.semantic_timelines,
-            thread_id,
-        ) {
-            self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
-        }
-        self.semantic_timeline_in_flight
-            .retain(|key| !semantic_request_key_matches_thread(key, thread_id));
-        self.semantic_timeline_pending
-            .retain(|key, _| !semantic_request_key_matches_thread(key, thread_id));
+
         if let Some(workspace_id) = workspace_id {
-            self.pending_requests.apply(
+            self.gateway.client_runtime.client_core().apply_pending_requests(
                 pioneer_client::cli_runtime::approvals::reduce_pending_request_thread_closed_cleanup(
                     workspace_id,
                     thread_id.to_owned(),
                 ),
             );
         }
-        self.cli_runtime_thread_bindings.remove(thread_id);
     }
 
     pub(in crate::app) fn clear_thread_conversations(&mut self) {
@@ -512,24 +505,21 @@ impl PioneerDesktop {
         self.message_revision_loading = false;
         self.message_mutation_pending = false;
         self.composer_edit_target = None;
-        client_state_reducers::clear_thread_client_state(
-            &mut self.draft_thread_id,
-            &mut self.thread_coordinators,
-            &mut self.thread_folders,
-            &mut self.thread_placements,
-            &mut self.thread_agents_doc_summaries,
-            &mut self.thread_folder_expanded,
-            &mut self.thread_tree_selected_node_id,
-        );
+        self.thread_bindings.clear();
+        self.gateway
+            .client_runtime
+            .client_core()
+            .clear_thread_stores();
+        self.thread_folders.clear();
+        self.thread_placements.clear();
+        self.thread_agents_doc_summaries.clear();
+        self.thread_folder_expanded.clear();
+        self.thread_tree_selected_node_id = None;
         self.composer_draft_lifecycle = reduce_composer_draft_lifecycle(
             &self.composer_draft_lifecycle,
             ComposerDraftLifecycleAction::ClearAll,
         )
         .state;
-        self.semantic_timelines = Default::default();
-        self.semantic_timeline_revision = self.semantic_timeline_revision.saturating_add(1);
-        self.semantic_timeline_in_flight.clear();
-        self.semantic_timeline_pending.clear();
         let mut composer_defaults = self.composer_domain_state();
         composer_defaults.attachments.clear();
         composer_defaults.capabilities.clear();
@@ -554,8 +544,6 @@ impl PioneerDesktop {
         self.composer_upload_error = None;
         self.composer_model_display_cache.clear();
         self.composer_model_display_loading_key = None;
-        self.pending_requests = Default::default();
-        self.cli_runtime_thread_bindings.clear();
     }
 
     pub(in crate::app) fn clear_workspace_capability_projections(&mut self) {
@@ -614,11 +602,11 @@ impl PioneerDesktop {
         self.workspaces_error = None;
         self.set_active_thread_id(None);
         self.clear_thread_conversations();
-        self.last_active_thread_by_workspace.clear();
-        self.draft_thread_by_workspace.clear();
         self.task_thread_navigation_stack.clear();
-        self.ready_turn_resume_threads.clear();
-        self.ready_turn_resume_thread_set.clear();
+        self.gateway
+            .client_runtime
+            .client_core()
+            .clear_thread_resume_queue();
         self.thread_artifacts = Default::default();
         self.show_thread_artifacts_sidebar = false;
         self.show_thread_members_sidebar = false;
@@ -636,21 +624,6 @@ impl PioneerDesktop {
         self.task_review_actions = Default::default();
         self.gateway.settings = None;
         self.clear_workspace_capability_projections();
-    }
-
-    pub(in crate::app) fn set_cli_runtime_thread_binding(
-        &mut self,
-        thread_id: String,
-        binding: Option<CLIRuntimeThreadBinding>,
-    ) {
-        match binding {
-            Some(binding) => {
-                self.cli_runtime_thread_bindings.insert(thread_id, binding);
-            }
-            None => {
-                self.cli_runtime_thread_bindings.remove(thread_id.as_str());
-            }
-        }
     }
 
     pub(in crate::app) fn set_thread_tree_snapshot(
@@ -718,42 +691,10 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn tick_thread_conversations(&mut self) -> bool {
-        self.thread_coordinators
-            .values_mut()
-            .fold(false, |changed, coordinator| {
-                coordinator.conversation.tick() || changed
-            })
-    }
-}
-
-fn semantic_request_key_matches_thread(key: &SemanticTimelineRequestKey, thread_id: &str) -> bool {
-    match key {
-        SemanticTimelineRequestKey::ThreadNewest {
-            thread_id: request_thread_id,
-        }
-        | SemanticTimelineRequestKey::ThreadBefore {
-            thread_id: request_thread_id,
-            ..
-        }
-        | SemanticTimelineRequestKey::ThreadAfter {
-            thread_id: request_thread_id,
-            ..
-        }
-        | SemanticTimelineRequestKey::TurnWorkInitial {
-            thread_id: request_thread_id,
-            ..
-        }
-        | SemanticTimelineRequestKey::TurnWorkBefore {
-            thread_id: request_thread_id,
-            ..
-        }
-        | SemanticTimelineRequestKey::TurnWorkAfter {
-            thread_id: request_thread_id,
-            ..
-        }
-        | SemanticTimelineRequestKey::TurnWorkItems {
-            thread_id: request_thread_id,
-            ..
-        } => request_thread_id == thread_id,
+        self.gateway
+            .client_runtime
+            .client_core()
+            .tick_thread_conversations();
+        false
     }
 }

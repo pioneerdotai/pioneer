@@ -135,7 +135,10 @@ impl PioneerDesktop {
         let tree_state = self.thread_tree_state().clone();
         let desktop_update_panel = self.render_desktop_update_sidebar_panel(cx);
         let is_new_thread_active = self.main_content_view == MainContentView::Threads
-            && match (self.current_active_thread_id(), self.draft_thread_id()) {
+            && match (
+                self.current_active_thread_id(),
+                self.draft_thread_id().as_deref(),
+            ) {
                 (Some(active_thread_id), Some(draft_thread_id)) => {
                     active_thread_id == draft_thread_id
                 }
@@ -857,8 +860,8 @@ impl PioneerDesktop {
                     crate::qualification_diagnostics::spinner!(
                         pioneer_observability::AnimationSourceId::DesktopUpdateDownload,
                     )
-                        .icon(IconName::Loader)
-                        .color(cx.theme().foreground.opacity(0.6)),
+                    .icon(IconName::Loader)
+                    .color(cx.theme().foreground.opacity(0.6)),
                 ),
             )
             .child(
@@ -881,7 +884,7 @@ impl PioneerDesktop {
             .into_iter()
             .map(|thread_id| {
                 let coordinator = self.thread_coordinator(thread_id.as_str());
-                let title = sidebar_thread_title_from_coordinator(coordinator);
+                let title = sidebar_thread_title_from_coordinator(coordinator.as_deref());
 
                 let unread_count = self
                     .thread_unread

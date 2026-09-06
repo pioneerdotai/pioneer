@@ -1,0 +1,218 @@
+{
+    "initial": [
+        {
+            "payload": {
+                "cli_binding": null,
+                "execution_revision": 1,
+                "history_loaded": false,
+                "history_loading": false,
+                "pending_requests": [],
+                "placement": null,
+                "projection": {
+                    "composer_locked": false,
+                    "in_flight_turn_id": null,
+                    "items": [],
+                    "last_error": null,
+                    "pending_request_id": null,
+                    "permission_audit": [],
+                    "phase_label": "idle",
+                    "revision": 0,
+                    "timeline": [],
+                    "turns": []
+                },
+                "semantic": {
+                    "threads_by_id": {}
+                },
+                "subscription_failed": false,
+                "thread": {
+                    "created_at": 1,
+                    "id": "a",
+                    "mode": "Chat",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai",
+                    "origin_kind": "user",
+                    "preview": "",
+                    "sidebar_visibility": "visible",
+                    "status": "Idle",
+                    "turns": [],
+                    "updated_at": 2,
+                    "workspace_id": "ws"
+                },
+                "workspace_id": "ws"
+            },
+            "revisions": {
+                "content": 1,
+                "domain": 1,
+                "presentation": 1,
+                "scoped": 1
+            },
+            "schema_version": 1,
+            "scope": {
+                "kind": "thread",
+                "thread_id": "a"
+            },
+            "sequence": 1
+        },
+        {
+            "payload": {
+                "cli_binding": null,
+                "execution_revision": 1,
+                "history_loaded": false,
+                "history_loading": false,
+                "pending_requests": [],
+                "placement": null,
+                "projection": {
+                    "composer_locked": false,
+                    "in_flight_turn_id": null,
+                    "items": [],
+                    "last_error": null,
+                    "pending_request_id": null,
+                    "permission_audit": [],
+                    "phase_label": "idle",
+                    "revision": 0,
+                    "timeline": [],
+                    "turns": []
+                },
+                "semantic": {
+                    "threads_by_id": {}
+                },
+                "subscription_failed": false,
+                "thread": {
+                    "created_at": 1,
+                    "id": "b",
+                    "mode": "Chat",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai",
+                    "origin_kind": "user",
+                    "preview": "",
+                    "sidebar_visibility": "visible",
+                    "status": "Idle",
+                    "turns": [],
+                    "updated_at": 2,
+                    "workspace_id": "ws"
+                },
+                "workspace_id": "ws"
+            },
+            "revisions": {
+                "content": 1,
+                "domain": 1,
+                "presentation": 1,
+                "scoped": 1
+            },
+            "schema_version": 1,
+            "scope": {
+                "kind": "thread",
+                "thread_id": "b"
+            },
+            "sequence": 2
+        }
+    ],
+    "updated": [
+        {
+            "payload": {
+                "cli_binding": null,
+                "execution_revision": 1,
+                "history_loaded": false,
+                "history_loading": false,
+                "pending_requests": [],
+                "placement": null,
+                "projection": {
+                    "composer_locked": false,
+                    "in_flight_turn_id": null,
+                    "items": [],
+                    "last_error": null,
+                    "pending_request_id": null,
+                    "permission_audit": [],
+                    "phase_label": "idle",
+                    "revision": 0,
+                    "timeline": [],
+                    "turns": []
+                },
+                "semantic": {
+                    "threads_by_id": {}
+                },
+                "subscription_failed": false,
+                "thread": {
+                    "created_at": 1,
+                    "id": "a",
+                    "mode": "Chat",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai",
+                    "origin_kind": "user",
+                    "preview": "",
+                    "sidebar_visibility": "visible",
+                    "status": "Idle",
+                    "turns": [],
+                    "updated_at": 2,
+                    "workspace_id": "ws"
+                },
+                "workspace_id": "ws"
+            },
+            "revisions": {
+                "content": 1,
+                "domain": 1,
+                "presentation": 1,
+                "scoped": 1
+            },
+            "schema_version": 1,
+            "scope": {
+                "kind": "thread",
+                "thread_id": "a"
+            },
+            "sequence": 1
+        },
+        {
+            "payload": {
+                "cli_binding": null,
+                "execution_revision": 1,
+                "history_loaded": false,
+                "history_loading": false,
+                "pending_requests": [],
+                "placement": null,
+                "projection": {
+                    "composer_locked": false,
+                    "in_flight_turn_id": null,
+                    "items": [],
+                    "last_error": null,
+                    "pending_request_id": null,
+                    "permission_audit": [],
+                    "phase_label": "idle",
+                    "revision": 0,
+                    "timeline": [],
+                    "turns": []
+                },
+                "semantic": {
+                    "threads_by_id": {}
+                },
+                "subscription_failed": false,
+                "thread": {
+                    "created_at": 1,
+                    "id": "b",
+                    "mode": "Chat",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai",
+                    "origin_kind": "user",
+                    "preview": "new preview",
+                    "sidebar_visibility": "visible",
+                    "status": "Idle",
+                    "turns": [],
+                    "updated_at": 2,
+                    "workspace_id": "ws"
+                },
+                "workspace_id": "ws"
+            },
+            "revisions": {
+                "content": 1,
+                "domain": 2,
+                "presentation": 1,
+                "scoped": 2
+            },
+            "schema_version": 1,
+            "scope": {
+                "kind": "thread",
+                "thread_id": "b"
+            },
+            "sequence": 3
+        }
+    ]
+}

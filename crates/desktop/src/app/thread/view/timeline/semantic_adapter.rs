@@ -25,11 +25,20 @@ impl PioneerDesktop {
         let Some(active_thread_id) = active_thread_id else {
             return TimelineRenderModel::empty();
         };
+        let Some(domain) = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .thread_snapshot(active_thread_id)
+        else {
+            return TimelineRenderModel::empty();
+        };
+        let timeline_revision = domain.timeline_revision();
         let cache_lookup_started = Instant::now();
         {
             let state = self.thread_timeline_view_state.borrow();
             if state.cached_semantic_model_active_thread_id.as_deref() == Some(active_thread_id)
-                && state.cached_semantic_model_revision == self.semantic_timeline_revision
+                && state.cached_semantic_model_revision == timeline_revision
                 && let Some(model) = state.cached_semantic_model.as_ref()
             {
                 pioneer_observability::record_desktop_timeline_stage(
@@ -57,7 +66,7 @@ impl PioneerDesktop {
             pioneer_observability::DiagnosticAction::Executed,
         ));
         let Some(flattened) =
-            semantic::flatten_semantic_timeline(&self.semantic_timelines, active_thread_id)
+            semantic::flatten_semantic_timeline(&domain.semantic(), active_thread_id)
         else {
             pioneer_observability::record_desktop_timeline_stage(
                 pioneer_observability::DesktopTimelineStageMetric {
@@ -76,7 +85,7 @@ impl PioneerDesktop {
         let semantic_rows = Rc::new(flattened);
 
         let mut projection = ConversationViewState::default();
-        self.merge_turn_metadata_for_timeline(active_thread_id, &mut projection);
+        Self::merge_turn_metadata_for_timeline(&domain.coordinator(), &mut projection);
         let render_model = render_semantic_timeline_rows(semantic_rows.rows.as_slice(), projection);
         pioneer_observability::record_qualification_diagnostic!(record_presentation(
             pioneer_observability::PresentationOwner::DesktopShell,
@@ -87,7 +96,7 @@ impl PioneerDesktop {
         ));
 
         let mut projection = render_model.projection;
-        projection.revision = self.semantic_timeline_revision;
+        projection.revision = timeline_revision;
         let rows = render_model
             .rows
             .into_iter()
@@ -116,7 +125,7 @@ impl PioneerDesktop {
         {
             let mut state = self.thread_timeline_view_state.borrow_mut();
             state.cached_semantic_model_active_thread_id = Some(active_thread_id.to_owned());
-            state.cached_semantic_model_revision = self.semantic_timeline_revision;
+            state.cached_semantic_model_revision = timeline_revision;
             state.cached_semantic_model = Some(model.clone());
         }
 
@@ -137,14 +146,9 @@ impl PioneerDesktop {
     }
 
     fn merge_turn_metadata_for_timeline(
-        &self,
-        thread_id: &str,
+        coordinator: &pioneer_client::threads::coordinator::ThreadCoordinator,
         projection: &mut ConversationViewState,
     ) {
-        let Some(coordinator) = self.thread_coordinator(thread_id) else {
-            return;
-        };
-
         projection
             .turns
             .extend(coordinator.conversation.projection().turns.iter().cloned());

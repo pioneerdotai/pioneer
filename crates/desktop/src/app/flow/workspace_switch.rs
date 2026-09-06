@@ -404,7 +404,7 @@ impl PioneerDesktop {
         let remembered = remember_workspace_thread_state(
             workspace_id,
             self.current_active_thread_id(),
-            self.draft_thread_id(),
+            self.draft_thread_id().as_deref(),
             self.thread_start_coordinator().pending_thread_id.as_deref(),
             |thread_id, workspace_id| self.thread_workspace_matches(thread_id, workspace_id),
         );
@@ -416,8 +416,9 @@ impl PioneerDesktop {
     fn restore_workspace_thread_state(&mut self, workspace_id: &str) {
         let restored = restore_workspace_thread_state(
             workspace_id,
-            self.last_active_thread_for_workspace(workspace_id),
-            self.draft_thread_for_workspace(workspace_id),
+            self.last_active_thread_for_workspace(workspace_id)
+                .as_deref(),
+            self.draft_thread_for_workspace(workspace_id).as_deref(),
             |thread_id, workspace_id| self.thread_workspace_matches(thread_id, workspace_id),
         );
 

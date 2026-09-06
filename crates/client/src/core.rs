@@ -122,21 +122,50 @@ impl ClientRevisions {
 pub enum ClientScope {
     Session,
     Navigation,
-    WorkspaceTree { workspace_id: Option<String> },
-    Task { task_id: Option<String> },
-    Thread { thread_id: String },
-    Timeline { thread_id: String },
-    Composer { thread_id: String },
-    PendingRequest { thread_id: Option<String> },
-    Artifact { thread_id: String },
-    Avatar { principal_id: String },
+    SidebarSummary {
+        workspace_id: String,
+        thread_id: String,
+    },
+    WorkspaceTree {
+        workspace_id: Option<String>,
+    },
+    Task {
+        task_id: Option<String>,
+    },
+    Thread {
+        thread_id: String,
+    },
+    Timeline {
+        thread_id: String,
+    },
+    Composer {
+        thread_id: String,
+    },
+    PendingRequest {
+        workspace_id: Option<String>,
+        thread_id: Option<String>,
+    },
+    Artifact {
+        thread_id: String,
+    },
+    Avatar {
+        principal_id: String,
+    },
     Provider,
-    Administration { workspace_id: Option<String> },
-    Mcp { workspace_id: Option<String> },
-    Skills { workspace_id: Option<String> },
+    Administration {
+        workspace_id: Option<String>,
+    },
+    Mcp {
+        workspace_id: Option<String>,
+    },
+    Skills {
+        workspace_id: Option<String>,
+    },
     Settings,
     OnboardingInvitation,
-    AgentsDocument { workspace_id: String },
+    AgentsDocument {
+        workspace_id: String,
+    },
     DesktopUpdate,
 }
 
@@ -550,11 +579,15 @@ impl ClientSubscription {
 
 impl Drop for ClientSubscription {
     fn drop(&mut self) {
+        self.queue
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(core) = self.core.upgrade() {
             core.subscribers
                 .lock()
                 .expect("client subscriber registry poisoned")
                 .remove(&self.id);
+            core.thread_subscription_changed(&self.queue.scope, false);
         }
         self.queue
             .events
@@ -609,6 +642,10 @@ pub struct ClientPublicationBatch {
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
     compatibility_runtime: ClientRuntime,
+    pub(crate) thread_request_sender:
+        Mutex<Option<std::sync::mpsc::Sender<crate::threads::registry::ThreadControllerRequest>>>,
+    thread_request_task: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(crate) thread_registry: Mutex<crate::threads::registry::ThreadRegistry>,
     pub(crate) identity_authorization:
         Mutex<crate::gateway::identity_authorization::IdentityAuthorizationStore>,
     pub(crate) session_refresh_slots: Mutex<HashMap<String, Weak<Mutex<bool>>>>,
@@ -630,6 +667,13 @@ pub struct ClientCore {
 impl Drop for ClientCore {
     fn drop(&mut self) {
         self.shutdown();
+        if let Ok(task) = self.thread_request_task.get_mut() {
+            if let Some(task) = task.take() {
+                if task.thread().id() != std::thread::current().id() {
+                    let _ = task.join();
+                }
+            }
+        }
         if let Ok(task) = self.gateway_task.get_mut() {
             if let Some(task) = task.take() {
                 if task.thread().id() != std::thread::current().id() {
@@ -691,6 +735,9 @@ impl ClientCore {
     pub fn new() -> Self {
         Self {
             compatibility_runtime: ClientRuntime::new(),
+            thread_registry: Mutex::default(),
+            thread_request_sender: Mutex::default(),
+            thread_request_task: Mutex::default(),
             identity_authorization: Mutex::default(),
             session_refresh_slots: Mutex::default(),
             session_transport: Mutex::default(),
@@ -948,6 +995,14 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.thread_request_sender
+            .lock()
+            .expect("thread request sender poisoned")
+            .take();
+        *self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned") = Default::default();
         self.publication_ready.notify_all();
         {
             let mut partitions = self.partitions.lock().expect("client partitions poisoned");
@@ -1009,28 +1064,111 @@ impl ClientCore {
         let route = GatewayEventRoute::classify(event);
         match route {
             GatewayEventRoute::Connection => {
+                if !matches!(
+                    event,
+                    crate::transport::ws::GatewayWsEvent::Connected { .. }
+                ) {
+                    self.cancel_thread_requests();
+                }
                 self.observe_gateway_transport(event);
                 self.observe_gateway_authorization(event);
             }
             GatewayEventRoute::Session => self.observe_gateway_transport(event),
             GatewayEventRoute::Authorization => self.observe_gateway_authorization(event),
             GatewayEventRoute::Settings => self.observe_gateway_settings(event),
+            GatewayEventRoute::Thread | GatewayEventRoute::PendingRequest => {
+                if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } =
+                    event
+                {
+                    if self.apply_thread_notification(notification.clone()) {
+                        return None;
+                    }
+                }
+                return Some(route);
+            }
             GatewayEventRoute::Administration
             | GatewayEventRoute::Workspace
             | GatewayEventRoute::Memory
             | GatewayEventRoute::Provider
-            | GatewayEventRoute::PendingRequest
             | GatewayEventRoute::Mcp
             | GatewayEventRoute::Skills
             | GatewayEventRoute::TaskNotification
-            | GatewayEventRoute::Unknown
-            | GatewayEventRoute::Thread => return Some(route),
+            | GatewayEventRoute::Unknown => return Some(route),
         }
         None
     }
 
     pub fn shared() -> Arc<Self> {
         let core = Arc::new(Self::new());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *core
+            .thread_request_sender
+            .lock()
+            .expect("thread request sender poisoned") = Some(sender);
+        let weak_requests = Arc::downgrade(&core);
+        *core
+            .thread_request_task
+            .lock()
+            .expect("thread request task poisoned") = Some(
+            std::thread::Builder::new()
+                .name("client-thread-requests".into())
+                .spawn(move || {
+                    loop {
+                        let Some(core) = weak_requests.upgrade() else {
+                            break;
+                        };
+                        if core.is_stopped() {
+                            break;
+                        }
+                        let delay = core.next_thread_resume_delay();
+                        drop(core);
+                        let request = match delay {
+                            Some(delay) => match receiver.recv_timeout(delay) {
+                                Ok(r) => Some(r),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(_) => break,
+                            },
+                            None => match receiver.recv() {
+                                Ok(r) => Some(r),
+                                Err(_) => break,
+                            },
+                        };
+                        let Some(core) = weak_requests.upgrade() else {
+                            break;
+                        };
+                        if core.is_stopped() {
+                            break;
+                        }
+                        match request {
+                            Some(crate::threads::registry::ThreadControllerRequest::Semantic(
+                                request,
+                            )) => core.execute_thread_semantic_request(
+                                &core.compatibility_runtime.ws_command_sender(),
+                                request,
+                            ),
+                            Some(
+                                crate::threads::registry::ThreadControllerRequest::Subscribe {
+                                    id,
+                                    workspace,
+                                    generation,
+                                },
+                            ) => core.execute_thread_connection_request(
+                                &id, &workspace, generation, false,
+                            ),
+                            Some(crate::threads::registry::ThreadControllerRequest::Binding {
+                                id,
+                                workspace,
+                                generation,
+                            }) => core.execute_thread_connection_request(
+                                &id, &workspace, generation, true,
+                            ),
+                            _ => {}
+                        }
+                        core.drive_due_thread_resumes();
+                    }
+                })
+                .expect("Client thread request task could not start"),
+        );
         let runtime = core.compatibility_runtime.clone();
         let delivery = core.gateway_delivery.clone();
         let weak = Arc::downgrade(&core);
@@ -1089,6 +1227,7 @@ impl ClientCore {
         scope: ClientScope,
         capacity: NonZeroUsize,
     ) -> ClientSubscription {
+        self.thread_subscription_changed(&scope, true);
         let partitions = self.partitions.lock().expect("client partitions poisoned");
         let latest_sequence = partitions
             .publications
@@ -1152,6 +1291,12 @@ impl ClientCore {
     }
 
     pub fn dispatch(&self, intent: ClientIntent) -> ClientTransition {
+        let ClientIntent::SetScopeDemand {
+            scope: thread_scope,
+            demand: thread_demand,
+            ..
+        } = &intent;
+        let (thread_scope, thread_demand) = (thread_scope.clone(), *thread_demand);
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         partitions.transition_sequence.advance();
         if self.is_stopped() {
@@ -1181,7 +1326,12 @@ impl ClientCore {
                 }
             },
         };
-        Self::transition_without_publication(&partitions, outcome)
+        let transition = Self::transition_without_publication(&partitions, outcome);
+        drop(partitions);
+        if outcome == ClientTransitionOutcome::Changed {
+            self.thread_demand_changed(&thread_scope, thread_demand);
+        }
+        transition
     }
 
     pub(crate) fn request_platform_effect(

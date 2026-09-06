@@ -28,16 +28,16 @@ impl PioneerDesktop {
             None
         } else {
             self.current_active_thread_id()
-                .filter(|thread_id| self.draft_thread_id() != Some(*thread_id))
+                .filter(|thread_id| self.draft_thread_id().as_deref() != Some(*thread_id))
                 .and_then(|thread_id| {
                     self.thread_coordinator(thread_id)
-                        .and_then(|coordinator| coordinator.thread())
+                        .and_then(|coordinator| coordinator.thread().cloned())
                         .map(|_| thread_id.to_owned())
                 })
         };
         let file_opener_thread_id = self
             .current_active_thread_id()
-            .filter(|thread_id| self.draft_thread_id() != Some(*thread_id))
+            .filter(|thread_id| self.draft_thread_id().as_deref() != Some(*thread_id))
             .map(str::to_owned);
         h_flex()
             .justify_between()
@@ -165,7 +165,7 @@ impl PioneerDesktop {
         };
         let Some(thread) = self
             .thread_coordinator(thread_id.as_str())
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
         else {
             return div().into_any_element();
         };
@@ -271,7 +271,7 @@ impl PioneerDesktop {
             return t!("sidebar.thread.untitled").to_string();
         };
 
-        if self.draft_thread_id() == Some(active_thread_id) {
+        if self.draft_thread_id().as_deref() == Some(active_thread_id) {
             return t!("sidebar.thread.untitled").to_string();
         }
 

@@ -64,7 +64,7 @@ impl PioneerDesktop {
         let Some(thread_id) = self.current_active_thread_id() else {
             return false;
         };
-        if self.draft_thread_id() == Some(thread_id) {
+        if self.draft_thread_id().as_deref() == Some(thread_id) {
             return self
                 .gateway
                 .capability_snapshot
@@ -80,7 +80,7 @@ impl PioneerDesktop {
         let Some(thread_id) = self.current_active_thread_id() else {
             return false;
         };
-        if self.draft_thread_id() == Some(thread_id) {
+        if self.draft_thread_id().as_deref() == Some(thread_id) {
             return self
                 .gateway
                 .capability_snapshot
@@ -124,7 +124,7 @@ impl PioneerDesktop {
         thread_id: &str,
     ) -> pioneer_client::artifacts::presentation::ArtifactPresentationPolicy {
         let connected = self.gateway.connection_state == GatewayConnectionState::Connected;
-        if self.draft_thread_id() == Some(thread_id) {
+        if self.draft_thread_id().as_deref() == Some(thread_id) {
             let workspace = self
                 .gateway
                 .capability_snapshot
@@ -197,8 +197,13 @@ impl PioneerDesktop {
         self.active_thread_id.as_deref()
     }
 
-    pub(in crate::app) fn draft_thread_id(&self) -> Option<&str> {
-        self.draft_thread_id.as_deref()
+    pub(in crate::app) fn draft_thread_id(&self) -> Option<String> {
+        self.active_workspace_id().and_then(|workspace| {
+            self.gateway
+                .client_runtime
+                .client_core()
+                .thread_workspace_draft(workspace)
+        })
     }
 
     pub(in crate::app) fn active_task_thread_navigation(
@@ -253,42 +258,66 @@ impl PioneerDesktop {
     pub(in crate::app) fn last_active_thread_for_workspace(
         &self,
         workspace_id: &str,
-    ) -> Option<&str> {
-        thread_tree::remembered_thread_for_workspace(
-            &self.last_active_thread_by_workspace,
-            workspace_id,
-        )
+    ) -> Option<String> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_workspace_last_active(workspace_id)
+    }
+    pub(in crate::app) fn draft_thread_for_workspace(&self, workspace_id: &str) -> Option<String> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_workspace_draft(workspace_id)
     }
 
-    pub(in crate::app) fn draft_thread_for_workspace(&self, workspace_id: &str) -> Option<&str> {
-        thread_tree::remembered_thread_for_workspace(&self.draft_thread_by_workspace, workspace_id)
+    pub(in crate::app) fn thread_start_coordinator(&self) -> ThreadStartCoordinator {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_start_snapshot()
     }
 
-    pub(in crate::app) fn thread_start_coordinator(&self) -> &ThreadStartCoordinator {
-        &self.thread_start
+    pub(in crate::app) fn thread_coordinator(
+        &self,
+        thread_id: &str,
+    ) -> Option<std::sync::Arc<ThreadCoordinator>> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_coordinator_snapshot(thread_id)
     }
 
-    pub(in crate::app) fn thread_coordinator(&self, thread_id: &str) -> Option<&ThreadCoordinator> {
-        client_selectors::thread_coordinator_from(&self.thread_coordinators, thread_id)
+    pub(in crate::app) fn thread_coordinator_snapshots(
+        &self,
+    ) -> HashMap<String, ThreadCoordinator> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_coordinator_snapshots()
     }
 
-    pub(in crate::app) fn thread_workspace_id(&self, thread_id: &str) -> Option<&str> {
-        client_selectors::thread_workspace_id_from(&self.thread_coordinators, thread_id).or_else(
-            || {
+    pub(in crate::app) fn thread_workspace_id(&self, thread_id: &str) -> Option<String> {
+        self.thread_coordinator(thread_id)
+            .map(|coordinator| coordinator.workspace_id.clone())
+            .or_else(|| {
                 self.task_thread_navigation_stack
                     .iter()
                     .rev()
                     .find(|entry| entry.child_thread_id == thread_id)
-                    .map(|entry| entry.workspace_id.as_str())
-            },
-        )
+                    .map(|entry| entry.workspace_id.clone())
+            })
     }
 
     pub(in crate::app) fn cli_runtime_binding_for_thread(
         &self,
         thread_id: &str,
-    ) -> Option<&CLIRuntimeThreadBinding> {
-        self.cli_runtime_thread_bindings.get(thread_id)
+    ) -> Option<CLIRuntimeThreadBinding> {
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_snapshot(thread_id)
+            .and_then(|s| s.cli_binding().cloned())
     }
 
     pub(in crate::app) fn composer_selected_provider_is_cli_runtime(&self) -> bool {
@@ -319,7 +348,7 @@ impl PioneerDesktop {
         client_selectors::model_selector_workspace_id_from(
             self.active_workspace_id(),
             self.current_active_thread_id(),
-            &self.thread_coordinators,
+            &self.thread_coordinator_snapshots(),
         )
     }
 
@@ -370,8 +399,8 @@ impl PioneerDesktop {
         workspace_id: &str,
     ) -> Vec<String> {
         let mut thread_ids = thread_tree::sorted_thread_ids_from_coordinators(
-            &self.thread_coordinators,
-            self.draft_thread_id(),
+            &self.thread_coordinator_snapshots(),
+            self.draft_thread_id().as_deref(),
             Some(workspace_id),
         );
         thread_ids.retain(|thread_id| {
@@ -384,11 +413,17 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn has_known_threads_for_workspace(&self, workspace_id: &str) -> bool {
-        client_selectors::has_known_threads_for_workspace(&self.thread_coordinators, workspace_id)
+        client_selectors::has_known_threads_for_workspace(
+            &self.thread_coordinator_snapshots(),
+            workspace_id,
+        )
     }
 
     pub(in crate::app) fn is_thread_timeline_loading(&self, thread_id: &str) -> bool {
-        self.semantic_timelines
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_semantic_snapshot(thread_id)
             .thread(thread_id)
             .is_some_and(|thread| {
                 matches!(
@@ -398,39 +433,61 @@ impl PioneerDesktop {
             })
     }
 
-    pub(in crate::app) fn active_thread_conversation(&self) -> Option<&Conversation> {
-        client_selectors::active_thread_conversation(
-            self.current_active_thread_id(),
-            &self.thread_coordinators,
-        )
+    pub(in crate::app) fn active_thread_conversation(
+        &self,
+    ) -> Option<pioneer_client::threads::registry::ConversationSnapshot> {
+        self.current_active_thread_id()
+            .and_then(|id| {
+                self.gateway
+                    .client_runtime
+                    .client_core()
+                    .thread_snapshot(id)
+            })
+            .map(|snapshot| snapshot.conversation())
     }
 
     pub(in crate::app) fn active_thread_pending_requests(&self) -> Vec<PendingRequest> {
-        self.pending_requests
-            .pending_for_scope(self.active_workspace_id(), self.current_active_thread_id())
+        self.gateway
+            .client_runtime
+            .client_core()
+            .pending_requests_for_scope(self.active_workspace_id(), self.current_active_thread_id())
     }
 
     pub(in crate::app) fn has_any_in_flight_turn(&self) -> bool {
-        client_selectors::has_any_in_flight_turn_in(&self.thread_coordinators)
+        client_selectors::has_any_in_flight_turn_in(&self.thread_coordinator_snapshots())
     }
 
     pub(in crate::app) fn in_flight_turn_id_for_thread(&self, thread_id: &str) -> Option<String> {
-        client_selectors::in_flight_turn_id_for_thread_in(&self.thread_coordinators, thread_id)
+        client_selectors::in_flight_turn_id_for_thread_in(
+            &self.thread_coordinator_snapshots(),
+            thread_id,
+        )
     }
 
     pub(in crate::app) fn client_snapshot(&self) -> ClientSnapshot {
         ClientSnapshot::from_parts(ClientSnapshotInput {
             active_thread_id: self.current_active_thread_id(),
-            draft_thread_id: self.draft_thread_id(),
+            draft_thread_id: self.draft_thread_id().as_deref(),
             preferred_workspace_id: self.preferred_workspace_id(),
             workspaces: self.workspaces(),
             workspaces_loading: self.workspaces_loading(),
             workspaces_error: self.workspaces_error(),
             workspace_action_in_progress: self.workspace_action_in_progress(),
             thread_list_loading: self.thread_list_loading,
-            thread_start_in_progress: self.thread_start.in_progress,
-            pending_thread_id: self.thread_start.pending_thread_id.as_deref(),
-            coordinators: &self.thread_coordinators,
+            thread_start_in_progress: self
+                .gateway
+                .client_runtime
+                .client_core()
+                .thread_start_snapshot()
+                .in_progress,
+            pending_thread_id: self
+                .gateway
+                .client_runtime
+                .client_core()
+                .thread_start_snapshot()
+                .pending_thread_id
+                .as_deref(),
+            coordinators: &self.thread_coordinator_snapshots(),
             gateway_connected: self.gateway.connection_state == GatewayConnectionState::Connected,
         })
     }
