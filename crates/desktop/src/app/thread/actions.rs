@@ -330,7 +330,7 @@ impl PioneerDesktop {
         };
         let composer_execution_mode = self
             .thread_coordinator(thread_id.as_str())
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
             .map(|thread| thread.origin_kind.composer_execution_mode())
             .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
 
@@ -359,7 +359,6 @@ impl PioneerDesktop {
         let pending_request_id = turn_start_ids.pending_request_id;
         let workspace_id = self
             .thread_workspace_id(thread_id.as_str())
-            .map(str::to_owned)
             .unwrap_or_else(|| self.default_thread_start_scope());
         let endpoint_kind = self
             .gateway
@@ -530,52 +529,16 @@ impl PioneerDesktop {
                             },
                         );
 
-                        if let Some(coordinator) = view.thread_coordinator_mut(thread_id.as_str()) {
-                            if let Some(thread) = coordinator.thread_mut() {
-                                turn_start::apply_prepared_turn_to_thread_snapshot(
-                                    thread,
-                                    selected_mode,
-                                    reduction.thread_snapshot_update.selected_model.as_deref(),
-                                    reduction
-                                        .thread_snapshot_update
-                                        .selected_provider
-                                        .as_deref(),
-                                    reduction
-                                        .thread_snapshot_update
-                                        .selected_reasoning_effort
-                                        .as_deref(),
-                                    reduction.thread_snapshot_update.user_text.as_str(),
-                                    reduction.thread_snapshot_update.updated_at_unix,
-                                );
-                            }
-                        }
-
-                        let promoted_from_draft = view.promote_thread_from_draft(
-                            reduction.promote_thread_from_draft_id.as_str(),
-                        );
+                        let core = view.gateway.client_runtime.client_core().clone();
+                        let promoted_from_draft = core.thread_workspace_draft(&workspace_id).as_deref() == Some(thread_id.as_str());
+                        core.commit_prepared_thread_turn(&thread_id,&workspace_id,selected_mode,&reduction.thread_snapshot_update,reduction.local_turn_start_requested_event.clone(),reduction.composer_execution_mode);
                         if promoted_from_draft {
+                            view.invalidate_active_thread_capability_projection();
                             view.rebuild_sidebar_tree_state(cx);
-                            let _ = view.drive_thread_start_queue(cx);
+                            view.request_thread_start_if_needed();
                         }
 
-                        let Some(conversation) = view.thread_conversation_mut(thread_id.as_str())
-                        else {
-                            view.composer_upload_in_progress = false;
-                            cx.notify();
-                            return;
-                        };
-                        conversation.apply(reduction.local_turn_start_requested_event.clone());
-                        if pioneer_client::timeline::semantic::apply_local_composer_event_to_semantic_timeline(
-                            &mut view.semantic_timelines,
-                            workspace_id.as_str(),
-                            &reduction.local_turn_start_requested_event,
-                            reduction.composer_execution_mode,
-                            pioneer_client::timeline::labels::now_unix_ms(),
-                        ) {
-                            view.semantic_timeline_revision =
-                                view.semantic_timeline_revision.saturating_add(1);
-                        }
-
+                        let operation=core.thread_operation_token(&thread_id);
                         let ws_sender = turn_start_sender.clone();
                         let turn_start_params_plan = reduction.turn_start_params_plan;
                         let send_context = reduction.send_context;
@@ -589,6 +552,7 @@ impl PioneerDesktop {
                             let send_context_for_update = send_context.clone();
                             let workspace_id_for_preflight = workspace_id_for_update.clone();
                             async move {
+                                let Some(operation)=operation else {return;};
                                 let result = cx
                                     .background_spawn(async move {
                                         ws_sender.thread_start(thread_start::thread_start_params(
@@ -603,26 +567,18 @@ impl PioneerDesktop {
                                     })
                                     .await;
 
+                                let reduction = match result {
+                                    Ok(response) => turn_start::reduce_turn_start_send_success(send_context_for_update,response),
+                                    Err(_) => turn_start::reduce_turn_start_send_failure(send_context_for_update,t!("chat.composer.send_failed").to_string()),
+                                };
+                                let accepted = matches!(reduction,turn_start::TurnStartSendReduction::Accepted {..});
+                                if !core.apply_thread_start_send_result(operation,reduction) {return;}
                                 let _ = this.update_in(&mut cx, |view, window, cx| {
+                                    if view.current_active_thread_id()!=Some(thread_id_for_update.as_str()) {
+                                        if accepted {view.clear_thread_draft(clear_thread_draft_id.as_str());}
+                                        return;
+                                    }
                                     view.composer_upload_in_progress = false;
-                                    let reduction = match result {
-                                        Ok(response) => turn_start::reduce_turn_start_send_success(
-                                            send_context_for_update,
-                                            response,
-                                        ),
-                                        Err(_error) => turn_start::reduce_turn_start_send_failure(
-                                            send_context_for_update,
-                                            t!("chat.composer.send_failed").to_string(),
-                                        ),
-                                    };
-                                    let (events, accepted) = match reduction {
-                                        turn_start::TurnStartSendReduction::Accepted { events } => {
-                                            (events, true)
-                                        }
-                                        turn_start::TurnStartSendReduction::Rejected { event } => {
-                                            (vec![event], false)
-                                        }
-                                    };
                                     if accepted {
                                         if clear_composer_on_accept
                                             && view.current_active_thread_id()
@@ -645,30 +601,6 @@ impl PioneerDesktop {
                                             t!("chat.composer.send_failed").to_string(),
                                         );
                                     }
-                                    {
-                                        let Some(conversation) = view
-                                            .thread_conversation_mut(thread_id_for_update.as_str())
-                                        else {
-                                            cx.notify();
-                                            return;
-                                        };
-                                        for event in &events {
-                                            conversation.apply(event.clone());
-                                        }
-                                    }
-                                    for event in &events {
-                                        if pioneer_client::timeline::semantic::apply_conversation_event_to_semantic_timeline(
-                                            &mut view.semantic_timelines,
-                                            workspace_id_for_update.as_str(),
-                                            event,
-                                            pioneer_client::timeline::labels::now_unix_ms(),
-                                        ) {
-                                            view.semantic_timeline_revision = view
-                                                .semantic_timeline_revision
-                                                .saturating_add(1);
-                                        }
-                                    }
-
                                     cx.notify();
                                 });
                             }
@@ -693,62 +625,30 @@ impl PioneerDesktop {
         let Some(thread_id) = self.active_thread_id.clone() else {
             return;
         };
-        let Some(turn_id) = self.in_flight_turn_id_for_thread(thread_id.as_str()) else {
-            return;
-        };
-
-        let Some(conversation) = self.thread_conversation_mut(thread_id.as_str()) else {
-            return;
-        };
-        let Some(cancel_request) = turn_cancel::plan_turn_cancel_request(
-            thread_id.clone(),
-            turn_id.clone(),
-            conversation.is_cancelling_turn(),
+        let core = self.gateway.client_runtime.client_core().clone();
+        let Some((turn_id, params)) = core.request_thread_cancel(
+            &thread_id,
             Some(t!("chat.composer.stop_reason").to_string()),
         ) else {
             return;
         };
-
-        let turn_cancel::TurnCancelRequest {
-            requested_event,
-            params,
-        } = cancel_request;
-        conversation.apply(requested_event);
-
         let ws_sender = self.gateway.client_runtime.ws_command_sender().clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-
-            async move {
-                let result = cx
-                    .background_spawn(async move { ws_sender.turn_cancel(params) })
-                    .await;
-
-                let _ = this.update(&mut cx, |view, cx| {
-                    match result {
-                        Ok(response) => {
-                            if let Some(event) = turn_cancel::turn_cancel_response_event(response)
-                                && let Some(conversation) =
-                                    view.thread_conversation_mut(thread_id.as_str())
-                            {
-                                conversation.apply(event);
-                            }
-                        }
-                        Err(error) => {
-                            if let Some(conversation) =
-                                view.thread_conversation_mut(thread_id.as_str())
-                            {
-                                conversation.apply(turn_cancel::local_turn_cancel_rejected_event(
-                                    thread_id.clone(),
-                                    turn_id.clone(),
-                                    format!("{error:#}"),
-                                ));
-                            }
+        cx.background_spawn(async move {
+            match ws_sender.turn_cancel(params) {
+                Ok(response) => {
+                    if let Some(event) = turn_cancel::turn_cancel_response_event(response) {
+                        if let Some(snapshot) = core.thread_coordinator_snapshot(&thread_id) {
+                            core.apply_thread_conversation_event(
+                                &snapshot.workspace_id,
+                                event,
+                                None,
+                            );
                         }
                     }
-
-                    cx.notify();
-                });
+                }
+                Err(error) => {
+                    core.reject_thread_cancel(&thread_id, &turn_id, &format!("{error:#}"))
+                }
             }
         })
         .detach();

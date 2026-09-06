@@ -13,21 +13,22 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app::flow) fn thread_resume_state_mut(
-        &mut self,
+        &self,
         thread_id: &str,
-    ) -> Option<&mut crate::app::root::ThreadResumeCoordinator> {
+    ) -> Option<pioneer_client::threads::registry::ResumeMutation<'_>> {
         self.thread_coordinator_mut(thread_id)
-            .map(|coordinator| &mut coordinator.resume)
+            .map(|mutation| mutation.resume_mutation())
     }
 
     pub(in crate::app::flow) fn reset_thread_resume_state(&mut self, thread_id: &str) {
-        if let Some(resume) = self.thread_resume_state_mut(thread_id) {
-            thread_resume::reset_thread_resume_coordinator(resume);
+        if let Some(mut resume) = self.thread_resume_state_mut(thread_id) {
+            thread_resume::reset_thread_resume_coordinator(&mut resume);
         }
     }
 
     pub(in crate::app::flow) fn enqueue_in_flight_turns_for_resume(&mut self) {
-        let thread_ids = thread_resume::thread_ids_with_in_flight_turns(&self.thread_coordinators);
+        let thread_ids =
+            thread_resume::thread_ids_with_in_flight_turns(&self.thread_coordinator_snapshots());
 
         for thread_id in thread_ids {
             self.enqueue_turn_resume_thread(thread_id);
@@ -60,7 +61,7 @@ impl PioneerDesktop {
                 }
                 TurnResumeQueueItemPlan::Resume => {
                     self.resume_in_flight_turn(thread_id, connection_id, cx);
-                    return true;
+                    return false;
                 }
             }
         }

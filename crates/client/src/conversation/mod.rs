@@ -34,6 +34,20 @@ pub struct Conversation {
     item_handlers: TurnItemHandlerRegistry,
 }
 
+impl Conversation {
+    pub(crate) fn snapshot_copy(&self) -> Self {
+        Self {
+            thread_id: self.thread_id.clone(),
+            next_sequence: self.next_sequence,
+            event_log: self.event_log.clone(),
+            pending_completion_turn_id: self.pending_completion_turn_id.clone(),
+            projector: self.projector.clone(),
+            state_machine: self.state_machine.clone(),
+            item_handlers: TurnItemHandlerRegistry::default(),
+        }
+    }
+}
+
 pub const MAX_EVENT_LOG_LEN: usize = 2_000;
 
 #[cfg(test)]

@@ -10,6 +10,50 @@ use pioneer_protocol::GatewayNotification;
 
 impl PioneerDesktop {
     pub(crate) fn start_gateway_ws_event_pump(&mut self, cx: &mut Context<Self>) {
+        let threads = self.thread_bindings.clone();
+        let mut thread_changes = threads.watch();
+        self.thread_binding_task = Some(cx.spawn(async move |view, cx| {
+            while thread_changes.changed().await.is_ok() {
+                let _ = *thread_changes.borrow_and_update();
+                let changes = threads.drain();
+                if changes.is_empty() { continue; }
+                if view.update(cx, |view, cx| {
+                    let mut visible_changed = false;
+                    let mut summary_changed = false;
+                    for change in changes {
+                        match change.scope() {
+                            pioneer_client::core::ClientScope::Thread {thread_id} => visible_changed |= view.current_active_thread_id() == Some(thread_id.as_str()),
+                            pioneer_client::core::ClientScope::SidebarSummary {workspace_id, ..} => {
+                                summary_changed |= view.active_workspace_id() == Some(workspace_id.as_str());
+                                if let Some(summary) = change.typed::<pioneer_client::threads::registry::SidebarSummaryChanged>() {
+                                    if let Some(placement) = &summary.payload().placement { view.thread_placements.insert(placement.thread_id.clone(),placement.clone()); }
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+
+                    if summary_changed { view.rebuild_sidebar_tree_state(cx); }
+                    if visible_changed {
+                        if view.current_active_thread_id().is_some_and(|id|view.gateway.client_runtime.client_core().thread_snapshot(id).is_none()) {view.set_active_thread_id(None);}
+                        if view.active_thread_resubscribe_pending {
+                            let domain=view.current_active_thread_id().and_then(|id|view.gateway.client_runtime.client_core().thread_snapshot(id));
+                            if let Some(domain)=domain {if !domain.coordinator().history_loading {
+                                view.active_thread_resubscribe_pending=false;
+                                if domain.subscription_failed() {view.startup.fail(pioneer_observability::DesktopStartupStage::ActiveThreadSubscribe);} else {
+                                    view.startup.succeed(pioneer_observability::DesktopStartupStage::ActiveThreadSubscribe);
+                                    view.reconcile_semantic_timeline_after_reconnect(cx);view.refresh_desktop_voice_status(cx);
+                                }
+                            }}
+                        }
+                        view.sync_composer_model_selection_for_active_thread();
+                        view.request_thread_start_if_needed();
+                        view.ensure_active_thread_capabilities_loaded(false, cx);
+                        cx.notify();
+                    }
+                }).is_err() { break; }
+            }
+        }));
         let client_runtime = self.gateway.client_runtime.clone();
         let session = self.gateway.session_binding.clone();
         let mut session_publications = session.watch();

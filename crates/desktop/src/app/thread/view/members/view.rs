@@ -39,7 +39,7 @@ impl PioneerDesktop {
         let is_private = self
             .current_active_thread_id()
             .and_then(|thread_id| self.thread_coordinator(thread_id))
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
             .is_some_and(|thread| thread.visibility == Some(ThreadVisibility::Private));
         let active_thread_id = self.current_active_thread_id();
         let capabilities =

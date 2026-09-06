@@ -431,6 +431,7 @@ impl ClientCore {
             .authorization_change_sequence
             .checked_add(1)
             .expect("access change sequence exhausted");
+        self.apply_thread_access_change(change);
         owner.access_change = Some(change.clone());
         owner.policy_change = None;
         self.publish_identity_authorization(&owner.publication(), changed);
@@ -466,6 +467,7 @@ impl ClientCore {
             .authorization_change_sequence
             .checked_add(1)
             .expect("authorization change sequence exhausted");
+        self.invalidate_threads_for_policy(change);
         owner.policy_change = Some(change.clone());
         owner.access_change = None;
         self.publish_identity_authorization(&owner.publication(), changed);

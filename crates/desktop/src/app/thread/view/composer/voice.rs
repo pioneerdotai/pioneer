@@ -318,7 +318,6 @@ impl PioneerDesktop {
         };
         let workspace_id = self
             .thread_workspace_id(thread_id.as_str())
-            .map(str::to_owned)
             .unwrap_or_else(|| self.default_thread_start_scope());
         let selected_mode = self.composer_turn_mode;
         let selected_permission_mode = self.composer_permission_mode;
@@ -467,7 +466,7 @@ impl PioneerDesktop {
                     }
 
                     if view.current_active_thread_id() != Some(thread_id.as_str())
-                        || view.thread_workspace_id(thread_id.as_str())
+                        || view.thread_workspace_id(thread_id.as_str()).as_deref()
                             != Some(workspace_id.as_str())
                     {
                         view.desktop_voice_composer = DesktopVoiceComposerState::Idle;

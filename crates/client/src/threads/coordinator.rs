@@ -12,12 +12,24 @@ pub struct ThreadCoordinator {
     thread_state: ThreadState,
 }
 
+#[derive(Clone)]
 enum ThreadState {
     Pending,
     Ready(Thread),
 }
 
 impl ThreadCoordinator {
+    pub(crate) fn snapshot_copy(&self) -> Self {
+        Self {
+            workspace_id: self.workspace_id.clone(),
+            conversation: self.conversation.snapshot_copy(),
+            resume: self.resume.clone(),
+            history_loaded: self.history_loaded,
+            history_loading: self.history_loading,
+            thread_state: self.thread_state.clone(),
+        }
+    }
+
     pub fn new(thread: Thread) -> Self {
         let workspace_id = thread.workspace_id.clone();
         let mut conversation = Conversation::new(thread.id.clone());

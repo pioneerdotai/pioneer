@@ -43,8 +43,10 @@ impl PioneerDesktop {
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.active_thread_resubscribe_pending = false;
             self.workspace_members_loading.clear();
-            self.semantic_timeline_in_flight.clear();
-            self.semantic_timeline_pending.clear();
+            self.gateway
+                .client_runtime
+                .client_core()
+                .cancel_thread_requests();
             self.desktop_voice_status = pioneer_protocol::VoiceStatus::Unavailable;
             self.desktop_voice_status_error = None;
             self.voice_input_action_error = None;

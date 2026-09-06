@@ -17,7 +17,7 @@ impl PioneerDesktop {
         }
 
         let retry_plan = thread_start::apply_thread_start_retry(
-            self.thread_start_coordinator_mut(),
+            &mut self.thread_start_coordinator_mut(),
             thread_id,
             std::time::Instant::now(),
         );
@@ -37,13 +37,11 @@ impl PioneerDesktop {
 
             async move {
                 cx.background_executor().timer(delay).await;
-                pioneer_observability::record_qualification_diagnostic!(
-                    record_animation_activity(
-                        pioneer_observability::AnimationSourceId::ThreadStartRetryClock,
-                        pioneer_observability::DiagnosticAction::Woke,
-                        pioneer_observability::Visibility::NotApplicable,
-                    )
-                );
+                pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                    pioneer_observability::AnimationSourceId::ThreadStartRetryClock,
+                    pioneer_observability::DiagnosticAction::Woke,
+                    pioneer_observability::Visibility::NotApplicable,
+                ));
 
                 #[cfg(not(feature = "qualification-diagnostics"))]
                 {
@@ -57,7 +55,7 @@ impl PioneerDesktop {
                         let start = app.thread_start_coordinator();
 
                         if !thread_start::should_fire_scheduled_thread_start_retry(
-                            start,
+                            &start,
                             expected_attempt,
                             thread_id_for_timer.as_str(),
                         ) {
@@ -83,7 +81,7 @@ impl PioneerDesktop {
                         let start = app.thread_start_coordinator();
 
                         if !thread_start::should_fire_scheduled_thread_start_retry(
-                            start,
+                            &start,
                             expected_attempt,
                             thread_id_for_timer.as_str(),
                         ) {
@@ -144,7 +142,7 @@ impl PioneerDesktop {
 
         let scope = self.default_thread_start_scope();
         let Some(start_plan) = thread_start::begin_thread_start_attempt(
-            self.thread_start_coordinator_mut(),
+            &mut self.thread_start_coordinator_mut(),
             thread_start::generate_thread_start_id(),
             scope,
         ) else {
@@ -199,7 +197,7 @@ impl PioneerDesktop {
                         return;
                     }
 
-                    thread_start::finish_thread_start_attempt(app.thread_start_coordinator_mut());
+                    thread_start::finish_thread_start_attempt(&mut app.thread_start_coordinator_mut());
 
                     match result {
                         Ok((workspace_id, response)) => {

@@ -8,7 +8,7 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> Vec<ClientEffect> {
         let plan = client_state_reducers::plan_gateway_switch_cleanup(
-            &self.thread_coordinators,
+            &self.thread_coordinator_snapshots(),
             self.current_active_thread_id(),
         );
         self.gateway.capability_snapshot = None;

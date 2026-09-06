@@ -4,11 +4,9 @@ use pioneer_client::{
     transport::ws::{command_sender as ws_commands, worker},
 };
 use pioneer_protocol::{
-    ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
-    TurnMessageEditResponse, TurnMessageErrorReason, TurnMessageRevisionsPageParams,
-    TurnMessageRevisionsPageResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse,
+    ThreadReadParams, ThreadReadResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
+    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageErrorReason,
+    TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
 };
 
 pub const TIMELINE_ERROR_CANCELLED: &str = "pioneer_timeline_cancelled";
@@ -21,27 +19,6 @@ pub const TURN_MESSAGE_ERROR_IMMUTABLE: &str = "pioneer_turn_message_immutable";
 pub const TURN_MESSAGE_ERROR_DELETED: &str = "pioneer_turn_message_deleted";
 pub const TURN_MESSAGE_ERROR_REVISION_CONFLICT: &str = "pioneer_turn_message_revision_conflict";
 pub const THREAD_READ_ERROR: &str = "pioneer_thread_read_error";
-
-pub fn thread_timeline_page(
-    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
-    params: ThreadTimelinePageParams,
-) -> Result<ThreadTimelinePageResponse, ClientFfiError> {
-    ws_commands::thread_timeline_page(transport, params).map_err(map_timeline_page_error)
-}
-
-pub fn turn_work_page(
-    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
-    params: TurnWorkPageParams,
-) -> Result<TurnWorkPageResponse, ClientFfiError> {
-    ws_commands::turn_work_page(transport, params).map_err(map_timeline_page_error)
-}
-
-pub fn turn_work_items_get(
-    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
-    params: TurnWorkItemsGetParams,
-) -> Result<TurnWorkItemsGetResponse, ClientFfiError> {
-    ws_commands::turn_work_items_get(transport, params).map_err(map_timeline_page_error)
-}
 
 pub fn turn_message_edit(
     transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
@@ -84,7 +61,7 @@ fn map_turn_message_error(error: anyhow::Error) -> ClientFfiError {
     ClientFfiError::new(format!("{error:#}"), code)
 }
 
-fn map_timeline_page_error(error: anyhow::Error) -> ClientFfiError {
+pub(crate) fn map_timeline_page_error(error: anyhow::Error) -> ClientFfiError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
 

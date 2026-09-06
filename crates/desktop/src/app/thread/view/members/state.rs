@@ -57,7 +57,7 @@ impl PioneerDesktop {
         };
         let Some(workspace_id) = self
             .thread_coordinator(thread_id.as_str())
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
             .map(|thread| thread.workspace_id.clone())
         else {
             return;
@@ -77,7 +77,7 @@ impl PioneerDesktop {
         else {
             return;
         };
-        let is_runtime_draft = self.draft_thread_id() == Some(thread_id.as_str());
+        let is_runtime_draft = self.draft_thread_id().as_deref() == Some(thread_id.as_str());
 
         self.startup
             .begin(pioneer_observability::DesktopStartupStage::ThreadCapabilitiesLoad);
@@ -313,7 +313,7 @@ impl PioneerDesktop {
         };
         let Some(thread) = self
             .thread_coordinator(thread_id.as_str())
-            .and_then(|coordinator| coordinator.thread())
+            .and_then(|coordinator| coordinator.thread().cloned())
         else {
             return;
         };

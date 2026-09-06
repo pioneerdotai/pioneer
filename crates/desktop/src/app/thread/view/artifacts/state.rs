@@ -58,8 +58,7 @@ impl PioneerDesktop {
             force,
             self.gateway.connection_state == GatewayConnectionState::Connected,
             self.gateway.ws_connection_id,
-            self.thread_workspace_id(thread_id.as_str())
-                .map(str::to_owned),
+            self.thread_workspace_id(thread_id.as_str()),
             self.is_thread_materialized_for_artifacts(thread_id.as_str()),
         );
         let request = match plan {
@@ -425,7 +424,7 @@ impl PioneerDesktop {
     }
 
     fn is_thread_materialized_for_artifacts(&self, thread_id: &str) -> bool {
-        self.draft_thread_id() != Some(thread_id)
+        self.draft_thread_id().as_deref() != Some(thread_id)
             && self
                 .thread_coordinator(thread_id)
                 .is_some_and(|coordinator| coordinator.thread().is_some())

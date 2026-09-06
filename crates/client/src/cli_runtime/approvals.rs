@@ -116,6 +116,10 @@ pub enum PendingRequestsReduction {
     Resolved {
         request_id: String,
     },
+    ResolvedInWorkspace {
+        workspace_id: String,
+        request_id: String,
+    },
     TerminalTurn {
         workspace_id: String,
         thread_id: String,
@@ -490,11 +494,15 @@ fn turn_permission_resolution_from_pending_resolution(
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PendingRequestState {
+pub struct PendingRequestRegistry {
     requests: Vec<PendingRequest>,
+    by_id: std::collections::HashMap<String, usize>,
 }
 
-impl PendingRequestState {
+/// Compatibility name for pure request reductions; runtime ownership belongs to ClientCore.
+pub type PendingRequestState = PendingRequestRegistry;
+
+impl PendingRequestRegistry {
     pub fn requests(&self) -> &[PendingRequest] {
         self.requests.as_slice()
     }
@@ -539,27 +547,29 @@ impl PendingRequestState {
     }
 
     pub fn request(&self, request_id: &str) -> Option<&PendingRequest> {
-        self.requests
-            .iter()
-            .find(|request| request.request_id == request_id)
+        self.by_id
+            .get(request_id)
+            .map(|index| &self.requests[*index])
     }
 
     pub fn apply<R>(&mut self, reduction: R) -> bool
     where
         R: Into<PendingRequestsReduction>,
     {
-        match reduction.into() {
+        let changed = match reduction.into() {
             PendingRequestsReduction::Opened(request) => {
-                if let Some(existing) = self
-                    .requests
-                    .iter_mut()
-                    .find(|existing| existing.request_id == request.request_id)
-                {
+                if let Some(index) = self.by_id.get(&request.request_id).copied() {
+                    let existing = &mut self.requests[index];
+                    if existing.workspace_id != request.workspace_id {
+                        return false;
+                    }
                     let changed = existing != &request;
                     *existing = request;
                     return changed;
                 }
 
+                self.by_id
+                    .insert(request.request_id.clone(), self.requests.len());
                 self.requests.push(request);
                 true
             }
@@ -568,6 +578,12 @@ impl PendingRequestState {
                     request.request_id == request_id
                 })
             }
+            PendingRequestsReduction::ResolvedInWorkspace {
+                workspace_id,
+                request_id,
+            } => remove_matching(&mut self.requests, |request| {
+                request.workspace_id == workspace_id && request.request_id == request_id
+            }),
             PendingRequestsReduction::TerminalTurn {
                 workspace_id,
                 thread_id,
@@ -597,7 +613,16 @@ impl PendingRequestState {
                     true
                 }
             }
+        };
+        if changed {
+            self.by_id = self
+                .requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| (request.request_id.clone(), index))
+                .collect();
         }
+        changed
     }
 }
 
@@ -1023,7 +1048,8 @@ pub fn reduce_cli_runtime_request_opened_notification(
 pub fn reduce_cli_runtime_request_resolved_notification(
     notification: CLIRuntimeRequestResolvedNotification,
 ) -> PendingRequestsReduction {
-    PendingRequestsReduction::Resolved {
+    PendingRequestsReduction::ResolvedInWorkspace {
+        workspace_id: notification.workspace_id,
         request_id: notification.request_id,
     }
 }
@@ -1039,7 +1065,8 @@ pub fn reduce_native_permission_request_opened_notification(
 pub fn reduce_native_permission_request_resolved_notification(
     notification: TurnPermissionRequestResolvedNotification,
 ) -> PendingRequestsReduction {
-    PendingRequestsReduction::Resolved {
+    PendingRequestsReduction::ResolvedInWorkspace {
+        workspace_id: notification.workspace_id,
         request_id: notification.request_id,
     }
 }
