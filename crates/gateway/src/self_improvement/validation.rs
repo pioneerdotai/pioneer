@@ -77,6 +77,7 @@ pub(crate) struct AuthorizedAgentSkillTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GroundedEvidenceCitation {
+    pub event_created_at_unix: i64,
     pub observation_key: String,
     pub turn_id: String,
     pub event_id: String,
@@ -122,6 +123,7 @@ pub(crate) struct CandidateGroundingError {
 
 #[derive(Debug)]
 pub(crate) struct IndexedHistoryEvidence {
+    pub event_created_at_unix: i64,
     pub source_turn_id: String,
     pub evidence_role: HistoryEvidenceRole,
     pub visible_text: String,
@@ -425,6 +427,7 @@ fn materialize_evidence_reference(
         .and_then(|index| index.get(&(reference.turn_id.clone(), reference.event_id.clone())))
         .ok_or_else(|| grounding_error("candidate_evidence_not_in_frozen_range"))?;
     if index.evidence_role != reference.evidence_role
+        || index.event_created_at_unix != reference.event_created_at_unix
         || reference.normalized_start >= reference.normalized_end
         || reference.normalized_end > index.visible_text.len()
         || !index
@@ -448,6 +451,7 @@ fn materialize_evidence_reference(
     }
     Ok(MaterializedEvidence {
         citation: GroundedEvidenceCitation {
+            event_created_at_unix: index.event_created_at_unix,
             observation_key: observation_key.to_owned(),
             turn_id: reference.turn_id.clone(),
             event_id: reference.event_id.clone(),
@@ -498,11 +502,13 @@ pub(crate) fn build_history_evidence_index(
                 };
                 let key = (block.event_turn_id.clone(), block.event_id.clone());
                 let entry = index.entry(key).or_insert_with(|| IndexedHistoryEvidence {
+                    event_created_at_unix: block.event_created_at_unix,
                     source_turn_id: turn.turn_id.clone(),
                     evidence_role: block.evidence_role,
                     visible_text: String::new(),
                 });
                 if entry.source_turn_id != turn.turn_id
+                    || entry.event_created_at_unix != block.event_created_at_unix
                     || entry.evidence_role != block.evidence_role
                 {
                     return Err(grounding_error("history_evidence_identity_changed"));

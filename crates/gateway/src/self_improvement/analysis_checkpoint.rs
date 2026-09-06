@@ -10,7 +10,7 @@ use super::learner::{
     ValidatedChunkDigest, validate_digest_against_processed_chunks, validate_persistable_digest,
 };
 
-const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 const CURSOR_MAX_BYTES: usize = 64 * 1024;
 const DIGEST_MAX_BYTES: usize = 1024 * 1024;
 const CHUNK_TERMINAL_VALIDATED: u8 = 0;
@@ -437,7 +437,7 @@ mod tests {
 
     fn chunk(index: u32, count: u32, text: &str) -> SelfImprovementHistoryChunk {
         let mut chunk = SelfImprovementHistoryChunk {
-            schema_version: 2,
+            schema_version: 3,
             workspace_id: "workspace".to_owned(),
             source_lower_exclusive: 0,
             source_upper_inclusive: 1,
@@ -448,6 +448,7 @@ mod tests {
                 turns: vec![SelfImprovementHistoryTurn {
                     turn_id: format!("turn-{index}"),
                     blocks: vec![SelfImprovementHistoryBlock {
+                        event_created_at_unix: 2,
                         block_key: format!("event-{index}:fragment"),
                         event_id: format!("event-{index}"),
                         event_thread_id: "thread".to_owned(),
@@ -522,6 +523,7 @@ mod tests {
                         observation_key: "stable-key".to_owned(),
                         summary: "Bounded procedural summary".to_owned(),
                         evidence: vec![ValidatedObservationEvidence {
+                            event_created_at_unix: 2,
                             chunk_fingerprint: chunks[0].fingerprint.clone(),
                             turn_id: "turn-0".to_owned(),
                             event_id: "event-0".to_owned(),

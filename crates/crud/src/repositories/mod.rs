@@ -34,6 +34,7 @@ pub(crate) mod read_model_repair;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
 pub(crate) mod self_improvement_finalization;
+pub(crate) mod self_improvement_history;
 pub(crate) mod self_improvement_run;
 pub(crate) mod self_improvement_source_turn;
 pub(crate) mod self_improvement_workspace_state;

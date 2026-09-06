@@ -970,6 +970,7 @@ mod tests {
         .await
         .unwrap();
         agent_skill::ActiveModel {
+            evidence_latest_at_unix: Set(None),
             id: Set(SKILL_ID.to_owned()),
             workspace_id: Set(WORKSPACE_ID.to_owned()),
             slug: Set("learned".to_owned()),
@@ -981,6 +982,7 @@ mod tests {
         .await
         .unwrap();
         agent_skill_version::ActiveModel {
+            evidence_latest_at_unix: Set(None),
             id: Set(VERSION_ID.to_owned()),
             skill_id: Set(SKILL_ID.to_owned()),
             version_number: Set(1),

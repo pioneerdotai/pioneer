@@ -143,6 +143,7 @@ struct ChunkAnalysisOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ValidatedObservationEvidence {
+    pub event_created_at_unix: i64,
     pub chunk_fingerprint: String,
     pub turn_id: String,
     pub event_id: String,
@@ -170,6 +171,7 @@ pub(crate) struct ValidatedChunkDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ActiveSkillModelInput {
+    pub evidence_latest_at_unix: Option<i64>,
     pub skill_id: String,
     pub version_id: String,
     pub rollback_parent_version_id: Option<String>,
@@ -183,6 +185,7 @@ pub(crate) struct ActiveSkillModelInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExactSkillVersionModelInput {
+    pub evidence_latest_at_unix: Option<i64>,
     pub target_role: &'static str,
     pub skill_id: String,
     pub version_id: String,
@@ -316,6 +319,7 @@ fn exact_review_targets(candidate: &ValidatedSkillCandidate) -> Vec<ExactSkillVe
         snapshot: &pioneer_crud::AgentSkillVersionSnapshotRecord,
     ) -> ExactSkillVersionModelInput {
         ExactSkillVersionModelInput {
+            evidence_latest_at_unix: snapshot.version.evidence_latest_at_unix,
             target_role,
             skill_id: snapshot.skill_id.to_string(),
             version_id: snapshot.version.id.clone(),
@@ -349,6 +353,67 @@ fn candidate_evidence(candidate: &ValidatedSkillCandidate) -> &[GroundedEvidence
         | ValidatedSkillCandidate::Update { evidence, .. }
         | ValidatedSkillCandidate::Rollback { evidence, .. } => evidence.cited_evidence.as_slice(),
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TemporalLearningContext {
+    pub recent_task_started_at_unix: Option<i64>,
+    pub active_skills: Vec<ActiveSkillModelInput>,
+}
+
+/// Each observation needs its own recent support. One unrelated fresh citation
+/// must not refresh all the other, older observations selected by synthesis.
+fn evidence_time(
+    evidence: &[GroundedEvidenceCitation],
+) -> Option<pioneer_crud::AgentSkillEvidenceTime> {
+    let mut observations = std::collections::HashMap::<&str, i64>::new();
+    for citation in evidence {
+        observations
+            .entry(&citation.observation_key)
+            .and_modify(|date| *date = (*date).max(citation.event_created_at_unix))
+            .or_insert(citation.event_created_at_unix);
+    }
+    Some(pioneer_crud::AgentSkillEvidenceTime {
+        confirmed_at_unix: observations.values().copied().min()?,
+        latest_at_unix: observations.values().copied().max()?,
+    })
+}
+
+fn validate_temporal_candidate(
+    candidate: &ValidatedSkillCandidate,
+    context: &TemporalLearningContext,
+) -> Result<(), &'static str> {
+    let evidence = match candidate {
+        ValidatedSkillCandidate::Create { evidence, .. }
+        | ValidatedSkillCandidate::Update { evidence, .. }
+        | ValidatedSkillCandidate::Rollback { evidence, .. } => evidence,
+    };
+    if evidence.observation_keys.iter().any(|key| {
+        !evidence
+            .cited_evidence
+            .iter()
+            .any(|citation| &citation.observation_key == key)
+    }) {
+        return Err("observation_without_dated_evidence");
+    }
+    let time = evidence_time(candidate_evidence(candidate)).ok_or("evidence_date_unknown")?;
+    let mut reference = context.recent_task_started_at_unix;
+    match candidate {
+        ValidatedSkillCandidate::Create { .. } => {}
+        ValidatedSkillCandidate::Update { target, .. }
+        | ValidatedSkillCandidate::Rollback { target, .. } => {
+            let target_date = target
+                .active
+                .lifecycle_evidence_latest_at_unix
+                .ok_or("target_evidence_date_unknown")?;
+            reference = Some(reference.map_or(target_date, |date| date.max(target_date)));
+        }
+    }
+    if reference.is_some_and(|date| time.confirmed_at_unix < date) {
+        return Err("historical_observation_without_recent_support");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +476,7 @@ pub(crate) fn reviewed_skill_final_outcome(
     let outcome = match candidate {
         ValidatedSkillCandidate::Create { artifact, evidence } => {
             SelfImprovementFinalOutcome::AcceptedCreate(AcceptedAgentSkillCreate {
+                evidence_time: evidence_time(&evidence.cited_evidence),
                 skill_id: prospective_skill_id,
                 version_id: prospective_version_id,
                 slug: artifact.slug,
@@ -429,6 +495,7 @@ pub(crate) fn reviewed_skill_final_outcome(
             target,
             evidence,
         } => SelfImprovementFinalOutcome::AcceptedUpdate(AcceptedAgentSkillUpdate {
+            evidence_time: evidence_time(&evidence.cited_evidence),
             skill_id: target.active.skill_id,
             expected_active_version_id: target.active.version.id,
             version_id: prospective_version_id,
@@ -449,6 +516,7 @@ pub(crate) fn reviewed_skill_final_outcome(
             rollback_version,
             evidence,
         } => SelfImprovementFinalOutcome::AcceptedRollback(AcceptedAgentSkillRollback {
+            evidence_time: evidence_time(&evidence.cited_evidence),
             skill_id: target.active.skill_id,
             expected_active_version_id: target.active.version.id,
             target_parent_version_id: rollback_version.version.id,
@@ -655,6 +723,7 @@ pub(crate) struct ModelCallResult<T> {
 }
 
 pub(crate) struct LearnerReviewerClient<'a> {
+    temporal_context: Option<&'a TemporalLearningContext>,
     registry: &'a ProviderRegistry,
     workspace_id: &'a str,
     default_model: &'a GatewaySelfImprovementModelSelectionConfig,
@@ -670,10 +739,16 @@ impl<'a> LearnerReviewerClient<'a> {
     ) -> Self {
         Self {
             registry,
+            temporal_context: None,
             workspace_id,
             default_model,
             reviewer_model,
         }
+    }
+
+    pub(crate) fn with_temporal_context(mut self, context: &'a TemporalLearningContext) -> Self {
+        self.temporal_context = Some(context);
+        self
     }
 
     pub(crate) async fn analyze_chunk(
@@ -787,6 +862,7 @@ impl<'a> LearnerReviewerClient<'a> {
             exact_new_anchor_turn_ids,
             active_skills,
             max_skill_markdown_bytes,
+            self.temporal_context,
         )
         .map_err(|_| {
             ModelContractError::new(
@@ -883,6 +959,7 @@ impl<'a> LearnerReviewerClient<'a> {
             cited_evidence,
             exact_target_versions,
             validation_diagnostics,
+            self.temporal_context,
         )
         .map_err(|_| {
             ModelContractError::new(
@@ -954,6 +1031,15 @@ impl<'a> LearnerReviewerClient<'a> {
         candidate: ValidatedSkillCandidate,
         max_skill_markdown_bytes: usize,
     ) -> Result<ModelCallResult<ReviewedSkillCandidate>, ModelContractError> {
+        if let Some(context) = self.temporal_context {
+            validate_temporal_candidate(&candidate, context).map_err(|reason| {
+                ModelContractError::new(
+                    ModelContractStage::Review,
+                    ModelContractErrorKind::HostValidationRejected,
+                    reason,
+                )
+            })?;
+        }
         let model_input = review_model_input(&candidate);
         let exact_targets = exact_review_targets(&candidate);
         let response = self
@@ -1168,6 +1254,7 @@ fn validate_chunk_analysis(
                 .ok_or_else(chunk_contract_rejected)?;
             let normalized_end = normalized_start.saturating_add(excerpt.len());
             evidence.push(ValidatedObservationEvidence {
+                event_created_at_unix: indexed.event_created_at_unix,
                 chunk_fingerprint: history.fingerprint.clone(),
                 turn_id: citation.turn_id,
                 event_id: citation.event_id,
@@ -1304,6 +1391,7 @@ pub(crate) fn validate_digest_against_processed_chunks(
                 return Err(chunk_contract_rejected());
             };
             if indexed.evidence_role != evidence.evidence_role
+                || indexed.event_created_at_unix != evidence.event_created_at_unix
                 || evidence.normalized_end > indexed.visible_text.len()
                 || !indexed
                     .visible_text
@@ -1481,7 +1569,7 @@ mod tests {
 
     fn history(roles: [HistoryEvidenceRole; 2], first_text: &str) -> SelfImprovementHistoryChunk {
         let mut history = SelfImprovementHistoryChunk {
-            schema_version: 2,
+            schema_version: 3,
             workspace_id: "workspace-one".to_owned(),
             source_lower_exclusive: 0,
             source_upper_inclusive: 2,
@@ -1493,6 +1581,7 @@ mod tests {
                     SelfImprovementHistoryTurn {
                         turn_id: "turn-one".to_owned(),
                         blocks: vec![SelfImprovementHistoryBlock {
+                            event_created_at_unix: 2,
                             block_key: "event-one:0".to_owned(),
                             event_id: "event-one".to_owned(),
                             event_thread_id: "thread-one".to_owned(),
@@ -1510,6 +1599,7 @@ mod tests {
                     SelfImprovementHistoryTurn {
                         turn_id: "turn-two".to_owned(),
                         blocks: vec![SelfImprovementHistoryBlock {
+                            event_created_at_unix: 2,
                             block_key: "event-two:0".to_owned(),
                             event_id: "event-two".to_owned(),
                             event_thread_id: "thread-one".to_owned(),
@@ -1622,6 +1712,7 @@ mod tests {
                 observation_key: "repeat-success".to_owned(),
                 summary: "The same verified sequence succeeded twice.".to_owned(),
                 evidence: vec![ValidatedObservationEvidence {
+                    event_created_at_unix: 2,
                     chunk_fingerprint: "f".repeat(64),
                     turn_id: "turn-one".to_owned(),
                     event_id: "event-one".to_owned(),
@@ -1636,6 +1727,7 @@ mod tests {
 
     fn active_skill_model_input() -> ActiveSkillModelInput {
         ActiveSkillModelInput {
+            evidence_latest_at_unix: Some(1),
             skill_id: "AAAAAAAAAAAAAAAAAAAAA".to_owned(),
             version_id: "BBBBBBBBBBBBBBBBBBBBB".to_owned(),
             rollback_parent_version_id: Some("PPPPPPPPPPPPPPPPPPPPP".to_owned()),
@@ -1649,6 +1741,7 @@ mod tests {
 
     fn exact_skill_version_model_input() -> ExactSkillVersionModelInput {
         ExactSkillVersionModelInput {
+            evidence_latest_at_unix: Some(1),
             target_role: "current_active",
             skill_id: "AAAAAAAAAAAAAAAAAAAAA".to_owned(),
             version_id: "BBBBBBBBBBBBBBBBBBBBB".to_owned(),
@@ -1669,10 +1762,12 @@ mod tests {
             parent_version_id: Option<&str>,
         ) -> AgentSkillVersionSnapshotRecord {
             AgentSkillVersionSnapshotRecord {
+                lifecycle_evidence_latest_at_unix: Some(1),
                 skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA").expect("valid skill id"),
                 workspace_id: workspace_id.to_owned(),
                 slug: "existing-skill".to_owned(),
                 version: AgentSkillVersionRecord {
+                    evidence_latest_at_unix: Some(1),
                     id: version_id.to_owned(),
                     version_number,
                     source_run_id: Some("run-one".to_owned()),
@@ -1699,6 +1794,165 @@ mod tests {
             rollback_parent: Some(snapshot(workspace_id, "PPPPPPPPPPPPPPPPPPPPP", 1, None)),
             next_version_number: 3,
         }
+    }
+
+    fn temporal_candidate() -> ValidatedSkillCandidate {
+        let history = history(
+            [HistoryEvidenceRole::NewAnchor; 2],
+            "The verified first step succeeded.",
+        );
+        let digest = validate_chunk_analysis(
+            &history,
+            None,
+            serde_json::from_str(&analysis_json("verified first step succeeded")).unwrap(),
+        )
+        .unwrap();
+        let output: SynthesisOutput =
+            serde_json::from_str(&synthesis_json("Follow the verified sequence.")).unwrap();
+        let grounded = ground_skill_candidate(
+            "workspace-one",
+            &frozen_range(),
+            &[history],
+            &digest,
+            &[],
+            output.candidate.unwrap(),
+        )
+        .unwrap();
+        validate_grounded_skill_candidate(grounded, 1024 * 1024).unwrap()
+    }
+
+    #[test]
+    fn freshness_is_per_observation_and_uses_original_evidence_dates() {
+        let mut candidate = temporal_candidate();
+        let context = TemporalLearningContext {
+            recent_task_started_at_unix: Some(100),
+            active_skills: vec![],
+        };
+        assert_eq!(
+            validate_temporal_candidate(&candidate, &context),
+            Err("historical_observation_without_recent_support")
+        );
+        let ValidatedSkillCandidate::Create { evidence, .. } = &mut candidate else {
+            unreachable!()
+        };
+        assert!(
+            evidence
+                .cited_evidence
+                .iter()
+                .all(|citation| citation.event_created_at_unix == 2)
+        );
+        evidence.cited_evidence[1].event_created_at_unix = 100;
+        evidence.cited_evidence[1].evidence_role = HistoryEvidenceRole::ContextOnly;
+        assert!(
+            validate_temporal_candidate(&candidate, &context).is_ok(),
+            "a corroborating recent context is allowed"
+        );
+        let ValidatedSkillCandidate::Create { evidence, .. } = &mut candidate else {
+            unreachable!()
+        };
+        let mut unrelated_old = evidence.cited_evidence[0].clone();
+        unrelated_old.observation_key = "unconfirmed-old-practice".into();
+        evidence
+            .observation_keys
+            .push(unrelated_old.observation_key.clone());
+        evidence.cited_evidence.push(unrelated_old);
+        assert_eq!(
+            validate_temporal_candidate(&candidate, &context),
+            Err("historical_observation_without_recent_support")
+        );
+        let time = evidence_time(candidate_evidence(&candidate)).unwrap();
+        assert_eq!((time.confirmed_at_unix, time.latest_at_unix), (2, 100));
+    }
+
+    #[test]
+    fn update_and_rollback_preserve_newer_lifecycle_evidence_and_unknown_age_is_not_invented() {
+        let ValidatedSkillCandidate::Create { artifact, evidence } = temporal_candidate() else {
+            unreachable!()
+        };
+        let mut target = authorized_target("workspace-one");
+        target.active.version.created_at_unix = 1_900_000_000;
+        target.active.lifecycle_evidence_latest_at_unix = Some(100);
+        let context = TemporalLearningContext {
+            recent_task_started_at_unix: None,
+            active_skills: vec![],
+        };
+        let update = ValidatedSkillCandidate::Update {
+            artifact: artifact.clone(),
+            evidence: evidence.clone(),
+            target: target.clone(),
+        };
+        let rollback = ValidatedSkillCandidate::Rollback {
+            candidate_key: "rollback".into(),
+            rollback_version: target.rollback_parent.clone().unwrap(),
+            target: target.clone(),
+            evidence: evidence.clone(),
+        };
+        for candidate in [update, rollback] {
+            assert_eq!(
+                validate_temporal_candidate(&candidate, &context),
+                Err("historical_observation_without_recent_support")
+            );
+        }
+        target.active.lifecycle_evidence_latest_at_unix = Some(1);
+        let update = ValidatedSkillCandidate::Update {
+            artifact: artifact.clone(),
+            evidence: evidence.clone(),
+            target: target.clone(),
+        };
+        assert!(
+            validate_temporal_candidate(&update, &context).is_ok(),
+            "version creation time must not be used"
+        );
+        target.active.lifecycle_evidence_latest_at_unix = None;
+        let unknown = ValidatedSkillCandidate::Update {
+            artifact,
+            evidence,
+            target,
+        };
+        assert_eq!(
+            validate_temporal_candidate(&unknown, &context),
+            Err("target_evidence_date_unknown")
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_candidate_is_host_rejected_before_review_and_catalog_reaches_reviewer() {
+        let provider = Arc::new(ScriptedProvider::new([]));
+        let registry = ProviderRegistry::with_provider("scripted", provider.clone());
+        let selection = model("scripted", "reviewer");
+        let context = TemporalLearningContext {
+            recent_task_started_at_unix: Some(100),
+            active_skills: vec![active_skill_model_input()],
+        };
+        let client = LearnerReviewerClient::new(&registry, "workspace-one", &selection, None)
+            .with_temporal_context(&context);
+        let candidate = temporal_candidate();
+        let error = client
+            .review_skill_candidate(candidate.clone(), 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.reason_code,
+            "historical_observation_without_recent_support"
+        );
+        assert!(provider.requests().is_empty());
+        let json: serde_json::Value = serde_json::from_str(
+            &review_data(
+                &review_model_input(&candidate),
+                candidate_evidence(&candidate),
+                &[],
+                &[],
+                Some(&context),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["temporalContext"]["recentTaskStartedAtUnix"], 100);
+        assert_eq!(
+            json["temporalContext"]["activeSkills"][0]["evidenceLatestAtUnix"],
+            1
+        );
+        assert_eq!(json["citedEvidence"][0]["eventCreatedAtUnix"], 2);
     }
 
     #[test]
@@ -1879,6 +2133,7 @@ mod tests {
         let anchors = ["turn-one".to_owned()];
         let active = [active_skill_model_input()];
         let cited_excerpts = [GroundedEvidenceCitation {
+            event_created_at_unix: 2,
             observation_key: "repeat-success".to_owned(),
             turn_id: "turn-one".to_owned(),
             event_id: "event-one".to_owned(),
@@ -2335,8 +2590,8 @@ mod tests {
         ];
         let active = [exact_skill_version_model_input()];
         for candidate in candidates {
-            let encoded =
-                review_data(&candidate, &[], &active, &[]).expect("typed review input must encode");
+            let encoded = review_data(&candidate, &[], &active, &[], None)
+                .expect("typed review input must encode");
             let data: serde_json::Value =
                 serde_json::from_str(encoded.as_str()).expect("review data JSON");
             assert_eq!(
@@ -2415,6 +2670,7 @@ mod tests {
             .value;
         digest.observations[0].summary = injected_digest.to_owned();
         let active_skills = [ActiveSkillModelInput {
+            evidence_latest_at_unix: Some(1),
             skill_id: "AAAAAAAAAAAAAAAAAAAAA".to_owned(),
             version_id: "BBBBBBBBBBBBBBBBBBBBB".to_owned(),
             rollback_parent_version_id: Some("PPPPPPPPPPPPPPPPPPPPP".to_owned()),
@@ -2864,6 +3120,7 @@ mod tests {
                 observation_key: "bounded-key".to_owned(),
                 summary: "Bounded summary".to_owned(),
                 evidence: vec![ValidatedObservationEvidence {
+                    event_created_at_unix: 2,
                     chunk_fingerprint: "0".repeat(64),
                     turn_id: "t".repeat(MAX_VALIDATED_DIGEST_BYTES),
                     event_id: "event".to_owned(),

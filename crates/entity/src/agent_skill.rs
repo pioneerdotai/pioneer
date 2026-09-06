@@ -14,6 +14,7 @@ pub struct Model {
     #[sea_orm(unique_key = "uq_agent_skill_workspace_slug")]
     pub slug: String,
     pub active_version_id: Option<String>,
+    pub evidence_latest_at_unix: Option<i64>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(

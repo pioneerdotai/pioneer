@@ -10,13 +10,390 @@ use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, St
 
 const START_AT: i64 = 1_900_000_000;
 
+#[derive(Default)]
+struct HistoryDatabaseObserver {
+    queued: tokio::sync::Notify,
+    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+}
+
+impl pioneer_sqlite::SqliteReadObserver for HistoryDatabaseObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+            self.reads.lock().unwrap().push(class);
+        }
+    }
+}
+
+impl pioneer_sqlite::SqliteWriteObserver for HistoryDatabaseObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+        self.writes.lock().unwrap().push(event);
+        if matches!(
+            event,
+            pioneer_sqlite::SqliteWriteEvent::Enqueued {
+                class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                ..
+            }
+        ) {
+            self.queued.notify_one();
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_backfill_uses_maintenance_routes_and_cancellation_releases_queued_writer() {
+    use pioneer_sqlite::{
+        SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
+    };
+    use sea_orm::TransactionTrait;
+    use std::{sync::Arc, time::Duration};
+
+    let path =
+        std::env::temp_dir().join(format!("pioneer-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let writer = Database::connect(
+        sea_orm::ConnectOptions::new(url.clone())
+            .max_connections(1)
+            .to_owned(),
+    )
+    .await
+    .unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    writer.execute_unprepared("INSERT INTO workspace (id, name, is_active, is_current) VALUES ('ws_source_a', 'History', 1, 1)").await.unwrap();
+    let bootstrap = CrudStore::new(writer.clone());
+    let parent = thread(
+        "ws_source_a",
+        "history_routing",
+        ThreadOriginKind::User,
+        START_AT,
+    );
+    let completed = turn(
+        "history_routing_turn",
+        TurnKind::Conversation,
+        TurnOrigin::User,
+    );
+    start_turn(&bootstrap, &parent, &completed).await;
+    complete_turn(&bootstrap, &parent, completed, START_AT + 1).await;
+    writer
+        .execute_unprepared("DELETE FROM self_improvement_source_turn")
+        .await
+        .unwrap();
+    bootstrap
+        .activate_self_improvement_workspace("ws_source_a", START_AT + 10)
+        .await
+        .unwrap();
+
+    let reader = Database::connect(
+        sea_orm::ConnectOptions::new(url)
+            .max_connections(1)
+            .to_owned(),
+    )
+    .await
+    .unwrap();
+    reader
+        .execute_unprepared("PRAGMA query_only=ON")
+        .await
+        .unwrap();
+    assert!(
+        reader
+            .execute_unprepared("DELETE FROM self_improvement_source_turn")
+            .await
+            .is_err()
+    );
+    let observer = Arc::new(HistoryDatabaseObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader.clone(),
+        SqliteWriteExecutor::with_observer(writer.clone(), observer.clone()),
+        observer.clone(),
+    );
+    let store = CrudStore::new(database.clone());
+    let occupied = database.begin().await.unwrap();
+    let worker = store.clone();
+    let queued = tokio::spawn(async move {
+        worker
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), observer.queued.notified())
+        .await
+        .unwrap();
+    // Interactive reads stay available while background work is queued behind the writer.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            store.get_self_improvement_workspace_state("ws_source_a")
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_some()
+    );
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(event,
+        SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. } if queue.maintenance == 0)));
+    occupied.commit().await.unwrap();
+    assert_eq!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        0
+    );
+    let reads = observer.reads.lock().unwrap().clone();
+    assert!(reads.contains(&SqliteReadClass::Maintenance));
+    assert!(reads.contains(&SqliteReadClass::Interactive));
+    let before_temporal_reads = observer.reads.lock().unwrap().len();
+    let maintenance = store.with_maintenance_access();
+    assert!(
+        maintenance
+            .self_improvement_processed_history_date("ws_source_a")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        maintenance
+            .recent_processed_self_improvement_sources("ws_source_a")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let temporal_reads = observer.reads.lock().unwrap()[before_temporal_reads..].to_vec();
+    assert!(!temporal_reads.is_empty());
+    assert!(
+        temporal_reads
+            .iter()
+            .all(|class| *class == SqliteReadClass::Maintenance)
+    );
+    assert!(observer.writes.lock().unwrap().iter().any(|event| matches!(
+        event,
+        SqliteWriteEvent::Acquired {
+            class: SqliteWriteClass::Maintenance,
+            ..
+        }
+    )));
+    assert_eq!(
+        scalar_i64(
+            &reader,
+            "SELECT COUNT(*) AS value FROM self_improvement_source_turn"
+        )
+        .await,
+        1
+    );
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn history_backfill_is_bounded_restart_safe_private_and_workspace_scoped() {
+    let (database, store) = migrated_store().await;
+    for index in 0..36 {
+        let workspace = if index == 35 {
+            "ws_source_b"
+        } else {
+            "ws_source_a"
+        };
+        let parent = thread(
+            workspace,
+            &format!("history_{index}"),
+            ThreadOriginKind::User,
+            START_AT,
+        );
+        let completed = turn(
+            &format!("history_turn_{index}"),
+            TurnKind::Conversation,
+            TurnOrigin::User,
+        );
+        start_turn(&store, &parent, &completed).await;
+        complete_turn(&store, &parent, completed, START_AT + 1).await;
+    }
+    database
+        .execute_unprepared("DELETE FROM self_improvement_source_turn")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        0,
+        "disabled workspaces must not scan"
+    );
+    store
+        .activate_self_improvement_workspace("ws_source_a", START_AT + 100)
+        .await
+        .unwrap();
+    // A poison row must be consumed as rejected so later valid rows can still be indexed.
+    database.execute_unprepared("UPDATE turn_event SET payload = '{}' WHERE event_type = 'turn/completed' AND turn_id = 'history_turn_0'").await.unwrap();
+    assert_eq!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        32
+    );
+    store
+        .deactivate_self_improvement_workspace("ws_source_a", START_AT + 101)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        0
+    );
+    let restarted = CrudStore::new(database.clone());
+    restarted
+        .activate_self_improvement_workspace("ws_source_a", START_AT + 102)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        restarted
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        restarted
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(scalar_i64(&database, "SELECT COUNT(*) AS value FROM self_improvement_source_turn WHERE workspace_id = 'ws_source_a'").await, 34);
+    assert_eq!(scalar_i64(&database, "SELECT COUNT(*) AS value FROM self_improvement_source_turn WHERE workspace_id = 'ws_source_b'").await, 0);
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20260906_000002_self_improvement_history_backfill")
+        .unwrap();
+    let manager = migration::SchemaManager::new(&database);
+    migration.up(&manager).await.unwrap();
+    migration.up(&manager).await.unwrap();
+    assert_eq!(scalar_i64(&database, "SELECT history_backfill_complete AS value FROM self_improvement_workspace_state WHERE workspace_id = 'ws_source_a'").await, 1,
+        "reapplying the migration must preserve historical scan progress");
+    // Live projection still handles new events after the historical scan is marked complete.
+    let parent = thread(
+        "ws_source_a",
+        "history_live",
+        ThreadOriginKind::User,
+        START_AT + 103,
+    );
+    let completed = turn(
+        "history_live_turn",
+        TurnKind::Conversation,
+        TurnOrigin::User,
+    );
+    start_turn(&restarted, &parent, &completed).await;
+    complete_turn(&restarted, &parent, completed, START_AT + 104).await;
+    assert_eq!(
+        restarted
+            .list_self_improvement_source_turns_after("ws_source_a", 0, START_AT + 102, 100)
+            .await
+            .unwrap()
+            .len(),
+        35
+    );
+}
+
+#[tokio::test]
+async fn history_backfill_rolls_back_source_and_checkpoint_and_concurrent_retries_converge() {
+    let (database, store) = migrated_store().await;
+    let parent = thread(
+        "ws_source_a",
+        "history_atomic",
+        ThreadOriginKind::User,
+        START_AT,
+    );
+    let completed = turn(
+        "history_atomic_turn",
+        TurnKind::Conversation,
+        TurnOrigin::User,
+    );
+    start_turn(&store, &parent, &completed).await;
+    complete_turn(&store, &parent, completed, START_AT + 1).await;
+    database
+        .execute_unprepared("DELETE FROM self_improvement_source_turn")
+        .await
+        .unwrap();
+    store
+        .activate_self_improvement_workspace("ws_source_a", START_AT + 10)
+        .await
+        .unwrap();
+    database.execute_unprepared("CREATE TRIGGER reject_history_checkpoint BEFORE UPDATE OF history_backfill_after_event_id ON self_improvement_workspace_state BEGIN SELECT RAISE(ABORT, 'test checkpoint failure'); END").await.unwrap();
+    assert!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scalar_i64(
+            &database,
+            "SELECT COUNT(*) AS value FROM self_improvement_source_turn"
+        )
+        .await,
+        0,
+        "source insertion must roll back with failed checkpoint"
+    );
+    assert_eq!(scalar_i64(&database, "SELECT history_backfill_after_event_id IS NULL AS value FROM self_improvement_workspace_state WHERE workspace_id = 'ws_source_a'").await, 1);
+    database
+        .execute_unprepared("DROP TRIGGER reject_history_checkpoint")
+        .await
+        .unwrap();
+    let other = store.clone();
+    let (first, second) = tokio::join!(
+        store.backfill_self_improvement_history("ws_source_a"),
+        other.backfill_self_improvement_history("ws_source_a")
+    );
+    assert_eq!(first.unwrap() + second.unwrap(), 1);
+    assert_eq!(
+        scalar_i64(
+            &database,
+            "SELECT COUNT(*) AS value FROM self_improvement_source_turn"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        store
+            .backfill_self_improvement_history("ws_source_a")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 struct BeforeSelfImprovementMigrator;
 
 impl MigratorTrait for BeforeSelfImprovementMigrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
         Migrator::migrations()
             .into_iter()
-            .filter(|migration| migration.name() != "m20260723_000001_self_improvement_core")
+            .filter(|migration| !migration.name().contains("self_improvement"))
             .collect()
     }
 }
@@ -542,7 +919,7 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
             .expect("range after cursor"),
         vec![all_a[1].clone(), all_a[2].clone()]
     );
-    assert!(
+    assert_eq!(
         store
             .list_self_improvement_source_turns_after(
                 "ws_source_a",
@@ -551,8 +928,8 @@ async fn source_projection_is_exact_idempotent_isolated_and_monotonic() {
                 10,
             )
             .await
-            .expect("effective enable boundary")
-            .is_empty()
+            .expect("activation time must not exclude unprocessed history"),
+        all_a
     );
     assert_eq!(
         store
@@ -646,6 +1023,34 @@ async fn collaborative_source_requires_verified_terminal_delivery_and_is_replay_
         .expect("replayed collaborative source must load");
     assert_eq!(replayed.len(), 1);
     assert_eq!(replayed[0].terminal_event_id, first_boundary);
+
+    // Simulate an old private conversation omitted by the former live source filter.
+    database
+        .execute_unprepared("DELETE FROM self_improvement_source_turn")
+        .await
+        .unwrap();
+    store
+        .activate_self_improvement_workspace("ws_source_a", START_AT + 100)
+        .await
+        .unwrap();
+    while store
+        .backfill_self_improvement_history("ws_source_a")
+        .await
+        .unwrap()
+        != 0
+    {}
+    let restored = store
+        .list_self_improvement_source_turns_after("ws_source_a", 0, START_AT + 100, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.len(),
+        1,
+        "child and occurrence turns must not become independent sources"
+    );
+    assert_eq!(restored[0].turn_id, parent_turn.id);
+    assert_eq!(restored[0].terminal_event_id, first_boundary);
+    assert_eq!(restored[0].task_delivery_id.as_deref(), Some(delivery_id));
 
     let forged_thread = thread(
         "ws_source_a",

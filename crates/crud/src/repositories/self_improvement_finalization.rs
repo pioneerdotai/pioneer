@@ -2,14 +2,15 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{
-    agent_skill, agent_skill_version, self_improvement_run, self_improvement_workspace_state,
+    agent_skill, agent_skill_version, self_improvement_run, self_improvement_source_turn,
+    self_improvement_workspace_state, thread, turn,
 };
 use pioneer_protocol::{ThreadSidebarVisibility, TurnKind, TurnOrigin, TurnStatus};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Cond, Expr, ExprTrait, Func, JoinType, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction, EntityTrait, QueryFilter,
-    Statement,
+    QuerySelect, Statement,
 };
 
 use super::agent_skill::{
@@ -35,6 +36,8 @@ const MAX_SOURCE_TURN_IDS: usize = 1_024;
 pub struct PreparedSelfImprovementFinalization {
     input: FinalizeSelfImprovementRunInput,
     outcome: PreparedFinalOutcome,
+    temporal_rejection_summary: String,
+    processed_history_date: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -104,6 +107,10 @@ pub async fn prepare<C: ConnectionTrait>(
     let outcome = match &input.outcome {
         SelfImprovementFinalOutcome::AcceptedCreate(create) => {
             let version = prepare_agent_skill_version(NewAgentSkillVersion {
+                evidence_latest_at_unix: create
+                    .evidence_time
+                    .as_ref()
+                    .map(|time| time.latest_at_unix),
                 id: create.version_id.clone(),
                 skill_id: create.skill_id.clone(),
                 version_number: 1,
@@ -149,6 +156,10 @@ pub async fn prepare<C: ConnectionTrait>(
         }
         SelfImprovementFinalOutcome::AcceptedUpdate(update) => {
             let version = prepare_agent_skill_version(NewAgentSkillVersion {
+                evidence_latest_at_unix: update
+                    .evidence_time
+                    .as_ref()
+                    .map(|time| time.latest_at_unix),
                 id: update.version_id.clone(),
                 skill_id: update.skill_id.clone(),
                 version_number: update.version_number,
@@ -236,7 +247,42 @@ pub async fn prepare<C: ConnectionTrait>(
             summary: no_change_summary(*reason, reason_codes, None, None, None)?,
         },
     };
-    Ok(PreparedSelfImprovementFinalization { input, outcome })
+    let (temporal_action, temporal_key) = match &input.outcome {
+        SelfImprovementFinalOutcome::AcceptedCreate(value) => {
+            (Some("create"), Some(value.candidate_key.as_str()))
+        }
+        SelfImprovementFinalOutcome::AcceptedUpdate(value) => {
+            (Some("update"), Some(value.candidate_key.as_str()))
+        }
+        SelfImprovementFinalOutcome::AcceptedRollback(value) => {
+            (Some("rollback"), Some(value.candidate_key.as_str()))
+        }
+        SelfImprovementFinalOutcome::NoChange { .. } => (None, None),
+    };
+    let temporal_rejection_summary = no_change_summary(
+        SelfImprovementNoChangeReason::HostValidationRejected,
+        &["temporal_evidence_rejected"],
+        temporal_action,
+        temporal_key,
+        None,
+    )?;
+    // Aggregate history on the reader, never under the serialized writer.
+    // Completed ranges are immutable; another completion moves the cursor and
+    // invalidates this run's workspace fence. Reconciliation cannot rewind a
+    // cursor while this frozen run is unresolved; reactivation changes the epoch.
+    // Newly projected source IDs cannot enter a previously completed range.
+    let processed_history_date = if temporal_action.is_some() {
+        super::self_improvement_source_turn::processed_history_date(db, &input.fence.workspace_id)
+            .await?
+    } else {
+        None
+    };
+    Ok(PreparedSelfImprovementFinalization {
+        input,
+        outcome,
+        temporal_rejection_summary,
+        processed_history_date,
+    })
 }
 
 pub fn validate_input(input: &FinalizeSelfImprovementRunInput) -> Result<()> {
@@ -418,47 +464,76 @@ fn prepare_source_turn_check(
     };
     let expected_count = i64::try_from(source_turn_ids.len())
         .context("accepted Agent skill source turn count exceeds durable integer range")?;
-    let placeholders = std::iter::repeat_n("?", source_turn_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT COUNT(*) AS matched_count, \
-         COALESCE(SUM(CASE WHEN source.id > ? AND source.id <= ? THEN 1 ELSE 0 END), 0) \
-             AS new_anchor_count \
-         FROM self_improvement_source_turn AS source \
-         INNER JOIN turn AS cited_turn \
-             ON cited_turn.id = source.turn_id \
-            AND cited_turn.thread_id = source.thread_id \
-         INNER JOIN thread AS source_thread \
-             ON source_thread.id = cited_turn.thread_id \
-            AND source_thread.workspace_id = source.workspace_id \
-         WHERE source.workspace_id = ? \
-           AND source.turn_id IN ({placeholders}) \
-           AND cited_turn.status = ? \
-           AND cited_turn.turn_kind = ? \
-           AND cited_turn.origin = ? \
-           AND source_thread.access_class IN (?, ?) \
-           AND source_thread.sidebar_visibility = ? \
-           AND source_thread.origin_kind IN (?, ?, ?)"
-    );
-    let mut values = Vec::with_capacity(source_turn_ids.len() + 12);
-    values.push(source_lower_exclusive.into());
-    values.push(source_upper_inclusive.into());
-    values.push(workspace_id.to_owned().into());
-    values.extend(source_turn_ids.iter().cloned().map(Into::into));
-    values.push(crate::convention::turn_status_to_db(TurnStatus::Completed).into());
-    values.push(crate::convention::turn_kind_to_db(TurnKind::Conversation).into());
-    values.push(crate::convention::turn_origin_to_db(TurnOrigin::User).into());
-    values.extend(source_access_classes().into_iter().map(Into::into));
-    values.push(
-        crate::convention::thread_sidebar_visibility_to_db(ThreadSidebarVisibility::Visible).into(),
-    );
-    values.extend(source_origins().into_iter().map(Into::into));
+    let new_anchor = Cond::all()
+        .add(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
+        .add(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
+        .add(super::self_improvement_source_turn::processed_source_predicate().not());
+    let query = Query::select()
+        .expr_as(
+            Func::count(Expr::col((
+                self_improvement_source_turn::Entity,
+                self_improvement_source_turn::Column::Id,
+            ))),
+            Alias::new("matched_count"),
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::from(Func::sum(Expr::case(new_anchor, 1).finally(0))),
+                Expr::val(0),
+            ]),
+            Alias::new("new_anchor_count"),
+        )
+        .from(self_improvement_source_turn::Entity)
+        .join(
+            JoinType::InnerJoin,
+            turn::Entity,
+            Cond::all()
+                .add(Expr::col((turn::Entity, turn::Column::Id)).equals((
+                    self_improvement_source_turn::Entity,
+                    self_improvement_source_turn::Column::TurnId,
+                )))
+                .add(Expr::col((turn::Entity, turn::Column::ThreadId)).equals((
+                    self_improvement_source_turn::Entity,
+                    self_improvement_source_turn::Column::ThreadId,
+                ))),
+        )
+        .join(
+            JoinType::InnerJoin,
+            thread::Entity,
+            Cond::all()
+                .add(
+                    Expr::col((thread::Entity, thread::Column::Id))
+                        .equals((turn::Entity, turn::Column::ThreadId)),
+                )
+                .add(
+                    Expr::col((thread::Entity, thread::Column::WorkspaceId)).equals((
+                        self_improvement_source_turn::Entity,
+                        self_improvement_source_turn::Column::WorkspaceId,
+                    )),
+                ),
+        )
+        .and_where(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id))
+        .and_where(
+            self_improvement_source_turn::Column::TurnId.is_in(source_turn_ids.iter().cloned()),
+        )
+        .and_where(
+            turn::Column::Status.eq(crate::convention::turn_status_to_db(TurnStatus::Completed)),
+        )
+        .and_where(
+            turn::Column::TurnKind.eq(crate::convention::turn_kind_to_db(TurnKind::Conversation)),
+        )
+        .and_where(turn::Column::Origin.eq(crate::convention::turn_origin_to_db(TurnOrigin::User)))
+        .and_where(thread::Column::AccessClass.is_in(source_access_classes()))
+        .and_where(thread::Column::SidebarVisibility.eq(
+            crate::convention::thread_sidebar_visibility_to_db(ThreadSidebarVisibility::Visible),
+        ))
+        .and_where(thread::Column::OriginKind.is_in(source_origins()))
+        .to_owned();
     Ok(Some(PreparedSourceTurnCheck {
         source_lower_exclusive,
         source_upper_inclusive,
         expected_count,
-        statement: Statement::from_sql_and_values(DatabaseBackend::Sqlite, sql, values),
+        statement: DatabaseBackend::Sqlite.build(&query),
     }))
 }
 
@@ -525,7 +600,12 @@ pub async fn finalize(
     prepared: PreparedSelfImprovementFinalization,
     now: DateTimeWithTimeZone,
 ) -> Result<FinalizeSelfImprovementRunResult> {
-    let PreparedSelfImprovementFinalization { input, outcome } = prepared;
+    let PreparedSelfImprovementFinalization {
+        input,
+        outcome,
+        temporal_rejection_summary,
+        processed_history_date,
+    } = prepared;
     let Some(run) = self_improvement_run::Entity::find_by_id(input.fence.run_id.clone())
         .filter(self_improvement_run::Column::WorkspaceId.eq(input.fence.workspace_id.clone()))
         .one(db)
@@ -540,6 +620,12 @@ pub async fn finalize(
         return Ok(FinalizeSelfImprovementRunResult::Stale);
     };
     if run.status == STATUS_COMPLETED {
+        if run.outcome.as_deref() == Some("no_change")
+            && run.applied_action.is_none()
+            && run.result_summary.as_deref() == Some(temporal_rejection_summary.as_str())
+        {
+            return Ok(FinalizeSelfImprovementRunResult::AlreadyFinalized);
+        }
         return Ok(
             if completed_run_matches(db, &run, &input.outcome, &outcome).await? {
                 FinalizeSelfImprovementRunResult::AlreadyFinalized
@@ -553,6 +639,20 @@ pub async fn finalize(
     }
     if !super::self_improvement_run::workspace_matches_fence(db, &input.fence).await? {
         return Ok(FinalizeSelfImprovementRunResult::Stale);
+    }
+
+    // The workspace fence above protects the prepared history reference; the
+    // exact active skill's evidence date is re-read in this atomic commit.
+    if !temporal_evidence_matches(db, &input, processed_history_date).await? {
+        return finish_no_change(
+            db,
+            &input,
+            run.source_upper_inclusive,
+            SelfImprovementNoChangeReason::HostValidationRejected,
+            &temporal_rejection_summary,
+            now,
+        )
+        .await;
     }
 
     match (&input.outcome, outcome) {
@@ -617,6 +717,7 @@ pub async fn finalize(
                 bail!("self-improvement workspace cursor changed during finalization");
             }
             apply_create_in_caller_transaction(db, mutation, now).await?;
+            record_lifecycle_evidence_time(db, &input, create.skill_id.as_str()).await?;
             Ok(FinalizeSelfImprovementRunResult::Applied {
                 skill_id: create.skill_id.clone(),
                 version_id: create.version_id.clone(),
@@ -646,6 +747,7 @@ pub async fn finalize(
                     previous_version_id,
                     resulting_version_id,
                 } => {
+                    record_lifecycle_evidence_time(db, &input, update.skill_id.as_str()).await?;
                     if !complete_run(
                         db,
                         &input,
@@ -758,6 +860,7 @@ pub async fn finalize(
                     previous_version_id,
                     resulting_version_id,
                 } => {
+                    record_lifecycle_evidence_time(db, &input, rollback.skill_id.as_str()).await?;
                     if !complete_run(
                         db,
                         &input,
@@ -824,6 +927,55 @@ pub async fn finalize(
     }
 }
 
+async fn temporal_evidence_matches<C: ConnectionTrait>(
+    db: &C,
+    input: &FinalizeSelfImprovementRunInput,
+    processed_history_date: Option<i64>,
+) -> Result<bool> {
+    let (time, target) = match &input.outcome {
+        SelfImprovementFinalOutcome::AcceptedCreate(value) => (value.evidence_time.as_ref(), None),
+        SelfImprovementFinalOutcome::AcceptedUpdate(value) => (
+            value.evidence_time.as_ref(),
+            Some((&value.skill_id, &value.expected_active_version_id)),
+        ),
+        SelfImprovementFinalOutcome::AcceptedRollback(value) => (
+            value.evidence_time.as_ref(),
+            Some((&value.skill_id, &value.expected_active_version_id)),
+        ),
+        SelfImprovementFinalOutcome::NoChange { .. } => return Ok(true),
+    };
+    let Some(time) = time else {
+        return Ok(false);
+    };
+    if time.confirmed_at_unix > time.latest_at_unix {
+        return Ok(false);
+    }
+    if processed_history_date.is_some_and(|date| time.confirmed_at_unix < date) {
+        return Ok(false);
+    }
+    if let Some((skill_id, version_id)) = target {
+        let skill = agent_skill::Entity::find_by_id(skill_id.as_str())
+            .filter(agent_skill::Column::WorkspaceId.eq(&input.fence.workspace_id))
+            .one(db)
+            .await?;
+        if skill
+            .as_ref()
+            .is_none_or(|skill| skill.active_version_id.as_deref() != Some(version_id.as_str()))
+        {
+            // Keep the existing lifecycle conflict/stale-active semantics; never
+            // consume a stale target as a temporal rejection instead.
+            return Ok(true);
+        }
+        if !skill
+            .and_then(|skill| skill.evidence_latest_at_unix)
+            .is_some_and(|date| time.confirmed_at_unix >= date)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn run_matches_fence(
     run: &self_improvement_run::Model,
     input: &FinalizeSelfImprovementRunInput,
@@ -883,6 +1035,11 @@ async fn completed_run_matches<C: ConnectionTrait>(
                 return Ok(false);
             };
             Ok(skill.slug == create.slug
+                && version.evidence_latest_at_unix
+                    == create
+                        .evidence_time
+                        .as_ref()
+                        .map(|time| time.latest_at_unix)
                 && version.skill_id == create.skill_id.as_str()
                 && version.version_number == 1
                 && version.source_run_id.as_deref() == Some(run.id.as_str())
@@ -937,6 +1094,11 @@ async fn completed_run_matches<C: ConnectionTrait>(
                 return Ok(false);
             };
             Ok(skill.slug == update.slug
+                && version.evidence_latest_at_unix
+                    == update
+                        .evidence_time
+                        .as_ref()
+                        .map(|time| time.latest_at_unix)
                 && version.skill_id == update.skill_id.as_str()
                 && version.version_number == update.version_number
                 && version.source_run_id.as_deref() == Some(run.id.as_str())
@@ -1028,19 +1190,20 @@ async fn create_conflict<C: ConnectionTrait>(
     {
         return Ok(Some(SelfImprovementFinalizationConflict::Slug));
     }
-    if db
-        .query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT 1 AS present \
-             FROM agent_skill_version AS version \
-             INNER JOIN agent_skill AS skill ON skill.id = version.skill_id \
-             WHERE skill.workspace_id = ? AND version.fingerprint = ? \
-             LIMIT 1",
-            [
-                input.fence.workspace_id.clone().into(),
-                create.fingerprint.clone().into(),
-            ],
-        ))
+    if agent_skill_version::Entity::find()
+        .select_only()
+        .column(agent_skill_version::Column::Id)
+        .join(
+            JoinType::InnerJoin,
+            agent_skill_version::Entity::belongs_to(agent_skill::Entity)
+                .from(agent_skill_version::Column::SkillId)
+                .to(agent_skill::Column::Id)
+                .into(),
+        )
+        .filter(agent_skill::Column::WorkspaceId.eq(input.fence.workspace_id.clone()))
+        .filter(agent_skill_version::Column::Fingerprint.eq(create.fingerprint.clone()))
+        .into_tuple::<String>()
+        .one(db)
         .await
         .context("failed to check Agent skill fingerprint conflict")?
         .is_some()
@@ -1177,6 +1340,36 @@ async fn complete_run<C: ConnectionTrait>(
         .context("failed to complete fenced self-improvement run")?
         .rows_affected
         == 1)
+}
+
+async fn record_lifecycle_evidence_time(
+    db: &DatabaseTransaction,
+    input: &FinalizeSelfImprovementRunInput,
+    skill_id: &str,
+) -> Result<()> {
+    let time = match &input.outcome {
+        SelfImprovementFinalOutcome::AcceptedCreate(value) => value.evidence_time.as_ref(),
+        SelfImprovementFinalOutcome::AcceptedUpdate(value) => value.evidence_time.as_ref(),
+        SelfImprovementFinalOutcome::AcceptedRollback(value) => value.evidence_time.as_ref(),
+        SelfImprovementFinalOutcome::NoChange { .. } => None,
+    }
+    .context("applied skill requires dated evidence")?;
+    // Called after the skill exists, within the same lifecycle transaction.
+    // Rollback updates this date without rewriting immutable version provenance.
+    let changed = agent_skill::Entity::update_many()
+        .col_expr(
+            agent_skill::Column::EvidenceLatestAtUnix,
+            Expr::value(Some(time.latest_at_unix)),
+        )
+        .filter(agent_skill::Column::Id.eq(skill_id))
+        .filter(agent_skill::Column::WorkspaceId.eq(&input.fence.workspace_id))
+        .exec(db)
+        .await?
+        .rows_affected;
+    if changed != 1 {
+        bail!("Agent skill disappeared while recording its evidence date");
+    }
+    Ok(())
 }
 
 async fn advance_cursor<C: ConnectionTrait>(

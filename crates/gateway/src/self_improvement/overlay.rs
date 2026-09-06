@@ -237,6 +237,10 @@ mod tests {
                     },
                     outcome: SelfImprovementFinalOutcome::AcceptedCreate(
                         AcceptedAgentSkillCreate {
+                            evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+                                confirmed_at_unix: NOW,
+                                latest_at_unix: NOW,
+                            }),
                             skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA")
                                 .expect("valid skill ID"),
                             version_id: "111111111111111111111".to_owned(),

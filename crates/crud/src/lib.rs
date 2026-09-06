@@ -537,7 +537,16 @@ pub struct SelfImprovementFinalizationAuthority {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillEvidenceTime {
+    /// Oldest of the newest supporting message dates, one per selected observation.
+    pub confirmed_at_unix: i64,
+    /// Newest actual supporting message, never the time of learning/version creation.
+    pub latest_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedAgentSkillCreate {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
     pub skill_id: SkillId,
     pub version_id: String,
     pub slug: String,
@@ -553,6 +562,7 @@ pub struct AcceptedAgentSkillCreate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedAgentSkillUpdate {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
     pub skill_id: SkillId,
     pub expected_active_version_id: String,
     pub version_id: String,
@@ -570,6 +580,7 @@ pub struct AcceptedAgentSkillUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedAgentSkillRollback {
+    pub evidence_time: Option<AgentSkillEvidenceTime>,
     pub skill_id: SkillId,
     pub expected_active_version_id: String,
     pub target_parent_version_id: String,
@@ -639,6 +650,7 @@ pub enum FinalizeSelfImprovementRunResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSkillVersionRecord {
+    pub evidence_latest_at_unix: Option<i64>,
     pub id: String,
     pub version_number: i64,
     pub source_run_id: Option<String>,
@@ -656,6 +668,8 @@ pub struct AgentSkillVersionRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSkillVersionSnapshotRecord {
+    /// Latest evidence supporting the current lifecycle decision, including rollback.
+    pub lifecycle_evidence_latest_at_unix: Option<i64>,
     pub skill_id: SkillId,
     pub workspace_id: String,
     pub slug: String,
@@ -3095,6 +3109,28 @@ impl CrudStore {
         repositories::agent_skill::list_active_versions(&self.connection, workspace_id).await
     }
 
+    pub async fn self_improvement_processed_history_date(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<i64>> {
+        repositories::self_improvement_source_turn::processed_history_date(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
+    pub async fn recent_processed_self_improvement_sources(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+        repositories::self_improvement_source_turn::recent_processed_sources(
+            &self.connection,
+            workspace_id,
+        )
+        .await
+    }
+
     pub async fn get_agent_skill_version(
         &self,
         workspace_id: &str,
@@ -3182,24 +3218,10 @@ impl CrudStore {
                 return Err(error);
             }
 
-            let baseline_source_id = match repositories::self_improvement_source_turn::source_head(
-                &transaction,
-                workspace_id.as_str(),
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            };
-
             if let Err(error) =
                 repositories::self_improvement_workspace_state::activate_if_inactive(
                     &transaction,
                     workspace_id.as_str(),
-                    baseline_source_id,
                     effective_enabled_at,
                 )
                 .await
@@ -3314,6 +3336,121 @@ impl CrudStore {
 
     pub async fn self_improvement_source_head(&self, workspace_id: &str) -> Result<i64> {
         repositories::self_improvement_source_turn::source_head(&self.connection, workspace_id)
+            .await
+    }
+
+    /// One bounded background discovery page. No LLM calls; canonical completions missing
+    /// from the old source index are restored through the normal source authority checks.
+    pub async fn backfill_self_improvement_history(&self, workspace_id: &str) -> Result<usize> {
+        let maintenance = self.with_maintenance_access();
+        let Some(mut state) = repositories::self_improvement_workspace_state::find(
+            &maintenance.connection,
+            workspace_id,
+        )
+        .await?
+        else {
+            return Ok(0);
+        };
+        if state.effective_enabled_at.is_none() || state.history_backfill_complete {
+            return Ok(0);
+        }
+        let events = repositories::self_improvement_history::discover(
+            &maintenance.connection,
+            workspace_id,
+            state.history_backfill_after_event_id.as_deref(),
+            32,
+        )
+        .await?;
+        let mut scanned = 0;
+        // Even an empty page commits a fenced completion marker. Each event gets a short
+        // atomic write; the writer is released between events and before parsing the next page.
+        for event in events
+            .iter()
+            .map(Some)
+            .chain(events.is_empty().then_some(None))
+        {
+            let applied = maintenance
+                .run_serialized_write(|| async {
+                    let transaction = maintenance.connection.begin().await?;
+                    let result =
+                        repositories::self_improvement_history::apply(&transaction, &state, event)
+                            .await;
+                    match result {
+                        Ok(applied) => {
+                            transaction.commit().await?;
+                            Ok(applied)
+                        }
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            Err(error)
+                        }
+                    }
+                })
+                .await?;
+            if !applied {
+                break;
+            }
+            if let Some(event) = event {
+                state.history_backfill_after_event_id = Some(event.id.clone());
+                scanned += 1;
+            }
+        }
+        Ok(scanned)
+    }
+
+    /// Recover sources skipped by the former activation baseline without replaying completed
+    /// run ranges. Unresolved runs retain their original frozen bounds and checkpoints.
+    pub async fn reconcile_self_improvement_history_cursor(
+        &self,
+        workspace_id: &str,
+    ) -> Result<()> {
+        let maintenance = self.with_maintenance_access();
+        let Some(state) = repositories::self_improvement_workspace_state::find(
+            &maintenance.connection,
+            workspace_id,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        if state.effective_enabled_at.is_none() || state.cursor_source_id == 0 {
+            return Ok(());
+        }
+        let sources = repositories::self_improvement_source_turn::list_after_cursor(
+            &maintenance.connection,
+            workspace_id,
+            0,
+            0,
+            1,
+        )
+        .await?;
+        let Some(earliest) = sources
+            .first()
+            .map(|source| source.id)
+            .filter(|id| *id <= state.cursor_source_id)
+        else {
+            return Ok(());
+        };
+        maintenance
+            .run_serialized_write(|| async {
+                let transaction = maintenance.connection.begin().await?;
+                let result = repositories::self_improvement_history::rewind_idle(
+                    &transaction,
+                    &state,
+                    earliest,
+                )
+                .await;
+                match result {
+                    Ok(()) => {
+                        transaction.commit().await?;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            })
             .await
     }
 

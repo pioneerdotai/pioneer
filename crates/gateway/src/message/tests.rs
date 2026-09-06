@@ -33079,7 +33079,11 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
         )
         .await
         .expect("post-native source rows must load");
-    assert_eq!(post_native_sources.len(), 3);
+    assert_eq!(
+        post_native_sources.len(),
+        1,
+        "the two sources consumed by learning must not be selected again"
+    );
     assert!(post_native_sources.iter().any(|source| {
         source.turn_id == "turn_native_agent_skill" && source.task_delivery_id.is_some()
     }));

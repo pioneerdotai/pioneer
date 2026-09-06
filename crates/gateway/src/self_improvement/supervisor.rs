@@ -43,7 +43,7 @@ use super::settings::{
 };
 use super::validation::AuthorizedAgentSkillTarget;
 
-const PIPELINE_CONTRACT_VERSION: &str = "self-improvement-v3";
+const PIPELINE_CONTRACT_VERSION: &str = "self-improvement-v4";
 const RUN_STATUS_PENDING: &str = "pending";
 const RUN_STATUS_RUNNING: &str = "running";
 const RUN_STATUS_FAILED: &str = "failed";
@@ -706,6 +706,21 @@ impl SelfImprovementSupervisor {
     }
 
     async fn process_workspace(&self, workspace_id: &str, now_unix: i64) -> Result<()> {
+        // At most 1,024 historical completion events per wake; the existing daily worker
+        // gradually discovers old history without a new job system or user-facing action.
+        for _ in 0..32 {
+            if self
+                .maintenance_store
+                .backfill_self_improvement_history(workspace_id)
+                .await?
+                == 0
+            {
+                break;
+            }
+        }
+        self.maintenance_store
+            .reconcile_self_improvement_history_cursor(workspace_id)
+            .await?;
         let state = self
             .maintenance_store
             .get_self_improvement_workspace_state(workspace_id)
@@ -986,7 +1001,41 @@ impl SelfImprovementSupervisor {
             .maintenance_store
             .list_canonical_turn_events_for_self_improvement(&frozen_range)
             .await?;
-        let snapshot = build_model_safe_full_thread_snapshot(&frozen_range, canonical.as_slice())?;
+        let processed_history_date = self
+            .maintenance_store
+            .self_improvement_processed_history_date(&run.workspace_id)
+            .await?;
+        let mut snapshot =
+            build_model_safe_full_thread_snapshot(&frozen_range, canonical.as_slice())?;
+        if processed_history_date.is_some_and(|date| {
+            frozen_range
+                .anchors
+                .iter()
+                .any(|source| source.parent_turn_created_at_unix < date)
+        }) {
+            let recent = self
+                .maintenance_store
+                .recent_processed_self_improvement_sources(&run.workspace_id)
+                .await?;
+            if let (Some(first), Some(last)) = (recent.first(), recent.last()) {
+                let ids = recent
+                    .iter()
+                    .map(|source| source.turn_id.clone())
+                    .collect::<HashSet<_>>();
+                let context_range = SelfImprovementFrozenSourceRange::new(
+                    &run.workspace_id,
+                    first.id - 1,
+                    last.id,
+                    recent,
+                )?;
+                let records = self
+                    .maintenance_store
+                    .list_canonical_turn_events_for_self_improvement(&context_range)
+                    .await?;
+                let context = build_model_safe_full_thread_snapshot(&context_range, &records)?;
+                super::history::append_corroboration_context(&mut snapshot, context, &ids)?;
+            }
+        }
         let chunks = plan_history_chunks(&snapshot, HistoryChunkLimits::default())?;
         let mut analysis = ResumableHistoryAnalysis::restore(&run, chunks.as_slice())?;
         for index in 0..analysis.next_chunk_index() {
@@ -1143,6 +1192,7 @@ impl SelfImprovementSupervisor {
         let active_inputs = active
             .iter()
             .map(|snapshot| ActiveSkillModelInput {
+                evidence_latest_at_unix: snapshot.lifecycle_evidence_latest_at_unix,
                 skill_id: snapshot.skill_id.to_string(),
                 version_id: snapshot.version.id.clone(),
                 rollback_parent_version_id: snapshot.version.parent_version_id.clone(),
@@ -1167,6 +1217,26 @@ impl SelfImprovementSupervisor {
         let prospective_skill_id = SkillId::new(generate_id(SKILL_ID_LEN))
             .context("generated an invalid Agent skill ID")?;
         let prospective_version_id = generate_id(SKILL_ID_LEN);
+        let temporal_context = super::learner::TemporalLearningContext {
+            // Backfill/discovery order is not chronology. Also protect the newer
+            // tasks in this same batch before the first completed run exists.
+            recent_task_started_at_unix: processed_history_date
+                .into_iter()
+                .chain(
+                    frozen_range
+                        .anchors
+                        .iter()
+                        .map(|source| source.parent_turn_created_at_unix),
+                )
+                .chain(
+                    active_inputs
+                        .iter()
+                        .filter_map(|skill| skill.evidence_latest_at_unix),
+                )
+                .max(),
+            active_skills: active_inputs.clone(),
+        };
+        let client = client.with_temporal_context(&temporal_context);
         let candidate = match self
             .lifecycle_contract_call_with_lease(&fence, &lease_clock, "synthesis", || {
                 client.synthesize_validated_candidate(
@@ -3569,10 +3639,25 @@ mod tests {
             .expect("cancelled run count must exist")
             .try_get::<i64>("", "value")
             .expect("cancelled run count must decode");
+        let created = database
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS total, COUNT(DISTINCT workspace_id) AS workspaces FROM self_improvement_run".to_owned(),
+            ))
+            .await.expect("created runs must query").expect("aggregate must exist");
+        let total = created.try_get::<i64>("", "total").unwrap();
         assert_eq!(
-            cancelled_count,
-            workspace_ids.len() as i64,
-            "every workspace must own and cancel exactly its logical run as bounded slots drain"
+            cancelled_count, total,
+            "every created run must be cancelled when its owned branch is joined"
+        );
+        assert_eq!(
+            total,
+            created.try_get::<i64>("", "workspaces").unwrap(),
+            "bounded dispatch must not create duplicate workspace runs"
+        );
+        assert!(
+            (provider.request_count() as i64..=workspace_ids.len() as i64).contains(&total),
+            "every started provider call needs a run; a workspace disabled during discovery may have none"
         );
     }
 
@@ -5020,7 +5105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_scoped_reconciliation_is_idempotent_and_reenable_baselines_disabled_history()
+    async fn workspace_scoped_reconciliation_is_idempotent_and_reenable_preserves_disabled_history()
     {
         let (_database, store, workspace_manager) = test_store().await;
         let provider = Arc::new(ScriptedLearningProvider::new());
@@ -5074,7 +5159,7 @@ mod tests {
             .expect("active state lookup must succeed")
             .expect("active state must exist");
         assert_eq!(first_epoch.activation_epoch, 1);
-        assert_eq!(first_epoch.cursor_source_id, 1);
+        assert_eq!(first_epoch.cursor_source_id, 0);
         assert_eq!(first_epoch.effective_enabled_at_unix, Some(ENABLED_AT + 1));
 
         let new_workspace = workspace_manager_for_new_workspace
@@ -5128,7 +5213,7 @@ mod tests {
             .expect("idempotent state must exist");
         assert_eq!(still_first_epoch.activation_epoch, 1);
         assert_eq!(
-            still_first_epoch.cursor_source_id, 1,
+            still_first_epoch.cursor_source_id, 0,
             "already-active reconciliation must not move the cursor"
         );
 
@@ -5170,8 +5255,8 @@ mod tests {
             .expect("re-enabled state must exist");
         assert_eq!(second_epoch.activation_epoch, 2);
         assert_eq!(
-            second_epoch.cursor_source_id, 3,
-            "active and disabled-window history must be baselined on re-enable"
+            second_epoch.cursor_source_id, 0,
+            "active and disabled-window history must remain available on re-enable"
         );
 
         project_completed_source_turn(
@@ -5182,7 +5267,7 @@ mod tests {
             ENABLED_AT + 5,
         )
         .await;
-        assert!(
+        assert_eq!(
             store
                 .list_self_improvement_source_turns_after(
                     WORKSPACE,
@@ -5194,8 +5279,9 @@ mod tests {
                 )
                 .await
                 .expect("late-projected source lookup must succeed")
-                .is_empty(),
-            "a turn completed while disabled must stay excluded even if projected after re-enable"
+                .len(),
+            4,
+            "late-projected history and disabled-window history must be included"
         );
 
         supervisor
@@ -5220,8 +5306,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_startup_reconciliation_baselines_the_uncertain_window() {
-        let (_database, store, workspace_manager) = test_store().await;
+    async fn late_old_history_receives_recent_completed_tasks_as_context_not_new_anchors() {
+        let (database, store, workspace_manager) = test_store().await;
+        let provider = Arc::new(ScriptedLearningProvider::new());
+        provider.set_responses([
+            r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+            r#"{"digestRevision":1,"observations":[]}"#.to_owned(),
+        ]);
+        let registry = Arc::new(ProviderRegistry::with_provider(
+            "learning",
+            provider.clone(),
+        ));
+        let supervisor = test_supervisor(
+            store.clone(),
+            registry,
+            workspace_manager,
+            GatewaySelfImprovementConfig {
+                enabled: true,
+                default_model: Some(GatewaySelfImprovementModelSelectionConfig {
+                    provider: "learning".into(),
+                    model: "learner".into(),
+                    reasoning_effort: None,
+                }),
+                reviewer_model: None,
+            },
+            1024 * 1024,
+        );
+        supervisor.reconcile_all(ENABLED_AT).await.unwrap();
+        project_completed_source_turn(
+            &store,
+            "recent_thread",
+            "recent_turn",
+            "Deploy through CI.",
+            ENABLED_AT + 1,
+        )
+        .await;
+        database.execute_unprepared(&format!("UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'recent_turn'; UPDATE turn_event SET created_at = datetime({}, 'unixepoch') WHERE turn_id = 'recent_turn' AND event_type != 'turn/completed'", ENABLED_AT, ENABLED_AT)).await.unwrap();
+        supervisor.wake_once(ENABLED_AT + 10).await.unwrap();
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(
+            store
+                .self_improvement_processed_history_date(WORKSPACE)
+                .await
+                .unwrap(),
+            Some(ENABLED_AT)
+        );
+        project_completed_source_turn(
+            &store,
+            "old_thread",
+            "old_turn",
+            "Deploy manually.",
+            ENABLED_AT - 31_536_000,
+        )
+        .await;
+        database.execute_unprepared(&format!("UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'old_turn'; UPDATE turn_event SET created_at = datetime({}, 'unixepoch') WHERE turn_id = 'old_turn' AND event_type != 'turn/completed'", ENABLED_AT - 31_536_001, ENABLED_AT - 31_536_001)).await.unwrap();
+        supervisor.wake_once(ENABLED_AT + 86_400).await.unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let input: serde_json::Value = serde_json::from_str(
+            &requests[1]
+                .messages
+                .iter()
+                .find(|message| message.role == Role::User)
+                .unwrap()
+                .content,
+        )
+        .unwrap();
+        let threads = input["history"]["threads"].as_array().unwrap();
+        let turns = threads
+            .iter()
+            .flat_map(|thread| thread["turns"].as_array().unwrap())
+            .collect::<Vec<_>>();
+        for (turn_id, role, date) in [
+            ("old_turn", "new_anchor", ENABLED_AT - 31_536_001),
+            ("recent_turn", "context_only", ENABLED_AT),
+        ] {
+            let turn = turns
+                .iter()
+                .find(|turn| turn["turn_id"] == turn_id)
+                .unwrap();
+            assert!(turn["blocks"].as_array().unwrap().iter().all(|block| {
+                block["evidence_role"] == role
+                    && block["event_created_at_unix"]
+                        .as_i64()
+                        .is_some_and(|value| (date..=date + 1).contains(&value))
+            }));
+        }
+        assert_eq!(
+            store
+                .self_improvement_processed_history_date(WORKSPACE)
+                .await
+                .unwrap(),
+            Some(ENABLED_AT)
+        );
+        assert!(
+            store
+                .list_active_agent_skill_versions(WORKSPACE)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_startup_automatically_learns_pre_activation_history() {
+        let (database, store, workspace_manager) = test_store().await;
         project_completed_source_turn(
             store.as_ref(),
             "thread_uncertain_startup",
@@ -5230,6 +5419,11 @@ mod tests {
             ENABLED_AT,
         )
         .await;
+        // The old private-thread filter never indexed this otherwise valid completion.
+        database
+            .execute_unprepared("DELETE FROM self_improvement_source_turn")
+            .await
+            .expect("legacy missing source fixture must apply");
         let provider = Arc::new(ScriptedLearningProvider::new());
         let registry = Arc::new(ProviderRegistry::with_provider(
             "learning",
@@ -5262,8 +5456,8 @@ mod tests {
             .expect("startup state must exist");
         assert_eq!(state.activation_epoch, 1);
         assert_eq!(
-            state.cursor_source_id, 1,
-            "uncertain-window history must enter the privacy-safe startup baseline"
+            state.cursor_source_id, 0,
+            "startup must preserve previously unprocessed workspace history"
         );
         assert_eq!(state.effective_enabled_at_unix, Some(ENABLED_AT + 1));
 
@@ -5272,16 +5466,16 @@ mod tests {
             .await
             .expect("post-reconciliation wake must be safe");
         assert!(
-            provider.requests().is_empty(),
-            "startup-baselined history must never be sent retroactively"
+            !provider.requests().is_empty(),
+            "old history must be learned without a separate user action"
         );
         assert!(
             store
-                .get_oldest_unresolved_self_improvement_run(WORKSPACE, state.activation_epoch)
+                .get_latest_self_improvement_run(WORKSPACE, state.activation_epoch)
                 .await
                 .expect("startup run lookup must succeed")
-                .is_none(),
-            "startup baseline must not create a run"
+                .is_some(),
+            "historical learning must create a normal run"
         );
         assert!(
             supervisor

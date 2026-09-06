@@ -281,7 +281,7 @@ mod tests {
         let mut run = run();
         run.analysis_cursor_json = Some(
             serde_json::json!({
-                "schemaVersion": 2, "sourceLowerExclusive": 0, "sourceUpperInclusive": 1,
+                "schemaVersion": 3, "sourceLowerExclusive": 0, "sourceUpperInclusive": 1,
                 "planFingerprint": "plan", "chunkCount": 101, "nextChunkIndex": 24,
                 "validatedChunkCount": 24,
             })

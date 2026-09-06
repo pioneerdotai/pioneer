@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use pioneer_entity::{
-    self_improvement_source_turn, task, task_delivery, task_result_candidate, task_run,
-    task_run_conversation_snapshot, task_run_thread_binding, task_run_turn, thread, thread_lineage,
-    turn,
+    self_improvement_run, self_improvement_source_turn, task, task_delivery, task_result_candidate,
+    task_run, task_run_conversation_snapshot, task_run_thread_binding, task_run_turn, thread,
+    thread_lineage, turn,
 };
 use pioneer_protocol::{
     ItemCompletedNotification, TASK_COMPOSER_WORK_VERSION, TaskDeliveryMode, TaskMetadata,
@@ -12,7 +12,7 @@ use pioneer_protocol::{
     task_delivery_id_from_result_item_id,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, OnConflict, Query};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect, Set,
 };
@@ -30,7 +30,6 @@ use crate::convention::{
     thread_sidebar_visibility_to_db, turn_kind_from_db, turn_kind_to_db, turn_origin_from_db,
     turn_origin_to_db, turn_status_from_db, turn_status_to_db,
 };
-use crate::util::unix_to_datetime;
 
 #[derive(Debug)]
 pub(crate) struct VerifiedCollaborativeExchange {
@@ -41,12 +40,44 @@ pub(crate) struct VerifiedCollaborativeExchange {
     pub accepted_task_run_turn_id: Option<String>,
 }
 
+/// Chronological reference for backfill. Source IDs represent discovery order, not
+/// message age. Use the original user turn date of successfully analyzed tasks.
+/// A single aggregate row is materialized; no history payload is read here.
+pub(crate) async fn processed_history_date<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Option<i64>> {
+    let source_date = Func::max(
+        Expr::from(Func::cust(Alias::new("strftime")).args([
+            Expr::val("%s"),
+            Expr::col((turn::Entity, turn::Column::CreatedAt)),
+        ]))
+        .cast_as(Alias::new("INTEGER")),
+    );
+    self_improvement_source_turn::Entity::find()
+        .select_only()
+        .column_as(Expr::from(source_date), "source_date")
+        .join(
+            JoinType::InnerJoin,
+            self_improvement_source_turn::Entity::belongs_to(turn::Entity)
+                .from(self_improvement_source_turn::Column::TurnId)
+                .to(turn::Column::Id)
+                .into(),
+        )
+        .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id))
+        .filter(processed_source_predicate())
+        .into_tuple::<Option<i64>>()
+        .one(db)
+        .await?
+        .context("missing processed history date aggregate")
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedSelfImprovementSourceTurn {
     row: self_improvement_source_turn::ActiveModel,
     workspace_id: String,
     thread_id: String,
-    turn_id: String,
+    pub(super) turn_id: String,
     task_delivery_id: Option<String>,
     terminal_event_id: String,
     parent_turn_created_at_unix: i64,
@@ -644,11 +675,56 @@ pub async fn contains_source_id<C: ConnectionTrait>(
         .is_some())
 }
 
+// Completed ranges are the durable consumption ledger, including previous activation epochs.
+// Backfill can rewind over holes without turning already-consumed sources into new anchors.
+pub(super) fn processed_source_predicate() -> Expr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::val(1))
+            .from(self_improvement_run::Entity)
+            .and_where(
+                Expr::col((
+                    self_improvement_run::Entity,
+                    self_improvement_run::Column::WorkspaceId,
+                ))
+                .equals((
+                    self_improvement_source_turn::Entity,
+                    self_improvement_source_turn::Column::WorkspaceId,
+                )),
+            )
+            .and_where(
+                self_improvement_run::Column::Status
+                    .eq(super::self_improvement_run::STATUS_COMPLETED),
+            )
+            .and_where(
+                Expr::col((
+                    self_improvement_run::Entity,
+                    self_improvement_run::Column::SourceLowerExclusive,
+                ))
+                .lt(Expr::col((
+                    self_improvement_source_turn::Entity,
+                    self_improvement_source_turn::Column::Id,
+                ))),
+            )
+            .and_where(
+                Expr::col((
+                    self_improvement_run::Entity,
+                    self_improvement_run::Column::SourceUpperInclusive,
+                ))
+                .gte(Expr::col((
+                    self_improvement_source_turn::Entity,
+                    self_improvement_source_turn::Column::Id,
+                ))),
+            )
+            .to_owned(),
+    )
+}
+
 pub async fn list_after_cursor<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     cursor_source_id: i64,
-    effective_enabled_at_unix: i64,
+    _effective_enabled_at_unix: i64,
     limit: u64,
 ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
     if cursor_source_id < 0 {
@@ -676,10 +752,7 @@ pub async fn list_after_cursor<C: ConnectionTrait>(
         )
         .filter(thread::Column::OriginKind.is_in(source_origins()))
         .filter(self_improvement_source_turn::Column::Id.gt(cursor_source_id))
-        .filter(
-            self_improvement_source_turn::Column::TerminalAt
-                .gte(unix_to_datetime(effective_enabled_at_unix)),
-        )
+        .filter(processed_source_predicate().not())
         .order_by_asc(self_improvement_source_turn::Column::Id)
         .limit(limit)
         .all(db)
@@ -690,12 +763,56 @@ pub async fn list_after_cursor<C: ConnectionTrait>(
     records_from_models(db, workspace_id, rows).await
 }
 
+/// A small, deterministic corroboration sample, not a second set of new anchors.
+/// Completed runs cannot change while a workspace has an unresolved claimed run.
+pub(crate) async fn recent_processed_sources<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
+    let rows = self_improvement_source_turn::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            self_improvement_source_turn::Entity::belongs_to(thread::Entity)
+                .from(self_improvement_source_turn::Column::ThreadId)
+                .to(thread::Column::Id)
+                .into(),
+        )
+        .join(
+            JoinType::InnerJoin,
+            self_improvement_source_turn::Entity::belongs_to(turn::Entity)
+                .from(self_improvement_source_turn::Column::TurnId)
+                .to(turn::Column::Id)
+                .into(),
+        )
+        .filter(self_improvement_source_turn::Column::WorkspaceId.eq(workspace_id))
+        .filter(thread::Column::WorkspaceId.eq(workspace_id))
+        .filter(thread::Column::AccessClass.is_in(source_access_classes()))
+        .filter(
+            thread::Column::SidebarVisibility.eq(thread_sidebar_visibility_to_db(
+                ThreadSidebarVisibility::Visible,
+            )),
+        )
+        .filter(thread::Column::OriginKind.is_in(source_origins()))
+        .filter(turn::Column::Status.eq(turn_status_to_db(TurnStatus::Completed)))
+        .filter(turn::Column::TurnKind.eq(turn_kind_to_db(TurnKind::Conversation)))
+        .filter(turn::Column::Origin.eq(turn_origin_to_db(TurnOrigin::User)))
+        .filter(processed_source_predicate())
+        .order_by_desc(turn::Column::CreatedAt)
+        .order_by_desc(self_improvement_source_turn::Column::Id)
+        .limit(8)
+        .all(db)
+        .await?;
+    let mut records = records_from_models(db, workspace_id, rows).await?;
+    records.sort_by_key(|source| source.id);
+    Ok(records)
+}
+
 pub async fn list_frozen_range<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,
     source_lower_exclusive: i64,
     source_upper_inclusive: i64,
-    effective_enabled_at_unix: i64,
+    _effective_enabled_at_unix: i64,
 ) -> Result<Vec<SelfImprovementSourceTurnRecord>> {
     if workspace_id.trim().is_empty() {
         bail!("self-improvement frozen source workspace_id must not be empty");
@@ -723,10 +840,7 @@ pub async fn list_frozen_range<C: ConnectionTrait>(
         .filter(thread::Column::OriginKind.is_in(source_origins()))
         .filter(self_improvement_source_turn::Column::Id.gt(source_lower_exclusive))
         .filter(self_improvement_source_turn::Column::Id.lte(source_upper_inclusive))
-        .filter(
-            self_improvement_source_turn::Column::TerminalAt
-                .gte(unix_to_datetime(effective_enabled_at_unix)),
-        )
+        .filter(processed_source_predicate().not())
         .order_by_asc(self_improvement_source_turn::Column::Id)
         .all(db)
         .await

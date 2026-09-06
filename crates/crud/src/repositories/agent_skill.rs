@@ -23,6 +23,7 @@ pub(super) struct NewAgentSkill {
 
 #[derive(Debug, Clone)]
 pub(super) struct NewAgentSkillVersion {
+    pub evidence_latest_at_unix: Option<i64>,
     pub id: String,
     pub skill_id: SkillId,
     pub version_number: i64,
@@ -40,6 +41,7 @@ pub(super) struct NewAgentSkillVersion {
 
 #[derive(Debug, Clone)]
 pub(super) struct PreparedAgentSkillVersion {
+    pub evidence_latest_at_unix: Option<i64>,
     pub id: String,
     pub skill_id: SkillId,
     pub version_number: i64,
@@ -74,6 +76,7 @@ pub(super) fn prepare_agent_skill_version(
         );
     }
     Ok(PreparedAgentSkillVersion {
+        evidence_latest_at_unix: input.evidence_latest_at_unix,
         id: input.id,
         skill_id: input.skill_id,
         version_number: input.version_number,
@@ -503,6 +506,7 @@ async fn insert_logical_skill<C: ConnectionTrait>(
 ) -> Result<()> {
     validate_identity(input.workspace_id.as_str(), input.slug.as_str())?;
     agent_skill::ActiveModel {
+        evidence_latest_at_unix: Set(None),
         id: Set(input.skill_id.as_str().to_owned()),
         workspace_id: Set(input.workspace_id),
         slug: Set(input.slug),
@@ -540,6 +544,7 @@ async fn insert_immutable_version<C: ConnectionTrait>(
         when_not_to_use: Set(input.when_not_to_use),
         fingerprint: Set(input.fingerprint),
         source_turn_ids_json: Set(input.source_turn_ids_json),
+        evidence_latest_at_unix: Set(input.evidence_latest_at_unix),
         created_at: Set(now),
     }
     .insert(db)
@@ -698,10 +703,12 @@ fn active_record_from_models(
     })?;
 
     Ok(AgentSkillVersionSnapshotRecord {
+        lifecycle_evidence_latest_at_unix: skill.evidence_latest_at_unix,
         skill_id,
         workspace_id: skill.workspace_id,
         slug: skill.slug,
         version: AgentSkillVersionRecord {
+            evidence_latest_at_unix: version.evidence_latest_at_unix,
             id: version.id,
             version_number: version.version_number,
             source_run_id: version.source_run_id,
@@ -770,6 +777,7 @@ mod tests {
         fingerprint: &str,
     ) -> PreparedAgentSkillVersion {
         prepare_agent_skill_version(NewAgentSkillVersion {
+            evidence_latest_at_unix: None,
             id: id.to_owned(),
             skill_id: skill(skill_id),
             version_number,

@@ -936,7 +936,10 @@ fn hydrate_legacy_turn_start_actor(
     Ok(())
 }
 
-fn decode_event(row: turn_event::Model, workspace_id: &str) -> Result<CanonicalTurnEventRecord> {
+pub(super) fn decode_event(
+    row: turn_event::Model,
+    workspace_id: &str,
+) -> Result<CanonicalTurnEventRecord> {
     let mut payload = serde_json::from_str::<CanonicalTurnEventPayload>(row.payload.as_str())
         .with_context(|| format!("failed to decode canonical turn event `{}`", row.id))?;
     if payload.workspace_id() != workspace_id

@@ -17,6 +17,207 @@ const VERSION_ID: &str = "111111111111111111111";
 const VERSION_2_ID: &str = "222222222222222222222";
 const VERSION_3_ID: &str = "333333333333333333333";
 
+#[tokio::test]
+async fn old_discovery_cannot_overwrite_processed_chronology_and_rejection_is_idempotent() {
+    let (database, store) = setup().await;
+    let store = store.with_maintenance_access();
+    database
+        .execute_unprepared(&format!(
+            "UPDATE turn SET created_at = datetime({}, 'unixepoch')",
+            NOW - 10
+        ))
+        .await
+        .unwrap();
+    let first = claimed_input(&store).await;
+    store
+        .finalize_self_improvement_run(first, NOW + 3)
+        .await
+        .unwrap();
+    let active = store
+        .list_active_agent_skill_versions(WORKSPACE)
+        .await
+        .unwrap();
+    assert_eq!(active[0].version.evidence_latest_at_unix, Some(NOW));
+    assert_eq!(active[0].lifecycle_evidence_latest_at_unix, Some(NOW));
+    assert_ne!(active[0].version.created_at_unix, NOW);
+    assert_eq!(
+        store
+            .self_improvement_processed_history_date(WORKSPACE)
+            .await
+            .unwrap(),
+        Some(NOW - 10)
+    );
+    assert_eq!(
+        store
+            .self_improvement_processed_history_date("other-workspace")
+            .await
+            .unwrap(),
+        None
+    );
+    let old_id = append_anchor(&database, "late_old_turn").await;
+    database
+        .execute_unprepared(&format!(
+            "UPDATE turn SET created_at = datetime({}, 'unixepoch') WHERE id = 'late_old_turn'",
+            NOW - 1_000
+        ))
+        .await
+        .unwrap();
+    let mut create = accepted_create();
+    create.skill_id = SkillId::new("BBBBBBBBBBBBBBBBBBBBB").unwrap();
+    create.version_id = VERSION_2_ID.into();
+    create.slug = "obsolete-practice".into();
+    create.candidate_key = "late-old-candidate".into();
+    create.fingerprint = "b".repeat(64);
+    create.source_turn_ids = vec![CONTEXT_TURN.into(), "late_old_turn".into()];
+    create.evidence_time = Some(pioneer_crud::AgentSkillEvidenceTime {
+        confirmed_at_unix: NOW - 1_000,
+        latest_at_unix: NOW - 1_000,
+    });
+    let input = claimed_action_input(
+        &store,
+        "2030-03-04",
+        1,
+        old_id,
+        SelfImprovementFinalOutcome::AcceptedCreate(create),
+        NOW + 4,
+    )
+    .await;
+    assert_eq!(
+        store
+            .finalize_self_improvement_run(input.clone(), NOW + 6)
+            .await
+            .unwrap(),
+        FinalizeSelfImprovementRunResult::NoChange {
+            reason: SelfImprovementNoChangeReason::HostValidationRejected
+        }
+    );
+    assert_eq!(
+        store
+            .finalize_self_improvement_run(input, NOW + 7)
+            .await
+            .unwrap(),
+        FinalizeSelfImprovementRunResult::AlreadyFinalized
+    );
+    assert_eq!(
+        store
+            .list_active_agent_skill_versions(WORKSPACE)
+            .await
+            .unwrap(),
+        active
+    );
+    assert_eq!(
+        store
+            .self_improvement_processed_history_date(WORKSPACE)
+            .await
+            .unwrap(),
+        Some(NOW - 10)
+    );
+    let context = store
+        .recent_processed_self_improvement_sources(WORKSPACE)
+        .await
+        .unwrap();
+    assert_eq!(context.len(), 3);
+    assert!(
+        store
+            .recent_processed_self_improvement_sources("other-workspace")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20260906_000002_self_improvement_history_backfill")
+        .unwrap();
+    let manager = migration::SchemaManager::new(&database);
+    migration.up(&manager).await.unwrap();
+    migration.up(&manager).await.unwrap();
+    assert_eq!(
+        store
+            .list_active_agent_skill_versions(WORKSPACE)
+            .await
+            .unwrap(),
+        active
+    );
+}
+
+#[tokio::test]
+async fn combined_history_migration_supports_repeated_down_and_up() {
+    let (database, _store) = setup().await;
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20260906_000002_self_improvement_history_backfill")
+        .unwrap();
+    let manager = migration::SchemaManager::new(&database);
+    let columns = [
+        (
+            "self_improvement_workspace_state",
+            "history_backfill_after_event_id",
+        ),
+        (
+            "self_improvement_workspace_state",
+            "history_backfill_complete",
+        ),
+        ("agent_skill", "evidence_latest_at_unix"),
+        ("agent_skill_version", "evidence_latest_at_unix"),
+    ];
+    for _ in 0..2 {
+        migration.down(&manager).await.unwrap();
+        for (table, column) in columns {
+            assert!(!manager.has_column(table, column).await.unwrap());
+        }
+        assert!(
+            !manager
+                .has_index(
+                    "self_improvement_run",
+                    "idx_self_improvement_completed_ranges"
+                )
+                .await
+                .unwrap()
+        );
+    }
+    for _ in 0..2 {
+        migration.up(&manager).await.unwrap();
+        for (table, column) in columns {
+            assert!(manager.has_column(table, column).await.unwrap());
+        }
+        assert!(
+            manager
+                .has_index(
+                    "self_improvement_run",
+                    "idx_self_improvement_completed_ranges"
+                )
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_temporal_proof_does_not_create_a_skill() {
+    let (_database, store) = setup().await;
+    let mut input = claimed_input(&store).await;
+    let SelfImprovementFinalOutcome::AcceptedCreate(create) = &mut input.outcome else {
+        unreachable!()
+    };
+    create.evidence_time = None;
+    assert_eq!(
+        store
+            .finalize_self_improvement_run(input, NOW + 3)
+            .await
+            .unwrap(),
+        FinalizeSelfImprovementRunResult::NoChange {
+            reason: SelfImprovementNoChangeReason::HostValidationRejected
+        }
+    );
+    assert!(
+        store
+            .list_active_agent_skill_versions(WORKSPACE)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 async fn setup() -> (DatabaseConnection, CrudStore) {
     let database = Database::connect("sqlite::memory:")
         .await
@@ -100,6 +301,10 @@ fn authority() -> SelfImprovementFinalizationAuthority {
 
 fn accepted_create() -> AcceptedAgentSkillCreate {
     AcceptedAgentSkillCreate {
+        evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+            confirmed_at_unix: NOW,
+            latest_at_unix: NOW,
+        }),
         skill_id: SkillId::new(SKILL_ID).expect("valid skill id"),
         version_id: VERSION_ID.to_owned(),
         slug: "stable-procedure".to_owned(),
@@ -354,6 +559,10 @@ async fn accepted_update_and_exact_parent_rollback_share_terminal_transaction() 
     let update_anchor = "turn_update_anchor";
     let update_upper = append_anchor(&database, update_anchor).await;
     let update = AcceptedAgentSkillUpdate {
+        evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+            confirmed_at_unix: NOW,
+            latest_at_unix: NOW,
+        }),
         skill_id: SkillId::new(SKILL_ID).expect("valid skill id"),
         expected_active_version_id: VERSION_ID.to_owned(),
         version_id: VERSION_2_ID.to_owned(),
@@ -433,6 +642,10 @@ async fn accepted_update_and_exact_parent_rollback_share_terminal_transaction() 
         update_upper,
         rollback_upper,
         SelfImprovementFinalOutcome::AcceptedRollback(AcceptedAgentSkillRollback {
+            evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+                confirmed_at_unix: NOW + 1,
+                latest_at_unix: NOW + 1,
+            }),
             skill_id: SkillId::new(SKILL_ID).expect("valid skill id"),
             expected_active_version_id: VERSION_2_ID.to_owned(),
             target_parent_version_id: VERSION_ID.to_owned(),
@@ -466,6 +679,8 @@ async fn accepted_update_and_exact_parent_rollback_share_terminal_transaction() 
         .expect("restored active version");
     assert_eq!(restored[0].version.id, VERSION_ID);
     assert_eq!(restored[0].version.display_name, "Stable procedure");
+    assert_eq!(restored[0].version.evidence_latest_at_unix, Some(NOW));
+    assert_eq!(restored[0].lifecycle_evidence_latest_at_unix, Some(NOW + 1));
     assert_eq!(
         scalar_i64(
             &database,
@@ -507,6 +722,10 @@ async fn accepted_update_and_exact_parent_rollback_share_terminal_transaction() 
         rollback_upper,
         post_rollback_upper,
         SelfImprovementFinalOutcome::AcceptedUpdate(AcceptedAgentSkillUpdate {
+            evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+                confirmed_at_unix: NOW + 2,
+                latest_at_unix: NOW + 2,
+            }),
             skill_id: SkillId::new(SKILL_ID).expect("valid skill id"),
             expected_active_version_id: VERSION_ID.to_owned(),
             version_id: VERSION_3_ID.to_owned(),
@@ -579,6 +798,10 @@ async fn late_terminal_failure_rolls_back_update_version_pointer_run_and_cursor(
         1,
         update_upper,
         SelfImprovementFinalOutcome::AcceptedUpdate(AcceptedAgentSkillUpdate {
+            evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+                confirmed_at_unix: NOW,
+                latest_at_unix: NOW,
+            }),
             skill_id: SkillId::new(SKILL_ID).expect("valid skill id"),
             expected_active_version_id: VERSION_ID.to_owned(),
             version_id: VERSION_2_ID.to_owned(),
@@ -660,6 +883,10 @@ async fn current_fingerprint_update_is_atomic_terminal_no_change() {
         1,
         upper,
         SelfImprovementFinalOutcome::AcceptedUpdate(AcceptedAgentSkillUpdate {
+            evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+                confirmed_at_unix: NOW,
+                latest_at_unix: NOW,
+            }),
             skill_id: SkillId::new(SKILL_ID).expect("valid skill id"),
             expected_active_version_id: VERSION_ID.to_owned(),
             version_id: VERSION_2_ID.to_owned(),
