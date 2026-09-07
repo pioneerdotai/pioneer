@@ -816,6 +816,10 @@ impl ClientCore {
             drafts.extend(registry.retire_summary(&id));
         }
         let current_principal_id = registry.current_principal_id.clone();
+        // Clear directory contents while retaining its publication/lifecycle fences.
+        // Restarting at revision one would reject the next thread + tree transaction.
+        let mut directory = std::mem::take(&mut registry.directory);
+        directory.invalidate();
         let presentation_revisions = std::mem::take(&mut registry.presentation_revisions);
         let retired = std::mem::take(&mut registry.retired);
         let retired_timelines = std::mem::take(&mut registry.retired_timelines);
@@ -830,6 +834,7 @@ impl ClientCore {
         let navigation_publication = registry.navigation_publication.take();
         *registry = ThreadRegistry {
             current_principal_id,
+            directory,
             presentation_revisions,
             clock,
             revisions,
