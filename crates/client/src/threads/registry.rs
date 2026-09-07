@@ -304,14 +304,15 @@ impl ThreadRegistry {
             ),
             snapshot.clone(),
         )];
-        let mut thread_summary = store.coordinator.thread().cloned();
-        if let Some(thread) = &mut thread_summary {
-            thread.turns.clear();
-        }
+        let thread_summary = store
+            .coordinator
+            .thread()
+            .cloned()
+            .map(crate::workspaces::directory::thread_directory_summary);
         let summary = SidebarSummaryChanged {
             thread_id: id.to_owned(),
             workspace_id: store.coordinator.workspace_id.clone(),
-            thread: thread_summary,
+            thread: thread_summary.clone(),
             placement: self.directory.placements.get(id).cloned(),
         };
         if self.directory.summaries.get(id) != Some(&summary) {
@@ -329,8 +330,7 @@ impl ThreadRegistry {
             ));
             self.directory.summaries.insert(id.to_owned(), summary);
         }
-        if let Some(mut thread) = store.coordinator.thread().cloned() {
-            thread.turns.clear();
+        if let Some(thread) = thread_summary {
             self.directory.threads.insert(id.to_owned(), thread);
         }
         self.retired.remove(id);
