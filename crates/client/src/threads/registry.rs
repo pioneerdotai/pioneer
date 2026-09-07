@@ -308,7 +308,15 @@ impl ThreadRegistry {
             .coordinator
             .thread()
             .cloned()
-            .map(crate::workspaces::directory::thread_directory_summary);
+            .map(|thread| {
+                let mut summary = crate::workspaces::directory::thread_directory_summary(thread);
+                if summary.turns.is_empty() {
+                    summary
+                        .turns
+                        .extend(store.coordinator.last_known_turn().cloned());
+                }
+                summary
+            });
         let summary = SidebarSummaryChanged {
             thread_id: id.to_owned(),
             workspace_id: store.coordinator.workspace_id.clone(),

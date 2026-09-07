@@ -880,6 +880,62 @@ mod tests {
     }
 
     #[test]
+    fn composer_defaults_survive_open_response_without_historical_turns() {
+        use crate::composer::model_selection::ComposerModelSelection;
+        let core = ClientCore::new();
+        let mut docs = conversation_thread("docs", "a", 10, Some("max"));
+        docs.model_provider = "cli_runtime:codex".into();
+        docs.model = "gpt-5.6-luna".into();
+        // Production Docs/Changle log end in TaskRun markers. They are not
+        // copied into the legacy Conversation projection when metadata loads.
+        for turn in &mut docs.turns {
+            turn.turn_kind = pioneer_protocol::TurnKind::TaskRun;
+        }
+        let mut latest = conversation_thread("latest", "a", 20, Some("high"));
+        latest.model_provider = "cli_runtime:codex".into();
+        latest.model = "gpt-6-astra".into();
+        load_directory(&core, "a", vec![docs.clone(), latest.clone()]);
+        let expected = ComposerModelSelection::from_thread(&docs);
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+
+        // Opening a persisted thread returns only the runtime's turns, which
+        // are empty on a cold gateway, although the directory knows its history.
+        let mut opened = docs.clone();
+        opened.turns.clear();
+        core.upsert_thread(opened.clone());
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+        assert!(
+            core.thread_snapshot("docs")
+                .unwrap()
+                .coordinator()
+                .thread()
+                .unwrap()
+                .turns
+                .is_empty(),
+            "historical evidence must not become runtime turns"
+        );
+        assert_eq!(
+            selected_model(&core, None, "a"),
+            ComposerModelSelection::from_thread(&latest)
+        );
+
+        // The opening notification and later metadata refresh have the same
+        // omission. History eviction must also keep the directory's evidence.
+        core.upsert_thread(opened);
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+        for index in 0..80 {
+            core.upsert_thread(thread(&format!("empty-{index}"), "a", 100 + index));
+        }
+        assert!(core.thread_snapshot("docs").is_none());
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+        core.remove_thread_store("docs");
+        assert_eq!(
+            selected_model(&core, Some("docs"), "a"),
+            ComposerModelSelection::from_thread(&latest)
+        );
+    }
+
+    #[test]
     fn composer_defaults_survive_history_eviction_but_not_thread_removal() {
         use crate::composer::model_selection::ComposerModelSelection;
         let core = ClientCore::new();

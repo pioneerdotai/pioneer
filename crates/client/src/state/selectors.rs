@@ -199,7 +199,9 @@ pub fn composer_model_selection_candidates_from(
 }
 
 fn thread_has_known_turns(coordinator: &ThreadCoordinator, thread: &Thread) -> bool {
-    !thread.turns.is_empty() || !coordinator.conversation.projection().turns.is_empty()
+    !thread.turns.is_empty()
+        || coordinator.last_known_turn().is_some()
+        || !coordinator.conversation.projection().turns.is_empty()
 }
 
 pub fn thread_folders_for_workspace<'a>(

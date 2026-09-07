@@ -228,3 +228,95 @@ impl PioneerDesktop {
         )
     }
 }
+
+#[cfg(test)]
+mod default_model_navigation_tests {
+    use super::PioneerDesktop;
+    use gpui_kit::{AppContext, TestAppContext};
+    use pioneer_client::composer::state_machine::ComposerDomainAction;
+    use pioneer_protocol::{Thread, ThreadMode};
+
+    fn thread(id: &str, model: &str, effort: &str, updated_at: i64) -> Thread {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "workspace_id": "workspace", "preview": "", "mode": "Chat",
+            "model": model, "model_provider": "cli_runtime:codex",
+            "reasoning_effort": effort, "created_at": 1, "updated_at": updated_at,
+            "status": "Idle", "turns": [{
+                "id": format!("{id}-last-turn"), "status": "Completed", "turn_kind": "task_run",
+                "mode": "Chat", "permission_profile": pioneer_protocol::default_turn_permission_profile_snapshot()
+            }]
+        })).unwrap()
+    }
+
+    fn check_navigation(cx: &mut TestAppContext, publication_first: bool) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+        let (desktop, cx) = cx.add_window_view(|window, cx| {
+            let registrar = cx
+                .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                .registrar();
+            let navigation =
+                crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+            let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+            PioneerDesktop::new(
+                window,
+                cx,
+                pioneer_observability::DesktopStartupTrace::start(),
+                navigation,
+                layout,
+            )
+        });
+        cx.update(|window, cx| {
+            desktop.update(cx, |desktop, cx| {
+                let core = desktop.gateway.client_runtime.client_core().clone();
+                let docs = thread("docs", "gpt-5.6-luna", "max", 10);
+                let changelog = thread("changelog", "gpt-5.6-luna", "xhigh", 20);
+                let newest = thread("newest", "gpt-6-astra", "high", 30);
+                for thread in [&docs, &changelog, &newest] {
+                    core.upsert_thread(thread.clone());
+                }
+                desktop.reduce_composer_domain(ComposerDomainAction::SetModeFromUser {
+                    mode: ThreadMode::Chat,
+                });
+                for target in [&newest, &docs, &changelog, &docs, &newest, &changelog] {
+                    core.navigate(
+                        pioneer_client::navigation::NavigationIntent::SelectThread {
+                            workspace_id: Some("workspace".into()),
+                            thread_id: Some(target.id.clone()),
+                        },
+                        None,
+                    );
+                    if publication_first {
+                        desktop.apply_navigation_publication(core.navigation_snapshot(), cx);
+                    }
+                    desktop.present_workspace_thread(Some(target.id.clone()), window, cx);
+                    let mut opened = target.clone();
+                    opened.turns.clear();
+                    core.upsert_thread(opened);
+                    desktop.sync_composer_model_selection_for_active_thread();
+                    assert_eq!(
+                        desktop.composer_selected_model.as_deref(),
+                        Some(target.model.as_str()),
+                        "{}",
+                        target.id
+                    );
+                    assert_eq!(
+                        desktop.composer_selected_reasoning_effort, target.reasoning_effort,
+                        "{}",
+                        target.id
+                    );
+                }
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn task_turn_defaults_survive_sidebar_navigation(cx: &mut TestAppContext) {
+        check_navigation(cx, false);
+    }
+
+    #[gpui_kit::test]
+    fn task_turn_defaults_survive_navigation_publication_first(cx: &mut TestAppContext) {
+        check_navigation(cx, true);
+    }
+}
