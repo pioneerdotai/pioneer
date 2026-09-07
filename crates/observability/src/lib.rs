@@ -26,9 +26,9 @@ mod desktop_gateway;
 mod metrics;
 mod operations;
 mod patch_telemetry;
+mod performance;
 #[cfg(feature = "qualification-diagnostics")]
 mod qualification_diagnostics;
-mod performance;
 mod startup;
 mod telemetry;
 
@@ -55,8 +55,6 @@ pub use operations::{
     GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard, GatewayProviderWarmupTrace,
 };
 pub use patch_telemetry::{PatchTelemetrySnapshot, register_patch_telemetry_snapshot_provider};
-#[cfg(feature = "qualification-diagnostics")]
-pub use qualification_diagnostics::*;
 pub use performance::{
     DesktopCodeHighlightCacheStatus, DesktopCodeHighlightFallbackReason,
     DesktopCodeHighlightMetric, DesktopCodeHighlightOutcome, DesktopCodeHighlightTheme,
@@ -66,6 +64,8 @@ pub use performance::{
     GatewayMarkdownStageMetric, GatewayMarkdownStreamKind, record_desktop_code_highlight,
     record_desktop_timeline_stage, record_gateway_markdown_message, record_gateway_markdown_stage,
 };
+#[cfg(feature = "qualification-diagnostics")]
+pub use qualification_diagnostics::*;
 pub use startup::{
     DesktopGatewayConnectFailureClass, DesktopPostUpdateContext, DesktopPostUpdateStage,
     DesktopPostUpdateStageGuard, DesktopStartupOutcome, DesktopStartupStage,

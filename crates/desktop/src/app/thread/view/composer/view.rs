@@ -735,9 +735,9 @@ impl PioneerDesktop {
                         crate::qualification_diagnostics::spinner!(
                             pioneer_observability::AnimationSourceId::ComposerAttachmentUpload,
                         )
-                            .with_size(gpui_kit::component::Size::Small)
-                            .color(status_color)
-                            .into_any_element()
+                        .with_size(gpui_kit::component::Size::Small)
+                        .color(status_color)
+                        .into_any_element()
                     } else {
                         Icon::new(status_icon)
                             .size_3()

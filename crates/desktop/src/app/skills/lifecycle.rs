@@ -15,7 +15,9 @@ const SKILLS_POLL_INTERVAL_SECS: u64 = 20;
 
 impl PioneerDesktop {
     pub(in crate::app) fn open_skills_screen_from_bottom_bar(&mut self, cx: &mut Context<Self>) {
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None },
+        );
         self.set_main_content_view(MainContentView::Skills, cx);
         self.ensure_skills_poller(cx);
         self.refresh_installed_skills(cx);
@@ -33,7 +35,11 @@ impl PioneerDesktop {
             return;
         }
 
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: Some(skill_id) });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSkillsRoute {
+                skill_id: Some(skill_id),
+            },
+        );
         self.set_main_content_view(MainContentView::SkillDetails, cx);
     }
 
@@ -227,7 +233,11 @@ impl PioneerDesktop {
         self.skills_management = reduction.management;
         self.skills_health_details = reduction.health_details;
         self.skills_pending_actions = reduction.pending_actions;
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: reduction.selected_target });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSkillsRoute {
+                skill_id: reduction.selected_target,
+            },
+        );
         self.skills_error = None;
 
         if reduction.selected_target_cleared {
@@ -245,7 +255,11 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn ensure_skills_poller(&mut self, cx: &mut Context<Self>) {
-        if self.navigation.activity(self.main_content_view(), self.window_active) != crate::desktop_navigation::RouteActivity::Active {
+        if self
+            .navigation
+            .activity(self.main_content_view(), self.window_active)
+            != crate::desktop_navigation::RouteActivity::Active
+        {
             return;
         }
         if self.skills_poller.is_some() {
@@ -256,19 +270,23 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 loop {
-                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_observability::AnimationSourceId::SkillsPoller,
-                        pioneer_observability::DiagnosticAction::Scheduled,
-                        pioneer_observability::Visibility::Global,
-                    ));
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::SkillsPoller,
+                            pioneer_observability::DiagnosticAction::Scheduled,
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
                     cx.background_executor()
                         .timer(Duration::from_secs(SKILLS_POLL_INTERVAL_SECS))
                         .await;
-                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_observability::AnimationSourceId::SkillsPoller,
-                        pioneer_observability::DiagnosticAction::Woke,
-                        pioneer_observability::Visibility::Global,
-                    ));
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::SkillsPoller,
+                            pioneer_observability::DiagnosticAction::Woke,
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if matches!(
@@ -288,11 +306,13 @@ impl PioneerDesktop {
                         }
                     });
                     if updated.is_err() {
-                        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                            pioneer_observability::AnimationSourceId::SkillsPoller,
-                            pioneer_observability::DiagnosticAction::Cancelled,
-                            pioneer_observability::Visibility::Global,
-                        ));
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::SkillsPoller,
+                                pioneer_observability::DiagnosticAction::Cancelled,
+                                pioneer_observability::Visibility::Global,
+                            )
+                        );
                         break;
                     }
                 }

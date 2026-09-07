@@ -156,13 +156,11 @@ impl RenderOnce for ProgressCircle {
                 }
 
                 let duration = Duration::from_secs_f64(0.15);
-                pioneer_observability::record_qualification_diagnostic!(
-                    record_animation_activity(
-                        pioneer_observability::AnimationSourceId::ProgressCircleTransition,
-                        pioneer_observability::DiagnosticAction::Scheduled,
-                        pioneer_observability::Visibility::NotApplicable,
-                    )
-                );
+                pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                    pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                    pioneer_observability::DiagnosticAction::Scheduled,
+                    pioneer_observability::Visibility::NotApplicable,
+                ));
                 cx.spawn({
                     let state = state.clone();
                     async move |cx| {
@@ -186,13 +184,11 @@ impl RenderOnce for ProgressCircle {
                 })
                 .detach();
 
-                pioneer_observability::record_qualification_diagnostic!(
-                    record_animation_activity(
-                        pioneer_observability::AnimationSourceId::ProgressCircleTransition,
-                        pioneer_observability::DiagnosticAction::Requested,
-                        pioneer_observability::Visibility::NotApplicable,
-                    )
-                );
+                pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
+                    pioneer_observability::AnimationSourceId::ProgressCircleTransition,
+                    pioneer_observability::DiagnosticAction::Requested,
+                    pioneer_observability::Visibility::NotApplicable,
+                ));
 
                 this.with_animation(
                     ("progress-circle-animation", previous_value.to_bits() as u64),

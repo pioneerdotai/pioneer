@@ -710,7 +710,11 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(in crate::app) fn cancel_desktop_voice_hold(&mut self, reason: &str, cx: &mut Context<Self>) {
+    pub(in crate::app) fn cancel_desktop_voice_hold(
+        &mut self,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(mut flow) = self.desktop_voice_capture.take()
             && let Err(error) = flow.release_cancel()
         {

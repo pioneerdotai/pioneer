@@ -508,18 +508,30 @@ impl RunningIndicatorViewCache {
         self.active = active;
         for entry in self.dino.values() {
             entry.view.update(cx, |view, cx| {
-                if view.suspended == !active { return; }
+                if view.suspended == !active {
+                    return;
+                }
                 view.suspended = !active;
-                if !active { view.clock_task.take(); view.clock_active = false; }
-                else { cx.notify(); }
+                if !active {
+                    view.clock_task.take();
+                    view.clock_active = false;
+                } else {
+                    cx.notify();
+                }
             });
         }
         for entry in self.elapsed.values() {
             entry.cached.view.update(cx, |view, cx| {
-                if view.suspended == !active { return; }
+                if view.suspended == !active {
+                    return;
+                }
                 view.suspended = !active;
-                if !active { view.clock_task.take(); view.clock_active = false; }
-                else { cx.notify(); }
+                if !active {
+                    view.clock_task.take();
+                    view.clock_active = false;
+                } else {
+                    cx.notify();
+                }
             });
         }
     }
@@ -689,9 +701,14 @@ mod tests {
     use std::time::Duration;
 
     #[gpui_kit::test]
-    fn warm_route_retains_clock_owner_but_cancels_work_until_remount(cx: &mut gpui_kit::TestAppContext) {
+    fn warm_route_retains_clock_owner_but_cancels_work_until_remount(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::{
+            CachedIndicatorView, RunningElapsedView, RunningElapsedViewEntry,
+            RunningIndicatorViewCache,
+        };
         use gpui_kit::AppContext;
-        use super::{CachedIndicatorView, RunningElapsedView, RunningElapsedViewEntry, RunningIndicatorViewCache};
         let weak = cx.update(|cx| {
             let mut cache = RunningIndicatorViewCache::default();
             cache.set_active(false, cx);
@@ -710,10 +727,17 @@ mod tests {
             });
             let identity = view.entity_id();
             let weak = view.downgrade();
-            cache.elapsed.insert("thread/turn".into(), RunningElapsedViewEntry {
-                started_at_unix_ms: 1_000, show_dino: false,
-                cached: CachedIndicatorView { view, last_used: std::time::Instant::now() },
-            });
+            cache.elapsed.insert(
+                "thread/turn".into(),
+                RunningElapsedViewEntry {
+                    started_at_unix_ms: 1_000,
+                    show_dino: false,
+                    cached: CachedIndicatorView {
+                        view,
+                        last_used: std::time::Instant::now(),
+                    },
+                },
+            );
             cache.set_active(false, cx);
             let retained = &cache.elapsed["thread/turn"].cached.view;
             assert_eq!(retained.entity_id(), identity);

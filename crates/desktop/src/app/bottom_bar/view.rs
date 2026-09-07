@@ -11,7 +11,11 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
-    pub(crate) fn render_bottom_bar(&self, action_region: &FocusHandle, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_bottom_bar(
+        &self,
+        action_region: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         pioneer_observability::record_qualification_diagnostic!(record_render(
             pioneer_observability::RenderRegion::BottomBar
         ));
@@ -60,7 +64,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenThreads, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenThreads, window, cx)
+                                }
+                            }),
                     )
                     .child(Separator::vertical().h_4().mx_0p5())
                     .child(
@@ -76,7 +85,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenProviders, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenProviders, window, cx)
+                                }
+                            }),
                     )
                     .when(can_manage_capabilities, |this| {
                         this.child(
@@ -92,7 +106,12 @@ impl PioneerDesktop {
                                             this.opacity(1.0).text_color(cx.theme().blue)
                                         }),
                                 )
-                                .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenMcp, window, cx) }),
+                                .on_click({
+                                    let target = action_region.clone();
+                                    move |_, window, cx| {
+                                        target.dispatch_action(&OpenMcp, window, cx)
+                                    }
+                                }),
                         )
                     })
                     .child(
@@ -108,7 +127,10 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenSkills, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| target.dispatch_action(&OpenSkills, window, cx)
+                            }),
                     )
                     .child(Separator::vertical().h_4().mx_0p5())
                     .child(
@@ -124,7 +146,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenAdministration, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenAdministration, window, cx)
+                                }
+                            }),
                     )
                     .child(
                         Button::new("bottom-bar-open-settings")
@@ -139,7 +166,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenSettings, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenSettings, window, cx)
+                                }
+                            }),
                     ),
             )
             .child(

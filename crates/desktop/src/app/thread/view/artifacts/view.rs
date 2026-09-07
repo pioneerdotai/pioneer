@@ -607,9 +607,9 @@ fn render_thread_artifact_action_status(
             crate::qualification_diagnostics::spinner!(
                 pioneer_observability::AnimationSourceId::ThreadArtifactAction,
             )
-                .icon(IconName::Loader)
-                .color(cx.theme().muted_foreground)
-                .into_any_element()
+            .icon(IconName::Loader)
+            .color(cx.theme().muted_foreground)
+            .into_any_element()
         })
         .child(
             div()

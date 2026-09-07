@@ -61,7 +61,11 @@ impl PioneerDesktop {
         }
         self.profile_editor = None;
         self.profile_editor_input_subscriptions.clear();
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSettingsRoute { route: content_view });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSettingsRoute {
+                route: content_view,
+            },
+        );
         self.self_improvement_status_poll = None;
 
         self.sync_settings_sidebar_tree_state(cx);
@@ -115,7 +119,11 @@ impl PioneerDesktop {
             .iter()
             .any(|(content_view, _)| *content_view == self.settings_content_view())
         {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSettingsRoute { route: SettingsContentView::Account });
+            self.navigation_intent(
+                pioneer_client::navigation::NavigationIntent::SetSettingsRoute {
+                    route: SettingsContentView::Account,
+                },
+            );
         }
         let selected_ix = items
             .iter()
@@ -790,19 +798,23 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 for _ in 0..REMOTE_ACCESS_STATUS_POLL_ATTEMPTS {
-                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_observability::AnimationSourceId::RemoteAccessPoller,
-                        pioneer_observability::DiagnosticAction::Scheduled,
-                        pioneer_observability::Visibility::Global,
-                    ));
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                            pioneer_observability::DiagnosticAction::Scheduled,
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
                     cx.background_executor()
                         .timer(REMOTE_ACCESS_STATUS_POLL_INTERVAL)
                         .await;
-                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_observability::AnimationSourceId::RemoteAccessPoller,
-                        pioneer_observability::DiagnosticAction::Woke,
-                        pioneer_observability::Visibility::Global,
-                    ));
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                            pioneer_observability::DiagnosticAction::Woke,
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if view.remote_access_status_poll_generation != generation {
@@ -842,11 +854,13 @@ impl PioneerDesktop {
                         _ => break,
                         #[cfg(feature = "qualification-diagnostics")]
                         _ => {
-                            pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                                pioneer_observability::AnimationSourceId::RemoteAccessPoller,
-                                pioneer_observability::DiagnosticAction::Cancelled,
-                                pioneer_observability::Visibility::Global,
-                            ));
+                            pioneer_observability::record_qualification_diagnostic!(
+                                record_animation_activity(
+                                    pioneer_observability::AnimationSourceId::RemoteAccessPoller,
+                                    pioneer_observability::DiagnosticAction::Cancelled,
+                                    pioneer_observability::Visibility::Global,
+                                )
+                            );
                             return;
                         }
                     }

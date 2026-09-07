@@ -56,8 +56,8 @@ impl PioneerDesktop {
                             crate::qualification_diagnostics::spinner!(
                                 pioneer_observability::AnimationSourceId::ComposerModelSelector,
                             )
-                                .with_size(gpui_kit::component::Size::Small)
-                                .color(cx.theme().muted_foreground),
+                            .with_size(gpui_kit::component::Size::Small)
+                            .color(cx.theme().muted_foreground),
                         )
                     })
                     .when(!loading, |this| {
