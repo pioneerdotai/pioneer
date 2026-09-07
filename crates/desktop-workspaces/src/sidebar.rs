@@ -108,6 +108,7 @@ impl ThreadSidebarView {
                     if let Some(workspace) = view.active_workspace_id() {
                         (view.save_expansion)(workspace, view.thread_folder_expanded.clone(), cx);
                     }
+                    cx.notify();
                 }
             },
         );
@@ -356,14 +357,6 @@ impl ThreadSidebarView {
                     .collect()
             })
             .unwrap_or_default()
-    }
-    pub fn toggle_thread_folder_expanded(&mut self, id: &str, cx: &mut Context<Self>) {
-        let expanded = self.thread_folder_expanded.entry(id.into()).or_default();
-        *expanded = !*expanded;
-        if let Some(workspace) = self.active_workspace_id() {
-            (self.save_expansion)(workspace, self.thread_folder_expanded.clone(), cx);
-        }
-        self.rebuild_sidebar_tree_state(cx);
     }
     pub fn workspace_by_id(&self, id: &str) -> Option<&Workspace> {
         self.catalog

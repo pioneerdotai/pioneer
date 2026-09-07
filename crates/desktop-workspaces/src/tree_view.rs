@@ -432,7 +432,8 @@ impl ThreadSidebarView {
                     let folder_click_listener = window.listener_for(
                         &desktop_entity,
                         move |view, _: &ClickEvent, _window, cx| {
-                            view.toggle_thread_folder_expanded(folder_id_for_click.as_str(), cx);
+                            // Tree already toggles expansion on mouse-down and
+                            // publishes it through TreeEvent. Click only selects.
                             view.set_thread_tree_selected_node_id(Some(folder_node_key(
                                 folder_id_for_click.as_str(),
                             )));
