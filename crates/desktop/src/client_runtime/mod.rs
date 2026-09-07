@@ -18,11 +18,32 @@ pub(crate) struct DesktopRuntimeCoordinator {
     storage_adapter: Option<DesktopSessionStorageAdapter>,
     _effect_router: Arc<DesktopPlatformEffectRouter>,
     _quit: Subscription,
+    #[cfg(test)]
+    pub(crate) skip_native_startup: bool,
 }
 
 impl Global for DesktopRuntimeCoordinator {}
 
 impl DesktopRuntimeCoordinator {
+    #[cfg(test)]
+    pub(crate) fn install_for_test(cx: &mut App) {
+        // Keep publications on GPUI's deterministic test executor; native client
+        // workers and the session storage thread belong to application startup.
+        let core = Arc::new(ClientCore::new());
+        let binding_router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));
+        let registrar = DesktopClientBindingRouter::registrar(&binding_router, &core, cx);
+        let quit = cx.on_app_quit(|_| async {});
+        cx.set_global(Self {
+            core,
+            binding_router,
+            registrar,
+            storage_adapter: None,
+            _effect_router: Arc::new(DesktopPlatformEffectRouter),
+            _quit: quit,
+            skip_native_startup: true,
+        });
+    }
+
     pub(crate) fn install(cx: &mut App) {
         if cx.has_global::<Self>() {
             return;
@@ -37,7 +58,9 @@ impl DesktopRuntimeCoordinator {
                 let _ = handle.update(cx, |root, window, cx| {
                     if let Ok(root) = root.clone().downcast::<gpui_kit::component::Root>() {
                         let content = root.read(cx).view().clone();
-                        if let Ok(shell) = content.downcast::<crate::desktop_shell::DesktopShellView>() {
+                        if let Ok(shell) =
+                            content.downcast::<crate::desktop_shell::DesktopShellView>()
+                        {
                             shell.update(cx, |shell, cx| shell.close(window, cx));
                         }
                     }
@@ -66,6 +89,8 @@ impl DesktopRuntimeCoordinator {
             storage_adapter: Some(storage_adapter),
             _effect_router: effect_router,
             _quit: quit,
+            #[cfg(test)]
+            skip_native_startup: false,
         });
     }
 
