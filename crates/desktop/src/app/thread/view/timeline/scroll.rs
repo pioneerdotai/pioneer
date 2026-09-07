@@ -1,109 +1,213 @@
 use super::*;
 use pioneer_client::threads::read::{MarkThreadReadContext, plan_mark_thread_read};
-impl PioneerDesktop {
-    pub(super) fn capture_timeline_scroll_anchor_before_semantic_update(
-        &self,
-        preserve_near_bottom: bool,
+
+/// Geometry of the last rendered publication, independent of request/loading state.
+#[derive(Default)]
+pub(crate) struct TimelineScrollState {
+    layout: Option<TimelineScrollLayout>,
+    expansion: Option<WorkExpansionAnchor>,
+}
+
+struct TimelineScrollLayout {
+    thread_id: String,
+    rows: std::sync::Arc<Vec<TimelineRenderRow>>,
+    sizes: Rc<Vec<Size<Pixels>>>,
+}
+
+struct WorkExpansionAnchor {
+    toggle_key: String,
+    after_key: Option<String>,
+    boundary_offset: Pixels,
+}
+
+impl ThreadTimelineViewState {
+    pub(super) fn reconcile_scroll(
+        &mut self,
+        thread_id: Option<&str>,
+        rows: std::sync::Arc<Vec<TimelineRenderRow>>,
+        sizes: Rc<Vec<Size<Pixels>>>,
+        handle: &gpui_kit::component::VirtualListScrollHandle,
+        follow_bottom: bool,
     ) {
         if self
-            .thread_timeline_view_state
-            .borrow()
-            .pending_scroll_anchor
-            .is_some()
+            .scroll
+            .reconcile(thread_id, rows, sizes, handle, follow_bottom)
         {
-            return;
-        }
-        if !preserve_near_bottom && self.timeline_is_near_bottom() {
-            self.thread_timeline_view_state
-                .borrow_mut()
-                .pending_scroll_anchor = None;
-            return;
-        }
-        let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
-            return;
-        };
-        let model = self.semantic_timeline_render_model(Some(thread_id.as_str()));
-        let rows = model.rows.as_ref();
-        if rows.is_empty() {
-            return;
-        }
-        let Some(item_sizes) = self
-            .thread_timeline_view_state
-            .borrow()
-            .cached_item_sizes
-            .clone()
-        else {
-            return;
-        };
-        if item_sizes.len() != rows.len() {
-            return;
-        }
-
-        let viewport_top = -self.thread_timeline_scroll_handle.offset().y;
-        let mut row_top = px(0.);
-        for (index, row) in rows.iter().enumerate() {
-            let row_height = item_sizes
-                .get(index)
-                .map(|size| size.height)
-                .unwrap_or_else(|| px(0.));
-            let row_bottom = row_top + row_height;
-            if row_bottom > viewport_top {
-                self.thread_timeline_view_state
-                    .borrow_mut()
-                    .pending_scroll_anchor = Some(TimelineScrollAnchor {
-                    thread_id,
-                    row_key: row.key().to_owned(),
-                    row_top_offset_px: row_top - viewport_top,
-                });
-                return;
-            }
-            row_top = row_bottom;
+            // Arrival consumes gestures received while the page was in flight.
+            // Rendering the new boundary alone must not request another page.
+            consume_semantic_prefetch_scroll_intents(self);
         }
     }
+}
 
-    pub(super) fn restore_pending_timeline_scroll_anchor(
-        &self,
-        active_thread_id: Option<&str>,
-        rows: &[TimelineRenderRow],
-        item_sizes: &[Size<Pixels>],
+impl TimelineScrollState {
+    fn cancel_expansion(&mut self) {
+        self.expansion = None;
+    }
+
+    pub(super) fn set_work_expansion_anchor(
+        &mut self,
+        thread_id: &str,
+        toggle_key: &str,
+        expanded: bool,
+        handle: &gpui_kit::component::VirtualListScrollHandle,
     ) {
-        let Some(anchor) = self
-            .thread_timeline_view_state
-            .borrow_mut()
-            .pending_scroll_anchor
-            .take()
+        self.expansion = None;
+        let Some(layout) = self
+            .layout
+            .as_ref()
+            .filter(|layout| layout.thread_id == thread_id)
         else {
             return;
         };
-        if active_thread_id != Some(anchor.thread_id.as_str()) {
+        if !expanded {
             return;
         }
-        if rows.len() != item_sizes.len() {
+        let Some(ix) = layout.rows.iter().position(|row| row.key() == toggle_key) else {
             return;
-        }
-
-        let mut row_top = px(0.);
-        for (index, row) in rows.iter().enumerate() {
-            if row.key() == anchor.row_key {
-                let desired_viewport_top = row_top - anchor.row_top_offset_px;
-                let max_offset = timeline_max_offset_for_item_sizes(
-                    item_sizes,
-                    self.thread_timeline_scroll_handle.bounds().size.height,
-                );
-                let min_offset = px(0.) - max_offset;
-                let next_offset = (px(0.) - desired_viewport_top).clamp(min_offset, px(0.));
-                let mut offset = self.thread_timeline_scroll_handle.offset();
-                offset.y = next_offset;
-                self.thread_timeline_scroll_handle.set_offset(offset);
-                return;
-            }
-            row_top += item_sizes
-                .get(index)
-                .map(|size| size.height)
-                .unwrap_or_else(|| px(0.));
-        }
+        };
+        let boundary = layout
+            .sizes
+            .iter()
+            .take(ix + 1)
+            .map(|size| size.height)
+            .sum::<Pixels>();
+        self.expansion = Some(WorkExpansionAnchor {
+            toggle_key: toggle_key.to_owned(),
+            after_key: layout.rows.get(ix + 1).map(|row| row.key().to_owned()),
+            boundary_offset: boundary + handle.offset().y,
+        });
     }
 
+    pub(super) fn reconcile(
+        &mut self,
+        thread_id: Option<&str>,
+        rows: std::sync::Arc<Vec<TimelineRenderRow>>,
+        sizes: Rc<Vec<Size<Pixels>>>,
+        handle: &gpui_kit::component::VirtualListScrollHandle,
+        follow_bottom: bool,
+    ) -> bool {
+        let Some(thread_id) = thread_id else {
+            return false;
+        };
+        let previous = self
+            .layout
+            .as_ref()
+            .filter(|layout| layout.thread_id == thread_id);
+        let Some(previous) = previous else {
+            self.expansion = None;
+            scroll_to_bottom(handle, &sizes);
+            self.layout = Some(TimelineScrollLayout {
+                thread_id: thread_id.to_owned(),
+                rows,
+                sizes,
+            });
+            return false;
+        };
+        if std::sync::Arc::ptr_eq(&previous.rows, &rows) && Rc::ptr_eq(&previous.sizes, &sizes) {
+            if follow_bottom {
+                scroll_to_bottom(handle, &sizes);
+            }
+            return false;
+        }
+
+        let old_keys = previous
+            .rows
+            .iter()
+            .map(TimelineRenderRow::key)
+            .collect::<HashSet<_>>();
+        let inserted_rows = rows.iter().any(|row| !old_keys.contains(row.key()));
+        let prepended = previous.rows.first().is_some_and(|first| {
+            rows.iter()
+                .position(|row| row.key() == first.key())
+                .is_some_and(|ix| ix > 0)
+        });
+        let mut top = px(0.);
+        let positions = rows
+            .iter()
+            .zip(sizes.iter())
+            .map(|(row, size)| {
+                let position = (row.key(), top);
+                top += size.height;
+                position
+            })
+            .collect::<HashMap<_, _>>();
+
+        let expansion_offset = self.expansion.as_ref().and_then(|anchor| {
+            let toggle_ix = rows.iter().position(|row| row.key() == anchor.toggle_key)?;
+            let boundary = match anchor.after_key.as_deref() {
+                Some(key) => *positions.get(key)?,
+                None => top,
+            };
+            let toggle_bottom = positions[anchor.toggle_key.as_str()] + sizes[toggle_ix].height;
+            // Expansion and its initial page may arrive in separate publications.
+            (boundary > toggle_bottom).then_some(anchor.boundary_offset - boundary)
+        });
+        if let Some(offset) = expansion_offset {
+            set_timeline_offset(handle, &sizes, offset);
+            self.expansion = None;
+        } else if follow_bottom && !prepended {
+            scroll_to_bottom(handle, &sizes);
+        } else {
+            let viewport_top = -handle.offset().y;
+            let mut old_top = px(0.);
+            let mut anchor_offset = None;
+            for (row, size) in previous.rows.iter().zip(previous.sizes.iter()) {
+                if old_top + size.height > viewport_top
+                    && let Some(new_top) = positions.get(row.key())
+                {
+                    let offset = old_top - viewport_top - *new_top;
+                    anchor_offset.get_or_insert(offset);
+                    // A Worked header stays above the inserted page. Preserve the
+                    // visible work item below it, rather than anchoring that header.
+                    if inserted_rows
+                        && *new_top > old_top
+                        && old_top < viewport_top + handle.bounds().size.height
+                    {
+                        anchor_offset = Some(offset);
+                        break;
+                    }
+                }
+                old_top += size.height;
+            }
+            if let Some(offset) = anchor_offset {
+                set_timeline_offset(handle, &sizes, offset);
+            }
+        }
+        self.layout = Some(TimelineScrollLayout {
+            thread_id: thread_id.to_owned(),
+            rows,
+            sizes,
+        });
+        inserted_rows
+    }
+}
+
+fn set_timeline_offset(
+    handle: &gpui_kit::component::VirtualListScrollHandle,
+    sizes: &[Size<Pixels>],
+    y: Pixels,
+) {
+    let max_offset = timeline_max_offset_for_item_sizes(sizes, handle.bounds().size.height);
+    let mut offset = handle.offset();
+    offset.y = y.clamp(-max_offset, px(0.));
+    handle.set_offset(offset);
+}
+
+fn scroll_to_bottom(handle: &gpui_kit::component::VirtualListScrollHandle, sizes: &[Size<Pixels>]) {
+    if handle.bounds().size.height <= px(1.) {
+        // The handle's item count still belongs to the previous frame.
+        handle.scroll_to_item(sizes.len().saturating_sub(1), ScrollStrategy::Top);
+    } else {
+        set_timeline_offset(
+            handle,
+            sizes,
+            -timeline_max_offset_for_item_sizes(sizes, handle.bounds().size.height),
+        );
+    }
+}
+
+impl PioneerDesktop {
     pub(super) fn sync_timeline_scroll(
         &self,
         active_thread_id: Option<&str>,
@@ -140,9 +244,7 @@ impl PioneerDesktop {
             state.autoscroll_paused_by_user = false;
         }
 
-        let should_follow = if state.pending_scroll_anchor.is_some() {
-            false
-        } else if force_follow {
+        let should_follow = if force_follow {
             item_count > 0 && !state.autoscroll_paused_by_user
         } else if thread_changed {
             item_count > 0
@@ -199,19 +301,6 @@ impl PioneerDesktop {
         }
 
         should_follow
-    }
-
-    pub(super) fn scroll_timeline_to_bottom_for_item_sizes(&self, item_sizes: &[Size<Pixels>]) {
-        let viewport_height = self.thread_timeline_scroll_handle.bounds().size.height;
-        if viewport_height <= px(1.) {
-            self.thread_timeline_scroll_handle.scroll_to_bottom();
-            return;
-        }
-
-        let max_offset = timeline_max_offset_for_item_sizes(item_sizes, viewport_height);
-        let mut offset = self.thread_timeline_scroll_handle.offset();
-        offset.y = px(0.) - max_offset;
-        self.thread_timeline_scroll_handle.set_offset(offset);
     }
 
     pub(super) fn timeline_is_near_bottom(&self) -> bool {
@@ -310,6 +399,7 @@ impl PioneerDesktop {
         let delta_y = event.delta.pixel_delta(window.line_height()).y;
         if delta_y != px(0.) {
             let mut state = self.thread_timeline_view_state.borrow_mut();
+            state.scroll.cancel_expansion();
             record_semantic_prefetch_scroll_intent(&mut state);
         }
 
@@ -381,7 +471,195 @@ mod tests {
         ThreadTimelineViewState, consume_semantic_prefetch_scroll_intents,
         record_semantic_prefetch_scroll_intent, timeline_max_offset_for_item_sizes,
     };
-    use gpui_kit::{px, size};
+    use super::{TimelineRenderRow, TimelineRow, TimelineRowKind};
+    use gpui_kit::component::{VirtualListScrollHandle, v_virtual_list};
+    use gpui_kit::{
+        Context, Entity, IntoElement, Pixels, Render, Size, TestAppContext, VisualTestContext,
+        Window, div, point, prelude::*, px, size,
+    };
+    use std::{rc::Rc, sync::Arc};
+
+    struct ScrollHarness {
+        thread_id: String,
+        rows: Arc<Vec<TimelineRenderRow>>,
+        sizes: Rc<Vec<Size<Pixels>>>,
+        handle: VirtualListScrollHandle,
+        state: ThreadTimelineViewState,
+        follow_bottom: bool,
+    }
+
+    impl ScrollHarness {
+        fn page(&mut self, keys: &[&str]) {
+            self.rows = Arc::new(
+                keys.iter()
+                    .map(|key| {
+                        TimelineRenderRow::Timeline(TimelineRow {
+                            key: (*key).to_owned(),
+                            author: None,
+                            kind: TimelineRowKind::Item { timeline_index: 0 },
+                        })
+                    })
+                    .collect(),
+            );
+            self.sizes = Rc::new(vec![size(px(200.), px(40.)); keys.len()]);
+        }
+    }
+
+    impl Render for ScrollHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.state.reconcile_scroll(
+                Some(&self.thread_id),
+                self.rows.clone(),
+                self.sizes.clone(),
+                &self.handle,
+                self.follow_bottom,
+            );
+            v_virtual_list(
+                cx.entity(),
+                "scroll-regression",
+                self.sizes.clone(),
+                |_, range, _, _| {
+                    range
+                        .map(|_| div().w(px(200.)).h(px(40.)))
+                        .collect::<Vec<_>>()
+                },
+            )
+            .w(px(200.))
+            .h(px(120.))
+            .track_scroll(&self.handle)
+        }
+    }
+
+    fn harness(cx: &mut TestAppContext) -> (Entity<ScrollHarness>, &mut VisualTestContext) {
+        cx.add_window_view(|_, _| {
+            let mut harness = ScrollHarness {
+                thread_id: "a".into(),
+                rows: Default::default(),
+                sizes: Default::default(),
+                handle: VirtualListScrollHandle::new(),
+                state: ThreadTimelineViewState::default(),
+                follow_bottom: false,
+            };
+            harness.page(&["a", "b", "c", "d", "e", "f"]);
+            harness
+        })
+    }
+
+    #[gpui_kit::test]
+    fn first_frame_and_thread_switch_open_at_latest_message(cx: &mut TestAppContext) {
+        let (view, cx) = harness(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let handle = view.read_with(cx, |view, _| view.handle.clone());
+        assert_eq!(handle.offset().y, -handle.max_offset().y);
+        assert!(handle.offset().y < px(0.));
+        handle.set_offset(point(px(0.), px(0.)));
+        view.update(cx, |view, cx| {
+            view.thread_id = "b".into();
+            view.page(&["x", "y", "z", "u", "v"]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(handle.offset().y, -handle.max_offset().y);
+    }
+
+    #[gpui_kit::test]
+    fn prepend_preserves_current_position_after_loading_frames_and_more_scrolling(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = harness(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let handle = view.read_with(cx, |view, _| view.handle.clone());
+        handle.set_offset(point(px(0.), px(-15.)));
+        // An intermediate publication changes loading state but has the same rows.
+        view.update(cx, |view, cx| {
+            view.page(&["a", "b", "c", "d", "e", "f"]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        handle.set_offset(point(px(0.), px(-7.)));
+        view.update(cx, |view, cx| {
+            view.page(&["older-2", "older-1", "a", "b", "c", "d", "e", "f"]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(handle.offset().y, px(-87.));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(handle.offset().y, px(-87.));
+    }
+
+    #[gpui_kit::test]
+    fn worked_expansion_keeps_group_end_and_prepended_items_keep_their_position(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = harness(cx);
+        view.update(cx, |view, _| {
+            view.page(&["message", "worked", "answer", "next-1", "next-2"])
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let handle = view.read_with(cx, |view, _| view.handle.clone());
+        handle.set_offset(point(px(0.), px(0.)));
+        view.update(cx, |view, cx| {
+            view.state
+                .scroll
+                .set_work_expansion_anchor("a", "worked", true, &view.handle);
+            view.page(&["message", "worked", "answer", "next-1", "next-2"]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(handle.offset().y, px(0.));
+        view.update(cx, |view, cx| {
+            view.page(&[
+                "message", "worked", "work-3", "work-4", "work-5", "answer", "next-1", "next-2",
+            ]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // The answer still starts at y=80: the end of Worked stays in place.
+        assert_eq!(handle.offset().y, px(-120.));
+        handle.set_offset(point(px(0.), px(-45.)));
+        view.update(cx, |view, cx| {
+            view.page(&[
+                "message", "worked", "work-1", "work-2", "work-3", "work-4", "work-5", "answer",
+                "next-1", "next-2",
+            ]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(handle.offset().y, px(-125.));
+    }
+
+    #[gpui_kit::test]
+    fn page_arrival_requires_new_scroll_intent_before_loading_another_page(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = harness(cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.update(cx, |view, cx| {
+            record_semantic_prefetch_scroll_intent(&mut view.state);
+            consume_semantic_prefetch_scroll_intents(&mut view.state);
+            // More wheel events can arrive while the first request is loading.
+            record_semantic_prefetch_scroll_intent(&mut view.state);
+            view.page(&["older", "a", "b", "c", "d", "e", "f"]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.state.semantic_prefetch_scroll_generation,
+                    view.state.semantic_prefetch_consumed_scroll_generation
+                );
+            });
+        }
+        view.update(cx, |view, _| {
+            record_semantic_prefetch_scroll_intent(&mut view.state);
+            assert!(
+                view.state.semantic_prefetch_scroll_generation
+                    > view.state.semantic_prefetch_consumed_scroll_generation
+            );
+        });
+    }
 
     #[test]
     fn scroll_events_coalesce_until_prefetch_intent_is_consumed() {

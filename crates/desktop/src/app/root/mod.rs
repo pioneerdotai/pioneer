@@ -20,7 +20,7 @@ use crate::{
         thread::{
             ThreadCoordinator,
             message_revisions::DesktopMessageRevisionDialogState,
-            view::timeline::{RunningIndicatorViewCache, TimelineLayoutIndex},
+            view::timeline::{RunningIndicatorViewCache, TimelineLayoutIndex, TimelineScrollState},
         },
     },
     audio::{
@@ -218,15 +218,9 @@ pub(super) struct ThreadTimelineViewState {
     pub(super) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
     pub(super) cached_timeline_layout_index: Option<Rc<TimelineLayoutIndex>>,
     pub(super) expanded_revision: u64,
-    pub(super) pending_scroll_anchor: Option<TimelineScrollAnchor>,
+    pub(super) scroll: TimelineScrollState,
     pub(super) semantic_prefetch_scroll_generation: u64,
     pub(super) semantic_prefetch_consumed_scroll_generation: u64,
-}
-
-pub(super) struct TimelineScrollAnchor {
-    pub(super) thread_id: String,
-    pub(super) row_key: String,
-    pub(super) row_top_offset_px: Pixels,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -177,14 +177,15 @@ impl PioneerDesktop {
             }
         };
 
-        self.restore_pending_timeline_scroll_anchor(
-            active_thread_id,
-            rows.as_ref(),
-            item_sizes.as_ref(),
-        );
-        if should_follow_bottom {
-            self.scroll_timeline_to_bottom_for_item_sizes(item_sizes.as_ref());
-        }
+        self.thread_timeline_view_state
+            .borrow_mut()
+            .reconcile_scroll(
+                active_thread_id,
+                rows.clone(),
+                item_sizes.clone(),
+                &self.thread_timeline_scroll_handle,
+                should_follow_bottom,
+            );
         self.request_mark_active_thread_read_if_viewed(
             active_thread_id,
             rows.as_ref(),

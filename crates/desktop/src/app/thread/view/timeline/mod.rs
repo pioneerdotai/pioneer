@@ -10,6 +10,8 @@ mod semantic_adapter;
 mod semantic_requests;
 mod view;
 
+pub(crate) use self::scroll::TimelineScrollState;
+
 use self::layout::{TIMELINE_CONTENT_MAX_WIDTH, TIMELINE_ROW_MEASUREMENT_GUARD};
 pub(crate) use self::layout::{
     TimelineAvatarGroupKind, TimelineGrouping, TimelineLayoutIndex, TimelineRowLayout,
@@ -19,9 +21,7 @@ use self::model::{TimelineRow, TimelineRowKind};
 pub(crate) use self::running_indicator::RunningIndicatorViewCache;
 use crate::app::{
     conversation::{ConversationViewState, ItemView},
-    root::{
-        CachedTimelineEntryLayout, PioneerDesktop, ThreadTimelineViewState, TimelineScrollAnchor,
-    },
+    root::{CachedTimelineEntryLayout, PioneerDesktop, ThreadTimelineViewState},
 };
 use gpui_kit::{prelude::*, *};
 use pioneer_client::timeline::rows::UserMessagePresentation;
