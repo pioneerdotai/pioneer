@@ -146,6 +146,80 @@ mod tests {
         }
     }
     #[test]
+    fn switching_loaded_timelines_restores_each_threads_rows() {
+        assert_switching_loaded_timelines(Arc::new(pioneer_client::core::ClientCore::new()), false);
+    }
+
+    #[test]
+    fn switching_loaded_timelines_with_background_presentation_restores_rows() {
+        assert_switching_loaded_timelines(pioneer_client::core::ClientCore::shared(), true);
+    }
+
+    fn assert_switching_loaded_timelines(
+        core: Arc<pioneer_client::core::ClientCore>,
+        load_after_selection: bool,
+    ) {
+        use pioneer_client::timeline::semantic::TopLevelPageMergeMode;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../client-ffi/tests/fixtures/thread-registry-wire.json"
+        ))
+        .unwrap();
+        for snapshot in fixture["initial"].as_array().unwrap() {
+            core.upsert_thread(
+                serde_json::from_value(snapshot["payload"]["thread"].clone()).unwrap(),
+            );
+        }
+        let load = |id: &str| {
+            core.apply_thread_timeline_page(
+                serde_json::from_value(serde_json::json!({
+                    "workspaceId": "ws", "threadId": id, "projectionVersion": 1,
+                    "blocks": [{"workspaceId": "ws", "threadId": id,
+                        "blockId": "message", "turnId": "turn", "sortKey": "1",
+                        "kind": {"kind": "user_message", "text": id, "mode": "Message"}}],
+                    "page": {"hasMoreBefore": false, "hasMoreAfter": false}
+                }))
+                .unwrap(),
+                TopLevelPageMergeMode::Reset,
+            );
+        };
+        if !load_after_selection {
+            for id in ["a", "b"] {
+                load(id);
+            }
+        }
+        let (registrar, deliver) = crate::client_runtime::test_binding_router(core.clone());
+        let binding = ThreadBindings::new(registrar);
+        for id in ["a", "b", "a", "b"] {
+            core.activate_thread(Some(id), Some("ws"));
+            binding.select(Some(id));
+            if load_after_selection {
+                load(id);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let sequence = *core.watch_publications().borrow();
+                deliver();
+                if binding
+                    .timeline_model(Some(id))
+                    .is_some_and(|model| !model.rows.is_empty())
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timeline {id} did not arrive"
+                );
+                core.wait_for_publications(sequence);
+            }
+            let model = binding
+                .timeline_model(Some(id))
+                .expect("selected timeline model");
+            assert!(!model.rows.is_empty(), "empty timeline for {id}");
+            assert_eq!(model.item_presentations.values().next().unwrap().text, id);
+        }
+        core.shutdown();
+    }
+    #[test]
     fn selection_and_teardown_reject_unrelated_and_late_publications() {
         let core = Arc::new(pioneer_client::core::ClientCore::new());
         let fixture: serde_json::Value = serde_json::from_str(include_str!(

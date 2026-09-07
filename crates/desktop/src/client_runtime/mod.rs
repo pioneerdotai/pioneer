@@ -1,4 +1,6 @@
 mod binding_router;
+#[cfg(test)]
+pub(crate) use binding_router::test_binding_router;
 mod platform_effect_router;
 
 use platform_effect_router::{DesktopPlatformEffectRouter, DesktopSessionStorageAdapter};

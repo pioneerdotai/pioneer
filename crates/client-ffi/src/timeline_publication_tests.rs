@@ -246,6 +246,36 @@ fn pending_position_fixtures() -> Value {
 }
 
 #[test]
+fn timeline_wire_restores_rows_after_repeated_eviction() {
+    let core = fixture_core();
+    let thread = core
+        .thread_snapshot("a")
+        .unwrap()
+        .coordinator()
+        .thread()
+        .unwrap()
+        .clone();
+    for _ in 0..3 {
+        core.remove_thread_store("a");
+        core.upsert_thread(thread.clone());
+    }
+    install(&core, "restored history");
+    let scope = ClientScope::Timeline {
+        thread_id: "a".into(),
+    };
+    let _subscription = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+    let wire = snapshot_dto(core.snapshot(&scope).unwrap());
+    let rows = wire.payload["rows"]
+        .as_array()
+        .expect("mobile timeline rows");
+    assert_eq!(rows.len(), 15);
+    assert!(
+        rows.iter()
+            .any(|row| row["content"]["text"] == "restored history")
+    );
+}
+
+#[test]
 fn timeline_publication_wire_preserves_identity_and_replacements() {
     let direct = fixture_core();
     let adapted = fixture_core();

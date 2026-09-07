@@ -159,6 +159,7 @@ pub struct ThreadRegistry {
     pub(crate) directory: crate::workspaces::directory::ThreadDirectoryStore,
     revisions: HashMap<String, (u64, u64, u64)>,
     retired: HashSet<String>,
+    retired_timelines: HashSet<String>,
     presentation_revisions: HashMap<String, u64>,
     subscription_counts: HashMap<String, usize>,
     demands: HashMap<ClientScope, ClientDemand>,
@@ -817,6 +818,7 @@ impl ClientCore {
         let current_principal_id = registry.current_principal_id.clone();
         let presentation_revisions = std::mem::take(&mut registry.presentation_revisions);
         let retired = std::mem::take(&mut registry.retired);
+        let retired_timelines = std::mem::take(&mut registry.retired_timelines);
         let revisions = std::mem::take(&mut registry.revisions);
         let subscriptions = std::mem::take(&mut registry.subscription_counts);
         let demands = std::mem::take(&mut registry.demands);
@@ -832,6 +834,7 @@ impl ClientCore {
             clock,
             revisions,
             retired,
+            retired_timelines,
             demands,
             timeline_subscription_counts,
             subscription_counts: subscriptions,
@@ -1783,33 +1786,37 @@ impl ThreadRegistry {
         };
         revisions.0 += 1;
         revisions.1 += 1;
-        let presentation_revision = self
-            .presentation_revisions
-            .entry(id.to_owned())
-            .or_default();
-        *presentation_revision += 1;
         let authority = ClientMutationAuthority { _private: () };
-        vec![
-            authority.publication(
-                ClientScope::Thread {
-                    thread_id: id.to_owned(),
-                },
-                ClientRevisions::new(
-                    DomainRevision::new(revisions.0),
-                    PresentationRevision::new(revisions.1),
-                    ContentRevision::new(revisions.1),
-                    ScopedRevision::new(revisions.0),
-                ),
-                Arc::new(serde_json::Value::Null),
+        let mut drafts = vec![authority.publication(
+            ClientScope::Thread {
+                thread_id: id.to_owned(),
+            },
+            ClientRevisions::new(
+                DomainRevision::new(revisions.0),
+                PresentationRevision::new(revisions.1),
+                ContentRevision::new(revisions.1),
+                ScopedRevision::new(revisions.0),
             ),
-            authority.publication(
+            Arc::new(serde_json::Value::Null),
+        )];
+        // Recreating a source does not recreate its timeline. Repeated source
+        // eviction must not advance the revision of an already absent timeline:
+        // duplicate null publications are omitted by the publication store.
+        if self.retired_timelines.insert(id.to_owned()) {
+            let presentation_revision = self
+                .presentation_revisions
+                .entry(id.to_owned())
+                .or_default();
+            *presentation_revision += 1;
+            drafts.push(authority.publication(
                 ClientScope::Timeline {
                     thread_id: id.to_owned(),
                 },
                 crate::threads::registry::revisions(*presentation_revision),
                 Arc::new(serde_json::Value::Null),
-            ),
-        ]
+            ));
+        }
+        drafts
     }
     fn evict_inactive(&mut self) -> Vec<ClientPublicationDraft> {
         let mut candidates = self
@@ -3048,6 +3055,83 @@ mod tests {
         assert!(Arc::ptr_eq(&before.rows()[0], &next.rows()[0]));
         assert!(Arc::ptr_eq(&before.rows()[1], &next.rows()[1]));
         assert!(next.source_revision() > before.source_revision());
+    }
+
+    #[test]
+    fn timeline_loads_after_repeated_eviction_before_open() {
+        let core = core();
+        let scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        for _ in 0..3 {
+            core.upsert_thread(thread("a", "ws"));
+            core.remove_thread_store("a");
+        }
+        let retired_revision = core.snapshot(&scope).unwrap().revisions().scoped().get();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "restored")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let _subscription = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+        let timeline = core
+            .thread_presentation_snapshot("a")
+            .expect("history must load after eviction")
+            .timeline();
+        assert_eq!(timeline.rows().len(), 1);
+        assert_eq!(timeline.revision(), retired_revision + 1);
+        assert_eq!(
+            core.snapshot(&scope).unwrap().revisions().scoped().get(),
+            timeline.revision()
+        );
+    }
+
+    #[test]
+    fn timeline_reopens_after_fence_and_repeated_cache_clears() {
+        let core = core();
+        let scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        core.upsert_thread(thread("a", "ws"));
+        let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+        assert!(core.thread_presentation_snapshot("a").is_some());
+        core.begin_authorization_epoch(Some(("synthetic-endpoint".into(), 1)));
+        drop(subscription);
+        let fence_revision = core.snapshot(&scope).unwrap().revisions().scoped().get();
+        core.clear_thread_stores();
+        for _ in 0..3 {
+            core.upsert_thread(thread("a", "ws"));
+            core.clear_thread_stores();
+        }
+        assert_eq!(
+            core.snapshot(&scope).unwrap().revisions().scoped().get(),
+            fence_revision
+        );
+        core.upsert_thread(thread("a", "ws"));
+        assert!(
+            core.snapshot(&ClientScope::Thread {
+                thread_id: "a".into()
+            })
+            .unwrap()
+            .typed::<ThreadDomainSnapshot>()
+            .is_some()
+        );
+        core.apply_thread_timeline_page(
+            presentation_page(&[("x", "fresh history")]),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+        let timeline = core
+            .thread_presentation_snapshot("a")
+            .expect("fresh timeline after fence")
+            .timeline();
+        assert_eq!(timeline.rows().len(), 1);
+        assert_eq!(timeline.revision(), fence_revision + 1);
+        drop(subscription);
+        core.remove_thread_store("a");
+        let retired = core.snapshot(&scope).unwrap();
+        assert!(retired.snapshot().serialized_payload().is_null());
+        assert_eq!(retired.revisions().scoped().get(), timeline.revision() + 1);
     }
 
     #[test]
@@ -4548,6 +4632,7 @@ impl ClientCore {
         registry
             .presentation_revisions
             .insert(id.to_owned(), revision);
+        registry.retired_timelines.remove(id);
         drop(registry);
         for action in initial_work {
             self.schedule_thread_semantic_request(action);
@@ -4862,10 +4947,23 @@ impl ThreadRegistry {
                     let revisions = self.revisions.entry(thread_id.clone()).or_default();
                     revisions.0 = publication.revisions().domain().get();
                     revisions.1 = publication.revisions().presentation().get();
+                    if publication.typed::<ThreadDomainSnapshot>().is_some() {
+                        self.retired.remove(thread_id);
+                    } else {
+                        self.retired.insert(thread_id.clone());
+                    }
                 }
                 ClientScope::Timeline { thread_id } => {
                     self.presentation_revisions
                         .insert(thread_id.clone(), publication.revisions().scoped().get());
+                    if publication
+                        .typed::<crate::timeline::presentation::TimelineSnapshot>()
+                        .is_some()
+                    {
+                        self.retired_timelines.remove(thread_id);
+                    } else {
+                        self.retired_timelines.insert(thread_id.clone());
+                    }
                 }
                 ClientScope::SidebarSummary { thread_id, .. } => {
                     self.revisions.entry(thread_id.clone()).or_default().2 =
