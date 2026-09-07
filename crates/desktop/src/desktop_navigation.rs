@@ -147,6 +147,10 @@ impl DesktopNavigationStore {
             RouteActivity::Warm
         }
     }
+    pub(crate) fn is_visible(&self, route: MainRoute) -> bool {
+        let snapshot = self.snapshot();
+        !self.closed.get() && snapshot.window_route == WindowRoute::Main && snapshot.route == route
+    }
     pub(crate) fn close(&self) {
         self.closed.set(true);
         self.registration.borrow_mut().take();
@@ -263,20 +267,26 @@ mod tests {
             store.activity(MainRoute::Threads, false),
             RouteActivity::Warm
         );
+        assert!(store.is_visible(MainRoute::Threads));
+        assert!(!store.is_visible(MainRoute::Settings));
         assert_eq!(
             store.activity(MainRoute::Settings, true),
             RouteActivity::Warm
         );
         store.set_window_route(WindowRoute::InvitationJoin);
+        assert!(!store.is_visible(MainRoute::Threads));
         store.set_window_route(WindowRoute::GatewaySetup);
+        assert!(!store.is_visible(MainRoute::Threads));
         assert_eq!(
             store.activity(MainRoute::Threads, true),
             RouteActivity::Dormant
         );
         store.set_window_route(WindowRoute::Main);
+        assert!(store.is_visible(MainRoute::Threads));
         assert_eq!(*store.window_history.borrow(), vec![WindowRoute::Main]);
         assert!(Arc::ptr_eq(&selection, &core.navigation_snapshot()));
         store.close();
+        assert!(!store.is_visible(MainRoute::Threads));
         assert_eq!(
             store.activity(MainRoute::Threads, true),
             RouteActivity::Dormant

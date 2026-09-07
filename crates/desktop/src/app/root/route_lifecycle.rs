@@ -63,11 +63,13 @@ impl LegacyScreenAdapter {
         if !thread_active && self.desktop_voice_composer.is_active() {
             self.cancel_desktop_voice_hold("route_inactive", cx);
         }
-        self.thread_bindings.select(if thread_active {
-            self.current_active_thread_id()
-        } else {
-            None
-        });
+        // Focus controls activity, not the content of a still-visible thread.
+        self.thread_bindings
+            .select(if self.navigation.is_visible(MainContentView::Threads) {
+                self.current_active_thread_id()
+            } else {
+                None
+            });
         self.running_indicator_views
             .borrow_mut()
             .set_active(thread_active, cx);

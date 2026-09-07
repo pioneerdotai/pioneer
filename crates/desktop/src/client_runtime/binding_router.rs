@@ -45,6 +45,28 @@ struct Registrar {
     wake: Weak<Notify>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_binding_router(
+    core: Arc<ClientCore>,
+) -> (Arc<dyn ClientBindingRegistrar>, impl Fn()) {
+    let routes = Rc::new(RefCell::new(Routes {
+        active: true,
+        ..Routes::default()
+    }));
+    let wake = Arc::new(Notify::new());
+    let registrar = Arc::new(Registrar {
+        core: Arc::downgrade(&core),
+        routes: Rc::downgrade(&routes),
+        wake: Arc::downgrade(&wake),
+    });
+    let router = DesktopClientBindingRouter {
+        routes,
+        wake,
+        task: None,
+    };
+    (registrar, move || router.deliver_pending(&core))
+}
+
 impl ClientBindingRegistrar for Registrar {
     fn register(
         &self,
@@ -219,6 +241,37 @@ mod tests {
             self.0
                 .borrow_mut()
                 .push(publication.revisions().scoped().get());
+        }
+    }
+
+    #[gpui_kit::test]
+    fn router_task_delivers_after_repeated_thread_switches(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext;
+        let core = Arc::new(ClientCore::new());
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../client-ffi/tests/fixtures/thread-registry-wire.json"
+        ))
+        .unwrap();
+        for snapshot in fixture["initial"].as_array().unwrap() {
+            core.upsert_thread(
+                serde_json::from_value(snapshot["payload"]["thread"].clone()).unwrap(),
+            );
+        }
+        let router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));
+        let registrar = cx.update(|cx| DesktopClientBindingRouter::registrar(&router, &core, cx));
+        let sink = Arc::new(Sink::default());
+        let target: Arc<dyn ClientPublicationSink> = sink.clone();
+        let mut registration = None;
+        for (ix, id) in ["a", "b", "a", "b"].into_iter().enumerate() {
+            registration.take();
+            registration = Some(registrar.register(
+                ClientScope::Timeline {
+                    thread_id: id.into(),
+                },
+                Arc::downgrade(&target),
+            ));
+            cx.run_until_parked();
+            assert_eq!(sink.0.borrow().len(), ix + 1, "thread {id}");
         }
     }
 
