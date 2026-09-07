@@ -1,7 +1,5 @@
 mod bootstrap;
 mod client_effects;
-mod desktop_update_apply;
-mod desktop_update_check;
 mod helpers;
 mod lifecycle_gateway_ops;
 mod lifecycle_operation;
@@ -10,7 +8,6 @@ mod notifications_view;
 mod popover_view;
 pub(crate) use popover_view::GatewaySwitcherView;
 mod session_refresh;
-mod task_user_notifications;
 mod thread_list;
 mod thread_start_execute;
 mod thread_start_queue;
@@ -24,8 +21,8 @@ mod ws_events_notifications;
 mod ws_events_pump;
 
 use super::root::{
-    DesktopUpdateUiState, GatewayConnectionState, GatewayOperationSource, GatewaySetupAction,
-    GatewayStatusLevel, MainContentView, PioneerDesktop, TaskThreadNavigationEntry,
+    GatewayConnectionState, GatewayOperationSource, GatewaySetupAction, GatewayStatusLevel,
+    MainContentView, PioneerDesktop, TaskThreadNavigationEntry,
 };
 use crate::app::gateway_setup::GatewaySetupFormState;
 use crate::gateway::{GatewayInstallWarning, GatewayRuntime};

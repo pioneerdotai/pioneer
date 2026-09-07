@@ -15,7 +15,6 @@ impl PioneerDesktop {
         navigation: Arc<crate::desktop_navigation::DesktopNavigationStore>,
         shell_state: Entity<crate::shell_state::ShellStateStore>,
     ) -> Self {
-
         let gateway_setup_form_state = cx.new(|cx| {
             GatewaySetupFormState::new(
                 window,
@@ -35,7 +34,6 @@ impl PioneerDesktop {
         });
         let composer_mention_select = cx.new(|cx| new_member_picker_state(window, cx));
         let thread_member_select = cx.new(|cx| new_member_picker_state(window, cx));
-        let thread_tree_state = cx.new(|cx| TreeState::new(cx));
         let settings_tree_state = cx.new(|cx| TreeState::new(cx));
         let administration_tree_state = cx.new(|cx| TreeState::new(cx));
         let provider_tree_state = cx.new(|cx| TreeState::new(cx));
@@ -97,15 +95,8 @@ impl PioneerDesktop {
             ),
             invitation_join: None,
             invitation_join_input_subscriptions: Vec::new(),
-            thread_unread: HashMap::new(),
-            thread_folders: HashMap::new(),
-            thread_placements: HashMap::new(),
-            thread_agents_doc_summaries: HashMap::new(),
             active_agents_doc_editor_scope: None,
             agents_doc_editor: None,
-            thread_folder_expanded: state::thread_folders_expanded_for_workspace(cx, None),
-            thread_tree_selected_node_id: None,
-            thread_tree_state,
             profile_editor: None,
             profile_editor_input_subscriptions: Vec::new(),
             administration: AdministrationCache::default(),
@@ -121,7 +112,13 @@ impl PioneerDesktop {
             members_loading: false,
             member_workspaces_saving: false,
             members_error: None,
-            member_avatar_state: DesktopMemberAvatarState::default(),
+            member_avatar_state: DesktopMemberAvatarState::new(
+                cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                    .core(),
+                cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                    .registrar(),
+                cx,
+            ),
             voice_input_action_error: None,
             voice_input_action_generation: 0,
             pending_voice_input_enabled: None,
@@ -132,13 +129,10 @@ impl PioneerDesktop {
             settings_tree_state,
             administration_tree_state,
             provider_tree_state,
-            thread_list_loading: false,
-            thread_list_refresh_requested: false,
+
             active_thread_resubscribe_pending: false,
-            workspaces: Vec::new(),
-            workspaces_loading: false,
-            workspaces_error: None,
-            workspace_action_in_progress: false,
+            task_notification_surface: None,
+            workspace_catalog_input: Default::default(),
             composer_state,
             composer_input_subscription: None,
             composer_mention_select,
@@ -178,7 +172,6 @@ impl PioneerDesktop {
             desktop_voice_composer: DesktopVoiceComposerState::Idle,
             desktop_voice_prepare_request: None,
             desktop_voice_capture: None,
-            desktop_update: DesktopUpdateUiState::initial(),
             composer_model_selection_manually_selected: false,
             composer_model_display_cache: HashMap::new(),
             composer_model_display_loading_key: None,
@@ -225,13 +218,6 @@ impl PioneerDesktop {
             thread_timeline_terminal_item: RefCell::new(HashMap::new()),
             code_highlight_cache: RefCell::new(DesktopCodeHighlightCache::default()),
             task_review_actions: TaskReviewActionState::default(),
-            task_user_notifications_workspace_id: None,
-            task_user_notifications: Vec::new(),
-            task_user_notifications_next_cursor: None,
-            task_user_notifications_loading: false,
-            task_user_notifications_refresh_requested: false,
-            task_user_notifications_refresh_generation: 0,
-            task_user_notifications_error: None,
             thread_artifacts: ThreadArtifactsState::default(),
             artifact_download_cancellations: HashMap::new(),
             show_thread_artifacts_sidebar: false,
@@ -378,14 +364,16 @@ impl PioneerDesktop {
         cx.observe_in(&cx.entity(), window, |view, _, window, cx| {
             view.reconcile_desktop_startup_readiness(window, cx);
             view.publish_frame_changes(cx);
-        }).detach();
-        cx.defer_in(window, |view, window, cx| view.reconcile_desktop_startup_readiness(window, cx));
+        })
+        .detach();
+        cx.defer_in(window, |view, window, cx| {
+            view.reconcile_desktop_startup_readiness(window, cx)
+        });
         view.sync_settings_sidebar_tree_state(cx);
         view.sync_administration_sidebar_tree_state(cx);
         view.sync_provider_sidebar_tree_state(cx);
         view.start_gateway_ws_event_pump(cx);
         view.bootstrap_gateway_runtime(cx);
-        view.start_desktop_update_check(cx);
         view.prune_thread_artifact_preview_cache(cx);
 
         view

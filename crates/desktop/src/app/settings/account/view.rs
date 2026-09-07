@@ -155,10 +155,9 @@ impl PioneerDesktop {
                     .items_center()
                     .gap_3()
                     .child(
-                        Avatar::new()
-                            .large()
-                            .name(principal.display_name.clone())
-                            .when_some(avatar_path, |avatar, path| avatar.src(path)),
+                        pioneer_desktop_foundation::AvatarSurface::new(Avatar::new().large())
+                            .fallback_name(principal.display_name.clone())
+                            .when_some(avatar_path, |avatar, path| avatar.source(path)),
                     )
                     .child(
                         v_flex()

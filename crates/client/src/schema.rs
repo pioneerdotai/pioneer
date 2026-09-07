@@ -41,8 +41,14 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
-        schema_doc!("client_navigation_state.json", crate::navigation::ClientNavigationState),
-        schema_doc!("navigation_intent.json", crate::navigation::NavigationIntent),
+        schema_doc!(
+            "client_navigation_state.json",
+            crate::navigation::ClientNavigationState
+        ),
+        schema_doc!(
+            "navigation_intent.json",
+            crate::navigation::NavigationIntent
+        ),
         schema_doc!(
             "gateway_settings_store.json",
             crate::gateway::settings_store::GatewaySettingsStore
@@ -54,6 +60,31 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "gateway_session_publication.json",
             crate::gateway::session_controller::GatewaySessionPublication
+        ),
+        schema_doc!("avatar_publication.json", crate::avatars::AvatarPublication),
+        schema_doc!(
+            "workspace_catalog_publication.json",
+            crate::workspaces::catalog::WorkspaceCatalogPublication
+        ),
+        schema_doc!(
+            "thread_tree_publication.json",
+            crate::workspaces::directory::ThreadTreePublication
+        ),
+        schema_doc!(
+            "task_notification_publication.json",
+            crate::tasks::notifications::TaskNotificationPublication
+        ),
+        schema_doc!(
+            "task_notification_effect.json",
+            crate::tasks::notifications::TaskNotificationEffect
+        ),
+        schema_doc!(
+            "task_inbox_publication.json",
+            crate::tasks::notifications::TaskInboxPublication
+        ),
+        schema_doc!(
+            "task_notification_intent.json",
+            crate::tasks::notifications::TaskNotificationIntent
         ),
         schema_doc!("client_scope.json", crate::core::ClientScope),
         schema_doc!("client_revisions.json", crate::core::ClientRevisions),

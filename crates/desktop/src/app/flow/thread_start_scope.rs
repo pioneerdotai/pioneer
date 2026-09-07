@@ -18,10 +18,7 @@ impl PioneerDesktop {
         )
     }
 
-    pub(in crate::app::flow) fn persist_active_gateway_workspace_id(
-        &mut self,
-        workspace_id: String,
-    ) {
+    pub(in crate::app) fn persist_active_gateway_workspace_id(&mut self, workspace_id: String) {
         let Some(runtime) = self.gateway.runtime.as_mut() else {
             return;
         };

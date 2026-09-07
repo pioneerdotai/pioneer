@@ -359,10 +359,10 @@ impl PioneerDesktop {
         if self.gateway.current_auth.is_some() && self.gateway.capability_snapshot.is_some() {
             self.startup.succeed(DesktopStartupStage::AuthorizationLoad);
         }
-        if !self.workspaces_loading {
+        if !self.workspaces_loading() {
             if self.active_workspace_id().is_some() {
                 self.startup.succeed(DesktopStartupStage::WorkspaceLoad);
-            } else if self.workspaces_error.is_some() {
+            } else if self.workspaces_error().is_some() {
                 self.startup.fail(DesktopStartupStage::WorkspaceLoad);
             }
         }
@@ -373,7 +373,7 @@ impl PioneerDesktop {
                 self.startup.succeed(DesktopStartupStage::ProviderLoad);
             }
         }
-        if !self.thread_list_loading && self.current_active_thread_id().is_some() {
+        if !self.thread_directory_loading() && self.current_active_thread_id().is_some() {
             self.startup.succeed(DesktopStartupStage::ThreadTreeLoad);
         }
         let active_thread_id = self.current_active_thread_id();
@@ -407,10 +407,10 @@ impl PioneerDesktop {
                 && self.gateway.current_auth.is_some()
                 && self.gateway.capability_snapshot.is_some()
                 && self.active_workspace_id().is_some()
-                && !self.workspaces_loading
+                && !self.workspaces_loading()
                 && !self.providers.loading()
                 && providers_ready
-                && !self.thread_list_loading
+                && !self.thread_directory_loading()
                 && active_thread_ready;
             initial_data_ready.then_some(operational_desktop_outcome())
         };

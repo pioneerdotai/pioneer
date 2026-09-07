@@ -204,7 +204,6 @@ impl PioneerDesktop {
                 let edit_thread_id = thread_id.clone();
                 let visibility_thread_id = thread_id.clone();
                 let desktop_entity = desktop_entity.clone();
-                let edit_desktop_entity = desktop_entity.clone();
                 let members_desktop_entity = desktop_entity.clone();
                 let menu = menu.min_w(px(180.));
                 let menu = if can_manage_thread {
@@ -212,14 +211,12 @@ impl PioneerDesktop {
                         PopupMenuItem::new(t!("sidebar.contextmenu.thread.edit").to_string())
                             .icon(PioneerIconName::Pen)
                             .on_click(move |_, window, cx| {
-                                let _ = edit_desktop_entity.update(cx, |view, cx| {
-                                    view.open_rename_thread_dialog(
-                                        edit_thread_id.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                    cx.notify();
-                                });
+                                window.dispatch_action(
+                                    Box::new(pioneer_desktop_workspaces::RenameThread {
+                                        thread_id: edit_thread_id.clone(),
+                                    }),
+                                    cx,
+                                );
                             }),
                     )
                 } else {

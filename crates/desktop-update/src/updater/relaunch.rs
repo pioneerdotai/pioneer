@@ -42,19 +42,19 @@ struct AppliedUpdateReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DesktopPostUpdateReceipt {
-    pub(crate) attempt_id: String,
-    pub(crate) from_version: String,
-    pub(crate) to_version: String,
-    pub(crate) platform: String,
-    pub(crate) process_exit_wait: Duration,
-    pub(crate) apply_duration: Duration,
-    pub(crate) relaunch_duration: Duration,
-    pub(crate) total_duration: Duration,
-    pub(crate) claimed_at: SystemTime,
+pub struct DesktopPostUpdateReceipt {
+    pub attempt_id: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub platform: String,
+    pub process_exit_wait: Duration,
+    pub apply_duration: Duration,
+    pub relaunch_duration: Duration,
+    pub total_duration: Duration,
+    pub claimed_at: SystemTime,
 }
 
-pub(crate) fn claim_post_update_receipt(
+pub fn claim_post_update_receipt(
     runtime_home: &Path,
     current_version: &str,
 ) -> Result<Option<DesktopPostUpdateReceipt>> {

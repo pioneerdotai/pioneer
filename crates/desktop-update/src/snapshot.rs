@@ -10,7 +10,7 @@ enum DesktopUpdateStylePreview {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DesktopUpdateUiState {
+pub enum DesktopUpdateSnapshot {
     Idle,
     Checking,
     Downloading {
@@ -38,8 +38,8 @@ pub(crate) enum DesktopUpdateUiState {
     },
 }
 
-impl DesktopUpdateUiState {
-    pub(crate) fn initial() -> Self {
+impl DesktopUpdateSnapshot {
+    pub fn initial() -> Self {
         #[cfg(debug_assertions)]
         {
             match desktop_update_style_preview_mode() {
@@ -74,7 +74,7 @@ impl DesktopUpdateUiState {
         }
     }
 
-    pub(crate) fn is_style_preview(&self) -> bool {
+    pub fn is_style_preview(&self) -> bool {
         let is_ready_preview = matches!(
             self,
             Self::Ready {
@@ -101,7 +101,7 @@ impl DesktopUpdateUiState {
         }
     }
 
-    pub(crate) fn should_render_sidebar_panel(&self) -> bool {
+    pub fn should_render_sidebar_panel(&self) -> bool {
         matches!(self, Self::Downloading { .. } | Self::Ready { .. })
     }
 }
@@ -118,7 +118,7 @@ fn desktop_update_style_preview_mode() -> Option<DesktopUpdateStylePreview> {
 
 #[cfg(test)]
 mod tests {
-    use super::DesktopUpdateUiState;
+    use super::DesktopUpdateSnapshot;
     use std::path::PathBuf;
 
     #[test]
@@ -127,7 +127,7 @@ mod tests {
 
         assert!(state.should_render_sidebar_panel());
         assert!(
-            DesktopUpdateUiState::Downloading {
+            DesktopUpdateSnapshot::Downloading {
                 style_preview: false
             }
             .should_render_sidebar_panel()
@@ -136,19 +136,19 @@ mod tests {
 
     #[test]
     fn checking_and_inactive_states_do_not_render_sidebar_panel() {
-        let idle = DesktopUpdateUiState::Idle;
-        let failed = DesktopUpdateUiState::FailedSilent {
+        let idle = DesktopUpdateSnapshot::Idle;
+        let failed = DesktopUpdateSnapshot::FailedSilent {
             checked_at_unix: 1_789_200_000,
             error_code: "download".to_owned(),
         };
 
         assert!(!idle.should_render_sidebar_panel());
-        assert!(!DesktopUpdateUiState::Checking.should_render_sidebar_panel());
+        assert!(!DesktopUpdateSnapshot::Checking.should_render_sidebar_panel());
         assert!(!failed.should_render_sidebar_panel());
     }
 
-    fn ready_state() -> DesktopUpdateUiState {
-        DesktopUpdateUiState::Ready {
+    fn ready_state() -> DesktopUpdateSnapshot {
+        DesktopUpdateSnapshot::Ready {
             version: "0.26.0".to_owned(),
             current_version: "0.25.0".to_owned(),
             tag: "v0.26.0".to_owned(),

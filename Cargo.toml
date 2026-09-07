@@ -15,6 +15,7 @@ members = [
   "crates/observability",
   "crates/desktop",
   "crates/desktop-foundation",
+  "crates/desktop-task-notifications",
   "crates/desktop-updater",
   "crates/cli",
   "crates/crud",
@@ -54,6 +55,9 @@ pioneer-observability = { path = "crates/observability" }
 pioneer-config = { path = "crates/config" }
 pioneer-desktop = { path = "crates/desktop" }
 pioneer-desktop-foundation = { path = "crates/desktop-foundation" }
+pioneer-desktop-workspaces = { path = "crates/desktop-workspaces" }
+pioneer-desktop-update = { path = "crates/desktop-update" }
+pioneer-desktop-task-notifications = { path = "crates/desktop-task-notifications" }
 pioneer-app-updater = { path = "crates/desktop-updater" }
 pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }

@@ -170,7 +170,6 @@ impl PioneerDesktop {
                                         view.set_main_content_view(MainContentView::Threads, cx);
                                     }
                                     view.resolve_current_principal_avatar(cx);
-                                    view.refresh_task_user_notifications(cx);
                                     view.sync_settings_sidebar_tree_state(cx);
                                     view.sync_administration_sidebar_tree_state(cx);
                                     if view.main_content_view() == MainContentView::Administration {
@@ -304,7 +303,11 @@ impl PioneerDesktop {
         content_view: AdministrationContentView,
         cx: &mut Context<Self>,
     ) {
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetAdministrationRoute { route: content_view });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetAdministrationRoute {
+                route: content_view,
+            },
+        );
         self.sync_administration_sidebar_tree_state(cx);
         self.set_main_content_view(MainContentView::Administration, cx);
         self.refresh_current_administration_content(cx);
@@ -333,10 +336,14 @@ impl PioneerDesktop {
             .iter()
             .any(|(content_view, _)| *content_view == self.administration_content_view())
         {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetAdministrationRoute { route: items
-                .first()
-                .map(|(content_view, _)| *content_view)
-                .unwrap_or(AdministrationContentView::Members) });
+            self.navigation_intent(
+                pioneer_client::navigation::NavigationIntent::SetAdministrationRoute {
+                    route: items
+                        .first()
+                        .map(|(content_view, _)| *content_view)
+                        .unwrap_or(AdministrationContentView::Members),
+                },
+            );
         }
 
         let selected_ix = items

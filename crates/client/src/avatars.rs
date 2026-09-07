@@ -226,6 +226,7 @@ impl AvatarCacheService {
             .http
             .execute(native_request, cancellation.clone())
             .await;
+        ensure_not_cancelled(&cancellation)?;
         let mut response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -281,8 +282,14 @@ impl AvatarCacheService {
         if detect_avatar_media_type(bytes.as_slice()) != Some(media_type) {
             return Err(AvatarCacheError::Corrupt);
         }
+        ensure_not_cancelled(&cancellation)?;
         persist_atomically(&paths, bytes.as_slice()).await?;
+        if cancellation.is_cancelled() {
+            remove_owned_file(paths.final_path.as_path()).await;
+            return Err(AvatarCacheError::Cancelled);
+        }
         let _ = prune_avatar_cache(self.runtime_home.as_path()).await;
+        ensure_not_cancelled(&cancellation)?;
         Ok(ResolvedAvatarRepresentation {
             local_path: paths.final_path,
             media_type,
@@ -799,6 +806,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_after_http_completion_cannot_commit_or_publish_bytes() {
+        // The port deliberately returns a completed response after cancellation.
+        struct CancellingHttp(TokioMutex<Option<GatewayHttpResponse>>);
+        #[async_trait]
+        impl AvatarHttp for CancellingHttp {
+            async fn execute(
+                &self,
+                _: GatewayHttpRequest,
+                cancellation: CancellationToken,
+            ) -> Result<GatewayHttpResponse, GatewayHttpError> {
+                cancellation.cancel();
+                Ok(self.0.lock().await.take().unwrap())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = png(b"synthetic");
+        let request = request(&bytes);
+        let http = Arc::new(CancellingHttp(TokioMutex::new(Some(response(
+            200, &request, bytes,
+        )))));
+        let service = AvatarCacheService::with_http(http, temp.path(), gateway_id(), session_id());
+        assert_eq!(
+            service
+                .resolve(request, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            AvatarCacheError::Cancelled
+        );
+        let mut files = Vec::new();
+        collect_cache_files(&avatar_cache_root(temp.path()), &mut files)
+            .await
+            .unwrap();
+        assert!(files.is_empty());
+    }
+    #[tokio::test]
     async fn fetch_commits_validated_bytes_then_revalidates_with_304() {
         let temp = tempfile::tempdir().unwrap();
         let bytes = png(b"avatar-one");
@@ -996,3 +1038,6 @@ mod tests {
         assert!(paths.parent().ends_with("system/agent"));
     }
 }
+
+mod controller;
+pub use controller::{AvatarPublication, AvatarStore, avatar_identity_key};

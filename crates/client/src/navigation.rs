@@ -94,6 +94,8 @@ pub struct ClientNavigationState {
     pub(crate) drafts: BTreeMap<String, String>,
     pub(crate) last_active: BTreeMap<String, String>,
     destination: SemanticDestination,
+    #[serde(default)]
+    agents_document_scope: Option<crate::agents_doc::scope::AgentsDocEditorScope>,
     lineage: Vec<TaskThreadLineage>,
     providers: Option<ProviderFilter>,
     administration: AdministrationRoute,
@@ -110,6 +112,9 @@ impl ClientNavigationState {
     }
     pub fn destination(&self) -> &SemanticDestination {
         &self.destination
+    }
+    pub fn agents_document_scope(&self) -> Option<&crate::agents_doc::scope::AgentsDocEditorScope> {
+        self.agents_document_scope.as_ref()
     }
     pub fn lineage(&self) -> &[TaskThreadLineage] {
         &self.lineage
@@ -263,6 +268,13 @@ impl ClientNavigationState {
                 }
                 self.active_thread_id = thread_id;
             }
+            NavigationIntent::OpenAgentsDocument { scope } => {
+                if self.workspace_id.as_deref() != Some(scope.workspace_id()) {
+                    return ClientTransitionOutcome::Rejected;
+                }
+                self.destination = SemanticDestination::AgentsDocument;
+                self.agents_document_scope = Some(scope);
+            }
             NavigationIntent::Navigate { destination } => {
                 match &destination {
                     SemanticDestination::Providers { filter } => self.providers = Some(*filter),
@@ -337,6 +349,9 @@ fn set_mapping(map: &mut BTreeMap<String, String>, workspace: String, id: Option
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NavigationIntent {
+    OpenAgentsDocument {
+        scope: crate::agents_doc::scope::AgentsDocEditorScope,
+    },
     SetAdministrationRoute {
         route: AdministrationRoute,
     },
@@ -400,6 +415,33 @@ impl ClientCore {
         if !self.is_stopped() {
             self.publish_navigation(&mut registry);
         }
+    }
+    /// Select and present a workspace thread as one navigation transition.
+    pub fn open_workspace_thread(
+        &self,
+        workspace: String,
+        thread: Option<String>,
+        expected_revision: Option<u64>,
+    ) -> ClientTransition {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if self.is_stopped() {
+            return self.navigation_outcome(ClientTransitionOutcome::Rejected);
+        }
+        if expected_revision.is_some_and(|revision| revision != registry.navigation_revision) {
+            return self.navigation_outcome(ClientTransitionOutcome::Stale);
+        }
+        registry.navigation.apply(NavigationIntent::ClearLineage);
+        registry.navigation.apply(NavigationIntent::Navigate {
+            destination: SemanticDestination::Threads,
+        });
+        registry.navigation.apply(NavigationIntent::SelectThread {
+            workspace_id: Some(workspace),
+            thread_id: thread,
+        });
+        self.publish_navigation(&mut registry)
     }
     pub fn navigate(
         &self,
@@ -470,6 +512,47 @@ mod tests {
             },
             expected_revision: None,
         })
+    }
+    #[test]
+    fn opening_a_workspace_thread_is_one_transition_and_rejects_late_navigation() {
+        let core = ClientCore::new();
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Settings {
+                    route: SettingsRoute::Account,
+                },
+            },
+            None,
+        );
+        let before = core
+            .snapshot(&crate::core::ClientScope::Navigation)
+            .unwrap()
+            .revisions()
+            .scoped()
+            .get();
+        core.open_workspace_thread("workspace".into(), Some("thread".into()), Some(before));
+        let opened = core
+            .snapshot(&crate::core::ClientScope::Navigation)
+            .unwrap();
+        assert_eq!(opened.revisions().scoped().get(), before + 1);
+        assert_eq!(
+            core.navigation_snapshot().destination(),
+            &SemanticDestination::Threads
+        );
+        assert_eq!(
+            core.open_workspace_thread("workspace".into(), Some("late".into()), Some(before))
+                .outcome(),
+            ClientTransitionOutcome::Stale
+        );
+        assert_eq!(
+            core.navigation_snapshot().active_thread_id(),
+            Some("thread")
+        );
+        assert_eq!(
+            core.open_workspace_thread("workspace".into(), Some("thread".into()), None)
+                .outcome(),
+            ClientTransitionOutcome::Noop
+        );
     }
     #[test]
     fn revoked_workspace_clears_selection_even_without_an_open_thread() {

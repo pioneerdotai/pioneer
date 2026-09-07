@@ -1,0 +1,19 @@
+[package]
+name = "pioneer-desktop-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+gpui-kit = { workspace = true, features = ["component"] }
+pioneer-desktop-foundation.workspace = true
+pioneer-app-updater = { path = "../desktop-updater" }
+pioneer-protocol.workspace = true
+anyhow.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
+url.workspace = true
+[dev-dependencies]
+tempfile.workspace = true

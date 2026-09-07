@@ -13,7 +13,15 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::*, *};
 use std::sync::Arc;
 
+struct DesktopUpdateApplyFailedNotification;
+
 pub(crate) struct DesktopShellView {
+    workspaces: Option<Entity<pioneer_desktop_workspaces::WorkspaceNavigationView>>,
+    _workspace_events: Subscription,
+    _task_notification_events: Subscription,
+    _workspace_context: Subscription,
+    desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
+    task_notifications: Option<Entity<pioneer_desktop_task_notifications::TaskNotificationView>>,
     action_region: FocusHandle,
     legacy: Option<Entity<LegacyScreenAdapter>>,
     sidebar: Option<Entity<SidebarHostView>>,
@@ -33,8 +41,147 @@ impl DesktopShellView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let (client, registrar) = {
+            let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
+            (runtime.core(), runtime.registrar())
+        };
+        let config = pioneer_desktop_task_notifications::TaskNotificationConfig::new(
+            client.clone(),
+            registrar.clone(),
+            pioneer_desktop_task_notifications::TaskNotificationLabels::new(
+                t!("tasks.notifications.title").to_string(),
+                t!("tasks.notifications.task").to_string(),
+                t!("tasks.notifications.loading").to_string(),
+                t!("tasks.notifications.empty").to_string(),
+                t!("tasks.notifications.completed").to_string(),
+                t!("tasks.notifications.mark_read").to_string(),
+            ),
+        );
+        let task_notifications =
+            cx.new(|cx| pioneer_desktop_task_notifications::TaskNotificationView::new(config, cx));
+        let task_legacy = legacy.downgrade();
+        let task_notification_events = cx.subscribe_in(
+            &task_notifications,
+            window,
+            move |_,
+                  _,
+                  event: &pioneer_desktop_task_notifications::TaskNotificationEvent,
+                  window,
+                  cx| {
+                let pioneer_desktop_task_notifications::TaskNotificationEvent::OpenThread {
+                    thread_id,
+                } = event;
+                let _ = task_legacy.update(cx, |legacy, cx| {
+                    legacy.present_workspace_thread(Some(thread_id.clone()), window, cx)
+                });
+            },
+        );
+        legacy.update(cx, |legacy, _| {
+            legacy.task_notification_surface = Some(task_notifications.clone().into())
+        });
+        let desktop_update = crate::state::runtime_home_dir().ok().map(|runtime_home| {
+            let config = pioneer_desktop_update::DesktopUpdateConfig::new(
+                runtime_home,
+                Arc::new(pioneer_desktop_update::NativeDesktopUpdatePort),
+                t!("desktop_update.ready_title").to_string().into(),
+                t!("desktop_update.downloading").to_string().into(),
+                "icons/leaf.svg".into(),
+                |details, window, cx| {
+                    use gpui_kit::component::notification::{Notification, NotificationType};
+                    let message =
+                        t!("desktop_update.apply_failed", error = details.as_str()).to_string();
+                    window.push_notification(
+                        Notification::new()
+                            .with_type(NotificationType::Warning)
+                            .id1::<DesktopUpdateApplyFailedNotification>((
+                                "desktop-update-apply-failed",
+                                0u64,
+                            ))
+                            .content(move |_, _, _| {
+                                v_flex()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .opacity(0.8)
+                                            .line_height(relative(1.4))
+                                            .whitespace_normal()
+                                            .child(message.clone()),
+                                    )
+                                    .into_any_element()
+                            }),
+                        cx,
+                    );
+                },
+            );
+            let view = cx.new(|cx| pioneer_desktop_update::DesktopUpdateView::new(config, cx));
+            view
+        });
+        let legacy_context = legacy.downgrade();
+        let workspace_preference = legacy.downgrade();
+        let workspace_config = pioneer_desktop_workspaces::WorkspaceNavigationConfig::new(
+            client.clone(),
+            registrar.clone(),
+            |workspace, cx| {
+                crate::state::thread_folders_expanded_for_workspace(cx, Some(workspace))
+            },
+            |workspace, expansion, cx| {
+                let _ = crate::state::set_thread_folders_expanded_for_workspace(
+                    cx, workspace, expansion,
+                );
+            },
+            move |cx| {
+                legacy_context
+                    .upgrade()
+                    .is_some_and(|legacy| legacy.read(cx).workspace_context_locked())
+            },
+            |builder, window, cx| {
+                window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
+            },
+            |builder, window, cx| {
+                window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
+            },
+            |builder, window, cx| {
+                window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
+            },
+            |builder, window, cx| {
+                window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
+            },
+        )
+        .with_workspace_preference(move |cx| {
+            workspace_preference
+                .upgrade()
+                .and_then(|legacy| legacy.read(cx).persisted_workspace_preference())
+        });
+        let workspaces = cx.new(|cx| {
+            pioneer_desktop_workspaces::WorkspaceNavigationView::new(workspace_config, cx)
+        });
+        let workspace_context_view = workspaces.downgrade();
+        let workspace_context = cx.observe(&legacy, move |_, _, cx| {
+            let _ = workspace_context_view.update(cx, |view, cx| view.refresh_presentation(cx));
+        });
+        let legacy_events = legacy.downgrade();
+        let workspace_events = cx.subscribe_in(
+            &workspaces,
+            window,
+            move |_,
+                  _,
+                  event: &pioneer_desktop_workspaces::WorkspaceNavigationEvent,
+                  window,
+                  cx| {
+                let _ = legacy_events.update(cx, |legacy, cx| match event {
+                    pioneer_desktop_workspaces::WorkspaceNavigationEvent::OpenThread {
+                        thread_id,
+                    } => legacy.present_workspace_thread(thread_id.clone(), window, cx),
+                    pioneer_desktop_workspaces::WorkspaceNavigationEvent::OpenAgentsDocument {
+                        scope,
+                    } => legacy.present_workspace_agents_document(scope.clone(), window, cx),
+                });
+            },
+        );
         navigation.set_window_route(legacy.read(cx).window_route());
         let sidebar = cx.new(|cx| SidebarHostView {
+            workspaces: workspaces.clone(),
+            desktop_update: desktop_update.clone(),
             legacy: legacy.downgrade(),
             navigation: navigation.clone(),
             _changes: cx.subscribe(&legacy, |_, _, _: &crate::app::SidebarChanged, cx| {
@@ -99,6 +246,12 @@ impl DesktopShellView {
             true
         });
         Self {
+            workspaces: Some(workspaces),
+            _workspace_events: workspace_events,
+            _task_notification_events: task_notification_events,
+            _workspace_context: workspace_context,
+            desktop_update,
+            task_notifications: Some(task_notifications),
             action_region: cx.focus_handle(),
             mounted_route: navigation.snapshot(),
             legacy: Some(legacy),
@@ -109,6 +262,11 @@ impl DesktopShellView {
             _frame_subscription: frame_subscription,
             _activation_subscription: activation_subscription,
             route_task: Some(route_task),
+        }
+    }
+    pub(crate) fn start_desktop_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(update) = &self.desktop_update {
+            update.update(cx, |view, cx| view.check(window, cx));
         }
     }
     fn activate_navigation(&mut self, route: MainRoute, cx: &mut Context<Self>) {
@@ -124,6 +282,15 @@ impl DesktopShellView {
         self.route_task.take();
         if let Some(legacy) = &self.legacy {
             legacy.update(cx, |legacy, cx| legacy.close_route_bindings(cx));
+        }
+        if let Some(view) = self.task_notifications.take() {
+            view.update(cx, |view, _| view.close());
+        }
+        if let Some(view) = self.desktop_update.take() {
+            view.update(cx, |view, _| view.close());
+        }
+        if let Some(view) = self.workspaces.take() {
+            view.update(cx, |view, cx| view.close(cx));
         }
         self.navigation.close();
         self.sidebar.take();
@@ -167,6 +334,15 @@ impl Render for DesktopShellView {
             .size_full()
             .track_focus(&self.action_region)
             .key_context("DesktopShell")
+            .on_action(cx.listener(
+                |view, action: &pioneer_desktop_workspaces::RenameThread, window, cx| {
+                    if let Some(workspaces) = &view.workspaces {
+                        workspaces.update(cx, |workspaces, cx| {
+                            workspaces.rename_thread(action, window, cx)
+                        });
+                    }
+                },
+            ))
             .on_action(cx.listener(|view, _: &OpenThreads, _, cx| {
                 view.activate_navigation(MainRoute::Threads, cx)
             }))
@@ -242,6 +418,8 @@ impl RenderOnce for ScreenHostView {
     }
 }
 struct SidebarHostView {
+    workspaces: Entity<pioneer_desktop_workspaces::WorkspaceNavigationView>,
+    desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
     legacy: WeakEntity<LegacyScreenAdapter>,
     navigation: Arc<DesktopNavigationStore>,
     _changes: Subscription,
@@ -249,18 +427,38 @@ struct SidebarHostView {
 impl Render for SidebarHostView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let route = self.navigation.snapshot();
+        if matches!(route.route(), MainRoute::Threads | MainRoute::AgentsDoc) {
+            return v_flex()
+                .size_full()
+                .bg(cx.theme().sidebar)
+                .gap_5()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .child(self.workspaces.clone()),
+                )
+                .children(self.desktop_update.clone())
+                .into_any_element();
+        }
         let content = self
             .legacy
             .upgrade()
             .map(|legacy| LegacyScreenAdapter::sidebar_surface(&legacy, route.route(), cx));
-        v_flex().size_full().bg(cx.theme().sidebar).child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .overflow_hidden()
-                .children(content),
-        )
+        v_flex()
+            .size_full()
+            .bg(cx.theme().sidebar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .children(content),
+            )
+            .into_any_element()
     }
 }
 #[derive(IntoElement)]
@@ -418,16 +616,9 @@ mod tests {
                 .contains("previous.navigation().destination()!=route.navigation().destination()")
         );
         assert!(shell.contains("track_focus(&self.action_region)"));
-        let updater = include_str!("app/flow/desktop_update_check.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert_eq!(
-            updater
-                .matches("cx.emit(crate::app::SidebarChanged)")
-                .count(),
-            3
-        );
+        let updater = include_str!("../../desktop-update/src/view.rs");
+        assert!(!updater.contains("SidebarChanged"));
+        assert!(!updater.contains("DesktopShellView"));
         let mcp = include_str!("app/mcp/lifecycle.rs");
         let details = mcp
             .split("fn apply_mcp_details_refresh_success_reduction(")

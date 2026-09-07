@@ -150,7 +150,7 @@ impl PioneerDesktop {
             .presentation(&member.principal_id)
             .and_then(|avatar| avatar.cached_image_path.clone());
         let memberships = self
-            .workspaces
+            .workspaces()
             .iter()
             .filter_map(|workspace| {
                 let workspace_id = WorkspaceId::new(workspace.id.clone()).ok()?;
@@ -216,11 +216,10 @@ impl PioneerDesktop {
                 h_flex()
                     .gap_2()
                     .child(
-                        Avatar::new()
-                            .name(member.display_name.clone())
-                            .size_10()
+                        pioneer_desktop_foundation::AvatarSurface::new(Avatar::new().size_10())
+                            .fallback_name(member.display_name.clone())
                             .when_some(avatar_path, |avatar, path| {
-                                avatar.src(std::path::PathBuf::from(path))
+                                avatar.source(std::path::PathBuf::from(path))
                             }),
                     )
                     .child(
@@ -360,7 +359,7 @@ impl PioneerDesktop {
             .map(|auth| &auth.principal.id);
         let capabilities = self.principal_presentation_capabilities();
         let workspaces = self
-            .workspaces
+            .workspaces()
             .iter()
             .filter_map(|workspace| {
                 let workspace_id = WorkspaceId::new(workspace.id.clone()).ok()?;
@@ -690,7 +689,7 @@ impl PioneerDesktop {
 
     pub(in crate::app) fn refresh_all_workspace_members(&mut self, cx: &mut Context<Self>) {
         let workspaces = self
-            .workspaces
+            .workspaces()
             .iter()
             .filter_map(|workspace| WorkspaceId::new(workspace.id.clone()).ok())
             .filter(|workspace_id| !self.workspace_members_loading.contains(workspace_id))

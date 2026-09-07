@@ -18,15 +18,7 @@ impl PioneerDesktop {
         self.gateway.settings_loading = settings.loading;
         self.gateway.settings_error = settings.error;
 
-        if let Some(loading) = reduction.thread_list_loading {
-            self.thread_list_loading = loading;
-        }
-        if let Some(loading) = reduction.workspaces_loading {
-            self.set_workspaces_loading(loading);
-        }
-        if let Some(error) = reduction.workspaces_error {
-            self.set_workspaces_error(error);
-        }
+        self.read_workspace_catalog_output();
         if reduction.clear_active_thread {
             self.set_active_thread_id(None);
         }
@@ -55,12 +47,10 @@ impl PioneerDesktop {
         }
 
         if let Some(cx) = cx.as_deref_mut() {
-            self.rebuild_sidebar_tree_state(cx);
             if self.gateway.connection_state == GatewayConnectionState::Connected {
                 self.startup.gateway_session_identity_verified();
                 self.startup
                     .succeed(pioneer_observability::DesktopStartupStage::GatewaySessionConnect);
-                self.resolve_agent_avatar(cx);
                 self.refresh_current_principal(cx);
                 self.active_thread_resubscribe_pending = self.current_active_thread_id().is_some();
                 self.refresh_desktop_voice_status(cx);
@@ -71,7 +61,6 @@ impl PioneerDesktop {
             if self.gateway.connection_state != GatewayConnectionState::Connected {
                 self.gateway.current_auth = None;
                 self.gateway.capability_snapshot = None;
-                self.clear_task_user_notification_inbox();
                 self.administration.clear_for_session_termination();
                 self.member_avatar_state.clear();
                 self.members_loading = false;
@@ -157,7 +146,7 @@ mod authorization_epoch_tests {
 
         assert!(connection_source.contains("self.clear_authorization_epoch_cache()"));
         for required in [
-            "self.workspaces.clear()",
+            "self.read_workspace_catalog_output()",
             "self.clear_thread_conversations()",
             "self.thread_artifacts = Default::default()",
             "self.active_agents_doc_editor_scope = None",

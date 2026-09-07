@@ -41,12 +41,16 @@ impl PioneerDesktop {
             return;
         }
 
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::OpenAgentsDocument {
+                scope: scope.clone(),
+            },
+        );
+
         if self.active_agents_doc_editor_scope.as_ref() == Some(&scope)
             && self.agents_doc_editor.is_some()
         {
             self.set_main_content_view(MainContentView::AgentsDoc, cx);
-            self.set_thread_tree_selected_node_id(Some(agents_doc_tree_node_key(&scope)));
-            self.rebuild_sidebar_tree_state(cx);
             return;
         }
 
@@ -56,11 +60,7 @@ impl PioneerDesktop {
             });
         }
 
-        let selected_node_id = agents_doc_tree_node_key(&scope);
         let (workspace_id, folder_id) = scope.clone().into_parts();
-        if let Some(folder_id) = folder_id.as_deref() {
-            self.set_thread_folder_expanded(folder_id, true, cx);
-        }
 
         let input = cx.new(|cx| {
             EditorState::new(window, cx)
@@ -86,8 +86,6 @@ impl PioneerDesktop {
         });
         self.active_agents_doc_editor_scope = Some(scope);
         self.agents_doc_editor = Some(editor);
-        self.set_thread_tree_selected_node_id(Some(selected_node_id));
         self.set_main_content_view(MainContentView::AgentsDoc, cx);
-        self.rebuild_sidebar_tree_state(cx);
     }
 }

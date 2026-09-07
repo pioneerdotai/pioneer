@@ -1,7 +1,4 @@
-use crate::{
-    app::root::{GatewayConnectionState, PioneerDesktop},
-    assets::PioneerIconName,
-};
+use crate::sidebar::*;
 use gpui_kit::component::{
     Colorize, Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
@@ -12,8 +9,8 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::{prelude::*, *};
+use pioneer_client::workspaces::Workspace;
 use pioneer_client::workspaces::selectors as workspace_selectors;
-use pioneer_protocol::Workspace;
 
 #[derive(IntoElement)]
 struct WorkspaceSelectorTrigger {
@@ -127,15 +124,14 @@ impl RenderOnce for WorkspaceSelectorTrigger {
                             .justify_center()
                             .when(self.show_spinner, |this| {
                                 this.child(
-                                    crate::qualification_diagnostics::spinner!(
-                                        pioneer_observability::AnimationSourceId::WorkspaceSelector,
-                                    )
-                                    .with_size(gpui_kit::component::Size::Small),
+                                    gpui_kit::component::spinner::Spinner::new()
+                                        .with_size(gpui_kit::component::Size::Small),
                                 )
                             })
                             .when(!self.show_spinner, |this| {
                                 this.child(
-                                    Icon::new(PioneerIconName::GalleryVerticalEnd)
+                                    Icon::empty()
+                                        .path("icons/gallery-vertical-end.svg")
                                         .size_4()
                                         .text_color(theme.background),
                                 )
@@ -233,8 +229,8 @@ impl RenderOnce for WorkspaceSelectorTrigger {
     }
 }
 
-impl PioneerDesktop {
-    pub(in crate::app) fn render_workspaces_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+impl ThreadSidebarView {
+    pub(crate) fn render_workspaces_popover(&self, cx: &mut Context<Self>) -> AnyElement {
         let capabilities = self.principal_presentation_capabilities();
         let can_create_workspace = capabilities.can_create_workspace;
         let can_manage_workspace = capabilities.can_manage_workspace;
@@ -250,18 +246,12 @@ impl PioneerDesktop {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let workspace_unavailable = self.gateway.connecting
-            || self.gateway.connection_state.is_transitioning()
-            || self.gateway.connection_state != GatewayConnectionState::Connected
-            || self
-                .gateway
-                .client_runtime
-                .client_core()
-                .gateway_refresh_in_flight();
+        let workspace_unavailable =
+            self.client.current_auth().is_none() || self.client.gateway_refresh_in_flight();
         let selector_interaction = workspace_selector_interaction_state(
             workspace_unavailable,
             self.workspace_action_in_progress(),
-            self.desktop_voice_context_locked() || self.composer_upload_in_progress,
+            self.context_locked,
         );
         // A user-initiated switch is optimistic: keep showing the newly selected
         // workspace while its server scope is synchronized in the background.
@@ -414,7 +404,7 @@ impl PioneerDesktop {
     }
 
     fn render_workspace_popover_option(
-        index: usize,
+        _index: usize,
         workspace: &Workspace,
         active_workspace_id: Option<&str>,
         actions_disabled: bool,
@@ -436,7 +426,7 @@ impl PioneerDesktop {
         let workspace_id_for_click = workspace_id.clone();
 
         let select_button = div()
-            .id(("workspace-option", index))
+            .id(format!("workspace-option-{workspace_id}"))
             .w_full()
             .min_w_0()
             .cursor_pointer()
@@ -460,7 +450,7 @@ impl PioneerDesktop {
                         return;
                     }
                     let _ = desktop_entity.update(cx, |view, cx| {
-                        view.switch_workspace_from_ui(workspace_id_for_click.clone(), cx);
+                        view.switch_workspace_from_popover(workspace_id_for_click.clone(), cx);
                     });
                     let _ = popover_entity.update(cx, |state, cx| {
                         state.dismiss(window, cx);
@@ -534,12 +524,12 @@ impl PioneerDesktop {
                         .items_center()
                         .pr_1()
                         .child(
-                            Button::new(("workspace-option-rename", index))
+                            Button::new(format!("workspace-option-rename-{workspace_id}"))
                                 .ghost()
                                 .xsmall()
                                 .compact()
                                 .disabled(actions_disabled)
-                                .icon(PioneerIconName::Bolt)
+                                .icon(Icon::empty().path("icons/bolt.svg"))
                                 .tooltip(t!("workspace.action.rename").to_string())
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
@@ -563,34 +553,5 @@ impl PioneerDesktop {
                 )
             })
             .into_any_element()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::workspace_selector_interaction_state;
-
-    #[test]
-    fn composer_context_lock_does_not_change_workspace_trigger_visual_state() {
-        let state = workspace_selector_interaction_state(false, false, true);
-
-        assert!(!state.trigger_disabled);
-        assert!(state.actions_disabled);
-    }
-
-    #[test]
-    fn workspace_unavailability_disables_trigger_and_actions() {
-        let state = workspace_selector_interaction_state(true, false, false);
-
-        assert!(state.trigger_disabled);
-        assert!(state.actions_disabled);
-    }
-
-    #[test]
-    fn workspace_operation_disables_trigger_and_actions() {
-        let state = workspace_selector_interaction_state(false, true, false);
-
-        assert!(state.trigger_disabled);
-        assert!(state.actions_disabled);
     }
 }

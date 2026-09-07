@@ -77,8 +77,69 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
     use ClientContractStability as Stability;
 
     let mut contracts = vec![
-        contract_type!("client_navigation_state.json", crate::navigation::ClientNavigationState, Domain::Root, Kind::Snapshot, Stability::Stable),
-        contract_type!("navigation_intent.json", crate::navigation::NavigationIntent, Domain::Root, Kind::Command, Stability::Stable),
+        contract_type!(
+            "workspace_catalog_publication.json",
+            crate::workspaces::catalog::WorkspaceCatalogPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "thread_tree_publication.json",
+            crate::workspaces::directory::ThreadTreePublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_notification_publication.json",
+            crate::tasks::notifications::TaskNotificationPublication,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_notification_effect.json",
+            crate::tasks::notifications::TaskNotificationEffect,
+            Domain::Tasks,
+            Kind::Effect,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_inbox_publication.json",
+            crate::tasks::notifications::TaskInboxPublication,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_notification_intent.json",
+            crate::tasks::notifications::TaskNotificationIntent,
+            Domain::Tasks,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "avatar_publication.json",
+            crate::avatars::AvatarPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "client_navigation_state.json",
+            crate::navigation::ClientNavigationState,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "navigation_intent.json",
+            crate::navigation::NavigationIntent,
+            Domain::Root,
+            Kind::Command,
+            Stability::Stable
+        ),
         contract_type!(
             "gateway_settings_store.json",
             crate::gateway::settings_store::GatewaySettingsStore,

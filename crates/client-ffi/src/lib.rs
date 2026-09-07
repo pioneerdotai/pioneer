@@ -125,8 +125,7 @@ use pioneer_client::{
     runtime::ClientRuntime,
     timeline::rows::{MessageRevisionPagePresentation, project_message_revision_page},
     workspaces::{
-        actions::WorkspaceBootstrapSuccessReduction,
-        bootstrap::{WorkspaceBootstrapRequest, bootstrap_workspace_catalog},
+        actions::WorkspaceBootstrapSuccessReduction, bootstrap::WorkspaceBootstrapRequest,
     },
 };
 #[cfg(test)]
@@ -185,12 +184,11 @@ use std::{
 use thread_files::{ClientThreadFileViewOpenRequest, ClientThreadFileViewOpenResult};
 use threads::{
     ClientThreadTreeLevel, ClientThreadTreeQueryData, ThreadTreeLevelRequest,
-    ThreadTreeRefreshRequest, client_thread_tree_level, refresh_thread_tree,
+    ThreadTreeRefreshRequest, client_thread_tree_level,
 };
 use workspaces::{
     WorkspaceCreateRequest, WorkspaceCreateResult, WorkspaceRenameRequest, WorkspaceRenameResult,
-    WorkspaceSwitchRequest, WorkspaceSwitchResult, create_workspace, rename_workspace,
-    switch_workspace,
+    WorkspaceSwitchRequest, WorkspaceSwitchResult,
 };
 use zeroize::Zeroizing;
 
@@ -290,20 +288,6 @@ fn contains_session_termination(events: &[ClientEvent]) -> bool {
             event,
             ClientEvent::GatewayNotification(
                 pioneer_protocol::GatewayNotification::AuthSessionRevoked(_)
-            )
-        )
-    })
-}
-
-fn contains_avatar_authorization_boundary(events: &[ClientEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            ClientEvent::GatewayNotification(
-                pioneer_protocol::GatewayNotification::AccessChanged(_)
-                    | pioneer_protocol::GatewayNotification::AuthorizationProjectionChanged(_)
-                    | pioneer_protocol::GatewayNotification::MemberChanged(_)
-                    | pioneer_protocol::GatewayNotification::WorkspaceMembersChanged(_)
             )
         )
     })
@@ -925,9 +909,6 @@ impl ClientFfiRuntime {
             .core
             .logout_auth_session()
             .map_err(normal_auth_error)?;
-        if let Ok(runtime_home) = self.native_cache_runtime_home() {
-            self.avatar_cache.invalidate_all(runtime_home.as_path());
-        }
         self.invitation_commits
             .lock()
             .map_err(|_| invitation_commit_lock_error())?
@@ -1240,6 +1221,7 @@ impl ClientFfiRuntime {
                 )
             })?;
         self.avatar_cache.resolve(
+            &self.client_runtime.core,
             &self.client_runtime.ws_command_sender(),
             self.native_cache_runtime_home()?,
             request,
@@ -1259,6 +1241,7 @@ impl ClientFfiRuntime {
                 )
             })?;
         self.avatar_cache.resolve_agent(
+            &self.client_runtime.core,
             &self.client_runtime.ws_command_sender(),
             self.native_cache_runtime_home()?,
             request,
@@ -1368,8 +1351,8 @@ impl ClientFfiRuntime {
         let params = parse_normal_params(input_json, "thread update")?;
         self.require_initialized_and_connected()?;
         self.client_runtime
-            .ws_command_sender()
-            .thread_update(params)
+            .core
+            .update_directory_thread(&self.client_runtime.ws_command_sender(), params)
             .map_err(administration_rpc_error)
     }
 
@@ -1479,9 +1462,6 @@ impl ClientFfiRuntime {
         }
         if *active != Some(connected.connection_id) {
             self.synchronize_legacy_authorization()?;
-            if let Ok(runtime_home) = self.native_cache_runtime_home() {
-                self.avatar_cache.invalidate_all(runtime_home.as_path());
-            }
             *active = Some(connected.connection_id);
         }
         Ok(connected)
@@ -1608,9 +1588,6 @@ impl ClientFfiRuntime {
             .ws_command_sender()
             .replace_access_and_wait(spec.into_connect_spec())
             .map_err(normal_auth_error)?;
-        if let Ok(runtime_home) = self.native_cache_runtime_home() {
-            self.avatar_cache.invalidate_all(runtime_home.as_path());
-        }
         self.client_runtime
             .core
             .begin_authorization_epoch(Some((gateway_id, connection_id)));
@@ -1652,13 +1629,6 @@ impl ClientFfiRuntime {
             if !events.is_empty() {
                 #[cfg(not(feature = "qualification-diagnostics"))]
                 {
-                    if contains_session_termination(events.as_slice())
-                        || contains_avatar_authorization_boundary(events.as_slice())
-                    {
-                        if let Ok(runtime_home) = self.native_cache_runtime_home() {
-                            self.avatar_cache.invalidate_all(runtime_home.as_path());
-                        }
-                    }
                     if contains_session_termination(events.as_slice()) {
                         self.invitation_commits
                             .lock()
@@ -1683,13 +1653,6 @@ impl ClientFfiRuntime {
                         )
                     );
                     let delivery_result = (|| -> Result<(), String> {
-                        if contains_session_termination(events.as_slice())
-                            || contains_avatar_authorization_boundary(events.as_slice())
-                        {
-                            if let Ok(runtime_home) = self.native_cache_runtime_home() {
-                                self.avatar_cache.invalidate_all(runtime_home.as_path());
-                            }
-                        }
                         if contains_session_termination(events.as_slice()) {
                             self.invitation_commits
                                 .lock()
@@ -1723,9 +1686,6 @@ impl ClientFfiRuntime {
 
     fn gateway_disconnect(&self) -> Result<ClientFfiGatewayDisconnectResult, String> {
         self.artifact_downloads.cancel_all();
-        if let Ok(runtime_home) = self.native_cache_runtime_home() {
-            self.avatar_cache.invalidate_all(runtime_home.as_path());
-        }
         self.client_runtime
             .ws_command_sender()
             .disconnect()
@@ -2016,18 +1976,6 @@ impl ClientFfiRuntime {
                 ClientFfiError::GENERIC_CODE,
             )
         })?;
-        if generation > *applied
-            || self.legacy_authorization_stamp().1
-                != self
-                    .legacy_authorization_change_sequence
-                    .load(Ordering::Acquire)
-        {
-            // The native avatar adapter follows accepted authorization publications,
-            // independently of the remaining thread notification delivery.
-            if let Ok(runtime_home) = self.native_cache_runtime_home() {
-                self.avatar_cache.invalidate_all(runtime_home.as_path());
-            }
-        }
         if generation > *applied {
             self.invitation_commits
                 .lock()
@@ -2060,7 +2008,9 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<WorkspaceBootstrapRequest>(input_json)
             .map_err(|error| format!("invalid workspace bootstrap request: {error}"))?;
 
-        bootstrap_workspace_catalog(&self.client_runtime.ws_command_sender(), request)
+        self.client_runtime
+            .core
+            .bootstrap_workspace_catalog(request.persisted_workspace_id)
             .map_err(|error| error.to_string())
     }
 
@@ -2068,7 +2018,9 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<WorkspaceSwitchRequest>(input_json)
             .map_err(|error| format!("invalid workspace switch request: {error}"))?;
 
-        switch_workspace(&self.client_runtime.ws_command_sender(), request)
+        self.client_runtime
+            .core
+            .switch_workspace(request.workspace_id)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2076,7 +2028,9 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<WorkspaceCreateRequest>(input_json)
             .map_err(|error| format!("invalid workspace create request: {error}"))?;
 
-        create_workspace(&self.client_runtime.ws_command_sender(), request)
+        self.client_runtime
+            .core
+            .create_workspace(request.name)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2084,7 +2038,9 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<WorkspaceRenameRequest>(input_json)
             .map_err(|error| format!("invalid workspace rename request: {error}"))?;
 
-        rename_workspace(&self.client_runtime.ws_command_sender(), request)
+        self.client_runtime
+            .core
+            .rename_workspace(request.workspace_id, request.name)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2851,11 +2807,15 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("invalid thread tree refresh request: {error}"))?;
         let active_thread_id = request.active_thread_id.clone();
 
-        let mut result = refresh_thread_tree(&self.client_runtime.ws_command_sender(), request)
+        let publication = self
+            .client_runtime
+            .core
+            .refresh_workspace_tree(&request.workspace_id)
             .map_err(|error| format!("{error:#}"))?;
-        self.active_thread
-            .apply_thread_tree_snapshot(&result.snapshot)
-            .map_err(|error| format!("{error:#}"))?;
+        let mut result = ClientThreadTreeQueryData {
+            snapshot: publication.snapshot().clone(),
+            composer_model_selection: None,
+        };
         result.composer_model_selection = self
             .active_thread
             .resolve_composer_model_selection(
@@ -2951,7 +2911,14 @@ impl ClientFfiRuntime {
                 timeline::THREAD_READ_ERROR,
             )
         })?;
-        timeline::thread_read(&self.client_runtime.ws_command_sender(), params)
+        let response = timeline::thread_read(&self.client_runtime.ws_command_sender(), params)?;
+        self.client_runtime.core.apply_directory_read(
+            &response.workspace_id,
+            &response.thread_id,
+            &response.cursor,
+            response.unread_count,
+        );
+        Ok(response)
     }
 
     fn turn_work_page(&self, input_json: &str) -> Result<TurnWorkPageResponse, ClientFfiError> {
@@ -4425,47 +4392,109 @@ mod tests {
 
     #[test]
     fn navigation_binding_matches_direct_rust_for_selection_destinations_and_fences() {
-        use pioneer_client::navigation::{NavigationIntent, SemanticDestination, TaskThreadLineage, AdministrationRoute, SettingsRoute};
+        use pioneer_client::navigation::{
+            AdministrationRoute, NavigationIntent, SemanticDestination, SettingsRoute,
+            TaskThreadLineage,
+        };
         use pioneer_client::providers::selectors::ProviderFilter;
         let runtime = ClientFfiRuntime::default();
         runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
         let direct = pioneer_client::core::ClientCore::shared();
         let intents = vec![
-            NavigationIntent::SelectWorkspace { workspace_id: Some("workspace".into()) },
-            NavigationIntent::RememberDraft { workspace_id: "workspace".into(), thread_id: Some("draft".into()) },
-            NavigationIntent::SelectThread { workspace_id: Some("workspace".into()), thread_id: Some("parent".into()) },
-            NavigationIntent::PushTaskThread { entry: TaskThreadLineage::new("parent".into(), "child".into(), "workspace".into(), "Task".into()) },
+            NavigationIntent::SelectWorkspace {
+                workspace_id: Some("workspace".into()),
+            },
+            NavigationIntent::RememberDraft {
+                workspace_id: "workspace".into(),
+                thread_id: Some("draft".into()),
+            },
+            NavigationIntent::SelectThread {
+                workspace_id: Some("workspace".into()),
+                thread_id: Some("parent".into()),
+            },
+            NavigationIntent::PushTaskThread {
+                entry: TaskThreadLineage::new(
+                    "parent".into(),
+                    "child".into(),
+                    "workspace".into(),
+                    "Task".into(),
+                ),
+            },
             NavigationIntent::PopTaskThread,
             NavigationIntent::PopTaskThread,
-            NavigationIntent::Navigate { destination: SemanticDestination::Providers { filter: ProviderFilter::Connected } },
-            NavigationIntent::Navigate { destination: SemanticDestination::Administration { route: AdministrationRoute::Invitations } },
-            NavigationIntent::Navigate { destination: SemanticDestination::Mcp { server_id: Some("server".into()) } },
-            NavigationIntent::Navigate { destination: SemanticDestination::Skills { skill_id: None } },
-            NavigationIntent::Navigate { destination: SemanticDestination::Settings { route: SettingsRoute::Memory } },
-            NavigationIntent::PromoteThread { thread_id: "draft".into() },
-            NavigationIntent::PromoteThread { thread_id: "draft".into() },
-            NavigationIntent::SelectThread { workspace_id: None, thread_id: Some(" ".into()) },
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Providers {
+                    filter: ProviderFilter::Connected,
+                },
+            },
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Administration {
+                    route: AdministrationRoute::Invitations,
+                },
+            },
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Mcp {
+                    server_id: Some("server".into()),
+                },
+            },
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Skills { skill_id: None },
+            },
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Settings {
+                    route: SettingsRoute::Memory,
+                },
+            },
+            NavigationIntent::PromoteThread {
+                thread_id: "draft".into(),
+            },
+            NavigationIntent::PromoteThread {
+                thread_id: "draft".into(),
+            },
+            NavigationIntent::SelectThread {
+                workspace_id: None,
+                thread_id: Some(" ".into()),
+            },
             NavigationIntent::Reset,
             NavigationIntent::Reset,
         ];
         for intent in intents {
             let request = client_binding::ClientIntentDispatchDto {
                 schema_version: 1,
-                intent: pioneer_client::core::ClientIntent::Navigation { intent, expected_revision: None },
+                intent: pioneer_client::core::ClientIntent::Navigation {
+                    intent,
+                    expected_revision: None,
+                },
             };
             let direct_result = direct.dispatch(request.intent.clone());
-            let ffi_result = runtime.client_intent_dispatch(&serde_json::to_string(&request).unwrap()).unwrap();
+            let ffi_result = runtime
+                .client_intent_dispatch(&serde_json::to_string(&request).unwrap())
+                .unwrap();
             assert_eq!(ffi_result, client_binding::transition_dto(direct_result));
-            let ffi = runtime.client_scoped_snapshot(r#"{"schema_version":1,"scope":{"kind":"navigation"}}"#).unwrap().unwrap();
-            assert_eq!(ffi, client_binding::snapshot_dto(direct.snapshot(&ClientScope::Navigation).unwrap()));
+            let ffi = runtime
+                .client_scoped_snapshot(r#"{"schema_version":1,"scope":{"kind":"navigation"}}"#)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                ffi,
+                client_binding::snapshot_dto(direct.snapshot(&ClientScope::Navigation).unwrap())
+            );
         }
         let stale = r#"{"schema_version":1,"intent":{"kind":"navigation","intent":{"kind":"reset"},"expected_revision":0}}"#;
-        assert_eq!(runtime.client_intent_dispatch(stale).unwrap().outcome, pioneer_client::core::ClientTransitionOutcome::Stale);
+        assert_eq!(
+            runtime.client_intent_dispatch(stale).unwrap().outcome,
+            pioneer_client::core::ClientTransitionOutcome::Stale
+        );
         for core in [&direct, &runtime.client_runtime.core] {
             core.activate_thread(Some("protected"), Some("workspace"));
             core.begin_authorization_epoch(None);
             assert_eq!(core.navigation_snapshot().active_thread_id(), None);
-            assert!(core.snapshot(&ClientScope::Navigation).unwrap().typed::<pioneer_client::navigation::ClientNavigationState>().is_some());
+            assert!(
+                core.snapshot(&ClientScope::Navigation)
+                    .unwrap()
+                    .typed::<pioneer_client::navigation::ClientNavigationState>()
+                    .is_some()
+            );
         }
     }
 
@@ -5603,39 +5632,6 @@ mod tests {
         ));
         runtime.client_shutdown("{}").unwrap();
     }
-
-    #[test]
-    fn authorization_and_directory_events_invalidate_private_avatar_cache() {
-        let access_changed =
-            ClientEvent::GatewayNotification(pioneer_protocol::GatewayNotification::AccessChanged(
-                pioneer_protocol::AccessChangedNotification {
-                    authorization_revision: 7,
-                    workspace_id: "workspace-one".to_owned(),
-                    thread_id: None,
-                    outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
-                    change: pioneer_protocol::AccessChangeKind::WorkspaceMembership,
-                },
-            ));
-        let member_changed =
-            ClientEvent::GatewayNotification(pioneer_protocol::GatewayNotification::MemberChanged(
-                pioneer_protocol::MemberChangedNotification {
-                    revision: 8,
-                    principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000001")
-                        .unwrap(),
-                },
-            ));
-
-        assert!(contains_avatar_authorization_boundary(&[
-            access_changed,
-            member_changed,
-        ]));
-        assert!(!contains_avatar_authorization_boundary(&[
-            ClientEvent::Error(contracts::ClientErrorEvent {
-                message: "unrelated".to_owned(),
-                code: None,
-            }),
-        ]));
-    }
 }
 
 ffi_client_json_method!(
@@ -5658,3 +5654,6 @@ ffi_client_json_method!(
 
 #[cfg(test)]
 mod timeline_publication_tests;
+
+#[cfg(test)]
+mod workspace_publication_tests;

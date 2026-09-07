@@ -534,7 +534,6 @@ impl PioneerDesktop {
                         core.commit_prepared_thread_turn(&thread_id,&workspace_id,selected_mode,&reduction.thread_snapshot_update,reduction.local_turn_start_requested_event.clone(),reduction.composer_execution_mode);
                         if promoted_from_draft {
                             view.invalidate_active_thread_capability_projection();
-                            view.rebuild_sidebar_tree_state(cx);
                             view.request_thread_start_if_needed();
                         }
 

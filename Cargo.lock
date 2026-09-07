@@ -8847,6 +8847,9 @@ dependencies = [
  "pioneer-client",
  "pioneer-config",
  "pioneer-desktop-foundation",
+ "pioneer-desktop-task-notifications",
+ "pioneer-desktop-update",
+ "pioneer-desktop-workspaces",
  "pioneer-keystore",
  "pioneer-observability",
  "pioneer-protocol",
@@ -8883,6 +8886,49 @@ version = "0.48.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
+]
+
+[[package]]
+name = "pioneer-desktop-task-notifications"
+version = "0.48.0"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "pioneer-desktop-update"
+version = "0.48.0"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "pioneer-app-updater",
+ "pioneer-desktop-foundation",
+ "pioneer-protocol",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "url",
+]
+
+[[package]]
+name = "pioneer-desktop-workspaces"
+version = "0.48.0"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

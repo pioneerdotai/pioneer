@@ -2,10 +2,7 @@ use super::*;
 use crate::app::root::{AdministrationContentView, DesktopVoiceComposerState, MainContentView};
 use crate::audio::capture::DesktopVoiceCaptureErrorKind;
 use pioneer_client::administration::{AdministrationEvent, AdministrationRefetch};
-use pioneer_client::authorization::{
-    AccessChangedPlan,
-
-};
+use pioneer_client::authorization::AccessChangedPlan;
 #[cfg(test)]
 use pioneer_client::authorization::{ThreadAuthorizationScope, plan_access_changed};
 use pioneer_client::notifications::router::{
@@ -129,9 +126,7 @@ impl PioneerDesktop {
             ClientRuntimeNotification::TurnLifecycle(_) => {}
             ClientRuntimeNotification::ConversationEvent(_) => {}
             ClientRuntimeNotification::ThreadClosed(_) => {}
-            ClientRuntimeNotification::WorkspaceRefresh(reduction) => {
-                self.apply_workspace_refresh_reduction(reduction);
-            }
+            ClientRuntimeNotification::WorkspaceRefresh(_) => {}
             ClientRuntimeNotification::ThreadUpdated(_) => {}
             ClientRuntimeNotification::ThreadParticipantsChanged(notification) => {
                 self.apply_thread_participants_changed_notification(notification, cx);
@@ -166,32 +161,12 @@ impl PioneerDesktop {
             }
             ClientRuntimeNotification::CLIRuntimePendingRequests(_) => {}
             ClientRuntimeNotification::PendingRequests { .. } => {}
-            ClientRuntimeNotification::TaskUserNotificationDelivered(notification) => {
-                self.apply_task_user_notification_delivered(notification, cx);
-            }
+            ClientRuntimeNotification::TaskUserNotificationDelivered(_) => {}
             ClientRuntimeNotification::GatewayRemoteAccessStatusChanged(_)
             | ClientRuntimeNotification::GatewayThreadEpisodicVectorRefillStatusChanged(_)
             | ClientRuntimeNotification::GatewayVoiceInputStatusChanged(_) => {}
-            ClientRuntimeNotification::WorkspaceChanged {
-                notification,
-                preference,
-            } => {
-                apply_workspace_changed_to_catalog(&mut self.workspaces, &notification);
-                self.apply_workspace_preference_reduction(preference);
-            }
+            ClientRuntimeNotification::WorkspaceChanged { .. } => {}
         }
-    }
-
-    fn apply_task_user_notification_delivered(
-        &mut self,
-        _notification: pioneer_protocol::TaskUserNotificationDeliveredNotification,
-        cx: &mut Context<Self>,
-    ) {
-        // The websocket event is only a live invalidation hint. Durable inbox
-        // reconciliation is performed by the Task notification controller so
-        // reconnect and foreground recovery use the same server-owned source.
-        self.refresh_task_user_notifications(cx);
-        cx.notify();
     }
 
     fn apply_administration_event(&mut self, event: AdministrationEvent, cx: &mut Context<Self>) {
@@ -253,7 +228,11 @@ impl PioneerDesktop {
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         // The Client plan records selection before the authorization fence. A navigation
         // publication may already have cleared selection when this binding runs.
-        let plan = self.gateway.client_runtime.client_core().apply_thread_access_change(&notification);
+        let plan = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .apply_thread_access_change(&notification);
         if !plan.apply {
             return;
         }
@@ -273,56 +252,25 @@ impl PioneerDesktop {
             self.message_revision_loading = false;
             self.message_mutation_pending = false;
         }
-        if notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked {
-            let mut preferred = self.preferred_workspace_id().map(str::to_owned);
-            apply_desktop_workspace_catalog_invalidation(
-                &mut self.workspaces,
-                &mut preferred,
-                &plan,
-            );
-        }
-        self.workspaces_error = None;
+        self.read_workspace_catalog_output();
 
         self.thread_artifacts
             .remove_threads(plan.invalidate_thread_ids.as_slice());
         for thread_id in &plan.invalidate_thread_ids {
             self.remove_thread_conversation(thread_id.as_str());
         }
-        let invalidated_thread_ids = plan
-            .invalidate_thread_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<std::collections::HashSet<_>>();
-        self.thread_unread
-            .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
         let workspace_access_lost = workspace_wide
             && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
-        if workspace_wide && (plan.clear_active_workspace || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str())) {
+        if workspace_wide
+            && (plan.clear_active_workspace
+                || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str()))
+        {
             // Membership/role changes fence every provider projection from
             // the previous authorization generation. The shared client
             // effect below reloads both catalogs through current-ACL APIs.
             self.providers.clear_for_workspace_switch();
             self.sync_open_model_selector_cli_runtime_snapshot();
-        }
-
-
-        if workspace_access_lost {
-            let removed_folder_ids = self
-                .thread_folders
-                .iter()
-                .filter(|(_, folder)| folder.workspace_id == plan.workspace_id)
-                .map(|(folder_id, _)| folder_id.clone())
-                .collect::<Vec<_>>();
-            self.thread_folders
-                .retain(|_, folder| folder.workspace_id != plan.workspace_id);
-            self.thread_placements
-                .retain(|_, placement| placement.workspace_id != plan.workspace_id);
-            self.thread_agents_doc_summaries
-                .retain(|_, summary| summary.workspace_id != plan.workspace_id);
-            for folder_id in removed_folder_ids {
-                self.thread_folder_expanded.remove(folder_id.as_str());
-            }
         }
 
         let active_editor_lost = workspace_access_lost
@@ -352,7 +300,6 @@ impl PioneerDesktop {
         if plan.clear_active_thread {
             self.set_active_thread_id(None);
             self.thread_artifacts.activate_thread(None);
-            self.thread_tree_selected_node_id = None;
             *self.thread_timeline_view_state.borrow_mut() = Default::default();
             self.thread_timeline_item_expanded.borrow_mut().clear();
             self.thread_timeline_terminal_item.borrow_mut().clear();
@@ -370,13 +317,11 @@ impl PioneerDesktop {
             self.clear_persisted_active_gateway_workspace_id();
         }
 
-        let affected_workspace_is_active =
-            plan.clear_active_workspace || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str());
+        let affected_workspace_is_active = plan.clear_active_workspace
+            || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str());
         if affected_workspace_is_active
             && (workspace_access_lost || !plan.invalidate_thread_ids.is_empty())
-        {
-            self.rebuild_sidebar_tree_state(cx);
-        }
+        {}
         execute_desktop_client_effects(self, plan.effects, cx);
         if administration_invalidation.apply {
             self.apply_administration_refetches(administration_invalidation.effects, cx);
@@ -409,24 +354,6 @@ impl PioneerDesktop {
         self.refresh_current_principal(cx);
         self.ensure_active_thread_capabilities_loaded(true, cx);
         cx.notify();
-    }
-
-    fn apply_workspace_refresh_reduction(&mut self, reduction: WorkspaceRefreshReduction) {
-        if reduction.queue_thread_list_refresh {
-            self.queue_thread_list_refresh();
-        }
-    }
-
-    fn apply_workspace_preference_reduction(&mut self, reduction: WorkspacePreferenceReduction) {
-        if let Some(workspace_id) = reduction.set_preferred_workspace_id {
-            self.set_preferred_workspace_id(workspace_id);
-        }
-        if let Some(workspace_id) = reduction.persist_active_gateway_workspace_id {
-            self.persist_active_gateway_workspace_id(workspace_id);
-        }
-        if reduction.queue_thread_list_refresh {
-            self.queue_thread_list_refresh();
-        }
     }
 
     fn apply_skills_refresh_reduction(&mut self, reduction: SkillsRefreshReduction) {

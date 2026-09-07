@@ -26,9 +26,7 @@ struct DesktopClientEffectSink<'a, 'cx> {
 }
 
 impl ClientEffectSink for DesktopClientEffectSink<'_, '_> {
-    fn refresh_workspace_list(&mut self) {
-        self.app.refresh_workspace_list(self.cx);
-    }
+    fn refresh_workspace_list(&mut self) {}
 
     fn refresh_gateway_settings(&mut self) {
         self.app.refresh_gateway_settings(self.cx);

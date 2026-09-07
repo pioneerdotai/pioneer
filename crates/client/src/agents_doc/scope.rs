@@ -5,7 +5,9 @@ use pioneer_protocol::{
 };
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentsDocEditorScope {
     Root {
         workspace_id: String,

@@ -1,5 +1,4 @@
 use crate::contracts::ClientEvent;
-use crate::threads::ClientThreadTreeSnapshot;
 use pioneer_client::{
     ClientError, ClientResult,
     administration::{AdministrationEventTracker, AdministrationRefetch},
@@ -482,19 +481,6 @@ impl ClientFfiActiveThreadState {
             administration_refetch: notification_reduction.administration_refetch,
             task_user_notification: notification_reduction.task_user_notification,
         })
-    }
-
-    pub fn apply_thread_tree_snapshot(
-        &self,
-        snapshot: &ClientThreadTreeSnapshot,
-    ) -> anyhow::Result<()> {
-        let inner = self.core.as_ref();
-
-        for thread in snapshot.threads_by_id.values() {
-            upsert_thread_snapshot(inner, thread.clone());
-        }
-
-        Ok(())
     }
 
     pub fn resolve_composer_model_selection(
@@ -2126,7 +2112,7 @@ mod tests {
         let state = ClientFfiActiveThreadState::default();
         {
             let inner = state.core.as_ref();
-            inner.activate_thread(Some("thread_revoked"), None);
+            inner.activate_thread(Some("thread_revoked"), Some("workspace_revoked"));
             install_coordinator(
                 &inner,
                 "thread_allowed".to_owned(),

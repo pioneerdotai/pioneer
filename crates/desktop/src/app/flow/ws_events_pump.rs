@@ -19,21 +19,13 @@ impl PioneerDesktop {
                 if changes.is_empty() { continue; }
                 if view.update(cx, |view, cx| {
                     let mut visible_changed = false;
-                    let mut summary_changed = false;
                     for change in changes {
                         match change.scope() {
                             pioneer_client::core::ClientScope::Thread {thread_id} | pioneer_client::core::ClientScope::Timeline {thread_id} => visible_changed |= view.current_active_thread_id() == Some(thread_id.as_str()),
-                            pioneer_client::core::ClientScope::SidebarSummary {workspace_id, ..} => {
-                                summary_changed |= view.active_workspace_id() == Some(workspace_id.as_str());
-                                if let Some(summary) = change.typed::<pioneer_client::threads::registry::SidebarSummaryChanged>() {
-                                    if let Some(placement) = &summary.payload().placement { view.thread_placements.insert(placement.thread_id.clone(),placement.clone()); }
-                                }
-                            },
                             _ => {}
                         }
                     }
 
-                    if summary_changed { view.rebuild_sidebar_tree_state(cx); }
                     if visible_changed {
                         if view.current_active_thread_id().is_some_and(|id|view.gateway.client_runtime.client_core().thread_snapshot(id).is_none()) {view.set_active_thread_id(None);}
                         if view.active_thread_resubscribe_pending {
@@ -494,7 +486,6 @@ impl PioneerDesktop {
         self.clear_authorization_epoch_cache();
         self.gateway.current_auth = None;
         self.gateway.capability_snapshot = None;
-        self.clear_task_user_notification_inbox();
         self.administration.clear_for_session_termination();
         self.member_avatar_state.clear();
         self.member_workspaces_saving = false;
@@ -513,11 +504,7 @@ struct DesktopPostEventSink<'a, 'cx> {
 
 impl ClientRuntimePostEventSink for DesktopPostEventSink<'_, '_> {
     fn refresh_thread_list_if_requested(&mut self) -> bool {
-        if !self.app.take_thread_list_refresh_request() {
-            return false;
-        }
-        self.app.refresh_thread_list(self.cx);
-        true
+        false
     }
 
     fn refresh_skills_if_requested(&mut self) -> bool {

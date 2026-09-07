@@ -1,9 +1,8 @@
 mod composer_domain;
-mod desktop_update;
 mod model_selection;
 mod mutations;
-mod route_lifecycle;
 mod presentation_events;
+mod route_lifecycle;
 pub(crate) use presentation_events::{FrameChanged, SidebarChanged};
 mod queries;
 mod state;
@@ -34,7 +33,6 @@ use crate::{
     components::member_picker::MemberPickerDelegate,
     gateway::{ClientRuntime, DesktopGatewayHttpClient, GatewayRuntime, GatewayWsCommandSender},
 };
-pub(super) use desktop_update::DesktopUpdateUiState;
 use gpui_kit::component::{
     VirtualListScrollHandle, combobox::ComboboxState, input::TextareaState, table::TableState,
     tree::TreeState,
@@ -74,9 +72,8 @@ pub(super) use pioneer_client::{
 use pioneer_protocol::{
     ArtifactRef, AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
     McpServerDetailsResponse, PrincipalId, SkillHealthItem, SkillId, SkillListItem, SkillPackId,
-    TaskUserNotification, Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode,
-    ThreadParticipantSummary, ThreadPlacement, ThreadVisibility, TurnPermissionMode, VoiceStatus,
-    Workspace, WorkspaceId,
+    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadParticipantSummary,
+    ThreadPlacement, ThreadVisibility, TurnPermissionMode, VoiceStatus, Workspace, WorkspaceId,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -157,7 +154,10 @@ impl GatewaySetupFormMode {
 }
 
 pub(super) use crate::desktop_navigation::MainRoute as MainContentView;
-pub(super) use pioneer_client::navigation::{AdministrationRoute as AdministrationContentView, SettingsRoute as SettingsContentView, TaskThreadLineage as TaskThreadNavigationEntry};
+pub(super) use pioneer_client::navigation::{
+    AdministrationRoute as AdministrationContentView, SettingsRoute as SettingsContentView,
+    TaskThreadLineage as TaskThreadNavigationEntry,
+};
 
 pub(super) struct GatewayCoordinator {
     pub(super) setup_view: Entity<crate::app::initial::InitialGatewaySetupView>,
@@ -326,18 +326,8 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) startup: DesktopStartupCoordinator,
     pub(super) invitation_join: Option<Entity<DesktopInvitationJoinState>>,
     pub(super) invitation_join_input_subscriptions: Vec<Subscription>,
-    /// Authoritative per-thread counts from `thread/tree`; never derived from
-    /// the locally loaded timeline window.
-    pub(super) thread_unread: HashMap<String, u64>,
-    pub(super) thread_folders: HashMap<String, ThreadFolder>,
-    pub(super) thread_placements: HashMap<String, ThreadPlacement>,
-    pub(super) thread_agents_doc_summaries:
-        HashMap<ThreadAgentsDocSummaryKey, ThreadAgentsDocSummary>,
     pub(super) active_agents_doc_editor_scope: Option<ThreadAgentsDocEditorScope>,
     pub(super) agents_doc_editor: Option<Entity<AgentsDocEditor>>,
-    pub(super) thread_folder_expanded: HashMap<String, bool>,
-    pub(super) thread_tree_selected_node_id: Option<String>,
-    pub(super) thread_tree_state: Entity<TreeState>,
     pub(super) profile_editor: Option<Entity<ProfileEditorState>>,
     pub(super) profile_editor_input_subscriptions: Vec<Subscription>,
     pub(super) administration: AdministrationCache,
@@ -365,13 +355,11 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) settings_tree_state: Entity<TreeState>,
     pub(super) administration_tree_state: Entity<TreeState>,
     pub(super) provider_tree_state: Entity<TreeState>,
-    pub(super) thread_list_loading: bool,
-    pub(super) thread_list_refresh_requested: bool,
+
     pub(super) active_thread_resubscribe_pending: bool,
-    pub(super) workspaces: Vec<Workspace>,
-    pub(super) workspaces_loading: bool,
-    pub(super) workspaces_error: Option<String>,
-    pub(super) workspace_action_in_progress: bool,
+    pub(crate) task_notification_surface: Option<AnyView>,
+    pub(super) workspace_catalog_input:
+        Arc<pioneer_client::workspaces::catalog::WorkspaceCatalogPublication>,
     pub(super) composer_state: Entity<TextareaState>,
     pub(super) composer_input_subscription: Option<Subscription>,
     pub(super) composer_mention_select: Entity<ComboboxState<MemberPickerDelegate>>,
@@ -414,7 +402,6 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) desktop_voice_prepare_request: Option<PrepareVoiceComposerSnapshotRequest>,
     pub(super) desktop_voice_capture:
         Option<DesktopVoiceCaptureFlow<PlatformDesktopAudioInputBackend, GatewayWsCommandSender>>,
-    pub(super) desktop_update: DesktopUpdateUiState,
     pub(super) composer_model_selection_manually_selected: bool,
     pub(super) composer_model_display_cache: HashMap<ProviderModelDisplayKey, Option<String>>,
     pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,
@@ -458,13 +445,6 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
     pub(super) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,
     pub(super) task_review_actions: TaskReviewActionState,
-    pub(super) task_user_notifications_workspace_id: Option<String>,
-    pub(super) task_user_notifications: Vec<TaskUserNotification>,
-    pub(super) task_user_notifications_next_cursor: Option<String>,
-    pub(super) task_user_notifications_loading: bool,
-    pub(super) task_user_notifications_refresh_requested: bool,
-    pub(super) task_user_notifications_refresh_generation: u64,
-    pub(super) task_user_notifications_error: Option<String>,
     pub(super) thread_artifacts: ThreadArtifactsState,
     pub(super) artifact_download_cancellations:
         HashMap<ArtifactVersionKey, tokio_util::sync::CancellationToken>,

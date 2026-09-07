@@ -146,7 +146,12 @@ impl PioneerDesktop {
                         view.message_mutation_pending = false;
                         if succeeded {
                             view.active_thread_resubscribe_pending = true;
-                            view.refresh_thread_list(cx);
+                            if let Some(workspace) = view.active_workspace_id() {
+                                view.gateway
+                                    .client_runtime
+                                    .client_core()
+                                    .request_workspace_tree_refresh(workspace);
+                            }
                             view.clear_composer(window, cx);
                         } else {
                             if let Some(target) = view
@@ -163,7 +168,12 @@ impl PioneerDesktop {
                             }
                             if conflict {
                                 view.active_thread_resubscribe_pending = true;
-                                view.refresh_thread_list(cx);
+                                if let Some(workspace) = view.active_workspace_id() {
+                                    view.gateway
+                                        .client_runtime
+                                        .client_core()
+                                        .request_workspace_tree_refresh(workspace);
+                                }
                             }
                         }
                         cx.notify();
@@ -234,7 +244,12 @@ impl PioneerDesktop {
                     let _ = this.update_in(&mut cx, |view, window, cx| {
                         view.message_mutation_pending = false;
                         view.active_thread_resubscribe_pending = true;
-                        view.refresh_thread_list(cx);
+                        if let Some(workspace) = view.active_workspace_id() {
+                            view.gateway
+                                .client_runtime
+                                .client_core()
+                                .request_workspace_tree_refresh(workspace);
+                        }
                         if result.is_err() {
                             let message = if conflict {
                                 t!("timeline.message.delete_conflict").to_string()

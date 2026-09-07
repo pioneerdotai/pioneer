@@ -82,6 +82,7 @@ impl LegacyScreenAdapter {
     }
 
     pub(crate) fn close_route_bindings(&mut self, cx: &mut Context<Self>) {
+        self.member_avatar_state.close();
         self.cancel_desktop_voice_hold("window_closed", cx);
         self.desktop_voice_status_poll_generation =
             self.desktop_voice_status_poll_generation.wrapping_add(1);

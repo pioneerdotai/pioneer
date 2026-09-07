@@ -189,13 +189,15 @@ impl PioneerDesktop {
             .unwrap_or_default()
     }
 
-    pub(in crate::app) fn thread_tree_state(&self) -> &Entity<TreeState> {
-        &self.thread_tree_state
+    pub(in crate::app) fn main_content_view(&self) -> MainContentView {
+        self.navigation.snapshot().route()
     }
-
-    pub(in crate::app) fn main_content_view(&self) -> MainContentView { self.navigation.snapshot().route() }
-    pub(in crate::app) fn administration_content_view(&self) -> AdministrationContentView { self.navigation_input.administration_route() }
-    pub(in crate::app) fn settings_content_view(&self) -> SettingsContentView { self.navigation_input.settings_route() }
+    pub(in crate::app) fn administration_content_view(&self) -> AdministrationContentView {
+        self.navigation_input.administration_route()
+    }
+    pub(in crate::app) fn settings_content_view(&self) -> SettingsContentView {
+        self.navigation_input.settings_route()
+    }
 
     pub(in crate::app) fn current_active_thread_id(&self) -> Option<&str> {
         self.navigation_input.active_thread_id()
@@ -214,7 +216,8 @@ impl PioneerDesktop {
         &self,
     ) -> Option<&TaskThreadNavigationEntry> {
         let active_thread_id = self.current_active_thread_id()?;
-        self.navigation_input.lineage()
+        self.navigation_input
+            .lineage()
             .last()
             .filter(|entry| entry.child_thread_id() == active_thread_id)
     }
@@ -224,7 +227,7 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn workspaces(&self) -> &[Workspace] {
-        self.workspaces.as_slice()
+        self.workspace_catalog_input.workspaces()
     }
 
     pub(in crate::app) fn active_workspaces(&self) -> Vec<&Workspace> {
@@ -232,15 +235,15 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn workspaces_loading(&self) -> bool {
-        self.workspaces_loading
+        self.workspace_catalog_input.is_loading()
     }
 
     pub(in crate::app) fn workspaces_error(&self) -> Option<&str> {
-        self.workspaces_error.as_deref()
+        self.workspace_catalog_input.error()
     }
 
     pub(in crate::app) fn workspace_action_in_progress(&self) -> bool {
-        self.workspace_action_in_progress
+        self.workspace_catalog_input.is_action_pending()
     }
 
     pub(in crate::app) fn workspace_by_id(&self, workspace_id: &str) -> Option<&Workspace> {
@@ -302,7 +305,8 @@ impl PioneerDesktop {
         self.thread_coordinator(thread_id)
             .map(|coordinator| coordinator.workspace_id.clone())
             .or_else(|| {
-                self.navigation_input.lineage()
+                self.navigation_input
+                    .lineage()
                     .iter()
                     .rev()
                     .find(|entry| entry.child_thread_id() == thread_id)
@@ -361,40 +365,6 @@ impl PioneerDesktop {
         self.providers.cli_runtimes()
     }
 
-    pub(in crate::app) fn thread_folder(&self, folder_id: &str) -> Option<&ThreadFolder> {
-        self.thread_folders.get(folder_id)
-    }
-
-    pub(in crate::app) fn thread_folders_for_workspace(
-        &self,
-        workspace_id: &str,
-    ) -> Vec<&ThreadFolder> {
-        thread_tree::thread_folders_for_workspace(&self.thread_folders, workspace_id)
-    }
-
-    pub(in crate::app) fn thread_agents_doc_summary_for_workspace(
-        &self,
-        folder_id: Option<&str>,
-        workspace_id: &str,
-    ) -> Option<&ThreadAgentsDocSummary> {
-        agents_doc_scope::thread_agents_doc_summary_for_workspace(
-            &self.thread_agents_doc_summaries,
-            folder_id,
-            workspace_id,
-        )
-    }
-
-    pub(in crate::app) fn thread_placements_for_workspace(
-        &self,
-        workspace_id: &str,
-    ) -> Vec<&ThreadPlacement> {
-        thread_tree::thread_placements_for_workspace(&self.thread_placements, workspace_id)
-    }
-
-    pub(in crate::app) fn selected_thread_tree_node_id(&self) -> Option<&str> {
-        self.thread_tree_selected_node_id.as_deref()
-    }
-
     pub(in crate::app) fn sorted_thread_ids_for_workspace(
         &self,
         workspace_id: &str,
@@ -406,7 +376,8 @@ impl PioneerDesktop {
         );
         thread_ids.retain(|thread_id| {
             !self
-                .navigation_input.lineage()
+                .navigation_input
+                .lineage()
                 .iter()
                 .any(|entry| entry.child_thread_id() == *thread_id)
         });
@@ -474,7 +445,7 @@ impl PioneerDesktop {
             workspaces_loading: self.workspaces_loading(),
             workspaces_error: self.workspaces_error(),
             workspace_action_in_progress: self.workspace_action_in_progress(),
-            thread_list_loading: self.thread_list_loading,
+            thread_list_loading: self.thread_directory_loading(),
             thread_start_in_progress: self
                 .gateway
                 .client_runtime
@@ -491,5 +462,26 @@ impl PioneerDesktop {
             coordinators: &self.thread_coordinator_snapshots(),
             gateway_connected: self.gateway.connection_state == GatewayConnectionState::Connected,
         })
+    }
+}
+
+impl PioneerDesktop {
+    pub(crate) fn workspace_context_locked(&self) -> bool {
+        self.composer_upload_in_progress || self.desktop_voice_context_locked()
+    }
+}
+
+impl PioneerDesktop {
+    pub(in crate::app) fn thread_directory_loading(&self) -> bool {
+        self.active_workspace_id()
+            .and_then(|workspace| {
+                self.gateway
+                    .client_runtime
+                    .client_core()
+                    .workspace_tree(workspace)
+            })
+            .map_or(self.workspaces_loading(), |publication| {
+                publication.is_loading()
+            })
     }
 }

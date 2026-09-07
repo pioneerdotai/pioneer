@@ -1,13 +1,13 @@
 //! Secret-free FFI projection for the native avatar cache.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use pioneer_client::{
     avatars::{
         AgentAvatarCacheResult, AvatarCacheError, AvatarCacheRequest, AvatarCacheService,
-        AvatarCacheSource, invalidate_avatar_cache,
+        AvatarCacheSource,
     },
     transport::{
         http::{
@@ -61,23 +61,20 @@ pub struct ClientAgentAvatarCacheResult {
 }
 
 #[derive(Default)]
-pub(crate) struct ClientFfiAvatarCache {
-    operation_gate: Mutex<()>,
-}
+pub(crate) struct ClientFfiAvatarCache {}
 
 impl ClientFfiAvatarCache {
     pub(crate) fn resolve(
         &self,
+        core: &pioneer_client::core::ClientCore,
         sender: &GatewayWsCommandSender,
         runtime_home: PathBuf,
         request: ClientMemberAvatarCacheRequest,
     ) -> Result<ClientMemberAvatarCacheResult, ClientFfiError> {
-        let _operation = self.operation_gate.lock().map_err(|_| {
-            ClientFfiError::new("avatar cache is unavailable", "avatar_cache_unavailable")
-        })?;
         let (service, runtime) = avatar_cache_service(sender, runtime_home)?;
         let result = runtime
-            .block_on(service.resolve(
+            .block_on(core.resolve_member_avatar(
+                &service,
                 AvatarCacheRequest {
                     principal_id: request.principal_id,
                     avatar_revision: request.avatar_revision,
@@ -97,27 +94,20 @@ impl ClientFfiAvatarCache {
 
     pub(crate) fn resolve_agent(
         &self,
+        core: &pioneer_client::core::ClientCore,
         sender: &GatewayWsCommandSender,
         runtime_home: PathBuf,
         request: ClientAgentAvatarCacheRequest,
     ) -> Result<ClientAgentAvatarCacheResult, ClientFfiError> {
-        let _operation = self.operation_gate.lock().map_err(|_| {
-            ClientFfiError::new("avatar cache is unavailable", "avatar_cache_unavailable")
-        })?;
         let (service, runtime) = avatar_cache_service(sender, runtime_home)?;
         let result = runtime
-            .block_on(
-                service.resolve_agent_avatar(request.avatar_revision, CancellationToken::new()),
-            )
+            .block_on(core.resolve_agent_avatar(
+                &service,
+                request.avatar_revision,
+                CancellationToken::new(),
+            ))
             .map_err(map_cache_error)?;
         agent_result_for_shell(result)
-    }
-
-    pub(crate) fn invalidate_all(&self, runtime_home: &Path) {
-        let Ok(_operation) = self.operation_gate.lock() else {
-            return;
-        };
-        let _ = invalidate_avatar_cache(runtime_home);
     }
 }
 

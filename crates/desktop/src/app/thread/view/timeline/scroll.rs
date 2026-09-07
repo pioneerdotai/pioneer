@@ -272,12 +272,15 @@ impl PioneerDesktop {
                                 response.thread_id.as_str(),
                                 response.workspace_id.as_str(),
                             ) {
-                                if response.unread_count == 0 {
-                                    view.thread_unread.remove(response.thread_id.as_str());
-                                } else {
-                                    view.thread_unread
-                                        .insert(response.thread_id, response.unread_count);
-                                }
+                                view.gateway
+                                    .client_runtime
+                                    .client_core()
+                                    .apply_directory_read(
+                                        &response.workspace_id,
+                                        &response.thread_id,
+                                        &response.cursor,
+                                        response.unread_count,
+                                    );
                             }
                         }
                         Err(_) => {

@@ -12,10 +12,6 @@ pub(super) struct FramePresentation {
     keepawake: Option<bool>,
     can_manage: bool,
     can_notify: bool,
-    notification_refresh: u64,
-    unread_notifications: usize,
-    notifications_loading: bool,
-    notifications_error: Option<String>,
     status: Option<String>,
     artifacts: bool,
     members: bool,
@@ -37,14 +33,6 @@ impl LegacyScreenAdapter {
                 .map(|settings| settings.general.keepawake),
             can_manage: capabilities.can_manage_capabilities,
             can_notify: capabilities.can_read_own_notifications,
-            notification_refresh: self.task_user_notifications_refresh_generation,
-            unread_notifications: self
-                .task_user_notifications
-                .iter()
-                .filter(|item| item.acknowledged_at.is_none())
-                .count(),
-            notifications_loading: self.task_user_notifications_loading,
-            notifications_error: self.task_user_notifications_error.clone(),
             status: self
                 .should_show_active_thread_status()
                 .then(|| self.active_thread_status_text()),

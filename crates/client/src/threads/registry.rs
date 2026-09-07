@@ -156,12 +156,10 @@ impl ThreadDomainStore {
 pub struct ThreadRegistry {
     current_principal_id: Option<String>,
     stores: HashMap<String, ThreadDomainStore>,
-    catalog: HashMap<String, Thread>,
-    placements: HashMap<String, pioneer_protocol::ThreadPlacement>,
+    pub(crate) directory: crate::workspaces::directory::ThreadDirectoryStore,
     revisions: HashMap<String, (u64, u64, u64)>,
     retired: HashSet<String>,
     presentation_revisions: HashMap<String, u64>,
-    summaries: HashMap<String, SidebarSummaryChanged>,
     subscription_counts: HashMap<String, usize>,
     demands: HashMap<ClientScope, ClientDemand>,
     timeline_subscription_counts: HashMap<String, usize>,
@@ -189,7 +187,8 @@ impl ThreadRegistry {
             return false;
         }
         if self
-            .catalog
+            .directory
+            .threads
             .get(id)
             .is_some_and(|thread| thread.workspace_id != workspace)
         {
@@ -205,7 +204,7 @@ impl ThreadRegistry {
         self.clock = self.clock.saturating_add(1);
         let store = self.stores.entry(id.to_owned()).or_insert_with(|| {
             let mut store = ThreadDomainStore::new(id, workspace);
-            if let Some(thread) = self.catalog.get(id) {
+            if let Some(thread) = self.directory.threads.get(id) {
                 store.coordinator.set_snapshot(thread.clone());
             }
             store.generation = self.clock;
@@ -249,7 +248,7 @@ impl ThreadRegistry {
                 + u64::from(
                     previous.is_none_or(|p| p.coordinator.resume != store.coordinator.resume),
                 ),
-            placement: self.placements.get(id).cloned(),
+            placement: self.directory.placements.get(id).cloned(),
             subscription_failed: store.subscription_failed,
             cache_patch: Default::default(),
         };
@@ -312,9 +311,12 @@ impl ThreadRegistry {
             thread_id: id.to_owned(),
             workspace_id: store.coordinator.workspace_id.clone(),
             thread: thread_summary,
-            placement: self.placements.get(id).cloned(),
+            placement: self.directory.placements.get(id).cloned(),
         };
-        if self.summaries.get(id) != Some(&summary) {
+        if self.directory.summaries.get(id) != Some(&summary) {
+            self.directory
+                .dirty_workspaces
+                .insert(summary.workspace_id.clone());
             store.summary_revision = namespace.2 + 1;
             drafts.push(authority.publication(
                 ClientScope::SidebarSummary {
@@ -324,11 +326,11 @@ impl ThreadRegistry {
                 revisions(store.summary_revision),
                 Arc::new(summary.clone()),
             ));
-            self.summaries.insert(id.to_owned(), summary);
+            self.directory.summaries.insert(id.to_owned(), summary);
         }
         if let Some(mut thread) = store.coordinator.thread().cloned() {
             thread.turns.clear();
-            self.catalog.insert(id.to_owned(), thread);
+            self.directory.threads.insert(id.to_owned(), thread);
         }
         self.retired.remove(id);
         self.revisions.insert(
@@ -381,7 +383,8 @@ impl DerefMut for ThreadMutation<'_> {
 impl Drop for ThreadMutation<'_> {
     fn drop(&mut self) {
         let drafts = self.registry.publish(&self.id);
-        self.core.transition(
+        self.core.transition_directory(
+            &mut self.registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -421,7 +424,8 @@ impl Drop for ThreadTimelineMutation<'_> {
             .threads_by_id
             .retain(|id, _| id == &self.id);
         let drafts = self.registry.publish(&self.id);
-        self.core.transition(
+        self.core.transition_directory(
+            &mut self.registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -483,6 +487,12 @@ impl ClientCore {
         let id = thread.id.clone();
         let workspace = thread.workspace_id.clone();
         if let Some(mut mutation) = self.thread_mutation(&id, &workspace) {
+            if mutation
+                .thread()
+                .is_some_and(|previous| previous.updated_at > thread.updated_at)
+            {
+                return;
+            }
             if mutation.thread() != Some(&thread) {
                 mutation.set_snapshot(thread);
             }
@@ -588,7 +598,8 @@ impl ClientCore {
                 Arc::new(projection),
             ));
         }
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -652,7 +663,8 @@ impl ClientCore {
                 .lock()
                 .expect("thread registry poisoned");
             let mut result: HashMap<_, _> = registry
-                .catalog
+                .directory
+                .threads
                 .iter()
                 .map(|(id, t)| (id.clone(), ThreadCoordinator::new(t.clone())))
                 .collect();
@@ -764,15 +776,21 @@ impl ClientCore {
             .lock()
             .expect("thread registry poisoned");
         registry.stores.remove(id);
-        registry.catalog.remove(id);
-        registry.placements.remove(id);
+        if let Some(thread) = registry.directory.threads.remove(id) {
+            registry
+                .directory
+                .dirty_workspaces
+                .insert(thread.workspace_id);
+        }
+        registry.directory.placements.remove(id);
         registry.navigation.remove_thread(id);
         registry.ready_resume.retain(|value| value != id);
         registry.ready_resume_set.remove(id);
         let mut drafts = registry.navigation_change().into_iter().collect::<Vec<_>>();
         drafts.extend(registry.retire(id));
         drafts.extend(registry.retire_summary(id));
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -823,7 +841,8 @@ impl ClientCore {
             ..Default::default()
         };
         self.publish_navigation(&mut registry);
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -844,7 +863,8 @@ impl ClientCore {
         for id in ids {
             drafts.extend(registry.publish(&id));
         }
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -1036,7 +1056,12 @@ impl ClientCore {
             .into_iter()
             .flat_map(|id| registry.publish(&id))
             .collect();
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
     }
 }
 
@@ -1051,7 +1076,8 @@ impl ClientCore {
         };
         store.cli_binding = binding;
         let drafts = registry.publish(id);
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -1064,7 +1090,8 @@ impl ClientCore {
         self.thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .navigation.active_thread_id
+            .navigation
+            .active_thread_id
             .clone()
     }
     pub fn thread_session_revision(&self) -> u64 {
@@ -1074,22 +1101,49 @@ impl ClientCore {
             .session_revision
     }
     pub fn activate_thread(&self, id: Option<&str>, workspace: Option<&str>) {
-        self.navigate(crate::navigation::NavigationIntent::SelectThread {
-            workspace_id: workspace.map(str::to_owned), thread_id: id.map(str::to_owned),
-        }, None);
+        self.navigate(
+            crate::navigation::NavigationIntent::SelectThread {
+                workspace_id: workspace.map(str::to_owned),
+                thread_id: id.map(str::to_owned),
+            },
+            None,
+        );
     }
     pub fn thread_workspace_draft(&self, workspace: &str) -> Option<String> {
-        let registry = self.thread_registry.lock().expect("thread registry poisoned");
-        registry.navigation.drafts.get(workspace).filter(|id| registry.stores.contains_key(*id)).cloned()
+        let registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        registry
+            .navigation
+            .drafts
+            .get(workspace)
+            .filter(|id| registry.stores.contains_key(*id))
+            .cloned()
     }
     pub fn thread_workspace_last_active(&self, workspace: &str) -> Option<String> {
-        self.navigation_snapshot().last_active(workspace).map(str::to_owned)
+        self.navigation_snapshot()
+            .last_active(workspace)
+            .map(str::to_owned)
     }
     pub fn remember_thread_draft(&self, workspace: &str, id: Option<String>) {
-        self.navigate(crate::navigation::NavigationIntent::RememberDraft { workspace_id: workspace.to_owned(), thread_id: id }, None);
+        self.navigate(
+            crate::navigation::NavigationIntent::RememberDraft {
+                workspace_id: workspace.to_owned(),
+                thread_id: id,
+            },
+            None,
+        );
     }
     pub fn promote_thread(&self, id: &str) -> bool {
-        self.navigate(crate::navigation::NavigationIntent::PromoteThread { thread_id: id.to_owned() }, None).outcome() == crate::core::ClientTransitionOutcome::Changed
+        self.navigate(
+            crate::navigation::NavigationIntent::PromoteThread {
+                thread_id: id.to_owned(),
+            },
+            None,
+        )
+        .outcome()
+            == crate::core::ClientTransitionOutcome::Changed
     }
     pub fn apply_thread_conversation_event(
         &self,
@@ -1148,7 +1202,8 @@ impl ClientCore {
             None => crate::timeline::semantic::apply_conversation_event_to_semantic_timeline_with_patch(&mut store.semantic, workspace, &event, crate::timeline::labels::now_unix_ms()),
         };
         let drafts = registry.publish(&id);
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -1197,7 +1252,8 @@ impl ClientCore {
             .map(|s| s.coordinator())
             .or_else(|| {
                 registry
-                    .catalog
+                    .directory
+                    .threads
                     .get(id)
                     .map(|t| Arc::new(ThreadCoordinator::new(t.clone())))
             })
@@ -1595,18 +1651,32 @@ impl ClientCore {
                 }
             }
             Some(ThreadUpdated(r)) => {
-                if let Some(placement) = r.placement {
-                    if placement.thread_id == r.thread.id
-                        && placement.workspace_id == r.thread.workspace_id
+                let id = r.thread.id.clone();
+                let workspace = r.thread.workspace_id.clone();
+                if let Some(mut mutation) = self.thread_mutation(&id, &workspace) {
+                    if mutation
+                        .thread()
+                        .is_some_and(|previous| previous.updated_at > r.thread.updated_at)
                     {
-                        self.thread_registry
-                            .lock()
-                            .expect("thread registry poisoned")
-                            .placements
-                            .insert(placement.thread_id.clone(), placement);
+                        return true;
+                    }
+                    if let Some(placement) = r.placement {
+                        if placement.thread_id == id
+                            && placement.workspace_id == workspace
+                            && mutation.registry.directory.placements.get(&id) != Some(&placement)
+                        {
+                            mutation.registry.directory.placements.insert(id, placement);
+                            mutation
+                                .registry
+                                .directory
+                                .dirty_workspaces
+                                .insert(workspace);
+                        }
+                    }
+                    if mutation.thread() != Some(&r.thread) {
+                        mutation.set_snapshot(r.thread);
                     }
                 }
-                self.upsert_thread(r.thread);
             }
             Some(ThreadClosed(r)) => {
                 if let Some(pending) = r.pending_requests {
@@ -1687,9 +1757,12 @@ impl ClientCore {
 
 impl ThreadRegistry {
     fn retire_summary(&mut self, id: &str) -> Vec<ClientPublicationDraft> {
-        let Some(summary) = self.summaries.remove(id) else {
+        let Some(summary) = self.directory.summaries.remove(id) else {
             return vec![];
         };
+        self.directory
+            .dirty_workspaces
+            .insert(summary.workspace_id.clone());
         let revision = self.revisions.entry(id.to_owned()).or_default();
         revision.2 += 1;
         vec![ClientMutationAuthority { _private: () }.publication(
@@ -1820,7 +1893,8 @@ impl ClientCore {
             store.demand = demand;
         }
         let drafts = registry.evict_inactive();
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -1854,7 +1928,8 @@ impl ClientCore {
             store.demand = combined;
         }
         let drafts = registry.evict_inactive();
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -1876,7 +1951,13 @@ impl ClientCore {
             .to_vec()
     }
     pub fn remember_thread_last_active(&self, workspace: &str, id: Option<String>) {
-        self.navigate(crate::navigation::NavigationIntent::RememberLast { workspace_id: workspace.to_owned(), thread_id: id }, None);
+        self.navigate(
+            crate::navigation::NavigationIntent::RememberLast {
+                workspace_id: workspace.to_owned(),
+                thread_id: id,
+            },
+            None,
+        );
     }
 }
 
@@ -3152,7 +3233,7 @@ mod tests {
         assert!(registry.stores.contains_key("running"));
         assert!(registry.stores.contains_key("draft"));
         assert!(registry.stores.contains_key("subscribed"));
-        assert_eq!(registry.catalog.len(), 83);
+        assert_eq!(registry.directory.threads.len(), 83);
         drop(registry);
         drop(subscription);
         assert!(core.thread_snapshot("subscribed").is_none());
@@ -3239,7 +3320,12 @@ impl ClientCore {
             },
         );
         let drafts = registry.publish(&id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
         Some(ThreadSemanticRequest {
             id,
             generation,
@@ -3400,7 +3486,12 @@ impl ClientCore {
                         )
                     });
             let drafts = registry.publish(&request.id);
-            self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
             drop(registry);
             let Some(action) = next else {
                 return;
@@ -3520,7 +3611,12 @@ impl ClientCore {
             key,
         );
         let drafts = registry.publish(&request.id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
         drop(registry);
         if let Some(next) = next {
             self.schedule_thread_semantic_request(next);
@@ -3817,7 +3913,12 @@ impl ClientCore {
                     store.coordinator.conversation.apply(event);
                 }
                 let drafts = registry.publish(id);
-                self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+                self.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    drafts,
+                    vec![],
+                );
                 let Some(next) = page.next_cursor else {
                     break;
                 };
@@ -3873,7 +3974,12 @@ impl ClientCore {
             }
         }
         let drafts = registry.publish(id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
     }
 }
 
@@ -3936,7 +4042,12 @@ impl ClientCore {
         );
         store.coordinator.set_snapshot(reduction.thread);
         let drafts = registry.publish(id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
         Ok(())
     }
 }
@@ -3948,7 +4059,7 @@ impl ClientCore {
         workspace: &str,
         visibility: pioneer_protocol::ThreadVisibility,
     ) -> anyhow::Result<String> {
-        let (id, generation) = {
+        let (id, generation, navigation_revision) = {
             let mut registry = self
                 .thread_registry
                 .lock()
@@ -3969,7 +4080,7 @@ impl ClientCore {
                 "Thread creation scope mismatch"
             );
             let generation = registry.stores[&id].generation;
-            (id, generation)
+            (id, generation, registry.navigation_revision)
         };
         let result = crate::transport::ws::command_sender::thread_start(
             transport,
@@ -4018,15 +4129,31 @@ impl ClientCore {
             .expect("retained draft")
             .coordinator
             .set_snapshot(reduction.thread);
-        registry.navigation.apply(crate::navigation::NavigationIntent::RememberDraft {
-            workspace_id: workspace.to_owned(), thread_id: Some(id.clone()),
-        });
-        registry.navigation.apply(crate::navigation::NavigationIntent::SelectThread {
-            workspace_id: Some(workspace.to_owned()), thread_id: Some(id.clone()),
-        });
+        registry
+            .navigation
+            .apply(crate::navigation::NavigationIntent::RememberDraft {
+                workspace_id: workspace.to_owned(),
+                thread_id: Some(id.clone()),
+            });
+        if registry.navigation_revision == navigation_revision
+            && registry.navigation.workspace_id() == Some(workspace)
+            && registry.navigation.active_thread_id().is_none()
+        {
+            registry
+                .navigation
+                .apply(crate::navigation::NavigationIntent::SelectThread {
+                    workspace_id: Some(workspace.to_owned()),
+                    thread_id: Some(id.clone()),
+                });
+        }
         self.publish_navigation(&mut registry);
         let drafts = registry.publish(&id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
         Ok(id)
     }
 }
@@ -4061,7 +4188,12 @@ impl ClientCore {
         }
         let generation = store.generation;
         let drafts = registry.publish(id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
         drop(registry);
         let request = if binding {
             ThreadControllerRequest::Binding {
@@ -4122,7 +4254,12 @@ impl ClientCore {
                 .and_then(|r| r.binding)
                 .filter(|binding| binding.thread_id == id && binding.workspace_id == workspace);
             let drafts = registry.publish(id);
-            self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
         } else {
             let result = self.refresh_thread_subscription_generation(
                 &self.compatibility_runtime().ws_command_sender(),
@@ -4143,7 +4280,12 @@ impl ClientCore {
             store.coordinator.history_loading = false;
             store.subscription_failed = result.is_err();
             let drafts = registry.publish(id);
-            self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
         }
     }
 }
@@ -4200,7 +4342,12 @@ impl ClientCore {
             );
         }
         let drafts = registry.publish(&token.id);
-        self.transition(&ClientMutationAuthority { _private: () }, drafts, vec![]);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
         true
     }
 }
@@ -4378,7 +4525,8 @@ impl ClientCore {
             })
             .collect::<Vec<_>>();
         let authority = ClientMutationAuthority { _private: () };
-        let transition = self.transition(
+        let transition = self.transition_directory(
+            &mut registry,
             &authority,
             vec![
                 authority
@@ -4668,7 +4816,8 @@ impl ClientCore {
         for id in ids {
             drafts.extend(registry.publish(&id));
         }
-        self.transition(
+        self.transition_directory(
+            &mut registry,
             &ClientMutationAuthority { _private: () },
             drafts,
             Vec::new(),
@@ -4681,7 +4830,7 @@ impl ThreadRegistry {
         self.current_principal_id = principal;
         self.pending_requests
             .apply(PendingRequestsReduction::ClearAll);
-        self.catalog.clear();
+        self.directory.invalidate();
         self.ready_resume.clear();
         self.ready_resume_set.clear();
         for (id, store) in &mut self.stores {
@@ -4703,6 +4852,12 @@ impl ThreadRegistry {
     ) {
         for publication in publications {
             match publication.scope() {
+                ClientScope::WorkspaceTree {
+                    workspace_id: Some(workspace),
+                } => {
+                    self.directory
+                        .synchronize_revision(workspace, publication.revisions().scoped().get());
+                }
                 ClientScope::Thread { thread_id } => {
                     let revisions = self.revisions.entry(thread_id.clone()).or_default();
                     revisions.0 = publication.revisions().domain().get();
@@ -4715,10 +4870,38 @@ impl ThreadRegistry {
                 ClientScope::SidebarSummary { thread_id, .. } => {
                     self.revisions.entry(thread_id.clone()).or_default().2 =
                         publication.revisions().scoped().get();
-                    self.summaries.remove(thread_id);
+                    self.directory.summaries.remove(thread_id);
                 }
                 _ => {}
             }
         }
+    }
+}
+
+impl ClientCore {
+    fn transition_directory(
+        &self,
+        registry: &mut ThreadRegistry,
+        authority: &ClientMutationAuthority,
+        mut drafts: Vec<ClientPublicationDraft>,
+        effects: Vec<crate::core::ClientEffectPlan>,
+    ) -> crate::core::ClientTransition {
+        for workspace in std::mem::take(&mut registry.directory.dirty_workspaces) {
+            let draft = registry.navigation.drafts.get(&workspace).cloned();
+            if let Some(publication) =
+                registry
+                    .directory
+                    .project(&workspace, draft.as_deref(), false, None)
+            {
+                drafts.push(authority.publication(
+                    ClientScope::WorkspaceTree {
+                        workspace_id: Some(workspace),
+                    },
+                    revisions(publication.revision()),
+                    publication,
+                ));
+            }
+        }
+        self.transition(authority, drafts, effects)
     }
 }

@@ -17,7 +17,6 @@ mod skills;
 mod startup;
 mod task_notifications;
 mod thread;
-mod workspaces;
 
-pub(crate) use root::{LegacyScreenAdapter, FrameChanged, SidebarChanged};
 pub(crate) use root::LegacyScreenAdapter as PioneerDesktop;
+pub(crate) use root::{FrameChanged, LegacyScreenAdapter, SidebarChanged};

@@ -1,0 +1,16 @@
+[package]
+name = "pioneer-desktop-workspaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+gpui-kit = { workspace = true, features = ["component"] }
+pioneer-client.workspace = true
+pioneer-desktop-foundation.workspace = true
+rust-i18n.workspace = true
+tokio.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true

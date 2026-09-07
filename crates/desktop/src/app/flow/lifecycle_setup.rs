@@ -12,16 +12,13 @@ impl PioneerDesktop {
             self.current_active_thread_id(),
         );
         self.gateway.capability_snapshot = None;
-        self.thread_list_loading = plan.thread_list_loading;
         if plan.clear_active_thread {
             self.set_active_thread_id(None);
         }
         if plan.clear_thread_conversations {
             self.clear_thread_conversations();
         }
-        if plan.rebuild_thread_tree {
-            self.rebuild_sidebar_tree_state(cx);
-        }
+        if plan.rebuild_thread_tree {}
         if plan.reset_thread_start {
             self.reset_thread_start_state();
         }

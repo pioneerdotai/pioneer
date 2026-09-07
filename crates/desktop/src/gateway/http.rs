@@ -37,6 +37,7 @@ pub(crate) struct DesktopGatewayHttpClient {
     downloads: ArtifactHttpDownloadService,
     previews: ArtifactHttpPreviewService,
     avatars: AvatarCacheService,
+    client_core: Arc<pioneer_client::core::ClientCore>,
     runtime: Arc<Runtime>,
 }
 
@@ -68,7 +69,7 @@ impl DesktopGatewayHttpClient {
             return Err(GatewayHttpError::InvalidEndpoint);
         }
         let authority = Arc::new(DesktopGatewayHttpAuthority {
-            client_core,
+            client_core: client_core.clone(),
             endpoint_id: endpoint.id.clone(),
             sender,
         });
@@ -91,6 +92,7 @@ impl DesktopGatewayHttpClient {
             downloads,
             previews,
             avatars,
+            client_core,
             runtime: Arc::new(runtime),
         })
     }
@@ -101,7 +103,10 @@ impl DesktopGatewayHttpClient {
         cancellation: CancellationToken,
     ) -> Result<AvatarCacheResult, AvatarCacheError> {
         self.runtime
-            .block_on(self.avatars.resolve(request, cancellation))
+            .block_on(
+                self.client_core
+                    .resolve_member_avatar(&self.avatars, request, cancellation),
+            )
     }
 
     pub(crate) fn resolve_agent_avatar(
@@ -109,10 +114,11 @@ impl DesktopGatewayHttpClient {
         avatar_revision: String,
         cancellation: CancellationToken,
     ) -> Result<AgentAvatarCacheResult, AvatarCacheError> {
-        self.runtime.block_on(
-            self.avatars
-                .resolve_agent_avatar(avatar_revision, cancellation),
-        )
+        self.runtime.block_on(self.client_core.resolve_agent_avatar(
+            &self.avatars,
+            avatar_revision,
+            cancellation,
+        ))
     }
 
     pub(crate) fn matches(

@@ -4,25 +4,25 @@ extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
 mod app;
-mod desktop_navigation;
-mod desktop_shell;
-mod shell_state;
 mod assets;
 mod audio;
 mod client_runtime;
 mod code_highlight;
 mod components;
+mod desktop_navigation;
+mod desktop_shell;
 mod file_opener;
 mod gateway;
 mod menu;
 mod qualification_diagnostics;
 mod render_guard;
 mod settings;
+mod shell_state;
 mod state;
 #[cfg(test)]
 mod tests;
 mod theme;
-mod updater;
+
 mod window;
 
 use anyhow::Context as _;
@@ -128,9 +128,9 @@ fn main() {
 
     if let Some(config) = startup_config.as_ref() {
         match config.runtime_home_dir().and_then(|runtime_home| {
-            updater::relaunch::claim_post_update_receipt(
+            pioneer_desktop_update::claim_post_update_receipt(
                 runtime_home.as_path(),
-                updater::desktop_current_version(),
+                pioneer_desktop_update::desktop_current_version(),
             )
             .map_err(Into::into)
         }) {
@@ -249,13 +249,27 @@ fn main() {
             let window_handle = cx
                 .open_window(window_options, |window, cx| {
                     client_runtime::DesktopRuntimeCoordinator::install(cx);
-                    let registrar = cx.global::<client_runtime::DesktopRuntimeCoordinator>().registrar();
-                    let navigation = desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+                    let registrar = cx
+                        .global::<client_runtime::DesktopRuntimeCoordinator>()
+                        .registrar();
+                    let navigation =
+                        desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
                     client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
                     let layout = cx.new(|cx| shell_state::ShellStateStore::new(window, cx));
-                    let legacy = cx.new(|cx| LegacyScreenAdapter::new(window, cx, startup.clone(), navigation.clone(), layout.clone()));
+                    let legacy = cx.new(|cx| {
+                        LegacyScreenAdapter::new(
+                            window,
+                            cx,
+                            startup.clone(),
+                            navigation.clone(),
+                            layout.clone(),
+                        )
+                    });
                     desktop = Some(legacy.downgrade());
-                    let shell = cx.new(|cx| desktop_shell::DesktopShellView::new(legacy, navigation, layout, window, cx));
+                    let shell = cx.new(|cx| {
+                        desktop_shell::DesktopShellView::new(legacy, navigation, layout, window, cx)
+                    });
+                    shell.update(cx, |shell, cx| shell.start_desktop_update(window, cx));
                     cx.new(|cx| Root::new(shell, window, cx))
                 })
                 .context(t!("errors.window.open_failed").to_string())?;

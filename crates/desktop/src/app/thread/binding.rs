@@ -4,7 +4,7 @@ use pioneer_desktop_foundation::{
 };
 use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
-/// Window registrations for the selected thread and independently displayed summaries.
+/// Window registrations for the selected thread and its timeline.
 pub(in crate::app) struct ThreadBindings {
     registrar: Arc<dyn ClientBindingRegistrar>,
     registrations: RefCell<HashMap<ClientScope, ClientBindingRegistration>>,
@@ -56,12 +56,6 @@ impl ThreadBindings {
             });
         }
     }
-    pub(in crate::app) fn track_summary(self: &Arc<Self>, workspace: &str, id: &str) {
-        self.register(ClientScope::SidebarSummary {
-            workspace_id: workspace.to_owned(),
-            thread_id: id.to_owned(),
-        });
-    }
     pub(in crate::app) fn remove(&self, id: &str) {
         if self
             .timeline
@@ -71,7 +65,7 @@ impl ThreadBindings {
         {
             self.timeline.borrow_mut().take();
         }
-        let keep = |scope: &ClientScope| !matches!(scope, ClientScope::Thread {thread_id} | ClientScope::Timeline {thread_id} | ClientScope::SidebarSummary {thread_id, ..} if thread_id == id);
+        let keep = |scope: &ClientScope| !matches!(scope, ClientScope::Thread {thread_id} | ClientScope::Timeline {thread_id} if thread_id == id);
         self.registrations.borrow_mut().retain(|s, _| keep(s));
         self.pending.borrow_mut().retain(|s, _| keep(s));
         self.latest.borrow_mut().retain(|s, _| keep(s));

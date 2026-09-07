@@ -36,29 +36,40 @@ impl PioneerDesktop {
         rendered_list_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let historical_revisions = layout
+        let avatar_demands = layout
             .grouping()
             .avatar_groups()
             .iter()
-            .filter_map(|group| {
-                let TimelineAvatarSource::HistoricalUser {
+            .map(|group| match &group.source {
+                TimelineAvatarSource::HistoricalUser {
                     author: Some(author),
-                } = &group.source
-                else {
-                    return None;
-                };
-                let author = self.current_timeline_author_presentation(Some(author));
-                author.avatar_revision.as_ref().and_then(|revision| {
-                    author
-                        .principal_id
-                        .map(|principal_id| (principal_id, revision.clone()))
-                })
+                } => {
+                    if let Some(execution_author) =
+                        super::timeline_agent_execution_author(Some(author))
+                    {
+                        let revision = super::timeline_agent_presentation(Some(execution_author))
+                            .and_then(timeline_agent_default_avatar_revision);
+                        (None, revision.map(str::to_owned))
+                    } else {
+                        let author = self.current_timeline_author_presentation(Some(author));
+                        (author.principal_id.zip(author.avatar_revision), None)
+                    }
+                }
+                TimelineAvatarSource::Agent {
+                    shows_running_dino: false,
+                    author,
+                } => {
+                    let revision = super::timeline_agent_execution_author(author.as_ref())
+                        .and_then(|author| super::timeline_agent_presentation(Some(author)))
+                        .map_or(
+                            Some(pioneer_protocol::PIONEER_AGENT_AVATAR_REVISION),
+                            timeline_agent_default_avatar_revision,
+                        );
+                    (None, revision.map(str::to_owned))
+                }
+                _ => (None, None),
             })
             .collect::<Vec<_>>();
-        let requests = self
-            .member_avatar_state
-            .reconcile_historical_revisions(&historical_revisions);
-        self.resolve_member_avatar_requests(requests, cx);
 
         let visuals = Rc::new(
             layout
@@ -135,6 +146,29 @@ impl PioneerDesktop {
                         .is_some_and(|(_, bottom)| bottom <= viewport_top)
                 });
                 let mut avatars = Vec::new();
+                let mut visible_members = Vec::new();
+                let mut visible_agents = Vec::new();
+                for (group, (member, agent)) in groups.iter().zip(&avatar_demands).skip(first_group)
+                {
+                    let Some((top, _)) = layout.avatar_group_bounds(group) else {
+                        continue;
+                    };
+                    if top >= viewport_bottom {
+                        break;
+                    }
+                    if let Some(member) = member {
+                        visible_members.push(member.clone());
+                    }
+                    if let Some(agent) = agent {
+                        visible_agents.push(agent.clone());
+                    }
+                }
+                let demand_owner = desktop_entity.clone();
+                cx.defer(move |cx| {
+                    demand_owner.update(cx, |view, cx| {
+                        view.sync_timeline_avatar_demand(visible_members, visible_agents, cx)
+                    });
+                });
 
                 for (group, visual) in groups.iter().zip(visuals.iter()).skip(first_group) {
                     let Some((natural_top, group_bottom)) = layout.avatar_group_bounds(group)

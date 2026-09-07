@@ -15,6 +15,9 @@ name = "pioneer-app"
 path = "src/main.rs"
 
 [dependencies]
+pioneer-desktop-workspaces.workspace = true
+pioneer-desktop-update.workspace = true
+pioneer-desktop-task-notifications.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true

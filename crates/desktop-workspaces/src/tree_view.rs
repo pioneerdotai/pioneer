@@ -1,12 +1,4 @@
-use crate::app::{
-    root::{
-        DesktopUpdateUiState, MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope,
-        ThreadAgentsDocSummaryKey,
-    },
-    sidebar::{SidebarTreeDragItem, SidebarTreeDragPayload},
-    thread::{ThreadCoordinator, thread_display_title},
-};
-use crate::assets::PioneerIconName;
+use crate::sidebar::*;
 use gpui_kit::component::{
     button::*,
     list::ListItem,
@@ -18,7 +10,7 @@ use gpui_kit::component::{
 use gpui_kit::{ClickEvent, prelude::*, *};
 use pioneer_client::agents_doc::scope::{self as agents_doc_scope, AgentsDocEditAction};
 use pioneer_client::threads::tree::{self as client_thread_tree, SidebarTreeNodeKey};
-use pioneer_protocol::{ThreadAgentsDocSummary, ThreadFolder};
+use pioneer_client::workspaces::{ThreadAgentsDocSummary, ThreadFolder};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,9 +50,9 @@ actions!(
 );
 actions!(sidebar_thread_menu, [SidebarThreadRename]);
 
-impl PioneerDesktop {
-    pub(in crate::app) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
-        cx.emit(crate::app::SidebarChanged);
+impl ThreadSidebarView {
+    pub(super) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
         let model = self.build_sidebar_tree_model();
         let selected_ix = if matches!(
             self.main_content_view(),
@@ -85,10 +77,19 @@ impl PioneerDesktop {
             None
         };
 
-        let tree_state = self.thread_tree_state.clone();
-        tree_state.update(cx, |state, cx| {
-            state.set_items(model.items, cx);
-            state.set_selected_index(selected_ix, cx);
+        let mut structure = Vec::new();
+        tree_structure(&model.items, 0, &mut structure);
+        let structure_changed = structure != self.tree_structure;
+        self.tree_structure = structure;
+        self.thread_tree_state.update(cx, |state, cx| {
+            // Stock set_items clears selection/context targeting, so metadata-only
+            // publications must keep the retained tree untouched.
+            if structure_changed {
+                state.set_items(model.items, cx);
+            }
+            if structure_changed || state.selected_index() != selected_ix {
+                state.set_selected_index(selected_ix, cx);
+            }
         });
     }
 
@@ -117,7 +118,7 @@ impl PioneerDesktop {
                 .as_deref()
                 .map(|workspace_id| {
                     agents_doc_scope::thread_agents_doc_summaries_for_workspace(
-                        &self.thread_agents_doc_summaries,
+                        &self.agents_doc_summaries(),
                         workspace_id,
                     )
                     .map(|(key, summary)| (key.clone(), summary.clone()))
@@ -134,7 +135,6 @@ impl PioneerDesktop {
         let root_context_area_top_px =
             self.build_sidebar_tree_model().visible_node_ids.len() as f32 * TREE_ROW_HEIGHT_PX;
         let tree_state = self.thread_tree_state().clone();
-        let desktop_update_panel = self.render_desktop_update_sidebar_panel(cx);
         let is_new_thread_active = self.main_content_view() == MainContentView::Threads
             && match (
                 self.current_active_thread_id(),
@@ -147,7 +147,7 @@ impl PioneerDesktop {
                 _ => false,
             };
 
-        let tree_view = tree(&tree_state, move |ix, entry, selected, window, cx| {
+        let tree_view = tree(&tree_state, move |_ix, entry, selected, window, cx| {
             let item_id = entry.item().id.as_ref();
             match parse_sidebar_tree_node_key(item_id) {
                 SidebarTreeNodeKey::ThreadsHeader => {
@@ -173,14 +173,14 @@ impl PioneerDesktop {
                         },
                     );
 
-                    ListItem::new(("thread-tree-row", ix))
+                    ListItem::new(format!("thread-tree-row-{item_id}"))
                         .separator()
                         .h(px(TREE_ROW_HEIGHT_PX))
                         .px_0()
                         .py_0()
                         .child(
                             h_flex()
-                                .id(("thread-tree-root", ix))
+                                .id(format!("thread-tree-root-{item_id}"))
                                 .w_full()
                                 .h(px(TREE_ROW_HEIGHT_PX))
                                 .justify_between()
@@ -230,7 +230,7 @@ impl PioneerDesktop {
                                             .ghost()
                                             .compact()
                                             .child(
-                                                Icon::new(PioneerIconName::FolderPlus)
+                                                Icon::empty().path("icons/folder-plus.svg")
                                                     .size_4()
                                                     .opacity(0.6),
                                             )
@@ -281,14 +281,14 @@ impl PioneerDesktop {
                         },
                     );
 
-                    ListItem::new(("thread-tree-row", ix))
+                    ListItem::new(format!("thread-tree-row-{item_id}"))
                         .separator()
                         .h(px(TREE_ROW_HEIGHT_PX))
                         .px_2()
                         .py_0()
                         .child(
                             div()
-                                .id(("thread-tree-thread-drag", ix))
+                                .id(format!("thread-tree-thread-drag-{item_id}"))
                                 .w_full()
                                 .h(px(TREE_ROW_HEIGHT_PX))
                                 .on_click(open_listener)
@@ -321,7 +321,7 @@ impl PioneerDesktop {
                                             h_flex()
                                                 // Newer GPUI versions only schedule an immediate
                                                 // hover repaint for elements with persistent state.
-                                                .id(("thread-tree-thread-hover", ix))
+                                                .id(format!("thread-tree-thread-hover-{item_id}"))
                                                 .w_full()
                                                 .min_w_0()
                                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
@@ -390,7 +390,7 @@ impl PioneerDesktop {
                             cx.notify();
                         },
                     );
-                    render_agents_doc_file_row(ix, entry.depth(), selected, open_listener, cx)
+                    render_agents_doc_file_row(item_id, entry.depth(), selected, open_listener, cx)
                 }
                 SidebarTreeNodeKey::Folder(folder_id) => {
                     let folder = folders_by_id.get(folder_id).cloned();
@@ -493,14 +493,14 @@ impl PioneerDesktop {
                         IconName::ChevronRight
                     };
 
-                    ListItem::new(("thread-tree-row", ix))
+                    ListItem::new(format!("thread-tree-row-{item_id}"))
                         .separator()
                         .h(px(TREE_ROW_HEIGHT_PX))
                         .px_2()
                         .py_0()
                         .child(
                             div()
-                                .id(("thread-tree-folder-drag", ix))
+                                .id(format!("thread-tree-folder-drag-{item_id}"))
                                 .on_click(folder_click_listener)
                                 .when(can_manage_workspace, |this| {
                                     this.on_action(folder_rename_action_listener)
@@ -575,7 +575,7 @@ impl PioneerDesktop {
                                         .child(tree_depth_guides(entry.depth(), cx))
                                         .child(
                                             h_flex()
-                                                .id(("thread-tree-folder-hover", ix))
+                                                .id(format!("thread-tree-folder-hover-{item_id}"))
                                                 .w_full()
                                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
                                                 .items_center()
@@ -633,9 +633,9 @@ impl PioneerDesktop {
                             cx.notify();
                         },
                     );
-                    render_agents_doc_file_row(ix, entry.depth(), selected, open_listener, cx)
+                    render_agents_doc_file_row(item_id, entry.depth(), selected, open_listener, cx)
                 }
-                SidebarTreeNodeKey::Unknown => ListItem::new(("thread-tree-row", ix))
+                SidebarTreeNodeKey::Unknown => ListItem::new(format!("thread-tree-row-{item_id}"))
                     .separator()
                     .h(px(TREE_ROW_HEIGHT_PX))
                     .px_2()
@@ -775,104 +775,6 @@ impl PioneerDesktop {
                         )),
                 ),
             )
-            .when_some(desktop_update_panel, |this, panel| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .px_2()
-                        .pb_2()
-                        .child(panel),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_desktop_update_sidebar_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.desktop_update.should_render_sidebar_panel() {
-            return None;
-        }
-
-        match &self.desktop_update {
-            DesktopUpdateUiState::Downloading { .. } => {
-                Some(self.render_desktop_update_downloading_panel(cx))
-            }
-            DesktopUpdateUiState::Ready { version, .. } => {
-                Some(self.render_desktop_update_ready_panel(version.as_str(), cx))
-            }
-            _ => None,
-        }
-    }
-
-    fn render_desktop_update_ready_panel(
-        &self,
-        version: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let hover_bg = cx.theme().sidebar_accent;
-        let version_label = desktop_update_version_label(version);
-
-        h_flex()
-            .id("desktop-update-sidebar-ready")
-            .w_full()
-            .items_center()
-            .gap_4()
-            .px_3()
-            .py_2()
-            .rounded_xl()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.35))
-            .cursor_pointer()
-            .hover(move |this| this.bg(hover_bg))
-            .child(Icon::new(PioneerIconName::Leaf).size_5())
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(t!("desktop_update.ready_title").to_string()),
-                    )
-                    .child(div().text_xs().opacity(0.6).child(version_label)),
-            )
-            .child(Icon::new(IconName::ArrowRight).size_5().opacity(0.6))
-            .on_click(cx.listener(|view, _, window, cx| {
-                view.restart_to_apply_desktop_update(window, cx);
-            }))
-            .into_any_element()
-    }
-
-    fn render_desktop_update_downloading_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
-            .id("desktop-update-sidebar-downloading")
-            .w_full()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .rounded_xl()
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().muted.opacity(0.35))
-            .child(
-                div().size_5().flex().items_center().justify_center().child(
-                    crate::qualification_diagnostics::spinner!(
-                        pioneer_observability::AnimationSourceId::DesktopUpdateDownload,
-                    )
-                    .icon(IconName::Loader)
-                    .color(cx.theme().foreground.opacity(0.6)),
-                ),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .text_sm()
-                    .opacity(0.6)
-                    .child(t!("desktop_update.downloading").to_string()),
-            )
             .into_any_element()
     }
 
@@ -884,14 +786,23 @@ impl PioneerDesktop {
         self.sorted_thread_ids_for_workspace(workspace_id)
             .into_iter()
             .map(|thread_id| {
-                let coordinator = self.thread_coordinator(thread_id.as_str());
-                let title = sidebar_thread_title_from_coordinator(coordinator.as_deref());
+                let title = self
+                    .input
+                    .as_ref()
+                    .and_then(|publication| publication.snapshot().threads_by_id.get(&thread_id))
+                    .and_then(thread_display_title)
+                    .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string());
 
                 let unread_count = self
-                    .thread_unread
-                    .get(thread_id.as_str())
-                    .copied()
-                    .unwrap_or(0);
+                    .input
+                    .as_ref()
+                    .and_then(|p| {
+                        p.snapshot()
+                            .unread
+                            .iter()
+                            .find(|entry| entry.thread_id == thread_id)
+                    })
+                    .map_or(0, |entry| entry.unread_count);
                 (
                     thread_id.clone(),
                     SidebarThreadRow {
@@ -915,6 +826,7 @@ impl PioneerDesktop {
         let can_manage_workspace = self
             .principal_presentation_capabilities()
             .can_manage_workspace;
+        let summaries = self.agents_doc_summaries();
         let client_model = client_thread_tree::sidebar_tree_model_from_workspace_data(
             client_thread_tree::SidebarTreeSourceData {
                 workspace_id,
@@ -922,7 +834,7 @@ impl PioneerDesktop {
                 placements: self.thread_placements_for_workspace(workspace_id),
                 sorted_thread_ids: self.sorted_thread_ids_for_workspace(workspace_id),
                 agents_doc_summaries: if can_manage_workspace {
-                    self.thread_agents_doc_summaries.values().collect()
+                    summaries.values().collect()
                 } else {
                     Vec::new()
                 },
@@ -975,14 +887,6 @@ fn sidebar_thread_title_from_coordinator(coordinator: Option<&ThreadCoordinator>
     thread_display_title(thread).unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
 }
 
-fn desktop_update_version_label(version: &str) -> String {
-    if version.starts_with('v') {
-        version.to_owned()
-    } else {
-        format!("v{version}")
-    }
-}
-
 fn thread_node_key(thread_id: &str) -> String {
     client_thread_tree::sidebar_thread_node_id(thread_id)
 }
@@ -991,7 +895,7 @@ fn folder_node_key(folder_id: &str) -> String {
     client_thread_tree::sidebar_folder_node_id(folder_id)
 }
 
-pub(in crate::app) fn agents_doc_tree_node_key(scope: &ThreadAgentsDocEditorScope) -> String {
+pub(super) fn agents_doc_tree_node_key(scope: &ThreadAgentsDocEditorScope) -> String {
     client_thread_tree::sidebar_agents_doc_node_id_for_scope(scope)
 }
 
@@ -1006,20 +910,20 @@ fn agents_doc_folder_node_key(folder_id: &str) -> String {
 }
 
 fn render_agents_doc_file_row(
-    ix: usize,
+    item_id: &str,
     depth: usize,
     selected: bool,
     open_listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &mut App,
 ) -> ListItem {
-    ListItem::new(("thread-tree-row", ix))
+    ListItem::new(format!("thread-tree-row-{item_id}"))
         .separator()
         .h(px(TREE_ROW_HEIGHT_PX))
         .px_2()
         .py_0()
         .child(
             div()
-                .id(("thread-tree-agents-doc", ix))
+                .id(format!("thread-tree-agents-doc-{item_id}"))
                 .w_full()
                 .h(px(TREE_ROW_HEIGHT_PX))
                 .on_click(open_listener)
@@ -1032,7 +936,7 @@ fn render_agents_doc_file_row(
                         .child(tree_depth_guides(depth, cx))
                         .child(
                             h_flex()
-                                .id(("thread-tree-agents-doc-hover", ix))
+                                .id(format!("thread-tree-agents-doc-hover-{item_id}"))
                                 .w_full()
                                 .min_w_0()
                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
@@ -1141,176 +1045,14 @@ fn can_drop_on_folder(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pioneer_protocol::{
-        Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
-    };
-
-    #[::core::prelude::v1::test]
-    fn collect_visible_node_ids_respects_expansion_state() {
-        let items = vec![
-            TreeItem::new(folder_node_key("a"), "A")
-                .expanded(false)
-                .child(TreeItem::new(thread_node_key("t1"), "T1")),
-            TreeItem::new(folder_node_key("b"), "B")
-                .expanded(true)
-                .child(TreeItem::new(thread_node_key("t2"), "T2")),
-        ];
-
-        let ids = collect_visible_node_ids(items.as_slice());
-        assert_eq!(
-            ids,
-            vec![
-                folder_node_key("a"),
-                folder_node_key("b"),
-                thread_node_key("t2")
-            ]
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn collect_visible_node_ids_includes_agents_doc_file_nodes() {
-        let items = vec![
-            TreeItem::new(agents_doc_root_node_key(), "AGENTS.md"),
-            TreeItem::new(folder_node_key("b"), "B")
-                .expanded(true)
-                .child(TreeItem::new(agents_doc_folder_node_key("b"), "AGENTS.md")),
-        ];
-
-        let ids = collect_visible_node_ids(items.as_slice());
-        assert_eq!(
-            ids,
-            vec![
-                agents_doc_root_node_key(),
-                folder_node_key("b"),
-                agents_doc_folder_node_key("b")
-            ]
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn folder_drop_guard_rejects_self_folder_and_accepts_thread() {
-        let folders = HashMap::from([
-            ("fld_1".to_owned(), sidebar_test_folder("fld_1", None)),
-            ("fld_2".to_owned(), sidebar_test_folder("fld_2", None)),
-            (
-                "fld_child".to_owned(),
-                sidebar_test_folder("fld_child", Some("fld_1")),
-            ),
-        ]);
-        let thread_payload = SidebarTreeDragPayload {
-            label: "t".to_owned(),
-            item: SidebarTreeDragItem::Thread {
-                thread_id: "thr_1".to_owned(),
-            },
-        };
-        let folder_payload = SidebarTreeDragPayload {
-            label: "f".to_owned(),
-            item: SidebarTreeDragItem::Folder {
-                folder_id: "fld_1".to_owned(),
-            },
-        };
-
-        assert!(can_drop_on_folder(
-            &thread_payload as &dyn Any,
-            Some("ws_1"),
-            &folders,
-            "fld_1"
+fn tree_structure(items: &[TreeItem], depth: usize, output: &mut Vec<(String, usize, bool, bool)>) {
+    for item in items {
+        output.push((
+            item.id.to_string(),
+            depth,
+            item.is_expanded(),
+            item.is_disabled(),
         ));
-        assert!(!can_drop_on_folder(
-            &folder_payload as &dyn Any,
-            Some("ws_1"),
-            &folders,
-            "fld_1"
-        ));
-        assert!(can_drop_on_folder(
-            &folder_payload as &dyn Any,
-            Some("ws_1"),
-            &folders,
-            "fld_2"
-        ));
-        assert!(!can_drop_on_folder(
-            &folder_payload as &dyn Any,
-            Some("ws_1"),
-            &folders,
-            "fld_child"
-        ));
-    }
-
-    fn sidebar_test_folder(id: &str, parent_folder_id: Option<&str>) -> ThreadFolder {
-        ThreadFolder {
-            id: id.to_owned(),
-            workspace_id: "ws_1".to_owned(),
-            parent_folder_id: parent_folder_id.map(str::to_owned),
-            name: id.to_owned(),
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn sidebar_thread_title_uses_preview_fallback_or_untitled() {
-        let thread_with_preview = Thread {
-            workspace_id: "ws_1".to_owned(),
-            id: "thr_1".to_owned(),
-            name: None,
-            preview: "one two three four five six seven".to_owned(),
-            preview_author: None,
-            mode: ThreadMode::Chat,
-            model: "gpt-5.4".to_owned(),
-            model_provider: "openai".to_owned(),
-            reasoning_effort: None,
-            created_at: 0,
-            updated_at: 0,
-            status: ThreadStatus::Idle,
-            origin_kind: ThreadOriginKind::User,
-            sidebar_visibility: ThreadSidebarVisibility::Visible,
-            agent_nickname: None,
-            agent_role: None,
-            visibility: None,
-            turns: Vec::new(),
-        };
-        let coordinator_with_preview = ThreadCoordinator::new(thread_with_preview);
-        assert_eq!(
-            sidebar_thread_title_from_coordinator(Some(&coordinator_with_preview)),
-            "one two three four five six..."
-        );
-        let thread_without_preview = Thread {
-            preview: "   ".to_owned(),
-            ..coordinator_with_preview
-                .thread()
-                .expect("thread should exist")
-                .clone()
-        };
-        let coordinator_without_preview = ThreadCoordinator::new(thread_without_preview);
-        assert_eq!(
-            sidebar_thread_title_from_coordinator(Some(&coordinator_without_preview)),
-            t!("sidebar.thread.untitled").to_string()
-        );
-        let source = include_str!("view.rs");
-        assert!(source.contains("self.thread_unread.get"));
-        assert!(source.contains("should_render_thread_unread_badge"));
-        assert!(!source.contains(&["projection.items", ".len()"].concat()));
-    }
-
-    #[::core::prelude::v1::test]
-    fn selected_thread_never_renders_an_unread_badge() {
-        assert!(should_render_thread_unread_badge(3, false));
-        assert!(!should_render_thread_unread_badge(3, true));
-        assert!(!should_render_thread_unread_badge(0, false));
-    }
-
-    #[::core::prelude::v1::test]
-    fn tree_hover_surfaces_keep_stateful_ids_for_immediate_gpui_repaints() {
-        let source = include_str!("view.rs");
-        for id in [
-            "thread-tree-thread-hover",
-            "thread-tree-folder-hover",
-            "thread-tree-agents-doc-hover",
-        ] {
-            assert!(source.contains(id), "missing stateful hover id: {id}");
-        }
+        tree_structure(&item.children, depth + 1, output);
     }
 }

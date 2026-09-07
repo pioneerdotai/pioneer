@@ -1,0 +1,15 @@
+[package]
+name = "pioneer-desktop-task-notifications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+gpui-kit = { workspace = true, features = ["component"] }
+pioneer-client.workspace = true
+pioneer-desktop-foundation.workspace = true
+tokio.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["component", "test-support"] }
+serde_json.workspace = true

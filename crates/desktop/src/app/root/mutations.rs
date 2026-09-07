@@ -10,16 +10,33 @@ use pioneer_client::threads::tree as thread_tree;
 use tracing::warn;
 
 impl PioneerDesktop {
-    pub(in crate::app) fn navigation_intent(&mut self, intent: pioneer_client::navigation::NavigationIntent) {
+    pub(in crate::app) fn navigation_intent(
+        &mut self,
+        intent: pioneer_client::navigation::NavigationIntent,
+    ) {
         let core = self.gateway.client_runtime.client_core();
         core.navigate(intent, None);
         self.install_navigation_input(core.navigation_snapshot());
     }
 
-    fn install_navigation_input(&mut self, input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>) -> bool {
-        if std::sync::Arc::ptr_eq(&self.navigation_input, &input) { return false; }
+    fn install_navigation_input(
+        &mut self,
+        input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>,
+    ) -> bool {
+        if std::sync::Arc::ptr_eq(&self.navigation_input, &input) {
+            return false;
+        }
         let changed = self.navigation_input.active_thread_id() != input.active_thread_id();
-        self.thread_bindings.select(if matches!(input.destination(), pioneer_client::navigation::SemanticDestination::Threads) { input.active_thread_id() } else { None });
+        self.thread_bindings.select(
+            if matches!(
+                input.destination(),
+                pioneer_client::navigation::SemanticDestination::Threads
+            ) {
+                input.active_thread_id()
+            } else {
+                None
+            },
+        );
         self.navigation_input = input;
         if changed {
             self.composer_edit_target = None;
@@ -34,10 +51,31 @@ impl PioneerDesktop {
         true
     }
 
-    pub(crate) fn apply_navigation_publication(&mut self, input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_navigation_publication(
+        &mut self,
+        input: std::sync::Arc<pioneer_client::navigation::ClientNavigationState>,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_changed = self.navigation_input.workspace_id() != input.workspace_id();
+        self.read_workspace_catalog_output();
+        if self.navigation_input.active_thread_id() != input.active_thread_id() {
+            self.remember_active_thread_draft(cx);
+        }
         let changed = self.install_navigation_input(input);
+        if workspace_changed {
+            if let Some(workspace) = self.navigation_input.workspace_id().map(str::to_owned) {
+                self.persist_active_gateway_workspace_id(workspace);
+            }
+            self.refresh_workspace_bound_screens_after_switch(cx);
+            self.refresh_current_principal(cx);
+            self.refresh_configured_providers(cx);
+            self.load_cli_provider_snapshot(cx);
+        }
+
         self.reconcile_route_activity(cx);
-        if changed { cx.notify(); }
+        if changed {
+            cx.notify();
+        }
     }
 
     pub(in crate::app) fn reconcile_composer_draft_with_capabilities(&mut self) {
@@ -176,25 +214,38 @@ impl PioneerDesktop {
         let destination = match view {
             MainContentView::Threads => SemanticDestination::Threads,
             MainContentView::AgentsDoc => SemanticDestination::AgentsDocument,
-            MainContentView::Providers => SemanticDestination::Providers { filter: self.navigation_input.providers_route() },
-            MainContentView::Administration => SemanticDestination::Administration { route: self.navigation_input.administration_route() },
-            MainContentView::Settings => SemanticDestination::Settings { route: self.navigation_input.settings_route() },
+            MainContentView::Providers => SemanticDestination::Providers {
+                filter: self.navigation_input.providers_route(),
+            },
+            MainContentView::Administration => SemanticDestination::Administration {
+                route: self.navigation_input.administration_route(),
+            },
+            MainContentView::Settings => SemanticDestination::Settings {
+                route: self.navigation_input.settings_route(),
+            },
             MainContentView::Mcp => SemanticDestination::Mcp { server_id: None },
-            MainContentView::McpDetails => SemanticDestination::Mcp { server_id: self.navigation_input.mcp_server_id().map(str::to_owned) },
+            MainContentView::McpDetails => SemanticDestination::Mcp {
+                server_id: self.navigation_input.mcp_server_id().map(str::to_owned),
+            },
             MainContentView::Skills => SemanticDestination::Skills { skill_id: None },
-            MainContentView::SkillDetails => SemanticDestination::Skills { skill_id: self.navigation_input.skill_id().cloned() },
+            MainContentView::SkillDetails => SemanticDestination::Skills {
+                skill_id: self.navigation_input.skill_id().cloned(),
+            },
         };
         self.navigation_intent(NavigationIntent::Navigate { destination });
         crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
         self.reconcile_route_activity(cx);
-
-        self.rebuild_sidebar_tree_state(cx);
     }
 
     pub(in crate::app) fn set_active_thread_id(&mut self, thread_id: Option<String>) {
-        let workspace_id = thread_id.as_deref().and_then(|id| self.thread_workspace_id(id))
+        let workspace_id = thread_id
+            .as_deref()
+            .and_then(|id| self.thread_workspace_id(id))
             .or_else(|| self.active_workspace_id().map(str::to_owned));
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SelectThread { workspace_id, thread_id });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SelectThread {
+            workspace_id,
+            thread_id,
+        });
     }
 
     pub(in crate::app) fn set_draft_thread_id(&mut self, thread_id: Option<String>) {
@@ -218,32 +269,17 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn set_preferred_workspace_id(&mut self, workspace_id: Option<String>) {
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SelectWorkspace { workspace_id });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SelectWorkspace { workspace_id },
+        );
     }
 
-    pub(in crate::app) fn load_thread_folder_expansion_for_workspace(
-        &mut self,
-        workspace_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.thread_folder_expanded =
-            state::thread_folders_expanded_for_workspace(cx, Some(workspace_id));
-    }
-
-    pub(in crate::app) fn set_workspaces(&mut self, workspaces: Vec<Workspace>) {
-        self.workspaces = workspaces;
-    }
-
-    pub(in crate::app) fn set_workspaces_loading(&mut self, loading: bool) {
-        self.workspaces_loading = loading;
-    }
-
-    pub(in crate::app) fn set_workspaces_error(&mut self, error: Option<String>) {
-        self.workspaces_error = error;
-    }
-
-    pub(in crate::app) fn set_workspace_action_in_progress(&mut self, in_progress: bool) {
-        self.workspace_action_in_progress = in_progress;
+    pub(in crate::app) fn read_workspace_catalog_output(&mut self) {
+        self.workspace_catalog_input = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .workspace_catalog();
     }
 
     pub(in crate::app) fn remember_last_active_thread_for_workspace(
@@ -335,17 +371,82 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.present_thread_draft(thread_id, true, window, cx);
+    }
+
+    pub(crate) fn present_workspace_agents_document(
+        &mut self,
+        scope: ThreadAgentsDocEditorScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_agents_doc_editor(scope, window, cx);
+    }
+
+    pub(crate) fn present_workspace_thread(
+        &mut self,
+        thread_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread_id) = thread_id {
+            self.present_thread_draft(thread_id, false, window, cx);
+        } else {
+            self.remember_active_thread_draft(cx);
+            self.clear_composer(window, cx);
+        }
+        self.apply_navigation_publication(
+            self.gateway
+                .client_runtime
+                .client_core()
+                .navigation_snapshot(),
+            cx,
+        );
+        if let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) {
+            if let (Some(workspace_id), Some(connection_id)) = (
+                self.active_workspace_id().map(str::to_owned),
+                self.gateway.ws_connection_id,
+            ) {
+                self.ensure_thread_subscription(
+                    thread_id.clone(),
+                    workspace_id.clone(),
+                    connection_id,
+                    cx,
+                );
+                self.refresh_cli_runtime_thread_binding(
+                    thread_id.clone(),
+                    workspace_id,
+                    connection_id,
+                    cx,
+                );
+            }
+            self.ensure_thread_semantic_timeline_loaded(&thread_id, cx);
+        }
+    }
+
+    fn present_thread_draft(
+        &mut self,
+        thread_id: String,
+        select: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let current_thread_id = self.navigation_input.active_thread_id().map(str::to_owned);
-        let current_draft = current_thread_id.as_ref().and_then(|_| {
-            self.composer_edit_target
-                .is_none()
-                .then(|| ComposerDomainDraft {
-                    text: normalize_composer_draft_text(&self.composer_state.read(cx).value()),
-                    domain: self.composer_domain_state(),
-                })
-        });
+        let current_draft = current_thread_id
+            .as_ref()
+            .filter(|id| select || *id != &thread_id)
+            .and_then(|_| {
+                self.composer_edit_target
+                    .is_none()
+                    .then(|| ComposerDomainDraft {
+                        text: normalize_composer_draft_text(&self.composer_state.read(cx).value()),
+                        domain: self.composer_domain_state(),
+                    })
+            });
         self.composer_edit_target = None;
-        self.set_active_thread_id(Some(thread_id.clone()));
+        if select {
+            self.set_active_thread_id(Some(thread_id.clone()));
+        }
         let fallback = composer_thread_switch_fallback(self.composer_domain_state());
         let transition = reduce_composer_draft_lifecycle(
             &self.composer_draft_lifecycle,
@@ -469,8 +570,6 @@ impl PioneerDesktop {
             self.invalidate_active_thread_capability_projection();
             self.thread_members.clear();
         }
-        self.thread_bindings
-            .track_summary(&thread.workspace_id, &thread.id);
         self.gateway
             .client_runtime
             .client_core()
@@ -487,16 +586,7 @@ impl PioneerDesktop {
             .existing_thread_mutation(thread_id)
     }
 
-    pub(in crate::app) fn queue_thread_list_refresh(&mut self) {
-        thread_tree::queue_thread_tree_refresh(&mut self.thread_list_refresh_requested);
-    }
-
-    pub(in crate::app) fn take_thread_list_refresh_request(&mut self) -> bool {
-        thread_tree::take_thread_tree_refresh_request(&mut self.thread_list_refresh_requested)
-    }
-
     pub(in crate::app) fn remove_thread_conversation(&mut self, thread_id: &str) {
-        self.thread_unread.remove(thread_id);
         let workspace_id = self.thread_workspace_id(thread_id);
         self.thread_bindings.remove(thread_id);
         self.gateway
@@ -507,7 +597,6 @@ impl PioneerDesktop {
             .client_runtime
             .client_core()
             .promote_thread(thread_id);
-        self.thread_placements.remove(thread_id);
         self.clear_thread_draft(thread_id);
 
         if let Some(workspace_id) = workspace_id {
@@ -521,7 +610,6 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn clear_thread_conversations(&mut self) {
-        self.thread_unread.clear();
         self.message_revision_dialog = None;
         self.message_revision_loading = false;
         self.message_mutation_pending = false;
@@ -531,11 +619,6 @@ impl PioneerDesktop {
             .client_runtime
             .client_core()
             .clear_thread_stores();
-        self.thread_folders.clear();
-        self.thread_placements.clear();
-        self.thread_agents_doc_summaries.clear();
-        self.thread_folder_expanded.clear();
-        self.thread_tree_selected_node_id = None;
         self.composer_draft_lifecycle = reduce_composer_draft_lifecycle(
             &self.composer_draft_lifecycle,
             ComposerDraftLifecycleAction::ClearAll,
@@ -574,7 +657,9 @@ impl PioneerDesktop {
         self.providers.clear_for_workspace_switch();
         self.sync_open_model_selector_cli_runtime_snapshot();
         self.mcp_servers.clear();
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: None,
+        });
         self.mcp_server_details = None;
         self.mcp_loading = false;
         self.mcp_details_loading = false;
@@ -590,7 +675,9 @@ impl PioneerDesktop {
         self.skills_error = None;
         self.skills_refresh_requested = false;
         self.skills_pending_actions.clear();
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None },
+        );
         self.composer_capabilities.clear();
         self.composer_skill_selections.clear();
         self.composer_attachments.clear();
@@ -610,7 +697,9 @@ impl PioneerDesktop {
             self.main_content_view(),
             MainContentView::Settings | MainContentView::Threads
         ) {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::Navigate { destination: pioneer_client::navigation::SemanticDestination::Threads });
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::Navigate {
+                destination: pioneer_client::navigation::SemanticDestination::Threads,
+            });
         }
     }
 
@@ -619,8 +708,7 @@ impl PioneerDesktop {
     /// deliberately owned by the Gateway coordinator and remain untouched.
     pub(in crate::app) fn clear_authorization_epoch_cache(&mut self) {
         self.gateway.capability_snapshot = None;
-        self.workspaces.clear();
-        self.workspaces_error = None;
+        self.read_workspace_catalog_output();
         self.set_active_thread_id(None);
         self.clear_thread_conversations();
         self.navigation_intent(pioneer_client::navigation::NavigationIntent::ClearLineage);
@@ -637,7 +725,6 @@ impl PioneerDesktop {
         self.thread_member_items.clear();
         self.active_agents_doc_editor_scope = None;
         self.agents_doc_editor = None;
-        self.thread_tree_selected_node_id = None;
         *self.thread_timeline_view_state.borrow_mut() = Default::default();
         self.thread_timeline_item_expanded.borrow_mut().clear();
         self.thread_timeline_terminal_item.borrow_mut().clear();
@@ -645,70 +732,6 @@ impl PioneerDesktop {
         self.task_review_actions = Default::default();
         self.gateway.settings = None;
         self.clear_workspace_capability_projections();
-    }
-
-    pub(in crate::app) fn set_thread_tree_snapshot(
-        &mut self,
-        folders: Vec<ThreadFolder>,
-        placements: Vec<ThreadPlacement>,
-        agents_docs: Vec<ThreadAgentsDocSummary>,
-    ) {
-        let normalized = thread_tree::normalize_thread_tree_snapshot(
-            folders,
-            placements,
-            &self.thread_folder_expanded,
-        );
-        self.thread_folders = normalized.folders_by_id;
-        self.thread_folder_expanded = normalized.folder_expanded;
-        self.thread_placements = normalized.placements_by_thread_id;
-        self.thread_agents_doc_summaries =
-            client_state_reducers::thread_agents_doc_summaries_by_scope(agents_docs);
-    }
-
-    pub(in crate::app) fn toggle_thread_folder_expanded(
-        &mut self,
-        folder_id: &str,
-        cx: &mut Context<Self>,
-    ) {
-        thread_tree::toggle_thread_folder_expanded(&mut self.thread_folder_expanded, folder_id);
-
-        self.save_thread_folder_expansion_for_active_workspace(cx);
-    }
-
-    pub(in crate::app) fn set_thread_folder_expanded(
-        &mut self,
-        folder_id: &str,
-        expanded: bool,
-        cx: &mut Context<Self>,
-    ) {
-        thread_tree::set_thread_folder_expanded(
-            &mut self.thread_folder_expanded,
-            folder_id,
-            expanded,
-        );
-
-        self.save_thread_folder_expansion_for_active_workspace(cx);
-    }
-
-    fn save_thread_folder_expansion_for_active_workspace(&self, cx: &mut Context<Self>) {
-        let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
-            return;
-        };
-
-        if let Err(error) = state::set_thread_folders_expanded_for_workspace(
-            cx,
-            workspace_id.as_str(),
-            self.thread_folder_expanded.clone(),
-        ) {
-            warn!(
-                error = %format!("{error:#}"),
-                "failed to save sidebar folder expansion state"
-            );
-        }
-    }
-
-    pub(in crate::app) fn set_thread_tree_selected_node_id(&mut self, node_id: Option<String>) {
-        self.thread_tree_selected_node_id = node_id;
     }
 
     pub(in crate::app) fn tick_thread_conversations(&mut self) -> bool {

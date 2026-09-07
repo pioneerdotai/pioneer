@@ -121,8 +121,8 @@ impl PioneerDesktop {
         }
 
         if self.gateway.connection_state.is_transitioning()
-            || self.workspaces_loading
-            || (self.thread_list_loading && self.current_active_thread_id().is_none())
+            || self.workspaces_loading()
+            || (self.thread_directory_loading() && self.current_active_thread_id().is_none())
             || self
                 .gateway
                 .client_runtime

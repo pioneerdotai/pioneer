@@ -183,7 +183,7 @@ impl PioneerDesktop {
             MainContentView::Mcp => self.render_mcp_sidebar(cx),
             MainContentView::SkillDetails => self.render_skill_details_sidebar(cx),
             MainContentView::Skills => self.render_skills_sidebar(cx),
-            MainContentView::Threads | MainContentView::AgentsDoc => self.render_sidebar(cx),
+            MainContentView::Threads | MainContentView::AgentsDoc => div().into_any_element(),
         }
     }
 }

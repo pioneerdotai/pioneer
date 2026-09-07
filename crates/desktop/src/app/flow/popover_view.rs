@@ -20,18 +20,12 @@ impl PioneerDesktop {
         publication: Option<
             &pioneer_client::gateway::session_controller::GatewaySessionPublication,
         >,
+        show_spinner: bool,
         cx: &gpui_kit::App,
     ) -> AnyElement {
         let scoped_status = publication
             .and_then(|publication| publication.status.as_ref())
             .filter(|_| !self.gateway.connecting);
-        let show_spinner = !self.is_gateway_setup_required()
-            && (self.gateway.connecting
-                || scoped_status
-                    .map_or(self.gateway.connection_state, |status| {
-                        status.connection_state
-                    })
-                    .is_transitioning());
         let gateway_status_color =
             match scoped_status.map_or(self.gateway.status_level, |status| status.status_level) {
                 GatewayStatusLevel::Neutral => cx.theme().muted_foreground,
@@ -270,7 +264,7 @@ impl PioneerDesktop {
     }
 
     fn render_gateways_popover_option(
-        index: usize,
+        _index: usize,
         endpoint: &GatewayEndpoint,
         active_gateway_id: Option<&str>,
         gateway_selection_locked: bool,
@@ -294,7 +288,7 @@ impl PioneerDesktop {
         let is_active = active_gateway_id == Some(endpoint_id.as_str());
 
         let select_button = div()
-            .id(("gateway-option", index))
+            .id(format!("gateway-option:{}", endpoint.id))
             .w_full()
             .min_w_0()
             .cursor_pointer()
@@ -412,7 +406,7 @@ impl PioneerDesktop {
                         .items_center()
                         .pr_1()
                         .child(
-                            Button::new(("gateway-option-edit", index))
+                            Button::new(format!("gateway-option-edit:{}", endpoint.id))
                                 .ghost()
                                 .xsmall()
                                 .compact()
@@ -449,6 +443,8 @@ pub(crate) struct GatewaySwitcherView {
     desktop: WeakEntity<PioneerDesktop>,
     binding: std::sync::Arc<crate::gateway::GatewaySessionBinding>,
     _delivery: gpui_kit::Task<()>,
+    _desktop_changes: Option<gpui_kit::Subscription>,
+    loading: bool,
 }
 
 impl GatewaySwitcherView {
@@ -461,15 +457,52 @@ impl GatewaySwitcherView {
         let delivery = cx.spawn(async move |view, cx| {
             while publications.changed().await.is_ok() {
                 let _ = *publications.borrow_and_update();
-                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                if view
+                    .update(cx, |view, cx| {
+                        view.refresh_loading(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         });
-        Self {
+        let desktop_changes = desktop
+            .upgrade()
+            .map(|desktop| cx.observe(&desktop, |view, _, cx| view.refresh_loading(cx)));
+        let mut view = Self {
             desktop,
             binding,
             _delivery: delivery,
+            _desktop_changes: desktop_changes,
+            loading: false,
+        };
+        view.refresh_loading(cx);
+        view
+    }
+    fn refresh_loading(&mut self, cx: &mut Context<Self>) {
+        let loading = self.desktop.upgrade().is_some_and(|desktop| {
+            let desktop = desktop.read(cx);
+            let publication = self
+                .binding
+                .publication()
+                .map(|publication| publication.payload());
+            let status = publication
+                .as_ref()
+                .and_then(|publication| publication.status.as_ref())
+                .filter(|_| !desktop.gateway.connecting);
+            !desktop.is_gateway_setup_required()
+                && (desktop.gateway.connecting
+                    || status
+                        .map_or(desktop.gateway.connection_state, |status| {
+                            status.connection_state
+                        })
+                        .is_transitioning())
+        });
+        if self.loading != loading {
+            self.loading = loading;
+            cx.notify();
         }
     }
 }
@@ -483,8 +516,11 @@ impl gpui_kit::Render for GatewaySwitcherView {
             .binding
             .publication()
             .map(|publication| publication.payload());
-        desktop
-            .read(cx)
-            .render_gateways_popover(desktop.clone(), publication.as_deref(), cx)
+        desktop.read(cx).render_gateways_popover(
+            desktop.clone(),
+            publication.as_deref(),
+            self.loading,
+            cx,
+        )
     }
 }

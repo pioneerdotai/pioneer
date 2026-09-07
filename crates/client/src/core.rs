@@ -129,6 +129,9 @@ pub enum ClientScope {
     WorkspaceTree {
         workspace_id: Option<String>,
     },
+    TaskInbox {
+        workspace_id: String,
+    },
     Task {
         task_id: Option<String>,
     },
@@ -166,7 +169,6 @@ pub enum ClientScope {
     AgentsDocument {
         workspace_id: String,
     },
-    DesktopUpdate,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -182,7 +184,16 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
-    Navigation { intent: crate::navigation::NavigationIntent, expected_revision: Option<u64> },
+    Workspace {
+        intent: crate::workspaces::intents::WorkspaceIntent,
+    },
+    TaskNotification {
+        intent: crate::tasks::notifications::TaskNotificationIntent,
+    },
+    Navigation {
+        intent: crate::navigation::NavigationIntent,
+        expected_revision: Option<u64>,
+    },
     RefreshTimeline {
         thread_id: String,
     },
@@ -631,6 +642,9 @@ impl Drop for ClientSubscription {
                 .expect("client subscriber registry poisoned")
                 .remove(&self.id);
             core.thread_subscription_changed(&self.queue.scope, false);
+            core.avatar_subscription_changed(&self.queue.scope, false);
+            core.task_inbox_subscription_changed(&self.queue.scope, false);
+            core.workspace_subscription_changed(&self.queue.scope, false);
         }
         self.queue
             .events
@@ -684,6 +698,10 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) avatar_store: Mutex<crate::avatars::AvatarStore>,
+    pub(crate) workspace_catalog: Mutex<crate::workspaces::catalog::WorkspaceCatalogStore>,
+    pub(crate) workspace_controller: Mutex<crate::workspaces::controller::WorkspaceController>,
+    pub(crate) task_notifications: Mutex<crate::tasks::notifications::TaskNotificationController>,
     compatibility_runtime: ClientRuntime,
     pub(crate) thread_request_sender:
         Mutex<Option<std::sync::mpsc::Sender<crate::threads::registry::ThreadControllerRequest>>>,
@@ -819,6 +837,10 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
+            avatar_store: Mutex::default(),
+            workspace_catalog: Mutex::default(),
+            workspace_controller: Mutex::default(),
+            task_notifications: Mutex::default(),
             compatibility_runtime: ClientRuntime::new(),
             thread_registry: Mutex::default(),
             thread_request_sender: Mutex::default(),
@@ -1083,6 +1105,18 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.avatar_store
+            .lock()
+            .expect("avatar store poisoned")
+            .invalidate();
+        self.task_notifications
+            .lock()
+            .expect("task inbox poisoned")
+            .stop();
+        self.workspace_controller
+            .lock()
+            .expect("workspace controller poisoned")
+            .stop();
         self.presentation_sender
             .lock()
             .expect("presentation sender poisoned")
@@ -1153,6 +1187,11 @@ impl ClientCore {
         {
             return None;
         }
+        if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
+            if self.observe_workspace_notification(notification) {
+                return None;
+            }
+        }
         let route = GatewayEventRoute::classify(event);
         match route {
             GatewayEventRoute::Connection => {
@@ -1178,13 +1217,19 @@ impl ClientCore {
                 }
                 return Some(route);
             }
+            GatewayEventRoute::TaskNotification => {
+                if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } =
+                    event
+                {
+                    self.observe_task_notification(notification);
+                }
+            }
             GatewayEventRoute::Administration
             | GatewayEventRoute::Workspace
             | GatewayEventRoute::Memory
             | GatewayEventRoute::Provider
             | GatewayEventRoute::Mcp
             | GatewayEventRoute::Skills
-            | GatewayEventRoute::TaskNotification
             | GatewayEventRoute::Unknown => return Some(route),
         }
         None
@@ -1193,6 +1238,8 @@ impl ClientCore {
     pub fn shared() -> Arc<Self> {
         let core = Arc::new(Self::new());
         core.initialize_navigation();
+        core.start_task_notification_controller();
+        core.start_workspace_controller();
         let (presentation_sender, presentation_receiver) = std::sync::mpsc::sync_channel(1);
         *core
             .presentation_sender
@@ -1349,6 +1396,9 @@ impl ClientCore {
         capacity: NonZeroUsize,
     ) -> ClientSubscription {
         self.thread_subscription_changed(&scope, true);
+        self.avatar_subscription_changed(&scope, true);
+        self.task_inbox_subscription_changed(&scope, true);
+        self.workspace_subscription_changed(&scope, true);
         let partitions = self.partitions.lock().expect("client partitions poisoned");
         let latest_sequence = partitions
             .publications
@@ -1417,6 +1467,11 @@ impl ClientCore {
         Self::transition_without_publication(&partitions, outcome)
     }
 
+    pub(crate) fn reject_intent(&self) -> ClientTransition {
+        let mut partitions = self.partitions.lock().expect("client partitions poisoned");
+        partitions.transition_sequence.advance();
+        Self::transition_without_publication(&partitions, ClientTransitionOutcome::Rejected)
+    }
     pub fn dispatch(&self, intent: ClientIntent) -> ClientTransition {
         if self.is_stopped() {
             let mut partitions = self.partitions.lock().expect("client partitions poisoned");
@@ -1427,7 +1482,16 @@ impl ClientCore {
             );
         }
         match &intent {
-            ClientIntent::Navigation { intent, expected_revision } => return self.navigate(intent.clone(), *expected_revision),
+            ClientIntent::Workspace { intent } => {
+                return self.dispatch_workspace_intent(intent.clone());
+            }
+            ClientIntent::TaskNotification { intent } => {
+                return self.task_notification_intent(intent.clone());
+            }
+            ClientIntent::Navigation {
+                intent,
+                expected_revision,
+            } => return self.navigate(intent.clone(), *expected_revision),
             ClientIntent::RefreshTimeline { thread_id } => {
                 self.refresh_thread_timeline(thread_id);
             }
@@ -1515,6 +1579,9 @@ impl ClientCore {
         drop(partitions);
         if outcome == ClientTransitionOutcome::Changed {
             self.thread_demand_changed(&thread_scope, thread_demand);
+            self.avatar_demand_changed(&thread_scope, thread_demand);
+            self.task_inbox_demand_changed(&thread_scope, thread_demand);
+            self.workspace_demand_changed(&thread_scope, thread_demand);
         }
         transition
     }
@@ -1880,6 +1947,25 @@ impl ClientCore {
             .current_auth
             .as_ref()
             .map(|auth| auth.principal.id.as_str().to_owned());
+        if evict_protected {
+            self.avatar_store
+                .lock()
+                .expect("avatar store poisoned")
+                .invalidate_access();
+        }
+        if evict_protected {
+            self.workspace_catalog
+                .lock()
+                .expect("workspace catalog poisoned")
+                .invalidate();
+        }
+        if evict_protected {
+            self.task_notifications
+                .lock()
+                .expect("task inbox poisoned")
+                .store
+                .invalidate();
+        }
         let mut presentation_fence = evict_protected.then(|| {
             let mut registry = self
                 .thread_registry
@@ -1935,7 +2021,9 @@ impl ClientCore {
             Arc::new(projections.clone()),
         )];
         if let Some(registry) = presentation_fence.as_mut() {
-            if let Some(navigation) = registry.navigation_change() { drafts.push(navigation); }
+            if let Some(navigation) = registry.navigation_change() {
+                drafts.push(navigation);
+            }
         }
         if evict_protected {
             for scope in partitions.publications.keys() {
@@ -1943,7 +2031,6 @@ impl ClientCore {
                     scope,
                     ClientScope::Navigation
                         | ClientScope::Session
-                        | ClientScope::DesktopUpdate
                         | ClientScope::OnboardingInvitation
                 ) || scope == &identity_scope
                 {
@@ -2565,7 +2652,10 @@ mod tests {
                 || publication.snapshot().serialized_payload().is_null()
                 || (publication.scope() == &ClientScope::Navigation
                     && publication.snapshot().serialized_payload().as_ref()
-                        == &serde_json::to_value(crate::navigation::ClientNavigationState::default()).unwrap())
+                        == &serde_json::to_value(
+                            crate::navigation::ClientNavigationState::default(),
+                        )
+                        .unwrap())
         }));
         let retained = core.snapshot(&identity).unwrap().snapshot();
         core.invalidate_authorization_revision(6);

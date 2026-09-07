@@ -184,7 +184,7 @@ impl PioneerDesktop {
                 .tooltip(t!("settings.invitations.create").to_string())
                 .disabled(
                     self.gateway.connection_state != GatewayConnectionState::Connected
-                        || self.workspaces.is_empty()
+                        || self.workspaces().is_empty()
                         || self.authorized_invitation_role_options().is_empty()
                         || self.administration.pending_action()
                             != &pioneer_client::administration::AdministrationPendingAction::Idle,
@@ -444,7 +444,7 @@ impl PioneerDesktop {
         }
 
         let workspaces = self
-            .workspaces
+            .workspaces()
             .iter()
             .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
             .collect::<Vec<_>>();
