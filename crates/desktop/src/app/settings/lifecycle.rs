@@ -115,9 +115,10 @@ impl PioneerDesktop {
                 ),
             ]);
         }
-        if !items
-            .iter()
-            .any(|(content_view, _)| *content_view == self.settings_content_view())
+        if self.gateway.capability_snapshot.is_some()
+            && !items
+                .iter()
+                .any(|(content_view, _)| *content_view == self.settings_content_view())
         {
             self.navigation_intent(
                 pioneer_client::navigation::NavigationIntent::SetSettingsRoute {

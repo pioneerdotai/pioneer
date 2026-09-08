@@ -9,6 +9,85 @@ struct FocusOwner {
 }
 
 #[gpui_kit::test]
+fn policy_refresh_keeps_members_dialog_open_before_and_after_result(cx: &mut TestAppContext) {
+    use pioneer_client::navigation::{AdministrationRoute, NavigationIntent, SemanticDestination};
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let core = cx.update(|cx| {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+    });
+    let destination = SemanticDestination::Administration {
+        route: AdministrationRoute::Members,
+    };
+    core.activate_thread(Some("thread"), Some("workspace"));
+    core.navigate(
+        NavigationIntent::Navigate {
+            destination: destination.clone(),
+        },
+        None,
+    );
+    let (_root, cx) = cx.add_window_view(|window, cx| {
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let desktop = cx.new(|cx| {
+            crate::app::LegacyScreenAdapter::new(
+                window,
+                cx,
+                pioneer_observability::DesktopStartupTrace::start(),
+                navigation.clone(),
+                layout.clone(),
+            )
+        });
+        let shell = cx.new(|cx| {
+            crate::desktop_shell::DesktopShellView::new(desktop, navigation, layout, window, cx)
+        });
+        Root::new(shell, window, cx)
+    });
+    cx.run_until_parked();
+    let result = cx.new(|_| None::<String>);
+    cx.update(|window, cx| {
+        let result = result.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog.title(
+                result
+                    .read(cx)
+                    .clone()
+                    .unwrap_or_else(|| "Creating invitation".into()),
+            )
+        });
+    });
+    for revision in [7, 8] {
+        core.invalidate_authorization_revision(revision);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(core.navigation_snapshot().destination(), &destination);
+            assert!(window.has_active_dialog(cx));
+            if revision == 7 {
+                result.update(cx, |result, cx| {
+                    *result = Some("Synthetic invitation result".into());
+                    cx.notify();
+                });
+            } else {
+                assert!(result.read(cx).is_some());
+            }
+        });
+    }
+    // Genuine route changes still close the one-time credential presentation.
+    core.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Threads,
+        },
+        None,
+    );
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+}
+
+#[gpui_kit::test]
 fn desktop_window_constructs_gateway_views_before_first_frame(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);

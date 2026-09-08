@@ -1790,7 +1790,7 @@ mod tests {
             .expect("typed policy invalidation");
 
         let inner = state.core.as_ref();
-        assert!(inner.active_thread_id().is_none());
+        assert_eq!(inner.active_thread_id().as_deref(), Some("thread_affected"));
         assert!(
             !inner
                 .thread_coordinator_snapshot("thread_affected")

@@ -11,6 +11,30 @@ use pioneer_protocol::{
 #[cfg(test)]
 use std::sync::Arc;
 
+/// A policy revision fences server data without ending the user's editing session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityPublicationChange {
+    Update,
+    Revalidate,
+    ResetSession,
+}
+impl IdentityPublicationChange {
+    fn revision(changed: bool) -> Self {
+        if changed {
+            Self::Revalidate
+        } else {
+            Self::Update
+        }
+    }
+    fn session(changed: bool) -> Self {
+        if changed {
+            Self::ResetSession
+        } else {
+            Self::Update
+        }
+    }
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthSessionsStore {
@@ -79,6 +103,13 @@ impl IdentityAuthorizationStore {
             capabilities: self.projections.clone(),
             auth_sessions: self.sessions.clone(),
         }
+    }
+    fn invalidate_policy_requests(&mut self) {
+        // The verified subject remains the same. Capabilities have their own revision
+        // fence; an absent projection must not look like a logout to either shell.
+        let auth = self.current_auth.take();
+        self.clear_sessions();
+        self.current_auth = auth;
     }
     fn clear_sessions(&mut self) {
         self.current_auth = None;
@@ -180,7 +211,10 @@ impl ClientCore {
         );
         if auth.principal != response.principal {
             auth.principal = response.principal.clone();
-            self.publish_identity_authorization(&owner.publication(), false);
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
         }
         Ok(response)
     }
@@ -241,7 +275,10 @@ impl ClientCore {
         );
         if owner.current_auth.as_ref() != Some(&auth) {
             owner.current_auth = Some(auth.clone());
-            self.publish_identity_authorization(&owner.publication(), false);
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
         }
         Ok(auth)
     }
@@ -298,10 +335,13 @@ impl ClientCore {
         }
         let changed = previous != owner.projections.accepted_revision();
         if changed {
-            owner.clear_sessions();
+            owner.invalidate_policy_requests();
         }
         owner.current_auth = Some(auth.clone());
-        self.publish_identity_authorization(&owner.publication(), changed);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::revision(changed),
+        );
         Ok((auth, snapshot))
     }
 
@@ -327,7 +367,10 @@ impl ClientCore {
             .expect("authorization connection generation exhausted");
         owner.projections.clear_epoch();
         owner.clear_sessions();
-        self.publish_identity_authorization(&owner.publication(), true);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::ResetSession,
+        );
     }
 
     pub fn begin_authorization_epoch(&self, epoch: Option<(String, u64)>) {
@@ -368,7 +411,10 @@ impl ClientCore {
                 .identity_request
                 .checked_add(1)
                 .expect("identity request generation exhausted");
-            self.publish_identity_authorization(&owner.publication(), false);
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
             return;
         }
         owner.epoch = epoch;
@@ -380,7 +426,10 @@ impl ClientCore {
             .expect("authorization connection generation exhausted");
         owner.projections.clear_epoch();
         owner.clear_sessions();
-        self.publish_identity_authorization(&owner.publication(), true);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::ResetSession,
+        );
     }
 
     pub(crate) fn observe_authorization_connection(
@@ -427,7 +476,10 @@ impl ClientCore {
             .expect("authorization connection generation exhausted");
         owner.projections.clear_epoch();
         owner.clear_sessions();
-        self.publish_identity_authorization(&owner.publication(), true);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::ResetSession,
+        );
     }
 
     pub(crate) fn observe_access_change(
@@ -455,7 +507,7 @@ impl ClientCore {
             .projections
             .invalidate_for_revision(change.authorization_revision);
         if changed {
-            owner.clear_sessions();
+            owner.invalidate_policy_requests();
         }
         owner.authorization_change_sequence = owner
             .authorization_change_sequence
@@ -464,7 +516,10 @@ impl ClientCore {
         self.apply_thread_access_change(change);
         owner.access_change = Some(change.clone());
         owner.policy_change = None;
-        self.publish_identity_authorization(&owner.publication(), changed);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::revision(changed),
+        );
     }
 
     pub(crate) fn observe_policy_change(
@@ -491,7 +546,7 @@ impl ClientCore {
             .is_none_or(|current| revision > current);
         owner.projections.invalidate_for_revision(revision);
         if changed {
-            owner.clear_sessions();
+            owner.invalidate_policy_requests();
         }
         owner.authorization_change_sequence = owner
             .authorization_change_sequence
@@ -500,7 +555,10 @@ impl ClientCore {
         self.invalidate_threads_for_policy(change);
         owner.policy_change = Some(change.clone());
         owner.access_change = None;
-        self.publish_identity_authorization(&owner.publication(), changed);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::revision(changed),
+        );
     }
 
     pub fn invalidate_authorization_revision(&self, revision: u64) {
@@ -517,9 +575,12 @@ impl ClientCore {
             .is_none_or(|current| revision > current);
         owner.projections.invalidate_for_revision(revision);
         if changed {
-            owner.clear_sessions();
+            owner.invalidate_policy_requests();
         }
-        self.publish_identity_authorization(&owner.publication(), changed);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::revision(changed),
+        );
     }
 
     pub fn authorization_revision(&self) -> Option<u64> {
@@ -564,9 +625,12 @@ impl ClientCore {
         if accepted == AuthorizationProjectionAcceptance::Accepted {
             let changed = previous_revision != owner.projections.accepted_revision();
             if changed {
-                owner.clear_sessions();
+                owner.invalidate_policy_requests();
             }
-            self.publish_identity_authorization(&owner.publication(), changed);
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::revision(changed),
+            );
         }
         accepted
     }
@@ -593,9 +657,12 @@ impl ClientCore {
         if accepted == AuthorizationProjectionAcceptance::Accepted {
             let changed = previous_revision != owner.projections.accepted_revision();
             if changed {
-                owner.clear_sessions();
+                owner.invalidate_policy_requests();
             }
-            self.publish_identity_authorization(&owner.publication(), changed);
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::revision(changed),
+            );
         }
         accepted
     }
@@ -628,7 +695,10 @@ impl ClientCore {
         owner.sessions.loading = revoking.is_none();
         owner.sessions.revoking = revoking;
         owner.sessions.error = None;
-        self.publish_identity_authorization(&owner.publication(), false);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::Update,
+        );
         Ok(owner.session_request)
     }
 
@@ -656,7 +726,10 @@ impl ClientCore {
             }
             Err(error) => owner.sessions.error = Some(format!("{error:#}")),
         }
-        self.publish_identity_authorization(&owner.publication(), false);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::Update,
+        );
         true
     }
 
@@ -764,7 +837,10 @@ impl ClientCore {
             owner.projections.clear_epoch();
             owner.clear_sessions();
         }
-        self.publish_identity_authorization(&owner.publication(), clear_protected);
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::session(clear_protected),
+        );
         result
     }
     pub fn logout_auth_session(&self) -> anyhow::Result<pioneer_protocol::AuthLogoutResponse> {
@@ -797,7 +873,10 @@ impl ClientCore {
                 owner.sessions.error = Some(format!("{error:#}"));
             }
         }
-        self.publish_identity_authorization(&owner.publication(), result.is_ok());
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::session(result.is_ok()),
+        );
         result
     }
 }
@@ -843,6 +922,142 @@ mod session_tests {
             device: session.device,
             session: session.session,
             role_key: None,
+        }
+    }
+
+    #[test]
+    fn policy_refresh_preserves_screen_thread_and_unsent_composer() {
+        use crate::composer::{state_machine::ComposerDomainState, store::ComposerIntent};
+        use crate::navigation::{AdministrationRoute, NavigationIntent, SemanticDestination};
+        use pioneer_protocol::{
+            AuthorizationChangeKind, AuthorizationChangeScope, PolicyGeneration,
+        };
+
+        for destination in [
+            SemanticDestination::Providers {
+                filter: crate::providers::selectors::ProviderFilter::Cli,
+            },
+            SemanticDestination::Mcp {
+                server_id: Some("server".into()),
+            },
+            SemanticDestination::Skills { skill_id: None },
+            SemanticDestination::Administration {
+                route: AdministrationRoute::Members,
+            },
+            SemanticDestination::Administration {
+                route: AdministrationRoute::Invitations,
+            },
+        ] {
+            for affected in [
+                AuthorizationChangeScope::Invitation {
+                    invitation_id: pioneer_protocol::InvitationId::new("I00000000000000000001")
+                        .unwrap(),
+                },
+                AuthorizationChangeScope::Workspace {
+                    workspace_id: "workspace".into(),
+                },
+            ] {
+                let workspace_policy =
+                    matches!(affected, AuthorizationChangeScope::Workspace { .. });
+                let core = ClientCore::new();
+                core.finish_current_auth(0, None, auth_me()).unwrap();
+                let thread = pioneer_protocol::Thread {
+                    id: "thread".into(),
+                    workspace_id: "workspace".into(),
+                    name: None,
+                    preview: String::new(),
+                    preview_author: None,
+                    mode: pioneer_protocol::ThreadMode::Chat,
+                    model: "model".into(),
+                    model_provider: "provider".into(),
+                    reasoning_effort: None,
+                    created_at: 1,
+                    updated_at: 2,
+                    status: pioneer_protocol::ThreadStatus::Idle,
+                    origin_kind: pioneer_protocol::ThreadOriginKind::User,
+                    sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
+                    agent_nickname: None,
+                    agent_role: None,
+                    visibility: None,
+                    turns: Vec::new(),
+                };
+                core.upsert_thread(thread);
+                core.activate_thread(Some("thread"), Some("workspace"));
+                core.composer_intent(ComposerIntent::Open {
+                    thread_id: "thread".into(),
+                    defaults: ComposerDomainState::default(),
+                });
+                let draft = core.composer_snapshot("thread").unwrap();
+                core.composer_intent(ComposerIntent::EditText {
+                    thread_id: "thread".into(),
+                    draft_id: draft.draft_id(),
+                    text: "Unsent message".into(),
+                });
+                core.navigate(
+                    NavigationIntent::Navigate {
+                        destination: destination.clone(),
+                    },
+                    None,
+                );
+                let navigation = core.navigation_snapshot();
+                let draft = core.composer_snapshot("thread").unwrap();
+                core.observe_policy_change(
+                    &pioneer_protocol::AuthorizationProjectionChangedNotification {
+                        policy_generation: PolicyGeneration::new(7).unwrap(),
+                        change: AuthorizationChangeKind::WorkspaceAcl,
+                        affected,
+                    },
+                );
+                assert_eq!(
+                    core.navigation_snapshot(),
+                    navigation,
+                    "policy refresh changed {destination:?}"
+                );
+                assert_eq!(core.current_auth(), Some(auth_me()));
+                assert_eq!(
+                    core.composer_snapshot("thread").unwrap().draft(),
+                    draft.draft()
+                );
+                assert!(
+                    core.snapshot(&ClientScope::Composer {
+                        thread_id: "thread".into()
+                    })
+                    .unwrap()
+                    .typed::<crate::composer::store::ComposerPublication>()
+                    .is_some()
+                );
+                assert!(
+                    core.snapshot(&ClientScope::Thread {
+                        thread_id: "thread".into()
+                    })
+                    .unwrap()
+                    .snapshot()
+                    .serialized_payload()
+                    .is_null()
+                );
+                assert!(
+                    core.authorization_snapshot(Some("workspace"), None)
+                        .is_none()
+                );
+                if workspace_policy {
+                    core.observe_access_change(&pioneer_protocol::AccessChangedNotification {
+                        authorization_revision: 7,
+                        workspace_id: "workspace".into(),
+                        thread_id: None,
+                        outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
+                        change: pioneer_protocol::AccessChangeKind::WorkspaceMembership,
+                    });
+                    assert!(core.active_thread_id().is_none());
+                    assert!(core.navigation_snapshot().workspace_id().is_none());
+                    assert!(core.composer_snapshot("thread").is_none());
+                }
+                core.begin_authorization_epoch(Some(("replacement".into(), 2)));
+                assert_eq!(
+                    *core.navigation_snapshot(),
+                    crate::navigation::ClientNavigationState::default()
+                );
+                assert!(core.composer_snapshot("thread").is_none());
+            }
         }
     }
 
@@ -952,7 +1167,7 @@ mod session_tests {
         );
 
         assert_eq!(value.payload().access_change.as_ref(), Some(&change));
-        assert!(value.payload().current_auth.is_none());
+        assert_eq!(value.payload().current_auth, Some(auth_me()));
         assert_eq!(core.authorization_revision(), Some(7));
         core.observe_access_change(&change);
         let mut stale = change.clone();
@@ -1043,8 +1258,14 @@ mod session_tests {
                 .is_err()
         );
         core.invalidate_authorization_revision(2);
-        assert!(core.finish_auth_profile_update(0, None, response).is_err());
+        assert!(
+            core.finish_auth_profile_update(0, None, response.clone())
+                .is_err()
+        );
+        assert_eq!(core.current_auth().unwrap().principal, response.principal);
+        core.clear_authorization_projections();
         assert!(core.current_auth().is_none());
+        assert!(core.finish_auth_profile_update(0, None, response).is_err());
     }
 
     #[test]
@@ -1064,9 +1285,12 @@ mod session_tests {
                 .is_err()
         );
         core.invalidate_authorization_revision(2);
-        assert!(core.current_auth().is_none());
+        assert_eq!(core.current_auth(), Some(identity.clone()));
         assert!(core.finish_current_auth(0, None, identity.clone()).is_err());
+        assert_eq!(core.current_auth(), Some(identity.clone()));
+        core.clear_authorization_projections();
         assert!(core.current_auth().is_none());
+        assert!(core.finish_current_auth(1, None, identity.clone()).is_err());
         core.shutdown();
         assert!(core.finish_current_auth(1, None, identity).is_err());
     }

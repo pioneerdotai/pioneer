@@ -534,6 +534,13 @@ impl ThreadScreenView {
         let next_session = identity
             .as_ref()
             .map(|p| (p.endpoint_id.clone(), p.connection_generation));
+        let policy_changed = self
+            .identity_input
+            .as_ref()
+            .map(|p| p.capabilities.accepted_revision())
+            != identity
+                .as_ref()
+                .map(|p| p.capabilities.accepted_revision());
         let authorized = identity.as_ref().is_some_and(|p| p.current_auth.is_some());
         if previous_session != next_session || !authorized {
             self.member_avatar_state.clear();
@@ -555,6 +562,7 @@ impl ThreadScreenView {
         if !authorized
             || self.connection_state != GatewayConnectionState::Connected
             || previous_session != next_session
+            || policy_changed
         {
             self.subscribed_workspace = None;
         }
