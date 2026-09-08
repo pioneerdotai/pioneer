@@ -20,15 +20,15 @@ use crate::code_highlight::HighlightLimits;
 use crate::code_highlight::HighlightOutcome;
 use crate::code_highlight::Rgba8;
 use crate::code_highlight::highlight_code;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 
-impl ThreadScreenView {
-    pub(super) fn render_code_highlighted_text(
+impl TimelineView {
+    pub(super) fn prepare_code_highlight(
         &self,
         source: &str,
         language_hint: Option<&str>,
         cx: &mut Context<Self>,
-    ) -> StyledText {
+    ) {
         let theme = if cx.theme().mode.is_dark() {
             CodeThemeId::Dark
         } else {
@@ -101,9 +101,24 @@ impl ThreadScreenView {
         for job in request.jobs {
             Self::spawn_code_highlight_job(job, cx);
         }
-
+    }
+    pub(super) fn render_code_highlighted_text(
+        &self,
+        source: &str,
+        language_hint: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> StyledText {
+        let theme = if cx.theme().mode.is_dark() {
+            CodeThemeId::Dark
+        } else {
+            CodeThemeId::Light
+        };
+        let lookup = self
+            .code_highlight_cache
+            .borrow()
+            .lookup(source, language_hint, theme);
         let text = SharedString::new(Arc::<str>::from(source));
-        let CodeHighlightLookup::Ready(code) = request.lookup else {
+        let CodeHighlightLookup::Ready(code) = lookup else {
             return StyledText::new(text);
         };
         let highlights = code.spans.iter().map(|span| {

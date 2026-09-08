@@ -2,7 +2,7 @@ use super::super::TimelineRowTopSpacing;
 use super::super::layout::TIMELINE_MESSAGE_END_BOTTOM_SPACING;
 use super::super::markdown::CodeHighlightPolicy;
 use crate::assets::PioneerIconName;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use chrono::Local;
 use chrono::TimeZone;
 use gpui_kit::component::Icon;
@@ -21,7 +21,7 @@ use pioneer_client::timeline::types::TurnItem;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(super) fn render_item_agent_message(
         &self,
         entry: &TimelineEntry,
@@ -78,7 +78,8 @@ impl ThreadScreenView {
                     )
                 };
             let open = self
-                .thread_timeline_item_expanded
+                .thread_timeline_view_state
+                .expanded
                 .borrow()
                 .contains(entry.id.as_str());
             let entry_id = entry.id.clone();
@@ -151,8 +152,8 @@ impl ThreadScreenView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            cx.listener(move |this, _, window, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
                 )

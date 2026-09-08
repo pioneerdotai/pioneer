@@ -102,6 +102,24 @@ impl Default for DesktopCodeHighlightCache {
 }
 
 impl DesktopCodeHighlightCache {
+    pub(crate) fn lookup(
+        &self,
+        source: &str,
+        language_hint: Option<&str>,
+        theme: CodeThemeId,
+    ) -> CodeHighlightLookup {
+        let key = make_highlight_key(source, normalize_language_hint(language_hint), theme);
+        match self.entries.get(&key).map(|record| &record.entry) {
+            Some(DesktopCodeHighlightCacheEntry::Ready(code)) => {
+                CodeHighlightLookup::Ready(code.clone())
+            }
+            Some(DesktopCodeHighlightCacheEntry::Fallback(reason)) => {
+                CodeHighlightLookup::Fallback(*reason)
+            }
+            Some(DesktopCodeHighlightCacheEntry::Pending { .. }) => CodeHighlightLookup::Pending,
+            None => CodeHighlightLookup::Unavailable,
+        }
+    }
     fn with_limits(max_entries: usize, max_payload_bytes: usize, max_active_jobs: usize) -> Self {
         Self {
             entries: HashMap::new(),

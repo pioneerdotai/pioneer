@@ -16,9 +16,9 @@ use pioneer_client::avatars::{
 use pioneer_client::avatars::{MemberSummary, PrincipalId, ProfileAvatarMediaType};
 use tokio_util::sync::CancellationToken;
 
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 pub(crate) struct ThreadAvatarChanged;
-impl gpui_kit::EventEmitter<ThreadAvatarChanged> for ThreadScreenView {}
+impl gpui_kit::EventEmitter<ThreadAvatarChanged> for TimelineView {}
 use gpui_kit::{AppContext as _, AsyncApp, Context, WeakEntity};
 use pioneer_client::core::{ClientPublicationReference, ClientScope};
 use pioneer_desktop_foundation::{
@@ -109,7 +109,7 @@ impl DesktopMemberAvatarState {
     pub(crate) fn new(
         client: Arc<pioneer_client::core::ClientCore>,
         registrar: Arc<dyn ClientBindingRegistrar>,
-        cx: &mut Context<ThreadScreenView>,
+        cx: &mut Context<TimelineView>,
     ) -> Self {
         let mut state = Self::default();
         state.registrar = Some(registrar);
@@ -572,7 +572,7 @@ fn apply_presentation_error(entry: &mut DesktopMemberAvatarPresentation, error: 
     entry.status = DesktopMemberAvatarStatus::Placeholder;
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn resolve_member_avatar_requests(
         &mut self,
         requests: Vec<AvatarCacheRequest>,
@@ -744,7 +744,7 @@ impl ThreadAvatarClient {
         ))
     }
 }
-impl ThreadScreenView {
+impl TimelineView {
     fn avatar_client(&self) -> Result<ThreadAvatarClient, AvatarCacheError> {
         self.avatar_http.clone().ok_or(AvatarCacheError::Offline)
     }

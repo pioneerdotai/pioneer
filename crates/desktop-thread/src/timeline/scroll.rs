@@ -20,7 +20,7 @@ struct WorkExpansionAnchor {
     boundary_offset: Pixels,
 }
 
-impl ThreadTimelineViewState {
+impl TimelinePresentationState {
     pub(super) fn reconcile_scroll(
         &mut self,
         thread_id: Option<&str>,
@@ -29,14 +29,8 @@ impl ThreadTimelineViewState {
         handle: &gpui_kit::component::VirtualListScrollHandle,
         follow_bottom: bool,
     ) {
-        if self
-            .scroll
-            .reconcile(thread_id, rows, sizes, handle, follow_bottom)
-        {
-            // Arrival consumes gestures received while the page was in flight.
-            // Rendering the new boundary alone must not request another page.
-            consume_semantic_prefetch_scroll_intents(self);
-        }
+        self.scroll
+            .reconcile(thread_id, rows, sizes, handle, follow_bottom);
     }
 }
 
@@ -207,7 +201,7 @@ fn scroll_to_bottom(handle: &gpui_kit::component::VirtualListScrollHandle, sizes
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(super) fn sync_timeline_scroll(
         &self,
         active_thread_id: Option<&str>,
@@ -258,7 +252,6 @@ impl ThreadScreenView {
         state.tail_text_len = tail_text_len;
 
         if thread_changed {
-            state.last_read_requested_through_turn_id = None;
             state.entry_layout_cache.clear();
             state.cached_item_sizes = None;
         } else if timeline_changed {
@@ -268,7 +261,7 @@ impl ThreadScreenView {
         drop(state);
 
         if thread_changed {
-            let mut expanded = self.thread_timeline_item_expanded.borrow_mut();
+            let mut expanded = self.thread_timeline_view_state.expanded.borrow_mut();
             if !expanded.is_empty() {
                 let mut state = self.thread_timeline_view_state.borrow_mut();
                 state.expanded_revision = state.expanded_revision.saturating_add(1);
@@ -290,7 +283,7 @@ impl ThreadScreenView {
                 .collect::<HashSet<_>>();
 
             {
-                let mut expanded = self.thread_timeline_item_expanded.borrow_mut();
+                let mut expanded = self.thread_timeline_view_state.expanded.borrow_mut();
                 let before = expanded.len();
                 expanded.retain(|key| live_expand_keys.contains(key.as_str()));
                 if expanded.len() != before {
@@ -303,102 +296,22 @@ impl ThreadScreenView {
         should_follow
     }
 
-    pub(super) fn timeline_is_near_bottom(&self) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
+    pub(crate) fn timeline_is_near_bottom(&self) -> bool {
+        let max_offset = self.thread_timeline_view_state.scroll_handle.max_offset().y;
         if max_offset <= px(1.) {
             return true;
         }
 
-        let current_offset = self.thread_timeline_scroll_handle.offset().y;
+        let current_offset = self.thread_timeline_view_state.scroll_handle.offset().y;
         let bottom_offset = px(0.) - max_offset;
         (current_offset - bottom_offset).abs() <= px(24.)
     }
 
-    pub(super) fn request_mark_active_thread_read_if_viewed(
-        &self,
-        active_thread_id: Option<&str>,
-        rows: &[TimelineRenderRow],
-        application_is_foreground: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let latest_known_user_turn_id = rows.iter().rev().find_map(|row| match row {
-            TimelineRenderRow::Timeline(TimelineRow {
-                kind: TimelineRowKind::UserMessage { presentation, .. },
-                ..
-            }) => Some(presentation.turn_id.as_str()),
-            _ => None,
-        });
-        let thread_id = active_thread_id.unwrap_or_default();
-        let mut state = self.thread_timeline_view_state.borrow_mut();
-        let params = plan_mark_thread_read(MarkThreadReadContext {
-            active_thread_id,
-            thread_id,
-            application_is_foreground,
-            thread_is_visible: self.timeline_is_near_bottom(),
-            latest_known_user_turn_id,
-            viewed_through_turn_id: latest_known_user_turn_id,
-            last_requested_through_turn_id: state.last_read_requested_through_turn_id.as_deref(),
-        });
-        let Some(params) = params else {
-            return;
-        };
-        state.last_read_requested_through_turn_id = Some(params.through_turn_id.clone());
-        drop(state);
-
-        let sender = self.client.clone();
-        let requested_turn_id = params.through_turn_id.clone();
-        let requested_thread_id = params.thread_id.clone();
-        let task_key = requested_turn_id.clone();
-        let task = cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let response = cx
-                    .background_spawn(async move { sender.read_thread_cursor(params) })
-                    .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    match response {
-                        Ok(response) => {
-                            if view.thread_workspace_matches(
-                                response.thread_id.as_str(),
-                                response.workspace_id.as_str(),
-                            ) {
-                                view.client.apply_directory_read(
-                                    &response.workspace_id,
-                                    &response.thread_id,
-                                    &response.cursor,
-                                    response.unread_count,
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            let mut state = view.thread_timeline_view_state.borrow_mut();
-                            if state.last_read_requested_through_turn_id.as_deref()
-                                == Some(requested_turn_id.as_str())
-                                && state.active_thread_id.as_deref()
-                                    == Some(requested_thread_id.as_str())
-                            {
-                                state.last_read_requested_through_turn_id = None;
-                            }
-                        }
-                    }
-                    view.read_tasks.borrow_mut().remove(&requested_turn_id);
-                    cx.notify();
-                });
-            }
-        });
-        self.read_tasks.borrow_mut().insert(task_key, task);
-    }
-
-    pub(super) fn on_timeline_scroll_wheel(
-        &self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let delta_y = event.delta.pixel_delta(window.line_height()).y;
+    pub(super) fn on_timeline_scroll_delta(&self, delta_y: Pixels, cx: &mut Context<Self>) {
         if delta_y != px(0.) {
             let mut state = self.thread_timeline_view_state.borrow_mut();
             state.scroll.cancel_expansion();
+            state.pending_follow_bottom = false;
             record_semantic_prefetch_scroll_intent(&mut state);
         }
 
@@ -424,34 +337,35 @@ impl ThreadScreenView {
     }
 
     fn timeline_scroll_wheel_reaches_bottom(&self, delta_y: Pixels) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
+        let max_offset = self.thread_timeline_view_state.scroll_handle.max_offset().y;
         if max_offset <= px(1.) {
             return true;
         }
 
-        let next_offset = (self.thread_timeline_scroll_handle.offset().y + delta_y)
+        let next_offset = (self.thread_timeline_view_state.scroll_handle.offset().y + delta_y)
             .clamp(px(0.) - max_offset, px(0.));
         let bottom_offset = px(0.) - max_offset;
         (next_offset - bottom_offset).abs() <= px(24.)
     }
 
     pub(super) fn consume_all_semantic_prefetch_scroll_intents(&self) {
-        let mut state = self.thread_timeline_view_state.borrow_mut();
-        consume_semantic_prefetch_scroll_intents(&mut state);
+        self.client.timeline_intent(
+            pioneer_client::timeline::controller::TimelineIntent::ConsumeScroll {
+                thread_id: self.thread_id.clone(),
+                consumer_id: format!("desktop:{}", self.mount),
+                generation: self.thread_timeline_view_state.demand_generation,
+                scroll_generation: self
+                    .thread_timeline_view_state
+                    .borrow()
+                    .semantic_prefetch_scroll_generation,
+            },
+        );
     }
 }
 
-fn record_semantic_prefetch_scroll_intent(state: &mut ThreadTimelineViewState) {
-    if state.semantic_prefetch_scroll_generation
-        == state.semantic_prefetch_consumed_scroll_generation
-    {
-        state.semantic_prefetch_scroll_generation =
-            state.semantic_prefetch_scroll_generation.saturating_add(1);
-    }
-}
-
-fn consume_semantic_prefetch_scroll_intents(state: &mut ThreadTimelineViewState) {
-    state.semantic_prefetch_consumed_scroll_generation = state.semantic_prefetch_scroll_generation;
+fn record_semantic_prefetch_scroll_intent(state: &mut TimelinePresentationState) {
+    state.semantic_prefetch_scroll_generation =
+        state.semantic_prefetch_scroll_generation.saturating_add(1);
 }
 
 fn timeline_max_offset_for_item_sizes(
@@ -466,10 +380,7 @@ fn timeline_max_offset_for_item_sizes(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ThreadTimelineViewState, consume_semantic_prefetch_scroll_intents,
-        record_semantic_prefetch_scroll_intent, timeline_max_offset_for_item_sizes,
-    };
+    use super::{TimelinePresentationState, timeline_max_offset_for_item_sizes};
     use super::{TimelineRenderRow, TimelineRow, TimelineRowKind};
     use gpui_kit::component::{VirtualListScrollHandle, v_virtual_list};
     use gpui_kit::{
@@ -483,7 +394,7 @@ mod tests {
         rows: Arc<Vec<TimelineRenderRow>>,
         sizes: Rc<Vec<Size<Pixels>>>,
         handle: VirtualListScrollHandle,
-        state: ThreadTimelineViewState,
+        state: TimelinePresentationState,
         follow_bottom: bool,
     }
 
@@ -536,7 +447,7 @@ mod tests {
                 rows: Default::default(),
                 sizes: Default::default(),
                 handle: VirtualListScrollHandle::new(),
-                state: ThreadTimelineViewState::default(),
+                state: TimelinePresentationState::default(),
                 follow_bottom: false,
             };
             harness.page(&["a", "b", "c", "d", "e", "f"]);
@@ -625,59 +536,6 @@ mod tests {
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(handle.offset().y, px(-125.));
-    }
-
-    #[gpui_kit::test]
-    fn page_arrival_requires_new_scroll_intent_before_loading_another_page(
-        cx: &mut TestAppContext,
-    ) {
-        let (view, cx) = harness(cx);
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        view.update(cx, |view, cx| {
-            record_semantic_prefetch_scroll_intent(&mut view.state);
-            consume_semantic_prefetch_scroll_intents(&mut view.state);
-            // More wheel events can arrive while the first request is loading.
-            record_semantic_prefetch_scroll_intent(&mut view.state);
-            view.page(&["older", "a", "b", "c", "d", "e", "f"]);
-            cx.notify();
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        for _ in 0..3 {
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            view.read_with(cx, |view, _| {
-                assert_eq!(
-                    view.state.semantic_prefetch_scroll_generation,
-                    view.state.semantic_prefetch_consumed_scroll_generation
-                );
-            });
-        }
-        view.update(cx, |view, _| {
-            record_semantic_prefetch_scroll_intent(&mut view.state);
-            assert!(
-                view.state.semantic_prefetch_scroll_generation
-                    > view.state.semantic_prefetch_consumed_scroll_generation
-            );
-        });
-    }
-
-    #[test]
-    fn scroll_events_coalesce_until_prefetch_intent_is_consumed() {
-        let mut state = ThreadTimelineViewState::default();
-
-        record_semantic_prefetch_scroll_intent(&mut state);
-        record_semantic_prefetch_scroll_intent(&mut state);
-        assert_eq!(state.semantic_prefetch_scroll_generation, 1);
-
-        state.semantic_prefetch_consumed_scroll_generation =
-            state.semantic_prefetch_scroll_generation;
-        record_semantic_prefetch_scroll_intent(&mut state);
-        assert_eq!(state.semantic_prefetch_scroll_generation, 2);
-
-        consume_semantic_prefetch_scroll_intents(&mut state);
-        assert_eq!(
-            state.semantic_prefetch_consumed_scroll_generation,
-            state.semantic_prefetch_scroll_generation
-        );
     }
 
     #[test]

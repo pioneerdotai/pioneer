@@ -2,7 +2,7 @@ mod view;
 use crate::{
     binding::ThreadBindings,
     member_picker::*,
-    screen::{GatewayConnectionState, ThreadScreenView},
+    screen::{GatewayConnectionState, TimelineView},
 };
 use gpui_kit::{prelude::*, *};
 use pioneer_client::{
@@ -19,7 +19,7 @@ pub(crate) struct ThreadMembersView {
     client: Arc<ClientCore>,
     thread_id: String,
     binding: Arc<ThreadBindings>,
-    screen: WeakEntity<ThreadScreenView>,
+    screen: WeakEntity<TimelineView>,
     thread_member_input: Option<Arc<ThreadMemberPublication>>,
     capability_input: Option<Arc<ThreadCapabilityPublication>>,
     identity_input: Option<Arc<IdentityAuthorizationPublication>>,
@@ -39,7 +39,7 @@ impl ThreadMembersView {
         client: Arc<ClientCore>,
         thread_id: String,
         registrar: Arc<dyn ClientBindingRegistrar>,
-        screen: WeakEntity<ThreadScreenView>,
+        screen: WeakEntity<TimelineView>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {

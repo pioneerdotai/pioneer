@@ -4,7 +4,7 @@ use super::layout::TIMELINE_CONTENT_HORIZONTAL_PADDING;
 use super::layout::TimelineAvatarSource;
 use super::layout::TimelineLayoutIndex;
 use super::running_indicator::RunningDinoView;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::avatar::Avatar;
 use gpui_kit::prelude::*;
@@ -25,19 +25,16 @@ enum TimelineAvatarVisual {
         cached_path: Option<PathBuf>,
     },
     RunningAgent {
-        dino: Entity<RunningDinoView>,
+        dino: Option<Entity<RunningDinoView>>,
     },
 }
 
-impl ThreadScreenView {
-    pub(super) fn render_timeline_avatar_rail(
+impl TimelineView {
+    pub(super) fn prepare_timeline_avatars(
         &mut self,
         layout: Rc<TimelineLayoutIndex>,
-        scroll_handle: gpui_kit::component::VirtualListScrollHandle,
-        content_width: Pixels,
-        rendered_list_width: Pixels,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) {
         let avatar_demands = layout
             .grouping()
             .avatar_groups()
@@ -73,6 +70,60 @@ impl ThreadScreenView {
             })
             .collect::<Vec<_>>();
 
+        let viewport_top = -self.thread_timeline_view_state.scroll_handle.offset().y;
+        let viewport_bottom = viewport_top + self.thread_timeline_view_state.viewport.size.height;
+        let groups = layout.grouping().avatar_groups();
+        let first_group = groups.partition_point(|group| {
+            layout
+                .avatar_group_bounds(group)
+                .is_some_and(|(_, bottom)| bottom <= viewport_top)
+        });
+        let mut visible_members = Vec::new();
+        let mut visible_agents = Vec::new();
+        for (group, (member, agent)) in groups.iter().zip(&avatar_demands).skip(first_group) {
+            let Some((top, _)) = layout.avatar_group_bounds(group) else {
+                continue;
+            };
+            if top >= viewport_bottom {
+                break;
+            }
+            if let Some(member) = member {
+                visible_members.push(member.clone());
+            }
+            if let Some(agent) = agent {
+                visible_agents.push(agent.clone());
+            }
+        }
+        self.sync_timeline_avatar_demand(visible_members, visible_agents, cx);
+        for group in groups.iter().skip(first_group) {
+            if layout
+                .avatar_group_bounds(group)
+                .is_some_and(|(top, _)| top >= viewport_bottom)
+            {
+                break;
+            }
+            if matches!(
+                group.source,
+                TimelineAvatarSource::Agent {
+                    shows_running_dino: true,
+                    ..
+                }
+            ) {
+                self.prepare_running_dino(
+                    format!("avatar:{}:{}", group.first_row_index, group.last_row_index),
+                    cx,
+                );
+            }
+        }
+    }
+    pub(super) fn render_timeline_avatar_rail(
+        &mut self,
+        layout: Rc<TimelineLayoutIndex>,
+        scroll_handle: gpui_kit::component::VirtualListScrollHandle,
+        content_width: Pixels,
+        _rendered_list_width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let visuals = Rc::new(
             layout
                 .grouping()
@@ -118,22 +169,9 @@ impl ThreadScreenView {
                 })
                 .collect::<Vec<_>>(),
         );
-        let desktop_entity = cx.entity().downgrade();
 
         canvas(
             move |bounds, window, cx| {
-                if (bounds.size.width - rendered_list_width).abs() > px(1.) {
-                    let desktop_entity = desktop_entity.clone();
-                    let measured_width = bounds.size.width;
-                    cx.defer(move |cx| {
-                        let _ = desktop_entity.update(cx, |view, cx| {
-                            if view.update_timeline_layout_width(measured_width) {
-                                cx.notify();
-                            }
-                        });
-                    });
-                }
-
                 // Rows are centered by GPUI against the current list bounds. Resolve the
                 // avatar rail from those same bounds in prepaint so sidebar/window resizing
                 // cannot leave the rail one layout frame behind the message content.
@@ -148,30 +186,6 @@ impl ThreadScreenView {
                         .is_some_and(|(_, bottom)| bottom <= viewport_top)
                 });
                 let mut avatars = Vec::new();
-                let mut visible_members = Vec::new();
-                let mut visible_agents = Vec::new();
-                for (group, (member, agent)) in groups.iter().zip(&avatar_demands).skip(first_group)
-                {
-                    let Some((top, _)) = layout.avatar_group_bounds(group) else {
-                        continue;
-                    };
-                    if top >= viewport_bottom {
-                        break;
-                    }
-                    if let Some(member) = member {
-                        visible_members.push(member.clone());
-                    }
-                    if let Some(agent) = agent {
-                        visible_agents.push(agent.clone());
-                    }
-                }
-                let demand_owner = desktop_entity.clone();
-                cx.defer(move |cx| {
-                    let _ = demand_owner.update(cx, |view, cx| {
-                        view.sync_timeline_avatar_demand(visible_members, visible_agents, cx)
-                    });
-                });
-
                 for (group, visual) in groups.iter().zip(visuals.iter()).skip(first_group) {
                     let Some((natural_top, group_bottom)) = layout.avatar_group_bounds(group)
                     else {
@@ -330,7 +344,7 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
         TimelineAvatarVisual::RunningAgent { dino } => div()
             .w(TIMELINE_AVATAR_SIZE)
             .h(TIMELINE_AVATAR_SIZE)
-            .child(dino.clone())
+            .children(dino.clone())
             .into_any_element(),
     }
 }

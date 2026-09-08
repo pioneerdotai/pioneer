@@ -1,16 +1,18 @@
 use super::TimelineRenderModel;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 
 pub(crate) use pioneer_client::timeline::semantic_render::SEMANTIC_TURN_WORK_GROUP_PREFIX;
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn semantic_timeline_render_model(
         &self,
         active_thread_id: Option<&str>,
     ) -> TimelineRenderModel {
-        self.thread_bindings
-            .timeline_model(active_thread_id)
-            .unwrap_or_else(TimelineRenderModel::empty)
+        if active_thread_id == Some(self.thread_id.as_str()) {
+            self.thread_timeline_view_state.model.clone()
+        } else {
+            TimelineRenderModel::empty()
+        }
     }
 }
 
@@ -19,6 +21,7 @@ impl TimelineRenderModel {
         snapshot: &pioneer_client::timeline::presentation::TimelineSnapshot,
     ) -> Self {
         Self {
+            revision: snapshot.revision(),
             source_revision: snapshot.source_revision(),
             item_presentations: std::sync::Arc::new(
                 snapshot

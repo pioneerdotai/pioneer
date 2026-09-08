@@ -14,7 +14,7 @@ use super::layout::TIMELINE_CONTENT_HORIZONTAL_PADDING;
 use super::layout::TIMELINE_END_BOTTOM_SPACING;
 use super::layout::TIMELINE_ITEM_BOTTOM_SPACING;
 use crate::assets::PioneerIconName;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::component::Icon;
 use gpui_kit::component::IconName;
 use gpui_kit::component::StyledExt;
@@ -113,7 +113,7 @@ fn task_status_label(status: TaskStatus) -> String {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(super) fn turn_security_icon(summary: &ClientTurnSecuritySummary) -> PioneerIconName {
         match summary.enforcement {
             ClientSecurityEnforcementStatus::Unavailable => PioneerIconName::ShieldX,
@@ -228,18 +228,20 @@ impl ThreadScreenView {
             .into_any_element()
     }
 
-    pub(super) fn toggle_timeline_item_expanded(&mut self, entry_id: &str, cx: &mut Context<Self>) {
-        let mut expanded = self.thread_timeline_item_expanded.borrow_mut();
-        if !expanded.remove(entry_id) {
-            expanded.insert(entry_id.to_owned());
-        }
-        drop(expanded);
-
-        let mut state = self.thread_timeline_view_state.borrow_mut();
-        state.expanded_revision = state.expanded_revision.saturating_add(1);
-        state.entry_layout_cache.remove(entry_id);
-        state.cached_item_sizes = None;
-        cx.notify();
+    pub(super) fn toggle_timeline_item_expanded(
+        &mut self,
+        entry_id: &str,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::timeline::controller::DesktopTimelineController::dispatch(
+            self,
+            &crate::timeline::controller::TimelineAction::Expand {
+                entry_id: entry_id.to_owned(),
+            },
+            window,
+            cx,
+        );
     }
 
     pub(super) fn render_turn_item_entry(

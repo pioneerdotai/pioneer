@@ -4229,6 +4229,110 @@ mod tests {
     }
 
     #[test]
+    fn timeline_wire_binding_and_direct_client_share_plans_and_scope_retirement() {
+        use pioneer_client::core::{ClientCore, ClientIntent};
+        use pioneer_client::timeline::controller::{TimelineDemand, TimelineIntent};
+        let mut runtime = ClientFfiRuntime::default();
+        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+        runtime.client_runtime.core = Arc::new(ClientCore::new());
+        let direct = ClientCore::new();
+        for core in [&direct, runtime.client_runtime.core.as_ref()] {
+            core.upsert_thread(serde_json::from_value(serde_json::json!({
+                "created_at":1,"id":"a","mode":"Chat","model":"synthetic-model","model_provider":"synthetic-provider","origin_kind":"user","preview":"","sidebar_visibility":"visible","status":"Idle","turns":[],"updated_at":2,"workspace_id":"workspace"
+            })).unwrap());
+            core.apply_thread_timeline_page(serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":1,
+                "blocks":[{"workspaceId":"workspace","threadId":"a","blockId":"message","turnId":"turn","sortKey":"1","kind":{"kind":"user_message","text":"synthetic","mode":"Message"}}],
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            })).unwrap(), pioneer_client::timeline::semantic::TopLevelPageMergeMode::Reset);
+            core.dispatch(ClientIntent::SetScopeDemand {
+                scope: ClientScope::Timeline {
+                    thread_id: "a".into(),
+                },
+                demand: pioneer_client::core::ClientDemand::Visible,
+                generation: pioneer_client::core::ClientGeneration::new(1),
+            });
+        }
+        let snapshot = direct.thread_presentation_snapshot("a").unwrap();
+        assert_eq!(
+            snapshot.timeline().source_revision(),
+            direct.thread_snapshot("a").unwrap().timeline_revision(),
+            "fixture must publish its latest source"
+        );
+        let input = TimelineIntent::Update {
+            demand: TimelineDemand {
+                thread_id: "a".into(),
+                consumer_id: "visible".into(),
+                generation: 1,
+                source_revision: snapshot.timeline().source_revision(),
+                row_ids: snapshot
+                    .timeline()
+                    .rows()
+                    .iter()
+                    .map(|r| r.id().as_str().to_owned())
+                    .collect(),
+                threshold: 3,
+                before: true,
+                after: true,
+                work: true,
+                presented_rows: false,
+                scroll_generation: 0,
+                latest_user_turn_id: Some("turn".into()),
+                viewed_through_turn_id: Some("turn".into()),
+                read_requires_unread: false,
+                prefetch_on_visibility: true,
+                boundary_request_limit: 1,
+            },
+        };
+        let envelope = client_binding::ClientIntentDispatchDto {
+            schema_version: 1,
+            intent: ClientIntent::Timeline {
+                intent: input.clone(),
+            },
+        };
+        let wire = serde_json::to_string(&envelope).unwrap();
+        let decoded: client_binding::ClientIntentDispatchDto = serde_json::from_str(&wire).unwrap();
+        let ClientIntent::Timeline { intent } = decoded.intent else {
+            panic!()
+        };
+        let plan = direct.plan_timeline_intent(input.clone(), 0);
+        assert_eq!(plan.reads.len(), 1);
+        assert_eq!(
+            plan,
+            runtime.client_runtime.core.plan_timeline_intent(intent, 0)
+        );
+        // The actual bridge dispatch of equal demand is a no-op: no fake plan is executed.
+        assert_eq!(
+            runtime.client_intent_dispatch(&wire).unwrap(),
+            client_binding::transition_dto(direct.dispatch(envelope.intent))
+        );
+        let exit = ClientIntent::Timeline {
+            intent: TimelineIntent::Exit {
+                thread_id: "a".into(),
+                consumer_id: "visible".into(),
+                generation: 1,
+            },
+        };
+        let wire = serde_json::to_string(&client_binding::ClientIntentDispatchDto {
+            schema_version: 1,
+            intent: exit.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            runtime.client_intent_dispatch(&wire).unwrap(),
+            client_binding::transition_dto(direct.dispatch(exit))
+        );
+        assert_eq!(
+            direct.plan_timeline_intent(input.clone(), 1),
+            Default::default()
+        );
+        assert_eq!(
+            runtime.client_runtime.core.plan_timeline_intent(input, 1),
+            Default::default()
+        );
+    }
+
+    #[test]
     fn navigation_binding_matches_direct_rust_for_selection_destinations_and_fences() {
         use pioneer_client::navigation::{
             AdministrationRoute, NavigationIntent, SemanticDestination, SettingsRoute,

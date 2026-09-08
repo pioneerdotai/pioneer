@@ -1,6 +1,6 @@
 //! Retained presentation of the existing timeline inside one mounted thread.
 pub(crate) use crate::timeline::state::{
-    CachedTimelineEntryLayout, CachedTimelineTerminal, ThreadTimelineViewState,
+    CachedTimelineEntryLayout, CachedTimelineTerminal, TimelinePresentationState,
 };
 use crate::{
     avatar::DesktopMemberAvatarState, binding::ThreadBindings,
@@ -42,7 +42,7 @@ pub(crate) enum ThreadScreenEvent {
     OpenMcpServer(String),
 }
 
-pub(crate) struct ThreadScreenView {
+pub(crate) struct TimelineView {
     pub(crate) client: Arc<ClientCore>,
     pub(crate) thread_id: String,
     pub(crate) thread_bindings: Arc<ThreadBindings>,
@@ -58,12 +58,11 @@ pub(crate) struct ThreadScreenView {
     >,
     pub(crate) connection_state: GatewayConnectionState,
     subscribed_workspace: Option<String>,
+    workspace_input: Option<String>,
     pub(crate) avatar_http: Option<crate::avatar::ThreadAvatarClient>,
     pub(crate) member_avatar_state: DesktopMemberAvatarState,
-    pub(crate) thread_timeline_scroll_handle: VirtualListScrollHandle,
-    pub(crate) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
+    pub(crate) thread_timeline_view_state: crate::timeline::state::TimelineViewState,
     pub(crate) running_indicator_views: RefCell<RunningIndicatorViewCache>,
-    pub(crate) thread_timeline_item_expanded: RefCell<HashSet<String>>,
     pub(crate) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
     pub(crate) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,
     pub(crate) pending_request_views:
@@ -75,34 +74,39 @@ pub(crate) struct ThreadScreenView {
     pub(crate) external: Arc<dyn ThreadExternalNavigationPort>,
     pub(crate) mount: u64,
     pub(crate) native_generation: Cell<u64>,
-    pub(crate) read_tasks: RefCell<HashMap<String, Task<()>>>,
     _binding_task: Task<()>,
     _bounds: Subscription,
+    _theme: Subscription,
+    _activation: Subscription,
 }
-impl EventEmitter<ThreadScreenEvent> for ThreadScreenView {}
-impl Render for ThreadScreenView {
+impl EventEmitter<ThreadScreenEvent> for TimelineView {}
+impl Render for TimelineView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let thread_id = self.thread_id.clone();
-        let model = self.semantic_timeline_render_model(Some(&thread_id));
-        self.render_timeline(Some(&thread_id), model, window, cx)
+        self.render_timeline(window, cx)
     }
 }
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn set_visible(
         &mut self,
         visible: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.thread_timeline_view_state.visible = visible;
         self.thread_bindings.set_active(visible);
         if visible {
+            self.running_indicator_views
+                .borrow_mut()
+                .set_active(true, cx);
             self.synchronize_inputs(window, cx);
         } else {
+            crate::timeline::controller::DesktopTimelineController::exit(self);
+            self.thread_timeline_view_state.layout_generation += 1;
+            self.thread_timeline_view_state.measurement = None;
             self.subscribed_workspace = None;
             self.pending_request_views.clear();
             self.task_review_views.clear();
             self.message_deletion_view = None;
-            self.read_tasks.borrow_mut().clear();
             self.member_avatar_state.clear();
             self.running_indicator_views
                 .borrow_mut()
@@ -119,15 +123,9 @@ impl ThreadScreenView {
             .filter(|entry| entry.child_thread_id() == self.thread_id)
     }
     pub(crate) fn thread_workspace_id(&self, thread_id: &str) -> Option<String> {
-        self.client
-            .thread_coordinator_snapshot(thread_id)
-            .map(|p| p.workspace_id.clone())
-            .filter(|workspace| !workspace.is_empty())
-            .or_else(|| {
-                (self.navigation_input.active_thread_id() == Some(thread_id))
-                    .then(|| self.navigation_input.workspace_id().map(str::to_owned))
-                    .flatten()
-            })
+        (thread_id == self.thread_id)
+            .then(|| self.workspace_input.clone())
+            .flatten()
     }
     pub(crate) fn thread_workspace_matches(&self, thread_id: &str, workspace_id: &str) -> bool {
         self.thread_id == thread_id
@@ -314,7 +312,7 @@ impl ThreadScreenView {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn reconcile_pending_request_views(
         &mut self,
         window: &mut Window,
@@ -354,7 +352,7 @@ impl ThreadScreenView {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn confirm_delete_message(
         &mut self,
         presentation: pioneer_client::timeline::rows::UserMessagePresentation,
@@ -401,7 +399,7 @@ impl ThreadScreenView {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn new(
         client: Arc<ClientCore>,
         thread_id: String,
@@ -423,6 +421,10 @@ impl ThreadScreenView {
                     }
                     if view
                         .update_in(cx, |view, window, cx| {
+                            if changes.iter().all(|publication| matches!(publication.scope(), pioneer_client::core::ClientScope::Timeline { .. })) {
+                                if crate::timeline::controller::DesktopTimelineController::reconcile_publication(view, window, cx) { cx.notify(); }
+                                return;
+                            }
                             let only_composer_text = changes.iter().all(|publication| {
                                 matches!(
                                     publication.scope(),
@@ -465,33 +467,58 @@ impl ThreadScreenView {
                 navigation_input: Arc::default(),
                 connection_state: GatewayConnectionState::Disconnected,
                 subscribed_workspace: None,
+                workspace_input: None,
                 avatar_http: None,
                 member_avatar_state,
-                thread_timeline_scroll_handle: VirtualListScrollHandle::new(),
-                thread_timeline_view_state: RefCell::default(),
+                thread_timeline_view_state: Default::default(),
                 running_indicator_views: RefCell::default(),
-                thread_timeline_item_expanded: RefCell::default(),
                 thread_timeline_terminal_item: RefCell::default(),
                 code_highlight_cache: RefCell::default(),
                 pending_request_views: HashMap::new(),
                 task_review_views: HashMap::new(),
                 message_deletion_view: None,
                 native_generation: Cell::new(0),
-                read_tasks: RefCell::default(),
                 _binding_task: binding_task,
-                _bounds: cx.observe_window_bounds(window, |view, _, cx| {
-                    let mut state = view.thread_timeline_view_state.borrow_mut();
-                    state.pending_width_probe = true;
-                    state.width_probe_attempts = 0;
-                    drop(state);
-                    cx.notify();
+                _bounds: cx.observe_window_bounds(window, |view, window, cx| {
+                    crate::timeline::controller::DesktopTimelineController::schedule(
+                        view, window, cx,
+                    )
                 }),
+                _activation: cx.observe_window_activation(window, |view, window, cx| {
+                    if window.is_window_active() {
+                        crate::timeline::controller::DesktopTimelineController::schedule(
+                            view, window, cx,
+                        );
+                    } else {
+                        crate::timeline::controller::DesktopTimelineController::exit(view);
+                    }
+                }),
+                _theme: cx.observe_global_in::<gpui_kit::component::Theme>(
+                    window,
+                    |view, window, cx| {
+                        {
+                            let mut state = view.thread_timeline_view_state.borrow_mut();
+                            state.entry_layout_cache.clear();
+                            state.cached_item_sizes = None;
+                        }
+                        crate::timeline::controller::DesktopTimelineController::reconcile(
+                            view, window, cx,
+                        );
+                        cx.notify();
+                    },
+                ),
             };
             view.synchronize_inputs(window, cx);
             view
         })
     }
     fn synchronize_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace_input = self
+            .client
+            .thread_coordinator_snapshot(&self.thread_id)
+            .map(|p| p.workspace_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| self.navigation_input.workspace_id().map(str::to_owned));
         use pioneer_client::core::ClientScope;
         let payload = |scope: ClientScope| self.thread_bindings.publication(&scope);
         self.composer_input = payload(ClientScope::Composer {
@@ -586,7 +613,6 @@ impl ThreadScreenView {
             self.pending_request_views.clear();
             self.task_review_views.clear();
             self.message_deletion_view = None;
-            self.read_tasks.borrow_mut().clear();
         } else {
             self.client.thread_capability_intent(
                 pioneer_client::threads::capabilities::ThreadCapabilityIntent::Observe {
@@ -615,25 +641,26 @@ impl ThreadScreenView {
             self.reconcile_pending_request_views(window, cx);
             self.reconcile_task_review_views(window, cx);
         }
+        crate::timeline::controller::DesktopTimelineController::reconcile(self, window, cx);
     }
 }
-impl Drop for ThreadScreenView {
+impl Drop for TimelineView {
     fn drop(&mut self) {
+        crate::timeline::controller::DesktopTimelineController::exit(self);
         self.member_avatar_state.close();
-        self.read_tasks.get_mut().clear();
         self.thread_bindings.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ThreadBindings, ThreadScreenView};
+    use super::{ThreadBindings, TimelineView};
     use gpui_kit::{
         Context, Entity, Render, TestAppContext, Window, component::Root, div, prelude::*,
     };
     use pioneer_client::core::{ClientCore, ClientScope};
     use std::sync::Arc;
-    struct Host(Option<Entity<ThreadScreenView>>);
+    struct Host(Option<Entity<TimelineView>>);
     impl Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div().size_full().children(self.0.clone())
@@ -651,7 +678,7 @@ mod tests {
         let binding = ThreadBindings::new(registrar, "a", vec![]);
         deliver();
         let (root, cx) = cx.add_window_view(|window, cx| {
-            let screen = ThreadScreenView::new(
+            let screen = TimelineView::new(
                 client.clone(),
                 "a".into(),
                 binding.clone(),

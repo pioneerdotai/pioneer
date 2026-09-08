@@ -4,7 +4,7 @@ use super::super::layout::TIMELINE_CONTENT_HORIZONTAL_PADDING;
 use super::super::layout::TIMELINE_MESSAGE_END_BOTTOM_SPACING;
 use super::super::markdown::CodeHighlightPolicy;
 use crate::assets::PioneerIconName;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use chrono::Local;
 use chrono::TimeZone;
 use gpui_kit::component::Icon;
@@ -32,7 +32,7 @@ use pioneer_client::timeline::types::TurnAuthorSnapshot;
 use pioneer_client::timeline::types::TurnItem;
 use std::path::PathBuf;
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn render_item_user_message(
         &self,
         entry: &TimelineEntry,
@@ -503,7 +503,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
 
 fn attachment_capability_icon(
     kind: ParsedUserAttachmentKind,
-    cx: &mut Context<ThreadScreenView>,
+    cx: &mut Context<TimelineView>,
 ) -> gpui_kit::Div {
     let icon = match kind {
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,

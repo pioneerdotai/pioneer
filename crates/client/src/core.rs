@@ -264,15 +264,8 @@ pub enum ClientIntent {
         row_ids: Vec<String>,
         collapsed_row_ids: Vec<String>,
     },
-    TimelineViewport {
-        thread_id: String,
-        row_ids: Vec<String>,
-        source_revision: u64,
-        threshold: usize,
-        before: bool,
-        after: bool,
-        work: bool,
-        presented_rows: bool,
+    Timeline {
+        intent: crate::timeline::controller::TimelineIntent,
     },
     SetScopeDemand {
         scope: ClientScope,
@@ -810,6 +803,7 @@ pub struct ClientCore {
     pub(crate) presentation_sender: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     presentation_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub(crate) thread_registry: Mutex<crate::threads::registry::ThreadRegistry>,
+    pub(crate) timeline_started: std::time::Instant,
     pub(crate) identity_authorization:
         Mutex<crate::gateway::identity_authorization::IdentityAuthorizationStore>,
     pub(crate) session_refresh_slots: Mutex<HashMap<String, Weak<Mutex<bool>>>>,
@@ -974,6 +968,7 @@ impl ClientCore {
             task_notifications: Mutex::default(),
             compatibility_runtime: ClientRuntime::new(),
             thread_registry: Mutex::default(),
+            timeline_started: std::time::Instant::now(),
             thread_request_sender: Mutex::default(),
             thread_request_task: Mutex::default(),
             presentation_sender: Mutex::default(),
@@ -1512,7 +1507,13 @@ impl ClientCore {
                         if core.is_stopped() {
                             break;
                         }
-                        let delay = core.next_thread_resume_delay();
+                        let delay = [
+                            core.next_thread_resume_delay(),
+                            core.next_timeline_read_delay(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min();
                         drop(core);
                         let request = match delay {
                             Some(delay) => match receiver.recv_timeout(delay) {
@@ -1532,6 +1533,9 @@ impl ClientCore {
                             break;
                         }
                         match request {
+                            Some(crate::threads::registry::ThreadControllerRequest::Read(
+                                request,
+                            )) => core.execute_timeline_read(request),
                             Some(crate::threads::registry::ThreadControllerRequest::Semantic(
                                 request,
                             )) => core.execute_thread_semantic_request(
@@ -1557,6 +1561,7 @@ impl ClientCore {
                             _ => {}
                         }
                         core.drive_due_thread_resumes();
+                        core.drive_timeline_reads();
                     }
                 })
                 .expect("Client thread request task could not start"),
@@ -1776,28 +1781,21 @@ impl ClientCore {
             } => {
                 self.set_thread_timeline_expansion(thread_id, row_ids, collapsed_row_ids);
             }
-            ClientIntent::TimelineViewport {
-                thread_id,
-                row_ids,
-                source_revision,
-                threshold,
-                before,
-                after,
-                work,
-                presented_rows,
-            } => {
-                for action in self.plan_thread_timeline_viewport(
-                    thread_id,
-                    *source_revision,
-                    row_ids,
-                    *threshold,
-                    *before,
-                    *after,
-                    *work,
-                    *presented_rows,
-                ) {
-                    self.schedule_thread_semantic_request(action);
+            ClientIntent::Timeline { intent } => {
+                let plan = self.timeline_intent(intent.clone());
+                let changed = plan != Default::default();
+                let mut partitions = self.partitions.lock().expect("client partitions poisoned");
+                if changed {
+                    partitions.transition_sequence.advance();
                 }
+                return Self::transition_without_publication(
+                    &partitions,
+                    if changed {
+                        ClientTransitionOutcome::Changed
+                    } else {
+                        ClientTransitionOutcome::Noop
+                    },
+                );
             }
             ClientIntent::SetScopeDemand { .. } => {}
         }

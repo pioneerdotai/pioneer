@@ -26,7 +26,7 @@ fn thread_has_one_public_root_and_only_approved_workspace_dependencies() {
         .next()
         .unwrap();
     for child in [
-        "ThreadScreenView::new",
+        "TimelineView::new",
         "ComposerView::new",
         "ThreadHeaderView::new",
         "ThreadSidePanelHostView::new",
@@ -77,12 +77,53 @@ fn shell_mounts_the_opaque_root_without_retaining_thread_domain_fields() {
 fn timeline_keeps_the_stock_list_and_existing_scroll_owner() {
     let view = include_str!("../src/timeline/view.rs");
     let screen = include_str!("../src/screen.rs");
+    let state = include_str!("../src/timeline/state.rs");
+    let controller = include_str!("../src/timeline/controller.rs");
     assert!(view.contains("v_virtual_list("));
-    assert!(screen.contains("VirtualListScrollHandle::new()"));
-    assert!(view.contains("sync_timeline_layout_width"));
+    assert!(state.contains("VirtualListScrollHandle::new()"));
+    assert!(!view.contains("sync_timeline_layout_width"));
     assert!(view.contains("cached_timeline_layout_index"));
-    for forbidden in ["DesktopTimelineController", "impl Element for", ".cached("] {
+    assert!(controller.contains("struct DesktopTimelineController;"));
+    for forbidden in ["impl Element for", ".cached("] {
         assert!(!view.contains(forbidden));
         assert!(!screen.contains(forbidden));
+    }
+}
+
+#[test]
+fn timeline_composition_reads_prepared_input_without_running_effects() {
+    let view = include_str!("../src/timeline/view.rs");
+    let render = view
+        .split("pub(crate) fn render_timeline(")
+        .nth(1)
+        .unwrap()
+        .split("pub(super) fn render_timeline_row(")
+        .next()
+        .unwrap();
+    // Event handler registration is allowed; these operations must never occur
+    // in composition or the virtual list's row/measurement callback.
+    for forbidden in [
+        "cx.spawn",
+        "cx.defer",
+        "cx.notify",
+        "borrow_mut()",
+        "thread_bindings",
+        "request_mark",
+        "request_semantic",
+        ".read(cx)",
+        ".update(cx",
+        "reconcile_scroll(",
+    ] {
+        assert!(!render.contains(forbidden), "render contains {forbidden}");
+    }
+    let rail = include_str!("../src/timeline/avatar_rail.rs");
+    let canvas = rail.split("canvas(").nth(1).unwrap();
+    for forbidden in [
+        "cx.defer",
+        "cx.notify",
+        "sync_timeline_avatar_demand",
+        "borrow_mut",
+    ] {
+        assert!(!canvas.contains(forbidden));
     }
 }

@@ -1,19 +1,16 @@
 use crate::screen::GatewayConnectionState;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::Context;
 use pioneer_client::timeline::semantic;
-use pioneer_client::timeline::semantic::DEFAULT_PREFETCH_THRESHOLD_ROWS;
 use pioneer_client::timeline::semantic::DEFAULT_TOP_LEVEL_PAGE_LIMIT;
 use pioneer_client::timeline::semantic::SemanticTimelineRequestAction;
 use pioneer_client::timeline::semantic::SemanticTimelineRequestKey;
-use pioneer_client::timeline::semantic::TopLevelPageMergeMode;
-use pioneer_client::timeline::semantic::WorkPageMergeMode;
 use pioneer_client::timeline::types::ThreadTimelinePageParams;
 use pioneer_client::timeline::types::TimelinePageAnchor;
 
 use super::semantic_adapter::SEMANTIC_TURN_WORK_GROUP_PREFIX;
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(crate) fn request_semantic_thread_newest_page(
         &mut self,
         thread_id: String,
@@ -41,106 +38,14 @@ impl ThreadScreenView {
         self.client.refresh_thread_timeline(&thread_id);
     }
 
-    pub(super) fn request_semantic_timeline_prefetch_for_visible_rows(
-        &mut self,
-        thread_id: &str,
-        row_ids: &[String],
-        source_revision: u64,
-        cx: &mut Context<Self>,
-    ) {
-        if self.current_active_thread_id() != Some(thread_id) {
-            return;
-        }
-        if let Some(publication) = self
-            .thread_bindings
-            .publication(&pioneer_client::core::ClientScope::Timeline {
-                thread_id: thread_id.to_owned(),
-            })
-            .and_then(|publication| {
-                publication.typed::<pioneer_client::timeline::presentation::TimelineSnapshot>()
-            })
-        {
-            let snapshot = publication.payload();
-            if snapshot.source_revision() == source_revision {
-                if let Some(workspace) = self.thread_workspace_id(thread_id) {
-                    for row in snapshot
-                        .rows()
-                        .iter()
-                        .filter(|row| row_ids.iter().any(|id| id == row.id().as_str()))
-                    {
-                        if let Some(content) = row.content() {
-                            for artifact in content
-                                .attachments
-                                .iter()
-                                .filter_map(|attachment| attachment.artifact.as_ref())
-                            {
-                                self.request_thread_artifact_preview_load(&workspace, artifact, cx);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let core = self.client.clone();
-        let actions = core.plan_thread_timeline_viewport(
-            thread_id,
-            source_revision,
-            row_ids,
-            DEFAULT_PREFETCH_THRESHOLD_ROWS,
-            self.semantic_prefetch_can_request_thread_before(),
-            self.semantic_prefetch_can_request_thread_after(),
-            self.semantic_prefetch_can_request_work_range(),
-            false,
-        );
-
-        if actions.is_empty() {
-            return;
-        }
-
-        let allow_thread_before = self.semantic_prefetch_can_request_thread_before();
-        let allow_thread_after = self.semantic_prefetch_can_request_thread_after();
-        let allow_work_prefetch = self.semantic_prefetch_can_request_work_range();
-        let scroll_generation = self
-            .thread_timeline_view_state
-            .borrow()
-            .semantic_prefetch_scroll_generation;
-        let consumed_scroll_generation = self
-            .thread_timeline_view_state
-            .borrow()
-            .semantic_prefetch_consumed_scroll_generation;
-        let allow_boundary_prefetch = scroll_generation > consumed_scroll_generation;
-        let mut consumed_boundary_prefetch = false;
-        for action in actions {
-            let requires_scroll_intent = semantic_action_requires_scroll_intent(&action);
-            if requires_scroll_intent && (!allow_boundary_prefetch || consumed_boundary_prefetch) {
-                continue;
-            }
-            if semantic_action_allowed_by_scroll(
-                &action,
-                allow_thread_before,
-                allow_thread_after,
-                allow_work_prefetch,
-            ) {
-                if requires_scroll_intent {
-                    consumed_boundary_prefetch = true;
-                }
-                self.execute_semantic_timeline_action(action, cx);
-            }
-        }
-        if consumed_boundary_prefetch {
-            self.thread_timeline_view_state
-                .borrow_mut()
-                .semantic_prefetch_consumed_scroll_generation = scroll_generation;
-        }
-    }
-
     pub(super) fn toggle_turn_work_group_expanded(
         &mut self,
         toggle_key: &str,
+        window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) {
         let Some(turn_id) = toggle_key.strip_prefix(SEMANTIC_TURN_WORK_GROUP_PREFIX) else {
-            self.toggle_timeline_item_expanded(toggle_key, cx);
+            self.toggle_timeline_item_expanded(toggle_key, window, cx);
             return;
         };
         let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
@@ -164,7 +69,7 @@ impl ThreadScreenView {
                 &thread_id,
                 toggle_key,
                 !is_expanded,
-                &self.thread_timeline_scroll_handle,
+                &self.thread_timeline_view_state.scroll_handle,
             );
         }
         self.consume_all_semantic_prefetch_scroll_intents();
@@ -193,78 +98,6 @@ impl ThreadScreenView {
         }
         self.client.schedule_thread_semantic_request(action);
     }
-
-    fn semantic_prefetch_can_request_thread_before(&self) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
-        if max_offset <= gpui_kit::px(1.) {
-            return false;
-        }
-        self.thread_timeline_scroll_handle.offset().y >= gpui_kit::px(-24.)
-    }
-
-    fn semantic_prefetch_can_request_thread_after(&self) -> bool {
-        let max_offset = self.thread_timeline_scroll_handle.max_offset().y;
-        if max_offset <= gpui_kit::px(1.) {
-            return false;
-        }
-        self.timeline_is_near_bottom()
-    }
-
-    fn semantic_prefetch_can_request_work_range(&self) -> bool {
-        self.thread_timeline_scroll_handle.max_offset().y > gpui_kit::px(1.)
-    }
-}
-
-fn turn_work_page_merge_mode(key: &SemanticTimelineRequestKey) -> WorkPageMergeMode {
-    match key {
-        SemanticTimelineRequestKey::TurnWorkBefore { .. } => WorkPageMergeMode::MergeBefore,
-        SemanticTimelineRequestKey::TurnWorkAfter { .. } => WorkPageMergeMode::MergeAfter,
-        // Initial and live newest-page requests share a key so they are deduplicated. Merging is
-        // equivalent to reset for an empty range; on refresh it preserves the oldest loaded
-        // cursor and extends the range toward its newest boundary.
-        SemanticTimelineRequestKey::TurnWorkInitial { .. } => WorkPageMergeMode::MergeAfter,
-        _ => WorkPageMergeMode::Merge,
-    }
-}
-
-fn top_level_page_preserves_near_bottom_anchor(merge_mode: TopLevelPageMergeMode) -> bool {
-    matches!(merge_mode, TopLevelPageMergeMode::MergeBefore)
-}
-
-fn work_page_preserves_near_bottom_anchor(merge_mode: WorkPageMergeMode) -> bool {
-    matches!(merge_mode, WorkPageMergeMode::MergeBefore)
-}
-
-fn semantic_action_allowed_by_scroll(
-    action: &SemanticTimelineRequestAction,
-    allow_thread_before: bool,
-    allow_thread_after: bool,
-    allow_work_prefetch: bool,
-) -> bool {
-    match action {
-        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. } => match key {
-            SemanticTimelineRequestKey::ThreadNewest { .. } => true,
-            SemanticTimelineRequestKey::ThreadBefore { .. } => allow_thread_before,
-            SemanticTimelineRequestKey::ThreadAfter { .. } => allow_thread_after,
-            _ => false,
-        },
-        SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
-            matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. }) || allow_work_prefetch
-        }
-        SemanticTimelineRequestAction::TurnWorkItemsGet { .. } => true,
-    }
-}
-
-fn semantic_action_requires_scroll_intent(action: &SemanticTimelineRequestAction) -> bool {
-    match action {
-        SemanticTimelineRequestAction::ThreadTimelinePage { key, .. } => {
-            !matches!(key, SemanticTimelineRequestKey::ThreadNewest { .. })
-        }
-        SemanticTimelineRequestAction::TurnWorkPage { key, .. } => {
-            !matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. })
-        }
-        SemanticTimelineRequestAction::TurnWorkItemsGet { .. } => false,
-    }
 }
 
 fn semantic_request_key_requires_scroll_intent(key: &SemanticTimelineRequestKey) -> bool {
@@ -276,37 +109,5 @@ fn semantic_request_key_requires_scroll_intent(key: &SemanticTimelineRequestKey)
         SemanticTimelineRequestKey::ThreadNewest { .. }
         | SemanticTimelineRequestKey::TurnWorkInitial { .. }
         | SemanticTimelineRequestKey::TurnWorkItems { .. } => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn newest_turn_work_page_merges_with_loaded_range() {
-        assert_eq!(
-            turn_work_page_merge_mode(&SemanticTimelineRequestKey::TurnWorkInitial {
-                thread_id: "thread_a".to_owned(),
-                turn_id: "turn_a".to_owned(),
-            }),
-            WorkPageMergeMode::MergeAfter
-        );
-    }
-
-    #[test]
-    fn prepend_pages_preserve_scroll_anchor_even_near_bottom() {
-        assert!(top_level_page_preserves_near_bottom_anchor(
-            TopLevelPageMergeMode::MergeBefore
-        ));
-        assert!(work_page_preserves_near_bottom_anchor(
-            WorkPageMergeMode::MergeBefore
-        ));
-        assert!(!top_level_page_preserves_near_bottom_anchor(
-            TopLevelPageMergeMode::MergeAfter
-        ));
-        assert!(!work_page_preserves_near_bottom_anchor(
-            WorkPageMergeMode::MergeAfter
-        ));
     }
 }

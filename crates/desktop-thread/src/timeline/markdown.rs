@@ -1,7 +1,7 @@
 use crate::assets::PioneerIconName;
 use crate::file_opener::LocalFileTarget;
 use crate::file_opener::local_file_target;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::component::IconName;
 use gpui_kit::component::IconNamed;
 use gpui_kit::component::StyledExt;
@@ -197,7 +197,30 @@ impl Element for MarkdownLinkText {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
+    pub(super) fn prepare_markdown_highlights(
+        &self,
+        document: &MarkdownDocument,
+        cx: &mut Context<Self>,
+    ) {
+        fn blocks(view: &TimelineView, input: &[MarkdownBlock], cx: &mut Context<TimelineView>) {
+            for block in input {
+                match block {
+                    MarkdownBlock::Code { language, text } => {
+                        view.prepare_code_highlight(text, language.as_deref(), cx)
+                    }
+                    MarkdownBlock::Quote { blocks: nested } => blocks(view, nested, cx),
+                    MarkdownBlock::List(list) => {
+                        for item in &list.items {
+                            blocks(view, &item.blocks, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        blocks(self, &document.blocks, cx);
+    }
     pub(super) fn render_markdown_auto(
         &self,
         interaction_scope: &str,

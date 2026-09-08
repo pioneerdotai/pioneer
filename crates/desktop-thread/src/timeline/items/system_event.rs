@@ -1,5 +1,5 @@
 use super::super::TimelineRowTopSpacing;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::v_flex;
@@ -185,7 +185,7 @@ fn capability_rejection_label_text(label: &CapabilityRejectionLabel) -> String {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(super) fn render_item_system_event(
         &self,
         entry: &TimelineEntry,
@@ -264,7 +264,8 @@ impl ThreadScreenView {
 
         let content = if has_details {
             let open = self
-                .thread_timeline_item_expanded
+                .thread_timeline_view_state
+                .expanded
                 .borrow()
                 .contains(entry.id.as_str());
 
@@ -318,8 +319,8 @@ impl ThreadScreenView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            cx.listener(move |this, _, window, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
                 )

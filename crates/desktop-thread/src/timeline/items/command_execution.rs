@@ -2,7 +2,7 @@ use super::super::TimelineRowTopSpacing;
 use super::format_running_elapsed;
 use crate::assets::PioneerIconName;
 use crate::screen::CachedTimelineTerminal;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::*;
@@ -21,7 +21,7 @@ use terminal::ColorPalette;
 use terminal::TerminalConfig;
 use terminal::TerminalView;
 
-impl ThreadScreenView {
+impl TimelineView {
     fn estimate_terminal_cols(content_width: Pixels) -> usize {
         let horizontal_padding = px(16.0);
         let approx_cell_width = px(6.7);
@@ -99,6 +99,36 @@ impl ThreadScreenView {
         terminal
     }
 
+    pub(crate) fn prepare_command_terminal(
+        &self,
+        entry: &TimelineEntry,
+        item_view: &ItemView,
+        content_width: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let item = &item_view.item;
+        let terminal_text =
+            command_execution_terminal_text(item, Self::timeline_entry_text(item_view), |output| {
+                Self::truncate_for_card(output, 24_000)
+            });
+
+        let cols = Self::estimate_terminal_cols(content_width);
+        let line_count = Self::estimate_visual_lines(terminal_text.as_str(), cols);
+        let desired_rows = line_count.saturating_add(2).clamp(8, 1600);
+        let terminal_height = px(((desired_rows.saturating_mul(13)).saturating_add(24)) as f32)
+            .max(px(140.0))
+            .min(px(360.0));
+
+        let _ = self.command_execution_terminal_view(
+            entry,
+            terminal_text.as_str(),
+            content_width,
+            terminal_height,
+            desired_rows,
+            cx,
+        );
+    }
+
     pub(super) fn render_item_command_execution(
         &self,
         entry: &TimelineEntry,
@@ -132,25 +162,22 @@ impl ThreadScreenView {
             .max(px(140.0))
             .min(px(360.0));
 
-        let terminal = self.command_execution_terminal_view(
-            entry,
-            terminal_text.as_str(),
-            content_width,
-            terminal_height,
-            desired_rows,
-            cx,
-        );
-
+        let terminal = self
+            .thread_timeline_terminal_item
+            .borrow()
+            .get(&entry.id)
+            .map(|entry| entry.view.clone());
         let terminal_block = div()
             .w_full()
             .h(terminal_height)
-            .child(terminal)
+            .children(terminal)
             .into_any_element();
 
         let running_elapsed_label = format_running_elapsed(item_view);
 
         let open = self
-            .thread_timeline_item_expanded
+            .thread_timeline_view_state
+            .expanded
             .borrow()
             .contains(entry.id.as_str());
 
@@ -227,8 +254,8 @@ impl ThreadScreenView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            cx.listener(move |this, _, window, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
                 )
@@ -267,8 +294,8 @@ impl ThreadScreenView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_timeline_item_expanded(entry_id.as_str(), cx);
+                            cx.listener(move |this, _, window, cx| {
+                                this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
                 )

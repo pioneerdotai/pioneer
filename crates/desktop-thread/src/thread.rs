@@ -8,7 +8,7 @@ use crate::{
     panel_layout::ThreadPanelLayoutStore,
     panels::ThreadSidePanelHostView,
     ports::*,
-    screen::{ThreadScreenEvent, ThreadScreenView},
+    screen::{ThreadScreenEvent, TimelineView},
 };
 use gpui_kit::{
     component::{
@@ -77,7 +77,7 @@ pub enum ThreadNavigationEvent {
 /// in its private owning children; only window layout changes notify this root.
 pub struct ThreadView {
     thread_id: String,
-    screen: Entity<ThreadScreenView>,
+    screen: Entity<TimelineView>,
     header: Entity<ThreadHeaderView>,
     composer: Entity<ComposerView>,
     panels: Entity<ThreadSidePanelHostView>,
@@ -167,7 +167,7 @@ impl ThreadView {
             ],
             config.initial,
         );
-        let screen = ThreadScreenView::new(
+        let screen = TimelineView::new(
             config.client.clone(),
             config.thread_id.clone(),
             screen_bindings,
@@ -228,7 +228,14 @@ impl ThreadView {
         });
         cx.new(|cx: &mut Context<Self>| {
             let subscriptions = vec![
-                cx.observe(&layout, |_, _, cx| cx.notify()),
+                cx.observe_in(&layout, window, |view, _, window, cx| {
+                    view.screen.update(cx, |timeline, cx| {
+                        crate::timeline::controller::DesktopTimelineController::schedule(
+                            timeline, window, cx,
+                        )
+                    });
+                    cx.notify();
+                }),
                 cx.subscribe(&header, |_, _, _: &HeaderBack, cx| {
                     cx.emit(ThreadNavigationEvent::CloseTaskThread)
                 }),
@@ -385,6 +392,158 @@ mod tests {
             div().size_full().children(self.0.clone())
         }
     }
+    #[gpui_kit::test]
+    fn timeline_reconciles_publications_before_composition_and_equal_input_is_quiet(
+        cx: &mut TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "A text");
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let thread = ThreadView::new(
+                ThreadViewConfig::new(
+                    client.clone(),
+                    "a".into(),
+                    registrar,
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                ),
+                window,
+                cx,
+            );
+            Root::new(thread, window, cx)
+        });
+        deliver();
+        cx.run_until_parked();
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |thread, _| thread.screen.clone());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let notifications = Rc::new(Cell::new(0));
+        let subscription = cx.update(|_, cx| {
+            let notifications = notifications.clone();
+            cx.observe(&timeline, move |_, _| {
+                notifications.set(notifications.get() + 1)
+            })
+        });
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                assert!(
+                    !crate::timeline::controller::DesktopTimelineController::reconcile_publication(
+                        view, window, cx
+                    )
+                );
+                let revision = view.thread_timeline_view_state.model.revision;
+                let viewport_revision = view.thread_timeline_view_state.viewport_revision;
+                let prepared = view
+                    .thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .item_sizes
+                    .clone();
+                drop(view.render(window, cx));
+                assert_eq!(view.thread_timeline_view_state.model.revision, revision);
+                assert_eq!(
+                    view.thread_timeline_view_state.viewport_revision,
+                    viewport_revision
+                );
+                assert!(Rc::ptr_eq(
+                    &prepared,
+                    &view
+                        .thread_timeline_view_state
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .item_sizes
+                ));
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 0);
+        drop(subscription);
+
+        // A completed draw can be superseded before its deferred measurement
+        // commits. Only the newest layout generation may replace the snapshot.
+        let previous_sizes = timeline.read_with(cx, |view, _| {
+            view.thread_timeline_view_state
+                .prepared
+                .as_ref()
+                .unwrap()
+                .item_sizes
+                .clone()
+        });
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                {
+                    let mut state = view.thread_timeline_view_state.borrow_mut();
+                    state.cached_item_sizes = None;
+                    // A follow request from the preceding content publication.
+                    state.pending_follow_bottom = true;
+                }
+                view.reconcile_timeline(window, cx);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            timeline.update(cx, |view, cx| {
+                view.reconcile_timeline(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        timeline.read_with(cx, |view, _| {
+            assert!(Rc::ptr_eq(
+                &previous_sizes,
+                &view
+                    .thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .item_sizes
+            ));
+            assert!(view.thread_timeline_view_state.measurement.is_some());
+            assert!(
+                view.thread_timeline_view_state
+                    .borrow()
+                    .pending_follow_bottom
+            );
+        });
+        // A gesture between measure and commit wins over the earlier follow.
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                crate::timeline::controller::DesktopTimelineController::dispatch(
+                    view,
+                    &crate::timeline::controller::TimelineAction::Scroll { delta_y: px(12.) },
+                    window,
+                    cx,
+                );
+                assert!(
+                    !view
+                        .thread_timeline_view_state
+                        .borrow()
+                        .pending_follow_bottom
+                );
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        timeline.read_with(cx, |view, _| {
+            assert!(view.thread_timeline_view_state.measurement.is_none());
+            let current = &view
+                .thread_timeline_view_state
+                .prepared
+                .as_ref()
+                .unwrap()
+                .item_sizes;
+            assert!(!Rc::ptr_eq(&previous_sizes, current));
+            assert_eq!(previous_sizes.as_ref(), current.as_ref());
+        });
+    }
+
     #[gpui_kit::test]
     fn mounted_root_keeps_window_layout_and_replaces_all_thread_content(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);

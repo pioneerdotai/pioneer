@@ -3,7 +3,7 @@ use super::{
     voice_owner::{VoiceInputEvent, VoiceInputView},
     *,
 };
-use crate::{binding::ThreadBindings, member_picker::*, ports::*, screen::ThreadScreenView};
+use crate::{binding::ThreadBindings, member_picker::*, ports::*, screen::TimelineView};
 use gpui_kit::{
     component::input::{InputEvent, TextareaState},
     prelude::*,
@@ -19,7 +19,7 @@ pub(crate) struct ComposerView {
     pub(super) client: Arc<ClientCore>,
     pub(super) thread_id: String,
     pub(super) thread_bindings: Arc<ThreadBindings>,
-    pub(super) screen: WeakEntity<ThreadScreenView>,
+    pub(super) screen: WeakEntity<TimelineView>,
     pub(super) composer_input: Option<Arc<ComposerPublication>>,
     pub(super) identity_input: Option<
         Arc<pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication>,
@@ -60,7 +60,7 @@ impl ComposerView {
         client: Arc<ClientCore>,
         thread_id: String,
         thread_bindings: Arc<ThreadBindings>,
-        screen: WeakEntity<ThreadScreenView>,
+        screen: WeakEntity<TimelineView>,
         files: Arc<dyn ThreadFilePort>,
         audio: Arc<dyn ThreadAudioPort>,
         mount: u64,
@@ -337,7 +337,7 @@ impl Drop for ComposerView {
 mod tests {
     use super::{
         Arc, ClientCore, ClientScope, ComposerIntent, ComposerView, ThreadAudioCompletion,
-        ThreadAudioError, ThreadAudioPort, ThreadAudioRequest, ThreadBindings, ThreadScreenView,
+        ThreadAudioError, ThreadAudioPort, ThreadAudioRequest, ThreadBindings, TimelineView,
     };
     use gpui_kit::component::Root;
     use gpui_kit::prelude::*;
@@ -377,7 +377,7 @@ mod tests {
     }
     struct Host {
         composer: Option<Entity<ComposerView>>,
-        screen: Entity<ThreadScreenView>,
+        screen: Entity<TimelineView>,
     }
     impl Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -402,7 +402,7 @@ mod tests {
         let audio = Arc::new(Audio(AtomicUsize::new(0)));
         let (root, cx) = cx.add_window_view(|window, cx| {
             let ports = Arc::new(crate::test_support::ThreadPorts);
-            let screen = ThreadScreenView::new(
+            let screen = TimelineView::new(
                 client.clone(),
                 "a".into(),
                 screen_binding.clone(),

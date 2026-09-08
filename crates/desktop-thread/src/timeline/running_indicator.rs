@@ -2,7 +2,7 @@ use super::TimelineRowTopSpacing;
 use super::items::format_elapsed_ms;
 use super::model::TimelineRow;
 use super::model::TimelineRowKind;
-use crate::screen::ThreadScreenView;
+use crate::screen::TimelineView;
 use gpui_kit::ImageSource;
 use gpui_kit::RenderImage;
 use gpui_kit::component::StyledExt;
@@ -192,7 +192,8 @@ pub(crate) struct RunningDinoView {
     assets: Option<Arc<RunningDinoAssets>>,
     asset_request_registered: bool,
     frame_index: usize,
-    last_rendered_at: Instant,
+    last_visible_at: Instant,
+    viewport_visible: bool,
     clock_active: bool,
     clock_task: Option<gpui_kit::Task<()>>,
     suspended: bool,
@@ -206,7 +207,8 @@ impl RunningDinoView {
             assets: None,
             asset_request_registered: false,
             frame_index: 0,
-            last_rendered_at: Instant::now(),
+            last_visible_at: Instant::now(),
+            viewport_visible: false,
             clock_active: false,
             clock_task: None,
             suspended: !active,
@@ -238,6 +240,7 @@ impl RunningDinoView {
                             let assets = assets.clone();
                             let _ = waiter.update(&mut cx, |view, cx| {
                                 view.assets = assets;
+                                view.ensure_clock(cx);
                                 cx.notify();
                             });
                         }
@@ -251,8 +254,49 @@ impl RunningDinoView {
         }
     }
 
+    fn synchronize_motion(&mut self, cx: &mut Context<Self>) {
+        let reduced = cx.reduce_motion();
+        if self.reduce_motion == reduced {
+            return;
+        }
+        self.reduce_motion = reduced;
+        if reduced {
+            self.clock_task.take();
+            self.clock_active = false;
+            self.frame_index = 0;
+        } else {
+            self.ensure_clock(cx);
+        }
+        cx.notify();
+    }
+
+    // The pinned App exposes motion changes as a window refresh, without an
+    // observer. Deliver that changed platform input after paint; the handler
+    // owns clock transitions. Equal refreshes do not schedule any work.
+    fn motion_refresh_input(&self, cx: &Context<Self>) -> impl IntoElement {
+        let previous = self.reduce_motion;
+        let entity = cx.weak_entity();
+        canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| {
+                if previous != cx.reduce_motion() {
+                    window.defer(cx, move |_, cx| {
+                        let _ = entity.update(cx, |view, cx| view.synchronize_motion(cx));
+                    });
+                }
+            },
+        )
+        .absolute()
+        .size_full()
+    }
+
     fn ensure_clock(&mut self, cx: &mut Context<Self>) {
-        if self.suspended || self.clock_active || self.reduce_motion || self.assets.is_none() {
+        if self.suspended
+            || !self.viewport_visible
+            || self.clock_active
+            || self.reduce_motion
+            || self.assets.is_none()
+        {
             return;
         }
         self.clock_active = true;
@@ -285,12 +329,11 @@ impl RunningDinoView {
                                 view.clock_active = false;
                                 return None;
                             }
-                            if view.last_rendered_at.elapsed() > DINO_OFFSCREEN_GRACE {
+                            if view.suspended || (!view.viewport_visible && view.last_visible_at.elapsed() > DINO_OFFSCREEN_GRACE) {
                                 view.clock_active = false;
-                                // If the UI thread was merely busy, this final
-                                // notification renders the still-mounted view
-                                // and restarts its clock. An actually unmounted
-                                // entity remains quiet after this one wake-up.
+                                // Visibility entry resumes the retained clock.
+                                // This final notification preserves the existing
+                                // grace-period completion cadence.
                                 pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(
                                     record_animation_activity(
                                         pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningDinoClock,
@@ -341,13 +384,6 @@ impl Render for RunningDinoView {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::RunningDino
         ));
-        self.last_rendered_at = Instant::now();
-        self.reduce_motion = cx.reduce_motion();
-        if self.reduce_motion {
-            self.frame_index = 0;
-        }
-        self.ensure_assets(cx);
-        self.ensure_clock(cx);
 
         let image = self.assets.as_ref().and_then(|assets| {
             let frames = assets.frames(cx.theme().mode.is_dark());
@@ -355,22 +391,29 @@ impl Render for RunningDinoView {
                 .get(self.frame_index % frames.len())
                 .map(|frame| ImageSource::Render(frame.image.clone()))
         });
-        div().w_full().h_full().when_some(image, |this, image| {
-            this.child(
-                img(image)
-                    .id("running-turn-dino-static-frame")
-                    .w_full()
-                    .h_full()
-                    .object_fit(ObjectFit::Contain),
-            )
-        })
+        div()
+            .w_full()
+            .h_full()
+            .relative()
+            .child(self.motion_refresh_input(cx))
+            .when_some(image, |this, image| {
+                this.child(
+                    img(image)
+                        .id("running-turn-dino-static-frame")
+                        .w_full()
+                        .h_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+            })
     }
 }
 
 pub(crate) struct RunningElapsedView {
+    elapsed_ms: u64,
     started_at_unix_ms: i64,
     show_dino: bool,
-    last_rendered_at: Instant,
+    last_visible_at: Instant,
+    viewport_visible: bool,
     clock_active: bool,
     clock_task: Option<gpui_kit::Task<()>>,
     suspended: bool,
@@ -380,8 +423,10 @@ impl RunningElapsedView {
     fn new(started_at_unix_ms: i64, show_dino: bool, active: bool) -> Self {
         Self {
             started_at_unix_ms,
+            elapsed_ms: now_unix_ms().saturating_sub(started_at_unix_ms).max(0) as u64,
             show_dino,
-            last_rendered_at: Instant::now(),
+            last_visible_at: Instant::now(),
+            viewport_visible: false,
             clock_active: false,
             clock_task: None,
             suspended: !active,
@@ -389,8 +434,13 @@ impl RunningElapsedView {
     }
 
     fn ensure_clock(&mut self, cx: &mut Context<Self>) {
-        if self.suspended || self.clock_active {
+        if self.suspended || !self.viewport_visible || self.clock_active {
             return;
+        }
+        let elapsed_ms = now_unix_ms().saturating_sub(self.started_at_unix_ms).max(0) as u64;
+        if self.elapsed_ms != elapsed_ms {
+            self.elapsed_ms = elapsed_ms;
+            cx.notify();
         }
         self.clock_active = true;
         let started_at_unix_ms = self.started_at_unix_ms;
@@ -412,7 +462,8 @@ impl RunningElapsedView {
                     ));
                     let keep_running = this
                         .update(&mut cx, |view, cx| {
-                            if view.last_rendered_at.elapsed() > ELAPSED_OFFSCREEN_GRACE {
+                            view.elapsed_ms = now_unix_ms().saturating_sub(view.started_at_unix_ms).max(0) as u64;
+                            if view.suspended || (!view.viewport_visible && view.last_visible_at.elapsed() > ELAPSED_OFFSCREEN_GRACE) {
                                 view.clock_active = false;
                                 // Distinguish a temporarily stalled UI from an
                                 // offscreen view without polling forever. A
@@ -463,9 +514,7 @@ impl Render for RunningElapsedView {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::RunningElapsed
         ));
-        self.last_rendered_at = Instant::now();
-        self.ensure_clock(cx);
-        let elapsed_ms = now_unix_ms().saturating_sub(self.started_at_unix_ms).max(0) as u64;
+        let elapsed_ms = self.elapsed_ms;
         let elapsed = if elapsed_ms >= 1_000 {
             format_elapsed_ms(elapsed_ms)
         } else {
@@ -517,6 +566,39 @@ impl Default for RunningIndicatorViewCache {
 }
 
 impl RunningIndicatorViewCache {
+    pub(crate) fn set_visible_activities(
+        &mut self,
+        activities: &std::collections::HashSet<String>,
+        cx: &mut App,
+    ) {
+        let now = Instant::now();
+        for (id, entry) in &self.dino {
+            let visible = activities.contains(id);
+            entry.view.update(cx, |view, cx| {
+                if view.viewport_visible != visible {
+                    view.last_visible_at = now;
+                }
+                view.viewport_visible = visible;
+                view.synchronize_motion(cx);
+                if visible {
+                    view.ensure_assets(cx);
+                    view.ensure_clock(cx);
+                }
+            });
+        }
+        for (id, entry) in &self.elapsed {
+            let visible = activities.contains(id);
+            entry.cached.view.update(cx, |view, cx| {
+                if view.viewport_visible != visible {
+                    view.last_visible_at = now;
+                }
+                view.viewport_visible = visible;
+                if visible {
+                    view.ensure_clock(cx);
+                }
+            });
+        }
+    }
     pub(crate) fn set_active(&mut self, active: bool, cx: &mut App) {
         self.active = active;
         for entry in self.dino.values() {
@@ -529,6 +611,7 @@ impl RunningIndicatorViewCache {
                     view.clock_task.take();
                     view.clock_active = false;
                 } else {
+                    view.ensure_clock(cx);
                     cx.notify();
                 }
             });
@@ -543,6 +626,7 @@ impl RunningIndicatorViewCache {
                     view.clock_task.take();
                     view.clock_active = false;
                 } else {
+                    view.ensure_clock(cx);
                     cx.notify();
                 }
             });
@@ -557,7 +641,7 @@ impl RunningIndicatorViewCache {
     }
 }
 
-impl ThreadScreenView {
+impl TimelineView {
     pub(super) fn semantic_timeline_has_running_turn_row(&self) -> bool {
         let active_thread_id = self.current_active_thread_id().map(str::to_owned);
         let model = self.semantic_timeline_render_model(active_thread_id.as_deref());
@@ -572,7 +656,7 @@ impl ThreadScreenView {
         })
     }
 
-    pub(super) fn running_turn_dino_view(
+    pub(super) fn prepare_running_dino(
         &self,
         activity_id: String,
         cx: &mut Context<Self>,
@@ -582,11 +666,21 @@ impl ThreadScreenView {
         cache.prune(now);
         if let Some(entry) = cache.dino.get_mut(&activity_id) {
             entry.last_used = now;
+            entry.view.update(cx, |view, cx| {
+                view.ensure_assets(cx);
+                view.ensure_clock(cx);
+            });
             return entry.view.clone();
         }
 
         let assets_loader = cache.assets_loader.clone();
-        let view = cx.new(|_| RunningDinoView::new(assets_loader, cache.active));
+        let view = cx.new(|cx| {
+            let mut view = RunningDinoView::new(assets_loader, cache.active);
+            view.reduce_motion = cx.reduce_motion();
+            view.ensure_assets(cx);
+            view.ensure_clock(cx);
+            view
+        });
         cache.dino.insert(
             activity_id,
             CachedIndicatorView {
@@ -597,7 +691,7 @@ impl ThreadScreenView {
         view
     }
 
-    fn running_elapsed_view(
+    pub(super) fn prepare_running_elapsed(
         &self,
         activity_id: String,
         started_at_unix_ms: i64,
@@ -615,7 +709,11 @@ impl ThreadScreenView {
             return entry.cached.view.clone();
         }
 
-        let view = cx.new(|_| RunningElapsedView::new(started_at_unix_ms, show_dino, cache.active));
+        let view = cx.new(|cx| {
+            let mut view = RunningElapsedView::new(started_at_unix_ms, show_dino, cache.active);
+            view.ensure_clock(cx);
+            view
+        });
         cache.elapsed.insert(
             activity_id,
             RunningElapsedViewEntry {
@@ -628,6 +726,31 @@ impl ThreadScreenView {
             },
         );
         view
+    }
+
+    pub(super) fn running_turn_dino_view(
+        &self,
+        activity_id: String,
+        _cx: &mut Context<Self>,
+    ) -> Option<Entity<RunningDinoView>> {
+        self.running_indicator_views
+            .borrow()
+            .dino
+            .get(&activity_id)
+            .map(|entry| entry.view.clone())
+    }
+    fn running_elapsed_view(
+        &self,
+        activity_id: String,
+        _started_at_unix_ms: i64,
+        _show_dino: bool,
+        _cx: &mut Context<Self>,
+    ) -> Option<Entity<RunningElapsedView>> {
+        self.running_indicator_views
+            .borrow()
+            .elapsed
+            .get(&activity_id)
+            .map(|entry| entry.cached.view.clone())
     }
 
     pub(super) fn render_running_turn_row(
@@ -667,9 +790,10 @@ impl ThreadScreenView {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::RunningActivity
         ));
-        let started_at = started_at_unix_ms.unwrap_or_else(now_unix_ms);
-        let dino =
-            show_dino.then(|| self.running_turn_dino_view(format!("content:{activity_id}"), cx));
+        let started_at = started_at_unix_ms.unwrap_or(0);
+        let dino = show_dino
+            .then(|| self.running_turn_dino_view(format!("content:{activity_id}"), cx))
+            .flatten();
         let elapsed = self.running_elapsed_view(activity_id, started_at, show_dino, cx);
         let status_label = match state {
             Some(pioneer_client::timeline::types::TurnWorkState::Starting) => {
@@ -703,7 +827,7 @@ impl ThreadScreenView {
                             }),
                     ),
             )
-            .child(elapsed)
+            .children(elapsed)
             .into_any_element()
     }
 }
@@ -759,16 +883,79 @@ mod tests {
             assert!(retained.read(cx).clock_task.is_none());
             retained.update(cx, |view, cx| view.ensure_clock(cx));
             assert!(retained.read(cx).clock_task.is_none());
+            retained.update(cx, |view, _| view.elapsed_ms = 0);
             cache.set_active(true, cx);
+            cache.set_visible_activities(
+                &std::collections::HashSet::from(["thread/turn".into()]),
+                cx,
+            );
             let retained = &cache.elapsed["thread/turn"].cached.view;
             assert_eq!(retained.entity_id(), identity);
             retained.update(cx, |view, cx| view.ensure_clock(cx));
             assert!(retained.read(cx).clock_task.is_some());
+            assert!(
+                retained.read(cx).elapsed_ms > 0,
+                "remount refreshes elapsed before the next tick"
+            );
             drop(cache);
             weak
         });
         cx.run_until_parked();
         assert!(weak.upgrade().is_none());
+    }
+
+    #[gpui_kit::test]
+    fn window_motion_refresh_stops_and_resumes_clock_without_viewport_input(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::*;
+        cx.update(gpui_kit::init);
+        let assets = Arc::new(decode_running_dino_assets().unwrap());
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = RunningDinoView::new(Arc::default(), true);
+            view.assets = Some(assets);
+            view.viewport_visible = true;
+            view.ensure_clock(cx);
+            view
+        });
+        assert!(view.read_with(cx, |view, _| view.clock_active));
+        cx.update(|window, cx| {
+            cx.set_reduce_motion(true);
+            // Render remains a pure read, even with a changed platform flag.
+            view.update(cx, |view, cx| {
+                drop(view.render(window, cx));
+                assert!(!view.reduce_motion);
+                assert!(view.clock_active);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.reduce_motion);
+            assert!(!view.clock_active);
+            assert!(view.clock_task.is_none());
+            assert_eq!(view.frame_index, 0);
+        });
+        cx.update(|window, cx| {
+            cx.set_reduce_motion(false);
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.reduce_motion);
+            assert!(view.clock_active);
+            assert!(view.clock_task.is_some());
+        });
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let notifications = notifications.clone();
+            cx.observe(&view, move |_, _| {
+                notifications.set(notifications.get() + 1)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 0, "equal motion refresh is quiet");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Timeline rows, grouping, and selectors.
 
+pub mod controller;
 pub mod labels;
 pub mod presentation;
 pub mod render_fingerprint;

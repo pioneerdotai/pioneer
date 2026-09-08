@@ -117,8 +117,6 @@ struct ThreadDomainStore {
     coordinator: ThreadCoordinator,
     semantic: SemanticTimelineState,
     cli_binding: Option<CLIRuntimeThreadBinding>,
-    in_flight: HashSet<SemanticTimelineRequestKey>,
-    pending: HashMap<SemanticTimelineRequestKey, SemanticTimelineRequestAction>,
     snapshot: Option<Arc<ThreadDomainSnapshot>>,
     summary_revision: u64,
     presentation: Option<Arc<crate::timeline::presentation::ThreadPresentationSnapshot>>,
@@ -136,8 +134,6 @@ impl ThreadDomainStore {
             coordinator: ThreadCoordinator::pending(id, workspace),
             semantic: Default::default(),
             cli_binding: None,
-            in_flight: Default::default(),
-            pending: Default::default(),
             snapshot: None,
             summary_revision: 0,
             presentation: None,
@@ -154,6 +150,7 @@ impl ThreadDomainStore {
 /// One owner for thread lifecycle, navigation mappings, and per-thread stores.
 #[derive(Default)]
 pub struct ThreadRegistry {
+    pub(crate) timeline: crate::timeline::controller::ThreadTimelineController,
     current_principal_id: Option<String>,
     stores: HashMap<String, ThreadDomainStore>,
     pub(crate) directory: crate::workspaces::directory::ThreadDirectoryStore,
@@ -180,6 +177,26 @@ pub struct ThreadRegistry {
         crate::authorization::AccessChangedPlan,
     )>,
     last_policy: Option<pioneer_protocol::AuthorizationProjectionChangedNotification>,
+}
+
+impl ThreadRegistry {
+    pub(crate) fn timeline_has_unread(&self, thread: &str) -> bool {
+        self.directory.has_unread(thread)
+    }
+    pub(crate) fn timeline_revision_matches(&self, thread: &str, revision: u64) -> bool {
+        self.stores.get(thread).is_some_and(|store| {
+            !store.presentation_blocked
+                && store
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.timeline_revision() == revision)
+        })
+    }
+    pub(crate) fn timeline_workspace_matches(&self, thread: &str, workspace: &str) -> bool {
+        self.stores
+            .get(thread)
+            .is_some_and(|store| store.coordinator.workspace_id == workspace)
+    }
 }
 
 impl ThreadRegistry {
@@ -304,19 +321,15 @@ impl ThreadRegistry {
             ),
             snapshot.clone(),
         )];
-        let thread_summary = store
-            .coordinator
-            .thread()
-            .cloned()
-            .map(|thread| {
-                let mut summary = crate::workspaces::directory::thread_directory_summary(thread);
-                if summary.turns.is_empty() {
-                    summary
-                        .turns
-                        .extend(store.coordinator.last_known_turn().cloned());
-                }
+        let thread_summary = store.coordinator.thread().cloned().map(|thread| {
+            let mut summary = crate::workspaces::directory::thread_directory_summary(thread);
+            if summary.turns.is_empty() {
                 summary
-            });
+                    .turns
+                    .extend(store.coordinator.last_known_turn().cloned());
+            }
+            summary
+        });
         let summary = SidebarSummaryChanged {
             thread_id: id.to_owned(),
             workspace_id: store.coordinator.workspace_id.clone(),
@@ -835,6 +848,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        registry.timeline.invalidate(Some(id));
         registry.stores.remove(id);
         if let Some(thread) = registry.directory.threads.remove(id) {
             registry
@@ -1040,10 +1054,12 @@ impl ClientCore {
         self.thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .stores
-            .get(id)
-            .map(|s| s.in_flight.clone())
-            .unwrap_or_default()
+            .timeline
+            .in_flight
+            .iter()
+            .filter(|key| request_thread_id(key) == id)
+            .cloned()
+            .collect()
     }
     pub fn enqueue_thread_semantic_request(
         &self,
@@ -1056,12 +1072,8 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        let store = registry.stores.get_mut(id)?;
-        crate::timeline::semantic::enqueue_semantic_timeline_request(
-            &mut store.in_flight,
-            &mut store.pending,
-            action,
-        )
+        registry.stores.get(id)?;
+        registry.timeline.begin(action)
     }
     pub fn finish_thread_semantic_request(
         &self,
@@ -1071,12 +1083,7 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        let store = registry.stores.get_mut(request_thread_id(key))?;
-        crate::timeline::semantic::finish_semantic_timeline_request(
-            &mut store.in_flight,
-            &mut store.pending,
-            key,
-        )
+        registry.timeline.finish(key, true, self.timeline_now_ms())
     }
 }
 fn request_thread_id(key: &SemanticTimelineRequestKey) -> &str {
@@ -1106,6 +1113,7 @@ impl ClientCore {
         registry.ready_resume.clear();
         registry.ready_resume_set.clear();
         let mut changed = Vec::new();
+        let cancelled = registry.timeline.invalidate(None);
         for (id, store) in &mut registry.stores {
             store.generation = generation;
             if store.coordinator.history_loading {
@@ -1117,7 +1125,11 @@ impl ClientCore {
                 changed.push(id.clone());
                 super::resume::reset_thread_resume_coordinator(&mut store.coordinator.resume);
             }
-            let keys = store.in_flight.drain().collect::<Vec<_>>();
+            let keys = cancelled
+                .iter()
+                .filter(|key| request_thread_id(key) == id)
+                .cloned()
+                .collect::<Vec<_>>();
             if !keys.is_empty() {
                 changed.push(id.clone());
             }
@@ -1128,11 +1140,44 @@ impl ClientCore {
                     crate::timeline::semantic::TimelineRequestStatus::Idle,
                 );
             }
-            store.pending.clear();
         }
         changed.sort();
         changed.dedup();
         let drafts = changed
+            .into_iter()
+            .flat_map(|id| registry.publish(&id))
+            .collect();
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
+    }
+    pub(crate) fn publish_timeline_cancellation(&self, keys: &[SemanticTimelineRequestKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let mut ids = HashSet::new();
+        for key in keys {
+            if registry.timeline.in_flight.contains(key) {
+                continue;
+            }
+            let id = request_thread_id(key);
+            if let Some(store) = registry.stores.get_mut(id) {
+                set_request_status(
+                    &mut store.semantic,
+                    key,
+                    crate::timeline::semantic::TimelineRequestStatus::Idle,
+                );
+                ids.insert(id.to_owned());
+            }
+        }
+        let drafts = ids
             .into_iter()
             .flat_map(|id| registry.publish(&id))
             .collect();
@@ -1881,8 +1926,11 @@ impl ThreadRegistry {
                     && !self.ready_resume_set.contains(*id)
                     && store.subscriptions == 0
                     && store.demand == ClientDemand::Suspended
-                    && store.in_flight.is_empty()
-                    && store.pending.is_empty()
+                    && !self
+                        .timeline
+                        .in_flight
+                        .iter()
+                        .any(|key| request_thread_id(key) == id.as_str())
                     && !store.coordinator.history_loading
                     && !store.coordinator.resume.in_progress
                     && store.coordinator.conversation.in_flight_turn_id().is_none()
@@ -1897,6 +1945,7 @@ impl ThreadRegistry {
         let count = candidates.len().saturating_sub(INACTIVE_THREAD_LIMIT);
         let mut drafts = Vec::new();
         for (id, _) in candidates.into_iter().take(count) {
+            self.timeline.invalidate(Some(&id));
             self.stores.remove(&id);
             drafts.extend(self.retire(&id));
         }
@@ -2145,17 +2194,17 @@ mod tests {
                 }
             };
             let request = core.begin_thread_semantic_request(action).unwrap();
+            let before = core.thread_snapshot("a").unwrap();
             core.execute_thread_semantic_request(&WrongTurnTransport, request);
             let snapshot = core.thread_snapshot("a").unwrap();
             let semantic = snapshot.semantic.thread("a").unwrap();
             assert!(!semantic.work_ranges_by_turn.contains_key("other"));
             assert_eq!(
                 semantic.work_ranges_by_turn["expected"].request_status,
-                crate::timeline::semantic::TimelineRequestStatus::Failed {
-                    message: "Timeline response scope mismatch".into()
-                }
+                before.semantic.thread("a").unwrap().work_ranges_by_turn["expected"].request_status
             );
-            assert!(core.thread_semantic_in_flight("a").is_empty());
+            assert_eq!(snapshot.revision(), before.revision());
+            assert_eq!(core.thread_semantic_in_flight("a").len(), 1);
         }
     }
     #[test]
@@ -3420,12 +3469,21 @@ mod tests {
 pub struct ThreadSemanticRequest {
     id: String,
     generation: u64,
+    request_generation: u64,
     action: SemanticTimelineRequestAction,
 }
 impl ClientCore {
     pub fn begin_thread_semantic_request(
         &self,
         action: SemanticTimelineRequestAction,
+    ) -> Option<ThreadSemanticRequest> {
+        self.accept_timeline_request(action, None)
+    }
+
+    fn accept_timeline_request(
+        &self,
+        action: SemanticTimelineRequestAction,
+        reserved: Option<u64>,
     ) -> Option<ThreadSemanticRequest> {
         if self.is_stopped() {
             return None;
@@ -3438,12 +3496,25 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        registry.stores.get(&id)?;
+        let action = if let Some(generation) = reserved {
+            if !registry.timeline.accepts(
+                crate::timeline::semantic::semantic_timeline_request_key(&action),
+                generation,
+            ) {
+                return None;
+            }
+            action
+        } else {
+            registry.timeline.retain_domain_request(
+                crate::timeline::semantic::semantic_timeline_request_key(&action),
+            );
+            registry.timeline.begin(action)?
+        };
+        let request_generation = registry.timeline.request_generation(
+            crate::timeline::semantic::semantic_timeline_request_key(&action),
+        );
         let store = registry.stores.get_mut(&id)?;
-        let action = crate::timeline::semantic::enqueue_semantic_timeline_request(
-            &mut store.in_flight,
-            &mut store.pending,
-            action,
-        )?;
         let generation = store.generation;
         set_request_status(
             &mut store.semantic,
@@ -3465,6 +3536,7 @@ impl ClientCore {
         Some(ThreadSemanticRequest {
             id,
             generation,
+            request_generation,
             action,
         })
     }
@@ -3479,6 +3551,49 @@ impl ClientCore {
         };
         if let Some(request) = self.begin_thread_semantic_request(action) {
             let _ = sender.send(ThreadControllerRequest::Semantic(request));
+        }
+    }
+
+    pub(crate) fn schedule_planned_timeline_request(
+        &self,
+        page: crate::timeline::controller::TimelinePageRequest,
+    ) {
+        let Some(request) = self.accept_timeline_request(page.action, Some(page.generation)) else {
+            return;
+        };
+        let sender = self
+            .thread_request_sender
+            .lock()
+            .expect("thread request sender poisoned")
+            .clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(ThreadControllerRequest::Semantic(request));
+        } else {
+            let key =
+                crate::timeline::semantic::semantic_timeline_request_key(&request.action).clone();
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            registry
+                .timeline
+                .finish(&key, false, self.timeline_now_ms());
+            if let Some(store) = registry.stores.get_mut(&request.id) {
+                set_request_status(
+                    &mut store.semantic,
+                    &key,
+                    crate::timeline::semantic::TimelineRequestStatus::Failed {
+                        message: "Timeline transport unavailable".into(),
+                    },
+                );
+            }
+            let drafts = registry.publish(&request.id);
+            self.transition_directory(
+                &mut registry,
+                &ClientMutationAuthority { _private: () },
+                drafts,
+                vec![],
+            );
         }
     }
     pub fn execute_thread_semantic_request(
@@ -3507,7 +3622,8 @@ impl ClientCore {
                     .lock()
                     .expect("thread registry poisoned");
                 if !registry.stores.get(&request.id).is_some_and(|store| {
-                    store.generation == request.generation && store.in_flight.contains(&key)
+                    store.generation == request.generation
+                        && registry.timeline.accepts(&key, request.request_generation)
                 }) {
                     return;
                 }
@@ -3545,8 +3661,18 @@ impl ClientCore {
                 }
                 SemanticTimelineRequestAction::TurnWorkItemsGet { params, .. } => params
                     .work_item_ids
-                    .chunks(200)
+                    .chunks(crate::timeline::controller::WORK_ITEM_CHUNK_LIMIT)
                     .map(|ids| {
+                        anyhow::ensure!(
+                            !self.is_stopped()
+                                && self
+                                    .thread_registry
+                                    .lock()
+                                    .expect("thread registry poisoned")
+                                    .timeline
+                                    .accepts(&key, request.request_generation),
+                            "Timeline request retired"
+                        );
                         commands::turn_work_items_get(
                             transport,
                             pioneer_protocol::TurnWorkItemsGetParams {
@@ -3563,18 +3689,19 @@ impl ClientCore {
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
+            if !registry.timeline.accepts(&key, request.request_generation) {
+                return;
+            }
             let Some(store) = registry.stores.get_mut(&request.id) else {
                 return;
             };
-            if self.is_stopped()
-                || store.generation != request.generation
-                || !store.in_flight.contains(&key)
-            {
+            if self.is_stopped() || store.generation != request.generation {
                 return;
             }
             let valid_scope = |workspace: &str, id: &str| {
                 workspace == store.coordinator.workspace_id && id == request.id
             };
+            let succeeded = result.is_ok();
             match result {
                 Ok(Page::Thread(page, mode))
                     if valid_scope(&page.workspace_id, &page.thread_id) =>
@@ -3597,13 +3724,7 @@ impl ClientCore {
                         apply_turn_work_items_get_response(&mut store.semantic, page);
                     }
                 }
-                Ok(_) => set_request_status(
-                    &mut store.semantic,
-                    &key,
-                    TimelineRequestStatus::Failed {
-                        message: "Timeline response scope mismatch".into(),
-                    },
-                ),
+                Ok(_) => return,
                 Err(error) => set_request_status(
                     &mut store.semantic,
                     &key,
@@ -3612,15 +3733,11 @@ impl ClientCore {
                     },
                 ),
             }
-            let next =
-                finish_semantic_timeline_request(&mut store.in_flight, &mut store.pending, &key)
-                    .and_then(|action| {
-                        enqueue_semantic_timeline_request(
-                            &mut store.in_flight,
-                            &mut store.pending,
-                            action,
-                        )
-                    });
+            let next = registry
+                .timeline
+                .finish(&key, succeeded, self.timeline_now_ms())
+                .and_then(|action| registry.timeline.begin(action));
+            let next_generation = registry.timeline.request_generation(&key);
             let drafts = registry.publish(&request.id);
             self.transition_directory(
                 &mut registry,
@@ -3633,6 +3750,7 @@ impl ClientCore {
                 return;
             };
             request.action = action;
+            request.request_generation = next_generation;
         }
     }
 }
@@ -3712,15 +3830,17 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        let key = crate::timeline::semantic::semantic_timeline_request_key(&request.action);
+        anyhow::ensure!(
+            registry.timeline.accepts(key, request.request_generation),
+            "Timeline request cancelled"
+        );
         let store = registry
             .stores
             .get_mut(&request.id)
             .ok_or_else(|| anyhow::anyhow!("Timeline request cancelled"))?;
-        let key = crate::timeline::semantic::semantic_timeline_request_key(&request.action);
         anyhow::ensure!(
-            !self.is_stopped()
-                && store.generation == request.generation
-                && store.in_flight.contains(key),
+            !self.is_stopped() && store.generation == request.generation,
             "Timeline request cancelled"
         );
         let result = result.and_then(|page| {
@@ -3741,11 +3861,9 @@ impl ClientCore {
                 },
             );
         }
-        let next = crate::timeline::semantic::finish_semantic_timeline_request(
-            &mut store.in_flight,
-            &mut store.pending,
-            key,
-        );
+        let next = registry
+            .timeline
+            .finish(key, result.is_ok(), self.timeline_now_ms());
         let drafts = registry.publish(&request.id);
         self.transition_directory(
             &mut registry,
@@ -3897,6 +4015,7 @@ impl ClientCore {
 }
 
 pub(crate) enum ThreadControllerRequest {
+    Read(crate::timeline::controller::TimelineReadRequest),
     Semantic(ThreadSemanticRequest),
     Resume,
     Subscribe {
@@ -4245,6 +4364,7 @@ impl ClientCore {
                     .get(&id)
                     .is_some_and(|s| s.snapshot.is_none())
                 {
+                    registry.timeline.invalidate(Some(&id));
                     registry.stores.remove(&id);
                 }
                 return Err(error);
@@ -4838,6 +4958,35 @@ impl ClientCore {
         work: bool,
         presented_rows: bool,
     ) -> Vec<SemanticTimelineRequestAction> {
+        self.plan_thread_timeline_demand(
+            id,
+            source_revision,
+            row_ids,
+            threshold,
+            before,
+            after,
+            work,
+            presented_rows,
+        )
+        .into_iter()
+        .filter(|action| {
+            !self.thread_semantic_in_flight(id).contains(
+                crate::timeline::semantic::semantic_timeline_request_key(action),
+            )
+        })
+        .collect()
+    }
+    pub(crate) fn plan_thread_timeline_demand(
+        &self,
+        id: &str,
+        source_revision: u64,
+        row_ids: &[String],
+        threshold: usize,
+        before: bool,
+        after: bool,
+        work: bool,
+        presented_rows: bool,
+    ) -> Vec<SemanticTimelineRequestAction> {
         use crate::timeline::semantic::*;
         let Some(presentation) = self.thread_presentation_snapshot(id) else {
             return Vec::new();
@@ -4893,7 +5042,7 @@ impl ClientCore {
                 },
                 top_level_limit: DEFAULT_TOP_LEVEL_PAGE_LIMIT,
                 turn_work_limit: DEFAULT_TURN_WORK_PAGE_LIMIT,
-                in_flight: self.thread_semantic_in_flight(id),
+                in_flight: Default::default(),
             },
         )
         .actions
@@ -4967,6 +5116,7 @@ impl ClientCore {
 
 impl ThreadRegistry {
     pub(crate) fn fence_presentations(&mut self, principal: Option<String>) {
+        self.timeline.invalidate(None);
         self.current_principal_id = principal;
         self.pending_requests
             .apply(PendingRequestsReduction::ClearAll);

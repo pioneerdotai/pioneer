@@ -253,6 +253,9 @@ pub struct ThreadDirectoryStore {
     projections: SidebarProjectionStore,
 }
 impl ThreadDirectoryStore {
+    pub(crate) fn has_unread(&self, thread: &str) -> bool {
+        self.unread.get(thread).copied().unwrap_or(0) > 0
+    }
     pub fn snapshot(&self, workspace: &str) -> Option<Arc<ThreadTreePublication>> {
         self.projections.snapshot(workspace)
     }
@@ -686,6 +689,17 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        self.apply_directory_read_locked(&mut registry, workspace, thread, cursor, unread);
+    }
+
+    pub(crate) fn apply_directory_read_locked(
+        &self,
+        registry: &mut crate::threads::registry::ThreadRegistry,
+        workspace: &str,
+        thread: &str,
+        cursor: &pioneer_protocol::ThreadReadCursor,
+        unread: u64,
+    ) {
         if self.is_stopped()
             || !registry
                 .directory
