@@ -517,12 +517,6 @@ impl TimelineView {
         })
     }
     fn synchronize_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.workspace_input = self
-            .client
-            .thread_coordinator_snapshot(&self.thread_id)
-            .map(|p| p.workspace_id.clone())
-            .filter(|id| !id.is_empty())
-            .or_else(|| self.navigation_input.workspace_id().map(str::to_owned));
         use pioneer_client::core::ClientScope;
         let payload = |scope: ClientScope| self.thread_bindings.publication(&scope);
         self.composer_input = payload(ClientScope::Composer {
@@ -553,6 +547,14 @@ impl TimelineView {
         self.navigation_input = payload(ClientScope::Navigation)
             .and_then(|p| p.typed::<ClientNavigationState>())
             .map_or_else(Arc::default, |p| p.payload());
+        // A new child may have only navigation identity until subscription
+        // loads its coordinator. Resolve its workspace from this same batch.
+        self.workspace_input = self
+            .client
+            .thread_coordinator_snapshot(&self.thread_id)
+            .map(|p| p.workspace_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| self.navigation_input.workspace_id().map(str::to_owned));
         let identity = payload(ClientScope::Administration { workspace_id: None }).and_then(|p| p.typed::<pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication>()).map(|p| p.payload());
         let previous_session = self
             .identity_input
@@ -678,6 +680,71 @@ mod tests {
             div().size_full().children(self.0.clone())
         }
     }
+    fn assert_new_child_workspace_on_first_publication(cx: &mut TestAppContext, initial: bool) {
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        crate::test_support::install_thread_timeline(&client, "parent", "Parent text");
+        client.activate_thread(Some("parent"), Some("workspace"));
+        client.navigate(
+            pioneer_client::navigation::NavigationIntent::PushTaskThread {
+                entry: pioneer_client::navigation::TaskThreadLineage::new(
+                    "parent".into(),
+                    "child".into(),
+                    "workspace".into(),
+                    "Task".into(),
+                ),
+            },
+            None,
+        );
+        // A newly discovered child has navigation identity before its first
+        // subscription response creates a retained domain snapshot.
+        assert!(client.thread_coordinator_snapshot("child").is_none());
+        let (registrar, deliver) = crate::test_support::binding_router(client.clone());
+        let binding = ThreadBindings::new(registrar, "child", vec![]);
+        if initial {
+            deliver();
+        }
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let screen = TimelineView::new(
+                client.clone(),
+                "child".into(),
+                binding.clone(),
+                Arc::new(crate::test_support::ThreadPorts),
+                Arc::new(crate::test_support::ThreadPorts),
+                1,
+                window,
+                cx,
+            );
+            Root::new(screen, window, cx)
+        });
+        if !initial {
+            deliver();
+            cx.run_until_parked();
+        }
+        let screen = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<TimelineView>().unwrap()
+        });
+        // No second publication, retry, reconnect or wall-clock wait may be
+        // required to provide the workspace needed by subscription/bootstrap.
+        screen.read_with(cx, |view, _| {
+            assert_eq!(view.navigation_input.active_thread_id(), Some("child"));
+            assert_eq!(
+                view.thread_workspace_id("child").as_deref(),
+                Some("workspace")
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn new_child_resolves_workspace_from_the_first_navigation_publication(cx: &mut TestAppContext) {
+        assert_new_child_workspace_on_first_publication(cx, true);
+    }
+
+    #[gpui_kit::test]
+    fn new_child_resolves_workspace_when_navigation_arrives_after_mount(cx: &mut TestAppContext) {
+        assert_new_child_workspace_on_first_publication(cx, false);
+    }
+
     #[gpui_kit::test]
     fn mounted_screen_uses_client_rows_and_unmount_releases_the_stock_viewport(
         cx: &mut TestAppContext,
