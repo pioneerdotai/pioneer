@@ -262,13 +262,41 @@ impl ComposerView {
     fn composer_model_selection_pending(&self) -> bool {
         !self.composer_domain().model_manually_selected
             && (self.connection_state.is_transitioning()
-                || self.client.thread_start_requested()
-                || self.client.thread_start_snapshot().in_progress
-                || self
-                    .client
-                    .thread_start_snapshot()
-                    .pending_thread_id
-                    .is_some()
+                || thread_creation_pending(
+                    &self.thread_id,
+                    &self.client.thread_start_snapshot(),
+                    self.client.thread_start_requested(),
+                )
                 || self.active_thread_snapshot().history_loading)
+    }
+}
+
+fn thread_creation_pending(
+    thread: &str,
+    start: &pioneer_client::threads::start::ThreadStartCoordinator,
+    queued: bool,
+) -> bool {
+    start.pending_thread_id.as_deref() == Some(thread)
+        && (queued || start.in_progress || start.next_attempt_at.is_some())
+}
+
+#[cfg(test)]
+mod loading_tests {
+    use super::thread_creation_pending;
+    #[test]
+    fn reserved_or_failed_draft_does_not_mean_model_loading() {
+        let mut start = pioneer_client::threads::start::ThreadStartCoordinator {
+            pending_thread_id: Some("draft".into()),
+            ..Default::default()
+        };
+        assert!(!thread_creation_pending("draft", &start, false));
+        start.in_progress = true;
+        assert!(thread_creation_pending("draft", &start, false));
+        assert!(!thread_creation_pending("other", &start, false));
+        start.in_progress = false;
+        start.next_attempt_at = Some(std::time::Instant::now());
+        assert!(thread_creation_pending("draft", &start, false));
+        start.next_attempt_at = None;
+        assert!(!thread_creation_pending("draft", &start, false));
     }
 }
