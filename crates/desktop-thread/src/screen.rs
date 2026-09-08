@@ -156,7 +156,11 @@ impl ThreadScreenView {
     ) -> pioneer_client::authorization::PrincipalPresentationCapabilities {
         self.identity_input
             .as_ref()
-            .and_then(|identity| identity.capabilities.snapshot(None, None))
+            .and_then(|identity| {
+                identity
+                    .capabilities
+                    .snapshot(self.thread_workspace_id(&self.thread_id).as_deref(), None)
+            })
             .as_ref()
             .map(pioneer_client::authorization::principal_presentation_capabilities)
             .unwrap_or_default()

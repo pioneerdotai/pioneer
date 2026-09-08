@@ -40,3 +40,6 @@ pub use ports::{
     ThreadFileOpenerChoice, ThreadFileOpenerPresentation, ThreadFilePort,
     ThreadPresentationOperation,
 };
+
+#[cfg(test)]
+mod localization_tests;
