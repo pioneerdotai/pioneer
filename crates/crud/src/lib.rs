@@ -12,6 +12,7 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
+pub use repositories::native_event_cleanup::NativeEventCleanupOutcome;
 pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcome;
 
 pub use events::{
@@ -836,23 +837,6 @@ pub struct TaskRuntimeInvariantStaleAttemptRecord {
     pub attempt_id: String,
     pub attempt_status: String,
     pub attempt_number: i64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CliRuntimeNativeEventCompactionSummary {
-    pub dry_run: bool,
-    pub batch_limit: u64,
-    pub candidate_rows: u64,
-    pub deleted_rows: u64,
-    pub payload_bytes: u64,
-    pub turns_touched: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct CliRuntimeNativeEventCompactionStats {
-    candidate_rows: u64,
-    payload_bytes: u64,
-    turns_touched: u64,
 }
 
 pub use crate::repositories::artifact::{
@@ -6450,104 +6434,33 @@ impl CrudStore {
         cli_runtime_binding::list_native_events(&self.connection, filter).await
     }
 
+    pub async fn cleanup_native_events_quantum(
+        &self,
+        after_rowid: i64,
+    ) -> Result<NativeEventCleanupOutcome> {
+        self.run_background_database_quantum(|| async {
+            let page =
+                repositories::native_event_cleanup::prepare(&self.connection, after_rowid).await?;
+            let mut outcome = NativeEventCleanupOutcome {
+                last_rowid: page.last().map(|row| row.source_rowid),
+                rows_scanned: page.len() as u64,
+                rows_deleted: 0,
+            };
+            if !page.is_empty() {
+                // One DELETE revalidates eligibility under the maintenance writer.
+                outcome.rows_deleted =
+                    repositories::native_event_cleanup::apply(&self.connection, &page).await?;
+            }
+            Ok(outcome)
+        })
+        .await
+    }
+
     pub async fn latest_cli_runtime_native_event(
         &self,
         filter: CliRuntimeNativeEventListFilter,
     ) -> Result<Option<CliRuntimeNativeEventRecord>> {
         cli_runtime_binding::latest_native_event(&self.connection, filter).await
-    }
-
-    pub async fn compact_terminal_cli_runtime_native_events_for_turn(
-        &self,
-        turn_id: &str,
-        batch_limit: u64,
-        dry_run: bool,
-    ) -> Result<CliRuntimeNativeEventCompactionSummary> {
-        self.compact_terminal_cli_runtime_native_events_internal(
-            Some(turn_id.to_owned()),
-            batch_limit,
-            dry_run,
-        )
-        .await
-    }
-
-    async fn compact_terminal_cli_runtime_native_events_internal(
-        &self,
-        turn_id: Option<String>,
-        batch_limit: u64,
-        dry_run: bool,
-    ) -> Result<CliRuntimeNativeEventCompactionSummary> {
-        const MAX_COMPACTION_WRITE_BATCH: u64 = 256;
-        let batch_limit = batch_limit.clamp(1, MAX_COMPACTION_WRITE_BATCH);
-        if dry_run {
-            let stats = Self::terminal_cli_runtime_native_event_compaction_stats(
-                &self.connection,
-                turn_id.as_deref(),
-                batch_limit,
-            )
-            .await?;
-            return Ok(CliRuntimeNativeEventCompactionSummary {
-                dry_run,
-                batch_limit,
-                candidate_rows: stats.candidate_rows,
-                deleted_rows: 0,
-                payload_bytes: stats.payload_bytes,
-                turns_touched: stats.turns_touched,
-            });
-        }
-
-        self.run_serialized_write(|| {
-            let connection = self.connection.clone();
-            let turn_id = turn_id.clone();
-            async move {
-                let transaction = connection
-                    .begin()
-                    .await
-                    .context("failed to begin CLI runtime native event compaction transaction")?;
-                let result: Result<CliRuntimeNativeEventCompactionSummary> = async {
-                    let stats = Self::terminal_cli_runtime_native_event_compaction_stats(
-                        &transaction,
-                        turn_id.as_deref(),
-                        batch_limit,
-                    )
-                    .await?;
-                    let deleted_rows = if stats.candidate_rows == 0 {
-                        0
-                    } else {
-                        Self::delete_terminal_cli_runtime_native_event_compaction_batch(
-                            &transaction,
-                            turn_id.as_deref(),
-                            batch_limit,
-                        )
-                        .await?
-                    };
-                    Ok(CliRuntimeNativeEventCompactionSummary {
-                        dry_run,
-                        batch_limit,
-                        candidate_rows: stats.candidate_rows,
-                        deleted_rows,
-                        payload_bytes: stats.payload_bytes,
-                        turns_touched: stats.turns_touched,
-                    })
-                }
-                .await;
-
-                match result {
-                    Ok(summary) => {
-                        transaction
-                            .commit()
-                            .await
-                            .context("failed to commit CLI runtime native event compaction")?;
-                        Ok(summary)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        Err(error)
-                    }
-                }
-            }
-        })
-        .await
     }
 
     pub async fn materialize_native_execution_window_transition(
@@ -17193,74 +17106,6 @@ impl CrudStore {
             has_more,
             next_cursor: has_more.then_some(last_sequence),
         }))
-    }
-
-    async fn terminal_cli_runtime_native_event_compaction_stats<C: ConnectionTrait>(
-        db: &C,
-        turn_id: Option<&str>,
-        batch_limit: u64,
-    ) -> Result<CliRuntimeNativeEventCompactionStats> {
-        let sql = terminal_cli_runtime_native_event_compaction_sql(
-            r#"
-SELECT
-    COUNT(*) AS candidate_rows,
-    COALESCE(SUM(payload_bytes), 0) AS payload_bytes,
-    COUNT(DISTINCT turn_id) AS turns_touched
-FROM candidates
-"#,
-            turn_id,
-        );
-        let Some(row) = db
-            .query_one_raw(terminal_cli_runtime_native_event_compaction_statement(
-                db.get_database_backend(),
-                sql,
-                turn_id,
-                batch_limit,
-            ))
-            .await
-            .context("failed to query CLI runtime native event compaction stats")?
-        else {
-            return Ok(CliRuntimeNativeEventCompactionStats::default());
-        };
-
-        Ok(CliRuntimeNativeEventCompactionStats {
-            candidate_rows: row
-                .try_get::<i64>("", "candidate_rows")
-                .context("failed to decode compactable CLI runtime native event count")?
-                .max(0) as u64,
-            payload_bytes: row
-                .try_get::<i64>("", "payload_bytes")
-                .context("failed to decode compactable CLI runtime native event payload size")?
-                .max(0) as u64,
-            turns_touched: row
-                .try_get::<i64>("", "turns_touched")
-                .context("failed to decode compactable CLI runtime native event turn count")?
-                .max(0) as u64,
-        })
-    }
-
-    async fn delete_terminal_cli_runtime_native_event_compaction_batch<C: ConnectionTrait>(
-        db: &C,
-        turn_id: Option<&str>,
-        batch_limit: u64,
-    ) -> Result<u64> {
-        let sql = terminal_cli_runtime_native_event_compaction_sql(
-            r#"
-DELETE FROM cli_runtime_native_event
-WHERE id IN (SELECT event_id FROM candidates)
-"#,
-            turn_id,
-        );
-        let result = db
-            .execute_raw(terminal_cli_runtime_native_event_compaction_statement(
-                db.get_database_backend(),
-                sql,
-                turn_id,
-                batch_limit,
-            ))
-            .await
-            .context("failed to delete compactable CLI runtime native events")?;
-        Ok(result.rows_affected())
     }
 
     pub async fn get_thread_conversation_history(
@@ -30083,66 +29928,6 @@ fn validate_json_size<T: serde::Serialize>(
     Ok(())
 }
 
-const CLI_RUNTIME_NATIVE_EVENT_COMPACTION_METHODS_SQL: &str = r#"
-    'item/agentMessage/delta',
-    'item/commandExecution/outputDelta',
-    'turn/diff/updated',
-    'thread/tokenUsage/updated',
-    'account/rateLimits/updated'
-"#;
-
-fn terminal_cli_runtime_native_event_compaction_sql(
-    result_sql: &str,
-    turn_id: Option<&str>,
-) -> String {
-    let turn_filter = if turn_id.is_some() {
-        "AND e.turn_id = ?"
-    } else {
-        ""
-    };
-    format!(
-        r#"
-WITH candidates AS (
-    SELECT
-        e.id AS event_id,
-        e.turn_id AS turn_id,
-        length(COALESCE(e.payload_redacted_json, '')) AS payload_bytes
-    FROM cli_runtime_native_event e
-    JOIN turn t ON t.id = e.turn_id
-    WHERE e.native_method IN ({methods})
-      AND t.status IN ('completed', 'blocked', 'failed', 'interrupted')
-      {turn_filter}
-      AND NOT EXISTS (
-          SELECT 1
-          FROM turn_cli_runtime_binding b
-          WHERE b.turn_id = e.turn_id
-            AND b.status IN ('starting', 'running')
-      )
-    ORDER BY e.created_at ASC, e.sequence ASC, e.id ASC
-    LIMIT ?
-)
-{result_sql}
-"#,
-        methods = CLI_RUNTIME_NATIVE_EVENT_COMPACTION_METHODS_SQL,
-        turn_filter = turn_filter,
-        result_sql = result_sql
-    )
-}
-
-fn terminal_cli_runtime_native_event_compaction_statement(
-    backend: DatabaseBackend,
-    sql: String,
-    turn_id: Option<&str>,
-    batch_limit: u64,
-) -> Statement {
-    let mut values = Vec::<sea_orm::Value>::new();
-    if let Some(turn_id) = turn_id {
-        values.push(turn_id.to_owned().into());
-    }
-    values.push((batch_limit.min(i64::MAX as u64) as i64).into());
-    Statement::from_sql_and_values(backend, sql, values)
-}
-
 fn contains_any_key(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
@@ -37894,7 +37679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_terminal_cli_runtime_native_events_keeps_active_and_structural_events() {
+    async fn native_event_cleanup_keeps_active_and_lifecycle_events() {
         let workspace_id = "ws_cli_native_compaction";
         let thread_id = "thread_cli_native_compaction";
         let terminal_turn_id = "turn_cli_native_terminal";
@@ -38061,21 +37846,13 @@ mod tests {
             sequence += 1;
         }
 
-        let dry_run = store
-            .compact_terminal_cli_runtime_native_events_for_turn(terminal_turn_id, 100, true)
-            .await
-            .expect("dry run should succeed");
-        assert_eq!(dry_run.candidate_rows, 5);
-        assert_eq!(dry_run.deleted_rows, 0);
-        assert_eq!(dry_run.turns_touched, 1);
-
         let compacted = store
-            .compact_terminal_cli_runtime_native_events_for_turn(terminal_turn_id, 100, false)
+            .with_maintenance_access()
+            .cleanup_native_events_quantum(0)
             .await
             .expect("compaction should succeed");
-        assert_eq!(compacted.candidate_rows, 5);
-        assert_eq!(compacted.deleted_rows, 5);
-        assert_eq!(compacted.turns_touched, 1);
+        assert_eq!(compacted.rows_scanned, 9);
+        assert_eq!(compacted.rows_deleted, 6);
 
         let remaining = store
             .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
@@ -38092,7 +37869,6 @@ mod tests {
         assert_eq!(
             remaining_ids,
             vec![
-                "native-terminal-completed",
                 "native-active-agent-delta",
                 "native-active-binding-agent-delta",
                 "native-unbound-rate-limit",

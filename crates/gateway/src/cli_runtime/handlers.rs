@@ -70,7 +70,6 @@ const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
 const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 =
     crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS;
-const CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE: u64 = 16_384;
 const CLI_RUNTIME_MAX_PENDING_MACHINE_REQUESTS: usize = 4096;
 const CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE: i64 = -32000;
 const CLI_RUNTIME_MACHINE_REQUEST_TIMEOUT_CODE: i64 = -32001;
@@ -7965,11 +7964,6 @@ impl MessageProcessor {
         }
 
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
-            self.compact_cli_runtime_terminal_native_events_for_turn(
-                binding.turn_id.as_str(),
-                source,
-            )
-            .await;
             return false;
         }
 
@@ -8735,11 +8729,6 @@ impl MessageProcessor {
         if status != TurnStatus::InProgress {
             self.invalidate_cli_runtime_turn_binding_cache(binding)
                 .await;
-            self.compact_cli_runtime_terminal_native_events_for_turn(
-                binding.turn_id.as_str(),
-                reason,
-            )
-            .await;
             self.release_cli_runtime_session_turn_lease(binding.turn_id.as_str())
                 .await;
         }
@@ -8774,50 +8763,6 @@ impl MessageProcessor {
                 .await;
             }
             _ => {}
-        }
-        self.compact_cli_runtime_terminal_native_events_for_turn(binding.turn_id.as_str(), reason)
-            .await;
-    }
-
-    async fn compact_cli_runtime_terminal_native_events_for_turn(
-        &self,
-        turn_id: &str,
-        reason: &str,
-    ) {
-        loop {
-            match self
-                .crud_store
-                .compact_terminal_cli_runtime_native_events_for_turn(
-                    turn_id,
-                    CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE,
-                    false,
-                )
-                .await
-            {
-                Ok(summary) if summary.candidate_rows == 0 => break,
-                Ok(summary) => {
-                    debug!(
-                        turn_id,
-                        reason,
-                        candidate_rows = summary.candidate_rows,
-                        deleted_rows = summary.deleted_rows,
-                        payload_bytes = summary.payload_bytes,
-                        "compacted terminal CLI runtime native delta events for turn"
-                    );
-                    if summary.deleted_rows == 0 {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        turn_id,
-                        reason,
-                        error = %format!("{error:#}"),
-                        "failed to compact terminal CLI runtime native delta events for turn"
-                    );
-                    break;
-                }
-            }
         }
     }
 
