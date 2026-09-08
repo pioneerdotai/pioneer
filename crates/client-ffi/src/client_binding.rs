@@ -11,7 +11,7 @@ use pioneer_client::core::{
 pub const CLIENT_BINDING_SCHEMA_VERSION: u32 = 1;
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientIntentDispatchDto {
     pub schema_version: u32,

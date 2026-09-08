@@ -1,6 +1,4 @@
-use gpui_kit::component::{
-    StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex,
-};
+use gpui_kit::component::{StyledExt, clipboard::Clipboard, h_flex, theme::ActiveTheme, v_flex};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::gateway::device_activation::DeviceActivationQrPresentation;
 

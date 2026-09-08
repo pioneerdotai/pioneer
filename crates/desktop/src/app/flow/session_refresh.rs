@@ -174,7 +174,7 @@ impl PioneerDesktop {
         }
         if self.workspace_action_in_progress()
             || self.desktop_voice_context_locked()
-            || self.composer_upload_in_progress
+            || self.composer_upload_in_progress()
         {
             cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
@@ -335,7 +335,6 @@ impl PioneerDesktop {
                                             reduction.workspace_id.as_str(),
                                         );
                                         view.active_thread_resubscribe_pending = false;
-                                        view.reconcile_semantic_timeline_after_reconnect(cx);
                                     }
                                     Ok(_) => {}
                                     Err(error) => {

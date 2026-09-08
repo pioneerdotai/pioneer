@@ -1,14 +1,15 @@
 //! Thin mobile boundary adapters for skill pack Composer intent.
 
-use pioneer_client::{
-    composer::skill_selection::{
-        ComposerSkillChip, ComposerSkillPickerProjection, ComposerSkillSelection,
-        ComposerSkillSelectionReduction, project_composer_skill_chips,
-        project_composer_skill_picker, reduce_composer_skill_selection_toggle,
-    },
-    skills::catalog as skill_catalog,
-    transport::ws::GatewayWsCommandSender,
+use pioneer_client::composer::skill_selection::{
+    ComposerSkillChip, ComposerSkillPickerProjection, ComposerSkillSelection,
+    ComposerSkillSelectionReduction, project_composer_skill_chips,
+    reduce_composer_skill_selection_toggle,
 };
+#[cfg(test)]
+use pioneer_client::{
+    composer::skill_selection::project_composer_skill_picker, skills::catalog as skill_catalog,
+};
+#[cfg(test)]
 use pioneer_protocol::SkillListResponse;
 use serde::Deserialize;
 
@@ -16,7 +17,8 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientComposerSkillPackPickerRequest {
-    pub workspace_id: String,
+    pub thread_id: String,
+    pub draft_id: pioneer_client::composer::store::DraftId,
     #[serde(default)]
     pub query: String,
 }
@@ -38,6 +40,7 @@ pub struct ClientComposerSkillChipsRequest {
     pub picker: ComposerSkillPickerProjection,
 }
 
+#[cfg(test)]
 fn skills_management_projection_from_response(
     response: SkillListResponse,
 ) -> skill_catalog::SkillManagementProjection {
@@ -46,15 +49,10 @@ fn skills_management_projection_from_response(
 }
 
 pub fn composer_skill_pack_picker(
-    ws_sender: &GatewayWsCommandSender,
+    core: &pioneer_client::core::ClientCore,
     request: ClientComposerSkillPackPickerRequest,
-) -> anyhow::Result<ComposerSkillPickerProjection> {
-    let response = ws_sender.skills_list(skill_catalog::skill_list_params(request.workspace_id))?;
-    let management = skills_management_projection_from_response(response);
-    Ok(project_composer_skill_picker(
-        &management,
-        request.query.as_str(),
-    ))
+) -> ComposerSkillPickerProjection {
+    core.composer_catalog_skill_picker(&request.thread_id, request.draft_id, &request.query)
 }
 
 pub fn composer_skill_selection_toggle(

@@ -1,6 +1,5 @@
 use super::*;
-use crate::app::root::{AdministrationContentView, DesktopVoiceComposerState, MainContentView};
-use crate::audio::capture::DesktopVoiceCaptureErrorKind;
+use crate::app::root::{AdministrationContentView, MainContentView};
 use pioneer_client::administration::{AdministrationEvent, AdministrationRefetch};
 use pioneer_client::authorization::AccessChangedPlan;
 #[cfg(test)]
@@ -12,9 +11,7 @@ use pioneer_client::notifications::router::{
 };
 use pioneer_client::providers::list::CliRuntimeSnapshotUpdate;
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
-use pioneer_client::voice::{VoiceFinalizeUiAction, VoiceSessionResultReduction};
 use pioneer_client::workspaces::selectors as workspace_selectors;
-use pioneer_protocol::{VoiceError, VoiceSessionOutcome};
 
 impl PioneerDesktop {
     pub(in crate::app::flow) fn apply_gateway_notification(
@@ -35,12 +32,20 @@ impl PioneerDesktop {
         let notification_thread_workspace_matches =
             self.notification_thread_workspace_matches(&notification);
         let start = self.thread_start_coordinator();
+        let artifacts = self.current_active_thread_id().and_then(|thread| {
+            self.gateway
+                .client_runtime
+                .client_core()
+                .artifact_snapshot(thread)
+        });
         let context = ClientRuntimeNotificationContext {
             pending_thread_id: start.pending_thread_id.as_deref(),
             active_thread_id: self.current_active_thread_id(),
             active_workspace_id: active_workspace.as_deref(),
             notification_thread_workspace_matches,
-            active_thread_artifacts: self.thread_artifacts.items_for_active_thread(),
+            active_thread_artifacts: artifacts
+                .as_ref()
+                .map_or(&[], |input| input.items.as_slice()),
             preferred_workspace_id: self.preferred_workspace_id(),
             workspaces: self.workspaces(),
             mcp_workspace_id: mcp_workspace.as_deref(),
@@ -53,42 +58,6 @@ impl PioneerDesktop {
             .reduce_gateway_notification(notification, context);
         if let Some(reduction) = reduction {
             self.apply_gateway_notification_reduction(reduction, cx);
-        }
-    }
-
-    fn apply_voice_session_result_reduction(
-        &mut self,
-        reduction: VoiceSessionResultReduction,
-        cx: &mut Context<Self>,
-    ) {
-        match reduction.action {
-            VoiceFinalizeUiAction::KeepFinalizing => {}
-            VoiceFinalizeUiAction::ClearFinalizing => {
-                if let DesktopVoiceComposerState::Finalizing { thread_id } =
-                    &self.desktop_voice_composer
-                {
-                    let thread_id = thread_id.clone();
-                    self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
-                    if matches!(reduction.outcome, VoiceSessionOutcome::TurnStarted) {
-                        self.clear_composer_payload_for_thread(thread_id.as_str());
-                    }
-                    cx.notify();
-                }
-            }
-            VoiceFinalizeUiAction::ShowNoSpeechError => {
-                self.desktop_voice_composer = DesktopVoiceComposerState::Error {
-                    kind: DesktopVoiceCaptureErrorKind::NoSpeech,
-                    message: desktop_voice_no_speech_message(reduction.error.as_ref()),
-                };
-                cx.notify();
-            }
-            VoiceFinalizeUiAction::ShowFinalizeError => {
-                self.desktop_voice_composer = DesktopVoiceComposerState::Error {
-                    kind: DesktopVoiceCaptureErrorKind::GatewayFinalize,
-                    message: desktop_voice_transcription_failed_message(reduction.error.as_ref()),
-                };
-                cx.notify();
-            }
         }
     }
 
@@ -128,9 +97,7 @@ impl PioneerDesktop {
             ClientRuntimeNotification::ThreadClosed(_) => {}
             ClientRuntimeNotification::WorkspaceRefresh(_) => {}
             ClientRuntimeNotification::ThreadUpdated(_) => {}
-            ClientRuntimeNotification::ThreadParticipantsChanged(notification) => {
-                self.apply_thread_participants_changed_notification(notification, cx);
-            }
+            ClientRuntimeNotification::ThreadParticipantsChanged(_) => {}
             ClientRuntimeNotification::SkillsRefresh(reduction) => {
                 self.apply_skills_refresh_reduction(reduction);
             }
@@ -143,19 +110,11 @@ impl PioneerDesktop {
             ClientRuntimeNotification::McpServerCatalogChanged(reduction) => {
                 self.apply_mcp_server_catalog_changed_reduction(reduction, cx);
             }
-            ClientRuntimeNotification::ThreadArtifactsRefresh(reduction) => {
-                self.apply_thread_artifacts_refresh_reduction(reduction, cx);
-            }
-            ClientRuntimeNotification::ArtifactThreadRefresh(reduction) => {
-                self.apply_artifact_thread_refresh_reduction(reduction, cx);
-            }
-            ClientRuntimeNotification::ArtifactDeletedRefresh(reduction) => {
-                self.apply_artifact_deleted_refresh_reduction(reduction, cx);
-            }
+            ClientRuntimeNotification::ThreadArtifactsRefresh(_)
+            | ClientRuntimeNotification::ArtifactThreadRefresh(_)
+            | ClientRuntimeNotification::ArtifactDeletedRefresh(_) => {}
             ClientRuntimeNotification::SemanticTimeline(_) => {}
-            ClientRuntimeNotification::VoiceSessionResult(reduction) => {
-                self.apply_voice_session_result_reduction(reduction, cx);
-            }
+            ClientRuntimeNotification::VoiceSessionResult(_) => {}
             ClientRuntimeNotification::CLIRuntimeSnapshot(reduction) => {
                 self.apply_cli_runtime_snapshot_reduction(reduction, cx);
             }
@@ -242,20 +201,11 @@ impl PioneerDesktop {
         // A newer revision is one atomic fence across global, workspace and
         // thread projections. No capability from the previous generation may
         // remain readable while its replacement is fetched.
-        self.invalidate_active_thread_capability_projection();
+
         self.gateway.capability_snapshot = None;
-        self.reconcile_composer_draft_with_capabilities();
-        if plan.clear_active_thread || plan.clear_active_workspace {
-            self.thread_scope_pending = Default::default();
-            self.thread_scope_error = None;
-            self.message_revision_dialog = None;
-            self.message_revision_loading = false;
-            self.message_mutation_pending = false;
-        }
+
         self.read_workspace_catalog_output();
 
-        self.thread_artifacts
-            .remove_threads(plan.invalidate_thread_ids.as_slice());
         for thread_id in &plan.invalidate_thread_ids {
             self.remove_thread_conversation(thread_id.as_str());
         }
@@ -299,17 +249,6 @@ impl PioneerDesktop {
 
         if plan.clear_active_thread {
             self.set_active_thread_id(None);
-            self.thread_artifacts.activate_thread(None);
-            *self.thread_timeline_view_state.borrow_mut() = Default::default();
-            self.thread_timeline_item_expanded.borrow_mut().clear();
-            self.thread_timeline_terminal_item.borrow_mut().clear();
-            *self.code_highlight_cache.borrow_mut() = Default::default();
-            self.show_thread_artifacts_sidebar = false;
-            self.show_thread_members_sidebar = false;
-            self.thread_members_thread_id = None;
-            self.thread_members.clear();
-            self.thread_members_loading = false;
-            self.task_review_actions = Default::default();
         }
 
         if plan.clear_workspace_capability_projections {
@@ -344,55 +283,20 @@ impl PioneerDesktop {
             return;
         }
         self.gateway.capability_snapshot = None;
-        self.invalidate_active_thread_capability_projection();
-        self.reconcile_composer_draft_with_capabilities();
+
         // The durable generation is a fail-closed fence, not merely a cache
         // hint.  Once old projections are removed, immediately rebuild both
         // active scopes from the Gateway so a connected client cannot remain
         // indefinitely disabled (or retain a stale draft) until an unrelated
         // lifecycle event happens to refresh it.
         self.refresh_current_principal(cx);
-        self.ensure_active_thread_capabilities_loaded(true, cx);
+
         cx.notify();
     }
 
     fn apply_skills_refresh_reduction(&mut self, reduction: SkillsRefreshReduction) {
         if reduction.queue_skills_refresh {
             self.queue_skills_refresh();
-        }
-    }
-
-    fn apply_thread_artifacts_refresh_reduction(
-        &mut self,
-        reduction: ThreadArtifactsRefreshReduction,
-        cx: &mut Context<Self>,
-    ) {
-        if reduction.refresh_thread_artifacts {
-            self.refresh_thread_artifacts(reduction.thread_id, reduction.force_refresh, cx);
-        }
-    }
-
-    fn apply_artifact_thread_refresh_reduction(
-        &mut self,
-        reduction: ArtifactThreadRefreshReduction,
-        cx: &mut Context<Self>,
-    ) {
-        if reduction.refresh_thread_artifacts
-            && let Some(thread_id) = reduction.thread_id
-        {
-            self.refresh_thread_artifacts(thread_id, reduction.force_refresh, cx);
-        }
-    }
-
-    fn apply_artifact_deleted_refresh_reduction(
-        &mut self,
-        reduction: ArtifactDeletedRefreshReduction,
-        cx: &mut Context<Self>,
-    ) {
-        if reduction.refresh_thread_artifacts
-            && let Some(thread_id) = reduction.active_thread_id
-        {
-            self.refresh_thread_artifacts(thread_id, reduction.force_refresh, cx);
         }
     }
 
@@ -414,7 +318,6 @@ impl PioneerDesktop {
                     .apply_cli_runtime_snapshot_update(revision, *runtime, removed)
                 {
                     CliRuntimeSnapshotUpdate::Applied => {
-                        self.refresh_composer_capability_target_for_selected_provider();
                         self.sync_open_model_selector_cli_runtime_snapshot();
                         cx.notify();
                     }
@@ -431,17 +334,6 @@ impl PioneerDesktop {
             CLIRuntimeSnapshotReduction::Upsert { .. }
             | CLIRuntimeSnapshotReduction::Reload { .. } => {}
         }
-    }
-
-    pub(in crate::app) fn apply_pending_requests_reduction(
-        &mut self,
-        reduction: pioneer_client::cli_runtime::approvals::PendingRequestsReduction,
-        _cx: &mut Context<Self>,
-    ) {
-        self.gateway
-            .client_runtime
-            .client_core()
-            .apply_pending_requests(reduction);
     }
 
     fn active_workspace_scope_for_notifications(&self) -> Option<String> {
@@ -785,8 +677,8 @@ mod access_change_tests {
             "self.providers.clear_for_workspace_switch()",
             "self.mcp_servers.clear()",
             "self.installed_skills.clear()",
-            "self.composer_capabilities.clear()",
-            "self.composer_skill_selections.clear()",
+            "self.composer_domain().capabilities.clear()",
+            "self.composer_domain().skill_selections.clear()",
         ] {
             assert!(
                 mutations_source.contains(required),
@@ -813,9 +705,7 @@ mod access_change_tests {
             )
         );
         assert!(production_source.contains("self.refresh_current_principal(cx)"));
-        assert!(
-            production_source.contains("self.ensure_active_thread_capabilities_loaded(true, cx)")
-        );
+        assert!(production_source.contains("self.request_active_thread_capabilities(true, cx)"));
         assert!(
             !production_source
                 .contains("ClientRuntimeNotification::AdministrationChanged(_) => {}")
@@ -825,36 +715,6 @@ mod access_change_tests {
 
 #[cfg(test)]
 use pioneer_client::gateway::settings_store::apply_vector_refill_notification;
-
-fn desktop_voice_no_speech_message(error: Option<&VoiceError>) -> String {
-    let Some(details) = error.and_then(|error| desktop_voice_error_details(error.message.as_str()))
-    else {
-        return t!("chat.composer.voice.no_speech").to_string();
-    };
-
-    t!(
-        "chat.composer.voice.no_speech_with_details",
-        details = details.as_str()
-    )
-    .to_string()
-}
-
-fn desktop_voice_transcription_failed_message(error: Option<&VoiceError>) -> String {
-    let Some(error) = error else {
-        return t!("chat.composer.voice.transcription_failed").to_string();
-    };
-
-    t!(
-        "chat.composer.voice.transcription_failed_with_details",
-        error = error.message.as_str()
-    )
-    .to_string()
-}
-
-fn desktop_voice_error_details(message: &str) -> Option<String> {
-    let (_, details) = message.split_once("reason=")?;
-    Some(format!("reason={details}"))
-}
 
 #[cfg(test)]
 mod vector_refill_tests {

@@ -7,9 +7,8 @@ use crate::transport::http::{
 };
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use pioneer_protocol::{
-    ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus, ArtifactRef,
-};
+pub use pioneer_protocol::ArtifactRef;
+use pioneer_protocol::{ArtifactPreviewRef, ArtifactProjectionKind, ArtifactProjectionStatus};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -26,7 +25,8 @@ pub const ARTIFACT_PREVIEW_SQUARE_EDGE_PX: u32 = 128;
 pub const ARTIFACT_PREVIEW_DETAIL_WIDTH_PX: u32 = 640;
 pub const ARTIFACT_PREVIEW_DETAIL_HEIGHT_PX: u32 = 320;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactPreviewImagePaths {
     pub square_path: PathBuf,
     pub detail_path: PathBuf,
@@ -228,13 +228,6 @@ impl ThreadArtifactPreviewState {
         self.loading_by_artifact.remove(&key);
         self.failed_by_artifact.insert(key);
     }
-
-    pub(crate) fn remove_keys(&mut self, keys: &HashSet<ArtifactVersionKey>) {
-        self.image_paths_by_artifact
-            .retain(|key, _| !keys.contains(key));
-        self.loading_by_artifact.retain(|key| !keys.contains(key));
-        self.failed_by_artifact.retain(|key| !keys.contains(key));
-    }
 }
 
 pub fn thumbnail_preview(artifact: &ArtifactRef) -> Option<&ArtifactPreviewRef> {
@@ -249,7 +242,7 @@ pub fn thumbnail_preview(artifact: &ArtifactRef) -> Option<&ArtifactPreviewRef> 
     }
 }
 
-pub fn write_artifact_preview_cache_files<R: ArtifactPreviewImageRenderer>(
+pub fn write_artifact_preview_cache_files<R: ArtifactPreviewImageRenderer + ?Sized>(
     renderer: &R,
     runtime_home: &Path,
     workspace_id: &str,

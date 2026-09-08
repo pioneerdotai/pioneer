@@ -1,5 +1,4 @@
 mod composer_domain;
-mod model_selection;
 mod mutations;
 mod presentation_events;
 mod route_lifecycle;
@@ -17,11 +16,7 @@ use crate::{
         settings::ProfileEditorState,
         skills::details::table::SkillDiagnosticsTableDelegate,
         startup::DesktopStartupCoordinator,
-        thread::{
-            ThreadCoordinator,
-            message_revisions::DesktopMessageRevisionDialogState,
-            view::timeline::{RunningIndicatorViewCache, TimelineLayoutIndex},
-        },
+        thread::ThreadCoordinator,
     },
     audio::{
         capture::{
@@ -53,10 +48,8 @@ pub(super) use pioneer_client::{
     },
     composer::{
         attachments::{ComposerAttachment, ComposerAttachmentUploadState},
-        draft::ComposerDraftLifecycleState,
         skill_selection::ComposerSkillSelection,
         state_machine::ComposerMentionCandidate,
-        turn_prepare::PrepareVoiceComposerSnapshotRequest,
     },
     gateway::runtime::GatewaySetupAction,
     providers::list::ProviderListState,
@@ -64,16 +57,14 @@ pub(super) use pioneer_client::{
     providers::selectors::ProviderFilter,
     skills::{catalog::SkillManagementProjection, upload::SkillUploadProgress},
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
-    tasks::review::TaskReviewActionState,
     threads::scope::ThreadScopePendingAction,
     threads::start::ThreadStartCoordinator,
-    timeline::rows::UserMessagePresentation,
 };
 use pioneer_protocol::{
-    ArtifactRef, AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
-    McpServerDetailsResponse, PrincipalId, SkillHealthItem, SkillId, SkillListItem, SkillPackId,
-    Thread, ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadParticipantSummary,
-    ThreadPlacement, ThreadVisibility, TurnPermissionMode, VoiceStatus, Workspace, WorkspaceId,
+    AuthMeResponse, CLIRuntimeThreadBinding, GatewaySettingsSnapshot, McpListItem,
+    McpServerDetailsResponse, SkillHealthItem, SkillId, SkillListItem, SkillPackId, Thread,
+    ThreadAgentsDocSummary, ThreadFolder, ThreadMode, ThreadParticipantSummary, ThreadPlacement,
+    ThreadVisibility, TurnPermissionMode, Workspace, WorkspaceId,
 };
 #[cfg(test)]
 pub(crate) use queries::{
@@ -194,129 +185,6 @@ pub(super) struct GatewayCoordinator {
     pub(super) capability_snapshot: Option<pioneer_protocol::AuthorizationCapabilitySnapshot>,
 }
 
-#[derive(Default)]
-pub(super) struct ThreadTimelineViewState {
-    pub(super) active_thread_id: Option<String>,
-    pub(super) item_count: usize,
-    pub(super) tail_entry_id: Option<String>,
-    pub(super) tail_text_len: usize,
-    pub(super) last_read_requested_through_turn_id: Option<String>,
-    pub(super) autoscroll_paused_by_user: bool,
-    pub(super) measured_list_width: Pixels,
-    pub(super) pending_width_probe: bool,
-    pub(super) width_probe_attempts: u8,
-    pub(super) entry_layout_cache: HashMap<String, CachedTimelineEntryLayout>,
-    pub(super) cached_render_active_thread_id: Option<String>,
-    pub(super) cached_render_width_px: i32,
-    pub(super) cached_render_item_count: usize,
-    pub(super) cached_render_tail_entry_id: Option<String>,
-    pub(super) cached_render_tail_fingerprint: u64,
-    pub(super) cached_render_model_fingerprint: u64,
-    pub cached_render_expanded_revision: u64,
-    pub(super) cached_render_principal_id: Option<String>,
-    pub(super) cached_render_task_child_thread: bool,
-    pub(super) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
-    pub(super) cached_timeline_layout_index: Option<Rc<TimelineLayoutIndex>>,
-    pub(super) expanded_revision: u64,
-    pub(super) pending_scroll_anchor: Option<TimelineScrollAnchor>,
-    pub(super) semantic_prefetch_scroll_generation: u64,
-    pub(super) semantic_prefetch_consumed_scroll_generation: u64,
-}
-
-pub(super) struct TimelineScrollAnchor {
-    pub(super) thread_id: String,
-    pub(super) row_key: String,
-    pub(super) row_top_offset_px: Pixels,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct CachedTimelineEntryLayout {
-    pub(super) render_fingerprint: u64,
-    pub(super) height: Pixels,
-}
-
-pub(super) struct CachedTimelineTerminal {
-    pub(super) content_hash: u64,
-    pub(super) view: Entity<TerminalView>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct DesktopVoiceHoldTarget {
-    pub(super) center: Point<Pixels>,
-    pub(super) radius: Pixels,
-}
-
-impl DesktopVoiceHoldTarget {
-    pub(super) fn contains(self, position: Point<Pixels>) -> bool {
-        let dx = position.x - self.center.x;
-        let dy = position.y - self.center.y;
-        let dx = f32::from(dx);
-        let dy = f32::from(dy);
-        let radius = f32::from(self.radius);
-        let distance_squared = dx * dx + dy * dy;
-        distance_squared <= radius * radius
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DesktopVoiceReleaseCandidate {
-    Send,
-    Cancel,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum DesktopVoiceComposerState {
-    Idle,
-    Preparing {
-        target: DesktopVoiceHoldTarget,
-        candidate: DesktopVoiceReleaseCandidate,
-        release_requested: bool,
-    },
-    Holding {
-        target: DesktopVoiceHoldTarget,
-        candidate: DesktopVoiceReleaseCandidate,
-    },
-    Finalizing {
-        thread_id: String,
-    },
-    Error {
-        kind: DesktopVoiceCaptureErrorKind,
-        message: String,
-    },
-}
-
-impl DesktopVoiceComposerState {
-    pub(super) fn is_active(&self) -> bool {
-        matches!(
-            self,
-            Self::Preparing { .. } | Self::Holding { .. } | Self::Finalizing { .. }
-        )
-    }
-
-    pub(super) fn error_message(&self) -> Option<&str> {
-        match self {
-            Self::Error { message, .. } => Some(message.as_str()),
-            _ => None,
-        }
-    }
-}
-
-impl Default for DesktopVoiceComposerState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct DesktopComposerEditTarget {
-    pub(super) presentation: UserMessagePresentation,
-    pub(super) preview: String,
-    pub(super) artifacts: Vec<ArtifactRef>,
-    pub(super) mention_selections: Vec<(PrincipalId, String)>,
-    pub(super) error: Option<String>,
-    pub(super) conflicted: bool,
-}
-
 pub(crate) struct LegacyScreenAdapter {
     pub(super) window_active: bool,
     frame_presentation: Option<presentation_events::FramePresentation>,
@@ -332,13 +200,8 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) profile_editor_input_subscriptions: Vec<Subscription>,
     pub(super) administration: AdministrationCache,
     pub(super) workspace_members_loading: HashSet<WorkspaceId>,
-    pub(super) thread_scope_pending: ThreadScopePendingAction,
-    pub(super) thread_scope_error: Option<String>,
-    pub(super) message_revision_dialog: Option<Entity<DesktopMessageRevisionDialogState>>,
     pub(crate) open_model_selector_cli_runtime_binding:
         Option<crate::components::model_selector::OpenModelSelectorCliRuntimeBinding>,
-    pub(super) message_revision_loading: bool,
-    pub(super) message_mutation_pending: bool,
     pub(super) invitations_loading: bool,
     pub(super) invitations_error: Option<String>,
     pub(super) members_loading: bool,
@@ -360,51 +223,6 @@ pub(crate) struct LegacyScreenAdapter {
     pub(crate) task_notification_surface: Option<AnyView>,
     pub(super) workspace_catalog_input:
         Arc<pioneer_client::workspaces::catalog::WorkspaceCatalogPublication>,
-    pub(super) composer_state: Entity<TextareaState>,
-    pub(super) composer_input_subscription: Option<Subscription>,
-    pub(super) composer_mention_select: Entity<ComboboxState<MemberPickerDelegate>>,
-    pub(super) composer_mention_select_subscription: Option<Subscription>,
-    pub(super) composer_mention_items: Vec<ComposerMentionCandidate>,
-    pub(super) thread_member_select: Entity<ComboboxState<MemberPickerDelegate>>,
-    pub(super) thread_member_select_subscription: Option<Subscription>,
-    pub(super) thread_member_items: Vec<ComposerMentionCandidate>,
-    pub(super) thread_members_thread_id: Option<String>,
-    pub(super) thread_scope_capabilities_thread_id: Option<String>,
-    pub(super) thread_scope_capabilities_loading_thread_id: Option<String>,
-    pub(super) thread_scope_capabilities_refresh_generation: u64,
-    pub(super) thread_scope_capabilities: ThreadPresentationCapabilities,
-    pub(super) thread_members: Vec<ThreadParticipantSummary>,
-    pub(super) thread_members_loading: bool,
-    pub(super) composer_attachments: Vec<ComposerAttachment>,
-    pub(super) composer_capabilities: Vec<ComposerCapability>,
-    pub(super) composer_skill_selections: Vec<ComposerSkillSelection>,
-    pub(super) composer_authorization_fingerprint: Option<String>,
-    pub(super) composer_upload_in_progress: bool,
-    pub(super) composer_upload_error: Option<String>,
-    pub(super) composer_turn_mode: ThreadMode,
-    pub(super) composer_hovered_mode: Option<ThreadMode>,
-    pub(super) composer_mode_manually_selected: bool,
-    pub(super) composer_reply_target:
-        Option<pioneer_client::composer::state_machine::ComposerReplyTarget>,
-    pub(super) composer_edit_target: Option<DesktopComposerEditTarget>,
-    pub(super) composer_selected_mentions:
-        Vec<pioneer_client::composer::state_machine::ComposerMentionSelection>,
-    pub(super) composer_selected_provider: Option<String>,
-    pub(super) composer_capability_target: ComposerCapabilityTarget,
-    pub(super) composer_selected_model: Option<String>,
-    pub(super) composer_selected_reasoning_effort: Option<String>,
-    pub(super) composer_permission_mode: TurnPermissionMode,
-    pub(super) desktop_microphone_gate: DesktopMicrophoneGateReport,
-    pub(super) desktop_voice_status: VoiceStatus,
-    pub(super) desktop_voice_status_error: Option<String>,
-    pub(super) desktop_voice_status_poll_generation: u64,
-    pub(super) desktop_voice_composer: DesktopVoiceComposerState,
-    pub(super) desktop_voice_prepare_request: Option<PrepareVoiceComposerSnapshotRequest>,
-    pub(super) desktop_voice_capture:
-        Option<DesktopVoiceCaptureFlow<PlatformDesktopAudioInputBackend, GatewayWsCommandSender>>,
-    pub(super) composer_model_selection_manually_selected: bool,
-    pub(super) composer_model_display_cache: HashMap<ProviderModelDisplayKey, Option<String>>,
-    pub(super) composer_model_display_loading_key: Option<ProviderModelDisplayKey>,
     pub(super) providers: ProviderListState,
     pub(super) mcp_servers: Vec<McpListItem>,
     pub(super) mcp_server_details: Option<McpServerDetailsResponse>,
@@ -434,23 +252,7 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) skills_list_scroll_handle: VirtualListScrollHandle,
     pub(super) skills_details_expanded_sections: HashSet<String>,
     pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
-    pub(super) composer_draft_lifecycle: ComposerDraftLifecycleState,
     pub(super) pending_thread_create_visibility: ThreadVisibility,
-    pub(super) thread_bindings: std::sync::Arc<crate::app::thread::binding::ThreadBindings>,
-    pub(super) thread_binding_task: Option<gpui_kit::Task<()>>,
-    pub(super) thread_timeline_scroll_handle: VirtualListScrollHandle,
-    pub(super) thread_timeline_view_state: RefCell<ThreadTimelineViewState>,
-    pub(super) running_indicator_views: RefCell<RunningIndicatorViewCache>,
-    pub(super) thread_timeline_item_expanded: RefCell<HashSet<String>>,
-    pub(super) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
-    pub(super) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,
-    pub(super) task_review_actions: TaskReviewActionState,
-    pub(super) thread_artifacts: ThreadArtifactsState,
-    pub(super) artifact_download_cancellations:
-        HashMap<ArtifactVersionKey, tokio_util::sync::CancellationToken>,
-    pub(super) show_thread_artifacts_sidebar: bool,
-    pub(super) show_thread_members_sidebar: bool,
-    pub(super) thread_artifacts_sidebar_width: Pixels,
     pub(super) gateway_setup_form_state: Entity<GatewaySetupFormState>,
     pub(super) gateway: GatewayCoordinator,
 }

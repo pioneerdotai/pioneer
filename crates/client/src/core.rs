@@ -144,6 +144,35 @@ pub enum ClientScope {
     Composer {
         thread_id: String,
     },
+    ThreadMember {
+        thread_id: String,
+    },
+    ThreadCapability {
+        thread_id: String,
+    },
+    TurnCancellation {
+        thread_id: String,
+    },
+    ComposerModelPicker {
+        thread_id: String,
+    },
+    ComposerCatalog {
+        thread_id: String,
+    },
+    MessageDeletion {
+        thread_id: String,
+    },
+    MessageRevisions {
+        thread_id: String,
+    },
+    ApprovalAction {
+        thread_id: String,
+        request_id: String,
+    },
+    TaskReview {
+        thread_id: String,
+        candidate_id: String,
+    },
     PendingRequest {
         workspace_id: Option<String>,
         thread_id: Option<String>,
@@ -181,9 +210,42 @@ pub enum ClientDemand {
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    Artifact {
+        intent: crate::artifacts::store::ArtifactIntent,
+    },
+    ThreadMember {
+        intent: crate::threads::members::ThreadMemberIntent,
+    },
+    ThreadCapability {
+        intent: crate::threads::capabilities::ThreadCapabilityIntent,
+    },
+    TurnCancellation {
+        intent: crate::turns::cancellation::TurnCancellationIntent,
+    },
+    ComposerModelPicker {
+        intent: crate::composer::model_picker::ComposerModelPickerIntent,
+    },
+    ComposerCatalog {
+        intent: crate::composer::catalog::ComposerCatalogIntent,
+    },
+    MessageRevisions {
+        intent: crate::threads::message_revisions::MessageRevisionIntent,
+    },
+    MessageDeletion {
+        intent: crate::threads::message_deletion::MessageDeletionIntent,
+    },
+    ApprovalAction {
+        intent: crate::cli_runtime::approval_actions::ApprovalActionIntent,
+    },
+    TaskReview {
+        intent: crate::tasks::review_controller::TaskReviewIntent,
+    },
+    Composer {
+        intent: crate::composer::store::ComposerIntent,
+    },
     Workspace {
         intent: crate::workspaces::intents::WorkspaceIntent,
     },
@@ -642,8 +704,19 @@ impl Drop for ClientSubscription {
                 .expect("client subscriber registry poisoned")
                 .remove(&self.id);
             core.thread_subscription_changed(&self.queue.scope, false);
+            core.composer_subscription_changed(&self.queue.scope, false);
             core.avatar_subscription_changed(&self.queue.scope, false);
             core.task_inbox_subscription_changed(&self.queue.scope, false);
+            core.task_review_subscription_changed(&self.queue.scope, false);
+            core.approval_action_subscription_changed(&self.queue.scope, false);
+            core.message_revision_subscription_changed(&self.queue.scope, false);
+            core.message_deletion_subscription_changed(&self.queue.scope, false);
+            core.composer_catalog_subscription_changed(&self.queue.scope, false);
+            core.composer_model_picker_subscription_changed(&self.queue.scope, false);
+            core.turn_cancellation_subscription_changed(&self.queue.scope, false);
+            core.thread_capability_subscription_changed(&self.queue.scope, false);
+            core.thread_member_subscription_changed(&self.queue.scope, false);
+            core.artifact_subscription_changed(&self.queue.scope, false);
             core.workspace_subscription_changed(&self.queue.scope, false);
         }
         self.queue
@@ -698,6 +771,34 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) artifact_store: Mutex<crate::artifacts::store::ArtifactStore>,
+    pub(crate) artifact_downloads: Mutex<crate::artifacts::operations::ArtifactDownloadController>,
+    pub(crate) thread_members: Mutex<crate::threads::members::ThreadMemberController>,
+    pub(crate) thread_capabilities: Mutex<crate::threads::capabilities::ThreadCapabilityController>,
+    pub(crate) composer_store: Mutex<crate::composer::store::ComposerStore>,
+    pub(crate) composer_voice_cleanup:
+        Mutex<crate::composer::voice::ComposerVoiceCleanupController>,
+    pub(crate) composer_voice_readiness:
+        Mutex<crate::composer::voice_readiness::ComposerVoiceReadinessController>,
+    pub(crate) composer_runtimes:
+        Mutex<crate::composer::runtime_selection::ComposerRuntimeController>,
+    pub(crate) composer_models:
+        Mutex<crate::composer::model_display::ComposerModelDisplayController>,
+    pub(crate) composer_steers: Mutex<crate::composer::steer::ComposerSteerController>,
+    pub(crate) composer_edits: Mutex<crate::composer::message_edit::ComposerMessageEditController>,
+    pub(crate) composer_sends: Mutex<crate::composer::workflow::ComposerSendController>,
+    pub(crate) turn_cancellations: Mutex<crate::turns::cancellation::TurnCancellationController>,
+    pub(crate) composer_model_picker_requests:
+        Mutex<crate::composer::model_picker::ComposerModelPickerController>,
+    pub(crate) composer_catalog_requests:
+        Mutex<crate::composer::catalog::ComposerCatalogController>,
+    pub(crate) message_revisions:
+        Mutex<crate::threads::message_revisions::MessageRevisionController>,
+    pub(crate) message_deletions:
+        Mutex<crate::threads::message_deletion::MessageDeletionController>,
+    pub(crate) approval_actions:
+        Mutex<crate::cli_runtime::approval_actions::ApprovalActionController>,
+    pub(crate) task_reviews: Mutex<crate::tasks::review_controller::TaskReviewActionController>,
     pub(crate) avatar_store: Mutex<crate::avatars::AvatarStore>,
     pub(crate) workspace_catalog: Mutex<crate::workspaces::catalog::WorkspaceCatalogStore>,
     pub(crate) workspace_controller: Mutex<crate::workspaces::controller::WorkspaceController>,
@@ -786,6 +887,17 @@ impl ClientMutationAuthority {
         Self { _private: () }
     }
 
+    /// Installs a synthetic identity through the same fenced completion as auth/me.
+    #[cfg(feature = "test-support")]
+    pub fn accept_identity_for_test(
+        &self,
+        core: &ClientCore,
+        auth: pioneer_protocol::AuthMeResponse,
+    ) -> anyhow::Result<pioneer_protocol::AuthMeResponse> {
+        let (generation, connection) = core.current_auth_ticket();
+        core.finish_current_auth(generation, connection, auth)
+    }
+
     pub(crate) fn timeline_publication(
         &self,
         snapshot: Arc<crate::timeline::presentation::TimelineSnapshot>,
@@ -837,6 +949,25 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
+            artifact_store: Mutex::default(),
+            artifact_downloads: Mutex::default(),
+            thread_members: Mutex::default(),
+            thread_capabilities: Mutex::default(),
+            composer_store: Mutex::default(),
+            composer_voice_cleanup: Mutex::default(),
+            composer_voice_readiness: Mutex::default(),
+            composer_runtimes: Mutex::default(),
+            composer_models: Mutex::default(),
+            composer_steers: Mutex::default(),
+            composer_edits: Mutex::default(),
+            composer_sends: Mutex::default(),
+            message_revisions: Mutex::default(),
+            message_deletions: Mutex::default(),
+            turn_cancellations: Mutex::default(),
+            composer_model_picker_requests: Mutex::default(),
+            composer_catalog_requests: Mutex::default(),
+            approval_actions: Mutex::default(),
+            task_reviews: Mutex::default(),
             avatar_store: Mutex::default(),
             workspace_catalog: Mutex::default(),
             workspace_controller: Mutex::default(),
@@ -1105,6 +1236,34 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.composer_voice_cleanup
+            .lock()
+            .expect("voice cleanup poisoned")
+            .stop();
+        self.composer_voice_readiness
+            .lock()
+            .expect("voice readiness controller poisoned")
+            .stop();
+        self.composer_runtimes
+            .lock()
+            .expect("composer runtime controller poisoned")
+            .stop();
+        self.composer_models
+            .lock()
+            .expect("composer models poisoned")
+            .stop();
+        self.composer_steers
+            .lock()
+            .expect("composer steer controller poisoned")
+            .stop();
+        self.composer_edits
+            .lock()
+            .expect("composer edit controller poisoned")
+            .stop();
+        self.composer_store
+            .lock()
+            .expect("composer store poisoned")
+            .clear();
         self.avatar_store
             .lock()
             .expect("avatar store poisoned")
@@ -1112,6 +1271,47 @@ impl ClientCore {
         self.task_notifications
             .lock()
             .expect("task inbox poisoned")
+            .stop();
+        self.turn_cancellations
+            .lock()
+            .expect("turn cancellations poisoned")
+            .stop();
+        self.composer_model_picker_requests
+            .lock()
+            .expect("composer model picker poisoned")
+            .stop();
+        self.composer_catalog_requests
+            .lock()
+            .expect("composer catalogs poisoned")
+            .stop();
+        self.message_revisions
+            .lock()
+            .expect("message revisions poisoned")
+            .stop();
+        self.message_deletions
+            .lock()
+            .expect("message deletion owner poisoned")
+            .stop();
+        self.approval_actions
+            .lock()
+            .expect("approval action owner poisoned")
+            .stop();
+        self.task_reviews
+            .lock()
+            .expect("task review owner poisoned")
+            .stop();
+        self.thread_capabilities
+            .lock()
+            .expect("thread capability owner poisoned")
+            .stop();
+        self.cancel_artifact_downloads(None);
+        self.artifact_store
+            .lock()
+            .expect("artifact owner poisoned")
+            .stop();
+        self.thread_members
+            .lock()
+            .expect("thread member owner poisoned")
             .stop();
         self.workspace_controller
             .lock()
@@ -1188,6 +1388,13 @@ impl ClientCore {
             return None;
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
+            self.observe_composer_runtime_notification(notification);
+            self.observe_composer_voice_notification(notification);
+            self.observe_composer_voice_readiness_notification(notification);
+            self.observe_artifact_notification(notification);
+            if self.observe_thread_member_notification(notification) {
+                return None;
+            }
             if self.observe_workspace_notification(notification) {
                 return None;
             }
@@ -1239,6 +1446,23 @@ impl ClientCore {
         let core = Arc::new(Self::new());
         core.initialize_navigation();
         core.start_task_notification_controller();
+        core.start_task_review_controller();
+        core.start_approval_action_controller();
+        core.start_message_revision_controller();
+        core.start_message_deletion_controller();
+        core.start_composer_catalog_controller();
+        core.start_composer_model_picker_controller();
+        core.start_turn_cancellation_controller();
+        core.start_composer_runtime_controller();
+        core.start_composer_voice_cleanup_controller();
+        core.start_composer_voice_readiness_controller();
+        core.start_composer_model_display_controller();
+        core.start_composer_message_edit_controller();
+        core.start_composer_steer_controller();
+        core.start_thread_capability_controller();
+        core.start_thread_member_controller();
+        core.start_artifact_controller();
+        core.start_artifact_preview_controller();
         core.start_workspace_controller();
         let (presentation_sender, presentation_receiver) = std::sync::mpsc::sync_channel(1);
         *core
@@ -1396,8 +1620,19 @@ impl ClientCore {
         capacity: NonZeroUsize,
     ) -> ClientSubscription {
         self.thread_subscription_changed(&scope, true);
+        self.composer_subscription_changed(&scope, true);
         self.avatar_subscription_changed(&scope, true);
         self.task_inbox_subscription_changed(&scope, true);
+        self.task_review_subscription_changed(&scope, true);
+        self.approval_action_subscription_changed(&scope, true);
+        self.message_revision_subscription_changed(&scope, true);
+        self.message_deletion_subscription_changed(&scope, true);
+        self.composer_catalog_subscription_changed(&scope, true);
+        self.composer_model_picker_subscription_changed(&scope, true);
+        self.turn_cancellation_subscription_changed(&scope, true);
+        self.thread_capability_subscription_changed(&scope, true);
+        self.thread_member_subscription_changed(&scope, true);
+        self.artifact_subscription_changed(&scope, true);
         self.workspace_subscription_changed(&scope, true);
         let partitions = self.partitions.lock().expect("client partitions poisoned");
         let latest_sequence = partitions
@@ -1467,6 +1702,18 @@ impl ClientCore {
         Self::transition_without_publication(&partitions, outcome)
     }
 
+    pub(crate) fn artifact_action_transition(&self, changed: bool) -> ClientTransition {
+        let partitions = self.partitions.lock().expect("client partitions poisoned");
+        Self::transition_without_publication(
+            &partitions,
+            if changed {
+                ClientTransitionOutcome::Changed
+            } else {
+                ClientTransitionOutcome::Noop
+            },
+        )
+    }
+
     pub(crate) fn reject_intent(&self) -> ClientTransition {
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
         partitions.transition_sequence.advance();
@@ -1482,6 +1729,33 @@ impl ClientCore {
             );
         }
         match &intent {
+            ClientIntent::Composer { intent } => return self.composer_intent(intent.clone()),
+            ClientIntent::Artifact { intent } => return self.artifact_intent(intent.clone()),
+            ClientIntent::ThreadMember { intent } => {
+                return self.thread_member_intent(intent.clone());
+            }
+            ClientIntent::ThreadCapability { intent } => {
+                return self.thread_capability_intent(intent.clone());
+            }
+            ClientIntent::TurnCancellation { intent } => {
+                return self.request_turn_cancellation(intent.clone());
+            }
+            ClientIntent::ComposerModelPicker { intent } => {
+                return self.composer_model_picker_intent(intent.clone());
+            }
+            ClientIntent::ComposerCatalog { intent } => {
+                return self.composer_catalog_intent(intent.clone());
+            }
+            ClientIntent::MessageRevisions { intent } => {
+                return self.message_revision_intent(intent.clone());
+            }
+            ClientIntent::MessageDeletion { intent } => {
+                return self.message_deletion_intent(intent.clone());
+            }
+            ClientIntent::ApprovalAction { intent } => {
+                return self.approval_action_intent(intent.clone());
+            }
+            ClientIntent::TaskReview { intent } => return self.task_review_intent(intent.clone()),
             ClientIntent::Workspace { intent } => {
                 return self.dispatch_workspace_intent(intent.clone());
             }
@@ -1579,8 +1853,19 @@ impl ClientCore {
         drop(partitions);
         if outcome == ClientTransitionOutcome::Changed {
             self.thread_demand_changed(&thread_scope, thread_demand);
+            self.composer_demand_changed(&thread_scope, thread_demand);
             self.avatar_demand_changed(&thread_scope, thread_demand);
             self.task_inbox_demand_changed(&thread_scope, thread_demand);
+            self.task_review_demand_changed(&thread_scope, thread_demand);
+            self.approval_action_demand_changed(&thread_scope, thread_demand);
+            self.message_revision_demand_changed(&thread_scope, thread_demand);
+            self.message_deletion_demand_changed(&thread_scope, thread_demand);
+            self.composer_catalog_demand_changed(&thread_scope, thread_demand);
+            self.composer_model_picker_demand_changed(&thread_scope, thread_demand);
+            self.turn_cancellation_demand_changed(&thread_scope, thread_demand);
+            self.thread_capability_demand_changed(&thread_scope, thread_demand);
+            self.thread_member_demand_changed(&thread_scope, thread_demand);
+            self.artifact_demand_changed(&thread_scope, thread_demand);
             self.workspace_demand_changed(&thread_scope, thread_demand);
         }
         transition
@@ -1741,10 +2026,21 @@ impl ClientCore {
         let wake_presentation = drafts
             .iter()
             .any(|draft| matches!(draft.scope, ClientScope::Thread { .. }));
+        let wake_composer = drafts.iter().any(|draft| {
+            matches!(
+                draft.scope,
+                ClientScope::Thread { .. }
+                    | ClientScope::ThreadCapability { .. }
+                    | ClientScope::Administration { .. }
+            )
+        });
         let transition = self.commit_publications(&mut partitions, drafts, effects);
         drop(partitions);
         if wake_presentation {
             self.wake_thread_presentation();
+        }
+        if wake_composer {
+            self.queue_composer_model_selection_refresh();
         }
         transition
     }
@@ -1965,6 +2261,22 @@ impl ClientCore {
                 .expect("task inbox poisoned")
                 .store
                 .invalidate();
+        }
+        if evict_protected {
+            self.cancel_artifact_downloads(None);
+            self.cancel_composer_requests();
+            self.composer_store
+                .lock()
+                .expect("composer store poisoned")
+                .clear();
+            self.invalidate_task_reviews(None);
+            self.invalidate_approval_actions(None);
+            self.invalidate_message_revisions(None);
+            self.invalidate_message_deletions(None);
+            self.invalidate_turn_cancellations(None);
+            self.invalidate_thread_capabilities(None);
+            self.invalidate_thread_members(None);
+            self.invalidate_artifacts(None);
         }
         let mut presentation_fence = evict_protected.then(|| {
             let mut registry = self

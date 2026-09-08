@@ -140,6 +140,21 @@ pub(crate) fn project_connections(
 }
 
 impl ClientCore {
+    /// Endpoint semantics for process-local platform effects on the accepted connection.
+    pub fn connected_gateway_endpoint_kind(&self) -> Option<super::types::GatewayEndpointKind> {
+        let connection = self.gateway_http_generation()?;
+        let sessions = self
+            .gateway_session
+            .lock()
+            .expect("Gateway session owner poisoned");
+        sessions.connections.values().find_map(|state| {
+            state
+                .connected
+                .as_ref()
+                .filter(|accepted| accepted.connection_id == connection)?;
+            state.ready.as_ref().map(|ready| ready.spec.endpoint_kind)
+        })
+    }
     /// Starts a prepared native transport under the process transport lease.
     /// Retrying startup returns its transport identity before readiness; identity
     /// verification is a separate Client operation after the transport connects.

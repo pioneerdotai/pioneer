@@ -28,7 +28,8 @@ pub struct ArtifactVersionKey {
     pub version_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactLocalFile {
     pub path: PathBuf,
     pub sha256: String,

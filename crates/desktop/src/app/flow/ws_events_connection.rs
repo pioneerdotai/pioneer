@@ -7,7 +7,6 @@ impl PioneerDesktop {
         reduction: GatewayConnectionReduction,
         mut cx: Option<&mut Context<Self>>,
     ) {
-        let was_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         self.gateway.status = gateway_status_message_text(&reduction.status);
         self.gateway.status_level = reduction.status_level;
         self.gateway.connection_state = reduction.connection_state;
@@ -39,8 +38,6 @@ impl PioneerDesktop {
                 .client_runtime
                 .client_core()
                 .cancel_thread_requests();
-            self.desktop_voice_status = pioneer_protocol::VoiceStatus::Unavailable;
-            self.desktop_voice_status_error = None;
             self.voice_input_action_error = None;
             self.voice_input_action_generation = self.voice_input_action_generation.wrapping_add(1);
             self.pending_voice_input_enabled = None;
@@ -53,10 +50,6 @@ impl PioneerDesktop {
                     .succeed(pioneer_observability::DesktopStartupStage::GatewaySessionConnect);
                 self.refresh_current_principal(cx);
                 self.active_thread_resubscribe_pending = self.current_active_thread_id().is_some();
-                self.refresh_desktop_voice_status(cx);
-                if !was_connected {
-                    self.reconcile_semantic_timeline_after_reconnect(cx);
-                }
             }
             if self.gateway.connection_state != GatewayConnectionState::Connected {
                 self.gateway.current_auth = None;

@@ -23,6 +23,7 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
     ) -> std::result::Result<(), String> {
         self.command_tx
             .send(GatewayWsCommand::Request {
+                expected_connection: None,
                 request_id,
                 payload,
                 response_tx,
@@ -984,6 +985,32 @@ impl GatewayWsCommandSender {
         response.map_err(anyhow::Error::msg)
     }
 
+    pub(crate) fn send_voice_audio_chunk_for_connection(
+        &self,
+        connection: u64,
+        session_id: String,
+        sequence: u64,
+        audio_format: VoiceAudioFormat,
+        captured_at_unix_ms: Option<u64>,
+        duration_ms: Option<u32>,
+        pcm_chunk: Vec<u8>,
+    ) -> Result<()> {
+        let payload = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
+            session_id,
+            sequence,
+            audio_format,
+            captured_at_unix_ms,
+            duration_ms,
+            &pcm_chunk,
+        )?;
+        self.command_tx
+            .send(GatewayWsCommand::VoiceBinaryChunk {
+                expected_connection: Some(connection),
+                payload,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))
+    }
+
     pub fn send_voice_audio_chunk(
         &self,
         session_id: String,
@@ -1003,7 +1030,10 @@ impl GatewayWsCommandSender {
         )?;
 
         self.command_tx
-            .send(GatewayWsCommand::VoiceBinaryChunk { payload })
+            .send(GatewayWsCommand::VoiceBinaryChunk {
+                expected_connection: None,
+                payload,
+            })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
         Ok(())
@@ -1234,5 +1264,40 @@ mod connection_generation_tests {
         assert!(!sender.gateway_state_event_is_current(&retiring));
         assert!(sender.accepts_gateway_event(&retiring));
         assert!(!sender.accepts_gateway_event(&retiring));
+    }
+}
+
+// Connection-bound commands are rejected by the worker after a route replacement.
+pub(crate) struct ConnectionRequestTransport {
+    sender: GatewayWsCommandSender,
+    connection: u64,
+}
+impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
+    fn send_json_rpc_request(
+        &self,
+        request_id: String,
+        payload: String,
+        response_tx: crate::rpc::JsonRpcResponseSender,
+    ) -> std::result::Result<(), String> {
+        self.sender
+            .command_tx
+            .send(GatewayWsCommand::Request {
+                expected_connection: Some(self.connection),
+                request_id,
+                payload,
+                response_tx,
+            })
+            .map_err(|_| crate::rpc::WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE.to_owned())
+    }
+}
+impl GatewayWsCommandSender {
+    pub(crate) fn requests_for_connection(
+        &self,
+        connection: u64,
+    ) -> impl crate::rpc::JsonRpcRequestTransport + use<> {
+        ConnectionRequestTransport {
+            sender: self.clone(),
+            connection,
+        }
     }
 }

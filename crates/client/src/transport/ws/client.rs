@@ -46,6 +46,7 @@ pub enum GatewayWsCommand {
         result_tx: Sender<std::result::Result<(), String>>,
     },
     Request {
+        expected_connection: Option<u64>,
         request_id: String,
         payload: String,
         response_tx: JsonRpcResponseSender,
@@ -63,6 +64,7 @@ pub enum GatewayWsCommand {
         response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
     },
     VoiceBinaryChunk {
+        expected_connection: Option<u64>,
         payload: Vec<u8>,
     },
     Disconnect,
@@ -184,6 +186,7 @@ async fn run_worker(
                 }
             }
             GatewayWsCommand::Request {
+                expected_connection,
                 request_id,
                 payload,
                 response_tx,
@@ -194,6 +197,13 @@ async fn run_worker(
                     )));
                     continue;
                 };
+
+                if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                    let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                        "websocket request connection retired",
+                    )));
+                    continue;
+                }
 
                 let fallback_tx = response_tx.clone();
                 if connection_task
@@ -262,11 +272,17 @@ async fn run_worker(
                         .send(Err("websocket connection task is unavailable".to_owned()));
                 }
             }
-            GatewayWsCommand::VoiceBinaryChunk { payload } => {
+            GatewayWsCommand::VoiceBinaryChunk {
+                expected_connection,
+                payload,
+            } => {
                 let Some(connection_task) = connection_task.as_mut() else {
                     continue;
                 };
 
+                if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                    continue;
+                }
                 let _ = connection_task
                     .rpc_tx
                     .send(ConnectionRpcCommand::VoiceBinaryChunk { payload });

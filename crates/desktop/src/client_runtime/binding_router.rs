@@ -215,7 +215,9 @@ impl DesktopClientBindingRouter {
     pub(super) fn deliver_pending(&self, core: &ClientCore) {
         for (target, publication) in self.drain(core) {
             if let Some(registration) = target.upgrade() {
-                if let Some(sink) = registration.sink.upgrade() { sink.publish(publication); }
+                if let Some(sink) = registration.sink.upgrade() {
+                    sink.publish(publication);
+                }
             }
         }
     }

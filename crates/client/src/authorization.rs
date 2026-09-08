@@ -11,8 +11,8 @@ use crate::{
 };
 use pioneer_protocol::{
     AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AccessChangeKind, AccessChangedNotification,
-    AuthMeResponse, AuthSessionListItem, AuthSessionStatus, AuthorizationCapabilitySnapshot,
-    AuthorizationRolePresentation, AuthorizationThreadCapabilities, DeviceStatus, PrincipalId,
+    AuthMeResponse, AuthSessionListItem, AuthSessionStatus, AuthorizationRolePresentation,
+    AuthorizationThreadCapabilities, DeviceStatus, PrincipalId,
 };
 use std::collections::BTreeMap;
 
@@ -1587,3 +1587,5 @@ mod tests {
         assert_eq!(endpoint_b.gateway.authorization_revision, None);
     }
 }
+
+pub use pioneer_protocol::AuthorizationCapabilitySnapshot;

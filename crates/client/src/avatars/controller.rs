@@ -137,6 +137,28 @@ impl Drop for AvatarStore {
     }
 }
 impl ClientCore {
+    /// Constructor wiring for process-local consumers of the existing avatar owner.
+    pub fn avatar_cache_service(
+        &self,
+        runtime_home: PathBuf,
+    ) -> Result<AvatarCacheService, AvatarCacheError> {
+        let sender = self.compatibility_runtime().ws_command_sender();
+        let access = sender
+            .current_gateway_http_access()
+            .map_err(|_| AvatarCacheError::Offline)?;
+        let http = crate::transport::http::GatewayHttpSession::from_access(
+            &access,
+            Arc::new(crate::transport::http_authority::GatewayWsHttpAuthority { sender }),
+        )
+        .map_err(|_| AvatarCacheError::Offline)?;
+        Ok(AvatarCacheService::new(
+            http,
+            runtime_home,
+            access.gateway_id,
+            access.session_id,
+        ))
+    }
+
     pub async fn resolve_member_avatar(
         &self,
         service: &AvatarCacheService,

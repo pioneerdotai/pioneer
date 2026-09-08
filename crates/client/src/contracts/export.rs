@@ -78,6 +78,104 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
 
     let mut contracts = vec![
         contract_type!(
+            "artifact_publication.json",
+            crate::artifacts::store::ArtifactPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "thread_member_publication.json",
+            crate::threads::members::ThreadMemberPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_publication.json",
+            crate::composer::store::ComposerPublication,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "turn_cancellation_publication.json",
+            crate::turns::cancellation::TurnCancellationPublication,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_model_picker_publication.json",
+            crate::composer::model_picker::ComposerModelPickerPublication,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_catalog_publication.json",
+            crate::composer::catalog::ComposerCatalogPublication,
+            Domain::Composer,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "message_revision_publication.json",
+            crate::threads::message_revisions::MessageRevisionPublication,
+            Domain::Timeline,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "message_deletion_publication.json",
+            crate::threads::message_deletion::MessageDeletionPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "approval_action_publication.json",
+            crate::cli_runtime::approval_actions::ApprovalActionPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "task_review_publication.json",
+            crate::tasks::review_controller::TaskReviewPublication,
+            Domain::Tasks,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "thread_capability_publication.json",
+            crate::threads::capabilities::ThreadCapabilityPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_voice_start_request.json",
+            crate::composer::voice::ComposerVoiceStartRequest,
+            Domain::Composer,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_voice_finalize_request.json",
+            crate::composer::voice::ComposerVoiceFinalizeRequest,
+            Domain::Composer,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
+            "composer_voice_cancel_request.json",
+            crate::composer::voice::ComposerVoiceCancelRequest,
+            Domain::Composer,
+            Kind::Command,
+            Stability::Stable
+        ),
+        contract_type!(
             "workspace_catalog_publication.json",
             crate::workspaces::catalog::WorkspaceCatalogPublication,
             Domain::Root,
@@ -493,20 +591,6 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
         contract_type!(
             "cli_runtime_list_response.json",
             pioneer_protocol::CLIRuntimeListResponse,
-            Domain::Providers,
-            Kind::Snapshot,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "cli_runtime_thread_binding_get_params.json",
-            pioneer_protocol::CLIRuntimeThreadBindingGetParams,
-            Domain::Providers,
-            Kind::Command,
-            Stability::Provisional
-        ),
-        contract_type!(
-            "cli_runtime_thread_binding_get_response.json",
-            pioneer_protocol::CLIRuntimeThreadBindingGetResponse,
             Domain::Providers,
             Kind::Snapshot,
             Stability::Provisional
@@ -2999,8 +3083,6 @@ mod tests {
             "cli_runtime_refresh_response.json",
             "cli_runtime_list_models_params.json",
             "cli_runtime_list_models_response.json",
-            "cli_runtime_thread_binding_get_params.json",
-            "cli_runtime_thread_binding_get_response.json",
             "cli_runtime_thread_binding.json",
             "cli_runtime_thread_compact_params.json",
             "cli_runtime_thread_compact_response.json",

@@ -5,13 +5,15 @@ use crate::{
     app::root::{MainContentView, PioneerDesktop},
     assets::PioneerIconName,
 };
-use gpui_kit::component::{
-    Icon, button::*, popover::Popover, separator::Separator, theme::ActiveTheme, *,
-};
+use gpui_kit::component::{Icon, button::*, separator::Separator, theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
-    pub(crate) fn render_bottom_bar(&self, action_region: &FocusHandle, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_bottom_bar(
+        &self,
+        action_region: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         pioneer_observability::record_qualification_diagnostic!(record_render(
             pioneer_observability::RenderRegion::BottomBar
         ));
@@ -22,7 +24,6 @@ impl PioneerDesktop {
             self.main_content_view(),
             MainContentView::Threads | MainContentView::AgentsDoc
         );
-        let show_thread_artifacts_button = self.main_content_view() == MainContentView::Threads;
         let is_providers_view_active = self.main_content_view() == MainContentView::Providers;
         let is_administration_view_active =
             self.main_content_view() == MainContentView::Administration;
@@ -35,7 +36,6 @@ impl PioneerDesktop {
             self.main_content_view(),
             MainContentView::Skills | MainContentView::SkillDetails
         );
-        let show_status_button = self.should_show_active_thread_status();
         h_flex()
             .justify_between()
             .items_center()
@@ -60,7 +60,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenThreads, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenThreads, window, cx)
+                                }
+                            }),
                     )
                     .child(Separator::vertical().h_4().mx_0p5())
                     .child(
@@ -76,7 +81,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenProviders, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenProviders, window, cx)
+                                }
+                            }),
                     )
                     .when(can_manage_capabilities, |this| {
                         this.child(
@@ -92,7 +102,12 @@ impl PioneerDesktop {
                                             this.opacity(1.0).text_color(cx.theme().blue)
                                         }),
                                 )
-                                .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenMcp, window, cx) }),
+                                .on_click({
+                                    let target = action_region.clone();
+                                    move |_, window, cx| {
+                                        target.dispatch_action(&OpenMcp, window, cx)
+                                    }
+                                }),
                         )
                     })
                     .child(
@@ -108,7 +123,10 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenSkills, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| target.dispatch_action(&OpenSkills, window, cx)
+                            }),
                     )
                     .child(Separator::vertical().h_4().mx_0p5())
                     .child(
@@ -124,7 +142,12 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenAdministration, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenAdministration, window, cx)
+                                }
+                            }),
                     )
                     .child(
                         Button::new("bottom-bar-open-settings")
@@ -139,107 +162,14 @@ impl PioneerDesktop {
                                         this.opacity(1.0).text_color(cx.theme().blue)
                                     }),
                             )
-                            .on_click({ let target = action_region.clone(); move |_, window, cx| target.dispatch_action(&OpenSettings, window, cx) }),
+                            .on_click({
+                                let target = action_region.clone();
+                                move |_, window, cx| {
+                                    target.dispatch_action(&OpenSettings, window, cx)
+                                }
+                            }),
                     ),
             )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(if show_status_button {
-                        self.render_active_thread_status_button()
-                    } else {
-                        div().into_any_element()
-                    })
-                    .child(if show_thread_artifacts_button {
-                        self.render_thread_members_sidebar_toggle_button(cx)
-                    } else {
-                        div().into_any_element()
-                    })
-                    .child(if show_thread_artifacts_button {
-                        self.render_thread_artifacts_sidebar_toggle_button(cx)
-                    } else {
-                        div().into_any_element()
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_active_thread_status_button(&self) -> AnyElement {
-        let status_text = self.active_thread_status_text();
-
-        Popover::new("active-thread-status-popover")
-            .anchor(Anchor::BottomRight)
-            .trigger(
-                Button::new("active-thread-status-trigger")
-                    .ghost()
-                    .small()
-                    .compact()
-                    .child(
-                        Icon::new(PioneerIconName::MessageCircle)
-                            .size_3p5()
-                            .opacity(0.6),
-                    ),
-            )
-            .content(move |_, _, _| {
-                v_flex().w(px(320.)).gap_2().p_1().child(
-                    div()
-                        .text_xs()
-                        .line_height(relative(1.15))
-                        .whitespace_normal()
-                        .child(status_text.clone()),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_thread_artifacts_sidebar_toggle_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        let artifacts_sidebar_icon = if self.show_thread_artifacts_sidebar {
-            IconName::PanelRightClose
-        } else {
-            IconName::PanelRightOpen
-        };
-
-        Button::new("bottom-bar-toggle-thread-artifacts-sidebar")
-            .ghost()
-            .small()
-            .compact()
-            .tooltip(t!("artifacts.title").to_string())
-            .child(
-                Icon::new(artifacts_sidebar_icon)
-                    .size_3p5()
-                    .opacity(0.6)
-                    .when(self.show_thread_artifacts_sidebar, |this| {
-                        this.opacity(1.0).text_color(cx.theme().blue)
-                    }),
-            )
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.show_thread_artifacts_sidebar = !view.show_thread_artifacts_sidebar;
-                if view.show_thread_artifacts_sidebar {
-                    view.show_thread_members_sidebar = false;
-                }
-                cx.notify();
-            }))
-            .into_any_element()
-    }
-
-    fn render_thread_members_sidebar_toggle_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        Button::new("bottom-bar-toggle-thread-members-sidebar")
-            .ghost()
-            .small()
-            .compact()
-            .tooltip(t!("settings.sidebar.members").to_string())
-            .child(
-                Icon::new(PioneerIconName::UserCheck)
-                    .size_3p5()
-                    .opacity(0.6)
-                    .when(self.show_thread_members_sidebar, |this| {
-                        this.opacity(1.0).text_color(cx.theme().blue)
-                    }),
-            )
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.toggle_thread_members_sidebar(cx);
-            }))
             .into_any_element()
     }
 }

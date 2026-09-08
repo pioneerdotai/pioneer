@@ -386,6 +386,128 @@ mod tests {
         }
     }
 
+    fn with_turn(mut thread: Thread) -> Thread {
+        thread.turns.push(pioneer_protocol::Turn {
+            id: "turn".into(),
+            status: pioneer_protocol::TurnStatus::Completed,
+            turn_kind: Default::default(),
+            origin: Default::default(),
+            mode: Default::default(),
+            author: None,
+            reply_to_turn_id: None,
+            mentions: vec![],
+            message_revision: 0,
+            message_deleted: false,
+            error: None,
+            prompt_manifest: None,
+            permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        });
+        thread
+    }
+
+    #[test]
+    fn composer_open_and_typed_sync_use_core_metadata_and_preserve_manual_selection() {
+        use crate::composer::{
+            state_machine::{ComposerDomainAction, ComposerDomainState},
+            store::ComposerIntent,
+        };
+        let core = crate::core::ClientCore::new();
+        let mut thread = with_turn(thread_with_effort("provider", "model", Some("high")));
+        core.upsert_thread(thread.clone());
+        core.composer_intent(ComposerIntent::Open {
+            thread_id: "thread".into(),
+            defaults: ComposerDomainState {
+                selected_mode: ThreadMode::Agent,
+                ..Default::default()
+            },
+        });
+        let first = core.composer_snapshot("thread").unwrap();
+        assert_eq!(first.domain().selected_model.as_deref(), Some("model"));
+        assert_eq!(
+            first.domain().selected_reasoning_effort.as_deref(),
+            Some("high")
+        );
+        core.composer_intent(ComposerIntent::Domain {
+            thread_id: "thread".into(),
+            draft_id: first.draft_id(),
+            action: ComposerDomainAction::SetModelSelectionFromUser {
+                provider: Some("manual-provider".into()),
+                model: Some("manual-model".into()),
+                capability_target: None,
+            },
+        });
+        thread.model = "server-model".into();
+        thread.updated_at += 1;
+        core.upsert_thread(thread);
+        core.composer_intent(ComposerIntent::SyncModelSelection {
+            thread_id: "thread".into(),
+            draft_id: first.draft_id(),
+            reset: false,
+        });
+        assert_eq!(
+            core.composer_snapshot("thread")
+                .unwrap()
+                .domain()
+                .selected_model
+                .as_deref(),
+            Some("manual-model")
+        );
+        core.composer_intent(ComposerIntent::SyncModelSelection {
+            thread_id: "thread".into(),
+            draft_id: first.draft_id(),
+            reset: true,
+        });
+        let reset = core.composer_snapshot("thread").unwrap();
+        assert_eq!(
+            reset.domain().selected_model.as_deref(),
+            Some("server-model")
+        );
+        core.composer_intent(ComposerIntent::SyncModelSelection {
+            thread_id: "thread".into(),
+            draft_id: first.draft_id(),
+            reset: false,
+        });
+        assert!(std::sync::Arc::ptr_eq(
+            &reset,
+            &core.composer_snapshot("thread").unwrap()
+        ));
+    }
+
+    #[test]
+    fn accepted_metadata_refreshes_composer_without_shell_or_js_reconciliation() {
+        use crate::composer::{state_machine::ComposerDomainState, store::ComposerIntent};
+        let core = std::sync::Arc::new(crate::core::ClientCore::new());
+        core.start_composer_model_display_controller();
+        let mut thread = with_turn(thread_with_effort("provider", "model", None));
+        core.upsert_thread(thread.clone());
+        core.composer_intent(ComposerIntent::Open {
+            thread_id: "thread".into(),
+            defaults: ComposerDomainState {
+                selected_mode: ThreadMode::Agent,
+                ..Default::default()
+            },
+        });
+        thread.model = "accepted-model".into();
+        thread.updated_at += 1;
+        core.upsert_thread(thread);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while core
+            .composer_snapshot("thread")
+            .unwrap()
+            .domain()
+            .selected_model
+            .as_deref()
+            != Some("accepted-model")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "accepted metadata did not reach composer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        core.shutdown();
+    }
+
     #[test]
     fn active_thread_with_turns_wins_over_newer_workspace_turn() {
         let resolved = resolve_composer_model_selection(
@@ -739,5 +861,21 @@ mod tests {
         assert_eq!(update.selected_reasoning_effort, None);
         assert!(update.clear_models);
         assert!(update.loading_models);
+    }
+}
+
+impl crate::core::ClientCore {
+    /// Resolve defaults from the accepted thread coordinators in this process.
+    pub(super) fn resolved_composer_model_selection(
+        &self,
+        thread_id: &str,
+    ) -> Option<ComposerModelSelection> {
+        let coordinators = self.thread_coordinator_snapshots();
+        let workspace = coordinators.get(thread_id)?.workspace_id.as_str();
+        crate::state::selectors::resolve_composer_model_selection_from(
+            Some(thread_id),
+            Some(workspace),
+            &coordinators,
+        )
     }
 }

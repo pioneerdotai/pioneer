@@ -12,9 +12,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use pioneer_protocol::{
-    AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES, PrincipalId, ProfileAvatarMediaType,
-};
+use pioneer_protocol::{AuthSessionId, GatewayId, PROFILE_AVATAR_MAX_DECODED_BYTES};
+pub use pioneer_protocol::{MemberSummary, PrincipalId, ProfileAvatarMediaType};
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

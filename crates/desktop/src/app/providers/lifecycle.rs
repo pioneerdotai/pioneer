@@ -26,8 +26,12 @@ impl PioneerDesktop {
             .principal_presentation_capabilities()
             .can_manage_capabilities;
         if !can_manage && self.navigation_input.providers_route() == ProviderFilter::Cli {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetProvidersRoute { filter: ProviderFilter::Api });
-        crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
+            self.navigation_intent(
+                pioneer_client::navigation::NavigationIntent::SetProvidersRoute {
+                    filter: ProviderFilter::Api,
+                },
+            );
+            crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
         }
         let selected_ix = Some(selectors::provider_filter_tree_index(
             self.navigation_input.providers_route(),
@@ -54,7 +58,9 @@ impl PioneerDesktop {
         {
             return;
         }
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetProvidersRoute { filter: filter });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetProvidersRoute { filter: filter },
+        );
         crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
         self.sync_provider_sidebar_tree_state(cx);
         cx.notify();
@@ -177,7 +183,6 @@ impl PioneerDesktop {
                         Ok(response) => {
                             match view.providers.apply_cli_runtime_snapshot_response(response) {
                                 provider_list::CliRuntimeSnapshotLoad::Applied => {
-                                    view.refresh_composer_capability_target_for_selected_provider();
                                     view.sync_open_model_selector_cli_runtime_snapshot();
                                 }
                                 provider_list::CliRuntimeSnapshotLoad::RetryRequired => {

@@ -1,7 +1,9 @@
 //! Client-side pending request state for CLI runtime approvals.
 
-use pioneer_protocol::{
+pub use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
+};
+use pioneer_protocol::{
     CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
     CLIRuntimeRequestRespondParams, TurnPermissionApprovalRequest,
     TurnPermissionApprovalResolution, TurnPermissionRequestOpenedNotification,
@@ -496,6 +498,8 @@ fn turn_permission_resolution_from_pending_resolution(
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PendingRequestRegistry {
     requests: Vec<PendingRequest>,
+    generation: u64,
+    generations: std::collections::HashMap<String, u64>,
     by_id: std::collections::HashMap<String, usize>,
 }
 
@@ -552,6 +556,10 @@ impl PendingRequestRegistry {
             .map(|index| &self.requests[*index])
     }
 
+    pub(crate) fn request_generation(&self, request_id: &str) -> Option<u64> {
+        self.generations.get(request_id).copied()
+    }
+
     pub fn apply<R>(&mut self, reduction: R) -> bool
     where
         R: Into<PendingRequestsReduction>,
@@ -564,12 +572,26 @@ impl PendingRequestRegistry {
                         return false;
                     }
                     let changed = existing != &request;
+                    if changed {
+                        self.generation = self
+                            .generation
+                            .checked_add(1)
+                            .expect("pending request generation exhausted");
+                        self.generations
+                            .insert(request.request_id.clone(), self.generation);
+                    }
                     *existing = request;
                     return changed;
                 }
 
                 self.by_id
                     .insert(request.request_id.clone(), self.requests.len());
+                self.generation = self
+                    .generation
+                    .checked_add(1)
+                    .expect("pending request generation exhausted");
+                self.generations
+                    .insert(request.request_id.clone(), self.generation);
                 self.requests.push(request);
                 true
             }
@@ -615,6 +637,11 @@ impl PendingRequestRegistry {
             }
         };
         if changed {
+            self.generations.retain(|id, _| {
+                self.requests
+                    .iter()
+                    .any(|request| &request.request_id == id)
+            });
             self.by_id = self
                 .requests
                 .iter()

@@ -254,6 +254,7 @@ mod tests {
     #[test]
     fn mobile_nitro_voice_array_buffer_uses_the_shared_binary_frame_contract() {
         let input = serde_json::json!({
+            "operation": { "thread_id": "thread", "draft_id": 1, "generation": 2 },
             "session_id": "voice_mobile_binary_1",
             "sequence": 7,
             "audio_format": {

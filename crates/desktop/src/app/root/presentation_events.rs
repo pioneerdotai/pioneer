@@ -12,9 +12,6 @@ pub(super) struct FramePresentation {
     keepawake: Option<bool>,
     can_manage: bool,
     can_notify: bool,
-    status: Option<String>,
-    artifacts: bool,
-    members: bool,
 }
 impl LegacyScreenAdapter {
     pub(super) fn publish_frame_changes(&mut self, cx: &mut Context<Self>) {
@@ -33,11 +30,6 @@ impl LegacyScreenAdapter {
                 .map(|settings| settings.general.keepawake),
             can_manage: capabilities.can_manage_capabilities,
             can_notify: capabilities.can_read_own_notifications,
-            status: self
-                .should_show_active_thread_status()
-                .then(|| self.active_thread_status_text()),
-            artifacts: self.show_thread_artifacts_sidebar,
-            members: self.show_thread_members_sidebar,
         };
         if self.frame_presentation.as_ref() != Some(&frame) {
             self.frame_presentation = Some(frame);

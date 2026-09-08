@@ -9,6 +9,7 @@ authors.workspace = true
 default = []
 schema = ["dep:schemars"]
 test-support = []
+qualification-diagnostics = ["pioneer-observability/qualification-diagnostics"]
 
 [[bin]]
 name = "schema"
@@ -24,6 +25,7 @@ hex.workspace = true
 libc.workspace = true
 mime_guess.workspace = true
 pioneer-protocol.workspace = true
+pioneer-observability.workspace = true
 pioneer-skills.workspace = true
 qrcode.workspace = true
 reqwest.workspace = true

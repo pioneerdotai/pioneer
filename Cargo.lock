@@ -8760,6 +8760,7 @@ dependencies = [
  "hex",
  "libc",
  "mime_guess",
+ "pioneer-observability",
  "pioneer-protocol",
  "pioneer-skills",
  "qrcode",
@@ -8848,6 +8849,7 @@ dependencies = [
  "pioneer-config",
  "pioneer-desktop-foundation",
  "pioneer-desktop-task-notifications",
+ "pioneer-desktop-thread",
  "pioneer-desktop-update",
  "pioneer-desktop-workspaces",
  "pioneer-keystore",
@@ -8898,6 +8900,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "pioneer-desktop-thread"
+version = "0.48.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui-kit",
+ "image",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "syntect",
+ "terminal",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "two-face",
+ "url",
 ]
 
 [[package]]

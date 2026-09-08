@@ -1,0 +1,32 @@
+[package]
+name = "pioneer-desktop-thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+qualification-diagnostics = ["pioneer-client/qualification-diagnostics"]
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["component"] }
+pioneer-client.workspace = true
+pioneer-desktop-foundation.workspace = true
+terminal.workspace = true
+rust-i18n.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+image.workspace = true
+sha2.workspace = true
+syntect.workspace = true
+two-face.workspace = true
+url.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+pioneer-client = { workspace = true, features = ["test-support"] }

@@ -56,7 +56,7 @@ pub fn upload_artifact_file<TTransport, TFileSystem>(
 ) -> Result<ArtifactRef>
 where
     TTransport: ArtifactUploadTransport,
-    TFileSystem: ClientFileSystem,
+    TFileSystem: ClientFileSystem + ?Sized,
 {
     validate_artifact_upload_file_request(&request)?;
 
@@ -125,7 +125,7 @@ fn upload_artifact_file_chunks_and_finish<TTransport, TFileSystem>(
 ) -> Result<ArtifactRef>
 where
     TTransport: ArtifactUploadTransport,
-    TFileSystem: ClientFileSystem,
+    TFileSystem: ClientFileSystem + ?Sized,
 {
     let chunk_size = usize::try_from(
         start

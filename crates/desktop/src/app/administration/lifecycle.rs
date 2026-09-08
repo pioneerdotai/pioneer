@@ -150,7 +150,7 @@ impl PioneerDesktop {
                                     view.startup.succeed(
                                         pioneer_observability::DesktopStartupStage::AuthorizationLoad,
                                     );
-                                    view.reconcile_composer_permission_mode_with_capabilities();
+
 
                                     let capabilities =
                                         view.principal_presentation_capabilities();

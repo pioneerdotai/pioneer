@@ -196,7 +196,7 @@ impl Render for PioneerDesktop {
             return self.gateway.setup_view.clone().into_any_element();
         }
         match self.main_content_view() {
-            MainContentView::Threads => self.render_thread(window, cx),
+            MainContentView::Threads => div().into_any_element(),
             MainContentView::AgentsDoc => self.render_agents_doc_editor(cx),
             MainContentView::Providers => self.render_providers(window, cx),
             MainContentView::Administration => self.render_administration(window, cx),

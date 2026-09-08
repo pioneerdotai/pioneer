@@ -153,6 +153,9 @@ pub enum ComposerDomainAction {
     RemoveAttachmentAt {
         index: usize,
     },
+    RemoveAttachment {
+        path: String,
+    },
     MarkAttachmentsUploading,
     MarkAttachmentsFailed {
         error: String,
@@ -165,6 +168,17 @@ pub enum ComposerDomainAction {
     },
     AddCapability {
         capability: ComposerCapability,
+    },
+    AddCapabilities {
+        capabilities: Vec<ComposerCapability>,
+    },
+    ToggleMcpSelection {
+        server_rows: Vec<super::capabilities::SelectableMcpCapability>,
+        tool_rows: Vec<super::capabilities::SelectableMcpCapability>,
+        key: String,
+    },
+    RemoveSkillSelection {
+        selection: ComposerSkillSelection,
     },
     RemoveCapability {
         id: String,
@@ -268,6 +282,10 @@ pub fn reduce_composer_domain_state(
         ComposerDomainAction::RemoveAttachmentAt { index } => {
             remove_composer_attachment_at(&mut next.attachments, index);
         }
+        ComposerDomainAction::RemoveAttachment { path } => {
+            next.attachments
+                .retain(|attachment| attachment.path != path);
+        }
         ComposerDomainAction::MarkAttachmentsUploading => {
             mark_pending_composer_attachments_uploading(&mut next.attachments);
         }
@@ -282,6 +300,40 @@ pub fn reduce_composer_domain_state(
         }
         ComposerDomainAction::AddCapability { capability } => {
             add_composer_capability(&mut next.capabilities, capability);
+        }
+        ComposerDomainAction::AddCapabilities { capabilities } => {
+            for capability in capabilities {
+                add_composer_capability(&mut next.capabilities, capability);
+            }
+        }
+        ComposerDomainAction::ToggleMcpSelection {
+            server_rows,
+            tool_rows,
+            key,
+        } => {
+            if let Some(row) = server_rows
+                .iter()
+                .chain(&tool_rows)
+                .find(|row| row.key == key && row.selectable)
+            {
+                let mut selected = next.capabilities.iter().map(|c| c.id.clone()).collect();
+                super::capabilities::toggle_mcp_capability_selection(
+                    &mut selected,
+                    &server_rows,
+                    &tool_rows,
+                    row,
+                );
+                next.capabilities = super::capabilities::replace_selected_mcp_composer_capabilities(
+                    &next.capabilities,
+                    &server_rows,
+                    &tool_rows,
+                    &selected,
+                );
+            }
+        }
+        ComposerDomainAction::RemoveSkillSelection { selection } => {
+            next.skill_selections
+                .retain(|current| current != &selection);
         }
         ComposerDomainAction::RemoveCapability { id } => {
             if let Some(index) = next
@@ -468,8 +520,10 @@ pub fn composer_mention_candidates(
     members: impl IntoIterator<Item = MemberSummary>,
 ) -> Vec<ComposerMentionCandidate> {
     let mut candidates = Vec::new();
-    for member in members {
-        if member.status != PrincipalStatus::Active
+    for mut member in members {
+        member.nickname = member.nickname.trim().to_owned();
+        if member.nickname.is_empty()
+            || member.status != PrincipalStatus::Active
             || candidates
                 .iter()
                 .any(|candidate: &ComposerMentionCandidate| {
@@ -640,6 +694,45 @@ mod tests {
     use pioneer_protocol::{
         McpScopeKind, PersistedActorRef, PrincipalKind, SkillId, SkillPackId, TurnAuthorSnapshot,
     };
+
+    #[test]
+    fn attachment_removal_keeps_its_target_after_insert_and_reorder() {
+        use crate::composer::attachments::composer_attachment_from_path;
+        use std::path::Path;
+
+        let first = composer_attachment_from_path(Path::new("/synthetic/first.txt")).unwrap();
+        let target = composer_attachment_from_path(Path::new("/synthetic/target.txt")).unwrap();
+        let inserted = composer_attachment_from_path(Path::new("/synthetic/inserted.txt")).unwrap();
+        let action = ComposerDomainAction::RemoveAttachment {
+            path: target.path.clone(),
+        };
+        let state = ComposerDomainState {
+            attachments: vec![inserted.clone(), first.clone(), target.clone()],
+            ..Default::default()
+        };
+        let removed = reduce_composer_domain_state(&state, action.clone());
+        assert_eq!(removed.state.attachments, vec![inserted, first]);
+        assert!(removed.changed);
+        let repeated = reduce_composer_domain_state(&removed.state, action);
+        assert!(!repeated.changed);
+        assert_eq!(repeated.state, removed.state);
+    }
+
+    #[test]
+    fn capability_removal_uses_domain_identity_after_filter_and_reorder() {
+        let target = mcp_capability();
+        let hidden = skill_capability();
+        let state = ComposerDomainState {
+            capabilities: vec![hidden.clone(), target.clone()],
+            selected_mode: ThreadMode::Agent,
+            ..Default::default()
+        };
+        // A filtered presentation places the target first, but the intent retains its ID.
+        let action = ComposerDomainAction::RemoveCapability { id: target.id };
+        let removed = reduce_composer_domain_state(&state, action.clone());
+        assert_eq!(removed.state.capabilities, vec![hidden]);
+        assert!(!reduce_composer_domain_state(&removed.state, action).changed);
+    }
 
     fn mcp_capability() -> ComposerCapability {
         ComposerCapability {

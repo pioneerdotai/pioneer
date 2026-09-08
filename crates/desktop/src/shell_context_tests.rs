@@ -110,3 +110,72 @@ fn pointer_key_and_menu_dispatch_reach_one_action_handler(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(owner.read_with(cx, |owner, _| owner.calls), 3);
 }
+
+struct ThreadAllocationProbe {
+    layout: gpui_kit::Entity<crate::shell_state::ShellStateStore>,
+    clicks: std::rc::Rc<std::cell::Cell<usize>>,
+}
+impl Render for ThreadAllocationProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::{button::Button, v_flex};
+        use gpui_kit::{ParentElement, Styled};
+        let clicks = self.clicks.clone();
+        super::DesktopBody {
+            layout: self.layout.clone(),
+            thread_mounted: true,
+            sidebar: div()
+                .size_full()
+                .debug_selector(|| "allocation-sidebar".into())
+                .into_any_element(),
+            screen: v_flex()
+                .size_full()
+                .debug_selector(|| "allocation-thread".into())
+                .child(div().flex_1().min_h_0())
+                .child(
+                    div()
+                        .h_8()
+                        .flex_none()
+                        .debug_selector(|| "allocation-thread-footer".into())
+                        .child(
+                            Button::new("allocation-action")
+                                .label("Panel")
+                                .on_click(move |_, _, _| clicks.set(clicks.get() + 1)),
+                        ),
+                )
+                .into_any_element(),
+            bottom: div()
+                .h_8()
+                .debug_selector(|| "allocation-bottom".into())
+                .into_any_element(),
+        }
+    }
+}
+#[gpui_kit::test]
+fn thread_footer_shares_the_existing_bottom_bar_allocation_and_receives_pointer_events(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let probe = cx.new(|_| ThreadAllocationProbe {
+            layout,
+            clicks: clicks.clone(),
+        });
+        Root::new(probe, window, cx)
+    });
+    cx.run_until_parked();
+    let sidebar = cx.debug_bounds("allocation-sidebar").unwrap();
+    let thread = cx.debug_bounds("allocation-thread").unwrap();
+    let footer = cx.debug_bounds("allocation-thread-footer").unwrap();
+    let bottom = cx.debug_bounds("allocation-bottom").unwrap();
+    assert_eq!(footer.origin.y, bottom.origin.y);
+    assert_eq!(footer.size.height, bottom.size.height);
+    assert_eq!(sidebar.bottom(), bottom.top());
+    assert_eq!(thread.bottom(), bottom.bottom());
+    cx.simulate_click(
+        footer.origin + gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(12.)),
+        gpui_kit::Modifiers::default(),
+    );
+    assert_eq!(clicks.get(), 1);
+}

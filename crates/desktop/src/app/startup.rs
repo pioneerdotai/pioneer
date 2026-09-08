@@ -376,18 +376,28 @@ impl PioneerDesktop {
         if !self.thread_directory_loading() && self.current_active_thread_id().is_some() {
             self.startup.succeed(DesktopStartupStage::ThreadTreeLoad);
         }
-        let active_thread_id = self.current_active_thread_id();
-        let thread_capabilities_ready = active_thread_id.is_some_and(|thread_id| {
-            self.thread_scope_capabilities_thread_id.as_deref() == Some(thread_id)
-                && self.thread_scope_capabilities_loading_thread_id.as_deref() != Some(thread_id)
+        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
+        let thread_capabilities_ready = active_thread_id.as_deref().is_some_and(|thread_id| {
+            self.gateway.client_runtime.client_core().thread_capability_snapshot(thread_id)
+                .is_some_and(|publication| publication.request == pioneer_client::threads::capabilities::ThreadCapabilityRequestState::Ready)
         });
         if thread_capabilities_ready {
             self.startup
                 .succeed(DesktopStartupStage::ThreadCapabilitiesLoad);
         }
         let active_thread_ready = thread_capabilities_ready
-            && !self.active_thread_resubscribe_pending
-            && self.composer_authorization_fingerprint.is_some();
+            && active_thread_id
+                .as_deref()
+                .and_then(|thread| {
+                    self.gateway
+                        .client_runtime
+                        .client_core()
+                        .thread_snapshot(thread)
+                })
+                .is_some_and(|thread| {
+                    !thread.coordinator().history_loading && !thread.subscription_failed()
+                })
+            && self.composer_authorization_fingerprint().is_some();
         let providers_ready = self
             .startup
             .stage_succeeded(DesktopStartupStage::ProviderLoad);

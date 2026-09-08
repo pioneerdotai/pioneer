@@ -1,50 +1,44 @@
 use super::*;
-use pioneer_client::composer::state_machine::{
-    ComposerDomainAction, ComposerDomainState, ComposerDomainTransition,
-    reduce_composer_domain_state,
-};
+use pioneer_client::composer::{state_machine::ComposerDomainState, store::*};
 
 impl PioneerDesktop {
+    fn composer_output(&self) -> Option<Arc<ComposerPublication>> {
+        self.current_active_thread_id().and_then(|thread| {
+            self.gateway
+                .client_runtime
+                .client_core()
+                .composer_snapshot(thread)
+        })
+    }
+    pub(in crate::app) fn composer_domain(&self) -> ComposerDomainState {
+        self.composer_output()
+            .map(|input| input.domain().clone())
+            .unwrap_or_default()
+    }
     pub(in crate::app) fn composer_domain_state(&self) -> ComposerDomainState {
-        ComposerDomainState {
-            attachments: self.composer_attachments.clone(),
-            capabilities: self.composer_capabilities.clone(),
-            skill_selections: self.composer_skill_selections.clone(),
-            selected_mode: self.composer_turn_mode,
-            mode_manually_selected: self.composer_mode_manually_selected,
-            selected_provider: self.composer_selected_provider.clone(),
-            capability_target: self.composer_capability_target,
-            selected_model: self.composer_selected_model.clone(),
-            selected_reasoning_effort: self.composer_selected_reasoning_effort.clone(),
-            selected_permission_mode: self.composer_permission_mode,
-            model_manually_selected: self.composer_model_selection_manually_selected,
-            reply_target: self.composer_reply_target.clone(),
-            selected_mentions: self.composer_selected_mentions.clone(),
-        }
+        self.composer_domain()
     }
-
-    pub(in crate::app) fn apply_composer_domain_state(&mut self, state: ComposerDomainState) {
-        self.composer_attachments = state.attachments;
-        self.composer_capabilities = state.capabilities;
-        self.composer_skill_selections = state.skill_selections;
-        self.composer_turn_mode = state.selected_mode;
-        self.composer_mode_manually_selected = state.mode_manually_selected;
-        self.composer_selected_provider = state.selected_provider;
-        self.composer_capability_target = state.capability_target;
-        self.composer_selected_model = state.selected_model;
-        self.composer_selected_reasoning_effort = state.selected_reasoning_effort;
-        self.composer_permission_mode = state.selected_permission_mode;
-        self.composer_model_selection_manually_selected = state.model_manually_selected;
-        self.composer_reply_target = state.reply_target;
-        self.composer_selected_mentions = state.selected_mentions;
+    pub(in crate::app) fn composer_authorization_fingerprint(&self) -> Option<String> {
+        self.composer_output()
+            .and_then(|input| input.authorization_fingerprint().map(str::to_owned))
     }
-
-    pub(in crate::app) fn reduce_composer_domain(
-        &mut self,
-        action: ComposerDomainAction,
-    ) -> ComposerDomainTransition {
-        let transition = reduce_composer_domain_state(&self.composer_domain_state(), action);
-        self.apply_composer_domain_state(transition.state.clone());
-        transition
+    pub(in crate::app) fn composer_upload_in_progress(&self) -> bool {
+        self.composer_output()
+            .and_then(|input| input.operation().cloned())
+            .is_some_and(|operation| match operation.kind {
+                ComposerOperationKind::Send => operation.pending(),
+                ComposerOperationKind::Voice => matches!(
+                    operation.status,
+                    ComposerOperationStatus::Preparing | ComposerOperationStatus::Uploading
+                ),
+                _ => false,
+            })
+    }
+    pub(in crate::app) fn desktop_voice_context_locked(&self) -> bool {
+        self.composer_output()
+            .and_then(|input| input.operation().cloned())
+            .is_some_and(|operation| {
+                operation.kind == ComposerOperationKind::Voice && operation.pending()
+            })
     }
 }

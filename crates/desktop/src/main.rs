@@ -22,6 +22,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 mod theme;
+mod thread_platform;
 
 mod window;
 

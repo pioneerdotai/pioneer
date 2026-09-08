@@ -3,9 +3,6 @@ use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::components::member_picker::{MemberPickerDelegate, new_member_picker_state};
 use crate::state;
 use gpui_kit::component::table::TableState;
-use pioneer_client::composer::{
-    model_selection::default_composer_turn_mode, permissions::default_composer_permission_mode,
-};
 
 impl PioneerDesktop {
     pub fn new(
@@ -27,13 +24,6 @@ impl PioneerDesktop {
                 ),
             )
         });
-        let composer_state = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 13)
-                .placeholder(t!("chat.composer.placeholder").to_string())
-        });
-        let composer_mention_select = cx.new(|cx| new_member_picker_state(window, cx));
-        let thread_member_select = cx.new(|cx| new_member_picker_state(window, cx));
         let settings_tree_state = cx.new(|cx| TreeState::new(cx));
         let administration_tree_state = cx.new(|cx| TreeState::new(cx));
         let provider_tree_state = cx.new(|cx| TreeState::new(cx));
@@ -68,7 +58,6 @@ impl PioneerDesktop {
             cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
                 .core(),
         );
-        let desktop_microphone_gate = DesktopMicrophoneGateReport::unknown();
         let session_binding = crate::gateway::GatewaySessionBinding::new(
             cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
                 .registrar()
@@ -101,12 +90,7 @@ impl PioneerDesktop {
             profile_editor_input_subscriptions: Vec::new(),
             administration: AdministrationCache::default(),
             workspace_members_loading: HashSet::new(),
-            thread_scope_pending: ThreadScopePendingAction::Idle,
-            thread_scope_error: None,
-            message_revision_dialog: None,
             open_model_selector_cli_runtime_binding: None,
-            message_revision_loading: false,
-            message_mutation_pending: false,
             invitations_loading: false,
             invitations_error: None,
             members_loading: false,
@@ -133,48 +117,6 @@ impl PioneerDesktop {
             active_thread_resubscribe_pending: false,
             task_notification_surface: None,
             workspace_catalog_input: Default::default(),
-            composer_state,
-            composer_input_subscription: None,
-            composer_mention_select,
-            composer_mention_select_subscription: None,
-            composer_mention_items: Vec::new(),
-            thread_member_select,
-            thread_member_select_subscription: None,
-            thread_member_items: Vec::new(),
-            thread_members_thread_id: None,
-            thread_scope_capabilities_thread_id: None,
-            thread_scope_capabilities_loading_thread_id: None,
-            thread_scope_capabilities_refresh_generation: 0,
-            thread_scope_capabilities: ThreadPresentationCapabilities::default(),
-            thread_members: Vec::new(),
-            thread_members_loading: false,
-            composer_attachments: Vec::new(),
-            composer_capabilities: Vec::new(),
-            composer_skill_selections: Vec::new(),
-            composer_authorization_fingerprint: None,
-            composer_upload_in_progress: false,
-            composer_upload_error: None,
-            composer_turn_mode: default_composer_turn_mode(),
-            composer_hovered_mode: None,
-            composer_mode_manually_selected: false,
-            composer_reply_target: None,
-            composer_edit_target: None,
-            composer_selected_mentions: Vec::new(),
-            composer_selected_provider: None,
-            composer_capability_target: ComposerCapabilityTarget::native(),
-            composer_selected_model: None,
-            composer_selected_reasoning_effort: None,
-            composer_permission_mode: default_composer_permission_mode(),
-            desktop_microphone_gate,
-            desktop_voice_status: VoiceStatus::Unavailable,
-            desktop_voice_status_error: None,
-            desktop_voice_status_poll_generation: 0,
-            desktop_voice_composer: DesktopVoiceComposerState::Idle,
-            desktop_voice_prepare_request: None,
-            desktop_voice_capture: None,
-            composer_model_selection_manually_selected: false,
-            composer_model_display_cache: HashMap::new(),
-            composer_model_display_loading_key: None,
             providers: Default::default(),
             mcp_servers: Vec::new(),
             mcp_server_details: None,
@@ -204,25 +146,7 @@ impl PioneerDesktop {
             skills_list_scroll_handle: VirtualListScrollHandle::new(),
             skills_details_expanded_sections: HashSet::new(),
             skills_audit_table_state,
-            composer_draft_lifecycle: ComposerDraftLifecycleState::default(),
             pending_thread_create_visibility: ThreadVisibility::Private,
-            thread_bindings: crate::app::thread::binding::ThreadBindings::new(
-                cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
-                    .registrar(),
-            ),
-            thread_binding_task: None,
-            thread_timeline_scroll_handle: VirtualListScrollHandle::new(),
-            thread_timeline_view_state: RefCell::new(ThreadTimelineViewState::default()),
-            running_indicator_views: RefCell::new(RunningIndicatorViewCache::default()),
-            thread_timeline_item_expanded: RefCell::new(HashSet::new()),
-            thread_timeline_terminal_item: RefCell::new(HashMap::new()),
-            code_highlight_cache: RefCell::new(DesktopCodeHighlightCache::default()),
-            task_review_actions: TaskReviewActionState::default(),
-            thread_artifacts: ThreadArtifactsState::default(),
-            artifact_download_cancellations: HashMap::new(),
-            show_thread_artifacts_sidebar: false,
-            show_thread_members_sidebar: false,
-            thread_artifacts_sidebar_width: px(340.),
             gateway_setup_form_state,
             gateway: GatewayCoordinator {
                 compatibility_task: None,
@@ -267,93 +191,6 @@ impl PioneerDesktop {
             },
         };
 
-        let composer_state = view.composer_state.clone();
-        view.composer_input_subscription = Some(cx.subscribe(
-            &composer_state,
-            |view, input, event: &gpui_kit::component::input::InputEvent, cx| {
-                if !matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                    return;
-                }
-                let text = input.read(cx).value();
-                if view
-                    .reduce_composer_domain(
-                        pioneer_client::composer::state_machine::ComposerDomainAction::ReconcileMentionsWithText {
-                            text: text.to_string(),
-                        },
-                    )
-                    .changed
-                {
-                    cx.notify();
-                }
-            },
-        ));
-
-        let composer_mention_select = view.composer_mention_select.clone();
-        view.composer_mention_select_subscription = Some(cx.subscribe_in(
-            &composer_mention_select,
-            window,
-            |_view,
-             select,
-             event: &gpui_kit::component::combobox::ComboboxEvent<MemberPickerDelegate>,
-             window,
-             cx| {
-                if let gpui_kit::component::combobox::ComboboxEvent::Confirm(candidates) = event {
-                    let Some(candidate) = candidates.first().cloned() else {
-                        return;
-                    };
-
-                    // Keep the parent update outside the render pass.
-                    let desktop_entity = cx.entity().clone();
-                    let select = select.clone();
-                    window.defer(cx, move |window, cx| {
-                        let _ = desktop_entity.update(cx, |view, cx| {
-                            view.insert_composer_mention(candidate, window, cx);
-                        });
-                        let _ = select.update(cx, |state, cx| {
-                            state.clear_selection(cx);
-                        });
-                    });
-                }
-            },
-        ));
-
-        let thread_member_select = view.thread_member_select.clone();
-        view.thread_member_select_subscription = Some(cx.subscribe_in(
-            &thread_member_select,
-            window,
-            |_view,
-             select,
-             event: &gpui_kit::component::combobox::ComboboxEvent<MemberPickerDelegate>,
-             window,
-             cx| {
-                if let gpui_kit::component::combobox::ComboboxEvent::Confirm(candidates) = event {
-                    let Some(candidate) = candidates.first().cloned() else {
-                        return;
-                    };
-
-                    let desktop_entity = cx.entity().clone();
-                    let select = select.clone();
-                    window.defer(cx, move |_, cx| {
-                        let _ = desktop_entity.update(cx, |view, cx| {
-                            view.add_thread_member(candidate.principal_id, cx);
-                        });
-                        let _ = select.update(cx, |state, cx| {
-                            state.clear_selection(cx);
-                        });
-                    });
-                }
-            },
-        ));
-
-        cx.observe_window_bounds(window, |view, _, cx| {
-            {
-                let mut state = view.thread_timeline_view_state.borrow_mut();
-                state.pending_width_probe = true;
-                state.width_probe_attempts = 0;
-            }
-            cx.notify();
-        })
-        .detach();
         cx.observe_window_activation(window, |view, window, cx| {
             if window.is_window_active() {
                 view.recover_gateway_session_on_foreground(cx);
@@ -372,9 +209,8 @@ impl PioneerDesktop {
         view.sync_settings_sidebar_tree_state(cx);
         view.sync_administration_sidebar_tree_state(cx);
         view.sync_provider_sidebar_tree_state(cx);
-        view.start_gateway_ws_event_pump(cx);
+        view.start_gateway_ws_event_pump(window, cx);
         view.bootstrap_gateway_runtime(cx);
-        view.prune_thread_artifact_preview_cache(cx);
 
         view
     }

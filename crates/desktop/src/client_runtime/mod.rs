@@ -37,7 +37,9 @@ impl DesktopRuntimeCoordinator {
                 let _ = handle.update(cx, |root, window, cx| {
                     if let Ok(root) = root.clone().downcast::<gpui_kit::component::Root>() {
                         let content = root.read(cx).view().clone();
-                        if let Ok(shell) = content.downcast::<crate::desktop_shell::DesktopShellView>() {
+                        if let Ok(shell) =
+                            content.downcast::<crate::desktop_shell::DesktopShellView>()
+                        {
                             shell.update(cx, |shell, cx| shell.close(window, cx));
                         }
                     }

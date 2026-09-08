@@ -460,7 +460,8 @@ pub struct ProviderModelSelectorProvider {
     pub kind: ProviderModelSelectorProviderKind,
 }
 
-#[derive(Clone, Debug)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProviderModelSelectorState {
     providers: Vec<ProviderSummary>,
     cli_runtimes: Vec<RuntimeSummary>,
@@ -474,7 +475,8 @@ pub struct ProviderModelSelectorState {
     error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProviderModelSelectorMode {
     Chat,
     SelfImprovement,
@@ -483,6 +485,9 @@ pub enum ProviderModelSelectorMode {
 }
 
 impl ProviderModelSelectorState {
+    pub fn cli_runtimes(&self) -> &[RuntimeSummary] {
+        &self.cli_runtimes
+    }
     pub fn new(selected_provider: Option<String>, selected_model: Option<String>) -> Self {
         Self::new_with_mode(
             selected_provider,

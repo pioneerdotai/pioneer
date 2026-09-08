@@ -937,3 +937,36 @@ mod tests {
         assert!(!production_source.contains(&["Author", "ization"].concat()));
     }
 }
+
+impl PioneerDesktop {
+    pub(in crate::app) fn active_gateway_http_client(
+        &mut self,
+    ) -> anyhow::Result<crate::gateway::DesktopGatewayHttpClient> {
+        let endpoint = self
+            .gateway
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.active_gateway().cloned())
+            .ok_or_else(|| anyhow::anyhow!("gateway endpoint unavailable"))?;
+        let access = self
+            .gateway
+            .client_runtime
+            .ws_command_sender()
+            .current_gateway_http_access()
+            .map_err(|_| anyhow::anyhow!("gateway authentication unavailable"))?;
+        if let Some(client) = self.gateway.http_client.as_ref()
+            && client.matches(&endpoint, &access)
+        {
+            return Ok(client.clone());
+        }
+        let runtime_home = crate::state::runtime_home_dir()?;
+        let client = crate::gateway::DesktopGatewayHttpClient::for_endpoint(
+            &endpoint,
+            self.gateway.client_runtime.ws_command_sender().clone(),
+            runtime_home,
+            self.gateway.client_runtime.client_core().clone(),
+        )?;
+        self.gateway.http_client = Some(client.clone());
+        Ok(client)
+    }
+}

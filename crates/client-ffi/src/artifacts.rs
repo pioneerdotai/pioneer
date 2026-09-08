@@ -1,54 +1,26 @@
 //! Secret-preserving native artifact actions for first-party mobile shells.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
-    },
+use pioneer_client::artifacts::{
+    access::ArtifactAccessError,
+    http_download::ArtifactHttpDownloadResult,
+    operations::{ArtifactDownloadIdentity, ArtifactDownloadOperationError, ArtifactDownloadState},
+    workflow::ArtifactActionIdentity,
 };
-
-use async_trait::async_trait;
-use pioneer_client::{
-    artifacts::http_download::{
-        ArtifactHttpDownloadError, ArtifactHttpDownloadProgress, ArtifactHttpDownloadRequest,
-        ArtifactHttpDownloadResult, ArtifactHttpDownloadService,
-    },
-    transport::{
-        http::{
-            BrowserViewUrl, GatewayHttpAccess, GatewayHttpAuthorityError, GatewayHttpError,
-            GatewayHttpSession, GatewayHttpSessionAuthority,
-        },
-        ws::GatewayWsCommandSender,
-    },
-};
-use pioneer_protocol::{
-    ArtifactGetParams, ArtifactSummary, ArtifactViewGrantCreateParams, ArtifactViewGrantDisposition,
-};
+use pioneer_client::core::ClientCore;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
-use tokio_util::sync::CancellationToken;
+use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroize;
 
 use crate::ClientFfiError;
 
 pub(crate) const INVALID_ARTIFACT_ACTION_CODE: &str = "invalid_artifact_action";
-pub(crate) const ARTIFACT_AUTHENTICATION_CODE: &str = "artifact_authentication_required";
 pub(crate) const ARTIFACT_RECONFIGURATION_CODE: &str = "artifact_reconfiguration_required";
-
-const OPERATION_QUEUED: u8 = 0;
-const OPERATION_DOWNLOADING: u8 = 1;
-const OPERATION_COMPLETED: u8 = 2;
-const OPERATION_FAILED: u8 = 3;
-const OPERATION_CANCELLED: u8 = 4;
-const MAX_ACTIVE_DOWNLOAD_OPERATIONS: usize = 8;
-const MAX_TRACKED_DOWNLOAD_OPERATIONS: usize = 128;
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientArtifactTargetRequest {
+    pub identity: ArtifactActionIdentity,
     pub workspace_id: String,
     pub artifact_id: String,
     #[serde(default)]
@@ -82,7 +54,10 @@ impl Drop for ClientArtifactViewOpenResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientArtifactDownloadRequest {
+    pub identity: ArtifactActionIdentity,
     pub operation_id: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
     pub workspace_id: String,
     pub artifact_id: String,
     #[serde(default)]
@@ -94,6 +69,7 @@ pub struct ClientArtifactDownloadRequest {
 #[serde(deny_unknown_fields)]
 pub struct ClientArtifactDownloadOperationRequest {
     pub operation_id: String,
+    pub generation: u64,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -123,6 +99,7 @@ pub enum ClientArtifactDownloadState {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientArtifactDownloadProgressResult {
     pub operation_id: String,
+    pub generation: u64,
     pub state: ClientArtifactDownloadState,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
@@ -138,352 +115,132 @@ pub struct ClientArtifactDownloadCancelResult {
     pub cancelled: bool,
 }
 
-#[derive(Default)]
-pub(crate) struct ClientFfiArtifactDownloads {
-    operations: Mutex<HashMap<String, Arc<ArtifactDownloadOperation>>>,
+pub(crate) fn download_progress(
+    core: &ClientCore,
+    request: ClientArtifactDownloadOperationRequest,
+) -> Result<ClientArtifactDownloadProgressResult, ClientFfiError> {
+    let input = core
+        .artifact_download_snapshot(&request.operation_id)
+        .ok_or_else(|| map_operation_error(ArtifactDownloadOperationError::NotFound))?;
+    if input.identity.generation != request.generation {
+        return Err(map_operation_error(
+            ArtifactDownloadOperationError::NotFound,
+        ));
+    }
+    Ok(ClientArtifactDownloadProgressResult {
+        operation_id: request.operation_id,
+        generation: input.identity.generation,
+        state: match input.state {
+            ArtifactDownloadState::Queued => ClientArtifactDownloadState::Queued,
+            ArtifactDownloadState::Downloading => ClientArtifactDownloadState::Downloading,
+            ArtifactDownloadState::Completed => ClientArtifactDownloadState::Completed,
+            ArtifactDownloadState::Failed => ClientArtifactDownloadState::Failed,
+            ArtifactDownloadState::Cancelled => ClientArtifactDownloadState::Cancelled,
+        },
+        downloaded_bytes: input.downloaded_bytes,
+        total_bytes: input.total_bytes,
+        resumed_from_bytes: input.resumed_from_bytes,
+        error_code: input.error_code.clone(),
+    })
 }
 
-struct ArtifactDownloadOperation {
-    cancellation: CancellationToken,
-    state: AtomicU8,
-    downloaded_bytes: AtomicU64,
-    total_bytes: AtomicU64,
-    resumed_from_bytes: AtomicU64,
-    error_code: Mutex<Option<String>>,
+pub(crate) fn cancel_download(
+    core: &ClientCore,
+    request: ClientArtifactDownloadOperationRequest,
+) -> Result<ClientArtifactDownloadCancelResult, ClientFfiError> {
+    let input = core
+        .artifact_download_snapshot(&request.operation_id)
+        .ok_or_else(|| map_operation_error(ArtifactDownloadOperationError::NotFound))?;
+    Ok(ClientArtifactDownloadCancelResult {
+        operation_id: request.operation_id,
+        cancelled: core.cancel_artifact_download(&ArtifactDownloadIdentity {
+            operation_id: input.identity.operation_id.clone(),
+            generation: request.generation,
+        }),
+    })
 }
 
-impl ArtifactDownloadOperation {
-    fn new() -> Self {
-        Self {
-            cancellation: CancellationToken::new(),
-            state: AtomicU8::new(OPERATION_QUEUED),
-            downloaded_bytes: AtomicU64::new(0),
-            total_bytes: AtomicU64::new(0),
-            resumed_from_bytes: AtomicU64::new(0),
-            error_code: Mutex::new(None),
-        }
-    }
-
-    fn update_progress(&self, progress: ArtifactHttpDownloadProgress) {
-        let Ok(_transition) = self.error_code.lock() else {
-            return;
-        };
-        if !operation_is_active(self.state.load(Ordering::Acquire)) {
-            return;
-        }
-        self.downloaded_bytes
-            .store(progress.downloaded_bytes, Ordering::Relaxed);
-        self.total_bytes
-            .store(progress.total_bytes, Ordering::Relaxed);
-        self.resumed_from_bytes
-            .store(progress.resumed_from_bytes, Ordering::Relaxed);
-        self.state.store(OPERATION_DOWNLOADING, Ordering::Release);
-    }
-
-    fn finish(&self, state: u8, error_code: Option<String>) -> bool {
-        let Ok(mut stored) = self.error_code.lock() else {
-            return false;
-        };
-        if !operation_is_active(self.state.load(Ordering::Acquire)) {
-            return false;
-        }
-        *stored = error_code;
-        self.state.store(state, Ordering::Release);
-        true
-    }
-
-    fn snapshot(&self, operation_id: String) -> ClientArtifactDownloadProgressResult {
-        let stored_error = self.error_code.lock().ok();
-        let state = match self.state.load(Ordering::Acquire) {
-            OPERATION_QUEUED => ClientArtifactDownloadState::Queued,
-            OPERATION_DOWNLOADING => ClientArtifactDownloadState::Downloading,
-            OPERATION_COMPLETED => ClientArtifactDownloadState::Completed,
-            OPERATION_CANCELLED => ClientArtifactDownloadState::Cancelled,
-            _ => ClientArtifactDownloadState::Failed,
-        };
-        ClientArtifactDownloadProgressResult {
-            operation_id,
-            state,
-            downloaded_bytes: self.downloaded_bytes.load(Ordering::Relaxed),
-            total_bytes: self.total_bytes.load(Ordering::Relaxed),
-            resumed_from_bytes: self.resumed_from_bytes.load(Ordering::Relaxed),
-            error_code: stored_error.and_then(|value| value.clone()),
-        }
-    }
-}
-
-impl ClientFfiArtifactDownloads {
-    fn begin(&self, operation_id: &str) -> Result<Arc<ArtifactDownloadOperation>, ClientFfiError> {
-        validate_operation_id(operation_id)?;
-        let operation = Arc::new(ArtifactDownloadOperation::new());
-        let mut operations = self.operations.lock().map_err(|_| {
-            ClientFfiError::new(
-                "artifact download operation lock is poisoned",
-                ClientFfiError::GENERIC_CODE,
-            )
-        })?;
-        if operations
-            .get(operation_id)
-            .is_some_and(|existing| operation_is_active(existing.state.load(Ordering::Acquire)))
-        {
-            return Err(ClientFfiError::new(
-                "artifact download operation is already active",
-                INVALID_ARTIFACT_ACTION_CODE,
-            ));
-        }
-        if operations
-            .values()
-            .filter(|existing| operation_is_active(existing.state.load(Ordering::Acquire)))
-            .count()
-            >= MAX_ACTIVE_DOWNLOAD_OPERATIONS
-        {
-            return Err(ClientFfiError::new(
-                "artifact download operation capacity is exhausted",
-                "artifact_download_capacity",
-            ));
-        }
-        if !operations.contains_key(operation_id)
-            && operations.len() >= MAX_TRACKED_DOWNLOAD_OPERATIONS
-        {
-            let remove_count = operations.len() + 1 - MAX_TRACKED_DOWNLOAD_OPERATIONS;
-            let terminal = operations
-                .iter()
-                .filter(|(_, existing)| {
-                    !operation_is_active(existing.state.load(Ordering::Acquire))
-                })
-                .map(|(operation_id, _)| operation_id.clone())
-                .take(remove_count)
-                .collect::<Vec<_>>();
-            for operation_id in terminal {
-                operations.remove(operation_id.as_str());
-            }
-        }
-        operations.insert(operation_id.to_owned(), operation.clone());
-        Ok(operation)
-    }
-
-    pub(crate) fn progress(
-        &self,
-        request: ClientArtifactDownloadOperationRequest,
-    ) -> Result<ClientArtifactDownloadProgressResult, ClientFfiError> {
-        validate_operation_id(request.operation_id.as_str())?;
-        let operations = self.operations.lock().map_err(|_| {
-            ClientFfiError::new(
-                "artifact download operation lock is poisoned",
-                ClientFfiError::GENERIC_CODE,
-            )
-        })?;
-        let operation = operations
-            .get(request.operation_id.as_str())
-            .ok_or_else(|| {
-                ClientFfiError::new(
-                    "artifact download operation was not found",
-                    INVALID_ARTIFACT_ACTION_CODE,
-                )
-            })?;
-        Ok(operation.snapshot(request.operation_id))
-    }
-
-    pub(crate) fn cancel(
-        &self,
-        request: ClientArtifactDownloadOperationRequest,
-    ) -> Result<ClientArtifactDownloadCancelResult, ClientFfiError> {
-        validate_operation_id(request.operation_id.as_str())?;
-        let operations = self.operations.lock().map_err(|_| {
-            ClientFfiError::new(
-                "artifact download operation lock is poisoned",
-                ClientFfiError::GENERIC_CODE,
-            )
-        })?;
-        let operation = operations
-            .get(request.operation_id.as_str())
-            .ok_or_else(|| {
-                ClientFfiError::new(
-                    "artifact download operation was not found",
-                    INVALID_ARTIFACT_ACTION_CODE,
-                )
-            })?;
-        let active = operation_is_active(operation.state.load(Ordering::Acquire));
-        if active {
-            operation.cancellation.cancel();
-        }
-        let cancelled =
-            active && operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned()));
-        Ok(ClientArtifactDownloadCancelResult {
-            operation_id: request.operation_id,
-            cancelled,
-        })
-    }
-
-    pub(crate) fn cancel_all(&self) {
-        if let Ok(operations) = self.operations.lock() {
-            for operation in operations.values() {
-                if operation_is_active(operation.state.load(Ordering::Acquire)) {
-                    operation.cancellation.cancel();
-                    let _ = operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned()));
-                }
-            }
-        }
-    }
-}
-
-fn operation_is_active(state: u8) -> bool {
-    matches!(state, OPERATION_QUEUED | OPERATION_DOWNLOADING)
+fn map_operation_error(error: ArtifactDownloadOperationError) -> ClientFfiError {
+    ClientFfiError::new(
+        "artifact download operation unavailable",
+        if error == ArtifactDownloadOperationError::Capacity {
+            "artifact_download_capacity"
+        } else {
+            INVALID_ARTIFACT_ACTION_CODE
+        },
+    )
 }
 
 pub(crate) fn open_artifact_view(
-    sender: &GatewayWsCommandSender,
+    core: &ClientCore,
     request: ClientArtifactTargetRequest,
 ) -> Result<ClientArtifactViewOpenResult, ClientFfiError> {
-    let artifact = resolve_artifact(sender, request)?;
-    let version_id = exact_version(&artifact)?;
-    let grant = sender
-        .artifact_view_grant_create(ArtifactViewGrantCreateParams {
-            workspace_id: artifact.workspace_id.clone(),
-            artifact_id: artifact.artifact.artifact_id.clone(),
-            version_id,
-            projection_kind: None,
-            disposition: ArtifactViewGrantDisposition::Inline,
-        })
-        .map_err(map_rpc_error)?;
-    let access = sender
-        .current_gateway_http_access()
-        .map_err(map_authority_error)?;
-    let view = BrowserViewUrl::resolve(&access.gateway_base_url, grant.relative_url.as_str())
-        .map_err(map_http_error)?;
+    validate_target(
+        core,
+        &request.identity,
+        &request.workspace_id,
+        &request.artifact_id,
+        request.version_id.as_deref(),
+    )?;
+    let plan = core
+        .prepare_artifact_action_view(&request.identity, None)
+        .map_err(map_access_error)?;
     Ok(ClientArtifactViewOpenResult {
-        view_url: view.expose_url().to_owned(),
-        expires_at: grant.expires_at,
+        view_url: plan.url.expose_url().to_owned(),
+        expires_at: plan.expires_at,
     })
 }
 
 pub(crate) fn download_artifact(
-    sender: &GatewayWsCommandSender,
-    downloads: &ClientFfiArtifactDownloads,
+    core: &Arc<ClientCore>,
     runtime_home: PathBuf,
     request: ClientArtifactDownloadRequest,
 ) -> Result<ClientArtifactDownloadResult, ClientFfiError> {
-    let operation = downloads.begin(request.operation_id.as_str())?;
-    let result = download_artifact_inner(sender, runtime_home, &request, operation.as_ref());
-    match result {
-        Ok(result) => {
-            if operation.finish(OPERATION_COMPLETED, None) {
-                Ok(result)
-            } else {
-                Err(map_download_error(ArtifactHttpDownloadError::Cancelled))
-            }
-        }
-        Err(error) => {
-            if operation.cancellation.is_cancelled() {
-                let _ = operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned()));
-                Err(map_download_error(ArtifactHttpDownloadError::Cancelled))
-            } else {
-                let _ = operation.finish(OPERATION_FAILED, Some(error.code.clone()));
-                Err(error)
-            }
-        }
-    }
-}
-
-fn download_artifact_inner(
-    sender: &GatewayWsCommandSender,
-    runtime_home: PathBuf,
-    request: &ClientArtifactDownloadRequest,
-    operation: &ArtifactDownloadOperation,
-) -> Result<ClientArtifactDownloadResult, ClientFfiError> {
-    let artifact = resolve_artifact(
-        sender,
-        ClientArtifactTargetRequest {
-            workspace_id: request.workspace_id.clone(),
-            artifact_id: request.artifact_id.clone(),
-            version_id: request.version_id.clone(),
-        },
+    validate_target(
+        core,
+        &request.identity,
+        &request.workspace_id,
+        &request.artifact_id,
+        request.version_id.as_deref(),
     )?;
-    let version_id = exact_version(&artifact)?;
-    let size_bytes = artifact.artifact.size_bytes.ok_or_else(invalid_artifact)?;
-    let sha256 = artifact
-        .artifact
-        .sha256
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(invalid_artifact)?;
-    let access = sender
-        .current_gateway_http_access()
-        .map_err(map_authority_error)?;
-    let authority = Arc::new(FfiGatewayHttpAuthority {
-        sender: sender.clone(),
-    });
-    let session = GatewayHttpSession::from_access(&access, authority).map_err(map_http_error)?;
-    let service = ArtifactHttpDownloadService::new(session, runtime_home);
-    let native_request = ArtifactHttpDownloadRequest {
-        gateway_profile_id: access.gateway_id.as_str().to_owned(),
-        workspace_id: artifact.workspace_id,
-        artifact_id: artifact.artifact.artifact_id.clone(),
-        version_id: version_id.clone(),
-        display_name: artifact.artifact.display_name.clone(),
-        expected_size_bytes: size_bytes,
-        expected_sha256: sha256,
-    };
-    let runtime = Runtime::new().map_err(|_| {
-        ClientFfiError::new(
-            "artifact download runtime is unavailable",
-            "artifact_download_unavailable",
+    if request.thread_id.as_deref() != Some(request.identity.thread_id.as_str()) {
+        return Err(map_operation_error(
+            ArtifactDownloadOperationError::InvalidIdentity,
+        ));
+    }
+    let (display_name, result) = core
+        .download_artifact_action(
+            &request.identity,
+            request.operation_id.clone(),
+            runtime_home,
         )
-    })?;
-    let progress = |progress: ArtifactHttpDownloadProgress| operation.update_progress(progress);
-    let result = runtime
-        .block_on(service.download(
-            native_request,
-            operation.cancellation.clone(),
-            Some(&progress),
-        ))
-        .map_err(map_download_error)?;
-    if operation.cancellation.is_cancelled() {
-        return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
-    }
-    verified_result(
-        request.operation_id.clone(),
-        artifact.artifact.display_name,
-        result,
-    )
+        .map_err(map_access_error)?;
+    verified_result(request.operation_id, display_name, result)
 }
 
-fn resolve_artifact(
-    sender: &GatewayWsCommandSender,
-    request: ClientArtifactTargetRequest,
-) -> Result<ArtifactSummary, ClientFfiError> {
-    let workspace_id = non_empty(request.workspace_id)?;
-    let artifact_id = non_empty(request.artifact_id)?;
-    let version_id = request.version_id.and_then(|value| {
-        let value = value.trim().to_owned();
-        (!value.is_empty()).then_some(value)
-    });
-    let artifact = sender
-        .artifact_get(ArtifactGetParams {
-            workspace_id: workspace_id.clone(),
-            artifact_id: artifact_id.clone(),
-            version_id: version_id.clone(),
-        })
-        .map(|response| response.artifact)
-        .map_err(map_rpc_error)?;
-    if artifact.workspace_id != workspace_id
-        || artifact.artifact.artifact_id != artifact_id
-        || version_id
-            .as_deref()
-            .is_some_and(|expected| artifact.artifact.version_id.as_deref() != Some(expected))
+fn validate_target(
+    core: &ClientCore,
+    identity: &ArtifactActionIdentity,
+    workspace: &str,
+    artifact: &str,
+    version: Option<&str>,
+) -> Result<(), ClientFfiError> {
+    let action = core
+        .artifact_action_snapshot(identity)
+        .ok_or_else(|| map_operation_error(ArtifactDownloadOperationError::NotFound))?;
+    if action.target.workspace_id != workspace
+        || action.target.artifact_id != artifact
+        || action.target.version_id.as_deref() != version
     {
-        return Err(invalid_artifact());
+        return Err(map_operation_error(
+            ArtifactDownloadOperationError::InvalidIdentity,
+        ));
     }
-    Ok(artifact)
+    Ok(())
 }
 
-fn exact_version(artifact: &ArtifactSummary) -> Result<String, ClientFfiError> {
-    artifact
-        .artifact
-        .version_id
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(invalid_artifact)
+fn map_access_error(error: ArtifactAccessError) -> ClientFfiError {
+    ClientFfiError::new(error.message(), error.code())
 }
 
 fn verified_result(
@@ -514,193 +271,83 @@ fn verified_result(
     })
 }
 
-struct FfiGatewayHttpAuthority {
-    sender: GatewayWsCommandSender,
-}
-
-#[async_trait]
-impl GatewayHttpSessionAuthority for FfiGatewayHttpAuthority {
-    async fn current_access(&self) -> Result<GatewayHttpAccess, GatewayHttpAuthorityError> {
-        self.sender.current_gateway_http_access()
-    }
-
-    async fn coordinated_refresh(
-        &self,
-        rejected_generation: u64,
-    ) -> Result<GatewayHttpAccess, GatewayHttpAuthorityError> {
-        let current = self.sender.current_gateway_http_access()?;
-        if current.generation != rejected_generation {
-            Ok(current)
-        } else {
-            // Mobile refresh credentials remain owned by the existing session
-            // coordinator. Native artifact I/O never starts a parallel refresh.
-            Err(GatewayHttpAuthorityError::TemporarilyUnavailable)
-        }
-    }
-}
-
-fn validate_operation_id(operation_id: &str) -> Result<(), ClientFfiError> {
-    if operation_id.is_empty()
-        || operation_id.len() > 128
-        || !operation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(ClientFfiError::new(
-            "invalid artifact download operation id",
-            INVALID_ARTIFACT_ACTION_CODE,
-        ));
-    }
-    Ok(())
-}
-
-fn non_empty(value: String) -> Result<String, ClientFfiError> {
-    let value = value.trim().to_owned();
-    if value.is_empty() || value.len() > 512 {
-        return Err(invalid_artifact());
-    }
-    Ok(value)
-}
-
-fn invalid_artifact() -> ClientFfiError {
-    ClientFfiError::new(
-        "artifact identity or immutable metadata is incomplete",
-        INVALID_ARTIFACT_ACTION_CODE,
-    )
-}
-
-fn map_authority_error(error: GatewayHttpAuthorityError) -> ClientFfiError {
-    match error {
-        GatewayHttpAuthorityError::Terminal(_) => ClientFfiError::new(
-            "Gateway session must be authenticated again",
-            ARTIFACT_AUTHENTICATION_CODE,
-        ),
-        GatewayHttpAuthorityError::TemporarilyUnavailable => ClientFfiError::new(
-            "Gateway session is unavailable for artifact access",
-            ARTIFACT_AUTHENTICATION_CODE,
-        ),
-    }
-}
-
-fn map_rpc_error(error: anyhow::Error) -> ClientFfiError {
-    let message = format!("{error:#}");
-    let lower = message.to_ascii_lowercase();
-    let code = if lower.contains("unauthorized") || lower.contains("authentication") {
-        ARTIFACT_AUTHENTICATION_CODE
-    } else if lower.contains("forbidden") || lower.contains("not found") {
-        "artifact_revoked_or_unavailable"
-    } else {
-        "artifact_action_failed"
-    };
-    ClientFfiError::new("artifact action failed", code)
-}
-
-fn map_http_error(error: GatewayHttpError) -> ClientFfiError {
-    let code = match error {
-        GatewayHttpError::InvalidEndpoint
-        | GatewayHttpError::GatewayPinMismatch
-        | GatewayHttpError::SessionMismatch => ARTIFACT_RECONFIGURATION_CODE,
-        GatewayHttpError::AuthenticationTerminal(_)
-        | GatewayHttpError::AuthenticationUnavailable
-        | GatewayHttpError::Unauthorized => ARTIFACT_AUTHENTICATION_CODE,
-        GatewayHttpError::Forbidden | GatewayHttpError::NotFound => {
-            "artifact_revoked_or_unavailable"
-        }
-        _ => "artifact_action_failed",
-    };
-    ClientFfiError::new("artifact HTTP action failed", code)
-}
-
-fn map_download_error(error: ArtifactHttpDownloadError) -> ClientFfiError {
-    let code = match error {
-        ArtifactHttpDownloadError::Authentication => ARTIFACT_AUTHENTICATION_CODE,
-        ArtifactHttpDownloadError::RevokedOrUnavailable => "artifact_revoked_or_unavailable",
-        other => other.code(),
-    };
-    ClientFfiError::new("artifact download failed", code)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pioneer_client::artifacts::{
+        http_download::ArtifactHttpDownloadProgress, operations::ArtifactDownloadTarget,
+    };
 
     #[test]
-    fn progress_and_cancel_contract_is_secret_free_and_deterministic() {
-        let downloads = ClientFfiArtifactDownloads::default();
-        let operation = downloads.begin("mobile-download-1").expect("begin");
+    fn ffi_progress_and_cancellation_read_the_direct_client_download_owner() {
+        let runtime = crate::ClientFfiRuntime::default();
+        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+        let core = &runtime.client_runtime.core;
+        let operation = core
+            .begin_artifact_download(
+                "synthetic".into(),
+                ArtifactDownloadTarget {
+                    thread_id: Some("thread".into()),
+                    workspace_id: "workspace".into(),
+                    artifact_id: "artifact".into(),
+                    version_id: Some("version".into()),
+                },
+            )
+            .unwrap();
         operation.update_progress(ArtifactHttpDownloadProgress {
             downloaded_bytes: 7,
             total_bytes: 10,
             resumed_from_bytes: 3,
         });
-        let progress = downloads
-            .progress(ClientArtifactDownloadOperationRequest {
-                operation_id: "mobile-download-1".to_owned(),
-            })
-            .expect("progress");
-        assert_eq!(progress.state, ClientArtifactDownloadState::Downloading);
-        assert_eq!(progress.downloaded_bytes, 7);
-        assert_eq!(progress.resumed_from_bytes, 3);
-
-        let cancelled = downloads
-            .cancel(ClientArtifactDownloadOperationRequest {
-                operation_id: "mobile-download-1".to_owned(),
-            })
-            .expect("cancel");
-        assert!(cancelled.cancelled);
-        assert!(operation.cancellation.is_cancelled());
+        let input = serde_json::json!({"operation_id": "synthetic", "generation": operation.identity().generation}).to_string();
+        let wire = runtime.artifact_download_progress(&input).unwrap();
+        let direct = core.artifact_download_snapshot("synthetic").unwrap();
+        assert_eq!(wire.state, ClientArtifactDownloadState::Downloading);
+        assert_eq!(wire.downloaded_bytes, direct.downloaded_bytes);
+        assert_eq!(wire.resumed_from_bytes, direct.resumed_from_bytes);
+        assert!(runtime.artifact_download_cancel(&input).unwrap().cancelled);
+        assert!(!runtime.artifact_download_cancel(&input).unwrap().cancelled);
+        assert!(operation.cancellation().is_cancelled());
+        assert!(!operation.finish(ArtifactDownloadState::Completed, None));
         assert_eq!(
-            downloads
-                .progress(ClientArtifactDownloadOperationRequest {
-                    operation_id: "mobile-download-1".to_owned(),
-                })
-                .expect("cancelled progress")
-                .state,
+            runtime.artifact_download_progress(&input).unwrap().state,
             ClientArtifactDownloadState::Cancelled
         );
     }
 
     #[test]
-    fn operation_registry_bounds_active_and_terminal_entries() {
-        let downloads = ClientFfiArtifactDownloads::default();
-        let active = (0..MAX_ACTIVE_DOWNLOAD_OPERATIONS)
-            .map(|index| downloads.begin(format!("active-{index}").as_str()).unwrap())
-            .collect::<Vec<_>>();
-        let error = match downloads.begin("active-overflow") {
-            Ok(_) => panic!("active download capacity must be bounded"),
-            Err(error) => error,
+    fn ffi_cancel_replay_cannot_cancel_a_reused_operation_id() {
+        let runtime = crate::ClientFfiRuntime::default();
+        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
+        let core = &runtime.client_runtime.core;
+        let target = ArtifactDownloadTarget {
+            thread_id: Some("thread".into()),
+            workspace_id: "workspace".into(),
+            artifact_id: "artifact".into(),
+            version_id: None,
         };
-        assert_eq!(error.code, "artifact_download_capacity");
-
-        for operation in active {
-            assert!(operation.finish(OPERATION_COMPLETED, None));
-        }
-        for index in 0..(MAX_TRACKED_DOWNLOAD_OPERATIONS + 10) {
-            let operation = downloads
-                .begin(format!("terminal-{index}").as_str())
-                .unwrap();
-            assert!(operation.finish(OPERATION_COMPLETED, None));
-        }
-        assert!(downloads.operations.lock().unwrap().len() <= MAX_TRACKED_DOWNLOAD_OPERATIONS);
-    }
-
-    #[test]
-    fn cancellation_is_terminal_against_late_progress_and_completion() {
-        let operation = ArtifactDownloadOperation::new();
-        operation.cancellation.cancel();
-        assert!(operation.finish(OPERATION_CANCELLED, Some("cancelled".to_owned())));
-
-        operation.update_progress(ArtifactHttpDownloadProgress {
-            downloaded_bytes: 9,
-            total_bytes: 10,
-            resumed_from_bytes: 0,
-        });
-
-        assert!(!operation.finish(OPERATION_COMPLETED, None));
-        assert_eq!(
-            operation.snapshot("cancelled-operation".to_owned()).state,
-            ClientArtifactDownloadState::Cancelled
+        let old = core
+            .begin_artifact_download("operation".into(), target.clone())
+            .unwrap();
+        let request = serde_json::json!({"operation_id":"operation", "generation": old.identity().generation}).to_string();
+        assert!(
+            runtime
+                .artifact_download_cancel(&request)
+                .unwrap()
+                .cancelled
         );
+        let next = core
+            .begin_artifact_download("operation".into(), target)
+            .unwrap();
+        assert!(
+            !runtime
+                .artifact_download_cancel(&request)
+                .unwrap()
+                .cancelled
+        );
+        assert!(runtime.artifact_download_progress(&request).is_err());
+        assert!(!next.cancellation().is_cancelled());
+        assert!(!old.finish(ArtifactDownloadState::Completed, None));
     }
 
     #[test]

@@ -3,11 +3,7 @@ use pioneer_client::{
     rpc::WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE,
     transport::ws::{command_sender as ws_commands, worker},
 };
-use pioneer_protocol::{
-    ThreadReadParams, ThreadReadResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
-    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageErrorReason,
-    TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
-};
+use pioneer_protocol::{ThreadReadParams, ThreadReadResponse, TurnMessageErrorReason};
 
 pub const TIMELINE_ERROR_CANCELLED: &str = "pioneer_timeline_cancelled";
 pub const TIMELINE_ERROR_RECONNECT_REQUIRED: &str = "pioneer_timeline_reconnect_required";
@@ -19,27 +15,6 @@ pub const TURN_MESSAGE_ERROR_IMMUTABLE: &str = "pioneer_turn_message_immutable";
 pub const TURN_MESSAGE_ERROR_DELETED: &str = "pioneer_turn_message_deleted";
 pub const TURN_MESSAGE_ERROR_REVISION_CONFLICT: &str = "pioneer_turn_message_revision_conflict";
 pub const THREAD_READ_ERROR: &str = "pioneer_thread_read_error";
-
-pub fn turn_message_edit(
-    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
-    params: TurnMessageEditParams,
-) -> Result<TurnMessageEditResponse, ClientFfiError> {
-    ws_commands::turn_message_edit(transport, params).map_err(map_turn_message_error)
-}
-
-pub fn turn_message_delete(
-    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
-    params: TurnMessageDeleteParams,
-) -> Result<TurnMessageDeleteResponse, ClientFfiError> {
-    ws_commands::turn_message_delete(transport, params).map_err(map_turn_message_error)
-}
-
-pub fn turn_message_revisions_page(
-    transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,
-    params: TurnMessageRevisionsPageParams,
-) -> Result<TurnMessageRevisionsPageResponse, ClientFfiError> {
-    ws_commands::turn_message_revisions_page(transport, params).map_err(map_turn_message_error)
-}
 
 pub fn thread_read(
     transport: &impl pioneer_client::rpc::JsonRpcRequestTransport,

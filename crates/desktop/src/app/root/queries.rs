@@ -48,16 +48,30 @@ impl PioneerDesktop {
     pub(in crate::app) fn can_manage_thread_presentation(&self, thread_id: &str) -> bool {
         self.principal_presentation_capabilities()
             .can_manage_all_threads
-            || (self.thread_scope_capabilities_thread_id.as_deref() == Some(thread_id)
-                && self.thread_scope_capabilities.can_manage_thread)
+            || self
+                .thread_presentation_capabilities(thread_id)
+                .is_some_and(|capabilities| capabilities.can_manage_thread)
     }
 
     pub(in crate::app) fn thread_presentation_capabilities(
         &self,
         thread_id: &str,
     ) -> Option<ThreadPresentationCapabilities> {
-        (self.thread_scope_capabilities_thread_id.as_deref() == Some(thread_id))
-            .then_some(self.thread_scope_capabilities)
+        self.gateway
+            .client_runtime
+            .client_core()
+            .thread_capability_snapshot(thread_id)
+            .and_then(|publication| {
+                publication
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.thread.as_ref())
+                    .map(|thread| {
+                        pioneer_client::authorization::thread_presentation_capabilities(Some(
+                            &thread.capabilities,
+                        ))
+                    })
+            })
     }
 
     pub(in crate::app) fn can_write_active_thread_presentation(&self) -> bool {
@@ -162,21 +176,6 @@ impl PioneerDesktop {
             },
             |thread_id| self.artifact_presentation_policy_for_thread(thread_id),
         )
-    }
-
-    pub(in crate::app) fn authorized_composer_permission_options(
-        &self,
-    ) -> Vec<pioneer_client::composer::permissions::ComposerPermissionModeOption> {
-        self.gateway
-            .capability_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.workspace.as_ref())
-            .map(|workspace| {
-                pioneer_client::composer::permissions::authorized_composer_permission_mode_options(
-                    workspace.capabilities.agent_permission_options.as_slice(),
-                )
-            })
-            .unwrap_or_default()
     }
 
     pub(in crate::app) fn authorized_invitation_role_options(
@@ -325,30 +324,6 @@ impl PioneerDesktop {
             .and_then(|s| s.cli_binding().cloned())
     }
 
-    pub(in crate::app) fn composer_selected_provider_is_cli_runtime(&self) -> bool {
-        self.composer_selected_provider
-            .as_deref()
-            .and_then(provider_list::runtime_id_from_cli_runtime_provider_key)
-            .is_some()
-    }
-
-    pub(in crate::app) fn effective_composer_capabilities(&self) -> Vec<ComposerCapability> {
-        self.composer_submission_plan("", false).capabilities
-    }
-
-    pub(in crate::app) fn composer_submission_plan(
-        &self,
-        text: &str,
-        has_attachments: bool,
-    ) -> ComposerSubmissionPlan {
-        composer_submission_plan_for_provider(
-            self.composer_selected_provider.as_deref(),
-            text,
-            has_attachments,
-            self.composer_capabilities.as_slice(),
-        )
-    }
-
     pub(in crate::app) fn model_selector_workspace_id(&self) -> String {
         client_selectors::model_selector_workspace_id_from(
             self.active_workspace_id(),
@@ -467,7 +442,7 @@ impl PioneerDesktop {
 
 impl PioneerDesktop {
     pub(crate) fn workspace_context_locked(&self) -> bool {
-        self.composer_upload_in_progress || self.desktop_voice_context_locked()
+        self.composer_upload_in_progress() || self.desktop_voice_context_locked()
     }
 }
 

@@ -1,8 +1,7 @@
 //! Shell-neutral reductions for voice session command responses and events.
 
 use pioneer_protocol::{
-    VoiceError, VoiceSessionFinalizeResponse, VoiceSessionOutcome, VoiceSessionResultNotification,
-    VoiceStatus,
+    VoiceSessionFinalizeResponse, VoiceSessionOutcome, VoiceSessionResultNotification,
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,3 +125,5 @@ mod tests {
         );
     }
 }
+
+pub use pioneer_protocol::{VoiceError, VoiceStatus};

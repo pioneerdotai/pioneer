@@ -422,7 +422,8 @@ impl PioneerDesktop {
                 .when(loading, |this| {
                     this.child(crate::qualification_diagnostics::spinner!(
                         pioneer_observability::AnimationSourceId::InvitationJoin,
-                    )).child(
+                    ))
+                    .child(
                         div()
                             .text_sm()
                             .opacity(0.65)

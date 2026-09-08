@@ -527,7 +527,38 @@ impl ClientCore {
             .pending_for_scope(workspace, thread)
     }
 
+    pub(crate) fn pending_request_for_action(
+        &self,
+        thread: &str,
+        request_id: &str,
+    ) -> Option<(PendingRequest, u64)> {
+        let registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let workspace = &registry.stores.get(thread)?.coordinator.workspace_id;
+        let request = registry
+            .pending_requests
+            .pending_for_scope(Some(workspace), Some(thread))
+            .into_iter()
+            .find(|request| request.request_id == request_id)?;
+        let generation = registry.pending_requests.request_generation(request_id)?;
+        Some((request, generation))
+    }
+
     pub fn apply_pending_requests(&self, reduction: PendingRequestsReduction) -> bool {
+        let changed = self.apply_pending_requests_matching(reduction, None);
+        if changed {
+            self.refresh_approval_actions();
+        }
+        changed
+    }
+
+    pub(crate) fn apply_pending_requests_matching(
+        &self,
+        reduction: PendingRequestsReduction,
+        expected: Option<(&PendingRequest, u64)>,
+    ) -> bool {
         if self.is_stopped() {
             return false;
         }
@@ -535,6 +566,16 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        if let Some((request, generation)) = expected {
+            if registry.pending_requests.request(&request.request_id) != Some(request)
+                || registry
+                    .pending_requests
+                    .request_generation(&request.request_id)
+                    != Some(generation)
+            {
+                return false;
+            }
+        }
         let before = registry.pending_requests.requests().to_vec();
         if !registry.pending_requests.apply(reduction) {
             return false;
@@ -763,6 +804,16 @@ impl ClientCore {
         registry.ready_resume_set.clear();
     }
     pub fn remove_thread_store(&self, id: &str) {
+        self.cancel_artifact_downloads(Some(id));
+        self.cancel_composer_requests_for_thread(id);
+        self.invalidate_task_reviews(Some(id));
+        self.invalidate_approval_actions(Some(id));
+        self.invalidate_message_revisions(Some(id));
+        self.invalidate_message_deletions(Some(id));
+        self.invalidate_turn_cancellations(Some(id));
+        self.invalidate_thread_capabilities(Some(id));
+        self.invalidate_thread_members(Some(id));
+        self.invalidate_artifacts(Some(id));
         let workspace = self
             .thread_coordinator_snapshot(id)
             .map(|c| c.workspace_id.clone());
@@ -798,6 +849,16 @@ impl ClientCore {
         );
     }
     pub fn clear_thread_stores(&self) {
+        self.cancel_artifact_downloads(None);
+        self.cancel_composer_requests();
+        self.invalidate_task_reviews(None);
+        self.invalidate_approval_actions(None);
+        self.invalidate_message_revisions(None);
+        self.invalidate_message_deletions(None);
+        self.invalidate_turn_cancellations(None);
+        self.invalidate_thread_capabilities(None);
+        self.invalidate_thread_members(None);
+        self.invalidate_artifacts(None);
         let ids = {
             let registry = self
                 .thread_registry
@@ -1025,6 +1086,9 @@ fn request_thread_id(key: &SemanticTimelineRequestKey) -> &str {
 
 impl ClientCore {
     pub fn cancel_thread_requests(&self) {
+        // Retire optimistic cancellation before advancing the thread incarnation.
+        // Otherwise a disconnected request would leave the turn in Cancelling.
+        self.invalidate_turn_cancellations(None);
         let mut registry = self
             .thread_registry
             .lock()
@@ -1090,6 +1154,8 @@ impl ClientCore {
             drafts,
             Vec::new(),
         );
+        drop(registry);
+        self.observe_composer_runtime(id, None, false);
     }
 }
 
@@ -1217,33 +1283,6 @@ impl ClientCore {
             Vec::new(),
         );
         patch
-    }
-    pub fn request_thread_cancel(
-        &self,
-        id: &str,
-        reason: Option<String>,
-    ) -> Option<(String, pioneer_protocol::TurnCancelParams)> {
-        let mut coordinator = self.existing_thread_mutation(id)?;
-        let turn = coordinator.conversation.in_flight_turn_id()?.to_owned();
-        let request = crate::turns::cancel::plan_turn_cancel_request(
-            id.to_owned(),
-            turn.clone(),
-            coordinator.conversation.is_cancelling_turn(),
-            reason,
-        )?;
-        coordinator.conversation.apply(request.requested_event);
-        Some((turn, request.params))
-    }
-    pub fn reject_thread_cancel(&self, id: &str, turn: &str, error: &str) {
-        if let Some(mut coordinator) = self.existing_thread_mutation(id) {
-            coordinator
-                .conversation
-                .apply(crate::turns::cancel::local_turn_cancel_rejected_event(
-                    id.to_owned(),
-                    turn.to_owned(),
-                    error.to_owned(),
-                ));
-        }
     }
 }
 
@@ -4349,6 +4388,8 @@ impl ClientCore {
                 drafts,
                 vec![],
             );
+            drop(registry);
+            self.observe_composer_runtime(id, None, false);
         } else {
             let result = self.refresh_thread_subscription_generation(
                 &self.compatibility_runtime().ws_command_sender(),
@@ -4380,6 +4421,7 @@ impl ClientCore {
 }
 
 /// Identifies an operation's original store incarnation across asynchronous I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadOperationToken {
     id: String,
     generation: u64,
@@ -5006,5 +5048,92 @@ impl ClientCore {
             }
         }
         self.transition(authority, drafts, effects)
+    }
+}
+
+impl ClientCore {
+    pub(crate) fn begin_thread_turn_cancellation(
+        &self,
+        id: &str,
+        reason: Option<String>,
+    ) -> Option<(ThreadOperationToken, pioneer_protocol::TurnCancelParams)> {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let store = registry.stores.get_mut(id)?;
+        let turn = store
+            .coordinator
+            .conversation
+            .in_flight_turn_id()?
+            .to_owned();
+        let request = crate::turns::cancel::plan_turn_cancel_request(
+            id,
+            turn,
+            store.coordinator.conversation.is_cancelling_turn(),
+            reason,
+        )?;
+        let token = ThreadOperationToken {
+            id: id.into(),
+            generation: store.generation,
+        };
+        store
+            .coordinator
+            .conversation
+            .apply(request.requested_event);
+        let drafts = registry.publish(id);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
+        Some((token, request.params))
+    }
+    pub(crate) fn finish_thread_turn_cancellation(
+        &self,
+        token: &ThreadOperationToken,
+        turn: &str,
+        event: Option<crate::conversation::events::ConversationEvent>,
+        abandoned: bool,
+    ) -> bool {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let Some(store) = registry
+            .stores
+            .get_mut(&token.id)
+            .filter(|s| s.generation == token.generation)
+        else {
+            return false;
+        };
+        if store.coordinator.conversation.in_flight_turn_id() != Some(turn)
+            || !store.coordinator.conversation.is_cancelling_turn()
+        {
+            return false;
+        }
+        if abandoned {
+            store
+                .coordinator
+                .conversation
+                .abandon_turn_cancellation(turn);
+        } else if let Some(event) = event {
+            store.coordinator.conversation.apply(event.clone());
+            crate::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+                &mut store.semantic,
+                &store.coordinator.workspace_id,
+                &event,
+                crate::timeline::labels::now_unix_ms(),
+            );
+        }
+        let drafts = registry.publish(&token.id);
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
+        true
     }
 }

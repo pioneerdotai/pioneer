@@ -64,6 +64,33 @@ pub fn plan_mark_thread_read(context: MarkThreadReadContext<'_>) -> Option<Threa
     })
 }
 
+impl crate::core::ClientCore {
+    /// Executes the existing viewport's immutable read plan without changing its policy.
+    pub fn read_thread_cursor(
+        &self,
+        params: ThreadReadParams,
+    ) -> anyhow::Result<pioneer_protocol::ThreadReadResponse> {
+        let token = self.thread_operation_token(&params.thread_id);
+        let auth = self.current_auth_ticket();
+        anyhow::ensure!(
+            !self.is_stopped() && token.is_some(),
+            "thread read scope is unavailable"
+        );
+        let response = self
+            .compatibility_runtime()
+            .ws_command_sender()
+            .thread_read(params.clone())?;
+        anyhow::ensure!(
+            !self.is_stopped()
+                && self.current_auth_ticket() == auth
+                && self.thread_operation_token(&params.thread_id) == token
+                && response.thread_id == params.thread_id,
+            "thread read scope retired"
+        );
+        Ok(response)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

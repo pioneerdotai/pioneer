@@ -2,6 +2,20 @@ use super::*;
 use pioneer_protocol::{Thread, TurnKind, TurnStatus};
 
 impl Conversation {
+    pub(crate) fn abandon_turn_cancellation(&mut self, turn: &str) {
+        if self.in_flight_turn_id() != Some(turn) || !self.is_cancelling_turn() {
+            return;
+        }
+        self.state_machine
+            .apply(&ConversationEvent::LocalTurnCancelRejected {
+                thread_id: self.thread_id.clone(),
+                turn_id: turn.into(),
+                error: String::new(),
+            });
+        self.projector.sync_flow_state(&self.state_machine);
+        self.projector.bump_revision();
+    }
+
     pub fn new(thread_id: impl Into<String>) -> Self {
         let mut conversation = Self {
             thread_id: thread_id.into(),

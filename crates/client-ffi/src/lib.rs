@@ -25,7 +25,6 @@ mod timeline;
 mod workspaces;
 
 use active_thread::{
-    ClientActiveThreadCancelTurnRequest, ClientActiveThreadCancelTurnResult,
     ClientActiveThreadClearResult, ClientActiveThreadEventRequest, ClientActiveThreadEventResult,
     ClientActiveThreadOpenByIdRequest, ClientActiveThreadOpenRequest,
     ClientActiveThreadSendTextRequest, ClientActiveThreadSendTextResult,
@@ -54,14 +53,12 @@ use composer::{
     ClientComposerCapabilityTargetRequest, ClientComposerDomainTransitionRequest,
     ClientComposerDraftLifecycleTransitionRequest, ClientComposerFilterMcpRowsRequest,
     ClientComposerFilterMcpRowsResult, ClientComposerFilterSkillRowsRequest,
-    ClientComposerMcpCapabilityFromRowRequest, ClientComposerMcpPickerRowsRequest,
-    ClientComposerMcpPickerRowsResult, ClientComposerMcpToggleRequest,
+    ClientComposerMcpCapabilityFromRowRequest, ClientComposerMcpToggleRequest,
     ClientComposerMcpToggleResult, ClientComposerSkillCapabilityFromRowRequest,
-    ClientComposerSkillPickerRowsRequest, ClientComposerSkillRowsForTargetRequest,
-    ClientComposerSkillToggleRequest, ClientComposerSkillToggleResult,
-    ClientComposerSubmissionPlanRequest, composer_attachment_from_path_request,
-    composer_capability_menu, composer_capability_target, composer_domain_transition,
-    composer_draft_lifecycle_transition, composer_mcp_picker_rows, composer_skill_picker_rows,
+    ClientComposerSkillRowsForTargetRequest, ClientComposerSkillToggleRequest,
+    ClientComposerSkillToggleResult, ClientComposerSubmissionPlanRequest,
+    composer_attachment_from_path_request, composer_capability_menu, composer_capability_target,
+    composer_domain_transition, composer_draft_lifecycle_transition,
     composer_skill_rows_for_target, composer_submission_plan, filter_mcp_picker_rows,
     filter_skill_picker_rows, mcp_capability_from_row, skill_capability_from_row,
     toggle_mcp_picker_selection, toggle_skill_picker_selection, update_composer_attachments,
@@ -133,24 +130,18 @@ use pioneer_protocol::TimelinePageAnchor;
 use pioneer_protocol::{
     CLIRuntimeListModelsParams, CLIRuntimeListModelsResponse, CLIRuntimeListParams,
     CLIRuntimeListResponse, CLIRuntimeRefreshParams, CLIRuntimeRefreshResponse,
-    CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
-    CLIRuntimeReviewStartResponse, CLIRuntimeThreadBindingGetParams,
-    CLIRuntimeThreadBindingGetResponse, CLIRuntimeThreadCompactParams,
-    CLIRuntimeThreadCompactResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    TaskAcceptParams, TaskAcceptResponse, TaskCancelParams, TaskCancelResponse, TaskReviseParams,
-    TaskReviseResponse, TaskUserNotificationAcknowledgeParams,
-    TaskUserNotificationAcknowledgeResponse, TaskUserNotificationListParams,
-    TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams, ThreadAgentsDocArchiveResponse,
-    ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse, ThreadAgentsDocSaveParams,
-    ThreadAgentsDocSaveResponse, ThreadReadParams, ThreadReadResponse, ThreadTimelinePageParams,
-    ThreadTimelinePageResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
-    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageRevisionsPageParams,
-    TurnMessageRevisionsPageResponse, TurnPermissionRequestRespondParams,
-    TurnPermissionRequestRespondResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams,
-    VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
-    VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
+    CLIRuntimeReviewStartParams, CLIRuntimeReviewStartResponse, CLIRuntimeThreadCompactParams,
+    CLIRuntimeThreadCompactResponse, ProviderListModelsParams, ProviderListModelsResponse,
+    ProviderListParams, ProviderListResponse, TaskAcceptParams, TaskAcceptResponse,
+    TaskCancelParams, TaskCancelResponse, TaskReviseParams, TaskReviseResponse,
+    TaskUserNotificationAcknowledgeParams, TaskUserNotificationAcknowledgeResponse,
+    TaskUserNotificationListParams, TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams,
+    ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadReadParams, ThreadReadResponse,
+    ThreadTimelinePageParams, ThreadTimelinePageResponse, TurnMessageRevisionsPageResponse,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    VoiceAudioFormat, VoiceSessionCancelResponse, VoiceSessionFinalizeResponse,
+    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
 };
 use presentation::{
     ClientArtifactPresentationPolicyRequest, ClientAuthorizationProjectionAcceptRequest,
@@ -208,7 +199,6 @@ struct ClientFfiRuntime {
     legacy_authorization_generation: Mutex<u64>,
     legacy_authorization_change_sequence: AtomicU64,
     diagnostics: ClientFfiDiagnostics,
-    artifact_downloads: artifacts::ClientFfiArtifactDownloads,
     avatar_cache: ClientFfiAvatarCache,
     invitation_commit_sequence: AtomicU64,
     invitation_commits:
@@ -228,7 +218,6 @@ impl Default for ClientFfiRuntime {
             legacy_authorization_generation: Default::default(),
             legacy_authorization_change_sequence: Default::default(),
             diagnostics: Default::default(),
-            artifact_downloads: Default::default(),
             avatar_cache: Default::default(),
             invitation_commit_sequence: Default::default(),
             invitation_commits: Default::default(),
@@ -314,6 +303,7 @@ pub struct ClientFfiGatewayDisconnectResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientFfiVoiceAudioChunkParams {
+    pub operation: pioneer_client::composer::store::ComposerOperationIdentity,
     pub session_id: String,
     pub sequence: u64,
     pub audio_format: VoiceAudioFormat,
@@ -410,7 +400,12 @@ impl ClientFfiRuntime {
                 ..
             } if matches!(
                 scope,
-                ClientScope::Thread { .. } | ClientScope::Timeline { .. }
+                ClientScope::Thread { .. }
+                    | ClientScope::Timeline { .. }
+                    | ClientScope::TaskReview { .. }
+                    | ClientScope::ThreadCapability { .. }
+                    | ClientScope::ThreadMember { .. }
+                    | ClientScope::Artifact { .. }
             ) =>
             {
                 Some(scope.clone())
@@ -1685,7 +1680,7 @@ impl ClientFfiRuntime {
     }
 
     fn gateway_disconnect(&self) -> Result<ClientFfiGatewayDisconnectResult, String> {
-        self.artifact_downloads.cancel_all();
+        self.client_runtime.core.cancel_artifact_downloads(None);
         self.client_runtime
             .ws_command_sender()
             .disconnect()
@@ -1716,7 +1711,7 @@ impl ClientFfiRuntime {
                     artifacts::INVALID_ARTIFACT_ACTION_CODE,
                 )
             })?;
-        artifacts::open_artifact_view(&self.client_runtime.ws_command_sender(), request)
+        artifacts::open_artifact_view(&self.client_runtime.core, request)
     }
 
     fn thread_file_view_open(
@@ -1747,12 +1742,7 @@ impl ClientFfiRuntime {
                 )
             })?;
         let runtime_home = self.native_cache_runtime_home()?;
-        artifacts::download_artifact(
-            &self.client_runtime.ws_command_sender(),
-            &self.artifact_downloads,
-            runtime_home,
-            request,
-        )
+        artifacts::download_artifact(&self.client_runtime.core, runtime_home, request)
     }
 
     fn artifact_download_progress(
@@ -1767,7 +1757,7 @@ impl ClientFfiRuntime {
                     artifacts::INVALID_ARTIFACT_ACTION_CODE,
                 )
             })?;
-        self.artifact_downloads.progress(request)
+        artifacts::download_progress(&self.client_runtime.core, request)
     }
 
     fn artifact_download_cancel(
@@ -1782,7 +1772,7 @@ impl ClientFfiRuntime {
                     artifacts::INVALID_ARTIFACT_ACTION_CODE,
                 )
             })?;
-        self.artifact_downloads.cancel(request)
+        artifacts::cancel_download(&self.client_runtime.core, request)
     }
 
     fn native_cache_runtime_home(&self) -> Result<std::path::PathBuf, ClientFfiError> {
@@ -2087,19 +2077,6 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
-    fn cli_runtime_thread_binding_get(
-        &self,
-        input_json: &str,
-    ) -> Result<CLIRuntimeThreadBindingGetResponse, String> {
-        let params = serde_json::from_str::<CLIRuntimeThreadBindingGetParams>(input_json)
-            .map_err(|error| format!("invalid CLI runtime thread binding get params: {error}"))?;
-
-        self.client_runtime
-            .ws_command_sender()
-            .cli_runtime_thread_binding_get(params)
-            .map_err(|error| format!("{error:#}"))
-    }
-
     fn cli_runtime_thread_compact(
         &self,
         input_json: &str,
@@ -2113,19 +2090,6 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
-    fn cli_runtime_turn_steer(
-        &self,
-        input_json: &str,
-    ) -> Result<CLIRuntimeTurnSteerResponse, String> {
-        let params = serde_json::from_str::<CLIRuntimeTurnSteerParams>(input_json)
-            .map_err(|error| format!("invalid CLI runtime turn steer params: {error}"))?;
-
-        self.client_runtime
-            .ws_command_sender()
-            .cli_runtime_turn_steer(params)
-            .map_err(|error| format!("{error:#}"))
-    }
-
     fn cli_runtime_review_start(
         &self,
         input_json: &str,
@@ -2136,32 +2100,6 @@ impl ClientFfiRuntime {
         self.client_runtime
             .ws_command_sender()
             .cli_runtime_review_start(params)
-            .map_err(|error| format!("{error:#}"))
-    }
-
-    fn cli_runtime_request_respond(
-        &self,
-        input_json: &str,
-    ) -> Result<CLIRuntimeRequestRespondResponse, String> {
-        let params = serde_json::from_str::<CLIRuntimeRequestRespondParams>(input_json)
-            .map_err(|error| format!("invalid CLI runtime request respond params: {error}"))?;
-
-        self.client_runtime
-            .ws_command_sender()
-            .cli_runtime_request_respond(params)
-            .map_err(|error| format!("{error:#}"))
-    }
-
-    fn turn_permission_request_respond(
-        &self,
-        input_json: &str,
-    ) -> Result<TurnPermissionRequestRespondResponse, String> {
-        let params = serde_json::from_str::<TurnPermissionRequestRespondParams>(input_json)
-            .map_err(|error| format!("invalid turn permission request respond params: {error}"))?;
-
-        self.client_runtime
-            .ws_command_sender()
-            .turn_permission_request_respond(params)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2233,24 +2171,27 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("{error:#}"))
     }
 
-    fn voice_session_start(&self, input_json: &str) -> Result<VoiceSessionStartResponse, String> {
-        let params = serde_json::from_str::<VoiceSessionStartParams>(input_json)
-            .map_err(|error| format!("invalid voice session start params: {error}"))?;
-
-        // Voice sessions are scoped to both workspace and thread on the active
-        // connection. Always restore that scope first so a recent workspace
-        // switch or access-token rotation cannot start Voice on a stale socket.
-        self.active_thread
-            .ensure_thread_subscription(
-                &self.client_runtime,
-                params.context.thread_id.as_str(),
-                params.context.workspace_id.clone(),
-            )
-            .map_err(|error| format!("{error:#}"))?;
-
+    fn composer_voice_capture_plan(
+        &self,
+        input_json: &str,
+    ) -> Result<pioneer_client::composer::store::ComposerOperationPlan, String> {
+        let identity = serde_json::from_str::<
+            pioneer_client::composer::store::ComposerOperationIdentity,
+        >(input_json)
+        .map_err(|error| format!("invalid voice operation identity: {error}"))?;
         self.client_runtime
-            .ws_command_sender()
-            .voice_session_start(params)
+            .core
+            .prepare_composer_voice_capture(identity)
+            .map_err(|error| format!("{error:#}"))
+    }
+    fn voice_session_start(&self, input_json: &str) -> Result<VoiceSessionStartResponse, String> {
+        let request = serde_json::from_str::<
+            pioneer_client::composer::voice::ComposerVoiceStartRequest,
+        >(input_json)
+        .map_err(|error| format!("invalid voice session start params: {error}"))?;
+        self.client_runtime
+            .core
+            .start_composer_voice_session(request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2263,8 +2204,9 @@ impl ClientFfiRuntime {
             .map_err(|error| format!("invalid voice audio chunk params: {error}"))?;
 
         self.client_runtime
-            .ws_command_sender()
-            .send_voice_audio_chunk(
+            .core
+            .send_composer_voice_audio_chunk(
+                &params.operation,
                 params.session_id,
                 params.sequence,
                 params.audio_format,
@@ -2281,22 +2223,24 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<VoiceSessionFinalizeResponse, String> {
-        let params = serde_json::from_str::<VoiceSessionFinalizeParams>(input_json)
-            .map_err(|error| format!("invalid voice session finalize params: {error}"))?;
-
+        let request = serde_json::from_str::<
+            pioneer_client::composer::voice::ComposerVoiceFinalizeRequest,
+        >(input_json)
+        .map_err(|error| format!("invalid voice session finalize params: {error}"))?;
         self.client_runtime
-            .ws_command_sender()
-            .voice_session_finalize(params)
+            .core
+            .finalize_composer_voice_session(request)
             .map_err(|error| format!("{error:#}"))
     }
 
     fn voice_session_cancel(&self, input_json: &str) -> Result<VoiceSessionCancelResponse, String> {
-        let params = serde_json::from_str::<VoiceSessionCancelParams>(input_json)
-            .map_err(|error| format!("invalid voice session cancel params: {error}"))?;
-
+        let request = serde_json::from_str::<
+            pioneer_client::composer::voice::ComposerVoiceCancelRequest,
+        >(input_json)
+        .map_err(|error| format!("invalid voice session cancel params: {error}"))?;
         self.client_runtime
-            .ws_command_sender()
-            .voice_session_cancel(params)
+            .core
+            .cancel_composer_voice_session(request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2608,29 +2552,6 @@ impl ClientFfiRuntime {
         Ok(update_composer_attachments(request))
     }
 
-    fn composer_skill_picker_rows(
-        &self,
-        input_json: &str,
-    ) -> Result<Vec<pioneer_client::composer::capabilities::SelectableSkillCapability>, String>
-    {
-        let request = serde_json::from_str::<ClientComposerSkillPickerRowsRequest>(input_json)
-            .map_err(|error| format!("invalid composer skill picker request: {error}"))?;
-
-        composer_skill_picker_rows(&self.client_runtime.ws_command_sender(), request)
-            .map_err(|error| format!("{error:#}"))
-    }
-
-    fn composer_mcp_picker_rows(
-        &self,
-        input_json: &str,
-    ) -> Result<ClientComposerMcpPickerRowsResult, String> {
-        let request = serde_json::from_str::<ClientComposerMcpPickerRowsRequest>(input_json)
-            .map_err(|error| format!("invalid composer mcp picker request: {error}"))?;
-
-        composer_mcp_picker_rows(&self.client_runtime.ws_command_sender(), request)
-            .map_err(|error| format!("{error:#}"))
-    }
-
     fn composer_skill_pack_picker(
         &self,
         input_json: &str,
@@ -2638,8 +2559,10 @@ impl ClientFfiRuntime {
     {
         let request = serde_json::from_str::<ClientComposerSkillPackPickerRequest>(input_json)
             .map_err(|error| format!("invalid composer skill pack picker request: {error}"))?;
-        composer_skill_pack_picker(&self.client_runtime.ws_command_sender(), request)
-            .map_err(|error| format!("{error:#}"))
+        Ok(composer_skill_pack_picker(
+            &self.client_runtime.core,
+            request,
+        ))
     }
 
     fn composer_skill_selection_toggle(
@@ -2850,49 +2773,6 @@ impl ClientFfiRuntime {
             .core
             .fetch_thread_timeline_page(&self.client_runtime.ws_command_sender(), params)
             .map_err(timeline::map_timeline_page_error)
-    }
-
-    fn turn_message_edit(
-        &self,
-        input_json: &str,
-    ) -> Result<TurnMessageEditResponse, ClientFfiError> {
-        let params =
-            serde_json::from_str::<TurnMessageEditParams>(input_json).map_err(|error| {
-                ClientFfiError::new(
-                    format!("invalid Turn message edit params: {error}"),
-                    timeline::TURN_MESSAGE_ERROR_INVALID_INPUT,
-                )
-            })?;
-        timeline::turn_message_edit(&self.client_runtime.ws_command_sender(), params)
-    }
-
-    fn turn_message_delete(
-        &self,
-        input_json: &str,
-    ) -> Result<TurnMessageDeleteResponse, ClientFfiError> {
-        let params =
-            serde_json::from_str::<TurnMessageDeleteParams>(input_json).map_err(|error| {
-                ClientFfiError::new(
-                    format!("invalid Turn message delete params: {error}"),
-                    timeline::TURN_MESSAGE_ERROR_INVALID_INPUT,
-                )
-            })?;
-        timeline::turn_message_delete(&self.client_runtime.ws_command_sender(), params)
-    }
-
-    fn turn_message_revisions_page(
-        &self,
-        input_json: &str,
-    ) -> Result<TurnMessageRevisionsPageResponse, ClientFfiError> {
-        let params = serde_json::from_str::<TurnMessageRevisionsPageParams>(input_json).map_err(
-            |error| {
-                ClientFfiError::new(
-                    format!("invalid Turn message revisions params: {error}"),
-                    timeline::TURN_MESSAGE_ERROR_INVALID_INPUT,
-                )
-            },
-        )?;
-        timeline::turn_message_revisions_page(&self.client_runtime.ws_command_sender(), params)
     }
 
     fn message_revision_page_presentation(
@@ -3172,18 +3052,6 @@ impl ClientFfiRuntime {
 
         self.active_thread
             .prepare_voice_composer_snapshot(&self.client_runtime, request)
-            .map_err(|error| format!("{error:#}"))
-    }
-
-    fn active_thread_cancel_turn(
-        &self,
-        input_json: &str,
-    ) -> Result<ClientActiveThreadCancelTurnResult, String> {
-        let request = serde_json::from_str::<ClientActiveThreadCancelTurnRequest>(input_json)
-            .map_err(|error| format!("invalid active thread cancel turn request: {error}"))?;
-
-        self.active_thread
-            .cancel_turn(&self.client_runtime, request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -3752,28 +3620,12 @@ ffi_client_json_method!(
     cli_runtime_list_models
 );
 ffi_client_json_method!(
-    pioneer_client_ffi_cli_runtime_thread_binding_get,
-    cli_runtime_thread_binding_get
-);
-ffi_client_json_method!(
     pioneer_client_ffi_cli_runtime_thread_compact,
     cli_runtime_thread_compact
 );
 ffi_client_json_method!(
-    pioneer_client_ffi_cli_runtime_turn_steer,
-    cli_runtime_turn_steer
-);
-ffi_client_json_method!(
     pioneer_client_ffi_cli_runtime_review_start,
     cli_runtime_review_start
-);
-ffi_client_json_method!(
-    pioneer_client_ffi_cli_runtime_request_respond,
-    cli_runtime_request_respond
-);
-ffi_client_json_method!(
-    pioneer_client_ffi_turn_permission_request_respond,
-    turn_permission_request_respond
 );
 ffi_client_json_method!(pioneer_client_ffi_task_accept, task_accept);
 ffi_client_json_method!(pioneer_client_ffi_task_revise, task_revise);
@@ -3788,6 +3640,10 @@ ffi_client_json_method!(
 );
 ffi_client_json_method!(pioneer_client_ffi_voice_status, voice_status);
 ffi_client_json_method!(pioneer_client_ffi_voice_session_start, voice_session_start);
+ffi_client_json_method!(
+    pioneer_client_ffi_composer_voice_capture_plan,
+    composer_voice_capture_plan
+);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pioneer_client_ffi_voice_audio_chunk(
     ptr: *mut PioneerClientFfi,
@@ -3916,14 +3772,6 @@ ffi_client_json_method!(
     composer_attachments_update
 );
 ffi_client_json_method!(
-    pioneer_client_ffi_composer_skill_picker_rows,
-    composer_skill_picker_rows
-);
-ffi_client_json_method!(
-    pioneer_client_ffi_composer_mcp_picker_rows,
-    composer_mcp_picker_rows
-);
-ffi_client_json_method!(
     pioneer_client_ffi_composer_skill_pack_picker,
     composer_skill_pack_picker
 );
@@ -3990,12 +3838,6 @@ ffi_client_json_typed_method!(
     pioneer_client_ffi_thread_timeline_page,
     thread_timeline_page
 );
-ffi_client_json_typed_method!(pioneer_client_ffi_turn_message_edit, turn_message_edit);
-ffi_client_json_typed_method!(pioneer_client_ffi_turn_message_delete, turn_message_delete);
-ffi_client_json_typed_method!(
-    pioneer_client_ffi_turn_message_revisions_page,
-    turn_message_revisions_page
-);
 ffi_client_json_method!(
     pioneer_client_ffi_message_revision_page_presentation,
     message_revision_page_presentation
@@ -4034,10 +3876,6 @@ ffi_client_json_method!(
 ffi_client_json_method!(
     pioneer_client_ffi_prepare_voice_composer_snapshot,
     prepare_voice_composer_snapshot
-);
-ffi_client_json_method!(
-    pioneer_client_ffi_active_thread_cancel_turn,
-    active_thread_cancel_turn
 );
 ffi_client_json_method!(
     pioneer_client_ffi_active_thread_unsubscribe_or_close,

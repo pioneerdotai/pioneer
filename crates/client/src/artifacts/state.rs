@@ -1,11 +1,8 @@
 //! Artifact read model state.
 
-use crate::artifacts::{
-    actions::{
-        ArtifactActionStatus, ArtifactLocalFile, ArtifactVersionKey, ThreadArtifactActionState,
-        artifact_version_key,
-    },
-    preview::{ArtifactPreviewImagePaths, ThreadArtifactPreviewState},
+use crate::artifacts::actions::{
+    ArtifactActionStatus, ArtifactLocalFile, ArtifactVersionKey, ThreadArtifactActionState,
+    artifact_version_key,
 };
 use pioneer_protocol::{
     ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind, ArtifactListForThreadParams,
@@ -13,12 +10,12 @@ use pioneer_protocol::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
     time::{Duration, Instant},
 };
 
 const THREAD_ARTIFACTS_TRANSIENT_RETRY_LIMIT: u8 = 5;
-const THREAD_ARTIFACTS_TRANSIENT_RETRY_DELAYS_MS: [u64; 5] = [250, 500, 1_000, 2_000, 4_000];
+pub(crate) const THREAD_ARTIFACTS_TRANSIENT_RETRY_DELAYS_MS: [u64; 5] =
+    [250, 500, 1_000, 2_000, 4_000];
 pub const THREAD_ARTIFACT_LIST_LIMIT: u64 = 250;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -44,7 +41,6 @@ pub struct ThreadArtifactCacheEntry {
 #[derive(Clone, Debug, Default)]
 pub struct ThreadArtifactsState {
     cache: ThreadArtifactCacheState,
-    preview: ThreadArtifactPreviewState,
     actions: ThreadArtifactActionState,
     local_files_by_artifact: HashMap<ArtifactVersionKey, ArtifactLocalFile>,
 }
@@ -191,12 +187,11 @@ impl ThreadArtifactsState {
     /// Removes every in-memory artifact projection owned by the supplied
     /// threads while preserving unrelated thread caches.
     ///
-    /// Access-loss handling intentionally drops preview paths, action state,
+    /// Access-loss handling intentionally drops action state,
     /// and local-file references together with the summaries so no shell can
     /// continue presenting a protected artifact through a secondary cache.
     pub fn remove_threads(&mut self, thread_ids: &[String]) {
         let removed_artifact_keys = self.cache.remove_threads(thread_ids);
-        self.preview.remove_keys(&removed_artifact_keys);
         self.actions.remove_keys(&removed_artifact_keys);
         self.local_files_by_artifact
             .retain(|key, _| !removed_artifact_keys.contains(key));
@@ -277,38 +272,6 @@ impl ThreadArtifactsState {
 
     pub fn action_in_progress(&self, artifact: &ArtifactRef) -> bool {
         self.actions.in_progress(artifact)
-    }
-
-    pub fn preview_square_image_path(&self, artifact: &ArtifactRef) -> Option<&Path> {
-        self.preview.square_image_path(artifact)
-    }
-
-    pub fn preview_detail_image_path(&self, artifact: &ArtifactRef) -> Option<&Path> {
-        self.preview.detail_image_path(artifact)
-    }
-
-    pub fn has_loadable_preview(&self, artifact: &ArtifactRef) -> bool {
-        self.preview.has_loadable_preview(artifact)
-    }
-
-    pub fn should_load_preview(&self, artifact: &ArtifactRef) -> bool {
-        self.preview.should_load_preview(artifact)
-    }
-
-    pub fn mark_preview_loading_if_needed(&mut self, artifact: &ArtifactRef) -> bool {
-        self.preview.mark_loading_if_needed(artifact)
-    }
-
-    pub fn apply_preview_loaded(
-        &mut self,
-        artifact: &ArtifactRef,
-        image_paths: ArtifactPreviewImagePaths,
-    ) {
-        self.preview.apply_loaded(artifact, image_paths);
-    }
-
-    pub fn apply_preview_failed(&mut self, artifact: &ArtifactRef) {
-        self.preview.apply_failed(artifact);
     }
 }
 

@@ -25,7 +25,9 @@ impl PioneerDesktop {
         {
             return;
         }
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: None,
+        });
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::Mcp, cx);
         self.ensure_mcp_poller(cx);
@@ -48,14 +50,16 @@ impl PioneerDesktop {
             return;
         }
 
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: Some(server_id) });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: Some(server_id),
+        });
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::McpDetails, cx);
         self.ensure_mcp_poller(cx);
         self.refresh_mcp_server_details(cx);
     }
 
-    pub(in crate::app) fn open_mcp_server_details_from_timeline(
+    pub(crate) fn open_mcp_server_details_from_timeline(
         &mut self,
         server_id: String,
         cx: &mut Context<Self>,
@@ -66,7 +70,9 @@ impl PioneerDesktop {
         let server_id =
             mcp_list::resolve_mcp_server_id_from_timeline(self.mcp_servers.as_slice(), server_id);
 
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: Some(server_id) });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: Some(server_id),
+        });
         self.mcp_server_details = None;
         self.set_main_content_view(MainContentView::McpDetails, cx);
         self.ensure_mcp_poller(cx);
@@ -79,7 +85,9 @@ impl PioneerDesktop {
             .principal_presentation_capabilities()
             .can_manage_capabilities;
         if !can_manage_capabilities {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+                server_id: None,
+            });
             self.mcp_server_details = None;
         }
         self.set_main_content_view(mcp_details_return_view(can_manage_capabilities), cx);
@@ -348,7 +356,9 @@ impl PioneerDesktop {
         cx.emit(crate::app::SidebarChanged);
         self.mcp_servers = reduction.servers;
         self.mcp_pending_actions = reduction.pending_actions;
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: reduction.selected_server_id });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: reduction.selected_server_id,
+        });
         self.mcp_server_details = reduction.server_details;
         self.mcp_error = None;
 
@@ -377,7 +387,9 @@ impl PioneerDesktop {
     ) {
         cx.emit(crate::app::SidebarChanged);
         self.mcp_servers = reduction.servers;
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: reduction.selected_server_id });
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: reduction.selected_server_id,
+        });
         self.mcp_server_details = reduction.server_details;
         self.mcp_error = None;
     }
@@ -390,7 +402,11 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn ensure_mcp_poller(&mut self, cx: &mut Context<Self>) {
-        if self.navigation.activity(self.main_content_view(), self.window_active) != crate::desktop_navigation::RouteActivity::Active {
+        if self
+            .navigation
+            .activity(self.main_content_view(), self.window_active)
+            != crate::desktop_navigation::RouteActivity::Active
+        {
             return;
         }
         if self.mcp_poller.is_some() {
@@ -401,19 +417,23 @@ impl PioneerDesktop {
             let mut cx = cx.clone();
             async move {
                 loop {
-                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_observability::AnimationSourceId::McpPoller,
-                        pioneer_observability::DiagnosticAction::Scheduled,
-                        pioneer_observability::Visibility::Global,
-                    ));
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::McpPoller,
+                            pioneer_observability::DiagnosticAction::Scheduled,
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
                     cx.background_executor()
                         .timer(Duration::from_secs(MCP_POLL_INTERVAL_SECS))
                         .await;
-                    pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_observability::AnimationSourceId::McpPoller,
-                        pioneer_observability::DiagnosticAction::Woke,
-                        pioneer_observability::Visibility::Global,
-                    ));
+                    pioneer_observability::record_qualification_diagnostic!(
+                        record_animation_activity(
+                            pioneer_observability::AnimationSourceId::McpPoller,
+                            pioneer_observability::DiagnosticAction::Woke,
+                            pioneer_observability::Visibility::Global,
+                        )
+                    );
 
                     let updated = this.update(&mut cx, |view, cx| {
                         if matches!(
@@ -436,11 +456,13 @@ impl PioneerDesktop {
                         }
                     });
                     if updated.is_err() {
-                        pioneer_observability::record_qualification_diagnostic!(record_animation_activity(
-                            pioneer_observability::AnimationSourceId::McpPoller,
-                            pioneer_observability::DiagnosticAction::Cancelled,
-                            pioneer_observability::Visibility::Global,
-                        ));
+                        pioneer_observability::record_qualification_diagnostic!(
+                            record_animation_activity(
+                                pioneer_observability::AnimationSourceId::McpPoller,
+                                pioneer_observability::DiagnosticAction::Cancelled,
+                                pioneer_observability::Visibility::Global,
+                            )
+                        );
                         break;
                     }
                 }

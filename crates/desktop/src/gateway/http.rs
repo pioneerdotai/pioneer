@@ -5,8 +5,8 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use pioneer_client::{
     artifacts::http_download::{
-        ArtifactHttpDownloadError, ArtifactHttpDownloadProgressSink, ArtifactHttpDownloadRequest,
-        ArtifactHttpDownloadResult, ArtifactHttpDownloadService,
+        ArtifactHttpDownloadError, ArtifactHttpDownloadRequest, ArtifactHttpDownloadResult,
+        ArtifactHttpDownloadService,
     },
     artifacts::preview::{ArtifactHttpPreviewService, ArtifactPreviewReadData},
     avatars::{
@@ -143,11 +143,14 @@ impl DesktopGatewayHttpClient {
     pub(crate) fn download(
         &self,
         request: ArtifactHttpDownloadRequest,
-        cancellation: CancellationToken,
-        progress: Option<&dyn ArtifactHttpDownloadProgressSink>,
+        operation: &pioneer_client::artifacts::operations::ArtifactDownloadOperation,
     ) -> Result<ArtifactHttpDownloadResult, ArtifactHttpDownloadError> {
-        self.runtime
-            .block_on(self.downloads.download(request, cancellation, progress))
+        let progress = |progress| operation.update_progress(progress);
+        self.runtime.block_on(self.downloads.download(
+            request,
+            operation.cancellation(),
+            Some(&progress),
+        ))
     }
 
     pub(crate) fn fetch_artifact_thumbnail(

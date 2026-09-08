@@ -306,7 +306,9 @@ impl PioneerDesktop {
             reduction.pending.pending,
         );
         if reduction.clear_selected_details {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute { server_id: None });
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+                server_id: None,
+            });
             self.mcp_server_details = None;
             if self.main_content_view() == MainContentView::McpDetails {
                 self.set_main_content_view(MainContentView::Mcp, cx);

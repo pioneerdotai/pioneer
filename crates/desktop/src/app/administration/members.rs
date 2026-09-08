@@ -596,74 +596,7 @@ impl PioneerDesktop {
         .detach();
     }
 
-    /// Loads the complete ACL-scoped directory used to supplement an
-    /// explicit workspace member list with implicit Superusers for mentions.
-    pub(in crate::app) fn ensure_active_thread_mention_directory_loaded(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected
-            || self.current_active_thread_id().is_none()
-            || self.members_loading
-            || self.members_error.is_some()
-            || self.administration.member_directory_complete()
-            || !self
-                .principal_presentation_capabilities()
-                .can_view_member_directory
-        {
-            return;
-        }
-
-        self.members_loading = true;
-        let sender = self.gateway.client_runtime.ws_command_sender().clone();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        let mut pages = Vec::new();
-                        let mut cursor = None;
-                        loop {
-                            let page = sender.member_list(MemberListParams {
-                                cursor,
-                                limit: Some(100),
-                            })?;
-                            cursor = page.next_cursor.clone();
-                            pages.push(page);
-                            if cursor.is_none() {
-                                break;
-                            }
-                        }
-                        Ok::<_, anyhow::Error>(pages)
-                    })
-                    .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    view.members_loading = false;
-                    match result {
-                        Ok(pages) => {
-                            for (index, page) in pages.into_iter().enumerate() {
-                                if index == 0 {
-                                    view.administration.apply_member_list(page);
-                                } else {
-                                    view.administration.append_member_page(page);
-                                }
-                            }
-                            view.members_error = None;
-                            view.resolve_visible_member_avatars(cx);
-                        }
-                        Err(_) => {
-                            view.members_error =
-                                Some(t!("settings.members.load_failed").to_string());
-                        }
-                    }
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn resolve_visible_member_avatars(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn resolve_visible_member_avatars(&mut self, cx: &mut Context<Self>) {
         let mut members = self.administration.members().cloned().collect::<Vec<_>>();
         if let Some(workspace_id) = self
             .current_active_thread_id()
@@ -681,6 +614,23 @@ impl PioneerDesktop {
                     .filter(|member| !known_ids.contains(&member.principal_id))
                     .cloned(),
             );
+        }
+        if let Some(input) = self.current_active_thread_id().and_then(|thread| {
+            self.gateway
+                .client_runtime
+                .client_core()
+                .thread_member_snapshot(thread)
+        }) {
+            let mut published = input
+                .member_directory
+                .iter()
+                .chain(&input.workspace_members)
+                .cloned()
+                .collect::<Vec<_>>();
+            published.extend(members);
+            let mut seen = std::collections::HashSet::new();
+            published.retain(|member| seen.insert(member.principal_id.clone()));
+            members = published;
         }
         let requests = self.member_avatar_state.reconcile_visible_members(&members);
         self.resolve_current_principal_avatar(cx);
@@ -797,30 +747,6 @@ impl PioneerDesktop {
             }
         })
         .detach();
-    }
-
-    pub(in crate::app) fn ensure_active_thread_workspace_members_loaded(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        if self.gateway.connection_state != GatewayConnectionState::Connected {
-            return;
-        }
-        let Some(workspace_id) = self
-            .current_active_thread_id()
-            .and_then(|thread_id| self.thread_workspace_id(thread_id))
-            .and_then(|workspace_id| WorkspaceId::new(workspace_id.to_owned()).ok())
-        else {
-            return;
-        };
-        if self
-            .administration
-            .workspace_members(&workspace_id)
-            .is_none()
-            && !self.workspace_members_loading.contains(&workspace_id)
-        {
-            self.refresh_workspace_members(workspace_id, cx);
-        }
     }
 
     fn confirm_member_action(

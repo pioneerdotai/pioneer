@@ -42,6 +42,18 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "artifact_publication.json",
+            crate::artifacts::store::ArtifactPublication
+        ),
+        schema_doc!(
+            "thread_member_publication.json",
+            crate::threads::members::ThreadMemberPublication
+        ),
+        schema_doc!(
+            "thread_capability_publication.json",
+            crate::threads::capabilities::ThreadCapabilityPublication
+        ),
+        schema_doc!(
             "client_navigation_state.json",
             crate::navigation::ClientNavigationState
         ),
@@ -62,6 +74,50 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             crate::gateway::session_controller::GatewaySessionPublication
         ),
         schema_doc!("avatar_publication.json", crate::avatars::AvatarPublication),
+        schema_doc!(
+            "turn_cancellation_publication.json",
+            crate::turns::cancellation::TurnCancellationPublication
+        ),
+        schema_doc!(
+            "composer_model_picker_publication.json",
+            crate::composer::model_picker::ComposerModelPickerPublication
+        ),
+        schema_doc!(
+            "composer_catalog_publication.json",
+            crate::composer::catalog::ComposerCatalogPublication
+        ),
+        schema_doc!(
+            "message_revision_publication.json",
+            crate::threads::message_revisions::MessageRevisionPublication
+        ),
+        schema_doc!(
+            "message_deletion_publication.json",
+            crate::threads::message_deletion::MessageDeletionPublication
+        ),
+        schema_doc!(
+            "approval_action_publication.json",
+            crate::cli_runtime::approval_actions::ApprovalActionPublication
+        ),
+        schema_doc!(
+            "task_review_publication.json",
+            crate::tasks::review_controller::TaskReviewPublication
+        ),
+        schema_doc!(
+            "composer_voice_start_request.json",
+            crate::composer::voice::ComposerVoiceStartRequest
+        ),
+        schema_doc!(
+            "composer_voice_finalize_request.json",
+            crate::composer::voice::ComposerVoiceFinalizeRequest
+        ),
+        schema_doc!(
+            "composer_voice_cancel_request.json",
+            crate::composer::voice::ComposerVoiceCancelRequest
+        ),
+        schema_doc!(
+            "composer_publication.json",
+            crate::composer::store::ComposerPublication
+        ),
         schema_doc!(
             "workspace_catalog_publication.json",
             crate::workspaces::catalog::WorkspaceCatalogPublication
@@ -669,14 +725,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "cli_runtime_list_response.json",
             pioneer_protocol::CLIRuntimeListResponse
-        ),
-        schema_doc!(
-            "cli_runtime_thread_binding_get_params.json",
-            pioneer_protocol::CLIRuntimeThreadBindingGetParams
-        ),
-        schema_doc!(
-            "cli_runtime_thread_binding_get_response.json",
-            pioneer_protocol::CLIRuntimeThreadBindingGetResponse
         ),
         schema_doc!(
             "cli_runtime_thread_binding.json",

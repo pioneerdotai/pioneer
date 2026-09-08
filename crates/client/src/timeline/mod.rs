@@ -8,3 +8,6 @@ pub mod semantic;
 pub mod semantic_render;
 
 pub mod item_presentation;
+
+pub mod diagnostics;
+pub mod types;

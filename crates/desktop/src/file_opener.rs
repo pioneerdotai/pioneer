@@ -203,6 +203,10 @@ impl FileOpenerId {
 }
 
 impl LocalFileTarget {
+    pub(crate) fn new(path: PathBuf, line: Option<u32>, column: Option<u32>) -> Self {
+        Self { path, line, column }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.path.as_path()
     }

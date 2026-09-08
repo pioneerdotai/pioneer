@@ -268,14 +268,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::active_thread::ClientActiveThreadClearResult
         ),
         schema_doc!(
-            "client_active_thread_cancel_turn_request.json",
-            crate::active_thread::ClientActiveThreadCancelTurnRequest
-        ),
-        schema_doc!(
-            "client_active_thread_cancel_turn_result.json",
-            crate::active_thread::ClientActiveThreadCancelTurnResult
-        ),
-        schema_doc!(
             "client_active_thread_event_request.json",
             crate::active_thread::ClientActiveThreadEventRequest
         ),
@@ -388,14 +380,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::ClientComposerMcpCapabilityFromRowRequest
         ),
         schema_doc!(
-            "client_composer_mcp_picker_rows_request.json",
-            crate::composer::ClientComposerMcpPickerRowsRequest
-        ),
-        schema_doc!(
-            "client_composer_mcp_picker_rows_result.json",
-            crate::composer::ClientComposerMcpPickerRowsResult
-        ),
-        schema_doc!(
             "client_composer_mcp_toggle_request.json",
             crate::composer::ClientComposerMcpToggleRequest
         ),
@@ -406,10 +390,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "client_composer_skill_capability_from_row_request.json",
             crate::composer::ClientComposerSkillCapabilityFromRowRequest
-        ),
-        schema_doc!(
-            "client_composer_skill_picker_rows_request.json",
-            crate::composer::ClientComposerSkillPickerRowsRequest
         ),
         schema_doc!(
             "client_composer_skill_toggle_request.json",
@@ -827,26 +807,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("turn_work_block.json", pioneer_protocol::TurnWorkBlock),
         schema_doc!(
-            "turn_message_edit_params.json",
-            pioneer_protocol::TurnMessageEditParams
-        ),
-        schema_doc!(
-            "turn_message_edit_response.json",
-            pioneer_protocol::TurnMessageEditResponse
-        ),
-        schema_doc!(
-            "turn_message_delete_params.json",
-            pioneer_protocol::TurnMessageDeleteParams
-        ),
-        schema_doc!(
-            "turn_message_delete_response.json",
-            pioneer_protocol::TurnMessageDeleteResponse
-        ),
-        schema_doc!(
-            "turn_message_revisions_page_params.json",
-            pioneer_protocol::TurnMessageRevisionsPageParams
-        ),
-        schema_doc!(
             "turn_message_revisions_page_response.json",
             pioneer_protocol::TurnMessageRevisionsPageResponse
         ),
@@ -1003,11 +963,6 @@ mod tests {
             "thread_tree_snapshot.json",
             "thread_read_params.json",
             "thread_read_response.json",
-            "turn_message_edit_params.json",
-            "turn_message_edit_response.json",
-            "turn_message_delete_params.json",
-            "turn_message_delete_response.json",
-            "turn_message_revisions_page_params.json",
             "turn_message_revisions_page_response.json",
         ] {
             let document = documents

@@ -1,45 +1,33 @@
 use crate::contracts::ClientEvent;
+#[cfg(test)]
+use pioneer_client::composer::capabilities::{ComposerCapability, plan_composer_submission};
+#[cfg(test)]
+use pioneer_client::composer::workflow::{
+    resolve_turn_selection, resolve_voice_turn_selection, selected_execution_target_from_runtimes,
+};
 use pioneer_client::{
     ClientError, ClientResult,
     administration::{AdministrationEventTracker, AdministrationRefetch},
     cli_runtime::approvals::PendingRequest,
     composer::{
-        attachments::ComposerAttachment,
-        capabilities::{ComposerCapability, plan_composer_submission},
-        model_selection as composer_model_selection,
-        skill_selection::{ComposerSkillPickerProjection, ComposerSkillSelection},
-        turn_prepare::{
-            ComposerSubmitAvailabilityInput, PrepareComposerTurnRequest,
-            PrepareVoiceComposerSnapshotRequest, PreparedComposerTurnSubmitContext,
-            PreparedVoiceComposerSnapshot, can_submit_composer_message, prepare_composer_turn,
-            prepare_voice_composer_snapshot, reduce_prepared_composer_turn_submit_success,
-        },
+        model_selection as composer_model_selection, turn_prepare::PreparedVoiceComposerSnapshot,
     },
     conversation::ConversationViewState,
     notifications::effects::ClientEffect,
-    providers::list::{
-        cli_runtime_list_params, resolve_cli_runtime_execution_backend,
-        runtime_id_from_cli_runtime_provider_key,
-    },
     runtime::{ClientRuntime, ClientRuntimeNotification, ClientRuntimeNotificationContext},
     security::{ClientSecurityDiagnosticRow, ClientTurnSecuritySummary, security_diagnostic_rows},
     state::selectors as client_selectors,
-    threads::{coordinator::ThreadCoordinator, session as thread_session},
+    threads::coordinator::ThreadCoordinator,
     timeline::{rows::TimelineRow, semantic::SemanticTimelineCachePatch},
     transport::ws::command_sender as ws_commands,
-    turns::{
-        cancel as turn_cancel,
-        start::{
-            now_unix_seconds, plan_turn_start_ids, reduce_turn_start_send_failure,
-            reduce_turn_start_send_success, turn_start_params_from_plan,
-        },
-    },
 };
 use pioneer_protocol::{
-    AccessChangeKind, AccessChangedNotification, AgentExecutionBackend, GatewayNotification,
-    PrincipalId, RuntimeSummary, Thread, ThreadGetParams, ThreadMode,
+    AccessChangeKind, AccessChangedNotification, GatewayNotification, Thread, ThreadGetParams,
 };
-use pioneer_protocol::{ThreadComposerExecutionMode, TurnPermissionMode};
+#[cfg(test)]
+use pioneer_protocol::{RuntimeSummary, ThreadComposerExecutionMode};
+#[cfg(test)]
+use pioneer_protocol::{ThreadMode, TurnPermissionMode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -140,32 +128,9 @@ pub struct ClientAccessChangedLifecycle {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientActiveThreadSendTextRequest {
-    #[serde(default)]
-    pub thread_id: Option<String>,
+    pub operation: pioneer_client::composer::store::ComposerOperationIdentity,
     #[serde(default)]
     pub workspace_id: Option<String>,
-    pub text: String,
-    #[serde(default)]
-    pub selected_model: Option<String>,
-    #[serde(default)]
-    pub selected_provider: Option<String>,
-    #[serde(default)]
-    pub selected_reasoning_effort: Option<String>,
-    #[serde(default)]
-    pub selected_mode: Option<ThreadMode>,
-    #[serde(default)]
-    pub reply_to_turn_id: Option<String>,
-    #[serde(default)]
-    pub mentioned_principal_ids: Vec<PrincipalId>,
-    pub permission_mode: TurnPermissionMode,
-    #[serde(default)]
-    pub attachments: Vec<ComposerAttachment>,
-    #[serde(default)]
-    pub capabilities: Vec<ComposerCapability>,
-    #[serde(default)]
-    pub skill_selections: Vec<ComposerSkillSelection>,
-    #[serde(default)]
-    pub skill_picker: ComposerSkillPickerProjection,
     #[serde(default)]
     pub expanded_keys: Vec<String>,
 }
@@ -184,56 +149,7 @@ pub struct ClientActiveThreadSendTextResult {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientPrepareVoiceComposerSnapshotRequest {
-    pub authorization_fingerprint: String,
-    #[serde(default)]
-    pub thread_id: Option<String>,
-    #[serde(default)]
-    pub workspace_id: Option<String>,
-    #[serde(default)]
-    pub turn_id: Option<String>,
-    #[serde(default)]
-    pub selected_model: Option<String>,
-    #[serde(default)]
-    pub selected_provider: Option<String>,
-    #[serde(default)]
-    pub selected_reasoning_effort: Option<String>,
-    #[serde(default)]
-    pub selected_mode: Option<ThreadMode>,
-    pub permission_mode: TurnPermissionMode,
-    #[serde(default)]
-    pub attachments: Vec<ComposerAttachment>,
-    #[serde(default)]
-    pub capabilities: Vec<ComposerCapability>,
-    #[serde(default)]
-    pub skill_selections: Vec<ComposerSkillSelection>,
-    #[serde(default)]
-    pub skill_picker: ComposerSkillPickerProjection,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientActiveThreadCancelTurnRequest {
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub expanded_keys: Vec<String>,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize)]
-pub struct ClientActiveThreadCancelTurnResult {
-    pub cancelled: bool,
-    pub thread_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub snapshot: ClientActiveThreadSnapshot,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ClientActiveThreadTurnSelection {
-    selected_model: Option<String>,
-    selected_provider: Option<String>,
-    selected_mode: ThreadMode,
+    pub operation: pioneer_client::composer::store::ComposerOperationIdentity,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -499,371 +415,34 @@ impl ClientFfiActiveThreadState {
 
     pub fn send_text_turn(
         &self,
-        runtime: &ClientRuntime,
+        _runtime: &ClientRuntime,
         request: ClientActiveThreadSendTextRequest,
     ) -> anyhow::Result<ClientActiveThreadSendTextResult> {
-        let ClientActiveThreadSendTextRequest {
-            thread_id,
-            workspace_id: requested_workspace_id,
-            text,
-            selected_model,
-            selected_provider,
-            selected_reasoning_effort,
-            selected_mode,
-            reply_to_turn_id,
-            mentioned_principal_ids,
-            permission_mode,
-            attachments,
-            capabilities,
-            skill_selections,
-            skill_picker,
-            expanded_keys,
-        } = request;
-
-        let message_requested = selected_mode == Some(ThreadMode::Message);
-        let message_has_execution_overrides = message_requested
-            && [
-                selected_model.as_deref(),
-                selected_provider.as_deref(),
-                selected_reasoning_effort.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .any(|value| !value.trim().is_empty());
-        if message_has_execution_overrides {
-            return Err(anyhow::anyhow!(
-                "Message does not accept model, provider, or reasoning overrides"
-            ));
-        }
-        if message_requested && (!capabilities.is_empty() || !skill_selections.is_empty()) {
-            return Err(anyhow::anyhow!(
-                "Message does not accept execution capabilities"
-            ));
-        }
-
-        let thread_id = thread_session::require_thread_id(thread_id, "sending text")
-            .map_err(anyhow::Error::msg)?;
-        let ids = plan_turn_start_ids();
-        let turn_id = ids.turn_id;
-        let pending_request_id = ids.pending_request_id;
-        let (workspace_id, endpoint_kind, composer_execution_mode) = {
-            let inner = self.core.as_ref();
-            let coordinator = inner
-                .thread_coordinator_snapshot(thread_id.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("active thread must be opened before starting turn")
-                })?;
-            (
-                coordinator.workspace_id.clone(),
-                None,
-                coordinator
-                    .thread()
-                    .map(|thread| thread.origin_kind.composer_execution_mode())
-                    .unwrap_or(ThreadComposerExecutionMode::ForegroundTurn),
-            )
-        };
-        if let Some(requested_workspace_id) = requested_workspace_id.as_deref() {
-            if requested_workspace_id != workspace_id {
-                return Err(anyhow::anyhow!(
-                    "active thread workspace `{workspace_id}` does not match composer workspace `{requested_workspace_id}`"
-                ));
-            }
-        }
-
-        // A planned access-token rotation replaces the WebSocket connection. The
-        // replacement connection has no thread subscriptions, even though the
-        // client-side thread coordinator is still warm. Re-establish the
-        // authoritative workspace scope and subscription before any composer
-        // preparation or optimistic local mutation.
-        self.ensure_thread_subscription(runtime, thread_id.as_str(), workspace_id.clone())?;
-
-        let selection = {
-            let inner = self.core.as_ref();
-            resolve_turn_selection(
-                inner,
-                thread_id.as_str(),
-                selected_provider,
-                selected_model,
-                selected_mode,
-                text.as_str(),
-                !attachments.is_empty(),
-                !capabilities.is_empty() || !skill_selections.is_empty(),
-            )?
-        };
-        let is_message = selection.selected_mode == ThreadMode::Message;
-        let execution_target = if is_message {
-            SelectedExecutionTarget {
-                execution_backend: None,
-            }
-        } else {
-            resolve_selected_execution_target(
-                runtime,
-                workspace_id.as_str(),
-                selection.selected_provider.as_deref(),
-            )?
-        };
-        let cli_runtime_selected = execution_target.execution_backend.is_some();
-        let submission = plan_composer_submission(
-            selection.selected_provider.as_deref(),
-            text.as_str(),
-            !attachments.is_empty(),
-            capabilities.as_slice(),
-        );
-        if !submission.has_composer_payload && skill_selections.is_empty() {
-            return Err(anyhow::anyhow!(
-                "message content is required before starting turn"
-            ));
-        }
-        let capabilities = submission.capabilities;
-        let prepared = prepare_composer_turn(
-            &runtime.ws_command_sender(),
+        let result = self.core.submit_composer_send(
+            request.operation,
             &ClientFfiFileSystem,
-            PrepareComposerTurnRequest {
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                endpoint_kind,
-                text,
-                attachments,
-                capabilities,
-                skill_selections,
-                skill_picker,
+            pioneer_client::composer::workflow::ComposerSendContext {
+                workspace_id: request.workspace_id,
+                endpoint_kind: None,
+                failure_message: "Failed to send message".to_owned(),
             },
         )?;
-        let turn_model_provider = if is_message || cli_runtime_selected {
-            None
-        } else {
-            selection.selected_provider.clone()
-        };
-        let submit_reduction = reduce_prepared_composer_turn_submit_success(
-            PreparedComposerTurnSubmitContext {
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                pending_request_id: pending_request_id.clone(),
-                composer_execution_mode,
-                selected_model: selection.selected_model,
-                selected_provider: selection.selected_provider,
-                turn_model_provider,
-                selected_mode: Some(selection.selected_mode),
-                reply_to_turn_id,
-                mentioned_principal_ids,
-                permission_mode,
-                execution_backend: execution_target.execution_backend,
-                selected_reasoning_effort,
-                cli_runtime_options: None,
-                updated_at_unix: now_unix_seconds(),
-            },
-            prepared,
-        );
-        let thread_snapshot_update = submit_reduction.thread_snapshot_update.clone();
-        let local_turn_start_requested_event =
-            submit_reduction.local_turn_start_requested_event.clone();
-        let turn_start_params =
-            turn_start_params_from_plan(submit_reduction.turn_start_params_plan);
-
-        let semantic_timeline_patch = self.core.commit_prepared_thread_turn(
-            &thread_id,
-            &workspace_id,
-            selection.selected_mode,
-            &thread_snapshot_update,
-            local_turn_start_requested_event,
-            submit_reduction.composer_execution_mode,
-        );
-
-        let send_context = submit_reduction.send_context;
-        let ws_sender = runtime.ws_command_sender();
-        let state = self.clone();
-        let token = self
-            .core
-            .thread_operation_token(&thread_id)
-            .ok_or_else(|| anyhow::anyhow!("Thread send cancelled"))?;
-        std::thread::spawn(move || {
-            let reduction = match ws_commands::turn_start(&ws_sender, turn_start_params) {
-                Ok(response) => reduce_turn_start_send_success(send_context, response),
-                Err(error) => reduce_turn_start_send_failure(send_context, format!("{error:#}")),
-            };
-            state.core.apply_thread_start_send_result(token, reduction);
-        });
-
-        let inner = self.core.as_ref();
-
         Ok(ClientActiveThreadSendTextResult {
-            thread_id,
-            turn_id,
-            pending_request_id,
-            snapshot: snapshot_from_inner(inner, expanded_keys.as_slice()),
-            semantic_timeline_patch,
+            thread_id: result.thread_id,
+            turn_id: result.turn_id,
+            pending_request_id: result.pending_request_id,
+            semantic_timeline_patch: result.semantic_timeline_patch,
+            snapshot: snapshot_from_inner(self.core.as_ref(), &request.expanded_keys),
         })
     }
 
     pub fn prepare_voice_composer_snapshot(
         &self,
-        runtime: &ClientRuntime,
+        _runtime: &ClientRuntime,
         request: ClientPrepareVoiceComposerSnapshotRequest,
     ) -> anyhow::Result<PreparedVoiceComposerSnapshot> {
-        let ClientPrepareVoiceComposerSnapshotRequest {
-            authorization_fingerprint,
-            thread_id,
-            workspace_id: _workspace_id,
-            turn_id,
-            selected_model,
-            selected_provider,
-            selected_reasoning_effort,
-            selected_mode,
-            permission_mode,
-            attachments,
-            capabilities,
-            skill_selections,
-            skill_picker,
-        } = request;
-
-        let thread_id = thread_session::require_thread_id(thread_id, "starting voice")
-            .map_err(anyhow::Error::msg)?;
-        let turn_id = match turn_id {
-            Some(turn_id) if turn_id.trim().is_empty() => {
-                return Err(anyhow::anyhow!(
-                    "turn_id is required before preparing voice context"
-                ));
-            }
-            Some(turn_id) => turn_id,
-            None => plan_turn_start_ids().turn_id,
-        };
-        let (workspace_id, endpoint_kind) = {
-            let inner = self.core.as_ref();
-            let coordinator = inner
-                .thread_coordinator_snapshot(thread_id.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("active thread must be opened before starting voice")
-                })?;
-            (coordinator.workspace_id.clone(), None)
-        };
-        let selection = {
-            let inner = self.core.as_ref();
-            resolve_voice_turn_selection(
-                inner,
-                thread_id.as_str(),
-                selected_provider,
-                selected_model,
-                selected_mode,
-            )?
-        };
-        let message_mode = selection.selected_mode == ThreadMode::Message;
-        let selected_provider = if message_mode {
-            None
-        } else {
-            Some(selection.selected_provider.ok_or_else(|| {
-                anyhow::anyhow!("model and provider must be selected before starting voice")
-            })?)
-        };
-        let selected_model = if message_mode {
-            None
-        } else {
-            Some(selection.selected_model.ok_or_else(|| {
-                anyhow::anyhow!("model and provider must be selected before starting voice")
-            })?)
-        };
-        let execution_backend = if message_mode {
-            None
-        } else {
-            resolve_selected_execution_target(
-                runtime,
-                workspace_id.as_str(),
-                selected_provider.as_deref(),
-            )?
-            .execution_backend
-        };
-        let cli_runtime_selected = execution_backend.is_some();
-        let capabilities = if message_mode {
-            Vec::new()
-        } else {
-            plan_composer_submission(
-                selected_provider.as_deref(),
-                "",
-                !attachments.is_empty(),
-                capabilities.as_slice(),
-            )
-            .capabilities
-        };
-        let turn_model_provider = if cli_runtime_selected {
-            None
-        } else {
-            selected_provider.clone()
-        };
-
-        prepare_voice_composer_snapshot(
-            &runtime.ws_command_sender(),
-            &ClientFfiFileSystem,
-            PrepareVoiceComposerSnapshotRequest {
-                authorization_fingerprint,
-                workspace_id,
-                thread_id,
-                turn_id,
-                endpoint_kind,
-                attachments,
-                capabilities,
-                skill_selections,
-                skill_picker,
-                selected_model,
-                selected_provider,
-                turn_model_provider,
-                selected_mode: Some(selection.selected_mode),
-                permission_mode,
-                execution_backend,
-                selected_reasoning_effort,
-                cli_runtime_options: None,
-            },
-        )
-    }
-
-    pub fn cancel_turn(
-        &self,
-        runtime: &ClientRuntime,
-        request: ClientActiveThreadCancelTurnRequest,
-    ) -> anyhow::Result<ClientActiveThreadCancelTurnResult> {
-        let ClientActiveThreadCancelTurnRequest {
-            reason,
-            expanded_keys,
-        } = request;
-        let Some((thread_id, turn_id, params)) = self.apply_local_turn_cancel_request(reason)?
-        else {
-            let inner = self.core.as_ref();
-
-            return Ok(ClientActiveThreadCancelTurnResult {
-                cancelled: false,
-                thread_id: inner.active_thread_id(),
-                turn_id: None,
-                snapshot: snapshot_from_inner(inner, expanded_keys.as_slice()),
-            });
-        };
-
-        let response = match ws_commands::turn_cancel(&runtime.ws_command_sender(), params) {
-            Ok(response) => response,
-            Err(error) => {
-                let message = format!("{error:#}");
-                self.apply_local_turn_cancel_rejected(
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                    message.as_str(),
-                )?;
-                return Err(anyhow::anyhow!(message));
-            }
-        };
-
-        if let Some(event) = turn_cancel::turn_cancel_response_event(response) {
-            if let Some(coordinator) = self.core.thread_coordinator_snapshot(&thread_id) {
-                self.core
-                    .apply_thread_conversation_event(&coordinator.workspace_id, event, None);
-            }
-        }
-
-        let inner = self.core.as_ref();
-
-        Ok(ClientActiveThreadCancelTurnResult {
-            cancelled: true,
-            thread_id: Some(thread_id),
-            turn_id: Some(turn_id),
-            snapshot: snapshot_from_inner(inner, expanded_keys.as_slice()),
-        })
+        self.core
+            .prepare_composer_voice(&request.operation, &ClientFfiFileSystem, None)
     }
 
     pub fn clear(&self, runtime: &ClientRuntime) -> anyhow::Result<ClientActiveThreadClearResult> {
@@ -912,29 +491,6 @@ impl ClientFfiActiveThreadState {
             thread_id,
             &workspace_id,
         )
-    }
-
-    fn apply_local_turn_cancel_request(
-        &self,
-        reason: Option<String>,
-    ) -> anyhow::Result<Option<(String, String, pioneer_protocol::TurnCancelParams)>> {
-        let Some(id) = self.core.active_thread_id() else {
-            return Ok(None);
-        };
-        Ok(self
-            .core
-            .request_thread_cancel(&id, reason)
-            .map(|(turn, params)| (id, turn, params)))
-    }
-
-    fn apply_local_turn_cancel_rejected(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        error: &str,
-    ) -> anyhow::Result<()> {
-        self.core.reject_thread_cancel(thread_id, turn_id, error);
-        Ok(())
     }
 
     fn apply_gateway_notification(
@@ -1124,212 +680,6 @@ fn non_empty_string(value: Option<String>) -> Option<String> {
         } else {
             Some(trimmed.to_owned())
         }
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SelectedExecutionTarget {
-    execution_backend: Option<AgentExecutionBackend>,
-}
-
-fn resolve_selected_execution_target(
-    runtime: &ClientRuntime,
-    workspace_id: &str,
-    selected_provider: Option<&str>,
-) -> anyhow::Result<SelectedExecutionTarget> {
-    let Some(provider_key) = selected_provider
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-    else {
-        return Ok(SelectedExecutionTarget {
-            execution_backend: None,
-        });
-    };
-    let Some(_) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
-        return Ok(SelectedExecutionTarget {
-            execution_backend: None,
-        });
-    };
-
-    let runtimes = ws_commands::cli_runtime_list(
-        &runtime.ws_command_sender(),
-        cli_runtime_list_params(workspace_id.to_owned()),
-    )?
-    .runtimes;
-
-    selected_execution_target_from_runtimes(Some(provider_key), runtimes.as_slice())
-}
-
-fn selected_execution_target_from_runtimes(
-    selected_provider: Option<&str>,
-    runtimes: &[RuntimeSummary],
-) -> anyhow::Result<SelectedExecutionTarget> {
-    let Some(provider_key) = selected_provider
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-    else {
-        return Ok(SelectedExecutionTarget {
-            execution_backend: None,
-        });
-    };
-    let Some(_) = runtime_id_from_cli_runtime_provider_key(provider_key) else {
-        return Ok(SelectedExecutionTarget {
-            execution_backend: None,
-        });
-    };
-
-    let execution_backend = resolve_cli_runtime_execution_backend(Some(provider_key), runtimes)
-        .map_err(anyhow::Error::msg)?;
-    Ok(SelectedExecutionTarget { execution_backend })
-}
-
-fn resolve_turn_selection(
-    inner: &pioneer_client::core::ClientCore,
-    thread_id: &str,
-    requested_provider: Option<String>,
-    requested_model: Option<String>,
-    requested_mode: Option<ThreadMode>,
-    text: &str,
-    has_attachments: bool,
-    has_capabilities: bool,
-) -> anyhow::Result<ClientActiveThreadTurnSelection> {
-    let selected_mode =
-        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
-    let coordinator = inner
-        .thread_coordinator_snapshot(thread_id)
-        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting turn"))?;
-
-    if selected_mode == ThreadMode::Message {
-        if !can_submit_composer_message(ComposerSubmitAvailabilityInput {
-            gateway_connected: true,
-            upload_in_progress: false,
-            has_active_thread: true,
-            selected_mode,
-            has_complete_model_selection: true,
-            // Message is an instant-completed Turn and never claims the
-            // foreground execution slot held by Chat/Agent.
-            conversation_can_submit: true,
-            text,
-            has_attachments,
-            has_capabilities,
-        }) {
-            return Err(anyhow::anyhow!(
-                "active thread is not ready to start a new turn"
-            ));
-        }
-
-        return Ok(ClientActiveThreadTurnSelection {
-            selected_model: None,
-            selected_provider: None,
-            selected_mode,
-        });
-    }
-
-    let requested_provider = non_empty_string(requested_provider);
-    let requested_model = non_empty_string(requested_model);
-    let requested_selection = match (requested_provider, requested_model) {
-        (Some(provider), Some(model)) => Some(composer_model_selection::ComposerModelSelection {
-            provider,
-            model,
-            selected_reasoning_effort: None,
-        }),
-        (None, None) => None,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "model and provider must both be selected before starting turn"
-            ));
-        }
-    };
-    let resolved_selection = match requested_selection {
-        Some(selection) => selection,
-        None => client_selectors::resolve_composer_model_selection_from(
-            Some(thread_id),
-            Some(coordinator.workspace_id.as_str()),
-            &inner.thread_coordinator_snapshots(),
-        )
-        .ok_or_else(|| {
-            anyhow::anyhow!("model and provider must be selected before starting turn")
-        })?,
-    };
-    if !can_submit_composer_message(ComposerSubmitAvailabilityInput {
-        gateway_connected: true,
-        upload_in_progress: false,
-        has_active_thread: true,
-        selected_mode,
-        has_complete_model_selection: true,
-        conversation_can_submit: coordinator.conversation.can_submit_message(),
-        text,
-        has_attachments,
-        has_capabilities,
-    }) {
-        return Err(anyhow::anyhow!(
-            "active thread is not ready to start a new turn"
-        ));
-    }
-
-    Ok(ClientActiveThreadTurnSelection {
-        selected_model: Some(resolved_selection.model),
-        selected_provider: Some(resolved_selection.provider),
-        selected_mode,
-    })
-}
-
-fn resolve_voice_turn_selection(
-    inner: &pioneer_client::core::ClientCore,
-    thread_id: &str,
-    requested_provider: Option<String>,
-    requested_model: Option<String>,
-    requested_mode: Option<ThreadMode>,
-) -> anyhow::Result<ClientActiveThreadTurnSelection> {
-    let selected_mode =
-        requested_mode.unwrap_or_else(composer_model_selection::default_composer_turn_mode);
-    let coordinator = inner
-        .thread_coordinator_snapshot(thread_id)
-        .ok_or_else(|| anyhow::anyhow!("active thread must be opened before starting voice"))?;
-    if selected_mode == ThreadMode::Message {
-        return Ok(ClientActiveThreadTurnSelection {
-            selected_model: None,
-            selected_provider: None,
-            selected_mode,
-        });
-    }
-
-    let requested_provider = non_empty_string(requested_provider);
-    let requested_model = non_empty_string(requested_model);
-    let requested_selection = match (requested_provider, requested_model) {
-        (Some(provider), Some(model)) => Some(composer_model_selection::ComposerModelSelection {
-            provider,
-            model,
-            selected_reasoning_effort: None,
-        }),
-        (None, None) => None,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "model and provider must both be selected before starting voice"
-            ));
-        }
-    };
-    let resolved_selection = match requested_selection {
-        Some(selection) => selection,
-        None => client_selectors::resolve_composer_model_selection_from(
-            Some(thread_id),
-            Some(coordinator.workspace_id.as_str()),
-            &inner.thread_coordinator_snapshots(),
-        )
-        .ok_or_else(|| {
-            anyhow::anyhow!("model and provider must be selected before starting voice")
-        })?,
-    };
-    if !coordinator.conversation.can_submit_message() {
-        return Err(anyhow::anyhow!(
-            "active thread is not ready to start a new voice turn"
-        ));
-    }
-
-    Ok(ClientActiveThreadTurnSelection {
-        selected_model: Some(resolved_selection.model),
-        selected_provider: Some(resolved_selection.provider),
-        selected_mode,
     })
 }
 
@@ -1878,17 +1228,10 @@ mod tests {
     }
 
     #[test]
-    fn active_thread_send_text_requires_permission_mode() {
-        let error = serde_json::from_value::<ClientActiveThreadSendTextRequest>(json!({
-            "text": "hello"
-        }))
-        .expect_err("permission mode should be required");
-
-        assert!(
-            error
-                .to_string()
-                .contains("missing field `permission_mode`")
-        );
+    fn active_thread_send_text_requires_operation_identity() {
+        let error = serde_json::from_value::<ClientActiveThreadSendTextRequest>(json!({}))
+            .expect_err("operation identity must be required");
+        assert!(error.to_string().contains("missing field `operation`"));
     }
 
     #[test]
@@ -1955,27 +1298,28 @@ mod tests {
     }
 
     #[test]
-    fn active_thread_send_text_decodes_explicit_permission_mode() {
-        let request: ClientActiveThreadSendTextRequest = serde_json::from_value(json!({
-            "text": "hello",
-            "selected_mode": "Message",
-            "reply_to_turn_id": "parent-turn",
-            "mentioned_principal_ids": ["P00000000000000000001"],
-            "permission_mode": "supervised"
-        }))
-        .expect("request decodes");
-
-        assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
-        assert_eq!(request.selected_mode, Some(ThreadMode::Message));
-        assert_eq!(request.reply_to_turn_id.as_deref(), Some("parent-turn"));
-        assert_eq!(
-            request
-                .mentioned_principal_ids
-                .iter()
-                .map(PrincipalId::as_str)
-                .collect::<Vec<_>>(),
-            vec!["P00000000000000000001"]
-        );
+    fn active_thread_send_text_rejects_copied_draft_payload() {
+        let value = json!({
+            "operation": { "thread_id": "thread_a", "draft_id": 7, "generation": 11 }
+        });
+        let request: ClientActiveThreadSendTextRequest =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.operation.thread_id, "thread_a");
+        assert_eq!(request.operation.generation, 11);
+        for field in [
+            "text",
+            "permission_mode",
+            "selected_model",
+            "reply_to_turn_id",
+            "attachments",
+        ] {
+            let mut copied = value.clone();
+            copied[field] = json!("stale copied value");
+            assert!(
+                serde_json::from_value::<ClientActiveThreadSendTextRequest>(copied).is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]
@@ -2029,60 +1373,33 @@ mod tests {
     }
 
     #[test]
-    fn text_and_voice_requests_round_trip_pack_skill_selections() {
-        let selection = json!({
-            "kind": "skill_pack",
-            "pack_id": "PPPPPPPPPPPPPPPPPPPPP"
-        });
-        let picker = json!({
-            "standalone": [],
-            "packs": [{
-                "key": "skill_pack:PPPPPPPPPPPPPPPPPPPPP",
-                "pack_id": "PPPPPPPPPPPPPPPPPPPPP",
-                "label": "writer-pack",
-                "children": [],
-                "selectable": false
-            }]
-        });
-
-        let text: ClientActiveThreadSendTextRequest = serde_json::from_value(json!({
-            "text": "hello",
-            "permission_mode": "supervised",
-            "skill_selections": [selection.clone()],
-            "skill_picker": picker.clone()
-        }))
-        .expect("text request");
-        let voice: ClientPrepareVoiceComposerSnapshotRequest = serde_json::from_value(json!({
-            "authorization_fingerprint": "fixture-policy",
-            "permission_mode": "supervised",
-            "skill_selections": [selection],
-            "skill_picker": picker
-        }))
-        .expect("voice request");
-
-        assert_eq!(text.skill_selections, voice.skill_selections);
-        assert_eq!(text.skill_picker, voice.skill_picker);
-        assert!(matches!(
-            text.skill_selections.as_slice(),
-            [ComposerSkillSelection::SkillPack { .. }]
-        ));
+    fn text_and_voice_requests_share_operation_identity_and_reject_copied_catalogs() {
+        let identity = json!({"thread_id":"thread_a", "draft_id":7, "generation":11});
+        let text: ClientActiveThreadSendTextRequest =
+            serde_json::from_value(json!({"operation":identity})).unwrap();
+        let voice: ClientPrepareVoiceComposerSnapshotRequest =
+            serde_json::from_value(json!({"operation":identity})).unwrap();
+        assert_eq!(text.operation, voice.operation);
+        let copied = json!({"operation":identity, "skill_picker":{"packs":[],"standalone":[]}});
+        assert!(
+            serde_json::from_value::<ClientActiveThreadSendTextRequest>(copied.clone()).is_err()
+        );
+        assert!(
+            serde_json::from_value::<ClientPrepareVoiceComposerSnapshotRequest>(copied).is_err()
+        );
     }
 
     #[test]
-    fn voice_prepare_request_decodes_explicit_turn_id() {
+    fn voice_prepare_request_uses_operation_identity_and_rejects_copied_draft_fields() {
         let request: ClientPrepareVoiceComposerSnapshotRequest = serde_json::from_value(json!({
-            "authorization_fingerprint": "fixture-policy",
-            "thread_id": "thread_a",
-            "workspace_id": "ws_a",
-            "turn_id": "turn_voice_a",
-            "permission_mode": "supervised"
+            "operation": { "thread_id": "thread_a", "draft_id": 7, "generation": 11 }
         }))
         .expect("request decodes");
-
-        assert_eq!(request.thread_id.as_deref(), Some("thread_a"));
-        assert_eq!(request.workspace_id.as_deref(), Some("ws_a"));
-        assert_eq!(request.turn_id.as_deref(), Some("turn_voice_a"));
-        assert_eq!(request.permission_mode, TurnPermissionMode::Supervised);
+        assert_eq!(request.operation.thread_id, "thread_a");
+        assert_eq!(request.operation.generation, 11);
+        assert!(serde_json::from_value::<ClientPrepareVoiceComposerSnapshotRequest>(json!({
+            "operation": request.operation, "turn_id": "shell_turn", "attachments": [], "selected_model": "shell_model"
+        })).is_err());
     }
 
     #[test]
