@@ -8,7 +8,10 @@ use crate::{
     },
 };
 use pioneer_protocol::ProviderListModelsResponse;
-use std::sync::{Arc, mpsc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, mpsc},
+};
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,11 +47,13 @@ enum ModelWork {
 pub(crate) struct ComposerModelDisplayController {
     sender: Option<mpsc::SyncSender<ModelWork>>,
     selection_pending: bool,
+    in_flight: HashMap<String, (ComposerOperationIdentity, (u64, Option<u64>))>,
     task: Option<std::thread::JoinHandle<()>>,
 }
 impl ComposerModelDisplayController {
     pub(crate) fn stop(&mut self) {
         self.sender.take();
+        self.in_flight.clear();
     }
 }
 impl Drop for ComposerModelDisplayController {
@@ -114,6 +119,16 @@ impl ClientCore {
                 && display.key == key
                 && display.reasoning_effort == effort
                 && display.request != ComposerModelDisplayRequestState::Cancelled
+                && (display.request != ComposerModelDisplayRequestState::Loading
+                    || self
+                        .composer_models
+                        .lock()
+                        .expect("composer models poisoned")
+                        .in_flight
+                        .get(thread_id)
+                        .is_some_and(|(identity, auth)| {
+                            *identity == display.identity && *auth == ticket
+                        }))
                 && (retry.is_none() || display.request == ComposerModelDisplayRequestState::Loading)
         }) {
             return None;
@@ -138,6 +153,14 @@ impl ClientCore {
             publication: publication.clone(),
             auth_ticket: ticket,
         };
+        self.composer_models
+            .lock()
+            .expect("composer models poisoned")
+            .in_flight
+            .insert(
+                thread_id.to_owned(),
+                (request.publication.identity.clone(), ticket),
+            );
         let mut next = (*current).clone();
         next.model_display = Some(publication);
         let transition = self.publish_composer_model_display(&mut store, next);
@@ -239,6 +262,11 @@ impl ClientCore {
         else {
             return;
         };
+        self.composer_models
+            .lock()
+            .expect("composer models poisoned")
+            .in_flight
+            .remove(&id.thread_id);
         let mut display = request.publication;
         match response {
             Ok(response) if response.provider == display.key.provider => {
@@ -278,6 +306,11 @@ impl ClientCore {
 
     pub(super) fn cancel_composer_model_display(&self, thread: &str) {
         let mut store = self.composer_store.lock().expect("composer store poisoned");
+        self.composer_models
+            .lock()
+            .expect("composer models poisoned")
+            .in_flight
+            .remove(thread);
         let Some(current) = store
             .drafts
             .get(thread)
@@ -440,6 +473,31 @@ mod tests {
             "capabilities": {"reasoning": {"supported": true, "effort_options": ["low", "high"]}}
         }]}))
         .unwrap()
+    }
+
+    #[test]
+    fn changed_auth_ticket_replaces_loading_request_without_manual_retry() {
+        let (core, receiver) = fixture();
+        core.enqueue_composer_model_display("a", Some("workspace"), (999, None), None)
+            .unwrap();
+        let stale = receive(&receiver);
+        assert!(!core.composer_model_request_is_current(&stale));
+        assert_eq!(observe(&core, false), ClientTransitionOutcome::Changed);
+        let current = receive(&receiver);
+        assert_ne!(current.publication.identity, stale.publication.identity);
+        let before = core.composer_snapshot("a").unwrap();
+        core.complete_composer_model_display(stale, Ok(response()));
+        assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+        core.complete_composer_model_display(current, Ok(response()));
+        assert_eq!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .model_display()
+                .unwrap()
+                .request,
+            ComposerModelDisplayRequestState::Ready
+        );
+        assert!(core.composer_models.lock().unwrap().in_flight.is_empty());
     }
 
     #[test]

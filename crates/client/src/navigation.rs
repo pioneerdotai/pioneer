@@ -471,7 +471,8 @@ impl ClientCore {
         registry: &mut crate::threads::registry::ThreadRegistry,
     ) -> ClientTransition {
         match registry.navigation_change() {
-            Some(publication) => self.transition(
+            Some(publication) => self.transition_directory(
+                registry,
                 &ClientMutationAuthority { _private: () },
                 vec![publication],
                 vec![],
@@ -487,6 +488,20 @@ impl crate::threads::registry::ThreadRegistry {
     pub(crate) fn navigation_change(&mut self) -> Option<crate::core::ClientPublicationDraft> {
         if self.navigation_publication.as_deref() == Some(&self.navigation) {
             return None;
+        }
+        // Draft membership changes the directory even when thread metadata is equal
+        // (a thread notification may precede the creation response).
+        let previous = self.navigation_publication.as_deref();
+        for workspace in self.navigation.drafts.keys().chain(
+            previous
+                .into_iter()
+                .flat_map(|navigation| navigation.drafts.keys()),
+        ) {
+            if previous.and_then(|navigation| navigation.draft(workspace))
+                != self.navigation.draft(workspace)
+            {
+                self.directory.dirty_workspaces.insert(workspace.clone());
+            }
         }
         self.navigation_revision += 1;
         self.session_revision += 1;

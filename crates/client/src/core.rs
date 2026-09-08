@@ -2036,10 +2036,14 @@ impl ClientCore {
             matches!(
                 draft.scope,
                 ClientScope::Thread { .. }
+                    | ClientScope::Navigation
                     | ClientScope::ThreadCapability { .. }
                     | ClientScope::Administration { .. }
             )
         });
+        let wake_workspace_draft = drafts
+            .iter()
+            .any(|draft| matches!(draft.scope, ClientScope::Administration { .. }));
         let transition = self.commit_publications(&mut partitions, drafts, effects);
         drop(partitions);
         if wake_presentation {
@@ -2047,6 +2051,9 @@ impl ClientCore {
         }
         if wake_composer {
             self.queue_composer_model_selection_refresh();
+        }
+        if wake_workspace_draft {
+            self.queue_workspace_draft_reconciliation();
         }
         transition
     }
@@ -2411,6 +2418,10 @@ impl ClientCore {
         drop(presentation_fence);
         drop(composer_fence);
         self.update_thread_presentation_identity(principal);
+        // Identity commits bypass transition() while applying the access fence.
+        // Resume consumers waiting for workspace capabilities/model metadata too.
+        self.queue_workspace_draft_reconciliation();
+        self.queue_composer_model_selection_refresh();
         transition
     }
 

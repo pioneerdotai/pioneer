@@ -166,6 +166,7 @@ pub struct ThreadRegistry {
     pub(crate) navigation_revision: u64,
     pub(crate) navigation_publication: Option<Arc<crate::navigation::ClientNavigationState>>,
     start: ThreadStartCoordinator,
+    start_generation: u64,
     start_requested: bool,
     ready_resume: VecDeque<String>,
     ready_resume_set: HashSet<String>,
@@ -763,6 +764,32 @@ impl ClientCore {
             .expect("thread registry poisoned")
             .start
             .clone()
+    }
+    /// Reserves the existing start coordinator's identity for an editable draft
+    /// before workspace bootstrap/creation completes. This does not send a request
+    /// or select a server thread; creation consumes the same identity.
+    pub fn prepare_thread_draft(&self) -> Option<String> {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if self.is_stopped() {
+            return None;
+        }
+        if let Some(draft) = registry
+            .navigation
+            .workspace_id()
+            .and_then(|workspace| registry.navigation.draft(workspace))
+        {
+            return Some(draft.to_owned());
+        }
+        if registry.start.pending_thread_id.is_none() {
+            super::start::ensure_pending_thread_start_id(
+                &mut registry.start,
+                super::start::generate_thread_start_id(),
+            );
+        }
+        registry.start.pending_thread_id.clone()
     }
     pub fn thread_start_mutation(&self) -> ThreadStartMutation<'_> {
         ThreadStartMutation(
@@ -2457,6 +2484,158 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn draft_reply_after_thread_notification_hides_draft_and_promotion_restores_it() {
+        struct NotifyingTransport(Arc<ClientCore>);
+        impl crate::rpc::JsonRpcRequestTransport for NotifyingTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let params: ThreadStartParams =
+                    serde_json::from_value(request["params"].clone()).unwrap();
+                let thread = thread(&params.thread_id, &params.workspace_id);
+                self.0.upsert_thread(thread.clone());
+                assert!(
+                    self.0
+                        .workspace_tree("ws")
+                        .unwrap()
+                        .snapshot()
+                        .threads_by_id
+                        .contains_key(&params.thread_id)
+                );
+                response
+                    .send(Ok(serde_json::to_value(ThreadStartResponse {
+                        thread,
+                        sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                    })
+                    .unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let core = core();
+        core.activate_thread(None, Some("ws"));
+        core.upsert_thread(thread("other", "other-workspace"));
+        let other = core.workspace_tree("other-workspace").unwrap();
+        let id = core.prepare_thread_draft().unwrap();
+        core.create_workspace_thread_draft(
+            &NotifyingTransport(core.clone()),
+            "ws",
+            ThreadVisibility::Private,
+        )
+        .unwrap();
+        assert_eq!(
+            core.thread_workspace_draft("ws").as_deref(),
+            Some(id.as_str())
+        );
+        assert!(
+            !core
+                .workspace_tree("ws")
+                .unwrap()
+                .snapshot()
+                .threads_by_id
+                .contains_key(&id)
+        );
+        let scope = ClientScope::WorkspaceTree {
+            workspace_id: Some("ws".into()),
+        };
+        let published = core
+            .snapshot(&scope)
+            .unwrap()
+            .typed::<crate::workspaces::directory::ThreadTreePublication>()
+            .unwrap()
+            .payload();
+        assert!(!published.snapshot().threads_by_id.contains_key(&id));
+        assert!(core.promote_thread(&id));
+        assert!(
+            core.workspace_tree("ws")
+                .unwrap()
+                .snapshot()
+                .threads_by_id
+                .contains_key(&id)
+        );
+        let before = core.workspace_tree("ws").unwrap();
+        assert!(!core.promote_thread(&id));
+        assert!(Arc::ptr_eq(&before, &core.workspace_tree("ws").unwrap()));
+        assert!(Arc::ptr_eq(
+            &other,
+            &core.workspace_tree("other-workspace").unwrap()
+        ));
+    }
+
+    #[test]
+    fn prepared_draft_keeps_identity_and_text_through_creation() {
+        use crate::composer::store::ComposerIntent;
+        let core = core();
+        let navigation = core.subscribe(ClientScope::Navigation, NonZeroUsize::new(8).unwrap());
+        let id = core.prepare_thread_draft().unwrap();
+        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+        assert!(core.navigation_snapshot().active_thread_id().is_none());
+        assert!(navigation.try_next().is_none());
+        assert!(!core.thread_start_snapshot().in_progress);
+        assert!(!core.thread_start_requested());
+        core.composer_intent(ComposerIntent::Activate {
+            thread_id: id.clone(),
+        });
+        let draft = core.composer_snapshot(&id).unwrap().draft_id();
+        core.composer_intent(ComposerIntent::EditText {
+            thread_id: id.clone(),
+            draft_id: draft,
+            text: "typed before bootstrap".into(),
+        });
+        core.activate_thread(None, Some("ws"));
+        let transport = DraftTransport(Default::default());
+        assert_eq!(
+            core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            core.navigation_snapshot().active_thread_id(),
+            Some(id.as_str())
+        );
+        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+        let composer = core.composer_snapshot(&id).unwrap();
+        assert_eq!(composer.draft_id(), draft);
+        assert_eq!(composer.draft().text, "typed before bootstrap");
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_draft_survives_failed_creation_for_explicit_retry() {
+        struct FailedTransport;
+        impl crate::rpc::JsonRpcRequestTransport for FailedTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                _: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                Err("synthetic unavailable transport".into())
+            }
+        }
+        let core = core();
+        core.activate_thread(None, Some("ws"));
+        let id = core.prepare_thread_draft().unwrap();
+        assert!(
+            core.create_workspace_thread_draft(&FailedTransport, "ws", ThreadVisibility::Private)
+                .is_err()
+        );
+        assert!(!core.thread_start_snapshot().in_progress);
+        assert!(!core.thread_start_requested());
+        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+        let transport = DraftTransport(Default::default());
+        assert_eq!(
+            core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
+                .unwrap(),
+            id
+        );
+    }
+
     #[test]
     fn draft_creation_reuses_single_owner_and_promotion_preserves_thread() {
         let core = core();
@@ -4342,7 +4521,24 @@ impl ClientCore {
         workspace: &str,
         visibility: pioneer_protocol::ThreadVisibility,
     ) -> anyhow::Result<String> {
-        let (id, generation, navigation_revision) = {
+        self.create_workspace_thread_draft_with_clock(
+            transport,
+            workspace,
+            visibility,
+            std::time::Instant::now,
+        )
+    }
+    pub(crate) fn create_workspace_thread_draft_with_clock(
+        &self,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+        workspace: &str,
+        visibility: pioneer_protocol::ThreadVisibility,
+        now: impl FnOnce() -> std::time::Instant,
+    ) -> anyhow::Result<String> {
+        let connection = self.gateway_http_generation();
+        let authorization = self.authorization_connection_generation();
+        let workspace_generation = self.workspace_operation_generation(workspace);
+        let (id, generation, navigation_revision, start_generation) = {
             let mut registry = self
                 .thread_registry
                 .lock()
@@ -4358,35 +4554,59 @@ impl ClientCore {
             )
             .ok_or_else(|| anyhow::anyhow!("Thread creation is already in progress"))?;
             let id = plan.requested_thread_id;
+            registry.start_generation += 1;
             anyhow::ensure!(
                 registry.require(&id, workspace),
                 "Thread creation scope mismatch"
             );
             let generation = registry.stores[&id].generation;
-            (id, generation, registry.navigation_revision)
+            (
+                id,
+                generation,
+                registry.navigation_revision,
+                registry.start_generation,
+            )
         };
         let result = crate::transport::ws::command_sender::thread_start(
             transport,
             super::start::thread_create_params(id.clone(), workspace.to_owned(), visibility),
-        );
+        )
+        .and_then(|response| {
+            anyhow::ensure!(
+                response.thread.id == id && response.thread.workspace_id == workspace,
+                "Thread creation response scope mismatch"
+            );
+            Ok(response)
+        });
+        let scope_current = self.gateway_http_generation() == connection
+            && self.authorization_connection_generation() == authorization
+            && self.workspace_operation_generation(workspace) == workspace_generation;
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        anyhow::ensure!(
-            !self.is_stopped()
-                && registry
-                    .stores
-                    .get(&id)
-                    .is_some_and(|s| s.generation == generation),
-            "Thread creation cancelled"
-        );
-        if registry.start.pending_thread_id.as_deref() == Some(&id) {
-            registry.start = Default::default();
+        if self.is_stopped()
+            || !scope_current
+            || registry.start_generation != start_generation
+            || !registry
+                .stores
+                .get(&id)
+                .is_some_and(|store| store.generation == generation)
+        {
+            if registry.start_generation == start_generation
+                && registry.start.pending_thread_id.as_deref() == Some(&id)
+            {
+                super::start::finish_thread_start_attempt(&mut registry.start);
+                registry.start.next_attempt_at = None;
+            }
+            anyhow::bail!("Thread creation cancelled");
         }
         let response = match result {
             Ok(response) => response,
             Err(error) => {
+                if registry.start.pending_thread_id.as_deref() == Some(&id) {
+                    super::start::finish_thread_start_attempt(&mut registry.start);
+                }
                 if registry
                     .stores
                     .get(&id)
@@ -4394,6 +4614,24 @@ impl ClientCore {
                 {
                     registry.timeline.invalidate(Some(&id));
                     registry.stores.remove(&id);
+                }
+                let retry = matches!(
+                    super::start::plan_thread_start_bootstrap_failure(&id, &format!("{error:#}")),
+                    super::start::ThreadStartBootstrapFailurePlan::Retry { .. }
+                )
+                .then(|| super::start::apply_thread_start_retry(&mut registry.start, &id, now()));
+                drop(registry);
+                if let Some(plan) = retry {
+                    self.queue_thread_draft_retry(
+                        crate::workspaces::controller::ThreadDraftRetry {
+                            workspace: workspace.to_owned(),
+                            thread: id,
+                            connection,
+                            authorization,
+                            workspace_generation,
+                            plan,
+                        },
+                    );
                 }
                 return Err(error);
             }
@@ -4403,10 +4641,9 @@ impl ClientCore {
             response,
             None,
         );
-        anyhow::ensure!(
-            reduction.thread.id == id && reduction.thread.workspace_id == workspace,
-            "Thread creation response scope mismatch"
-        );
+        if registry.start.pending_thread_id.as_deref() == Some(&id) {
+            registry.start = Default::default();
+        }
         registry
             .stores
             .get_mut(&id)
@@ -5144,6 +5381,8 @@ impl ClientCore {
 
 impl ThreadRegistry {
     pub(crate) fn fence_presentations(&mut self, principal: Option<String>) {
+        super::start::finish_thread_start_attempt(&mut self.start);
+        self.start.next_attempt_at = None;
         self.timeline.invalidate(None);
         self.current_principal_id = principal;
         self.pending_requests
@@ -5210,7 +5449,7 @@ impl ThreadRegistry {
 }
 
 impl ClientCore {
-    fn transition_directory(
+    pub(crate) fn transition_directory(
         &self,
         registry: &mut ThreadRegistry,
         authority: &ClientMutationAuthority,

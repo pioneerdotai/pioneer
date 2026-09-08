@@ -393,6 +393,76 @@ mod tests {
         }
     }
     #[gpui_kit::test]
+    fn new_thread_draws_empty_timeline_and_editable_composer_before_bootstrap(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        assert!(client.navigation_snapshot().active_thread_id().is_none());
+        let id = client.prepare_thread_draft().unwrap();
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let thread = ThreadView::new(
+                ThreadViewConfig::new(
+                    client.clone(),
+                    id.clone(),
+                    registrar,
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                ),
+                window,
+                cx,
+            );
+            Root::new(thread, window, cx)
+        });
+        deliver();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in ["thread-empty-timeline", "thread-composer"] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("new-thread surface must be drawn");
+            assert!(
+                bounds.size.width > px(0.) && bounds.size.height > px(0.),
+                "{selector}"
+            );
+        }
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        // Connecting the selected Gateway starts an authorization epoch and
+        // clears pre-session composer publications while this draft stays mounted.
+        client.begin_authorization_epoch(Some(("synthetic-endpoint".into(), 1)));
+        deliver();
+        cx.run_until_parked();
+        assert!(client.composer_snapshot(&id).is_some());
+        cx.update(|window, cx| {
+            let composer = thread.read(cx).composer.clone();
+            composer.update(cx, |composer, cx| composer.focus(window, cx));
+        });
+        cx.simulate_input("Before bootstrap");
+        deliver();
+        cx.run_until_parked();
+        assert_eq!(
+            client.composer_snapshot(&id).unwrap().draft().text,
+            "Before bootstrap"
+        );
+        client.activate_thread(None, Some("workspace"));
+        deliver();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("thread-composer").is_some());
+        assert_eq!(
+            client.composer_snapshot(&id).unwrap().draft().text,
+            "Before bootstrap"
+        );
+        assert!(client.navigation_snapshot().active_thread_id().is_none());
+        assert!(!client.thread_start_snapshot().in_progress);
+        assert!(client.thread_coordinator_snapshot(&id).is_none());
+    }
+
+    #[gpui_kit::test]
     fn command_publications_publish_row_owned_terminal_through_completion_and_retirement(
         cx: &mut TestAppContext,
     ) {
