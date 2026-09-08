@@ -95,6 +95,7 @@ fn execution_continuation_runtime_section(
     let section = execution_continuation_section_with_runtime_facts(
         &ExecutionContinuationRuntimeFactsInput {
             checkpoint,
+            initiating_thread_id: Some("initiating_thread_snapshot"),
             prior_visible_assistant_text,
         },
     );
@@ -349,7 +350,9 @@ section_ids:
 ## Execution Continuation
 This is the same user turn continuing in a new execution window. Continue from the saved execution-window state without restarting the request. Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action.
 
-Checkpoint: schema_version=2, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
+Initiating thread: initiating_thread_snapshot
+Execution thread: thread_snapshot (internal child)
+Checkpoint: schema_version=2, workspace_id=workspace_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window
@@ -396,7 +399,9 @@ section_ids:
 ## Execution Continuation
 This is the same user turn continuing in a new execution window. Continue from the saved execution-window state without restarting the request. Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action.
 
-Checkpoint: schema_version=2, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
+Initiating thread: initiating_thread_snapshot
+Execution thread: thread_snapshot (internal child)
+Checkpoint: schema_version=2, workspace_id=workspace_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window

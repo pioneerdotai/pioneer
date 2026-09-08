@@ -1850,9 +1850,20 @@ pub(crate) async fn materialize(
     // catalog still capability-filters agent_start_options/agent_start, while
     // every projected mutation receives the same immutable opaque targets.
     let options = Some(binding.options.clone());
+    let initiating_thread_id = Some(
+        binding
+            .adapter
+            .lock()
+            .await
+            .persistence_facts()
+            .home_root_thread_id,
+    );
     let catalog = project_agent_model_tool_catalog(&binding.capabilities, options.as_ref());
     if catalog.is_empty() {
-        return Ok(pioneer_agent::TurnToolMaterialization::default());
+        return Ok(pioneer_agent::TurnToolMaterialization {
+            initiating_thread_id,
+            ..Default::default()
+        });
     }
 
     let adapter = binding.adapter.clone();
@@ -1888,6 +1899,7 @@ pub(crate) async fn materialize(
     Ok(pioneer_agent::TurnToolMaterialization {
         bundles: vec![bundle],
         diagnostics: Vec::new(),
+        initiating_thread_id,
     })
 }
 

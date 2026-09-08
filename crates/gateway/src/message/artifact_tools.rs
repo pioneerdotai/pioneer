@@ -137,6 +137,7 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         Ok(TurnToolMaterialization {
             bundles,
             diagnostics: agent_actions.diagnostics,
+            initiating_thread_id: agent_actions.initiating_thread_id,
         })
     }
 

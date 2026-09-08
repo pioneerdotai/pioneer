@@ -14,6 +14,7 @@ const STRICT_OBLIGATION_REFS_MAX_CHARS: usize = 512;
 #[derive(Debug, Clone, Copy)]
 pub struct ExecutionContinuationRuntimeFactsInput<'a> {
     pub checkpoint: &'a ExecutionCheckpointPayload,
+    pub initiating_thread_id: Option<&'a str>,
     pub prior_visible_assistant_text: Option<&'a str>,
 }
 
@@ -25,13 +26,15 @@ pub fn render_execution_continuation_runtime_facts(
     input: &ExecutionContinuationRuntimeFactsInput<'_>,
 ) -> String {
     let checkpoint = input.checkpoint;
-    let mut lines = Vec::new();
+    let mut lines = vec![crate::render_thread_ids(
+        input.initiating_thread_id,
+        &checkpoint.thread_id,
+    )];
 
     lines.push(format!(
-        "Checkpoint: schema_version={}, workspace_id={}, thread_id={}, turn_id={}",
+        "Checkpoint: schema_version={}, workspace_id={}, turn_id={}",
         checkpoint.schema_version,
         checkpoint.workspace_id,
-        checkpoint.thread_id,
         checkpoint.turn_id
     ));
 
@@ -351,6 +354,7 @@ mod tests {
         let rendered =
             render_execution_continuation_runtime_facts(&ExecutionContinuationRuntimeFactsInput {
                 checkpoint: &checkpoint,
+                initiating_thread_id: Some("initiating_thread_snapshot"),
                 prior_visible_assistant_text: Some("short visible text"),
             });
 
@@ -428,6 +432,7 @@ mod tests {
             render_execution_continuation_runtime_facts(&ExecutionContinuationRuntimeFactsInput {
                 checkpoint: &checkpoint,
                 prior_visible_assistant_text: None,
+                initiating_thread_id: Some("initiating_thread_snapshot"),
             });
 
         assert!(rendered.contains("Strict unresolved obligations reported by runtime validators:"));
@@ -510,10 +515,13 @@ mod tests {
             render_execution_continuation_runtime_facts(&ExecutionContinuationRuntimeFactsInput {
                 checkpoint: &checkpoint,
                 prior_visible_assistant_text: None,
+                initiating_thread_id: Some("initiating_thread_snapshot"),
             });
 
         insta::assert_snapshot!(rendered, @r###"
-Checkpoint: schema_version=2, workspace_id=ws_snapshot, thread_id=thr_snapshot, turn_id=turn_snapshot
+Initiating thread: initiating_thread_snapshot
+Execution thread: thr_snapshot (internal child)
+Checkpoint: schema_version=2, workspace_id=ws_snapshot, turn_id=turn_snapshot
 Original request preview: Create the proposal
 Original attachment kinds: local_file
 Completed window: index=2, agent_rounds=5, tool_calls=6, provider_tokens=unknown

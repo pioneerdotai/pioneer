@@ -11,9 +11,15 @@ use std::collections::HashMap;
 
 const CLI_RUNTIME_RECOVERY_CONTINUATION_PROMPT: &str = "Continue the interrupted task from the existing thread context.\n\nRecovery contract:\n- The original user request and prior conversation are authoritative.\n- Treat the current workspace and external systems as the source of truth.\n- Inspect and reconcile current state before making further changes.\n- Do not repeat actions or tool calls that already completed.\n- Continue from the first unfinished step.\n- If safe continuation cannot be established, stop and explain what must be resolved.";
 
-pub(crate) fn cli_runtime_recovery_turn_input() -> serde_json::Value {
+pub(crate) fn cli_runtime_recovery_turn_input(
+    initiating_thread_id: &str,
+    execution_thread_id: &str,
+) -> serde_json::Value {
     serde_json::to_value(vec![CLIRuntimeTurnInputItem::Text {
-        text: CLI_RUNTIME_RECOVERY_CONTINUATION_PROMPT.to_owned(),
+        text: format!(
+            "{}\n\n{CLI_RUNTIME_RECOVERY_CONTINUATION_PROMPT}",
+            pioneer_promt::render_thread_ids(Some(initiating_thread_id), execution_thread_id)
+        ),
     }])
     .expect("CLI runtime recovery text input must serialize")
 }

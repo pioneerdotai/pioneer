@@ -1724,6 +1724,7 @@ fn runtime_sections_with_execution_continuation_context(
     execution_window_index: u32,
     execution_checkpoint_context: Option<&ExecutionCheckpointContext>,
     prior_visible_assistant_text: Option<&str>,
+    initiating_thread_id: Option<&str>,
 ) -> Vec<PromptRuntimeSectionInput> {
     if execution_window_index <= 1 {
         return runtime_sections.to_vec();
@@ -1744,6 +1745,7 @@ fn runtime_sections_with_execution_continuation_context(
 
     let facts_input = ExecutionContinuationRuntimeFactsInput {
         checkpoint: &context.payload,
+        initiating_thread_id,
         prior_visible_assistant_text,
     };
     let continuation_section = execution_continuation_section_with_runtime_facts(&facts_input);
@@ -2175,6 +2177,7 @@ fn compile_agent_instruction_delivery_plan(
     include_task_orchestration_policy: bool,
     include_request_tools_catalog: bool,
     continue_generation_hint: bool,
+    initiating_thread_id: Option<&str>,
     thread_id: &str,
     turn_id: &str,
 ) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
@@ -2194,6 +2197,7 @@ fn compile_agent_instruction_delivery_plan(
         include_task_orchestration_policy,
         include_request_tools_catalog,
         continue_generation_hint,
+        initiating_thread_id,
         thread_id,
         turn_id,
     )
@@ -2208,13 +2212,15 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     include_task_orchestration_policy: bool,
     include_request_tools_catalog: bool,
     continue_generation_hint: bool,
+    initiating_thread_id: Option<&str>,
     thread_id: &str,
     turn_id: &str,
 ) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
     let now = Local::now();
 
     let extra_system = format!(
-        "## Runtime\nCurrent date/time: {} ({})\nOS: {}",
+        "## Runtime\n{}\nCurrent date/time: {} ({})\nOS: {}",
+        pioneer_promt::render_thread_ids(initiating_thread_id, thread_id),
         now.format("%Y-%m-%d %H:%M:%S"),
         now.format("%Z"),
         std::env::consts::OS,
@@ -3825,6 +3831,7 @@ async fn execute_agent_provider_response(
             execution_window_index,
             execution_checkpoint_context.as_ref(),
             prior_visible_assistant_text.as_deref(),
+            turn_tool_materialization.initiating_thread_id.as_deref(),
         );
         let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
             prompt_runtime_sections,
@@ -3847,6 +3854,7 @@ async fn execute_agent_provider_response(
             include_task_orchestration_policy,
             false,
             continue_generation_hint,
+            turn_tool_materialization.initiating_thread_id.as_deref(),
             thread_id,
             turn_id,
         )?;
@@ -4250,6 +4258,7 @@ async fn execute_agent_provider_response(
         execution_window_index,
         execution_checkpoint_context.as_ref(),
         prior_visible_assistant_text.as_deref(),
+        turn_tool_materialization.initiating_thread_id.as_deref(),
     );
     let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
         prompt_runtime_sections,
@@ -4272,6 +4281,7 @@ async fn execute_agent_provider_response(
         include_task_orchestration_policy,
         true,
         continue_generation_hint,
+        turn_tool_materialization.initiating_thread_id.as_deref(),
         thread_id,
         turn_id,
     )?;
@@ -4639,6 +4649,7 @@ async fn execute_agent_provider_response(
                         include_task_orchestration_policy,
                         round_plan.tools_enabled,
                         continue_generation_hint,
+                        turn_tool_materialization.initiating_thread_id.as_deref(),
                         thread_id,
                         turn_id,
                     )
@@ -4716,6 +4727,7 @@ async fn execute_agent_provider_response(
                         execution_window_index,
                         execution_checkpoint_context.as_ref(),
                         prior_visible_assistant_text.as_deref(),
+                        turn_tool_materialization.initiating_thread_id.as_deref(),
                     );
                 let no_tool_runtime_sections = runtime_sections_with_artifact_reference_policy(
                     no_tool_runtime_sections,
@@ -4730,6 +4742,7 @@ async fn execute_agent_provider_response(
                     include_task_orchestration_policy,
                     false,
                     continue_generation_hint,
+                    turn_tool_materialization.initiating_thread_id.as_deref(),
                     thread_id,
                     turn_id,
                 )
@@ -5039,6 +5052,7 @@ async fn execute_agent_provider_response(
                             include_task_orchestration_policy,
                             false,
                             continue_generation_hint,
+                            turn_tool_materialization.initiating_thread_id.as_deref(),
                             thread_id,
                             turn_id,
                         )
@@ -6358,6 +6372,7 @@ async fn execute_agent_provider_response(
                     include_task_orchestration_policy,
                     next_round_tools_enabled,
                     continue_generation_hint,
+                    turn_tool_materialization.initiating_thread_id.as_deref(),
                     thread_id,
                     turn_id,
                 )
@@ -7275,6 +7290,7 @@ mod tests {
             1,
             Some(&checkpoint_context),
             Some("partial assistant text"),
+            Some("initiating_thread_test"),
         );
 
         assert_eq!(sections, base_sections);
@@ -7289,9 +7305,15 @@ mod tests {
             2,
             Some(&checkpoint_context),
             Some("partial assistant text"),
+            Some("initiating_thread_test"),
         );
 
         assert_eq!(sections.len(), 1);
+        assert!(sections[0].content.contains("Initiating thread: initiating_thread_test"));
+        assert!(sections[0].content.contains(&format!(
+            "Execution thread: {} (internal child)",
+            checkpoint_context.payload.thread_id
+        )));
         assert_eq!(
             sections[0].id,
             PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ExecutionContinuation)
@@ -9009,6 +9031,7 @@ mod tests {
             false,
             false,
             false,
+            Some("thread_test"),
             "thread_test",
             "turn_test",
         )
@@ -9055,6 +9078,7 @@ mod tests {
             false,
             false,
             false,
+            Some("thread_agents_md"),
             "thread_agents_md",
             "turn_agents_md",
         )
@@ -9088,6 +9112,7 @@ mod tests {
             false,
             true,
             false,
+            Some("thread_permissions"),
             "thread_permissions",
             "turn_permissions",
         )
@@ -9136,6 +9161,7 @@ mod tests {
             false,
             true,
             false,
+            Some("thread_request_tools_catalog"),
             "thread_request_tools_catalog",
             "turn_request_tools_catalog",
         )
@@ -9189,6 +9215,7 @@ mod tests {
             false,
             false,
             false,
+            Some("thread_no_request_tools_catalog"),
             "thread_no_request_tools_catalog",
             "turn_no_request_tools_catalog",
         )

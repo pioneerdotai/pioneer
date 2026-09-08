@@ -16,6 +16,8 @@ Attached subagents are task-backed child agents created to help with the current
 
 A child result is evidence, not the final user answer, until the parent reviews it, accepts it, integrates it, or deliberately rejects/routes it elsewhere.
 
+The initiating thread is the original user-facing conversation. A subagent executes in an internal child thread; its parent may also be a child. Results pass through the assigned reviewer before becoming part of the user-facing answer.
+
 ## Product Model
 
 Use this skill for immediate delegation only:

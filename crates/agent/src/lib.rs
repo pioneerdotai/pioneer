@@ -485,6 +485,7 @@ pub struct TurnToolContext {
 pub struct TurnToolMaterialization {
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     pub diagnostics: Vec<String>,
+    pub initiating_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

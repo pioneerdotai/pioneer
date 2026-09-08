@@ -5065,6 +5065,10 @@ impl MessageProcessor {
                     continuation_thread_id.as_str(),
                     context_thread_id.as_str(),
                     combined_preflight.mcp_projection.as_ref(),
+                    match &execution_authority {
+                        TurnExecutionAuthority::Fresh(admission) => admission.root_thread_id(),
+                        TurnExecutionAuthority::Durable { context, .. } => context.root_thread_id(),
+                    },
                     selected_skill_names.as_slice(),
                     success_response.task_conversation_history(),
                 )
@@ -6638,6 +6642,9 @@ impl MessageProcessor {
                 .context("failed to reset Codex Goal before recovery")?;
         }
 
+        let recovery_authority = self
+            .load_turn_execution_authorization_context(&binding.turn_id)
+            .await?;
         let prepared_at = chrono::Utc::now().fixed_offset();
         let (prepared_binding, attempt) = self
             .crud_store
@@ -6688,7 +6695,10 @@ impl MessageProcessor {
             .start_turn(
                 crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
                     native_thread_id: prepared_binding.native_thread_id.clone(),
-                    input: crate::cli_runtime::turn_recovery::cli_runtime_recovery_turn_input(),
+                    input: crate::cli_runtime::turn_recovery::cli_runtime_recovery_turn_input(
+                        recovery_authority.root_thread_id(),
+                        &prepared_binding.thread_id,
+                    ),
                     cwd: Some(restored.native_cwd.clone()),
                     model: prepared_binding.model.clone(),
                     approval_policy: prepared_binding.approval_policy.clone(),
@@ -7322,6 +7332,7 @@ impl MessageProcessor {
         continuation_thread_id: &str,
         context_thread_id: &str,
         mcp_projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
+        initiating_thread_id: &str,
         selected_skill_names: &[String],
         frozen_history: Option<&[ChatMessage]>,
     ) -> anyhow::Result<pioneer_promt::CompiledInstructionDeliveryPlan> {
@@ -7347,7 +7358,8 @@ impl MessageProcessor {
             self.artifact_runtime_home.as_path(),
             crate::cli_runtime::context::CLIRuntimeContextBuildInput {
                 workspace_id: outcome.started_notification.workspace_id.as_str(),
-                thread_id: context_thread_id,
+                thread_id: outcome.started_notification.thread_id.as_str(),
+                initiating_thread_id,
                 turn_id: outcome.started_notification.turn.id.as_str(),
                 runtime_id,
                 runtime_label: cli_runtime_context_label(runtime_kind),
