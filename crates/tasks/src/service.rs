@@ -1623,10 +1623,10 @@ impl TaskService {
                     ),
                 };
                 if reviewer_execution_id.as_str() != intended_execution_id {
-                    bail!(
+                    return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
                         "parent reviewer execution does not match task `{}` immutable reviewer intent",
                         response.task.id
-                    );
+                    )));
                 }
                 let turn_id = actor
                     .reviewer_turn_id
@@ -2572,11 +2572,11 @@ impl TaskService {
         };
 
         if execution_turn.task_id == target_task_id {
-            bail!(
+            return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
                 "cannot_cancel_current_execution_task: task `{}` cannot cancel itself while executing run `{}`",
                 execution_turn.task_id,
                 execution_turn.run_id
-            );
+            )));
         }
 
         let mut visited = BTreeSet::new();
@@ -2602,12 +2602,12 @@ impl TaskService {
                 return Ok(());
             };
             if parent_task_id == target_task_id {
-                bail!(
+                return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
                     "cannot_cancel_current_execution_ancestor: task `{}` cannot cancel ancestor task `{}` while executing run `{}`",
                     execution_turn.task_id,
                     target_task_id,
                     execution_turn.run_id
-                );
+                )));
             }
             current_task_id = parent_task_id;
         }
@@ -2675,7 +2675,7 @@ impl TaskService {
 
     pub async fn update_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskUpdateParams,
     ) -> TaskRuntimeResult<TaskUpdateResponse> {
         validate_update_params(&params)?;
@@ -2683,16 +2683,21 @@ impl TaskService {
             bail!("task `{}` not found", params.task_id);
         };
         if is_terminal_task(response.task.status) {
-            bail!("terminal task `{}` cannot be updated", params.task_id);
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "terminal task `{}` cannot be updated",
+                    params.task_id
+                )),
+            );
         }
         if let Some(expected_revision) = params.expected_revision
             && response.task.revision != expected_revision
         {
-            bail!(
-                "task `{}` revision mismatch: expected {}, got {}",
-                params.task_id,
-                expected_revision,
-                response.task.revision
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "task `{}` revision mismatch: expected {}, got {}",
+                    params.task_id, expected_revision, response.task.revision
+                )),
             );
         }
 
@@ -2998,6 +3003,12 @@ impl TaskService {
         )?;
 
         if changed_fields.is_empty() {
+            self.append_events_with_optional_agent_action(
+                Vec::new(),
+                now,
+                context.agent_action_commit,
+            )
+            .await?;
             return Ok(TaskUpdateResponse {
                 task,
                 trigger: None,
@@ -3009,18 +3020,19 @@ impl TaskService {
         task.updated_at = now;
         task.revision = task.revision.saturating_add(1);
         let appended = self
-            .append_event(
-                TaskEventPayload::TaskUpdated {
+            .append_events_with_optional_agent_action(
+                vec![TaskEventPayload::TaskUpdated {
                     task: task.clone(),
                     trigger: updated_trigger.clone(),
                     agent_spec: updated_agent_spec.clone(),
                     changed_fields: changed_fields.clone(),
                     updated_at: now,
-                },
+                }],
                 now,
+                context.agent_action_commit,
             )
             .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         if updated_trigger.is_some() {
             self.process_due_once(now).await?;
         }
@@ -3039,14 +3051,19 @@ impl TaskService {
 
     pub async fn reschedule_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskRescheduleParams,
     ) -> TaskRuntimeResult<TaskRescheduleResponse> {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
         if is_terminal_task(response.task.status) {
-            bail!("terminal task `{}` cannot be rescheduled", params.task_id);
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "terminal task `{}` cannot be rescheduled",
+                    params.task_id
+                )),
+            );
         }
         TaskTriggerCalculator::validate(&params.trigger.spec)?;
         let now = now_timestamp_secs();
@@ -3074,17 +3091,18 @@ impl TaskService {
             updated_at: now,
         };
         let appended = self
-            .append_event(
-                TaskEventPayload::TaskRescheduled {
+            .append_events_with_optional_agent_action(
+                vec![TaskEventPayload::TaskRescheduled {
                     task_id: params.task_id.clone(),
                     trigger: trigger.clone(),
                     rescheduled_at: now,
                     reason: pioneer_protocol::TaskRescheduleReason::UserRequested,
-                },
+                }],
                 now,
+                context.agent_action_commit,
             )
             .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         self.process_due_once(now).await?;
         let task = self
             .store
@@ -3097,13 +3115,19 @@ impl TaskService {
 
     pub async fn pause_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskPauseParams,
     ) -> TaskRuntimeResult<TaskPauseResponse> {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
         if is_terminal_task(response.task.status) {
+            self.append_events_with_optional_agent_action(
+                Vec::new(),
+                now_timestamp_secs(),
+                context.agent_action_commit,
+            )
+            .await?;
             return Ok(TaskPauseResponse {
                 task: response.task,
                 triggers: response.triggers,
@@ -3124,17 +3148,18 @@ impl TaskService {
                 trigger
             })
             .collect::<Vec<_>>();
-        let appended = task_service_future(self.append_event(
-            TaskEventPayload::TaskPaused {
+        let appended = task_service_future(self.append_events_with_optional_agent_action(
+            vec![TaskEventPayload::TaskPaused {
                 task: task.clone(),
                 triggers: triggers.clone(),
                 reason: params.reason,
                 paused_at: now,
-            },
+            }],
             now,
+            context.agent_action_commit,
         ))
         .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         Ok(TaskPauseResponse { task, triggers })
     }
 
@@ -3149,7 +3174,12 @@ impl TaskService {
         };
         let was_blocked = response.task.status == TaskStatus::Blocked;
         if is_terminal_task(response.task.status) && !was_blocked {
-            bail!("terminal task `{}` cannot be resumed", params.task_id);
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "terminal task `{}` cannot be resumed",
+                    params.task_id
+                )),
+            );
         }
         let readmission = match (
             was_blocked,

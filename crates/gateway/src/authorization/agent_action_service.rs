@@ -117,7 +117,11 @@ impl CanonicalAgentActionService {
                     ..
                 } => ResourceAction::TaskDetach,
                 AgentActionIntent::ControlTask {
-                    control: pioneer_protocol::AgentTaskControl::Resume,
+                    control:
+                        pioneer_protocol::AgentTaskControl::Resume
+                        | pioneer_protocol::AgentTaskControl::Pause
+                        | pioneer_protocol::AgentTaskControl::Update
+                        | pioneer_protocol::AgentTaskControl::Reschedule,
                     ..
                 } => ResourceAction::TaskScheduleManage,
                 _ => unreachable!("normalized control kind comes from a control intent"),

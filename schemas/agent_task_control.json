@@ -5,6 +5,9 @@
   "enum": [
     "cancel",
     "resume",
-    "detach"
+    "detach",
+    "pause",
+    "update",
+    "reschedule"
   ]
 }

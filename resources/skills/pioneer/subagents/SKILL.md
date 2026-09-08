@@ -109,6 +109,10 @@ Read `references/tool-schemas.md` for exact payload examples.
 
 ## Wait And Review
 
+Task read/control access follows the authorized root-thread capsule and current action grants; a new turn does not by itself erase access. Review is stricter: reading the full review candidate, accepting it, or requesting revisions requires the task's designated reviewer. Capsule membership alone does not make another subagent the reviewer. Recovery of the same reviewer execution preserves that identity; an independent new execution does not inherit it.
+
+An access or runtime error is not proof that a child stopped. Do not recreate work or claim cancellation on that basis; report the unresolved state and avoid duplicate work. See `system:pioneer/tasks` for durable task access and failure handling.
+
 For independent attached subagents, create them all first, then call `task_wait` with `taskIds` or `runIds`. Prefer `runIds` when available. By default, `task_wait` returns as soon as any target is terminal or requires review. Handle every returned result before calling `task_wait` again for the remaining active runs.
 
 `task_wait` can return terminal results, pending work, or `reviewRequired`. A review-required candidate is not final. Inspect every candidate and accept only when it satisfies:
