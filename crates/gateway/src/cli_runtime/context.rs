@@ -26,6 +26,7 @@ const THREAD_CONTEXT_MESSAGE_MAX_CHARS: usize = 800;
 pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub workspace_id: &'a str,
     pub thread_id: &'a str,
+    pub initiating_thread_id: &'a str,
     pub turn_id: &'a str,
     pub runtime_id: &'a str,
     pub runtime_label: &'a str,
@@ -52,6 +53,7 @@ pub(crate) fn compile_cli_runtime_delivery_plan(
         CliRuntimeContextInput {
             workspace_id: input.workspace_id.to_owned(),
             thread_id: input.thread_id.to_owned(),
+            initiating_thread_id: input.initiating_thread_id.to_owned(),
             turn_id: input.turn_id.to_owned(),
             runtime_id: input.runtime_id.to_owned(),
             runtime_label: Some(input.runtime_label.to_owned()),
@@ -344,6 +346,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
@@ -378,6 +381,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "claude-default",
                 runtime_label: "Claude CLI",
@@ -426,6 +430,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
@@ -474,6 +479,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",

@@ -389,16 +389,31 @@ async fn project_cli_runtime_identity<C: ConnectionTrait>(
         )
     })?;
 
+    // A return to earlier settings repeats the fingerprint, but is a new source
+    // revision. Keep existing snapshot IDs (including the legacy fingerprint-only
+    // IDs) so historical execution references remain immutable. New snapshots
+    // must include the revision to avoid colliding with that earlier history.
+    let snapshot_id = agent_presentation_snapshot::Entity::find()
+        .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(identity.id.clone()))
+        .filter(agent_presentation_snapshot::Column::SourceRevision.eq(identity.source_revision))
+        .filter(agent_presentation_snapshot::Column::SourceFingerprint.eq(fingerprint.clone()))
+        .one(db)
+        .await
+        .context("failed to inspect CLI runtime presentation snapshot")?
+        .map(|snapshot| snapshot.id)
+        .unwrap_or_else(|| {
+            deterministic_id(
+                'S',
+                &format!(
+                    "cli-snapshot\0{workspace_id}\0{}\0{}\0{fingerprint}",
+                    instance.id, identity.source_revision
+                ),
+            )
+        });
     insert_presentation_snapshot(
         db,
         &PresentationSnapshotInput {
-            id: deterministic_id(
-                'S',
-                &format!(
-                    "cli-snapshot\0{workspace_id}\0{}\0{fingerprint}",
-                    instance.id
-                ),
-            ),
+            id: snapshot_id,
             agent_identity_id: identity.id,
             source_revision: identity.source_revision,
             source_fingerprint: fingerprint,
@@ -510,6 +525,201 @@ fn short_hash(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{CliRuntimeIdentitySeed, runtime_nickname, validate_runtime_catalog};
+
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_entity::{agent_identity, agent_presentation_snapshot, workspace};
+    use pioneer_sqlite::SqliteDatabase;
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+
+    async fn catalog_database() -> SqliteDatabase {
+        let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let db = SqliteDatabase::from_single_connection(connection);
+        workspace::ActiveModel {
+            id: Set("workspace".into()),
+            name: Set("Workspace".into()),
+            is_active: Set(true),
+            is_current: Set(true),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    fn runtime_seed(kind: &str, enabled: bool) -> CliRuntimeIdentitySeed {
+        CliRuntimeIdentitySeed {
+            id: kind.into(),
+            kind: kind.into(),
+            display_name: format!("{kind} CLI"),
+            nickname: kind.into(),
+            enabled,
+            source_revision_material: format!("{kind}:{enabled}"),
+        }
+    }
+
+    async fn sync(db: &SqliteDatabase, instances: &[CliRuntimeIdentitySeed]) {
+        super::sync_cli_runtime_identity_catalog(db, instances, chrono::Utc::now().fixed_offset())
+            .await
+            .expect("CLI settings projection must succeed");
+    }
+
+    #[tokio::test]
+    async fn cli_provider_off_on_cycles_keep_immutable_history_and_are_idempotent() {
+        for kind in ["codex", "claude"] {
+            let db = catalog_database().await;
+            let mut previous = Vec::new();
+            for (index, enabled) in [true, false, true, false, true].into_iter().enumerate() {
+                // Keep both sources configured so switching one does not retire the other.
+                let instances = [
+                    runtime_seed("codex", enabled),
+                    runtime_seed("claude", enabled),
+                ];
+                sync(&db, &instances).await;
+                let identity = super::load_agent_identity_by_source(
+                    &db,
+                    "workspace",
+                    super::SOURCE_CLI_RUNTIME_INSTANCE,
+                    kind,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let snapshots = agent_presentation_snapshot::Entity::find()
+                    .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
+                    .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
+                    .all(&db)
+                    .await
+                    .unwrap();
+                if index > 0 {
+                    assert_eq!(&snapshots[..previous.len()], previous.as_slice());
+                }
+                assert_eq!(
+                    snapshots.last().unwrap().source_revision,
+                    identity.source_revision
+                );
+                assert_eq!(
+                    snapshots.last().unwrap().source_fingerprint,
+                    identity.source_fingerprint
+                );
+                assert_eq!(identity.status, "active");
+                assert_eq!(snapshots.len(), index + 1);
+                sync(&db, &instances).await;
+                let replay = agent_presentation_snapshot::Entity::find()
+                    .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
+                    .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
+                    .all(&db)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    snapshots, replay,
+                    "replay must not rewrite or append history"
+                );
+                previous = snapshots;
+            }
+            db.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_provider_projection_recovers_after_failed_reenable_and_rollback() {
+        for partial_revision in [3, 4] {
+            let db = catalog_database().await;
+            let on = runtime_seed("codex", true);
+            let off = runtime_seed("codex", false);
+            sync(&db, &[on.clone()]).await;
+            sync(&db, &[off.clone()]).await;
+            let identity = super::load_agent_identity_by_source(
+                &db,
+                "workspace",
+                super::SOURCE_CLI_RUNTIME_INSTANCE,
+                "codex",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // Old code advanced the identity before its snapshot insert failed. The
+            // rollback also failed, leaving this identity ahead of the settings file.
+            let mut partial: agent_identity::ActiveModel = identity.into();
+            partial.source_revision = Set(partial_revision);
+            partial.source_fingerprint = Set(super::cli_runtime_identity_fingerprint(
+                if partial_revision == 3 { &on } else { &off },
+            ));
+            partial.update(&db).await.unwrap();
+            sync(&db, &[off]).await;
+            sync(&db, &[on]).await;
+            let identity = super::load_agent_identity_by_source(
+                &db,
+                "workspace",
+                super::SOURCE_CLI_RUNTIME_INSTANCE,
+                "codex",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(identity.source_revision, 5);
+            let history = agent_presentation_snapshot::Entity::find()
+                .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(identity.id))
+                .order_by_asc(agent_presentation_snapshot::Column::SourceRevision)
+                .all(&db)
+                .await
+                .unwrap();
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|row| row.source_revision)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 4, 5]
+            );
+            db.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_provider_projection_preserves_legacy_snapshot_ids() {
+        let db = catalog_database().await;
+        let on = runtime_seed("codex", true);
+        sync(&db, &[on.clone()]).await;
+        let identity = super::load_agent_identity_by_source(
+            &db,
+            "workspace",
+            super::SOURCE_CLI_RUNTIME_INSTANCE,
+            "codex",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let legacy_id = super::deterministic_id(
+            'S',
+            &format!(
+                "cli-snapshot\0workspace\0codex\0{}",
+                identity.source_fingerprint,
+            ),
+        );
+        agent_presentation_snapshot::Entity::update_many()
+            .col_expr(
+                agent_presentation_snapshot::Column::Id,
+                sea_orm::sea_query::Expr::value(&legacy_id),
+            )
+            .filter(agent_presentation_snapshot::Column::AgentIdentityId.eq(&identity.id))
+            .exec(&db)
+            .await
+            .unwrap();
+        let before = agent_presentation_snapshot::Entity::find_by_id(&legacy_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        sync(&db, &[on]).await;
+        let after = agent_presentation_snapshot::Entity::find_by_id(&legacy_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
+        db.close().await.unwrap();
+    }
 
     #[test]
     fn runtime_nickname_is_stable_and_bounded() {

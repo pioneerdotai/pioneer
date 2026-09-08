@@ -357,6 +357,46 @@ pub(crate) struct ComposerStore {
 }
 
 impl ComposerStore {
+    pub(crate) fn fence_authorization(&mut self) -> Vec<crate::core::ClientPublicationDraft> {
+        self.policies.clear();
+        self.runtimes.clear();
+        self.catalogs.clear();
+        self.model_pickers.clear();
+        self.voice_readiness.clear();
+        self.drafts
+            .values_mut()
+            .map(|current| {
+                let mut next = (**current).clone();
+                cancel_operation(&mut next);
+                next.authorization_fingerprint = None;
+                next.reconciliation = None;
+                next.permission_options.clear();
+                next.selected_permission_mode_allowed = false;
+                next.selected_provider_ready = false;
+                next.runtime_selection = None;
+                next.model_display = None;
+                next.voice_readiness = None;
+                next.revision = next
+                    .revision
+                    .checked_add(1)
+                    .expect("composer revision exhausted");
+                *current = Arc::new(next);
+                ClientMutationAuthority { _private: () }.publication(
+                    ClientScope::Composer {
+                        thread_id: current.thread_id().into(),
+                    },
+                    ClientRevisions::new(
+                        DomainRevision::new(current.revision()),
+                        PresentationRevision::new(current.revision()),
+                        ContentRevision::ZERO,
+                        ScopedRevision::new(current.revision()),
+                    ),
+                    current.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.drafts.clear();
         self.last_opened_thread = None;
@@ -379,6 +419,35 @@ impl ComposerStore {
 }
 
 impl ClientCore {
+    pub(crate) fn forget_revoked_composer(&self, thread: &str) {
+        let mut store = self.composer_store.lock().expect("composer store poisoned");
+        let Some(draft) = store.drafts.remove(thread) else {
+            return;
+        };
+        store.policies.remove(thread);
+        if store.last_opened_thread.as_deref() == Some(thread) {
+            store.last_opened_thread = None;
+        }
+        let revision = draft
+            .revision()
+            .checked_add(1)
+            .expect("composer revision exhausted");
+        self.publish(
+            &ClientMutationAuthority { _private: () },
+            ClientScope::Composer {
+                thread_id: thread.into(),
+            },
+            ClientRevisions::new(
+                DomainRevision::new(revision),
+                PresentationRevision::new(revision),
+                ContentRevision::ZERO,
+                ScopedRevision::new(revision),
+            ),
+            Arc::new(serde_json::Value::Null),
+            vec![],
+        );
+    }
+
     pub(super) fn reconcile_composer_authorization(
         &self,
         thread: &str,
@@ -514,7 +583,12 @@ impl ClientCore {
             ClientScope::Composer {
                 thread_id: identity.thread_id.clone(),
             },
-            crate::threads::registry::revisions(revision),
+            ClientRevisions::new(
+                DomainRevision::new(revision),
+                PresentationRevision::new(revision),
+                ContentRevision::ZERO,
+                ScopedRevision::new(revision),
+            ),
             next,
             vec![],
         );
@@ -670,7 +744,12 @@ impl ClientCore {
             ClientScope::Composer {
                 thread_id: identity.thread_id.clone(),
             },
-            crate::threads::registry::revisions(revision),
+            ClientRevisions::new(
+                DomainRevision::new(revision),
+                PresentationRevision::new(revision),
+                ContentRevision::ZERO,
+                ScopedRevision::new(revision),
+            ),
             next,
             vec![],
         );

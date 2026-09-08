@@ -70,7 +70,11 @@ impl ComposerView {
     ) -> pioneer_client::authorization::PrincipalPresentationCapabilities {
         self.identity_input
             .as_ref()
-            .and_then(|identity| identity.capabilities.snapshot(None, None))
+            .and_then(|identity| {
+                identity
+                    .capabilities
+                    .snapshot(self.active_workspace_id().as_deref(), None)
+            })
             .as_ref()
             .map(pioneer_client::authorization::principal_presentation_capabilities)
             .unwrap_or_default()
@@ -121,6 +125,18 @@ impl ComposerView {
     pub(super) fn active_artifact_presentation_policy(
         &self,
     ) -> pioneer_client::artifacts::presentation::ArtifactPresentationPolicy {
+        if self.is_draft() {
+            let workspace = self.authorization().and_then(|snapshot| snapshot.workspace);
+            return pioneer_client::artifacts::presentation::artifact_presentation_policy(
+                workspace
+                    .as_ref()
+                    .is_some_and(|scope| scope.capabilities.can_read_artifacts),
+                workspace
+                    .as_ref()
+                    .is_some_and(|scope| scope.execution_draft_policy.can_attach_artifacts),
+                self.connection_state == GatewayConnectionState::Connected,
+            );
+        }
         let capabilities = self.thread_presentation_capabilities(&self.thread_id);
         pioneer_client::artifacts::presentation::artifact_presentation_policy(
             capabilities.is_some_and(|c| c.can_read_artifacts),

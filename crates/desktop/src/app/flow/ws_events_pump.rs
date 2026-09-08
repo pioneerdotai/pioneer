@@ -132,8 +132,15 @@ impl PioneerDesktop {
                 change_sequence = publication.authorization_change_sequence;
                 if view
                     .update(cx, |view, cx| {
-                        if changed_epoch || missed {
+                        if changed_epoch {
                             view.clear_authorization_epoch_cache();
+                        } else if missed {
+                            // Watch delivery can coalesce ordinary saves. The Client already
+                            // fenced their protected scopes; preserve the user's current route.
+                            view.invalidate_workspace_capability_projections();
+                            view.administration = Default::default();
+                            view.gateway.capability_snapshot = None;
+                            view.refresh_current_principal(cx);
                         }
                         view.gateway.current_auth = publication.current_auth.clone();
 

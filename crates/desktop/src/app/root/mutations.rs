@@ -333,15 +333,30 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn clear_workspace_capability_projections(&mut self) {
+        self.invalidate_workspace_capability_projections();
+        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
+            server_id: None,
+        });
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None },
+        );
+        if !matches!(
+            self.main_content_view(),
+            MainContentView::Settings | MainContentView::Threads
+        ) {
+            self.navigation_intent(pioneer_client::navigation::NavigationIntent::Navigate {
+                destination: pioneer_client::navigation::SemanticDestination::Threads,
+            });
+        }
+    }
+
+    pub(in crate::app) fn invalidate_workspace_capability_projections(&mut self) {
         self.reset_thread_start_state();
         self.clear_thread_start_queue();
         self.clear_turn_resume_queue();
         self.providers.clear_for_workspace_switch();
         self.sync_open_model_selector_cli_runtime_snapshot();
         self.mcp_servers.clear();
-        self.navigation_intent(pioneer_client::navigation::NavigationIntent::SetMcpRoute {
-            server_id: None,
-        });
         self.mcp_server_details = None;
         self.mcp_loading = false;
         self.mcp_details_loading = false;
@@ -357,18 +372,6 @@ impl PioneerDesktop {
         self.skills_error = None;
         self.skills_refresh_requested = false;
         self.skills_pending_actions.clear();
-        self.navigation_intent(
-            pioneer_client::navigation::NavigationIntent::SetSkillsRoute { skill_id: None },
-        );
-
-        if !matches!(
-            self.main_content_view(),
-            MainContentView::Settings | MainContentView::Threads
-        ) {
-            self.navigation_intent(pioneer_client::navigation::NavigationIntent::Navigate {
-                destination: pioneer_client::navigation::SemanticDestination::Threads,
-            });
-        }
     }
 
     /// Clears every server-authorized projection before a connection begins a

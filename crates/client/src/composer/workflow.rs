@@ -1325,9 +1325,12 @@ mod tests {
 
     #[test]
     fn send_acknowledgement_clears_only_matching_draft_and_failure_retains_payload() {
-        for accepted in [true, false] {
+        for (draft, accepted) in [(true, true), (true, false), (false, true), (false, false)] {
             let (core, identity) = fixture();
             let reduction = ready_send(&core, &identity);
+            if draft {
+                core.remember_thread_draft("workspace", Some("a".into()));
+            }
             let (started, receive) = std::sync::mpsc::sync_channel(1);
             let (reply, finish) = std::sync::mpsc::sync_channel(1);
             core.send_prepared_composer_turn_using(
@@ -1351,10 +1354,24 @@ mod tests {
             reply.send(accepted).unwrap();
             join_sends(&core);
             let input = core.composer_snapshot("a").unwrap();
+            let published = core
+                .snapshot(&crate::core::ClientScope::Composer {
+                    thread_id: "a".into(),
+                })
+                .unwrap()
+                .typed::<super::super::store::ComposerPublication>()
+                .unwrap()
+                .payload();
+            assert!(
+                Arc::ptr_eq(&input, &published),
+                "send completion must reach Desktop/Mobile publications"
+            );
+            assert!(!published.operation().unwrap().pending());
             if accepted {
                 assert!(input.draft().text.is_empty());
                 assert_ne!(input.draft_id(), identity.draft_id);
                 assert!(input.domain().attachments.is_empty());
+                assert!(core.thread_workspace_draft("workspace").is_none());
             } else {
                 assert_eq!(input.draft().text, "captured draft");
                 assert_eq!(input.draft_id(), identity.draft_id);
@@ -1405,6 +1422,18 @@ mod tests {
             join_sends(&core);
             assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
             assert_eq!(before.draft().text, "new draft");
+            let published = core
+                .snapshot(&crate::core::ClientScope::Composer {
+                    thread_id: "a".into(),
+                })
+                .unwrap()
+                .typed::<super::super::store::ComposerPublication>()
+                .unwrap()
+                .payload();
+            assert!(
+                Arc::ptr_eq(&before, &published),
+                "edits during sending must remain published"
+            );
         }
     }
 }

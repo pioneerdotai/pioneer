@@ -825,6 +825,9 @@ impl ClientCore {
         registry.ready_resume_set.clear();
     }
     pub fn remove_thread_store(&self, id: &str) {
+        self.evict_thread_store(id, true);
+    }
+    fn evict_thread_store(&self, id: &str, remove_navigation: bool) {
         self.cancel_artifact_downloads(Some(id));
         self.cancel_composer_requests_for_thread(id);
         self.invalidate_task_reviews(Some(id));
@@ -849,7 +852,21 @@ impl ClientCore {
             .lock()
             .expect("thread registry poisoned");
         registry.timeline.invalidate(Some(id));
-        registry.stores.remove(id);
+        if remove_navigation {
+            registry.stores.remove(id);
+        } else {
+            registry.clock = registry.clock.saturating_add(1);
+            let generation = registry.clock;
+            if let Some(store) = registry.stores.get_mut(id) {
+                let mut fresh = ThreadDomainStore::new(id, &store.coordinator.workspace_id);
+                fresh.generation = generation;
+                fresh.subscriptions = store.subscriptions;
+                fresh.demand = store.demand;
+                fresh.last_used = store.last_used;
+                fresh.presentation_blocked = true;
+                *store = fresh;
+            }
+        }
         if let Some(thread) = registry.directory.threads.remove(id) {
             registry
                 .directory
@@ -857,7 +874,9 @@ impl ClientCore {
                 .insert(thread.workspace_id);
         }
         registry.directory.placements.remove(id);
-        registry.navigation.remove_thread(id);
+        if remove_navigation {
+            registry.navigation.remove_thread(id);
+        }
         registry.ready_resume.retain(|value| value != id);
         registry.ready_resume_set.remove(id);
         let mut drafts = registry.navigation_change().into_iter().collect::<Vec<_>>();
@@ -1423,16 +1442,23 @@ impl ClientCore {
             )
         };
         let scopes = self
-            .thread_coordinator_snapshots()
-            .into_iter()
-            .map(|(id, s)| crate::authorization::ThreadAuthorizationScope {
-                thread_id: id,
-                workspace_id: s.workspace_id.clone(),
-            })
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .stores
+            .iter()
+            .map(
+                |(id, store)| crate::authorization::ThreadAuthorizationScope {
+                    thread_id: id.clone(),
+                    workspace_id: store.coordinator.workspace_id.clone(),
+                },
+            )
             .collect::<Vec<_>>();
         let plan = crate::authorization::plan_access_changed(
             notification,
-            revision,
+            // A policy event and its concrete access-loss event can share one revision.
+            // Exact duplicate access events were already handled above.
+            revision.filter(|revision| *revision != notification.authorization_revision),
             workspace.as_deref(),
             active.as_deref(),
             &scopes,
@@ -1444,6 +1470,7 @@ impl ClientCore {
                 .invalidation_revision = Some(plan.authorization_revision);
             for id in &plan.invalidate_thread_ids {
                 self.remove_thread_store(id);
+                self.forget_revoked_composer(id);
             }
             if plan.clear_active_thread {
                 self.activate_thread(None, None);
@@ -1516,7 +1543,8 @@ impl ClientCore {
             })
             .collect::<Vec<_>>();
         for id in ids {
-            self.remove_thread_store(&id);
+            // A changed policy requires revalidation, not a user navigation action.
+            self.evict_thread_store(&id, false);
         }
     }
 }

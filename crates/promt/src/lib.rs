@@ -64,6 +64,7 @@ pub use render::{
         request_tools_hidden_domain_catalog_section, runtime_sections_with_request_tools_catalog,
     },
     task_run::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput},
+    text::render_thread_ids,
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
     turn_preflight::{

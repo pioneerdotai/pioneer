@@ -154,7 +154,11 @@ impl TimelineView {
     ) -> pioneer_client::authorization::PrincipalPresentationCapabilities {
         self.identity_input
             .as_ref()
-            .and_then(|identity| identity.capabilities.snapshot(None, None))
+            .and_then(|identity| {
+                identity
+                    .capabilities
+                    .snapshot(self.thread_workspace_id(&self.thread_id).as_deref(), None)
+            })
             .as_ref()
             .map(pioneer_client::authorization::principal_presentation_capabilities)
             .unwrap_or_default()
@@ -557,6 +561,13 @@ impl TimelineView {
         let next_session = identity
             .as_ref()
             .map(|p| (p.endpoint_id.clone(), p.connection_generation));
+        let policy_changed = self
+            .identity_input
+            .as_ref()
+            .map(|p| p.capabilities.accepted_revision())
+            != identity
+                .as_ref()
+                .map(|p| p.capabilities.accepted_revision());
         let authorized = identity.as_ref().is_some_and(|p| p.current_auth.is_some());
         if previous_session != next_session || !authorized {
             self.member_avatar_state.clear();
@@ -578,6 +589,7 @@ impl TimelineView {
         if !authorized
             || self.connection_state != GatewayConnectionState::Connected
             || previous_session != next_session
+            || policy_changed
         {
             self.subscribed_workspace = None;
         }

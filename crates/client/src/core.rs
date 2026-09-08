@@ -2235,8 +2235,12 @@ impl ClientCore {
     pub(crate) fn publish_identity_authorization(
         &self,
         projections: &crate::gateway::identity_authorization::IdentityAuthorizationPublication,
-        evict_protected: bool,
+        change: crate::gateway::identity_authorization::IdentityPublicationChange,
     ) -> ClientTransition {
+        use crate::gateway::identity_authorization::IdentityPublicationChange;
+        let evict_protected = change != IdentityPublicationChange::Update;
+        let reset_session = change == IdentityPublicationChange::ResetSession;
+        let mut composer_publications = Vec::new();
         let principal = projections
             .current_auth
             .as_ref()
@@ -2263,10 +2267,6 @@ impl ClientCore {
         if evict_protected {
             self.cancel_artifact_downloads(None);
             self.cancel_composer_requests();
-            self.composer_store
-                .lock()
-                .expect("composer store poisoned")
-                .clear();
             self.invalidate_task_reviews(None);
             self.invalidate_approval_actions(None);
             self.invalidate_message_revisions(None);
@@ -2276,13 +2276,26 @@ impl ClientCore {
             self.invalidate_thread_members(None);
             self.invalidate_artifacts(None);
         }
+        // Keep edits serialized with the fence through publication commit. Otherwise
+        // a concurrent keystroke could advance the composer revision between them.
+        let mut composer_fence =
+            evict_protected.then(|| self.composer_store.lock().expect("composer store poisoned"));
+        if let Some(composers) = composer_fence.as_mut() {
+            if reset_session {
+                composers.clear();
+            } else {
+                composer_publications = composers.fence_authorization();
+            }
+        }
         let mut presentation_fence = evict_protected.then(|| {
             let mut registry = self
                 .thread_registry
                 .lock()
                 .expect("thread registry poisoned");
             registry.fence_presentations(principal.clone());
-            registry.reset_navigation();
+            if reset_session {
+                registry.reset_navigation();
+            }
             registry
         });
         let mut partitions = self.partitions.lock().expect("client partitions poisoned");
@@ -2330,6 +2343,7 @@ impl ClientCore {
             next_revisions(&identity_scope),
             Arc::new(projections.clone()),
         )];
+        drafts.append(&mut composer_publications);
         if let Some(registry) = presentation_fence.as_mut() {
             if let Some(navigation) = registry.navigation_change() {
                 drafts.push(navigation);
@@ -2343,6 +2357,9 @@ impl ClientCore {
                         | ClientScope::Session
                         | ClientScope::OnboardingInvitation
                 ) || scope == &identity_scope
+                    || (!reset_session
+                        && matches!(scope, ClientScope::Composer { .. })
+                        && drafts.iter().any(|draft| &draft.scope == scope))
                 {
                     continue;
                 }
@@ -2383,6 +2400,7 @@ impl ClientCore {
             registry.synchronize_publication_revisions(transition.changes().publications());
         }
         drop(presentation_fence);
+        drop(composer_fence);
         self.update_thread_presentation_identity(principal);
         transition
     }

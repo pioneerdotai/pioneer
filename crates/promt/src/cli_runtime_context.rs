@@ -19,6 +19,7 @@ const MAX_EXACT_MCP_TOOL_NAMES: usize = 24;
 pub struct CliRuntimeContextInput {
     pub workspace_id: String,
     pub thread_id: String,
+    pub initiating_thread_id: String,
     pub turn_id: String,
     pub runtime_id: String,
     pub runtime_label: Option<String>,
@@ -205,7 +206,10 @@ fn render_pioneer_context(input: &CliRuntimeContextInput) -> String {
         format!("Runtime metadata for this {runtime_label}-backed turn:"),
         format!("Runtime: {runtime_label} ({})", input.runtime_id.trim()),
         format!("Workspace: {}", input.workspace_id.trim()),
-        format!("Thread: {}", input.thread_id.trim()),
+        crate::render_thread_ids(
+            Some(input.initiating_thread_id.trim()),
+            input.thread_id.trim(),
+        ),
         format!("Turn: {}", input.turn_id.trim()),
     ];
     if let Some(model) = input.model.as_deref().and_then(normalized_optional) {
@@ -370,6 +374,7 @@ mod tests {
         CliRuntimeContextInput {
             workspace_id: "workspace_1".to_owned(),
             thread_id: "thread_1".to_owned(),
+            initiating_thread_id: "thread_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             runtime_id: "codex-default".to_owned(),
             runtime_label: Some("Codex CLI".to_owned()),

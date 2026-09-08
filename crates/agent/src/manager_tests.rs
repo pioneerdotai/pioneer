@@ -2367,6 +2367,7 @@ impl TurnToolProvider for StaticTurnToolProvider {
         Ok(TurnToolMaterialization {
             bundles: vec![self.bundle.clone()],
             diagnostics: Vec::new(),
+            ..Default::default()
         })
     }
 }

@@ -92,16 +92,17 @@ Send it to me.
 
 ## Delivery Rules
 
+The initiating thread is the original user-facing conversation. The execution thread is where the agent runs and may be an internal child. Choose delivery by the intended recipient, not by the execution location.
+
 Use delivery to match the user experience:
 
-- `thread` + `origin_thread`: write the result to the visible thread where the work originated. Best default for "send the answer back here".
-- `thread` + `current_thread` or `collaboration_root`: target the current execution thread or collaboration root without supplying an id.
+- `thread` + `origin_thread`: deliver to the initiating conversation, without supplying `threadId`.
+- `thread` + `current_thread`: deliver to the current execution thread, without supplying `threadId`.
+- `thread` + `collaboration_root`: deliver to the root conversation of the collaboration capsule, without supplying `threadId`.
 - `thread` + `exact_thread`: write the result to an explicitly supplied `threadId`.
 - `user_notification`: notify the user without necessarily writing a durable chat message. Good for lightweight alerts, but bad when the user expects the full answer in the main thread.
 - `webhook`: send the result outside Pioneer.
 - `none`: keep the result in task state only.
-
-If the user says "send it here", "post the report in this thread", "make the answer appear in this chat", or "not just a notification", do not use `user_notification`. Use `thread` with `threadTarget:"origin_thread"`.
 
 Changing delivery affects future runs. It does not retroactively materialize already delivered results in the parent thread.
 
@@ -136,7 +137,7 @@ Do not invent a run result for a scheduled task that has not run yet.
 
 - Scheduled tasks are not attached subagents.
 - Do not call `task_wait` for scheduled future work with `waitable:false` or `runId:null`.
-- `user_notification` is not the same as "write the answer in this thread".
+- `user_notification` does not guarantee a durable thread message.
 - `includeResult:false` can produce only a generic delivery message.
 - Delivery changes affect future runs, not past runs.
 - Scheduled task instructions must be self-contained.

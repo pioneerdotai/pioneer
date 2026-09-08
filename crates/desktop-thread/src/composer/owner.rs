@@ -384,6 +384,234 @@ mod tests {
             div().size_full().children(self.composer.clone())
         }
     }
+    fn workspace_capabilities(
+        workspace: &str,
+    ) -> pioneer_client::authorization::AuthorizationCapabilitySnapshot {
+        use serde_json::json;
+        let resources = json!({
+            "fingerprint": "synthetic-resources", "providers": {"all": true},
+            "provider_models_all": true, "cli_runtimes": {"all": true},
+            "cli_models_all": true, "skills": {"all": true}, "mcp_servers": {"all": true}
+        });
+        pioneer_client::authorization::AuthorizationCapabilitySnapshot {
+            schema_version: 7,
+            authorization_revision: 1,
+            principal_id: "P00000000000000000001".try_into().unwrap(),
+            role_key: "member".into(),
+            role: serde_json::from_value(json!({"key": "member", "display_name": "Member", "description": "", "built_in": true})).unwrap(),
+            global: Default::default(),
+            workspace: Some(serde_json::from_value(json!({
+                "workspace_id": workspace,
+                "capabilities": {
+                    "can_read": true, "can_create_thread": true, "can_manage": false,
+                    "can_read_own_notifications": false, "can_acknowledge_own_notifications": false,
+                    "can_use_providers": true, "can_use_cli_runtimes": true, "can_use_skills": true,
+                    "can_use_mcp": true, "can_run_tasks": true, "can_read_artifacts": true,
+                    "can_write_artifacts": true,
+                    "execution_limits": {"max_active_executions": 1, "max_queued_tasks": 1, "max_scheduled_tasks": 1},
+                    "agent_permission_options": [], "can_list_members": false, "can_add_member": false,
+                    "can_remove_member": false, "thread_visibility_options": []
+                },
+                "operational_resources": resources,
+                "execution_draft_policy": {
+                    "fingerprint": "synthetic-policy", "resources": resources,
+                    "permission_options": [], "can_attach_artifacts": true,
+                    "mcp_invocation_limits": {"profile_version": 5, "max_arguments_bytes": 1024,
+                        "max_queue_wait_ms": 1000, "max_concurrent_calls": 1, "max_queued_calls": 1}
+                }
+            })).unwrap()),
+            thread: None,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn workspace_publications_enable_draft_and_existing_composer_actions(cx: &mut TestAppContext) {
+        use pioneer_client::{
+            authorization::AuthorizationProjectionAcceptance,
+            core::ClientMutationAuthority,
+            gateway::{
+                identity_authorization::IdentityAuthorizationPublication,
+                session_controller::GatewaySessionPublication,
+            },
+            state::{
+                client_state::{GatewayConnectionState, GatewayStatusLevel},
+                reducers::{GatewayStatusProjection, GatewayStatusTextUpdate},
+            },
+        };
+        fn publish<T: serde::Serialize + Send + Sync + 'static>(
+            client: &ClientCore,
+            authority: &ClientMutationAuthority,
+            scope: ClientScope,
+            payload: T,
+        ) {
+            use pioneer_client::core::{ClientRevisions, ClientTransitionOutcome, ScopedRevision};
+            let previous = client
+                .snapshot(&scope)
+                .map(|p| p.revisions())
+                .unwrap_or_default();
+            let revisions = ClientRevisions::new(
+                previous.domain(),
+                previous.presentation(),
+                previous.content(),
+                ScopedRevision::new(previous.scoped().get() + 1),
+            );
+            assert_eq!(
+                client
+                    .publish(authority, scope, revisions, Arc::new(payload), vec![])
+                    .outcome(),
+                ClientTransitionOutcome::Changed
+            );
+        }
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        crate::test_support::install_thread_timeline(&client, "a", "row");
+        client.remember_thread_draft("workspace", Some("a".into()));
+        assert_eq!(
+            client.thread_workspace_draft("workspace").as_deref(),
+            Some("a")
+        );
+        client.composer_intent(ComposerIntent::Open {
+            thread_id: "a".into(),
+            defaults: Default::default(),
+        });
+        let (registrar, deliver) = crate::test_support::binding_router(client.clone());
+        let screen_binding = ThreadBindings::new(registrar.clone(), "a", vec![]);
+        let composer_binding = ThreadBindings::new(registrar, "a", vec![]);
+        deliver();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let ports = Arc::new(crate::test_support::ThreadPorts);
+            let screen = TimelineView::new(
+                client.clone(),
+                "a".into(),
+                screen_binding.clone(),
+                ports.clone(),
+                ports.clone(),
+                1,
+                window,
+                cx,
+            );
+            let composer = ComposerView::new(
+                client.clone(),
+                "a".into(),
+                composer_binding.clone(),
+                screen.downgrade(),
+                ports,
+                Arc::new(Audio(AtomicUsize::new(0))),
+                1,
+                window,
+                cx,
+            );
+            let host = cx.new(|_| Host {
+                composer: Some(composer),
+                screen,
+            });
+            Root::new(host, window, cx)
+        });
+        cx.run_until_parked();
+        let host = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<Host>().unwrap()
+        });
+        let composer = host.read_with(cx, |host, _| host.composer.clone().unwrap());
+        let authority = ClientMutationAuthority::for_test();
+        let publish_identity = |snapshot| {
+            let mut identity = IdentityAuthorizationPublication::default();
+            assert_eq!(
+                identity.capabilities.accept(snapshot),
+                AuthorizationProjectionAcceptance::Accepted
+            );
+            publish(
+                &client,
+                &authority,
+                ClientScope::Administration { workspace_id: None },
+                identity,
+            );
+        };
+        let mut session = GatewaySessionPublication::default();
+        session.status = Some(GatewayStatusProjection {
+            status: GatewayStatusTextUpdate::KeepExisting,
+            status_level: GatewayStatusLevel::Neutral,
+            connection_state: GatewayConnectionState::Connected,
+            clear_gateway_error: false,
+        });
+        publish(&client, &authority, ClientScope::Session, session);
+        // Another workspace must not grant rights to the mounted thread.
+        publish_identity(workspace_capabilities("other"));
+        deliver();
+        cx.run_until_parked();
+        composer.read_with(cx, |view, _| {
+            assert!(!view.principal_presentation_capabilities().can_use_providers);
+            assert!(!view.can_start_active_thread_agent_presentation());
+            assert!(!view.active_artifact_presentation_policy().can_attach);
+        });
+        publish_identity(workspace_capabilities("workspace"));
+        deliver();
+        cx.run_until_parked();
+        composer.read_with(cx, |view, _| {
+            let rights = view.principal_presentation_capabilities();
+            assert!(rights.can_use_providers && rights.can_use_cli_runtimes);
+            assert!(rights.can_use_skills && rights.can_use_mcp);
+            assert!(view.can_start_active_thread_agent_presentation());
+            assert!(view.active_artifact_presentation_policy().can_attach);
+        });
+        host.read_with(cx, |host, cx| {
+            assert!(
+                host.screen
+                    .read(cx)
+                    .principal_presentation_capabilities()
+                    .can_use_mcp
+            )
+        });
+        // Once promoted, attachment/start rights come from the thread scope.
+        client.remember_thread_draft("workspace", None);
+        let mut snapshot = workspace_capabilities("workspace");
+        snapshot.thread = Some(serde_json::from_value(serde_json::json!({
+            "workspace_id": "workspace", "thread_id": "a",
+            "capabilities": {
+                "can_read": true, "can_write": true, "can_edit_own_message": false,
+                "can_delete_own_message": false, "can_start_turn": true,
+                "can_observe_agent_execution": false, "can_cancel_agent_execution": false,
+                "can_resume_agent_execution": false, "can_steer_agent_execution": false,
+                "can_observe_agent_requests": false, "can_respond_to_agent_requests": false,
+                "can_control_cli_runtime": false, "can_create_task": false, "can_review_tasks": false,
+                "can_cancel_tasks": false, "can_read_artifacts": true, "can_write_artifacts": true,
+                "can_bind_artifacts": true, "can_read_agents_document": false,
+                "can_manage_agents_document": false, "can_manage": false,
+                "can_manage_private_participants": false, "can_move": false
+            }
+        })).unwrap());
+        authority.accept_thread_capabilities_for_test(&client, snapshot.clone());
+        deliver();
+        cx.run_until_parked();
+        composer.read_with(cx, |view, _| {
+            assert!(view.principal_presentation_capabilities().can_use_skills);
+            assert!(view.can_start_active_thread_agent_presentation());
+            assert!(view.active_artifact_presentation_policy().can_attach);
+        });
+        let scope = snapshot.thread.as_mut().unwrap();
+        scope.capabilities.can_start_turn = false;
+        scope.capabilities.can_bind_artifacts = false;
+        authority.accept_thread_capabilities_for_test(&client, snapshot);
+        deliver();
+        cx.run_until_parked();
+        composer.read_with(cx, |view, _| {
+            assert!(!view.can_start_active_thread_agent_presentation());
+            assert!(!view.active_artifact_presentation_policy().can_attach);
+        });
+        publish(
+            &client,
+            &authority,
+            ClientScope::Administration { workspace_id: None },
+            IdentityAuthorizationPublication::default(),
+        );
+        deliver();
+        cx.run_until_parked();
+        composer.read_with(cx, |view, _| {
+            assert!(!view.principal_presentation_capabilities().can_use_providers);
+            assert!(!view.principal_presentation_capabilities().can_use_skills);
+            assert!(!view.principal_presentation_capabilities().can_use_mcp);
+        });
+    }
+
     #[gpui_kit::test]
     fn retained_input_publishes_one_edit_accepts_controlled_updates_without_echo_and_drops(
         cx: &mut TestAppContext,

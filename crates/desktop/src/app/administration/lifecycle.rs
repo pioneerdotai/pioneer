@@ -90,7 +90,8 @@ impl PioneerDesktop {
         if scope_changed {
             self.gateway.capability_snapshot = None;
         }
-        if self.gateway.capability_snapshot.is_none() {
+        let reload_protected_content = self.gateway.capability_snapshot.is_none();
+        if reload_protected_content {
             self.sync_settings_sidebar_tree_state(cx);
             self.sync_administration_sidebar_tree_state(cx);
             cx.notify();
@@ -174,6 +175,19 @@ impl PioneerDesktop {
                                     view.sync_administration_sidebar_tree_state(cx);
                                     if view.main_content_view() == MainContentView::Administration {
                                         view.refresh_current_administration_content(cx);
+                                    }
+                                    if reload_protected_content && view.gateway.capability_snapshot.is_some() {
+                                        match view.main_content_view() {
+                                            MainContentView::Providers => {
+                                                view.refresh_configured_providers(cx);
+                                                view.load_cli_provider_snapshot(cx);
+                                            }
+                                            MainContentView::Skills | MainContentView::SkillDetails
+                                            | MainContentView::Mcp | MainContentView::McpDetails => {
+                                                view.refresh_workspace_bound_screens_after_switch(cx);
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                     cx.notify();
                                     CurrentPrincipalRefreshDecision::Complete
@@ -332,9 +346,10 @@ impl PioneerDesktop {
             ));
         }
 
-        if !items
-            .iter()
-            .any(|(content_view, _)| *content_view == self.administration_content_view())
+        if self.gateway.capability_snapshot.is_some()
+            && !items
+                .iter()
+                .any(|(content_view, _)| *content_view == self.administration_content_view())
         {
             self.navigation_intent(
                 pioneer_client::navigation::NavigationIntent::SetAdministrationRoute {
@@ -375,6 +390,70 @@ impl PioneerDesktop {
 
 #[cfg(test)]
 mod tests {
+    #[gpui_kit::test]
+    fn pending_permissions_keep_administration_and_settings_routes(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{App, AppContext};
+        use pioneer_client::navigation::{
+            AdministrationRoute, NavigationIntent, SemanticDestination, SettingsRoute,
+        };
+        cx.update(gpui_kit::init);
+        cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+        let core = cx.update(|cx: &mut App| {
+            cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                .core()
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let registrar = cx
+                .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                .registrar();
+            let navigation =
+                crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+            let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+            let desktop = cx.new(|cx| {
+                crate::app::LegacyScreenAdapter::new(
+                    window,
+                    cx,
+                    pioneer_observability::DesktopStartupTrace::start(),
+                    navigation,
+                    layout,
+                )
+            });
+            gpui_kit::component::Root::new(desktop, window, cx)
+        });
+        for destination in [
+            SemanticDestination::Administration {
+                route: AdministrationRoute::Invitations,
+            },
+            SemanticDestination::Settings {
+                route: SettingsRoute::Memory,
+            },
+        ] {
+            core.navigate(
+                NavigationIntent::Navigate {
+                    destination: destination.clone(),
+                },
+                None,
+            );
+            cx.update(|_, cx| {
+                let desktop = root
+                    .read(cx)
+                    .view()
+                    .clone()
+                    .downcast::<crate::app::LegacyScreenAdapter>()
+                    .unwrap();
+                desktop.update(cx, |view, cx| {
+                    view.apply_navigation_publication(core.navigation_snapshot(), cx);
+                    view.gateway.capability_snapshot = None;
+                    view.sync_administration_sidebar_tree_state(cx);
+                    view.sync_settings_sidebar_tree_state(cx);
+                });
+            });
+            assert_eq!(core.navigation_snapshot().destination(), &destination);
+        }
+    }
+
     use super::{
         capability_content_requires_threads_fallback, current_principal_refresh_context_matches,
         retain_verified_auth_after_capability_failure,

@@ -271,17 +271,11 @@ impl PioneerDesktop {
 
     fn apply_authorization_projection_changed_notification(
         &mut self,
-        notification: pioneer_protocol::AuthorizationProjectionChangedNotification,
+        _notification: pioneer_protocol::AuthorizationProjectionChangedNotification,
         cx: &mut Context<Self>,
     ) {
-        let (invalidate_workspace, invalidate_thread) = desktop_authorization_projection_effects(
-            &notification.affected,
-            self.active_workspace_id(),
-            self.current_active_thread_id(),
-        );
-        if !invalidate_workspace && !invalidate_thread {
-            return;
-        }
+        // Invitation-only mutations also advance the shared capability revision.
+        // Missing permissions during revalidation are not a session replacement.
         self.gateway.capability_snapshot = None;
 
         // The durable generation is a fail-closed fence, not merely a cache
@@ -350,45 +344,6 @@ impl PioneerDesktop {
     }
 }
 
-fn desktop_authorization_projection_effects(
-    affected: &pioneer_protocol::AuthorizationChangeScope,
-    active_workspace_id: Option<&str>,
-    active_thread_id: Option<&str>,
-) -> (bool, bool) {
-    match affected {
-        pioneer_protocol::AuthorizationChangeScope::Global
-        | pioneer_protocol::AuthorizationChangeScope::Role { .. }
-        | pioneer_protocol::AuthorizationChangeScope::Principal { .. } => (true, true),
-        pioneer_protocol::AuthorizationChangeScope::PrincipalWorkspace { workspace_id, .. } => {
-            let active = active_workspace_id == Some(workspace_id.as_str());
-            (active, active)
-        }
-        pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
-            workspace_id,
-            thread_id,
-            ..
-        } => (
-            false,
-            active_workspace_id == Some(workspace_id.as_str())
-                && active_thread_id == Some(thread_id.as_str()),
-        ),
-        pioneer_protocol::AuthorizationChangeScope::Invitation { .. } => (false, false),
-        pioneer_protocol::AuthorizationChangeScope::Workspace { workspace_id }
-        | pioneer_protocol::AuthorizationChangeScope::ResourceSelector { workspace_id, .. } => {
-            let active = active_workspace_id == Some(workspace_id.as_str());
-            (active, active)
-        }
-        pioneer_protocol::AuthorizationChangeScope::Thread {
-            workspace_id,
-            thread_id,
-        } => (
-            false,
-            active_workspace_id == Some(workspace_id.as_str())
-                && active_thread_id == Some(thread_id.as_str()),
-        ),
-    }
-}
-
 #[cfg(test)]
 fn desktop_thread_authorization_scopes(
     coordinators: &std::collections::HashMap<String, crate::app::thread::ThreadCoordinator>,
@@ -429,56 +384,6 @@ mod access_change_tests {
     use crate::app::thread::ThreadCoordinator;
     use pioneer_protocol::{AccessChangeKind, AccessChangedNotification};
     use std::collections::HashMap;
-
-    #[::core::prelude::v1::test]
-    fn policy_generation_change_invalidates_only_the_exact_desktop_scope() {
-        let principal_id = pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap();
-        assert_eq!(
-            desktop_authorization_projection_effects(
-                &pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
-                    principal_id: principal_id.clone(),
-                    workspace_id: "workspace-active".to_owned(),
-                    thread_id: "thread-active".to_owned(),
-                },
-                Some("workspace-active"),
-                Some("thread-active"),
-            ),
-            (false, true)
-        );
-        assert_eq!(
-            desktop_authorization_projection_effects(
-                &pioneer_protocol::AuthorizationChangeScope::PrincipalThread {
-                    principal_id,
-                    workspace_id: "workspace-active".to_owned(),
-                    thread_id: "thread-other".to_owned(),
-                },
-                Some("workspace-active"),
-                Some("thread-active"),
-            ),
-            (false, false)
-        );
-        assert_eq!(
-            desktop_authorization_projection_effects(
-                &pioneer_protocol::AuthorizationChangeScope::Workspace {
-                    workspace_id: "workspace-active".to_owned(),
-                },
-                Some("workspace-active"),
-                Some("thread-active"),
-            ),
-            (true, true)
-        );
-        assert_eq!(
-            desktop_authorization_projection_effects(
-                &pioneer_protocol::AuthorizationChangeScope::Invitation {
-                    invitation_id: pioneer_protocol::InvitationId::new("I00000000000000000001",)
-                        .unwrap(),
-                },
-                Some("workspace-active"),
-                Some("thread-active"),
-            ),
-            (false, false)
-        );
-    }
 
     #[::core::prelude::v1::test]
     fn thread_scoped_access_changes_retain_verified_workspace_capabilities() {
