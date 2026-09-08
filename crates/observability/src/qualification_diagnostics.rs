@@ -159,7 +159,10 @@ bounded_enum!(DeliveryMeasurement {
     BatchItems,
 });
 
-bounded_enum!(PresentationOwner { DesktopShell, Client });
+bounded_enum!(PresentationOwner {
+    DesktopShell,
+    Client
+});
 
 bounded_enum!(PresentationStage {
     SemanticFlatten,
@@ -191,9 +194,7 @@ bounded_enum!(TimelineStage {
 /// Stable IDs for application-owned animation selections and timer-driven
 /// sources that can request work or produce UI updates.
 /// Existing discriminants are immutable; additions must append a new value.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(u16)]
 #[serde(rename_all = "snake_case")]
 pub enum AnimationSourceId {
@@ -440,18 +441,22 @@ pub enum DiagnosticGuardError {
 
 impl fmt::Display for DiagnosticGuardError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", match self {
-            Self::IsolationNotAttested => "qualification isolation was not fully attested",
-            Self::InvalidRecordLimit => "diagnostic record limit is outside the bounded range",
-            Self::InvalidDurationLimit => "diagnostic duration is outside the bounded range",
-            Self::CaptureAlreadyActive => "a diagnostic capture is already active",
-            Self::CaptureAlreadyConsumed => {
-                "this process has already consumed its single diagnostic capture"
+        write!(
+            formatter,
+            "{}",
+            match self {
+                Self::IsolationNotAttested => "qualification isolation was not fully attested",
+                Self::InvalidRecordLimit => "diagnostic record limit is outside the bounded range",
+                Self::InvalidDurationLimit => "diagnostic duration is outside the bounded range",
+                Self::CaptureAlreadyActive => "a diagnostic capture is already active",
+                Self::CaptureAlreadyConsumed => {
+                    "this process has already consumed its single diagnostic capture"
+                }
+                Self::CaptureNotActive => "no diagnostic capture is active",
+                Self::InvalidSnapshot => "diagnostic snapshot violates its frozen capture bounds",
+                Self::SerializationFailed => "diagnostic snapshot serialization failed",
             }
-            Self::CaptureNotActive => "no diagnostic capture is active",
-            Self::InvalidSnapshot => "diagnostic snapshot violates its frozen capture bounds",
-            Self::SerializationFailed => "diagnostic snapshot serialization failed",
-        })
+        )
     }
 }
 
@@ -481,7 +486,9 @@ pub fn start_qualification_capture(
     limits: CaptureLimits,
 ) -> Result<(), DiagnosticGuardError> {
     let limits = limits.validate()?;
-    let mut capture = CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut capture = CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if capture.is_some() {
         return Err(DiagnosticGuardError::CaptureAlreadyActive);
     }
@@ -511,9 +518,13 @@ pub fn start_qualification_capture(
 pub fn stop_qualification_capture(
     _isolation: &QualificationIsolationAttestation,
 ) -> Result<DiagnosticCaptureSnapshot, DiagnosticGuardError> {
-    let mut capture = CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut capture = CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     ACTIVE_CAPTURE_GENERATION.store(0, Ordering::Release);
-    let state = capture.take().ok_or(DiagnosticGuardError::CaptureNotActive)?;
+    let state = capture
+        .take()
+        .ok_or(DiagnosticGuardError::CaptureNotActive)?;
     let max_duration_micros = state.limits.max_duration_ms.saturating_mul(1_000);
     let stopped_after_micros = state
         .recording_stopped_after_micros
@@ -570,15 +581,25 @@ fn validate_snapshot_for_export(
 
 fn diagnostic_event_is_valid(event: DiagnosticEventKey) -> bool {
     match event {
-        DiagnosticEventKey::Animation { source_id, action, visibility } => {
+        DiagnosticEventKey::Animation {
+            source_id,
+            action,
+            visibility,
+        } => {
             animation_action_matches_source(source_id, action)
                 && animation_visibility_matches_source_action(source_id, action, visibility)
         }
         DiagnosticEventKey::Render { .. } | DiagnosticEventKey::ConsistencyError { .. } => true,
-        DiagnosticEventKey::Presentation { owner, host_app, .. } => {
-            owner != PresentationOwner::DesktopShell || host_app == ClientHostApp::Desktop
-        }
-        DiagnosticEventKey::ClientDelivery { shell, layer, action, visibility, .. } => {
+        DiagnosticEventKey::Presentation {
+            owner, host_app, ..
+        } => owner != PresentationOwner::DesktopShell || host_app == ClientHostApp::Desktop,
+        DiagnosticEventKey::ClientDelivery {
+            shell,
+            layer,
+            action,
+            visibility,
+            ..
+        } => {
             delivery_layer_matches_shell(shell, layer)
                 && delivery_wire_action_matches_layer(layer, action)
                 && delivery_visibility_matches_layer(layer, visibility)
@@ -604,8 +625,12 @@ fn record_diagnostic_event(event: DiagnosticEventKey, value: u64) {
     if generation == 0 {
         return;
     }
-    let mut capture = CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(state) = capture.as_mut() else { return };
+    let mut capture = CAPTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = capture.as_mut() else {
+        return;
+    };
     if state.generation != generation {
         return;
     }
@@ -630,10 +655,7 @@ fn record_diagnostic_event(event: DiagnosticEventKey, value: u64) {
 /// Emits a call-site observation for an application-owned animation selection.
 /// This records source presence, not paint or a GPUI animation-frame callback.
 #[inline(always)]
-pub fn record_animation_source_observed(
-    source_id: AnimationSourceId,
-    visibility: Visibility,
-) {
+pub fn record_animation_source_observed(source_id: AnimationSourceId, visibility: Visibility) {
     let action = AnimationAction::Observed;
     if !animation_action_matches_source(source_id, action) {
         record_diagnostic_event(
@@ -666,10 +688,7 @@ pub fn record_animation_source_observed(
 /// Records a stock loading-indicator selection only when the application's
 /// existing loading state is active.
 #[inline(always)]
-pub fn record_loading_animation_source(
-    source_id: AnimationSourceId,
-    is_loading: bool,
-) {
+pub fn record_loading_animation_source(source_id: AnimationSourceId, is_loading: bool) {
     if is_loading {
         record_animation_source_observed(source_id, Visibility::NotApplicable);
     }
@@ -703,7 +722,14 @@ pub fn record_animation_activity(
         );
         return;
     }
-    record_diagnostic_event(DiagnosticEventKey::Animation { source_id, action, visibility }, 1);
+    record_diagnostic_event(
+        DiagnosticEventKey::Animation {
+            source_id,
+            action,
+            visibility,
+        },
+        1,
+    );
 }
 
 #[inline(always)]
@@ -784,7 +810,13 @@ pub fn record_client_delivery(
         return;
     };
     record_diagnostic_event(
-        DiagnosticEventKey::ClientDelivery { shell, layer, scope, action, visibility },
+        DiagnosticEventKey::ClientDelivery {
+            shell,
+            layer,
+            scope,
+            action,
+            visibility,
+        },
         1,
     );
 }
@@ -829,19 +861,20 @@ pub fn record_client_delivery_measurement(
 fn delivery_layer_matches_shell(shell: Shell, layer: DeliveryLayer) -> bool {
     matches!(
         (shell, layer),
-        (Shell::Desktop, DeliveryLayer::DesktopEventPump | DeliveryLayer::DesktopRootReducer)
-            | (
-                Shell::Mobile,
-                DeliveryLayer::MobileFfiGatewayEvents
-                    | DeliveryLayer::MobileFfiActiveThreadReducer
-                    | DeliveryLayer::MobileBinding
-            )
+        (
+            Shell::Desktop,
+            DeliveryLayer::DesktopEventPump | DeliveryLayer::DesktopRootReducer
+        ) | (
+            Shell::Mobile,
+            DeliveryLayer::MobileFfiGatewayEvents
+                | DeliveryLayer::MobileFfiActiveThreadReducer
+                | DeliveryLayer::MobileBinding
+        )
     )
 }
 
 fn delivery_action_matches_layer(layer: DeliveryLayer, action: DiagnosticAction) -> bool {
-    delivery_action(action)
-        .is_some_and(|action| delivery_wire_action_matches_layer(layer, action))
+    delivery_action(action).is_some_and(|action| delivery_wire_action_matches_layer(layer, action))
 }
 
 fn delivery_wire_action_matches_layer(layer: DeliveryLayer, action: DeliveryAction) -> bool {
@@ -854,9 +887,18 @@ fn delivery_wire_action_matches_layer(layer: DeliveryLayer, action: DeliveryActi
                 DeliveryLayer::MobileFfiGatewayEvents,
                 DeliveryAction::Completed | DeliveryAction::Dropped
             )
-            | (DeliveryLayer::MobileFfiActiveThreadReducer, DeliveryAction::Received)
-            | (DeliveryLayer::MobileFfiActiveThreadReducer, DeliveryAction::Completed)
-            | (DeliveryLayer::MobileFfiActiveThreadReducer, DeliveryAction::Dropped)
+            | (
+                DeliveryLayer::MobileFfiActiveThreadReducer,
+                DeliveryAction::Received
+            )
+            | (
+                DeliveryLayer::MobileFfiActiveThreadReducer,
+                DeliveryAction::Completed
+            )
+            | (
+                DeliveryLayer::MobileFfiActiveThreadReducer,
+                DeliveryAction::Dropped
+            )
             | (DeliveryLayer::MobileBinding, DeliveryAction::Received)
             | (DeliveryLayer::MobileBinding, DeliveryAction::Delivered)
             | (DeliveryLayer::MobileBinding, DeliveryAction::Applied)
@@ -871,12 +913,16 @@ fn delivery_measurement_matches_layer(
 ) -> bool {
     matches!(
         (layer, measurement),
-        (DeliveryLayer::MobileFfiGatewayEvents, DeliveryMeasurement::BatchItems)
-            | (
-                DeliveryLayer::MobileFfiActiveThreadReducer,
-                DeliveryMeasurement::PayloadBytes
-            )
-            | (DeliveryLayer::MobileBinding, DeliveryMeasurement::BatchItems)
+        (
+            DeliveryLayer::MobileFfiGatewayEvents,
+            DeliveryMeasurement::BatchItems
+        ) | (
+            DeliveryLayer::MobileFfiActiveThreadReducer,
+            DeliveryMeasurement::PayloadBytes
+        ) | (
+            DeliveryLayer::MobileBinding,
+            DeliveryMeasurement::BatchItems
+        )
     )
 }
 
@@ -911,10 +957,7 @@ pub fn record_timeline(stage: TimelineStage, action: DiagnosticAction, value: u6
     record_diagnostic_event(DiagnosticEventKey::Timeline { stage, action }, value);
 }
 
-fn animation_action_matches_source(
-    source_id: AnimationSourceId,
-    action: AnimationAction,
-) -> bool {
+fn animation_action_matches_source(source_id: AnimationSourceId, action: AnimationAction) -> bool {
     use AnimationAction::{Cancelled, Completed, Executed, Observed, Requested, Scheduled, Woke};
     use AnimationSourceId::*;
 
@@ -956,10 +999,9 @@ fn animation_action_matches_source(
         TimelineRunningDinoClock | TimelineRunningElapsedClock | McpPoller | SkillsPoller => {
             matches!(action, Scheduled | Woke | Requested | Cancelled)
         }
-        ProgressCircleTransition => matches!(
-            action,
-            Scheduled | Woke | Requested | Executed | Completed
-        ),
+        ProgressCircleTransition => {
+            matches!(action, Scheduled | Woke | Requested | Executed | Completed)
+        }
         RemoteAccessPoller | ArtifactDownloadProgressClock | DesktopVoiceStatusPoller => {
             matches!(action, Scheduled | Woke | Requested | Cancelled | Completed)
         }
@@ -1164,7 +1206,10 @@ mod tests {
         }
 
         for action in [Scheduled, Woke, Requested, Executed, Completed] {
-            assert!(animation_action_matches_source(ProgressCircleTransition, action));
+            assert!(animation_action_matches_source(
+                ProgressCircleTransition,
+                action
+            ));
         }
         assert!(!animation_action_matches_source(
             ProgressCircleTransition,
@@ -1212,7 +1257,9 @@ mod tests {
         }
 
         fn reset_capture() {
-            *CAPTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *CAPTURE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             CAPTURE_CONSUMED.store(false, Ordering::Release);
             ACTIVE_CAPTURE_GENERATION.store(0, Ordering::Release);
         }
@@ -1508,11 +1555,7 @@ mod tests {
             )
             .expect("start capture");
 
-            record_timeline(
-                TimelineStage::RowBuild,
-                DiagnosticAction::Scheduled,
-                1,
-            );
+            record_timeline(TimelineStage::RowBuild, DiagnosticAction::Scheduled, 1);
 
             let snapshot = stop_qualification_capture(&isolation).expect("stop capture");
             assert_eq!(snapshot.records.len(), 1);

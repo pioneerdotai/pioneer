@@ -11,6 +11,13 @@ use std::{
     sync::Arc,
 };
 
+/// Keep the latest turn marker supplied by thread metadata, without retaining history.
+/// Composer defaults need this marker to distinguish a conversation from an empty draft.
+pub(crate) fn thread_directory_summary(mut thread: Thread) -> Thread {
+    thread.turns = thread.turns.into_iter().next_back().into_iter().collect();
+    thread
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
@@ -385,13 +392,13 @@ impl ThreadDirectoryStore {
         self.folders.retain(|_, f| f.workspace_id != workspace);
         self.placements.retain(|_, p| p.workspace_id != workspace);
         self.agents_docs.retain(|(w, _), _| w != workspace);
-        for mut thread in response
+        for thread in response
             .threads
             .into_iter()
             .filter(|t| t.workspace_id == workspace)
         {
-            thread.turns.clear();
-            self.threads.insert(thread.id.clone(), thread);
+            self.threads
+                .insert(thread.id.clone(), thread_directory_summary(thread));
         }
         for folder in response
             .folders
@@ -762,6 +769,196 @@ mod tests {
     }
     fn snapshot(threads: Vec<Thread>, unread: Vec<ThreadUnreadSummary>) -> ThreadTreeSnapshot {
         thread_tree_snapshot_from_parts("a".into(), threads, unread, vec![], vec![], vec![])
+    }
+
+    fn conversation_thread(id: &str, workspace: &str, time: i64, effort: Option<&str>) -> Thread {
+        let mut thread = thread(id, workspace, time);
+        thread.model = format!("model-{id}");
+        thread.reasoning_effort = effort.map(str::to_owned);
+        thread.turns = ["older", "latest"]
+            .map(|suffix| pioneer_protocol::Turn {
+                id: format!("{id}-{suffix}"),
+                status: pioneer_protocol::TurnStatus::Completed,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: vec![],
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            })
+            .into();
+        thread
+    }
+
+    fn load_directory(core: &ClientCore, workspace: &str, threads: Vec<Thread>) {
+        let mut registry = core.thread_registry.lock().unwrap();
+        let generation = registry.directory.begin(workspace);
+        assert!(registry.directory.complete(
+            workspace,
+            generation,
+            ThreadTreeResponse {
+                workspace_id: workspace.into(),
+                threads,
+                unread: vec![],
+                folders: vec![],
+                placements: vec![],
+                agents_docs: vec![],
+            }
+        ));
+    }
+
+    fn selected_model(
+        core: &ClientCore,
+        active: Option<&str>,
+        workspace: &str,
+    ) -> Option<crate::composer::model_selection::ComposerModelSelection> {
+        crate::state::selectors::resolve_composer_model_selection_from(
+            active,
+            Some(workspace),
+            &core.thread_coordinator_snapshots(),
+        )
+    }
+
+    #[test]
+    fn composer_defaults_survive_directory_loading_and_coordinator_hydration() {
+        use crate::composer::model_selection::ComposerModelSelection;
+        let core = ClientCore::new();
+        let older = conversation_thread("older", "a", 10, Some("high"));
+        let latest = conversation_thread("latest", "a", 20, None);
+        load_directory(
+            &core,
+            "a",
+            vec![older.clone(), latest.clone(), thread("draft", "a", 30)],
+        );
+        load_directory(
+            &core,
+            "b",
+            vec![conversation_thread("foreign", "b", 100, Some("low"))],
+        );
+
+        for hydrated in [false, true] {
+            if hydrated {
+                // The directory refresh feeds its compact records to active coordinators.
+                let summaries = core
+                    .thread_registry
+                    .lock()
+                    .unwrap()
+                    .directory
+                    .threads
+                    .clone();
+                for thread in summaries.into_values() {
+                    core.upsert_thread(thread);
+                }
+            }
+            assert_eq!(
+                selected_model(&core, Some("older"), "a"),
+                ComposerModelSelection::from_thread(&older)
+            );
+            assert_eq!(
+                selected_model(&core, Some("latest"), "a"),
+                ComposerModelSelection::from_thread(&latest)
+            );
+            for active in [None, Some("draft"), Some("not-created-yet")] {
+                assert_eq!(
+                    selected_model(&core, active, "a"),
+                    ComposerModelSelection::from_thread(&latest)
+                );
+            }
+        }
+        let registry = core.thread_registry.lock().unwrap();
+        assert_eq!(registry.directory.threads["older"].turns.len(), 1);
+        assert_eq!(
+            registry.directory.threads["older"].turns[0].id,
+            "older-latest"
+        );
+        assert!(registry.directory.threads["draft"].turns.is_empty());
+    }
+
+    #[test]
+    fn composer_defaults_survive_open_response_without_historical_turns() {
+        use crate::composer::model_selection::ComposerModelSelection;
+        let core = ClientCore::new();
+        let mut docs = conversation_thread("docs", "a", 10, Some("max"));
+        docs.model_provider = "cli_runtime:codex".into();
+        docs.model = "gpt-5.6-luna".into();
+        // Production Docs/Changle log end in TaskRun markers. They are not
+        // copied into the legacy Conversation projection when metadata loads.
+        for turn in &mut docs.turns {
+            turn.turn_kind = pioneer_protocol::TurnKind::TaskRun;
+        }
+        let mut latest = conversation_thread("latest", "a", 20, Some("high"));
+        latest.model_provider = "cli_runtime:codex".into();
+        latest.model = "gpt-6-astra".into();
+        load_directory(&core, "a", vec![docs.clone(), latest.clone()]);
+        let expected = ComposerModelSelection::from_thread(&docs);
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+
+        // Opening a persisted thread returns only the runtime's turns, which
+        // are empty on a cold gateway, although the directory knows its history.
+        let mut opened = docs.clone();
+        opened.turns.clear();
+        core.upsert_thread(opened.clone());
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+        assert!(
+            core.thread_snapshot("docs")
+                .unwrap()
+                .coordinator()
+                .thread()
+                .unwrap()
+                .turns
+                .is_empty(),
+            "historical evidence must not become runtime turns"
+        );
+        assert_eq!(
+            selected_model(&core, None, "a"),
+            ComposerModelSelection::from_thread(&latest)
+        );
+
+        // The opening notification and later metadata refresh have the same
+        // omission. History eviction must also keep the directory's evidence.
+        core.upsert_thread(opened);
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+        for index in 0..80 {
+            core.upsert_thread(thread(&format!("empty-{index}"), "a", 100 + index));
+        }
+        assert!(core.thread_snapshot("docs").is_none());
+        assert_eq!(selected_model(&core, Some("docs"), "a"), expected);
+        core.remove_thread_store("docs");
+        assert_eq!(
+            selected_model(&core, Some("docs"), "a"),
+            ComposerModelSelection::from_thread(&latest)
+        );
+    }
+
+    #[test]
+    fn composer_defaults_survive_history_eviction_but_not_thread_removal() {
+        use crate::composer::model_selection::ComposerModelSelection;
+        let core = ClientCore::new();
+        let existing = conversation_thread("existing", "a", 10, Some("high"));
+        core.upsert_thread(existing.clone());
+        for index in 0..80 {
+            core.upsert_thread(thread(&format!("empty-{index}"), "a", 100 + index));
+        }
+        assert!(
+            core.thread_snapshot("existing").is_none(),
+            "history was evicted"
+        );
+        assert_eq!(
+            selected_model(&core, Some("existing"), "a"),
+            ComposerModelSelection::from_thread(&existing)
+        );
+        assert_eq!(
+            selected_model(&core, None, "a"),
+            ComposerModelSelection::from_thread(&existing)
+        );
+        core.remove_thread_store("existing");
+        assert_eq!(selected_model(&core, None, "a"), None);
+        assert_eq!(selected_model(&core, Some("empty-79"), "a"), None);
     }
     #[test]
     fn equal_input_is_noop_and_unread_changes_only_its_semantic_node() {

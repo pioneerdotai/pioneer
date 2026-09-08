@@ -471,15 +471,19 @@ impl GatewaySwitcherView {
         let desktop_changes = desktop
             .upgrade()
             .map(|desktop| cx.observe(&desktop, |view, _, cx| view.refresh_loading(cx)));
-        let mut view = Self {
+        // The parent creates this view inside its own constructor. Read it only
+        // after GPUI has returned both entities to the app's entity map.
+        let view = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = view.update(cx, |view, cx| view.refresh_loading(cx));
+        });
+        Self {
             desktop,
             binding,
             _delivery: delivery,
             _desktop_changes: desktop_changes,
             loading: false,
-        };
-        view.refresh_loading(cx);
-        view
+        }
     }
     fn refresh_loading(&mut self, cx: &mut Context<Self>) {
         let loading = self.desktop.upgrade().is_some_and(|desktop| {

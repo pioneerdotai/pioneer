@@ -1,7 +1,6 @@
 //! Retained presentation of the existing timeline inside one mounted thread.
 pub(crate) use crate::timeline::state::{
     CachedTimelineEntryLayout, CachedTimelineTerminal, ThreadTimelineViewState,
-    TimelineScrollAnchor,
 };
 use crate::{
     avatar::DesktopMemberAvatarState, binding::ThreadBindings,

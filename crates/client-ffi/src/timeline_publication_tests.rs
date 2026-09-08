@@ -89,7 +89,8 @@ fn install(core: &ClientCore, message: &str) {
         "download",
         "dynamicToolCall",
     ] {
-        let mut item = json!({"type":kind, "id":kind, "toolName":kind, "arguments":{"query":"query", "url":"https://example.test:8443/path", "cmd":"sh -lc 'printf hello'"}, "status":"completed", "outputPolicy":policy, "display":{"kind":"hidden"}, "storage":{"kind":"none"}, "success":true});
+        // Keep the golden argument text stable with either serde_json map backend.
+        let mut item = json!({"type":kind, "id":kind, "toolName":kind, "arguments":{"cmd":"sh -lc 'printf hello'", "query":"query", "url":"https://example.test:8443/path"}, "status":"completed", "outputPolicy":policy, "display":{"kind":"hidden"}, "storage":{"kind":"none"}, "success":true});
         if kind == "commandExecution" {
             item["display"] =
                 json!({"kind":"shell", "stdout":"hello\r\nworld\t!", "truncated":false});

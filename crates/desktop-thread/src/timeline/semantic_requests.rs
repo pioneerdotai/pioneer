@@ -38,7 +38,6 @@ impl ThreadScreenView {
         let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
             return;
         };
-        self.capture_timeline_scroll_anchor_before_semantic_update(false);
         self.client.refresh_thread_timeline(&thread_id);
     }
 
@@ -159,7 +158,16 @@ impl ThreadScreenView {
             })
             .unwrap_or(false);
 
-        self.capture_timeline_scroll_anchor_before_semantic_update(false);
+        {
+            let mut state = self.thread_timeline_view_state.borrow_mut();
+            state.scroll.set_work_expansion_anchor(
+                &thread_id,
+                toggle_key,
+                !is_expanded,
+                &self.thread_timeline_scroll_handle,
+            );
+        }
+        self.consume_all_semantic_prefetch_scroll_intents();
         self.client
             .set_thread_turn_work_expanded(&thread_id, turn_id, !is_expanded);
     }
@@ -179,11 +187,6 @@ impl ThreadScreenView {
         };
         if self.current_active_thread_id() == Some(id.as_str()) {
             let key = semantic::semantic_timeline_request_key(&action);
-            self.capture_timeline_scroll_anchor_before_semantic_update(matches!(
-                key,
-                SemanticTimelineRequestKey::ThreadBefore { .. }
-                    | SemanticTimelineRequestKey::TurnWorkBefore { .. }
-            ));
             if semantic_request_key_requires_scroll_intent(key) {
                 self.consume_all_semantic_prefetch_scroll_intents();
             }

@@ -331,6 +331,9 @@ impl ClientCore {
     }
 
     pub fn begin_authorization_epoch(&self, epoch: Option<(String, u64)>) {
+        let continuing_session = epoch
+            .as_ref()
+            .and_then(|(endpoint, _)| self.continuing_authorization_session(endpoint));
         let mut owner = self
             .identity_authorization
             .lock()
@@ -339,6 +342,33 @@ impl ClientCore {
             return;
         }
         if epoch.is_some() && owner.epoch == epoch {
+            return;
+        }
+        if let (Some((endpoint, _)), Some((previous_connection, metadata)), Some(auth)) = (
+            epoch.as_ref(),
+            continuing_session,
+            owner.current_auth.as_ref(),
+        ) && owner
+            .epoch
+            .as_ref()
+            .is_some_and(|(previous_endpoint, connection)| {
+                previous_endpoint == endpoint && *connection == previous_connection
+            })
+            && auth.gateway.id == metadata.gateway_id
+            && auth.device.id == metadata.device_id
+            && auth.session.id == metadata.session_id
+            && auth.session.status == pioneer_protocol::AuthSessionStatus::Active
+        {
+            // Access-token rotation changes the transport, not the authorization subject.
+            // Keep accepted capabilities, navigation and drafts until identity verification
+            // succeeds (or the existing failure path invalidates the session). Fence older
+            // auth requests; other RPCs also check the HTTP connection generation.
+            owner.epoch = epoch;
+            owner.identity_request = owner
+                .identity_request
+                .checked_add(1)
+                .expect("identity request generation exhausted");
+            self.publish_identity_authorization(&owner.publication(), false);
             return;
         }
         owner.epoch = epoch;

@@ -26,15 +26,9 @@ pub(crate) struct ThreadTimelineViewState {
     pub(crate) cached_item_sizes: Option<Rc<Vec<Size<Pixels>>>>,
     pub(crate) cached_timeline_layout_index: Option<Rc<TimelineLayoutIndex>>,
     pub(crate) expanded_revision: u64,
-    pub(crate) pending_scroll_anchor: Option<TimelineScrollAnchor>,
+    pub(crate) scroll: super::TimelineScrollState,
     pub(crate) semantic_prefetch_scroll_generation: u64,
     pub(crate) semantic_prefetch_consumed_scroll_generation: u64,
-}
-
-pub(crate) struct TimelineScrollAnchor {
-    pub(crate) thread_id: String,
-    pub(crate) row_key: String,
-    pub(crate) row_top_offset_px: Pixels,
 }
 
 #[derive(Clone, Copy, Debug)]

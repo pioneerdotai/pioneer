@@ -46,6 +46,93 @@ fn config(
         },
     )
 }
+
+#[gpui_kit::test]
+fn folder_pointer_and_keyboard_expansion_survives_reconciliation(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px};
+    use pioneer_client::workspaces::projection::thread_tree_snapshot_from_parts;
+
+    cx.update(gpui_kit::init);
+    let core = Arc::new(ClientCore::new());
+    core.open_workspace_thread("w".into(), None, None);
+    let saves = Rc::new(RefCell::new(Vec::new()));
+    let saved = saves.clone();
+    let mut config = config(core, Rc::new(RefCell::new(HashSet::new())));
+    config.save_expansion = Rc::new(move |_, state, _| saved.borrow_mut().push(state));
+    let folders = vec![
+        serde_json::from_value(serde_json::json!({"id":"parent","workspace_id":"w","name":"Parent","created_at":1,"updated_at":1})).unwrap(),
+        serde_json::from_value(serde_json::json!({"id":"child","workspace_id":"w","parent_folder_id":"parent","name":"Child","created_at":1,"updated_at":1})).unwrap(),
+    ];
+    let snapshot =
+        thread_tree_snapshot_from_parts("w".into(), vec![], vec![], folders, vec![], vec![]);
+    let publication = Arc::new(serde_json::from_value(serde_json::json!({
+        "revision":1,"snapshot":snapshot,"changes":{"changed":[],"removed":[],"reordered_folders":[]},"loading":false,"error":null
+    })).unwrap());
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let sidebar = cx.new(|cx| {
+            let mut sidebar = super::sidebar::ThreadSidebarView::new(config, cx);
+            sidebar.input = Some(publication);
+            sidebar.rebuild_sidebar_tree_state(cx);
+            sidebar
+        });
+        Root::new(sidebar, window, cx)
+    });
+    let sidebar = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<super::sidebar::ThreadSidebarView>()
+            .unwrap()
+    });
+    let tree = sidebar.read_with(cx, |sidebar, _| sidebar.thread_tree_state.clone());
+    let folder_id = pioneer_client::threads::tree::sidebar_folder_node_id("parent");
+    let folder_id: gpui_kit::SharedString = folder_id.into();
+    let child_id: gpui_kit::SharedString =
+        pioneer_client::threads::tree::sidebar_folder_node_id("child").into();
+    let position = tree.read_with(cx, |tree, _| {
+        let index = tree.index_of(&folder_id).unwrap();
+        let bounds = tree.scroll_handle().0.borrow().base_handle.bounds();
+        point(
+            bounds.left() + px(70.),
+            bounds.top() + px(index as f32 * 32. + 16.),
+        )
+    });
+    for expanded in [true, false, true, false] {
+        let before = saves.borrow().len();
+        cx.simulate_click(position, Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            saves.borrow().len(),
+            before + 1,
+            "one state change per click"
+        );
+        assert_eq!(
+            saves.borrow().last().unwrap().get("parent"),
+            Some(&expanded)
+        );
+        sidebar.update(cx, |sidebar, cx| sidebar.rebuild_sidebar_tree_state(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            tree.read_with(cx, |tree, _| (
+                tree.entry(tree.index_of(&folder_id).unwrap())
+                    .unwrap()
+                    .is_expanded(),
+                tree.index_of(&child_id).is_some(),
+            )),
+            (expanded, expanded)
+        );
+    }
+    cx.update(|window, cx| tree.update(cx, |tree, cx| tree.focus(window, cx)));
+    for (key, expanded) in [("right", true), ("left", false)] {
+        let before = saves.borrow().len();
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert_eq!(saves.borrow().len(), before + 1);
+        assert_eq!(
+            saves.borrow().last().unwrap().get("parent"),
+            Some(&expanded)
+        );
+    }
+}
 #[gpui_kit::test]
 fn retained_workspace_root_releases_its_scoped_bindings(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

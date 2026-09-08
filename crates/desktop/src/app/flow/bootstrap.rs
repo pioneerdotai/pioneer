@@ -2,6 +2,15 @@ use super::*;
 
 impl PioneerDesktop {
     pub(crate) fn bootstrap_gateway_runtime(&mut self, cx: &mut Context<Self>) {
+        // Window-construction tests exercise real views without loading the
+        // user's gateway profile or starting native services.
+        #[cfg(test)]
+        if cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .skip_native_startup
+        {
+            return;
+        }
         self.startup
             .begin(pioneer_observability::DesktopStartupStage::GatewayRuntimeLoad);
         let operation_epoch = self.next_gateway_connection_epoch();

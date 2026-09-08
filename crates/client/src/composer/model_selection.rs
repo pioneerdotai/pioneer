@@ -405,6 +405,83 @@ mod tests {
         thread
     }
 
+    fn check_task_turn_navigation(publication_first: bool) {
+        use crate::composer::{state_machine::ComposerDomainState, store::ComposerIntent};
+        let core = crate::core::ClientCore::new();
+        let threads = [
+            ("docs", "gpt-5.6-luna", "max"),
+            ("changelog", "gpt-5.6-luna", "xhigh"),
+            ("newest", "gpt-6-astra", "high"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, model, effort))| {
+            let mut thread =
+                with_turn(thread_with_effort("cli_runtime:codex", model, Some(effort)));
+            thread.id = id.into();
+            thread.updated_at = i as i64 + 1;
+            thread.turns[0].id = format!("{id}-last-turn");
+            thread.turns[0].turn_kind = pioneer_protocol::TurnKind::TaskRun;
+            core.upsert_thread(thread.clone());
+            thread
+        })
+        .collect::<Vec<_>>();
+        for i in [2, 0, 1, 0, 2, 1] {
+            let target = &threads[i];
+            core.navigate(
+                crate::navigation::NavigationIntent::SelectThread {
+                    workspace_id: Some("ws".into()),
+                    thread_id: Some(target.id.clone()),
+                },
+                None,
+            );
+            let mut opened = target.clone();
+            opened.turns.clear();
+            if publication_first {
+                core.upsert_thread(opened.clone());
+            }
+            core.composer_intent(ComposerIntent::Open {
+                thread_id: target.id.clone(),
+                defaults: ComposerDomainState {
+                    selected_mode: ThreadMode::Chat,
+                    ..Default::default()
+                },
+            });
+            if !publication_first {
+                core.upsert_thread(opened);
+            }
+            let draft = core.composer_snapshot(&target.id).unwrap();
+            core.composer_intent(ComposerIntent::SyncModelSelection {
+                thread_id: target.id.clone(),
+                draft_id: draft.draft_id(),
+                reset: false,
+            });
+            let draft = core.composer_snapshot(&target.id).unwrap();
+            assert_eq!(
+                draft.domain().selected_model.as_deref(),
+                Some(target.model.as_str()),
+                "{}",
+                target.id
+            );
+            assert_eq!(
+                draft.domain().selected_reasoning_effort,
+                target.reasoning_effort,
+                "{}",
+                target.id
+            );
+        }
+    }
+
+    #[test]
+    fn task_turn_defaults_survive_sidebar_navigation() {
+        check_task_turn_navigation(false);
+    }
+
+    #[test]
+    fn task_turn_defaults_survive_navigation_publication_first() {
+        check_task_turn_navigation(true);
+    }
+
     #[test]
     fn composer_open_and_typed_sync_use_core_metadata_and_preserve_manual_selection() {
         use crate::composer::{

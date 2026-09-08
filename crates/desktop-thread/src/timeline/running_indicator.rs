@@ -718,10 +718,10 @@ mod tests {
     fn warm_route_retains_clock_owner_but_cancels_work_until_remount(
         cx: &mut gpui_kit::TestAppContext,
     ) {
-        use super::CachedIndicatorView;
-        use super::RunningElapsedView;
-        use super::RunningElapsedViewEntry;
-        use super::RunningIndicatorViewCache;
+        use super::{
+            CachedIndicatorView, RunningElapsedView, RunningElapsedViewEntry,
+            RunningIndicatorViewCache,
+        };
         use gpui_kit::AppContext;
         let weak = cx.update(|cx| {
             let mut cache = RunningIndicatorViewCache::default();

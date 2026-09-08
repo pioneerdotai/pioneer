@@ -155,6 +155,28 @@ impl ClientCore {
             state.ready.as_ref().map(|ready| ready.spec.endpoint_kind)
         })
     }
+    /// The replacement credentials must belong to the device session whose transport
+    /// was already verified. A new endpoint/session still starts a fresh authorization epoch.
+    pub(crate) fn continuing_authorization_session(
+        &self,
+        endpoint: &str,
+    ) -> Option<(u64, GatewaySessionMetadata)> {
+        let sessions = self
+            .gateway_session
+            .lock()
+            .expect("Gateway session owner poisoned");
+        let state = sessions.connections.get(endpoint)?;
+        let connected = state.connected.as_ref()?;
+        let ready = state.ready.as_ref()?;
+        let previous = &connected.metadata;
+        let next = &ready.metadata;
+        (previous.gateway_id == next.gateway_id
+            && previous.device_id == next.device_id
+            && previous.session_id == next.session_id
+            && previous.refresh_generation <= next.refresh_generation)
+            .then(|| (connected.connection_id, next.clone()))
+    }
+
     /// Starts a prepared native transport under the process transport lease.
     /// Retrying startup returns its transport identity before readiness; identity
     /// verification is a separate Client operation after the transport connects.
@@ -1406,6 +1428,158 @@ mod tests {
             || Ok(auth_me()),
             || Ok(()),
         )
+    }
+
+    #[test]
+    fn access_rotation_preserves_navigation_thread_and_authorization_publications() {
+        let core = ClientCore::new();
+        let endpoint = endpoint("endpoint");
+        let storage = storage();
+        connect(&core, &endpoint, &storage, 1).unwrap();
+        let thread: Thread = serde_json::from_value(serde_json::json!({
+            "id": "thread", "workspace_id": "workspace", "preview": "existing conversation",
+            "mode": "Chat", "model": "model", "model_provider": "provider",
+            "created_at": 1, "updated_at": 1, "status": "Idle", "turns": []
+        }))
+        .unwrap();
+        core.upsert_thread(thread);
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectThread {
+                workspace_id: Some("workspace".into()),
+                thread_id: Some("thread".into()),
+            },
+            None,
+        );
+        let navigation = core.navigation_snapshot();
+        let thread = core.thread_snapshot("thread").unwrap();
+        let composer_scope = crate::core::ClientScope::Composer {
+            thread_id: "thread".into(),
+        };
+        let draft = Arc::new(crate::composer::draft::ComposerDomainDraft {
+            text: "Message still being written".into(),
+            ..Default::default()
+        });
+        core.publish(
+            &crate::core::ClientMutationAuthority { _private: () },
+            composer_scope.clone(),
+            crate::threads::registry::revisions(1),
+            draft.clone(),
+            vec![],
+        );
+        let composer = core.snapshot(&composer_scope).unwrap().snapshot();
+        let authorization_generation = core.authorization_connection_generation();
+        let identity_ticket = core.current_auth_ticket();
+        for generation in 2..=3 {
+            let mut refresh_request = request(&endpoint);
+            refresh_request.now_unix = 1950 + (generation - 2) * 1000;
+            let mut successor = grant(generation);
+            successor.access_expires_at_unix = refresh_request.now_unix + 1050;
+            let auth = AuthMeResponse {
+                gateway: successor.gateway.clone(),
+                principal: successor.principal.clone(),
+                device: successor.device.clone(),
+                session: successor.session.clone(),
+                role_key: None,
+            };
+            core.ensure_gateway_session_with_ports(
+                refresh_request,
+                &storage,
+                |_, _, _, _| Ok(successor.clone()),
+                |_, _, _| Ok(()),
+                |_| {
+                    // The transport event can reach the identity observer before the
+                    // synchronous replacement call completes its own verification.
+                    core.observe_authorization_connection(
+                        &crate::transport::ws::GatewayWsEvent::Connected {
+                            endpoint_id: endpoint.id.clone(),
+                            connection_id: generation,
+                            endpoint_name: endpoint.name.clone(),
+                            gateway_base_url: endpoint.gateway_base_url.clone(),
+                        },
+                    );
+                    assert_eq!(core.navigation_snapshot().as_ref(), navigation.as_ref());
+                    Ok(generation)
+                },
+                || {
+                    assert!(Arc::ptr_eq(
+                        &core.snapshot(&composer_scope).unwrap().snapshot(),
+                        &composer
+                    ));
+                    Ok(auth.clone())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(core.navigation_snapshot().as_ref(), navigation.as_ref());
+            assert!(Arc::ptr_eq(
+                &core.thread_snapshot("thread").unwrap(),
+                &thread
+            ));
+            assert!(Arc::ptr_eq(
+                &core.snapshot(&composer_scope).unwrap().snapshot(),
+                &composer
+            ));
+            // Both shells use this generation to clear protected UI and composer drafts.
+            assert_eq!(
+                core.authorization_connection_generation(),
+                authorization_generation
+            );
+            assert_eq!(
+                core.current_auth().unwrap().session.refresh_generation,
+                generation
+            );
+        }
+        assert!(
+            core.finish_current_auth(identity_ticket.0, identity_ticket.1, auth_me())
+                .is_err()
+        );
+        core.begin_authorization_epoch(None);
+        assert!(core.navigation_snapshot().active_thread_id().is_none());
+        assert!(core.authorization_connection_generation() > authorization_generation);
+        assert!(
+            core.snapshot(&composer_scope)
+                .unwrap()
+                .typed::<crate::composer::draft::ComposerDomainDraft>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn access_rotation_identity_failure_still_clears_the_previous_session() {
+        let core = ClientCore::new();
+        let endpoint = endpoint("endpoint");
+        let storage = storage();
+        connect(&core, &endpoint, &storage, 1).unwrap();
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectThread {
+                workspace_id: Some("workspace".into()),
+                thread_id: Some("thread".into()),
+            },
+            None,
+        );
+        let authorization_generation = core.authorization_connection_generation();
+        let mut refresh_request = request(&endpoint);
+        refresh_request.now_unix = 1950;
+        let result = core.ensure_gateway_session_with_ports(
+            refresh_request,
+            &storage,
+            |_, _, _, _| Ok(grant(2)),
+            |_, _, _| Ok(()),
+            |_| Ok(2),
+            || {
+                let mut auth = auth_me();
+                auth.principal.id = PrincipalId::new("P00000000000000000002").unwrap();
+                Ok(auth)
+            },
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(GatewaySessionConnectionFailure::Terminal { .. })
+        ));
+        assert!(core.current_auth().is_none());
+        assert!(core.navigation_snapshot().active_thread_id().is_none());
+        assert!(core.authorization_connection_generation() > authorization_generation);
     }
 
     #[test]

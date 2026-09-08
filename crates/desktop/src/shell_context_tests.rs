@@ -7,6 +7,46 @@ use gpui_kit::{
 struct FocusOwner {
     focus: FocusHandle,
 }
+
+#[gpui_kit::test]
+fn desktop_window_constructs_gateway_views_before_first_frame(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |window, cx| {
+            crate::client_runtime::DesktopRuntimeCoordinator::install(cx);
+            let registrar = cx
+                .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                .registrar();
+            let navigation =
+                crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+            let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+            let desktop = cx.new(|cx| {
+                crate::app::LegacyScreenAdapter::new(
+                    window,
+                    cx,
+                    pioneer_observability::DesktopStartupTrace::start(),
+                    navigation.clone(),
+                    layout.clone(),
+                )
+            });
+            let shell = cx.new(|cx| {
+                crate::desktop_shell::DesktopShellView::new(desktop, navigation, layout, window, cx)
+            });
+            cx.new(|cx| Root::new(shell, window, cx))
+        })
+        .unwrap()
+    });
+    let root = window.root(cx).unwrap();
+    root.read_with(cx, |root, _| {
+        assert!(
+            root.view()
+                .clone()
+                .downcast::<crate::desktop_shell::DesktopShellView>()
+                .is_ok()
+        );
+    });
+}
 impl Render for FocusOwner {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().track_focus(&self.focus)
