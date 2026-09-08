@@ -1,3 +1,6 @@
+#[path = "tests/task_capsule.rs"]
+mod task_capsule;
+
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageProcessor,
     ProgressItemRegistry, ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
@@ -24611,18 +24614,14 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "task_detach",
         "task_get",
         "task_resume",
+        "task_update",
+        "task_list",
+        "task_reschedule",
+        "task_pause",
     ] {
         assert!(
             tool_names.contains(&expected),
             "agent mode should expose {expected}"
-        );
-    }
-    for hidden_without_typed_agent_intent in
-        ["task_update", "task_list", "task_reschedule", "task_pause"]
-    {
-        assert!(
-            !tool_names.contains(&hidden_without_typed_agent_intent),
-            "agent mode must hide {hidden_without_typed_agent_intent} without a typed Agent capability"
         );
     }
     for hidden_until_review in ["task_accept", "task_revise"] {

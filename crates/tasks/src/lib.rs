@@ -20,7 +20,7 @@ mod wait;
 mod tests;
 
 pub use actor_contract::{build_occurrence_contract, build_task_actor_contract};
-pub use error::{TaskRuntimeError, TaskRuntimeResult};
+pub use error::{TaskOperationError, TaskRuntimeError, TaskRuntimeResult};
 pub use event_bus::{
     TaskEventBus, TaskEventFilter, TaskEventSubscription, TaskEventWake, TaskEventWakeDelivery,
 };

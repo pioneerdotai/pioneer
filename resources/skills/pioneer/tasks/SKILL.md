@@ -107,6 +107,10 @@ Changing delivery affects future runs. It does not retroactively materialize alr
 
 ## Updating Existing Tasks
 
+Task access belongs to the authorized root-thread capsule, not to the turn/run or hidden execution thread that created the task. A later authorized execution in the same capsule can inspect and manage the existing task by its stable `taskId`, within both its admitted action grants and the initiating user's current permissions. A user's broader rights do not widen an execution's restricted grants. Knowing an id does not grant access to another capsule.
+
+`task_access_denied` means this execution cannot perform the operation; it does not mean the task is absent, broken, cancelled, or no longer scheduled. Do not create a replacement merely because inspection or cancellation failed: the original schedule may still fire. Report the blocker and possible duplicate risk. For `task_state_conflict`, reload the task and reconcile the requested change. For `task_operation_failed` (or older `agent_runtime_integrity_lost`), report an unconfirmed operation, not a dead task.
+
 Use `task_list` or `task_get` to inspect before patching. Patch only fields that should change.
 
 For delivery fixes, preserve schedule, goal, instructions, and output instructions unless the user asked to change them.
