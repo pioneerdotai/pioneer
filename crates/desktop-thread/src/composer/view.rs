@@ -218,6 +218,7 @@ impl ComposerView {
         };
 
         h_flex()
+            .debug_selector(|| "thread-composer".into())
             .w_full()
             .flex_none()
             .justify_center()

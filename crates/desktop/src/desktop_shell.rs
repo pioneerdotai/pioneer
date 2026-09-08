@@ -15,6 +15,27 @@ use std::sync::Arc;
 
 struct DesktopUpdateApplyFailedNotification;
 
+fn thread_view_target(
+    navigation: &DesktopNavigationStore,
+    client: &pioneer_client::core::ClientCore,
+    window_active: bool,
+) -> Option<String> {
+    if navigation.activity(MainRoute::Threads, window_active) == RouteActivity::Dormant {
+        return None;
+    }
+    navigation
+        .snapshot()
+        .navigation()
+        .active_thread_id()
+        .map(str::to_owned)
+        .or_else(|| {
+            navigation
+                .is_visible(MainRoute::Threads)
+                .then(|| client.prepare_thread_draft())
+                .flatten()
+        })
+}
+
 pub(crate) struct DesktopShellView {
     thread: Option<(String, Entity<pioneer_desktop_thread::ThreadView>)>,
     thread_events: Option<Subscription>,
@@ -277,15 +298,13 @@ impl DesktopShellView {
         view
     }
     fn mount_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let route = self.navigation.snapshot();
         let visible = self.navigation.is_visible(MainRoute::Threads);
-        let target = (self
-            .navigation
-            .activity(MainRoute::Threads, window.is_window_active())
-            != crate::desktop_navigation::RouteActivity::Dormant)
-            .then(|| route.navigation().active_thread_id())
-            .flatten();
-        if self.thread.as_ref().map(|(id, _)| id.as_str()) == target {
+        let (client, registrar) = {
+            let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
+            (runtime.core(), runtime.registrar())
+        };
+        let target = thread_view_target(&self.navigation, &client, window.is_window_active());
+        if self.thread.as_ref().map(|(id, _)| id) == target.as_ref() {
             if let Some((_, thread)) = &self.thread {
                 thread.update(cx, |thread, cx| thread.set_visible(visible, window, cx));
             }
@@ -295,10 +314,6 @@ impl DesktopShellView {
         self.thread.take();
         let Some(thread_id) = target.filter(|_| visible) else {
             return;
-        };
-        let (client, registrar) = {
-            let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
-            (runtime.core(), runtime.registrar())
         };
         let Ok(runtime_root) = crate::state::runtime_home_dir() else {
             return;
@@ -616,6 +631,48 @@ mod context_tests;
 #[cfg(test)]
 mod tests {
     #[test]
+    fn new_thread_route_mounts_before_bootstrap_and_keeps_its_target_on_creation() {
+        use super::*;
+        use pioneer_client::core::{ClientCore, ClientScope};
+        use pioneer_desktop_foundation::{
+            ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
+        };
+        struct Registrar;
+        impl ClientBindingRegistrar for Registrar {
+            fn register(
+                &self,
+                _: ClientScope,
+                _: std::sync::Weak<dyn ClientPublicationSink>,
+            ) -> ClientBindingRegistration {
+                ClientBindingRegistration::new(|| {})
+            }
+        }
+        let client = ClientCore::new();
+        let navigation = DesktopNavigationStore::new(&Registrar);
+        assert!(
+            navigation
+                .snapshot()
+                .navigation()
+                .active_thread_id()
+                .is_none()
+        );
+        let id = thread_view_target(&navigation, &client, true)
+            .expect("New thread must mount the composer before server creation");
+        assert_eq!(
+            thread_view_target(&navigation, &client, false).as_deref(),
+            Some(id.as_str())
+        );
+        client.activate_thread(Some(&id), Some("workspace"));
+        navigation.publish(client.snapshot(&ClientScope::Navigation).unwrap());
+        assert_eq!(
+            thread_view_target(&navigation, &client, true).as_deref(),
+            Some(id.as_str())
+        );
+        navigation.set_window_route(WindowRoute::GatewaySetup);
+        assert!(thread_view_target(&navigation, &client, true).is_none());
+    }
+
+    #[test]
     fn bootstrap_has_one_toolkit_root_and_shell_is_its_content() {
         let main = include_str!("main.rs");
         assert_eq!(main.matches("gpui_kit::init(cx)").count(), 1);
@@ -773,7 +830,7 @@ mod tests {
             );
         }
         let feature = include_str!("../../desktop-thread/src/screen.rs");
-        assert!(feature.contains("impl Drop for ThreadScreenView"));
+        assert!(feature.contains("impl Drop for TimelineView"));
         assert!(feature.contains("self.thread_bindings.clear()"));
     }
 

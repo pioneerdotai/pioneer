@@ -595,7 +595,18 @@ impl TimelineView {
         {
             self.subscribed_workspace = None;
         }
-        if authorized && self.connection_state == GatewayConnectionState::Connected {
+        // The new-thread surface uses the reserved creation identity immediately.
+        // It is not yet a server thread to subscribe to or paginate.
+        let awaiting_creation = self
+            .client
+            .thread_start_snapshot()
+            .pending_thread_id
+            .as_deref()
+            == Some(self.thread_id.as_str());
+        if authorized
+            && !awaiting_creation
+            && self.connection_state == GatewayConnectionState::Connected
+        {
             if let Some(workspace) = self.thread_workspace_id(&self.thread_id) {
                 if self.subscribed_workspace.as_ref() != Some(&workspace) {
                     // Record the mounted scope before scheduling, since the Client publishes

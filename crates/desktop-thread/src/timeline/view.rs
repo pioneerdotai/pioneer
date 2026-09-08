@@ -302,6 +302,7 @@ impl TimelineView {
             .filter(|p| !p.model.rows.is_empty())
         else {
             return v_flex()
+                .debug_selector(|| "thread-empty-timeline".into())
                 .w_full()
                 .h_full()
                 .justify_center()

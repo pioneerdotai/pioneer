@@ -240,6 +240,23 @@ impl ComposerView {
                     .map(|status| status.connection_state)
             })
             .unwrap_or(GatewayConnectionState::Disconnected);
+        // The startup draft can be mounted before the first authorization epoch.
+        // A session fence clears its publication, but the reserved creation ID
+        // still belongs to this composer. Reopen an empty draft in the new epoch.
+        if self.composer_input.is_none()
+            && self.client.composer_snapshot(&self.thread_id).is_none()
+            && self
+                .client
+                .thread_start_snapshot()
+                .pending_thread_id
+                .as_deref()
+                == Some(self.thread_id.as_str())
+        {
+            self.client.composer_intent(ComposerIntent::Activate {
+                thread_id: self.thread_id.clone(),
+            });
+            self.composer_input = self.client.composer_snapshot(&self.thread_id);
+        }
         if let Some(input) = &self.composer_input {
             self.client.composer_catalog_intent(
                 pioneer_client::composer::catalog::ComposerCatalogIntent::Observe {

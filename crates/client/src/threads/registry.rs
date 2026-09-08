@@ -764,6 +764,32 @@ impl ClientCore {
             .start
             .clone()
     }
+    /// Reserves the existing start coordinator's identity for an editable draft
+    /// before workspace bootstrap/creation completes. This does not send a request
+    /// or select a server thread; creation consumes the same identity.
+    pub fn prepare_thread_draft(&self) -> Option<String> {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if self.is_stopped() {
+            return None;
+        }
+        if let Some(draft) = registry
+            .navigation
+            .workspace_id()
+            .and_then(|workspace| registry.navigation.draft(workspace))
+        {
+            return Some(draft.to_owned());
+        }
+        if registry.start.pending_thread_id.is_none() {
+            super::start::ensure_pending_thread_start_id(
+                &mut registry.start,
+                super::start::generate_thread_start_id(),
+            );
+        }
+        registry.start.pending_thread_id.clone()
+    }
     pub fn thread_start_mutation(&self) -> ThreadStartMutation<'_> {
         ThreadStartMutation(
             self.thread_registry
@@ -2457,6 +2483,75 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn prepared_draft_keeps_identity_and_text_through_creation() {
+        use crate::composer::store::ComposerIntent;
+        let core = core();
+        let navigation = core.subscribe(ClientScope::Navigation, NonZeroUsize::new(8).unwrap());
+        let id = core.prepare_thread_draft().unwrap();
+        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+        assert!(core.navigation_snapshot().active_thread_id().is_none());
+        assert!(navigation.try_next().is_none());
+        assert!(!core.thread_start_snapshot().in_progress);
+        assert!(!core.thread_start_requested());
+        core.composer_intent(ComposerIntent::Activate {
+            thread_id: id.clone(),
+        });
+        let draft = core.composer_snapshot(&id).unwrap().draft_id();
+        core.composer_intent(ComposerIntent::EditText {
+            thread_id: id.clone(),
+            draft_id: draft,
+            text: "typed before bootstrap".into(),
+        });
+        core.activate_thread(None, Some("ws"));
+        let transport = DraftTransport(Default::default());
+        assert_eq!(
+            core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            core.navigation_snapshot().active_thread_id(),
+            Some(id.as_str())
+        );
+        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+        let composer = core.composer_snapshot(&id).unwrap();
+        assert_eq!(composer.draft_id(), draft);
+        assert_eq!(composer.draft().text, "typed before bootstrap");
+        assert_eq!(transport.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_draft_survives_failed_creation_for_explicit_retry() {
+        struct FailedTransport;
+        impl crate::rpc::JsonRpcRequestTransport for FailedTransport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                _: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                Err("synthetic unavailable transport".into())
+            }
+        }
+        let core = core();
+        core.activate_thread(None, Some("ws"));
+        let id = core.prepare_thread_draft().unwrap();
+        assert!(
+            core.create_workspace_thread_draft(&FailedTransport, "ws", ThreadVisibility::Private)
+                .is_err()
+        );
+        assert!(!core.thread_start_snapshot().in_progress);
+        assert!(!core.thread_start_requested());
+        assert_eq!(core.prepare_thread_draft().as_deref(), Some(id.as_str()));
+        let transport = DraftTransport(Default::default());
+        assert_eq!(
+            core.create_workspace_thread_draft(&transport, "ws", ThreadVisibility::Private)
+                .unwrap(),
+            id
+        );
+    }
+
     #[test]
     fn draft_creation_reuses_single_owner_and_promotion_preserves_thread() {
         let core = core();
@@ -4368,7 +4463,14 @@ impl ClientCore {
         let result = crate::transport::ws::command_sender::thread_start(
             transport,
             super::start::thread_create_params(id.clone(), workspace.to_owned(), visibility),
-        );
+        )
+        .and_then(|response| {
+            anyhow::ensure!(
+                response.thread.id == id && response.thread.workspace_id == workspace,
+                "Thread creation response scope mismatch"
+            );
+            Ok(response)
+        });
         let mut registry = self
             .thread_registry
             .lock()
@@ -4381,12 +4483,13 @@ impl ClientCore {
                     .is_some_and(|s| s.generation == generation),
             "Thread creation cancelled"
         );
-        if registry.start.pending_thread_id.as_deref() == Some(&id) {
-            registry.start = Default::default();
-        }
         let response = match result {
             Ok(response) => response,
             Err(error) => {
+                if registry.start.pending_thread_id.as_deref() == Some(&id) {
+                    // Keep the draft identity (and its composer) for explicit retry.
+                    super::start::finish_thread_start_attempt(&mut registry.start);
+                }
                 if registry
                     .stores
                     .get(&id)
@@ -4403,10 +4506,9 @@ impl ClientCore {
             response,
             None,
         );
-        anyhow::ensure!(
-            reduction.thread.id == id && reduction.thread.workspace_id == workspace,
-            "Thread creation response scope mismatch"
-        );
+        if registry.start.pending_thread_id.as_deref() == Some(&id) {
+            registry.start = Default::default();
+        }
         registry
             .stores
             .get_mut(&id)
