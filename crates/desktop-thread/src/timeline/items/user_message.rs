@@ -37,6 +37,7 @@ impl TimelineView {
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
+        content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
         item: &TurnItem,
         presentation: Option<&UserMessagePresentation>,
         exact_author: Option<&TurnAuthorSnapshot>,
@@ -135,7 +136,10 @@ impl TimelineView {
 
         row.child(
             v_flex()
-                .id(("timeline-user-message", entry.item_index))
+                .id(SharedString::from(format!(
+                    "timeline-user-message:{}:{}",
+                    self.thread_id, entry.id
+                )))
                 .w(content_width)
                 .px(TIMELINE_CONTENT_HORIZONTAL_PADDING)
                 .when(
@@ -352,7 +356,7 @@ impl TimelineView {
                                         this.child(self.render_markdown_auto(
                                             item_view.id.as_str(),
                                             raw_text,
-                                            item_view.partial_markdown.as_ref(),
+                                            content.markdown_presentation.as_ref(),
                                             CodeHighlightPolicy::Disabled,
                                             cx,
                                         ))
@@ -385,65 +389,57 @@ impl TimelineView {
             .flex_wrap()
             .gap_1p5()
             .pb_2()
-            .children(
-                attachments
-                    .into_iter()
-                    .enumerate()
-                    .map(|(chip_index, attachment)| {
-                        let chip_id =
-                            stable_user_message_attachment_chip_id(item_id.as_str(), chip_index);
-                        let artifact = attachment.artifact.clone();
-                        let preview_image_path = artifact.as_ref().and_then(|artifact| {
-                            if !can_read_artifacts {
-                                return None;
-                            }
-                            self.thread_artifact_preview_path(artifact, false)
-                        });
-                        let artifact_id = artifact
-                            .as_ref()
-                            .filter(|_| can_read_artifacts)
-                            .map(|artifact| artifact.artifact_id.clone());
+            .children(attachments.into_iter().map(|attachment| {
+                let chip_id =
+                    stable_user_message_attachment_chip_id(item_id.as_str(), &attachment.id);
+                let artifact = attachment.artifact.clone();
+                let preview_image_path = artifact.as_ref().and_then(|artifact| {
+                    if !can_read_artifacts {
+                        return None;
+                    }
+                    self.thread_artifact_preview_path(artifact, false)
+                });
+                let artifact_id = artifact
+                    .as_ref()
+                    .filter(|_| can_read_artifacts)
+                    .map(|artifact| artifact.artifact_id.clone());
 
-                        h_flex()
-                            .id(("timeline-user-attachment-chip", chip_id))
-                            .h(px(32.))
-                            .max_w(px(196.))
+                h_flex()
+                    .id(("timeline-user-attachment-chip", chip_id))
+                    .h(px(32.))
+                    .max_w(px(196.))
+                    .min_w_0()
+                    .flex_initial()
+                    .pl_1()
+                    .pr_2()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_user_message_attachment_preview(
+                        preview_image_path,
+                        attachment.kind,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
                             .min_w_0()
-                            .flex_initial()
-                            .pl_1()
-                            .pr_2()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .items_center()
-                            .gap_2()
-                            .child(self.render_user_message_attachment_preview(
-                                preview_image_path,
-                                attachment.kind,
-                                cx,
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .child(attachment.display_name),
-                            )
-                            .when_some(artifact_id, |this, artifact_id| {
-                                this.hover(|this| this.opacity(0.8)).on_click(cx.listener(
-                                    move |view, _, _, cx| {
-                                        view.open_thread_artifact_in_sidebar(
-                                            artifact_id.clone(),
-                                            cx,
-                                        );
-                                    },
-                                ))
-                            })
-                    }),
-            )
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_xs()
+                            .child(attachment.display_name),
+                    )
+                    .when_some(artifact_id, |this, artifact_id| {
+                        this.hover(|this| this.opacity(0.8)).on_click(cx.listener(
+                            move |view, _, _, cx| {
+                                view.open_thread_artifact_in_sidebar(artifact_id.clone(), cx);
+                            },
+                        ))
+                    })
+            }))
             .into_any_element()
     }
 

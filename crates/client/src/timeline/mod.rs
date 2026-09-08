@@ -12,3 +12,5 @@ pub mod item_presentation;
 
 pub mod diagnostics;
 pub mod types;
+
+pub mod markdown;

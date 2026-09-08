@@ -82,7 +82,7 @@ fn timeline_keeps_the_stock_list_and_existing_scroll_owner() {
     assert!(view.contains("v_virtual_list("));
     assert!(state.contains("VirtualListScrollHandle::new()"));
     assert!(!view.contains("sync_timeline_layout_width"));
-    assert!(view.contains("cached_timeline_layout_index"));
+    assert!(view.contains("TimelineLayoutIndex::from_store"));
     assert!(controller.contains("struct DesktopTimelineController;"));
     for forbidden in ["impl Element for", ".cached("] {
         assert!(!view.contains(forbidden));
@@ -125,5 +125,111 @@ fn timeline_composition_reads_prepared_input_without_running_effects() {
         "borrow_mut",
     ] {
         assert!(!canvas.contains(forbidden));
+    }
+}
+
+#[test]
+fn row_sources_keep_the_approved_element_and_no_optional_reuse_mechanisms() {
+    fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/timeline"),
+        &mut files,
+    );
+    let mut elements = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            ".cached(",
+            "IndexedTimelineListElement",
+            "RowBodyView",
+            "TranslationCache",
+            "CodeHighlightCache",
+            "Proposal68",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{} contains {forbidden}",
+                path.display()
+            );
+        }
+        for line in production
+            .lines()
+            .filter(|line| line.starts_with("impl Element for "))
+        {
+            elements.push(line.to_owned());
+        }
+    }
+    assert_eq!(elements, vec!["impl Element for MarkdownLinkText {"]);
+    let row = include_str!("../src/timeline/row_registry.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert!(row.contains("HashMap<RowId, Arc<TimelineRowSlotView>>"));
+    assert!(!row.contains("Entity<"));
+    assert!(!row.contains("item_index)"));
+    let view = include_str!("../src/timeline/view.rs");
+    assert!(!view.contains("unwrap_or_else(|| view.render_timeline_row"));
+    let command = include_str!("../src/timeline/items/command_execution.rs");
+    let command_render = command
+        .split("pub(super) fn render_item_command_execution(")
+        .nth(1)
+        .unwrap();
+    assert!(command_render.contains("terminal: Option<Entity<TerminalView>>"));
+    assert!(command_render.contains(".children(terminal)"));
+    for forbidden in [
+        "thread_timeline_terminal_item",
+        ".synchronize(",
+        "TerminalView::new",
+        "borrow_mut(",
+        "cx.notify()",
+    ] {
+        assert!(!command_render.contains(forbidden));
+    }
+    assert!(row.contains("self.terminal.as_ref().map(|terminal| terminal.view.clone())"));
+    let markdown = include_str!("../src/timeline/markdown.rs");
+    let link = markdown
+        .split("impl Element for MarkdownLinkText {")
+        .nth(1)
+        .unwrap()
+        .split("impl TimelineView {")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "cx.notify",
+        "cx.spawn",
+        ".update(cx",
+        "cached",
+        "thread_bindings",
+    ] {
+        assert!(!link.contains(forbidden));
+    }
+    let measure = include_str!("../src/timeline/mod.rs")
+        .split("impl TimelineLayoutMeasurement {")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) use")
+        .next()
+        .unwrap();
+    assert!(measure.contains("layout_as_root("));
+    for forbidden in [
+        "notify(",
+        "spawn(",
+        "borrow_mut(",
+        "dispatch(",
+        "commit(",
+        "thread_bindings",
+    ] {
+        assert!(!measure.contains(forbidden));
     }
 }

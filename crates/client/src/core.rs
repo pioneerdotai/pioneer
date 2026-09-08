@@ -486,9 +486,17 @@ impl ClientSnapshot {
 }
 
 #[derive(Clone)]
-pub struct ClientPublicationReference(Arc<ClientSnapshot>);
+pub struct ClientPublicationReference(
+    Arc<ClientSnapshot>,
+    Option<Arc<crate::timeline::presentation::TimelineChangeSet>>,
+);
 
 impl ClientPublicationReference {
+    /// Transaction delta carried by delivery, never retained in a scoped snapshot.
+    pub fn timeline_change(&self) -> Option<Arc<crate::timeline::presentation::TimelineChangeSet>> {
+        self.1.clone()
+    }
+
     pub fn scope(&self) -> &ClientScope {
         self.0.scope()
     }
@@ -541,7 +549,7 @@ impl<T> ScopedPublication<T> {
     }
 
     pub fn reference(&self) -> ClientPublicationReference {
-        ClientPublicationReference(Arc::clone(&self.snapshot))
+        ClientPublicationReference(Arc::clone(&self.snapshot), None)
     }
 }
 
@@ -1202,7 +1210,7 @@ impl ClientCore {
                     partitions
                         .publications
                         .values()
-                        .map(|snapshot| ClientPublicationReference(snapshot.clone()))
+                        .map(|snapshot| ClientPublicationReference(snapshot.clone(), None))
                         .collect::<Vec<_>>(),
                 ),
             })]
@@ -1688,7 +1696,7 @@ impl ClientCore {
             .expect("client partitions poisoned")
             .publications
             .get(scope)
-            .map(|snapshot| ClientPublicationReference(Arc::clone(snapshot)))
+            .map(|snapshot| ClientPublicationReference(Arc::clone(snapshot), None))
     }
 
     pub fn snapshot_if_newer(
@@ -2195,11 +2203,12 @@ impl ClientCore {
             let publications = changed_drafts
                 .into_iter()
                 .map(|draft| {
+                    let timeline_change = draft.timeline_change.clone().map(Arc::new);
                     let snapshot = ClientSnapshot::from_draft(draft, sequence);
                     partitions
                         .publications
                         .insert(snapshot.scope().clone(), Arc::clone(&snapshot));
-                    ClientPublicationReference(snapshot)
+                    ClientPublicationReference(snapshot, timeline_change)
                 })
                 .collect::<Vec<_>>();
             for effect in &effects {

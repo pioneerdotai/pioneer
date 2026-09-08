@@ -1,3 +1,4 @@
+use super::state::TimelinePresentationState;
 use super::*;
 use pioneer_client::threads::read::{MarkThreadReadContext, plan_mark_thread_read};
 
@@ -250,13 +251,6 @@ impl TimelineView {
         state.item_count = item_count;
         state.tail_entry_id = tail_entry_id.map(str::to_owned);
         state.tail_text_len = tail_text_len;
-
-        if thread_changed {
-            state.entry_layout_cache.clear();
-            state.cached_item_sizes = None;
-        } else if timeline_changed {
-            state.cached_item_sizes = None;
-        }
 
         drop(state);
 

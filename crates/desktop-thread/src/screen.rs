@@ -1,10 +1,8 @@
 //! Retained presentation of the existing timeline inside one mounted thread.
-pub(crate) use crate::timeline::state::{
-    CachedTimelineEntryLayout, CachedTimelineTerminal, TimelinePresentationState,
-};
+pub(crate) use crate::timeline::state::TimelinePresentationState;
 use crate::{
-    avatar::DesktopMemberAvatarState, binding::ThreadBindings,
-    code_highlight::DesktopCodeHighlightCache, ports::*, timeline::RunningIndicatorViewCache,
+    avatar::DesktopMemberAvatarState, binding::ThreadBindings, ports::*,
+    timeline::RunningIndicatorViewCache,
 };
 use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::{prelude::*, *};
@@ -61,10 +59,18 @@ pub(crate) struct TimelineView {
     workspace_input: Option<String>,
     pub(crate) avatar_http: Option<crate::avatar::ThreadAvatarClient>,
     pub(crate) member_avatar_state: DesktopMemberAvatarState,
+    pub(crate) layout_store: crate::timeline::layout_store::TimelineLayoutStore,
+    pub(crate) measurement_coordinator:
+        crate::timeline::layout_store::TimelineMeasurementCoordinator,
+    pub(crate) timeline_access_revoked: bool,
+    pub(crate) retained_context: Option<(Pixels, u64, gpui_kit::TextStyle)>,
+    pub(crate) row_registry: crate::timeline::row_registry::TimelineRowRegistry,
     pub(crate) thread_timeline_view_state: crate::timeline::state::TimelineViewState,
     pub(crate) running_indicator_views: RefCell<RunningIndicatorViewCache>,
-    pub(crate) thread_timeline_terminal_item: RefCell<HashMap<String, CachedTimelineTerminal>>,
-    pub(crate) code_highlight_cache: RefCell<DesktopCodeHighlightCache>,
+    pub(crate) thread_timeline_terminal_item:
+        RefCell<crate::timeline::terminal_registry::TerminalRegistry>,
+    pub(crate) markdown_highlights:
+        RefCell<HashMap<u64, crate::timeline::code_highlighting::LiveHighlight>>,
     pub(crate) pending_request_views:
         HashMap<(String, String), Entity<crate::approvals::PendingRequestView>>,
     pub(crate) task_review_views:
@@ -86,6 +92,17 @@ impl Render for TimelineView {
     }
 }
 impl TimelineView {
+    pub(crate) fn retire_timeline_rows(&mut self) {
+        crate::timeline::controller::DesktopTimelineController::exit(self);
+        self.measurement_coordinator.cancel();
+        self.retained_context = None;
+        self.thread_timeline_view_state.prepared = None;
+        self.thread_timeline_view_state.model = crate::timeline::TimelineRenderModel::empty();
+        self.row_registry = Default::default();
+        self.layout_store = Default::default();
+        self.markdown_highlights.borrow_mut().clear();
+        self.thread_timeline_terminal_item.borrow_mut().clear();
+    }
     pub(crate) fn set_visible(
         &mut self,
         visible: bool,
@@ -101,8 +118,13 @@ impl TimelineView {
             self.synchronize_inputs(window, cx);
         } else {
             crate::timeline::controller::DesktopTimelineController::exit(self);
-            self.thread_timeline_view_state.layout_generation += 1;
-            self.thread_timeline_view_state.measurement = None;
+            self.measurement_coordinator.cancel();
+            self.retained_context = None;
+            self.thread_timeline_view_state.prepared = None;
+            self.markdown_highlights.borrow_mut().clear();
+            self.thread_timeline_terminal_item.borrow_mut().clear();
+            self.row_registry.clear_terminals();
+            self.measurement_coordinator.draw = None;
             self.subscribed_workspace = None;
             self.pending_request_views.clear();
             self.task_review_views.clear();
@@ -475,9 +497,14 @@ impl TimelineView {
                 avatar_http: None,
                 member_avatar_state,
                 thread_timeline_view_state: Default::default(),
+                timeline_access_revoked: false,
+                retained_context: None,
+                row_registry: Default::default(),
+                layout_store: Default::default(),
+                measurement_coordinator: Default::default(),
                 running_indicator_views: RefCell::default(),
                 thread_timeline_terminal_item: RefCell::default(),
-                code_highlight_cache: RefCell::default(),
+                markdown_highlights: RefCell::default(),
                 pending_request_views: HashMap::new(),
                 task_review_views: HashMap::new(),
                 message_deletion_view: None,
@@ -500,11 +527,8 @@ impl TimelineView {
                 _theme: cx.observe_global_in::<gpui_kit::component::Theme>(
                     window,
                     |view, window, cx| {
-                        {
-                            let mut state = view.thread_timeline_view_state.borrow_mut();
-                            state.entry_layout_cache.clear();
-                            state.cached_item_sizes = None;
-                        }
+                        view.layout_store.theme_revision += 1;
+                        view.layout_store.context_changed();
                         crate::timeline::controller::DesktopTimelineController::reconcile(
                             view, window, cx,
                         );
@@ -524,7 +548,8 @@ impl TimelineView {
             .filter(|id| !id.is_empty())
             .or_else(|| self.navigation_input.workspace_id().map(str::to_owned));
         use pioneer_client::core::ClientScope;
-        let payload = |scope: ClientScope| self.thread_bindings.publication(&scope);
+        let bindings = self.thread_bindings.clone();
+        let payload = |scope: ClientScope| bindings.publication(&scope);
         self.composer_input = payload(ClientScope::Composer {
             thread_id: self.thread_id.clone(),
         })
@@ -569,6 +594,19 @@ impl TimelineView {
                 .as_ref()
                 .map(|p| p.capabilities.accepted_revision());
         let authorized = identity.as_ref().is_some_and(|p| p.current_auth.is_some());
+        let lost_access = self
+            .identity_input
+            .as_ref()
+            .is_some_and(|p| p.current_auth.is_some())
+            && !authorized;
+        if lost_access || (previous_session.is_some() && previous_session != next_session) {
+            self.retire_timeline_rows();
+            self.timeline_access_revoked = true;
+        }
+        if authorized {
+            self.timeline_access_revoked = false;
+        }
+
         if previous_session != next_session || !authorized {
             self.member_avatar_state.clear();
             self.avatar_http = None;
@@ -711,7 +749,14 @@ mod tests {
         screen.read_with(cx, |view, _| {
             let model = view.semantic_timeline_render_model(Some("a"));
             assert_eq!(
-                model.item_presentations.values().next().unwrap().text,
+                model
+                    .item_presentations
+                    .values()
+                    .next()
+                    .unwrap()
+                    .content()
+                    .unwrap()
+                    .text,
                 "A text"
             );
             assert!(view.thread_bindings.timeline_model(Some("b")).is_none());

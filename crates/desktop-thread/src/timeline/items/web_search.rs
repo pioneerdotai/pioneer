@@ -30,6 +30,7 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (search_query, result_count, results) = match item {
@@ -84,11 +85,7 @@ impl TimelineView {
 
         let running_elapsed_label = format_running_elapsed(item_view);
 
-        let open = self
-            .thread_timeline_view_state
-            .expanded
-            .borrow()
-            .contains(entry.id.as_str());
+        let open = expanded;
 
         let entry_id = entry.id.clone();
         let mut toggle_id_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -116,8 +113,8 @@ impl TimelineView {
                 .border_color(cx.theme().border)
                 .p_1();
 
-            for (index, result) in results.iter().enumerate() {
-                list = list.child(self.web_search_result_row(result, toggle_id, index, cx));
+            for result in &results {
+                list = list.child(self.web_search_result_row(result, toggle_id, cx));
             }
 
             v_flex().w_full().pt_1().child(list).into_any_element()
@@ -223,15 +220,14 @@ impl TimelineView {
         &self,
         result: &WebSearchResultItem,
         toggle_id: u64,
-        index: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let host = host_from_url(result.url.as_str()).unwrap_or_else(|| result.url.clone());
         let favicon_url = self.timeline_favicon_url(None, result.url.as_str());
-        let row_id = toggle_id.wrapping_mul(1_000_003).wrapping_add(index as u64);
+        let row_id = SharedString::from(format!("web-search-result:{toggle_id}:{}", result.url));
 
         div()
-            .id(("web-search-result-link", row_id))
+            .id(row_id)
             .w_full()
             .flex()
             .items_center()

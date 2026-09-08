@@ -1,15 +1,19 @@
 mod avatar_rail;
-mod code_highlighting;
+pub(crate) mod code_highlighting;
 pub(crate) mod controller;
 mod items;
 mod layout;
+pub(crate) mod layout_index;
+pub(crate) mod layout_store;
 mod markdown;
 pub(crate) mod model;
+pub(crate) mod row_registry;
 mod running_indicator;
 mod scroll;
 mod semantic_adapter;
 mod semantic_requests;
 pub(crate) mod state;
+pub(crate) mod terminal_registry;
 mod view;
 
 use self::layout::TIMELINE_CONTENT_MAX_WIDTH;
@@ -23,15 +27,11 @@ use self::model::TimelineRow;
 use self::model::TimelineRowKind;
 pub(crate) use self::running_indicator::RunningIndicatorViewCache;
 pub(crate) use self::scroll::TimelineScrollState;
-use crate::screen::CachedTimelineEntryLayout;
-use crate::screen::TimelinePresentationState;
 use crate::screen::TimelineView;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use pioneer_client::conversation::reducer::ConversationViewState;
 use pioneer_client::conversation::reducer::ItemView;
-use pioneer_client::timeline::diagnostics::DesktopTimelineCacheStatus;
-use pioneer_client::timeline::diagnostics::DesktopTimelineStage;
 use pioneer_client::timeline::rows::UserMessagePresentation;
 use pioneer_client::timeline::types::MemberSummary;
 use pioneer_client::timeline::types::PersistedActorRef;
@@ -40,134 +40,36 @@ use pioneer_client::timeline::types::TurnAuthorSnapshot;
 use pioneer_client::timeline::types::WorkspaceId;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::rc::Rc;
-use std::time::Duration;
-use std::time::Instant;
 
-#[derive(Default)]
-struct TimelineRowMeasurementStats {
-    cache_hits: usize,
-    cache_misses: usize,
-    cache_hit_lookup_elapsed: Duration,
-    cache_miss_lookup_elapsed: Duration,
-    element_build_elapsed: Duration,
-    layout_elapsed: Duration,
-    measured_input_bytes: usize,
-}
-
-impl TimelineRowMeasurementStats {
-    fn record_observability(&self) {
-        self.record_stage(
-            DesktopTimelineStage::RowCacheLookup,
-            DesktopTimelineCacheStatus::Hit,
-            self.cache_hit_lookup_elapsed,
-            self.cache_hits,
-            None,
-        );
-        self.record_stage(
-            DesktopTimelineStage::RowCacheLookup,
-            DesktopTimelineCacheStatus::Miss,
-            self.cache_miss_lookup_elapsed,
-            self.cache_misses,
-            None,
-        );
-        self.record_stage(
-            DesktopTimelineStage::RowElementBuild,
-            DesktopTimelineCacheStatus::Miss,
-            self.element_build_elapsed,
-            self.cache_misses,
-            Some(self.measured_input_bytes),
-        );
-        self.record_stage(
-            DesktopTimelineStage::RowLayout,
-            DesktopTimelineCacheStatus::Miss,
-            self.layout_elapsed,
-            self.cache_misses,
-            Some(self.measured_input_bytes),
-        );
-    }
-
-    fn record_stage(
-        &self,
-        stage: DesktopTimelineStage,
-        cache: DesktopTimelineCacheStatus,
-        elapsed: Duration,
-        row_count: usize,
-        input_bytes: Option<usize>,
-    ) {
-        if row_count == 0 {
-            return;
-        }
-        pioneer_client::timeline::diagnostics::record_desktop_timeline_stage(
-            pioneer_client::timeline::diagnostics::DesktopTimelineStageMetric {
-                stage,
-                cache,
-                content: pioneer_client::timeline::diagnostics::DesktopTimelineContentKind::Mixed,
-                outcome: pioneer_client::timeline::diagnostics::DesktopTimelineOutcome::Ok,
-                elapsed,
-                input_bytes,
-                block_count: None,
-                row_count: Some(row_count),
-            },
-        );
-    }
-}
-
-// A single-use payload for the existing stock size-vector measurement. It is
-// prepared in update, consumed during draw, and committed in a deferred update.
+// Prepared in update, measured during stock draw, committed by the layout store.
 pub(super) struct TimelineLayoutMeasurement {
-    entries: Vec<(String, u64, Result<Size<Pixels>, AnyElement>)>,
+    entries: Vec<(layout_store::RowMeasurementKey, AnyElement)>,
     row_width: Pixels,
-    stats: TimelineRowMeasurementStats,
 }
-
 impl TimelineLayoutMeasurement {
     fn measure(
-        mut self,
+        self,
         window: &mut Window,
         cx: &mut App,
-    ) -> (
-        Rc<Vec<Size<Pixels>>>,
-        HashMap<String, CachedTimelineEntryLayout>,
-    ) {
-        let mut cache = HashMap::new();
-        let sizes = self
-            .entries
+    ) -> Vec<(layout_store::RowMeasurementKey, Pixels)> {
+        self.entries
             .into_iter()
-            .map(|(key, fingerprint, input)| {
-                let measured = match input {
-                    Ok(size) => size,
-                    Err(mut element) => {
-                        let started = Instant::now();
-                        let measured = element.layout_as_root(
-                            size(
-                                AvailableSpace::Definite(self.row_width),
-                                AvailableSpace::MaxContent,
-                            ),
-                            window,
-                            cx,
-                        );
-                        self.stats.layout_elapsed += started.elapsed();
-                        size(
-                            px(0.),
-                            (measured.height + TIMELINE_ROW_MEASUREMENT_GUARD).max(px(1.)),
-                        )
-                    }
-                };
-                cache.insert(
-                    key,
-                    CachedTimelineEntryLayout {
-                        render_fingerprint: fingerprint,
-                        height: measured.height,
-                    },
+            .map(|(key, mut element)| {
+                let measured = element.layout_as_root(
+                    size(
+                        AvailableSpace::Definite(self.row_width),
+                        AvailableSpace::MaxContent,
+                    ),
+                    window,
+                    cx,
                 );
-                measured
+                (
+                    key,
+                    (measured.height + TIMELINE_ROW_MEASUREMENT_GUARD).max(px(1.)),
+                )
             })
-            .collect();
-        self.stats.record_observability();
-        (Rc::new(sizes), cache)
+            .collect()
     }
 }
 
@@ -279,14 +181,18 @@ fn user_message_uses_current_principal_alignment(
 }
 
 pub(super) type TimelineItemPresentations =
-    HashMap<String, pioneer_client::timeline::item_presentation::TimelineItemPresentation>;
+    HashMap<String, std::sync::Arc<pioneer_client::timeline::presentation::TimelineRowSnapshot>>;
 
 #[derive(Clone)]
 pub(crate) struct TimelineRenderModel {
+    pub snapshot: Option<std::sync::Arc<pioneer_client::timeline::presentation::TimelineSnapshot>>,
     pub revision: u64,
     pub source_revision: u64,
     pub(crate) item_presentations: std::sync::Arc<
-        HashMap<String, pioneer_client::timeline::item_presentation::TimelineItemPresentation>,
+        HashMap<
+            String,
+            std::sync::Arc<pioneer_client::timeline::presentation::TimelineRowSnapshot>,
+        >,
     >,
     pub groups: std::sync::Arc<Vec<pioneer_client::timeline::presentation::TimelineGroup>>,
     pub projection: std::sync::Arc<ConversationViewState>,
@@ -297,6 +203,7 @@ pub(crate) struct TimelineRenderModel {
 impl TimelineRenderModel {
     pub(crate) fn empty() -> Self {
         Self {
+            snapshot: None,
             revision: 0,
             source_revision: 0,
             item_presentations: Default::default(),
@@ -354,7 +261,7 @@ impl TimelineView {
         }
 
         let mut state = self.thread_timeline_view_state.borrow_mut();
-        if (state.measured_list_width - measured_width).abs() <= px(1.) {
+        if state.measured_list_width == measured_width {
             return false;
         }
 
@@ -365,42 +272,12 @@ impl TimelineView {
         let next_content_width = measured_width.max(px(1.)).min(TIMELINE_CONTENT_MAX_WIDTH);
         state.measured_list_width = measured_width;
 
-        let content_width_changed = (previous_content_width - next_content_width).abs() > px(1.);
-        if content_width_changed {
-            state.entry_layout_cache.clear();
-            state.cached_item_sizes = None;
-            state.cached_timeline_layout_index = None;
-        }
+        let content_width_changed = previous_content_width != next_content_width;
         content_width_changed
     }
 
     fn timeline_entry_text(item_view: &ItemView) -> &str {
         pioneer_client::timeline::labels::timeline_entry_text(item_view)
-    }
-
-    fn timeline_row_render_fingerprint(
-        &self,
-        projection: &ConversationViewState,
-        row: &TimelineRenderRow,
-        row_revisions: &HashMap<String, u64>,
-        expanded: &HashSet<String>,
-    ) -> u64 {
-        match row {
-            TimelineRenderRow::Timeline(row) => {
-                model::timeline_row_render_fingerprint_from_content(
-                    row_revisions
-                        .get(row.key.as_str())
-                        .copied()
-                        .expect("published timeline row revision"),
-                    projection,
-                    row,
-                    expanded,
-                )
-            }
-            TimelineRenderRow::PendingRequest(row) => *row_revisions
-                .get(&row.key)
-                .expect("published pending row revision"),
-        }
     }
 
     fn timeline_content_width(&self, window: &Window) -> Pixels {
@@ -437,68 +314,65 @@ impl TimelineView {
 
     fn prepare_timeline_item_sizes(
         &self,
-        state: &TimelinePresentationState,
-        projection: &ConversationViewState,
-        item_presentations: &TimelineItemPresentations,
-        rows: &[TimelineRenderRow],
+        model: &TimelineRenderModel,
         grouping: &TimelineGrouping,
         row_width: Pixels,
         content_width: Pixels,
-        row_revisions: &HashMap<String, u64>,
-        expanded: &HashSet<String>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> TimelineLayoutMeasurement {
-        let mut stats = TimelineRowMeasurementStats::default();
-        let entries = rows
-            .iter()
-            .enumerate()
-            .map(|(ix, row)| {
-                let started = Instant::now();
-                let is_last_row = ix + 1 == rows.len();
-                let row_layout = grouping.row_layout(ix);
+        let mut entries = Vec::new();
+        let expanded = self.thread_timeline_view_state.expanded.borrow();
+        let principal = self
+            .identity_input
+            .as_ref()
+            .and_then(|input| input.current_auth.as_ref())
+            .map(|auth| auth.principal.id.to_string());
+        if let Some(snapshot) = &model.snapshot {
+            for (ix, row) in snapshot.rows().iter().enumerate() {
+                let layout = grouping.row_layout(ix);
                 let author = grouping.agent_author_for_group_start(ix);
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                self.timeline_row_render_fingerprint(projection, row, row_revisions, expanded)
-                    .hash(&mut hasher);
-                is_last_row.hash(&mut hasher);
-                row_layout.hash(&mut hasher);
-                if row_layout.starts_avatar_group {
-                    timeline_agent_label(author).hash(&mut hasher);
-                }
-                let fingerprint = hasher.finish();
-                let measured = if let Some(cached) = state.entry_layout_cache.get(row.key())
-                    && cached.render_fingerprint == fingerprint
-                {
-                    stats.cache_hits += 1;
-                    stats.cache_hit_lookup_elapsed += started.elapsed();
-                    Ok(size(px(0.), cached.height.max(px(1.))))
-                } else {
-                    stats.cache_misses += 1;
-                    stats.cache_miss_lookup_elapsed += started.elapsed();
-                    let started = Instant::now();
-                    let element = self.render_timeline_row(
-                        projection,
-                        item_presentations,
-                        row,
-                        is_last_row,
-                        row_layout,
-                        author,
-                        content_width,
-                        cx,
-                    );
-                    stats.element_build_elapsed += started.elapsed();
-                    stats.measured_input_bytes +=
-                        Self::timeline_render_row_text_len(projection, row);
-                    Err(element)
+                let key = layout_store::RowMeasurementKey {
+                    id: row.id().clone(),
+                    layout_revision: row.revision(),
+                    content_revision: row.content_revision(),
+                    presentation_revision: row.metadata_revision(),
+                    content_width,
+                    rem: window.rem_size(),
+                    text_style: self.thread_timeline_view_state.layout_text_style.clone(),
+                    theme_revision: self.layout_store.theme_revision,
+                    locale: rust_i18n::locale().to_string(),
+                    expanded: expanded.contains(row.id().as_str()),
+                    grouping: layout,
+                    last: ix + 1 == snapshot.rows().len(),
+                    author_label: layout
+                        .starts_avatar_group
+                        .then(|| timeline_agent_label(author))
+                        .flatten(),
+                    principal: principal.clone(),
+                    task_child: self.active_task_thread_navigation().is_some(),
                 };
-                (row.key().to_owned(), fingerprint, measured)
-            })
-            .collect();
-        TimelineLayoutMeasurement {
-            entries,
-            row_width,
-            stats,
+                if self.layout_store.height(&key).is_none() {
+                    let slot = self
+                        .row_registry
+                        .get(row.id())
+                        .expect("live published row slot");
+                    entries.push((
+                        key,
+                        slot.render(
+                            self,
+                            ix + 1 == snapshot.rows().len(),
+                            layout,
+                            author,
+                            content_width,
+                            expanded.contains(row.id().as_str()),
+                            cx,
+                        ),
+                    ));
+                }
+            }
         }
+        TimelineLayoutMeasurement { entries, row_width }
     }
 
     fn timeline_render_row_text_len(

@@ -1,32 +1,129 @@
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
-
-use gpui_kit::component::theme::ActiveTheme as _;
-use gpui_kit::prelude::*;
-use gpui_kit::*;
-use pioneer_client::timeline::diagnostics::DesktopCodeHighlightCacheStatus;
-use pioneer_client::timeline::diagnostics::DesktopCodeHighlightFallbackReason;
-use pioneer_client::timeline::diagnostics::DesktopCodeHighlightMetric;
-use pioneer_client::timeline::diagnostics::DesktopCodeHighlightOutcome;
-use pioneer_client::timeline::diagnostics::DesktopCodeHighlightTheme;
-use pioneer_client::timeline::diagnostics::record_desktop_code_highlight;
-
-use crate::code_highlight::CodeHighlightJob;
-use crate::code_highlight::CodeHighlightLookup;
-use crate::code_highlight::CodeThemeId;
-use crate::code_highlight::HighlightFallbackReason;
-use crate::code_highlight::HighlightLimits;
-use crate::code_highlight::HighlightOutcome;
-use crate::code_highlight::Rgba8;
-use crate::code_highlight::highlight_code;
+//! One syntax result and cancellable foreground generation per live code block.
+use crate::code_highlight::{
+    CodeThemeId, HighlightLimits, HighlightOutcome, HighlightedCode, highlight_code,
+};
 use crate::screen::TimelineView;
+use gpui_kit::component::ActiveTheme;
+use gpui_kit::{prelude::*, *};
+use std::sync::Arc;
 
+#[derive(Clone, PartialEq)]
+struct HighlightInput {
+    revision: u64,
+    theme_revision: u64,
+    typography: TextStyle,
+    engine: u16,
+    theme: CodeThemeId,
+    source: String,
+    language: Option<String>,
+}
+pub(crate) struct LiveHighlight {
+    input: HighlightInput,
+    pub view: Entity<MarkdownHighlightController>,
+}
+pub(crate) struct MarkdownHighlightController {
+    input: HighlightInput,
+    generation: u64,
+    completed_generation: Option<u64>,
+    result: Option<HighlightedCode>,
+    task: Option<Task<()>>,
+}
+impl MarkdownHighlightController {
+    fn new(input: HighlightInput, cx: &mut Context<Self>) -> Self {
+        let mut owner = Self {
+            input,
+            generation: 0,
+            completed_generation: None,
+            result: None,
+            task: None,
+        };
+        owner.start(cx);
+        owner
+    }
+    fn synchronize(&mut self, input: HighlightInput, cx: &mut Context<Self>) {
+        if self.input == input {
+            return;
+        }
+        self.task.take();
+        self.input = input;
+        self.result = None;
+        self.start(cx);
+        cx.notify();
+    }
+    fn finish(&mut self, generation: u64, code: Option<HighlightedCode>) -> bool {
+        if self.generation != generation || self.completed_generation == Some(generation) {
+            return false;
+        }
+        self.completed_generation = Some(generation);
+        self.task = None;
+        let changed = code.is_some();
+        self.result = code;
+        changed
+    }
+    fn start(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.completed_generation = None;
+        let generation = self.generation;
+        let input = self.input.clone();
+        self.task = Some(cx.spawn(async move |weak, cx| {
+            // Failure is a terminal plain-text result for this input revision.
+            let result = cx
+                .background_spawn(async move {
+                    highlight_code(
+                        &input.source,
+                        input.language.as_deref(),
+                        input.theme,
+                        HighlightLimits::DESKTOP,
+                    )
+                })
+                .await;
+            let _ = weak.update(cx, |owner, cx| {
+                let code = match result {
+                    Ok(HighlightOutcome::Highlighted(code)) => Some(code),
+                    _ => None,
+                };
+                if owner.finish(generation, code) {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+}
+impl Render for MarkdownHighlightController {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let text = StyledText::new(SharedString::new(Arc::<str>::from(
+            self.input.source.as_str(),
+        )));
+        if let Some(code) = &self.result {
+            text.with_highlights(code.spans.iter().map(|span| {
+                (
+                    span.byte_range.clone(),
+                    HighlightStyle {
+                        color: Some(
+                            rgba(u32::from_be_bytes([
+                                span.foreground.red,
+                                span.foreground.green,
+                                span.foreground.blue,
+                                span.foreground.alpha,
+                            ]))
+                            .into(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+            }))
+        } else {
+            text
+        }
+    }
+}
 impl TimelineView {
     pub(super) fn prepare_code_highlight(
         &self,
+        id: u64,
+        revision: u64,
         source: &str,
-        language_hint: Option<&str>,
+        language: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let theme = if cx.theme().mode.is_dark() {
@@ -34,257 +131,84 @@ impl TimelineView {
         } else {
             CodeThemeId::Light
         };
-        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
-            pioneer_client::timeline::diagnostics::TimelineStage::MarkdownHighlightPlan,
-            pioneer_client::timeline::diagnostics::DiagnosticAction::Requested,
-            1,
-        ));
-        let request = self.code_highlight_cache.borrow_mut().request(
-            source,
-            language_hint,
+        let input = HighlightInput {
+            revision,
+            theme_revision: self.layout_store.theme_revision,
+            typography: self.thread_timeline_view_state.layout_text_style.clone(),
+            engine: crate::code_highlight::HIGHLIGHT_ENGINE_REVISION,
             theme,
-            HighlightLimits::DESKTOP,
-        );
-        if request.observe_immediate_fallback {
-            let (outcome, fallback_reason) = match &request.lookup {
-                CodeHighlightLookup::Fallback(reason) => (
-                    DesktopCodeHighlightOutcome::Fallback,
-                    fallback_reason(*reason),
-                ),
-                CodeHighlightLookup::Unavailable => (
-                    DesktopCodeHighlightOutcome::Fallback,
-                    DesktopCodeHighlightFallbackReason::CacheCapacity,
-                ),
-                _ => (
-                    DesktopCodeHighlightOutcome::Error,
-                    DesktopCodeHighlightFallbackReason::UnexpectedState,
-                ),
-            };
-            observe_code_highlight(
-                source.len(),
-                theme,
-                DesktopCodeHighlightCacheStatus::Miss,
-                outcome,
-                fallback_reason,
-                0,
-                None,
-            );
-        }
-        if request.observe_cache_hit {
-            let (outcome, fallback_reason, span_count) = match &request.lookup {
-                CodeHighlightLookup::Ready(code) => (
-                    DesktopCodeHighlightOutcome::Highlighted,
-                    DesktopCodeHighlightFallbackReason::None,
-                    code.spans.len(),
-                ),
-                CodeHighlightLookup::Fallback(reason) => (
-                    DesktopCodeHighlightOutcome::Fallback,
-                    fallback_reason(*reason),
-                    0,
-                ),
-                _ => (
-                    DesktopCodeHighlightOutcome::Error,
-                    DesktopCodeHighlightFallbackReason::UnexpectedState,
-                    0,
-                ),
-            };
-            observe_code_highlight(
-                source.len(),
-                theme,
-                DesktopCodeHighlightCacheStatus::Hit,
-                outcome,
-                fallback_reason,
-                span_count,
-                None,
-            );
-        }
-        for job in request.jobs {
-            Self::spawn_code_highlight_job(job, cx);
-        }
-    }
-    pub(super) fn render_code_highlighted_text(
-        &self,
-        source: &str,
-        language_hint: Option<&str>,
-        cx: &mut Context<Self>,
-    ) -> StyledText {
-        let theme = if cx.theme().mode.is_dark() {
-            CodeThemeId::Dark
-        } else {
-            CodeThemeId::Light
+            source: source.into(),
+            language: language.map(str::to_owned),
         };
-        let lookup = self
-            .code_highlight_cache
-            .borrow()
-            .lookup(source, language_hint, theme);
-        let text = SharedString::new(Arc::<str>::from(source));
-        let CodeHighlightLookup::Ready(code) = lookup else {
-            return StyledText::new(text);
-        };
-        let highlights = code.spans.iter().map(|span| {
-            (
-                span.byte_range.clone(),
-                HighlightStyle {
-                    color: Some(gpui_color(span.foreground)),
-                    ..Default::default()
-                },
-            )
-        });
-        StyledText::new(text).with_highlights(highlights)
-    }
-
-    fn spawn_code_highlight_job(job: CodeHighlightJob, cx: &mut Context<Self>) {
-        let completion_key = job.key.clone();
-        let completion_generation = job.generation;
-        let source_bytes = job.source.len();
-        let theme = job.theme;
-        let started = Instant::now();
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        highlight_code(
-                            job.source.as_ref(),
-                            job.language_hint.as_deref(),
-                            job.theme,
-                            job.limits,
-                        )
-                    })
-                    .await;
-                let _ = this.update(&mut cx, |view, cx| {
-                    let elapsed = started.elapsed();
-                    let (mut outcome, mut fallback_reason, span_count) =
-                        result_observation(&result);
-                    let completion = view.code_highlight_cache.borrow_mut().complete(
-                        &completion_key,
-                        completion_generation,
-                        result,
-                    );
-                    pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
-                        pioneer_client::timeline::diagnostics::TimelineStage::MarkdownHighlightResultApply,
-                        if completion.accepted {
-                            pioneer_client::timeline::diagnostics::DiagnosticAction::Applied
-                        } else {
-                            pioneer_client::timeline::diagnostics::DiagnosticAction::StaleDiscard
-                        },
-                        1,
-                    ));
-                    if !completion.accepted {
-                        outcome = DesktopCodeHighlightOutcome::Stale;
-                        fallback_reason = DesktopCodeHighlightFallbackReason::None;
-                    }
-                    observe_code_highlight(
-                        source_bytes,
-                        theme,
-                        DesktopCodeHighlightCacheStatus::Miss,
-                        outcome,
-                        fallback_reason,
-                        span_count,
-                        Some(elapsed),
-                    );
-                    for queued_job in completion.jobs {
-                        Self::spawn_code_highlight_job(queued_job, cx);
-                    }
-                    if completion.visible_output_changed {
-                        cx.notify();
-                    }
-                });
+        let mut live = self.markdown_highlights.borrow_mut();
+        if let Some(existing) = live.get_mut(&id) {
+            if existing.input == input {
+                return;
             }
-        })
-        .detach();
-    }
-}
-
-fn result_observation(
-    result: &Result<HighlightOutcome, crate::code_highlight::HighlightError>,
-) -> (
-    DesktopCodeHighlightOutcome,
-    DesktopCodeHighlightFallbackReason,
-    usize,
-) {
-    match result {
-        Ok(HighlightOutcome::Highlighted(code)) => (
-            DesktopCodeHighlightOutcome::Highlighted,
-            DesktopCodeHighlightFallbackReason::None,
-            code.spans.len(),
-        ),
-        Ok(HighlightOutcome::Fallback(reason)) => (
-            DesktopCodeHighlightOutcome::Fallback,
-            fallback_reason(*reason),
-            0,
-        ),
-        Err(_) => (
-            DesktopCodeHighlightOutcome::Error,
-            DesktopCodeHighlightFallbackReason::ParserError,
-            0,
-        ),
-    }
-}
-
-fn fallback_reason(reason: HighlightFallbackReason) -> DesktopCodeHighlightFallbackReason {
-    match reason {
-        HighlightFallbackReason::Empty => DesktopCodeHighlightFallbackReason::Empty,
-        HighlightFallbackReason::Plaintext => DesktopCodeHighlightFallbackReason::Plaintext,
-        HighlightFallbackReason::UnknownLanguage => {
-            DesktopCodeHighlightFallbackReason::UnknownLanguage
+            existing
+                .view
+                .update(cx, |owner, cx| owner.synchronize(input.clone(), cx));
+            existing.input = input;
+        } else {
+            let view = cx.new(|cx| MarkdownHighlightController::new(input.clone(), cx));
+            live.insert(id, LiveHighlight { input, view });
         }
-        HighlightFallbackReason::SourceTooLarge => {
-            DesktopCodeHighlightFallbackReason::SourceTooLarge
-        }
-        HighlightFallbackReason::SpanLimit => DesktopCodeHighlightFallbackReason::SpanLimit,
-        HighlightFallbackReason::ParserError => DesktopCodeHighlightFallbackReason::ParserError,
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn observe_code_highlight(
-    source_bytes: usize,
-    theme: CodeThemeId,
-    cache: DesktopCodeHighlightCacheStatus,
-    outcome: DesktopCodeHighlightOutcome,
-    fallback_reason: DesktopCodeHighlightFallbackReason,
-    span_count: usize,
-    elapsed: Option<Duration>,
-) {
-    record_desktop_code_highlight(DesktopCodeHighlightMetric {
-        cache,
-        outcome,
-        fallback_reason,
-        theme: match theme {
-            CodeThemeId::Light => DesktopCodeHighlightTheme::Light,
-            CodeThemeId::Dark => DesktopCodeHighlightTheme::Dark,
-        },
-        source_bytes,
-        span_count,
-        elapsed,
-    });
-}
-
-fn gpui_color(color: Rgba8) -> Hsla {
-    rgba(u32::from_be_bytes([
-        color.red,
-        color.green,
-        color.blue,
-        color.alpha,
-    ]))
-    .into()
+    pub(super) fn render_code_highlighted_text(&self, id: u64, source: &str) -> AnyElement {
+        if let Some(owner) = self.markdown_highlights.borrow().get(&id) {
+            owner.view.clone().into_any_element()
+        } else {
+            StyledText::new(SharedString::new(Arc::<str>::from(source))).into_any_element()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::gpui_color;
-    use crate::code_highlight::Rgba8;
-
-    #[test]
-    fn rgba_conversion_keeps_all_channels() {
-        let color = gpui_color(Rgba8 {
-            red: 0x12,
-            green: 0x34,
-            blue: 0x56,
-            alpha: 0x78,
+    use super::{CodeThemeId, HighlightInput, MarkdownHighlightController};
+    use gpui_kit::{AppContext, TestAppContext, TextStyle};
+    fn input(source: &str) -> HighlightInput {
+        HighlightInput {
+            revision: 1,
+            theme_revision: 1,
+            typography: TextStyle::default(),
+            engine: crate::code_highlight::HIGHLIGHT_ENGINE_REVISION,
+            theme: CodeThemeId::Dark,
+            source: source.into(),
+            language: Some("rust".into()),
+        }
+    }
+    #[gpui_kit::test]
+    fn generations_are_scoped_equal_inputs_quiet_and_drop_releases_owner(cx: &mut TestAppContext) {
+        let a = cx.new(|cx| MarkdownHighlightController::new(input("let a = 1;"), cx));
+        let b = cx.new(|cx| MarkdownHighlightController::new(input("let a = 1;"), cx));
+        assert_ne!(a.entity_id(), b.entity_id());
+        a.update(cx, |owner, cx| {
+            owner.synchronize(input("let a = 1;"), cx);
+            assert_eq!(owner.generation, 1);
+            let mut next = owner.input.clone();
+            next.theme_revision += 1;
+            owner.synchronize(next, cx);
+            assert_eq!(owner.generation, 2);
+            assert!(!owner.finish(1, None));
+            owner.task.take();
+            assert!(!owner.finish(2, None));
+            assert_eq!(owner.completed_generation, Some(2));
+            assert!(!owner.finish(2, None)); // bounded failure: no repeated task for equal revision
+            owner.synchronize(owner.input.clone(), cx);
+            assert!(owner.task.is_none());
         });
-        let expected: gpui_kit::Hsla = gpui_kit::rgba(0x12345678).into();
-        assert_eq!(color, expected);
+        b.read_with(cx, |owner, _| assert_eq!(owner.generation, 1));
+        let weak = a.downgrade();
+        drop(a);
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none());
+        cx.run_until_parked();
+        b.update(cx, |owner, _| {
+            assert_eq!(owner.completed_generation, Some(1));
+            assert!(owner.result.is_some());
+            assert!(!owner.finish(1, None));
+        });
     }
 }

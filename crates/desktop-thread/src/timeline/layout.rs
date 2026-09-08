@@ -208,36 +208,37 @@ impl TimelineGrouping {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct TimelineLayoutIndex {
     grouping: Rc<TimelineGrouping>,
-    item_sizes: Rc<Vec<Size<Pixels>>>,
-    item_origins: Vec<Pixels>,
+    index: Rc<std::cell::RefCell<super::layout_index::RowLayoutIndex>>,
 }
 
 impl TimelineLayoutIndex {
-    /// Mirrors the timeline's `v_virtual_list` contract: the list receives these exact
-    /// item sizes and is explicitly rendered without padding or inter-item gap.
+    pub(crate) fn from_store(
+        grouping: Rc<TimelineGrouping>,
+        index: Rc<std::cell::RefCell<super::layout_index::RowLayoutIndex>>,
+    ) -> Rc<Self> {
+        Rc::new(Self { grouping, index })
+    }
+    pub(crate) fn visible_range(&self, offset: Pixels, height: Pixels) -> std::ops::Range<usize> {
+        super::layout_index::visible_range(&self.index.borrow(), offset, height)
+    }
+    #[cfg(test)]
     pub(crate) fn new(
         grouping: Rc<TimelineGrouping>,
         item_sizes: Rc<Vec<Size<Pixels>>>,
     ) -> Rc<Self> {
-        let item_origins = item_sizes
-            .iter()
-            .scan(px(0.), |top, item_size| {
-                let origin = *top;
-                *top += item_size.height;
-                Some(origin)
-            })
-            .collect();
-
-        Rc::new(Self {
-            grouping,
-            item_sizes,
-            item_origins,
-        })
+        let mut index = super::layout_index::RowLayoutIndex::default();
+        for (ix, size) in item_sizes.iter().enumerate() {
+            index.insert(
+                ix,
+                serde_json::from_value(serde_json::json!(format!("fixture:{ix}"))).unwrap(),
+                size.height,
+            );
+        }
+        Self::from_store(grouping, Rc::new(std::cell::RefCell::new(index)))
     }
-
     pub(crate) fn grouping(&self) -> &TimelineGrouping {
         self.grouping.as_ref()
     }
@@ -250,16 +251,16 @@ impl TimelineLayoutIndex {
         &self,
         group: &TimelineAvatarGroup,
     ) -> Option<(Pixels, Pixels)> {
-        let first_origin = *self.item_origins.get(group.first_row_index)?;
-        let last_origin = *self.item_origins.get(group.last_row_index)?;
-        let last_size = self.item_sizes.get(group.last_row_index)?;
+        let index = self.index.borrow();
+        let first_origin = index.origin(group.first_row_index)?;
+        let last_end = index.end(group.last_row_index)?;
         let anchor = first_origin
             + self
                 .grouping
                 .row_layout(group.first_row_index)
                 .top_spacing
                 .pixels();
-        Some((anchor, last_origin + last_size.height - group.bottom_inset))
+        Some((anchor, last_end - group.bottom_inset))
     }
 }
 

@@ -253,12 +253,15 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
+        expanded: bool,
+        terminal: Option<Entity<terminal::TerminalView>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match item {
             TurnItem::UserMessage { .. } => self.render_item_user_message(
                 entry,
                 item_view,
+                content,
                 item,
                 None,
                 None,
@@ -275,15 +278,18 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
             TurnItem::Reasoning { .. } => self.render_item_reasoning(
                 entry,
                 item_view,
+                content,
                 item,
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
             TurnItem::SystemEvent { .. } => self.render_item_system_event(
@@ -310,6 +316,8 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
+                terminal,
                 cx,
             ),
             TurnItem::FileChange { .. } => self.render_item_file_change(
@@ -320,6 +328,7 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
             TurnItem::WebSearch { .. } => self.render_item_web_search(
@@ -329,6 +338,7 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
             TurnItem::WebFetch { .. } => self.render_item_web_fetch(
@@ -338,6 +348,7 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
             TurnItem::Download { .. } => self.render_item_download(
@@ -347,6 +358,7 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
             TurnItem::DynamicToolCall { .. } => self.render_item_dynamic_tool_call(
@@ -356,6 +368,7 @@ impl TimelineView {
                 top_spacing,
                 is_last_row,
                 content_width,
+                expanded,
                 cx,
             ),
         }

@@ -393,6 +393,195 @@ mod tests {
         }
     }
     #[gpui_kit::test]
+    fn command_publications_publish_row_owned_terminal_through_completion_and_retirement(
+        cx: &mut TestAppContext,
+    ) {
+        use pioneer_client::timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode};
+        // The public TerminalView seam reads this synthetic stream on an OS thread.
+        cx.background_executor.allow_parking();
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "message");
+        let work = serde_json::json!({
+            "turnId":"turn", "presentation":"expanded_terminal_no_final", "state":"completed",
+            "workCount":1,"visibleWorkCount":1,"hiddenWorkCount":0,
+            "hasMoreBefore":false,"hasMoreAfter":false
+        });
+        client.apply_thread_timeline_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":1,
+                "blocks":[{"workspaceId":"workspace","threadId":"a","blockId":"work-block",
+                    "turnId":"turn","sortKey":"1","kind":{"kind":"turn_work","work":work}}],
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            TopLevelPageMergeMode::Reset,
+        );
+        let publish = |revision: i64, output: &str, active: bool| {
+            client.apply_turn_work_page(serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","turnId":"turn","projectionVersion":1,
+                "sourceHighWatermark":revision,"projectionUpdatedAtUnixMicros":revision,"work":work,
+                "items":[{"workItemId":"work-id","itemId":"command-id","turnId":"turn","orderKey":"1",
+                    "sourceSequence":revision,"sourceUpdatedAtUnixMicros":revision,
+                    "itemType":"command_execution","status":if active {"running"} else {"completed"},
+                    "item":{"type":"commandExecution","id":"command-id","toolName":"exec_command",
+                        "arguments":{},"status":if active {"in_progress"} else {"completed"},"command":["synthetic"],
+                        "outputPolicy":{"llm":{"mode":"summary_only"},"llmRetention":{"mode":"do_not_retain"},
+                            "timeline":{"mode":"full","max_bytes":24000},"storage":{"mode":"none"},
+                            "recovery":{"mode":"none"},"deltas":{"mode":"disabled"}},
+                        "display":{"kind":"shell","stdout":output,"truncated":false},"storage":{"kind":"none"}}
+                }],"page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            })).unwrap(), WorkPageMergeMode::Reset);
+            // Flush the copied publication without starting a Client worker.
+            let _flush = client.subscribe(
+                pioneer_client::core::ClientScope::Timeline {
+                    thread_id: "a".into(),
+                },
+                std::num::NonZeroUsize::new(8).unwrap(),
+            );
+        };
+        publish(1, "streaming", true);
+        client.set_thread_turn_work_expanded("a", "turn", true);
+        cx.update(gpui_kit::init);
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let thread = ThreadView::new(
+                ThreadViewConfig::new(
+                    client.clone(),
+                    "a".into(),
+                    registrar,
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                ),
+                window,
+                cx,
+            );
+            Root::new(thread, window, cx)
+        });
+        deliver();
+        cx.run_until_parked();
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |thread, _| thread.screen.clone());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let row_terminal = |cx: &gpui_kit::VisualTestContext| {
+            timeline.read_with(cx, |view, _| {
+                let slot = view
+                    .thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .slots
+                    .iter()
+                    .find(|slot| slot.snapshot().id().as_str() == "work-id")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "semantic command row missing: {:?}",
+                            view.thread_timeline_view_state
+                                .prepared
+                                .as_ref()
+                                .unwrap()
+                                .model
+                                .rows
+                        )
+                    });
+                let terminal = slot.terminal.as_ref().expect("prepared terminal child");
+                let registered = view.row_registry.get(slot.snapshot().id()).unwrap();
+                if Arc::ptr_eq(registered.snapshot(), slot.snapshot()) {
+                    assert_eq!(
+                        registered.terminal.as_ref().unwrap().view.entity_id(),
+                        terminal.view.entity_id()
+                    );
+                }
+                terminal.view.clone()
+            })
+        };
+        let active = row_terminal(cx);
+        timeline.read_with(cx, |view, _| {
+            assert!(
+                view.thread_timeline_terminal_item
+                    .borrow()
+                    .entries
+                    .contains_key("work-id")
+            )
+        });
+        publish(2, "final", false);
+        deliver();
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                crate::timeline::controller::DesktopTimelineController::reconcile_publication(
+                    view, window, cx,
+                );
+                assert!(view.measurement_coordinator.draw.is_some());
+                let slot = view
+                    .thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .slots
+                    .iter()
+                    .find(|slot| slot.snapshot().id().as_str() == "work-id")
+                    .unwrap();
+                assert_eq!(
+                    slot.terminal.as_ref().unwrap().view.entity_id(),
+                    active.entity_id()
+                );
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let completed = row_terminal(cx);
+        assert_eq!(completed.entity_id(), active.entity_id());
+        timeline.read_with(cx, |view, _| {
+            assert!(
+                view.thread_timeline_terminal_item
+                    .borrow()
+                    .entries
+                    .is_empty()
+            )
+        });
+        publish(3, "late final", false);
+        deliver();
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                crate::timeline::controller::DesktopTimelineController::reconcile_publication(
+                    view, window, cx,
+                );
+                assert!(view.measurement_coordinator.draw.is_some());
+                let slot = view
+                    .thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .slots
+                    .iter()
+                    .find(|slot| slot.snapshot().id().as_str() == "work-id")
+                    .unwrap();
+                assert_eq!(
+                    slot.terminal.as_ref().unwrap().view.entity_id(),
+                    completed.entity_id()
+                );
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let replaced = row_terminal(cx);
+        assert_ne!(replaced.entity_id(), completed.entity_id());
+        publish(4, "late final", false);
+        deliver();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert_eq!(row_terminal(cx).entity_id(), replaced.entity_id());
+        let weak = replaced.downgrade();
+        drop(replaced);
+        timeline.update(cx, |view, _| view.retire_timeline_rows());
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none());
+    }
+    #[gpui_kit::test]
     fn timeline_reconciles_publications_before_composition_and_equal_input_is_quiet(
         cx: &mut TestAppContext,
     ) {
@@ -482,10 +671,12 @@ mod tests {
             timeline.update(cx, |view, cx| {
                 {
                     let mut state = view.thread_timeline_view_state.borrow_mut();
-                    state.cached_item_sizes = None;
+
                     // A follow request from the preceding content publication.
                     state.pending_follow_bottom = true;
                 }
+                view.layout_store.theme_revision += 1;
+                view.layout_store.context_changed();
                 view.reconcile_timeline(window, cx);
                 cx.notify();
             });
@@ -505,7 +696,7 @@ mod tests {
                     .unwrap()
                     .item_sizes
             ));
-            assert!(view.thread_timeline_view_state.measurement.is_some());
+            assert!(view.measurement_coordinator.draw.is_some());
             assert!(
                 view.thread_timeline_view_state
                     .borrow()
@@ -532,7 +723,7 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.run_until_parked();
         timeline.read_with(cx, |view, _| {
-            assert!(view.thread_timeline_view_state.measurement.is_none());
+            assert!(view.measurement_coordinator.draw.is_none());
             let current = &view
                 .thread_timeline_view_state
                 .prepared
@@ -541,6 +732,83 @@ mod tests {
                 .item_sizes;
             assert!(!Rc::ptr_eq(&previous_sizes, current));
             assert_eq!(previous_sizes.as_ref(), current.as_ref());
+        });
+
+        // Transient expansion must not paint with the preceding collapsed layout.
+        let row_id = timeline.read_with(cx, |view, _| {
+            view.thread_timeline_view_state
+                .prepared
+                .as_ref()
+                .unwrap()
+                .slots[0]
+                .snapshot()
+                .id()
+                .as_str()
+                .to_owned()
+        });
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                assert!(
+                    !view
+                        .thread_timeline_view_state
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .expanded
+                        .contains(&row_id)
+                );
+                crate::timeline::controller::DesktopTimelineController::expand(
+                    view, &row_id, window, cx,
+                );
+                assert!(view.measurement_coordinator.draw.is_some());
+                assert!(
+                    !view
+                        .thread_timeline_view_state
+                        .prepared
+                        .as_ref()
+                        .unwrap()
+                        .expanded
+                        .contains(&row_id)
+                );
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        timeline.read_with(cx, |view, _| {
+            assert!(view.measurement_coordinator.draw.is_none());
+            assert!(
+                view.thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .expanded
+                    .contains(&row_id)
+            );
+        });
+
+        // Revocation between draw and deferred commit retires the complete row closure.
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                crate::timeline::controller::DesktopTimelineController::expand(
+                    view, &row_id, window, cx,
+                )
+            });
+            window.draw(cx).clear(cx);
+            timeline.update(cx, |view, _| view.retire_timeline_rows());
+        });
+        cx.run_until_parked();
+        timeline.read_with(cx, |view, _| {
+            assert!(view.thread_timeline_view_state.prepared.is_none());
+            assert!(view.row_registry.slots().is_empty());
+            assert_eq!(view.layout_store.index.borrow().len(), 0);
+            assert!(view.markdown_highlights.borrow().is_empty());
+            assert!(
+                view.thread_timeline_terminal_item
+                    .borrow()
+                    .entries
+                    .is_empty()
+            );
+            assert!(view.measurement_coordinator.draw.is_none());
         });
     }
 
@@ -580,7 +848,14 @@ mod tests {
                     .read(cx)
                     .semantic_timeline_render_model(Some("a"));
                 assert_eq!(
-                    model.item_presentations.values().next().unwrap().text,
+                    model
+                        .item_presentations
+                        .values()
+                        .next()
+                        .unwrap()
+                        .content()
+                        .unwrap()
+                        .text,
                     "A text"
                 );
                 (
@@ -625,6 +900,9 @@ mod tests {
             });
         });
         deliver();
+        cx.run_until_parked();
+        // Complete the remount draw transaction before measuring unrelated publications.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.run_until_parked();
         let notifications = std::rc::Rc::new(std::cell::Cell::new((0, 0)));
         let observers = cx.update(|_, cx| {
@@ -701,6 +979,8 @@ mod tests {
                     .item_presentations
                     .values()
                     .next()
+                    .unwrap()
+                    .content()
                     .unwrap()
                     .text,
                 "B text"

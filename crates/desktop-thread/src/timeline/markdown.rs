@@ -12,8 +12,8 @@ use gpui_kit::component::v_flex;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use pioneer_client::conversation::TimelineEntryStatus;
+use pioneer_client::timeline::markdown::{MarkdownNode, MarkdownPresentation};
 use pioneer_client::timeline::types::MarkdownBlock;
-use pioneer_client::timeline::types::MarkdownDocument;
 use pioneer_client::timeline::types::MarkdownInline;
 use pioneer_client::timeline::types::MarkdownList;
 use pioneer_client::timeline::types::MarkdownMark;
@@ -200,32 +200,26 @@ impl Element for MarkdownLinkText {
 impl TimelineView {
     pub(super) fn prepare_markdown_highlights(
         &self,
-        document: &MarkdownDocument,
+        document: &MarkdownPresentation,
         cx: &mut Context<Self>,
     ) {
-        fn blocks(view: &TimelineView, input: &[MarkdownBlock], cx: &mut Context<TimelineView>) {
-            for block in input {
-                match block {
-                    MarkdownBlock::Code { language, text } => {
-                        view.prepare_code_highlight(text, language.as_deref(), cx)
-                    }
-                    MarkdownBlock::Quote { blocks: nested } => blocks(view, nested, cx),
-                    MarkdownBlock::List(list) => {
-                        for item in &list.items {
-                            blocks(view, &item.blocks, cx);
-                        }
-                    }
-                    _ => {}
-                }
+        for node in document.code_blocks() {
+            if let MarkdownBlock::Code { language, text } = &node.block {
+                self.prepare_code_highlight(
+                    markdown_node_interaction_id(&document.document_id, node.id),
+                    node.revision,
+                    text,
+                    language.as_deref(),
+                    cx,
+                );
             }
         }
-        blocks(self, &document.blocks, cx);
     }
     pub(super) fn render_markdown_auto(
         &self,
         interaction_scope: &str,
         text: &str,
-        document: Option<&MarkdownDocument>,
+        document: Option<&MarkdownPresentation>,
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -271,8 +265,8 @@ impl TimelineView {
 
     pub(super) fn render_markdown_document(
         &self,
-        interaction_scope: &str,
-        document: &MarkdownDocument,
+        _interaction_scope: &str,
+        document: &MarkdownPresentation,
         code_highlight_policy: CodeHighlightPolicy,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -284,13 +278,8 @@ impl TimelineView {
             pioneer_client::timeline::diagnostics::DiagnosticAction::Executed,
             1,
         ));
-        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
-            pioneer_client::timeline::diagnostics::TimelineStage::MarkdownDocumentProjection,
-            pioneer_client::timeline::diagnostics::DiagnosticAction::Executed,
-            u64::try_from(document.blocks.len()).unwrap_or(u64::MAX),
-        ));
         let started = Instant::now();
-        if document.blocks.is_empty() {
+        if document.nodes.is_empty() {
             let element = div()
                 .w_full()
                 .text_sm()
@@ -313,16 +302,17 @@ impl TimelineView {
 
         let mut content = v_flex().w_full().overflow_hidden().gap_0();
         let mut previous_block: Option<&MarkdownBlock> = None;
-        let interaction_root = markdown_interaction_root_id(interaction_scope);
-        for (index, block) in document.blocks.iter().enumerate() {
+        let interaction_root = document.document_id.as_str();
+        for (index, node) in document.nodes.iter().enumerate() {
+            let block = &node.block;
             let top_spacing = Self::markdown_block_spacing(previous_block, block, index);
             if top_spacing > px(0.) {
                 content = content.child(div().w_full().h(top_spacing));
             }
             content = content.child(self.render_markdown_block(
-                block,
+                node,
                 code_highlight_policy,
-                markdown_child_interaction_id(interaction_root, index),
+                interaction_root,
                 cx,
             ));
             previous_block = Some(block);
@@ -336,7 +326,7 @@ impl TimelineView {
                 outcome: pioneer_client::timeline::diagnostics::DesktopTimelineOutcome::Ok,
                 elapsed: started.elapsed(),
                 input_bytes: None,
-                block_count: Some(document.blocks.len()),
+                block_count: Some(document.nodes.len()),
                 row_count: None,
             },
         );
@@ -365,12 +355,13 @@ impl TimelineView {
 
     fn render_markdown_block(
         &self,
-        block: &MarkdownBlock,
+        node: &MarkdownNode,
         code_highlight_policy: CodeHighlightPolicy,
-        interaction_id: u64,
+        document_id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match block {
+        let interaction_id = markdown_node_interaction_id(document_id, node.id);
+        match &node.block {
             MarkdownBlock::Paragraph(inline) => self.render_markdown_inline(
                 inline,
                 MarkdownTextVariant::Paragraph,
@@ -383,16 +374,21 @@ impl TimelineView {
                 interaction_id,
                 cx,
             ),
-            MarkdownBlock::List(list) => {
-                self.render_markdown_list(list, code_highlight_policy, interaction_id, cx)
-            }
-            MarkdownBlock::Quote { blocks } => {
-                self.render_markdown_quote(blocks, code_highlight_policy, interaction_id, cx)
+            MarkdownBlock::List(list) => self.render_markdown_list(
+                list,
+                &node.children,
+                code_highlight_policy,
+                document_id,
+                cx,
+            ),
+            MarkdownBlock::Quote { .. } => {
+                self.render_markdown_quote(&node.children, code_highlight_policy, document_id, cx)
             }
             MarkdownBlock::Code { language, text } => self.render_markdown_code_block(
                 language.as_deref(),
                 text.as_str(),
                 code_highlight_policy,
+                interaction_id,
                 cx,
             ),
             MarkdownBlock::Rule => div()
@@ -546,11 +542,13 @@ impl TimelineView {
     fn render_markdown_list(
         &self,
         list: &MarkdownList,
+        nodes: &[MarkdownNode],
         code_highlight_policy: CodeHighlightPolicy,
-        interaction_id: u64,
+        document_id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut rows = v_flex().w_full().overflow_hidden().gap_1();
+        let mut nodes = nodes.iter();
         for (index, item) in list.items.iter().enumerate() {
             let prefix = if let Some(checked) = item.checked {
                 if checked {
@@ -565,12 +563,12 @@ impl TimelineView {
             };
 
             let mut content = v_flex().w_full().gap_2();
-            let item_interaction_id = markdown_child_interaction_id(interaction_id, index);
-            for (block_index, block) in item.blocks.iter().enumerate() {
+            for _ in &item.blocks {
+                let node = nodes.next().expect("Client list block identity");
                 content = content.child(self.render_markdown_block(
-                    block,
+                    node,
                     code_highlight_policy,
-                    markdown_child_interaction_id(item_interaction_id, block_index),
+                    document_id,
                     cx,
                 ));
             }
@@ -598,17 +596,17 @@ impl TimelineView {
 
     fn render_markdown_quote(
         &self,
-        blocks: &[MarkdownBlock],
+        blocks: &[MarkdownNode],
         code_highlight_policy: CodeHighlightPolicy,
-        interaction_id: u64,
+        document_id: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut content = v_flex().w_full().gap_2();
-        for (index, block) in blocks.iter().enumerate() {
+        for block in blocks {
             content = content.child(self.render_markdown_block(
                 block,
                 code_highlight_policy,
-                markdown_child_interaction_id(interaction_id, index),
+                document_id,
                 cx,
             ));
         }
@@ -628,6 +626,7 @@ impl TimelineView {
         language: Option<&str>,
         text: &str,
         code_highlight_policy: CodeHighlightPolicy,
+        interaction_id: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
@@ -636,7 +635,7 @@ impl TimelineView {
             1,
         ));
         let language_label = sanitized_language_label(language);
-        let clipboard_id = code_block_clipboard_id(language_label.as_deref(), text);
+        let clipboard_id = SharedString::from(format!("copy-code-block:{interaction_id}"));
         let header = h_flex()
             .w_full()
             .h(px(20.))
@@ -657,10 +656,10 @@ impl TimelineView {
         let mut body = v_flex().w_full().gap_2().child(header);
         let styled_code = match code_highlight_policy {
             CodeHighlightPolicy::Disabled => {
-                StyledText::new(SharedString::new(Arc::<str>::from(text)))
+                StyledText::new(SharedString::new(Arc::<str>::from(text))).into_any_element()
             }
             CodeHighlightPolicy::FinalMessage => {
-                self.render_code_highlighted_text(text, language, cx)
+                self.render_code_highlighted_text(interaction_id, text)
             }
         };
         body = body.child(
@@ -689,17 +688,6 @@ impl TimelineView {
     }
 }
 
-fn code_block_clipboard_id(language: Option<&str>, text: &str) -> SharedString {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hash;
-    use std::hash::Hasher;
-
-    let mut hasher = DefaultHasher::new();
-    language.hash(&mut hasher);
-    text.hash(&mut hasher);
-    SharedString::from(format!("copy-code-block-{:016x}", hasher.finish()))
-}
-
 fn sanitized_language_label(language: Option<&str>) -> Option<String> {
     let token = language?
         .trim_matches(|character: char| character.is_ascii_whitespace())
@@ -720,28 +708,18 @@ fn sanitized_language_label(language: Option<&str>) -> Option<String> {
 }
 
 fn normalize_mark_range(text: &str, mark: &MarkdownMark) -> (usize, usize) {
-    let text_len = text.len();
-    let start = snap_to_char_boundary_backward(text, mark.start.min(text_len));
-    let end = snap_to_char_boundary_forward(text, mark.end.min(text_len));
-    (start, end)
+    use pioneer_client::timeline::markdown::markdown_byte_boundary;
+    (
+        markdown_byte_boundary(text, mark.start, false),
+        markdown_byte_boundary(text, mark.end, true),
+    )
 }
 
-fn markdown_interaction_root_id(scope: &str) -> u64 {
-    use std::hash::Hash;
-    use std::hash::Hasher;
-
+pub(super) fn markdown_node_interaction_id(document: &str, node: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    scope.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn markdown_child_interaction_id(parent: u64, index: usize) -> u64 {
-    use std::hash::Hash;
-    use std::hash::Hasher;
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    parent.hash(&mut hasher);
-    index.hash(&mut hasher);
+    document.hash(&mut hasher);
+    node.hash(&mut hasher);
     hasher.finish()
 }
 

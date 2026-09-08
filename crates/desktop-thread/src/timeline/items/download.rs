@@ -28,6 +28,7 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (display_url, status_code, success, bytes_written) = match item {
@@ -80,11 +81,7 @@ impl TimelineView {
 
         let running_elapsed_label = format_running_elapsed(item_view);
 
-        let open = self
-            .thread_timeline_view_state
-            .expanded
-            .borrow()
-            .contains(entry.id.as_str());
+        let open = expanded;
 
         let entry_id = entry.id.clone();
         let mut toggle_id_hasher = std::collections::hash_map::DefaultHasher::new();

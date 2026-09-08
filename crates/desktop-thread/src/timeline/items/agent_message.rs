@@ -31,22 +31,11 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (text, markdown) = match item {
-            TurnItem::AgentMessage { markdown, .. } => (
-                Self::timeline_entry_text(item_view),
-                item_view
-                    .final_markdown
-                    .as_ref()
-                    .or(item_view.partial_markdown.as_ref())
-                    .or(markdown.as_ref()),
-            ),
-            _ => (
-                Self::timeline_entry_text(item_view),
-                item_view.partial_markdown.as_ref(),
-            ),
-        };
+        let text = Self::timeline_entry_text(item_view);
+        let markdown = content.markdown_presentation.as_ref();
 
         let timestamp_text = item_view
             .started_at_unix_ms
@@ -60,28 +49,23 @@ impl TimelineView {
         let code_highlight_policy = CodeHighlightPolicy::for_timeline_status(item_view.status);
 
         if content.task_timeline {
-            let body_element =
-                if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
-                    self.render_markdown_document(
-                        item_view.id.as_str(),
-                        document,
-                        code_highlight_policy,
-                        cx,
-                    )
-                } else {
-                    self.render_markdown_auto(
-                        item_view.id.as_str(),
-                        text,
-                        None,
-                        CodeHighlightPolicy::Disabled,
-                        cx,
-                    )
-                };
-            let open = self
-                .thread_timeline_view_state
-                .expanded
-                .borrow()
-                .contains(entry.id.as_str());
+            let body_element = if let Some(document) = markdown {
+                self.render_markdown_document(
+                    item_view.id.as_str(),
+                    document,
+                    code_highlight_policy,
+                    cx,
+                )
+            } else {
+                self.render_markdown_auto(
+                    item_view.id.as_str(),
+                    text,
+                    None,
+                    CodeHighlightPolicy::Disabled,
+                    cx,
+                )
+            };
+            let open = expanded;
             let entry_id = entry.id.clone();
 
             let mut toggle_id_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -134,10 +118,10 @@ impl TimelineView {
                                         .items_center()
                                         .gap_2()
                                         .child(
-                                            Clipboard::new((
-                                                "copy-subagent-message",
-                                                entry.item_index,
-                                            ))
+                                            Clipboard::new(SharedString::from(format!(
+                                                "copy-subagent-message:{}:{}",
+                                                self.thread_id, entry.id
+                                            )))
                                             .value(copy_text.clone()),
                                         )
                                         .child(
@@ -198,24 +182,27 @@ impl TimelineView {
                     }
                     menu
                 })
-                .child(div().w_full().overflow_hidden().child(
-                    if let Some(document) = markdown.or(item_view.partial_markdown.as_ref()) {
-                        self.render_markdown_document(
-                            item_view.id.as_str(),
-                            document,
-                            code_highlight_policy,
-                            cx,
-                        )
-                    } else {
-                        self.render_markdown_auto(
-                            item_view.id.as_str(),
-                            text,
-                            None,
-                            CodeHighlightPolicy::Disabled,
-                            cx,
-                        )
-                    },
-                )),
+                .child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .child(if let Some(document) = markdown {
+                            self.render_markdown_document(
+                                item_view.id.as_str(),
+                                document,
+                                code_highlight_policy,
+                                cx,
+                            )
+                        } else {
+                            self.render_markdown_auto(
+                                item_view.id.as_str(),
+                                text,
+                                None,
+                                CodeHighlightPolicy::Disabled,
+                                cx,
+                            )
+                        }),
+                ),
         )
         .into_any_element()
     }

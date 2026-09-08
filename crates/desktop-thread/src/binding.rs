@@ -17,6 +17,7 @@ pub(crate) struct ThreadBindings {
     latest: RefCell<HashMap<ClientScope, ClientPublicationReference>>,
     pending: RefCell<HashMap<ClientScope, ClientPublicationReference>>,
     changed: tokio::sync::watch::Sender<u64>,
+    timeline_changes: RefCell<Vec<Arc<pioneer_client::timeline::presentation::TimelineChangeSet>>>,
     timeline: RefCell<Option<(String, crate::timeline::TimelineRenderModel)>>,
 }
 impl ThreadBindings {
@@ -69,6 +70,7 @@ impl ThreadBindings {
             pending: RefCell::default(),
             changed: tokio::sync::watch::channel(0).0,
             timeline: RefCell::default(),
+            timeline_changes: RefCell::default(),
         });
         let sink: Arc<dyn ClientPublicationSink> = binding.clone();
         for scope in &binding.scopes {
@@ -87,6 +89,11 @@ impl ThreadBindings {
     }
     pub(crate) fn publication(&self, scope: &ClientScope) -> Option<ClientPublicationReference> {
         self.latest.borrow().get(scope).cloned()
+    }
+    pub(crate) fn take_timeline_changes(
+        &self,
+    ) -> Vec<Arc<pioneer_client::timeline::presentation::TimelineChangeSet>> {
+        self.timeline_changes.take()
     }
     pub(crate) fn timeline_model(
         &self,
@@ -117,9 +124,12 @@ impl ThreadBindings {
     pub(crate) fn clear(&self) {
         self.active.set(false);
         self.timeline.borrow_mut().take();
+        self.timeline_changes.borrow_mut().clear();
         self.registrations.borrow_mut().clear();
         self.pending.borrow_mut().clear();
         self.latest.borrow_mut().clear();
+        self.timeline.borrow_mut().take();
+        self.timeline_changes.borrow_mut().clear();
     }
     pub(crate) fn watch(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changed.subscribe()
@@ -143,6 +153,15 @@ impl ClientPublicationSink for ThreadBindings {
             return;
         }
         if let ClientScope::Timeline { thread_id } = scope {
+            if let Some(change) = publication.timeline_change() {
+                let mut pending = self.timeline_changes.borrow_mut();
+                if pending.len() == 64 {
+                    pending.clear();
+                }
+                pending.push(change);
+            } else {
+                self.timeline_changes.borrow_mut().clear();
+            }
             *self.timeline.borrow_mut() = publication
                 .typed::<pioneer_client::timeline::presentation::TimelineSnapshot>()
                 .map(|snapshot| {

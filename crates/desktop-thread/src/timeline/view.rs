@@ -32,6 +32,8 @@ use std::hash::Hasher;
 #[derive(Clone)]
 pub(crate) struct PreparedTimeline {
     pub(crate) model: TimelineRenderModel,
+    pub(crate) expanded: std::rc::Rc<std::collections::HashSet<String>>,
+    pub(crate) slots: Vec<std::sync::Arc<super::row_registry::TimelineRowSlotView>>,
     pub(crate) grouping: std::rc::Rc<TimelineGrouping>,
     pub(crate) item_sizes: std::rc::Rc<Vec<Size<Pixels>>>,
     pub(crate) layout_index: std::rc::Rc<TimelineLayoutIndex>,
@@ -42,19 +44,28 @@ pub(crate) struct PreparedTimeline {
 impl TimelineView {
     pub(crate) fn reconcile_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.thread_timeline_view_state.model.clone();
+        let changes = self.thread_bindings.take_timeline_changes();
+        if let Some(snapshot) = &model.snapshot {
+            if !self.row_registry.matches(snapshot) {
+                for change in changes {
+                    if !self.row_registry.apply(&change) {
+                        break;
+                    }
+                }
+                if !self.row_registry.matches(snapshot) {
+                    self.row_registry.reset(snapshot);
+                }
+            }
+        }
+
         let thread_id = self.thread_id.clone();
         let active_thread_id = Some(thread_id.as_str());
         let projection = model.projection.clone();
-        let item_presentations = model.item_presentations.clone();
 
         let list_width = self.timeline_content_width(window);
         let content_width = self.timeline_entry_content_width(list_width);
-        let row_revisions = model.row_revisions.clone();
 
         let rows = model.rows.clone();
-        let expanded = self.thread_timeline_view_state.expanded.borrow().clone();
-        let expanded_revision = self.thread_timeline_view_state.borrow().expanded_revision;
-        let rows_render_fingerprint = (projection.revision, expanded_revision);
 
         let should_follow_bottom =
             self.sync_timeline_scroll(active_thread_id, projection.as_ref(), rows.as_ref());
@@ -79,20 +90,6 @@ impl TimelineView {
                         true,
                         cx,
                     );
-                }
-                if matches!(
-                    item.item,
-                    pioneer_client::timeline::types::TurnItem::CommandExecution { .. }
-                ) {
-                    self.prepare_command_terminal(entry, item, content_width, cx);
-                }
-                if let Some(content) = item_presentations
-                    .get(&item.id)
-                    .filter(|content| !content.streaming)
-                {
-                    if let Some(document) = &content.markdown {
-                        self.prepare_markdown_highlights(document, cx);
-                    }
                 }
             }
         }
@@ -126,42 +123,7 @@ impl TimelineView {
             task_child_thread: self.active_task_thread_navigation().is_some(),
         };
 
-        // Timeline row heights depend on the capped content width, not on the empty
-        // margins around it. Sidebar resizing above the cap must not invalidate every row.
-        let width_px = (content_width / px(1.)).round() as i32;
-        let tail_row_key = rows.last().map(|row| row.key());
         let message_text_bottom_inset = timeline_message_text_bottom_inset(window);
-
-        let generation = self
-            .thread_timeline_view_state
-            .layout_generation
-            .saturating_add(1);
-        self.thread_timeline_view_state.layout_generation = generation;
-        self.thread_timeline_view_state.measurement = None;
-        let state = self.thread_timeline_view_state.borrow();
-        let can_reuse = state.cached_render_active_thread_id.as_deref() == active_thread_id
-            && state.cached_render_width_px == width_px
-            && state.cached_render_item_count == rows.len()
-            && state.cached_render_model_fingerprint == rows_render_fingerprint.0
-            && state.cached_render_expanded_revision == rows_render_fingerprint.1
-            && state.cached_render_principal_id == render_current_principal_id
-            && state.cached_render_task_child_thread == presentation_context.task_child_thread;
-        if can_reuse
-            && let Some(item_sizes) = state.cached_item_sizes.clone()
-            && let Some(layout_index) = state.cached_timeline_layout_index.clone()
-        {
-            let grouping = layout_index.grouping_rc();
-            drop(state);
-            self.commit_timeline_layout(PreparedTimeline {
-                model,
-                grouping,
-                item_sizes,
-                layout_index,
-                content_width,
-                list_width,
-            });
-            return;
-        }
         let grouping = TimelineGrouping::from_snapshot(
             rows.as_ref(),
             model.groups.as_ref(),
@@ -171,64 +133,194 @@ impl TimelineView {
             message_text_bottom_inset,
         );
         let measurement = self.prepare_timeline_item_sizes(
-            &state,
-            projection.as_ref(),
-            item_presentations.as_ref(),
-            rows.as_ref(),
-            grouping.as_ref(),
+            &model,
+            &grouping,
             list_width,
             content_width,
-            row_revisions.as_ref(),
-            &expanded,
+            window,
             cx,
         );
-        drop(state);
-        let tail_row_key = tail_row_key.map(str::to_owned);
+        let order = model
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.rows().iter().map(|row| row.id().clone()).collect())
+            .unwrap_or_default();
+        let expanded = std::rc::Rc::new(self.thread_timeline_view_state.expanded.borrow().clone());
+        let ticket = self
+            .measurement_coordinator
+            .begin(model.revision, self.layout_store.context_revision);
+        if measurement.entries.is_empty() {
+            self.measurement_coordinator.accept(ticket);
+            let item_sizes = self.layout_store.commit(order, Vec::new());
+            let layout_index =
+                TimelineLayoutIndex::from_store(grouping.clone(), self.layout_store.index.clone());
+            self.commit_timeline_layout(
+                PreparedTimeline {
+                    expanded,
+                    slots: self.row_registry.slots(),
+                    model,
+                    grouping,
+                    item_sizes,
+                    layout_index,
+                    content_width,
+                    list_width,
+                },
+                cx,
+            );
+            return;
+        }
         let entity = cx.weak_entity();
-        self.thread_timeline_view_state.measurement = Some(std::rc::Rc::new(
-            std::cell::RefCell::new(Some(Box::new(move |window, cx| {
-                let (item_sizes, cache) = measurement.measure(window, cx);
+        self.measurement_coordinator.draw = Some(std::rc::Rc::new(std::cell::RefCell::new(Some(
+            Box::new(move |window, cx| {
+                let measured_rem = window.rem_size();
+                let measured_style = window.text_style();
+                let measured_locale = rust_i18n::locale().to_string();
+                let measured = measurement.measure(window, cx);
                 window.defer(cx, move |window, cx| {
                     let _ = entity.update(cx, |view, cx| {
-                        if view.thread_timeline_view_state.layout_generation != generation {
+                        if view.thread_timeline_view_state.model.revision != ticket.presentation
+                            || view.layout_store.context_revision != ticket.context
+                            || !view.measurement_coordinator.is_pending(ticket)
+                        {
                             return;
                         }
-                        view.thread_timeline_view_state.measurement = None;
-                        let layout_index =
-                            TimelineLayoutIndex::new(grouping.clone(), item_sizes.clone());
+                        if view.thread_timeline_view_state.layout_rem != measured_rem
+                            || view.thread_timeline_view_state.layout_text_style != measured_style
+                            || view.thread_timeline_view_state.layout_locale != measured_locale
                         {
-                            let mut state = view.thread_timeline_view_state.borrow_mut();
-                            state.entry_layout_cache = cache;
-                            state.cached_render_active_thread_id = Some(thread_id);
-                            state.cached_render_width_px = width_px;
-                            state.cached_render_item_count = rows.len();
-                            state.cached_render_tail_entry_id = tail_row_key;
-                            state.cached_render_tail_fingerprint = rows_render_fingerprint.0;
-                            state.cached_render_model_fingerprint = rows_render_fingerprint.0;
-                            state.cached_render_expanded_revision = rows_render_fingerprint.1;
-                            state.cached_render_principal_id = render_current_principal_id;
-                            state.cached_render_task_child_thread =
-                                presentation_context.task_child_thread;
-                            state.cached_item_sizes = Some(item_sizes.clone());
-                            state.cached_timeline_layout_index = Some(layout_index.clone());
+                            view.thread_timeline_view_state.layout_rem = measured_rem;
+                            view.thread_timeline_view_state.layout_text_style = measured_style;
+                            view.thread_timeline_view_state.layout_locale = measured_locale;
+                            view.layout_store.context_changed();
+                            view.reconcile_timeline(window, cx);
+                            cx.notify();
+                            return;
                         }
-                        view.commit_timeline_layout(PreparedTimeline {
-                            model,
-                            grouping,
-                            item_sizes,
-                            layout_index,
-                            content_width,
-                            list_width,
-                        });
+                        view.measurement_coordinator.accept(ticket);
+                        view.measurement_coordinator.draw = None;
+                        let item_sizes = view.layout_store.commit(order, measured);
+                        let layout_index = TimelineLayoutIndex::from_store(
+                            grouping.clone(),
+                            view.layout_store.index.clone(),
+                        );
+                        view.commit_timeline_layout(
+                            PreparedTimeline {
+                                expanded,
+                                slots: view.row_registry.slots(),
+                                model,
+                                grouping,
+                                item_sizes,
+                                layout_index,
+                                content_width,
+                                list_width,
+                            },
+                            cx,
+                        );
                         super::controller::DesktopTimelineController::schedule(view, window, cx);
                         cx.notify();
                     });
                 });
-            }))),
-        ));
+            }),
+        ))));
     }
 
-    fn commit_timeline_layout(&mut self, prepared: PreparedTimeline) {
+    fn commit_timeline_layout(&mut self, mut prepared: PreparedTimeline, cx: &mut Context<Self>) {
+        let projection = &prepared.model.projection;
+        let item_presentations = &prepared.model.item_presentations;
+        let live_terminals = projection
+            .timeline
+            .iter()
+            .filter(|entry| {
+                projection
+                    .item_for_timeline_entry(entry)
+                    .is_some_and(|item| {
+                        matches!(
+                            item.item,
+                            pioneer_client::timeline::types::TurnItem::CommandExecution { .. }
+                        )
+                    })
+            })
+            .map(|entry| entry.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.thread_timeline_terminal_item
+            .borrow_mut()
+            .retain(|id| live_terminals.contains(id));
+        let live_highlights = item_presentations
+            .values()
+            .filter_map(|row| row.content())
+            .filter(|content| !content.streaming)
+            .filter_map(|content| content.markdown_presentation.as_ref())
+            .flat_map(|document| {
+                document.code_blocks().into_iter().map(|node| {
+                    super::markdown::markdown_node_interaction_id(&document.document_id, node.id)
+                })
+            })
+            .collect::<std::collections::HashSet<_>>();
+        self.markdown_highlights
+            .borrow_mut()
+            .retain(|id, _| live_highlights.contains(id));
+
+        let old_slots = self
+            .thread_timeline_view_state
+            .prepared
+            .as_ref()
+            .map(|old| {
+                old.slots
+                    .iter()
+                    .map(|slot| (slot.snapshot().id(), slot))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let context = (
+            prepared.content_width,
+            self.layout_store.theme_revision,
+            self.thread_timeline_view_state.layout_text_style.clone(),
+        );
+        let context_changed = self.retained_context.as_ref() != Some(&context);
+        for slot in &mut prepared.slots {
+            let unchanged = old_slots
+                .get(slot.snapshot().id())
+                .is_some_and(|old| std::sync::Arc::ptr_eq(old, slot));
+            if unchanged && !context_changed {
+                continue;
+            }
+            let snapshot = slot.snapshot().clone();
+            if let Some(item) = snapshot.item() {
+                if matches!(
+                    item.item,
+                    pioneer_client::timeline::types::TurnItem::CommandExecution { .. }
+                ) {
+                    let entry = pioneer_client::conversation::TimelineEntry {
+                        id: slot.snapshot().id().as_str().to_owned(),
+                        turn_id: item.turn_id.clone(),
+                        item_id: item.id.clone(),
+                        item_index: 0,
+                    };
+                    let terminal = self.prepare_command_terminal(
+                        &entry,
+                        item,
+                        prepared.content_width,
+                        old_slots
+                            .get(snapshot.id())
+                            .and_then(|slot| slot.terminal.as_ref()),
+                        cx,
+                    );
+                    std::sync::Arc::make_mut(slot).terminal = Some(terminal);
+                    self.row_registry.publish_slot(slot.clone());
+                }
+                if let Some(content) = slot
+                    .snapshot()
+                    .content()
+                    .filter(|content| !content.streaming)
+                {
+                    if let Some(document) = &content.markdown_presentation {
+                        self.prepare_markdown_highlights(document, cx);
+                    }
+                }
+            }
+        }
+        self.retained_context = Some(context);
+
         let should_follow_bottom = {
             let mut state = self.thread_timeline_view_state.borrow_mut();
             let follow = state.pending_follow_bottom && !state.autoscroll_paused_by_user;
@@ -248,16 +340,18 @@ impl TimelineView {
     }
 
     fn timeline_measurement_pass(&self, cx: &Context<Self>) -> AnyElement {
-        let measurement = self.thread_timeline_view_state.measurement.clone();
+        let measurement = self.measurement_coordinator.draw.clone();
         let scroll = self.thread_timeline_view_state.scroll_handle.clone();
         let bounds = self.thread_timeline_view_state.viewport;
         let offset = self.thread_timeline_view_state.viewport_offset;
         let rem = self.thread_timeline_view_state.layout_rem;
+        let text_style = self.thread_timeline_view_state.layout_text_style.clone();
+        let locale = self.thread_timeline_view_state.layout_locale.clone();
         let visible = self.thread_timeline_view_state.visible;
         let entity = cx.weak_entity();
         canvas(
             move |_, window, cx| {
-                // Only the single-use draw payload is consumed here. Cache, scroll,
+                // Only the single-use draw payload is consumed here. Layout, scroll,
                 // snapshot and notification changes happen in its deferred handler.
                 if let Some(measurement) = measurement
                     && let Some(measure) = measurement.borrow_mut().take()
@@ -271,11 +365,23 @@ impl TimelineView {
                 if visible
                     && (scroll.bounds() != bounds
                         || scroll.offset() != offset
-                        || window.rem_size() != rem)
+                        || window.rem_size() != rem
+                        || window.text_style() != text_style
+                        || rust_i18n::locale().as_bytes() != locale.as_bytes())
                 {
+                    let text_style = window.text_style();
+                    let locale = rust_i18n::locale().to_string();
                     window.defer(cx, move |window, cx| {
                         let _ = entity.update(cx, |view, cx| {
                             if view.thread_timeline_view_state.visible {
+                                if view.thread_timeline_view_state.layout_text_style != text_style
+                                    || view.thread_timeline_view_state.layout_locale != locale
+                                {
+                                    view.thread_timeline_view_state.layout_text_style = text_style;
+                                    view.thread_timeline_view_state.layout_locale = locale;
+                                    view.layout_store.context_changed();
+                                    view.reconcile_timeline(window, cx);
+                                }
                                 super::controller::DesktopTimelineController::viewport(
                                     view, window, cx,
                                 );
@@ -313,6 +419,8 @@ impl TimelineView {
                 .into_any_element();
         };
         let PreparedTimeline {
+            expanded,
+            slots,
             model,
             grouping,
             item_sizes,
@@ -320,11 +428,7 @@ impl TimelineView {
             content_width,
             list_width,
         } = prepared;
-        let projection = model.projection.clone();
-        let item_presentations = model.item_presentations.clone();
         let rows = model.rows.clone();
-        let render_projection = projection.clone();
-        let render_item_presentations = item_presentations.clone();
         let render_rows = rows.clone();
         let render_grouping = grouping.clone();
         let render_row_count = render_rows.len();
@@ -351,7 +455,6 @@ impl TimelineView {
                     "thread-timeline-virtual-list",
                     item_sizes,
                     move |view, visible_range, _, cx| {
-                        let projection = render_projection.as_ref();
                         let visible_indices = visible_range.collect::<Vec<_>>();
                         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
                             pioneer_client::timeline::diagnostics::TimelineStage::VisibleRowTraversal,
@@ -360,20 +463,7 @@ impl TimelineView {
                         ));
                         let elements = visible_indices
                             .into_iter()
-                            .filter_map(|ix| {
-                                render_rows.get(ix).map(|row| {
-                                    view.render_timeline_row(
-                                        projection,
-                                        render_item_presentations.as_ref(),
-                                        row,
-                                        ix + 1 == render_row_count,
-                                        render_grouping.row_layout(ix),
-                                        render_grouping.agent_author_for_group_start(ix),
-                                        content_width,
-                                        cx,
-                                    )
-                                })
-                            })
+                            .map(|ix| slots[ix].render(view, ix + 1 == render_row_count, render_grouping.row_layout(ix), render_grouping.agent_author_for_group_start(ix), content_width, expanded.contains(slots[ix].snapshot().id().as_str()), cx))
                             .collect::<Vec<_>>();
                         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
                             pioneer_client::timeline::diagnostics::TimelineStage::VisibleRowElementBuild,
@@ -411,6 +501,8 @@ impl TimelineView {
         row_layout: TimelineRowLayout,
         agent_group_author: Option<&pioneer_client::timeline::types::TurnAuthorSnapshot>,
         content_width: Pixels,
+        expanded: bool,
+        terminal: Option<Entity<terminal::TerminalView>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
@@ -435,6 +527,8 @@ impl TimelineView {
                 is_last_row,
                 body_top_spacing,
                 grouped_content_width,
+                expanded,
+                terminal,
                 cx,
             );
             return self.render_agent_timeline_group_row(
@@ -452,6 +546,8 @@ impl TimelineView {
             is_last_row,
             row_layout.top_spacing,
             content_width,
+            expanded,
+            terminal,
             cx,
         )
     }
@@ -464,6 +560,8 @@ impl TimelineView {
         is_last_row: bool,
         top_spacing: TimelineRowTopSpacing,
         content_width: Pixels,
+        expanded: bool,
+        terminal: Option<Entity<terminal::TerminalView>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
@@ -488,6 +586,10 @@ impl TimelineView {
                 self.render_item_user_message(
                     entry,
                     item_view,
+                    item_presentations
+                        .get(&item_view.id)
+                        .and_then(|row| row.content())
+                        .expect("Client message content"),
                     &item_view.item,
                     Some(presentation),
                     author.as_ref(),
@@ -512,11 +614,14 @@ impl TimelineView {
                     item_view,
                     item_presentations
                         .get(&item_view.id)
+                        .and_then(|row| row.content())
                         .expect("captured published item content"),
                     &item_view.item,
                     top_spacing,
                     is_last_row,
                     content_width,
+                    expanded,
+                    terminal,
                     cx,
                 )
             }

@@ -155,6 +155,7 @@ pub fn timeline_entry_text(item_view: &ItemView) -> &str {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ParsedUserAttachment {
+    pub id: String,
     pub display_name: String,
     pub kind: ParsedUserAttachmentKind,
     pub artifact: Option<ArtifactRef>,
@@ -172,6 +173,7 @@ pub fn parse_user_attachments(attachments: &[UserMessageAttachment]) -> Vec<Pars
     attachments
         .iter()
         .map(|attachment| ParsedUserAttachment {
+            id: super::item_presentation::project_attachment(attachment).id,
             display_name: display_name_from_attachment(attachment),
             kind: attachment_kind(attachment),
             artifact: artifact_from_attachment(attachment),
@@ -243,10 +245,10 @@ pub fn artifact_from_attachment(attachment: &UserMessageAttachment) -> Option<Ar
     }
 }
 
-pub fn stable_user_message_attachment_chip_id(item_id: &str, chip_index: usize) -> u64 {
+pub fn stable_user_message_attachment_chip_id(item_id: &str, attachment_id: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     item_id.hash(&mut hasher);
-    chip_index.hash(&mut hasher);
+    attachment_id.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1789,8 +1791,8 @@ mod tests {
         assert_eq!(parsed[5].kind, ParsedUserAttachmentKind::Mcp);
         assert_eq!(parsed[1].artifact.as_ref(), Some(&artifact));
         assert_ne!(
-            stable_user_message_attachment_chip_id("user_1", 0),
-            stable_user_message_attachment_chip_id("user_2", 0)
+            stable_user_message_attachment_chip_id("user_1", "artifact:a"),
+            stable_user_message_attachment_chip_id("user_2", "artifact:a")
         );
     }
 

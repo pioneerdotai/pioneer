@@ -22,11 +22,17 @@ impl DesktopTimelineController {
         window: &mut Window,
         cx: &mut Context<TimelineView>,
     ) -> bool {
-        let Some(model) = view.thread_bindings.timeline_model(Some(&view.thread_id)) else {
+        if view.timeline_access_revoked {
             return false;
+        }
+        let Some(model) = view.thread_bindings.timeline_model(Some(&view.thread_id)) else {
+            let changed = view.thread_timeline_view_state.prepared.is_some()
+                || view.measurement_coordinator.draw.is_some();
+            view.retire_timeline_rows();
+            return changed;
         };
         if (view.thread_timeline_view_state.prepared.is_some()
-            || view.thread_timeline_view_state.measurement.is_some())
+            || view.measurement_coordinator.draw.is_some())
             && view.thread_timeline_view_state.model.revision == model.revision
         {
             return false;
@@ -63,8 +69,6 @@ impl DesktopTimelineController {
             }
             let mut state = view.thread_timeline_view_state.borrow_mut();
             state.expanded_revision = state.expanded_revision.saturating_add(1);
-            state.entry_layout_cache.remove(entry_id);
-            state.cached_item_sizes = None;
         }
         view.reconcile_timeline(window, cx);
         Self::schedule(view, window, cx);
@@ -98,6 +102,9 @@ impl DesktopTimelineController {
         window: &mut Window,
         cx: &mut Context<TimelineView>,
     ) {
+        if view.timeline_access_revoked {
+            return;
+        }
         if let Some(model) = view.thread_bindings.timeline_model(Some(&view.thread_id)) {
             view.thread_timeline_view_state.model = model;
         }
@@ -124,9 +131,7 @@ impl DesktopTimelineController {
         let rem_changed = view.thread_timeline_view_state.layout_rem != window.rem_size();
         if rem_changed {
             view.thread_timeline_view_state.layout_rem = window.rem_size();
-            let mut state = view.thread_timeline_view_state.borrow_mut();
-            state.entry_layout_cache.clear();
-            state.cached_item_sizes = None;
+            view.layout_store.context_changed();
         }
         let width_changed = view.update_timeline_layout_width(bounds.size.width) || rem_changed;
         let bounds_changed = bounds != view.thread_timeline_view_state.viewport;
@@ -134,32 +139,20 @@ impl DesktopTimelineController {
         view.thread_timeline_view_state.viewport_offset =
             view.thread_timeline_view_state.scroll_handle.offset();
         if width_changed {
+            view.layout_store.context_changed();
             view.reconcile_timeline(window, cx);
             Self::schedule(view, window, cx);
         }
-        if view.thread_timeline_view_state.measurement.is_some() {
+        if view.measurement_coordinator.draw.is_some() {
             return;
         }
         let Some(prepared) = view.thread_timeline_view_state.prepared.clone() else {
             return;
         };
-        // The current temporary size vector remains the range source, with the stock
-        // list's extra trailing row. No persistent index or alternate list is introduced.
         let offset = -view.thread_timeline_view_state.scroll_handle.offset().y;
-        let mut total = px(0.);
-        let mut start = 0;
-        let mut end = prepared.item_sizes.len();
-        for (ix, size) in prepared.item_sizes.iter().enumerate() {
-            total += size.height;
-            if total <= offset {
-                start = ix + 1;
-            }
-            if total > offset + bounds.size.height {
-                end = (ix + 2).min(prepared.item_sizes.len());
-                break;
-            }
-        }
-        let range = start.min(end)..end;
+        let range = prepared
+            .layout_index
+            .visible_range(offset, bounds.size.height);
         let range_changed = range != view.thread_timeline_view_state.visible_range;
         view.thread_timeline_view_state.visible_range = range.clone();
         if bounds_changed || range_changed {
@@ -239,7 +232,11 @@ impl DesktopTimelineController {
                 };
                 if let Some(item) =
                     entry.and_then(|entry| prepared.model.projection.item_for_timeline_entry(entry))
-                    && let Some(content) = prepared.model.item_presentations.get(&item.id)
+                    && let Some(content) = prepared
+                        .model
+                        .item_presentations
+                        .get(&item.id)
+                        .and_then(|row| row.content())
                 {
                     for artifact in content
                         .attachments

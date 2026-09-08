@@ -1,7 +1,7 @@
 use super::super::TimelineRowTopSpacing;
+use super::super::terminal_registry::TerminalPresentation;
 use super::format_running_elapsed;
 use crate::assets::PioneerIconName;
-use crate::screen::CachedTimelineTerminal;
 use crate::screen::TimelineView;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::h_flex;
@@ -16,7 +16,6 @@ use pioneer_client::timeline::labels::command_execution_terminal_text;
 use pioneer_client::timeline::types::TurnItem;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::io::Cursor;
 use terminal::ColorPalette;
 use terminal::TerminalConfig;
 use terminal::TerminalView;
@@ -43,11 +42,13 @@ impl TimelineView {
         &self,
         entry: &TimelineEntry,
         terminal_text: &str,
+        active: bool,
+        previous: Option<&TerminalPresentation>,
         content_width: Pixels,
         terminal_height: Pixels,
         desired_rows: usize,
         cx: &mut Context<Self>,
-    ) -> Entity<TerminalView> {
+    ) -> TerminalPresentation {
         let horizontal_padding = px(16.0);
         let vertical_padding = px(16.0);
         let available_width = (content_width - horizontal_padding).max(px(200.0));
@@ -57,21 +58,6 @@ impl TimelineView {
         let cols = ((available_width / approx_cell_width) as usize).clamp(40, 260);
         let fallback_rows = ((available_height / approx_cell_height) as usize).clamp(8, 80);
         let rows = desired_rows.max(fallback_rows).clamp(8, 1600);
-
-        let mut content_hasher = std::collections::hash_map::DefaultHasher::new();
-        terminal_text.hash(&mut content_hasher);
-        cols.hash(&mut content_hasher);
-        rows.hash(&mut content_hasher);
-        let content_hash = content_hasher.finish();
-
-        if let Some(cached) = self
-            .thread_timeline_terminal_item
-            .borrow()
-            .get(entry.id.as_str())
-            && cached.content_hash == content_hash
-        {
-            return cached.view.clone();
-        }
 
         let config = TerminalConfig {
             font_family: "Menlo".to_owned(),
@@ -84,19 +70,15 @@ impl TimelineView {
             colors: ColorPalette::builder().background(0x1e, 0x1e, 0x1e).build(),
             ..TerminalConfig::default()
         };
-        let terminal_bytes = terminal_text.as_bytes().to_vec();
-        let terminal = cx
-            .new(|cx| TerminalView::new(std::io::sink(), Cursor::new(terminal_bytes), config, cx));
-
-        self.thread_timeline_terminal_item.borrow_mut().insert(
-            entry.id.clone(),
-            CachedTimelineTerminal {
-                content_hash,
-                view: terminal.clone(),
-            },
-        );
-
-        terminal
+        self.thread_timeline_terminal_item.borrow_mut().synchronize(
+            &entry.id,
+            &entry.turn_id,
+            terminal_text,
+            active,
+            previous,
+            config,
+            cx,
+        )
     }
 
     pub(crate) fn prepare_command_terminal(
@@ -104,8 +86,9 @@ impl TimelineView {
         entry: &TimelineEntry,
         item_view: &ItemView,
         content_width: Pixels,
+        previous: Option<&TerminalPresentation>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> TerminalPresentation {
         let item = &item_view.item;
         let terminal_text =
             command_execution_terminal_text(item, Self::timeline_entry_text(item_view), |output| {
@@ -119,14 +102,16 @@ impl TimelineView {
             .max(px(140.0))
             .min(px(360.0));
 
-        let _ = self.command_execution_terminal_view(
+        self.command_execution_terminal_view(
             entry,
             terminal_text.as_str(),
+            item_view.status == TimelineEntryStatus::Running,
+            previous,
             content_width,
             terminal_height,
             desired_rows,
             cx,
-        );
+        )
     }
 
     pub(super) fn render_item_command_execution(
@@ -137,6 +122,8 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
+        expanded: bool,
+        terminal: Option<Entity<TerminalView>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let command_label = match item {
@@ -162,11 +149,6 @@ impl TimelineView {
             .max(px(140.0))
             .min(px(360.0));
 
-        let terminal = self
-            .thread_timeline_terminal_item
-            .borrow()
-            .get(&entry.id)
-            .map(|entry| entry.view.clone());
         let terminal_block = div()
             .w_full()
             .h(terminal_height)
@@ -175,11 +157,7 @@ impl TimelineView {
 
         let running_elapsed_label = format_running_elapsed(item_view);
 
-        let open = self
-            .thread_timeline_view_state
-            .expanded
-            .borrow()
-            .contains(entry.id.as_str());
+        let open = expanded;
 
         let entry_id = entry.id.clone();
         let mut toggle_id_hasher = std::collections::hash_map::DefaultHasher::new();

@@ -21,13 +21,14 @@ impl TimelineRenderModel {
         snapshot: &pioneer_client::timeline::presentation::TimelineSnapshot,
     ) -> Self {
         Self {
+            snapshot: Some(std::sync::Arc::new(snapshot.clone())),
             revision: snapshot.revision(),
             source_revision: snapshot.source_revision(),
             item_presentations: std::sync::Arc::new(
                 snapshot
                     .rows()
                     .iter()
-                    .filter_map(|row| Some((row.item()?.id.clone(), row.content()?.clone())))
+                    .filter_map(|row| Some((row.item()?.id.clone(), row.clone())))
                     .collect(),
             ),
             groups: snapshot.groups(),

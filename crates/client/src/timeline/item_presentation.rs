@@ -54,6 +54,8 @@ pub struct TimelineItemPresentation {
     pub kind: TimelineItemKind,
     pub text: String,
     pub markdown: Option<MarkdownDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown_presentation: Option<super::markdown::MarkdownPresentation>,
     pub streaming: bool,
     pub collapsed: bool,
     pub task_timeline: bool,
@@ -112,6 +114,7 @@ pub(crate) fn project_item(item: &ItemView) -> TimelineItemPresentation {
                 TurnItem::AgentMessage { markdown, .. } => markdown.clone(),
                 _ => None,
             }),
+        markdown_presentation: None,
         streaming,
         collapsed: item.status == TimelineEntryStatus::Completed,
         task_timeline: labels::is_task_timeline_agent_message(item),

@@ -21,10 +21,12 @@ impl TimelineView {
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
+        content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
         item: &TurnItem,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let body = match item {
@@ -40,18 +42,14 @@ impl TimelineView {
         let body_element = self.render_markdown_auto(
             item_view.id.as_str(),
             body.as_str(),
-            item_view.partial_markdown.as_ref(),
+            content.markdown_presentation.as_ref(),
             code_highlight_policy,
             cx,
         );
 
         let running_elapsed_label = format_running_elapsed(item_view);
 
-        let open = self
-            .thread_timeline_view_state
-            .expanded
-            .borrow()
-            .contains(entry.id.as_str());
+        let open = expanded;
 
         let entry_id = entry.id.clone();
 

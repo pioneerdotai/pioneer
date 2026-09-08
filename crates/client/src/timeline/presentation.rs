@@ -397,6 +397,7 @@ pub(crate) fn project(
                 }
                 _ => None,
             };
+            let markdown_scope = format!("{}:{}:{}", id.len(), id, value.key());
             let id = RowId(value.key().to_owned());
             let old = previous_by_id.get(id.as_str());
             let turn_id = item
@@ -445,6 +446,18 @@ pub(crate) fn project(
                     .iter()
                     .map(super::item_presentation::project_attachment)
                     .collect();
+            }
+            if let Some(content) = &mut content {
+                if let Some(document) = &content.markdown {
+                    content.markdown_presentation =
+                        Some(super::markdown::MarkdownPresentation::project(
+                            &markdown_scope,
+                            document,
+                            old.and_then(|row| row.content.as_ref())
+                                .and_then(|content| content.markdown_presentation.as_ref()),
+                            revision,
+                        ));
+                }
             }
             let mut row = TimelineRowSnapshot {
                 content,

@@ -327,3 +327,50 @@ fn timeline_publication_wire_preserves_identity_and_replacements() {
         serde_json::from_str::<Value>(&std::fs::read_to_string(path).unwrap()).unwrap()
     );
 }
+
+#[test]
+fn markdown_documents_and_blocks_cross_the_wire_without_a_second_projector() {
+    let core = fixture_core();
+    let scope = ClientScope::Timeline {
+        thread_id: "a".into(),
+    };
+    let _lease = core.subscribe(scope.clone(), NonZeroUsize::new(8).unwrap());
+    core.apply_thread_timeline_page(ThreadTimelinePageResponse {
+        workspace_id:"ws".into(),thread_id:"a".into(),projection_version:1,
+        blocks:vec![block("answer","turn","01",json!({"kind":"assistant_message","itemId":"answer","text":"code", "markdown":{"blocks":[{"type":"code","language":"rust","text":"let value = 1;\n"}]}}))],page:TimelinePageInfo::default(),
+    },TopLevelPageMergeMode::Reset);
+    let _materialized = core.subscribe(scope.clone(), NonZeroUsize::new(8).unwrap());
+    let publication = core.snapshot(&scope).unwrap();
+    let direct = publication
+        .snapshot()
+        .payload::<pioneer_client::timeline::presentation::TimelineSnapshot>()
+        .unwrap();
+    let wire = snapshot_dto(publication);
+    let document = direct
+        .rows()
+        .iter()
+        .find_map(|row| row.content()?.markdown_presentation.as_ref())
+        .unwrap();
+    let serialized = serde_json::to_value(document).unwrap();
+    assert!(
+        wire.payload["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["content"]["markdown_presentation"] == serialized)
+    );
+    assert_eq!(document.code_blocks().len(), 1);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/markdown-presentation-wire.json");
+    if std::env::var_os("UPDATE_MARKDOWN_PRESENTATION_FIXTURE").is_some() {
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&serialized).unwrap()),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        serialized,
+        serde_json::from_str::<Value>(&std::fs::read_to_string(path).unwrap()).unwrap()
+    );
+}
