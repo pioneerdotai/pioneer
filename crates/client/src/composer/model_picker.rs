@@ -964,6 +964,40 @@ mod tests {
             ClientTransitionOutcome::Noop
         );
         assert!(Arc::ptr_eq(&after, &core.composer_snapshot("a").unwrap()));
+        // A new thread must still accept and publish typing after choosing its model.
+        core.remember_thread_draft("workspace", Some("a".into()));
+        assert_eq!(
+            core.composer_intent(ComposerIntent::EditText {
+                thread_id: "a".into(),
+                draft_id: after.draft_id(),
+                text: "first message".into(),
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let edited = core.composer_snapshot("a").unwrap();
+        let published = core
+            .snapshot(&ClientScope::Composer {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .typed::<super::super::store::ComposerPublication>()
+            .unwrap()
+            .payload();
+        assert!(
+            Arc::ptr_eq(&edited, &published),
+            "typing after model selection must reach Desktop/Mobile"
+        );
+        assert_eq!(published.draft().text, "first message");
+        assert_eq!(
+            core.composer_intent(ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id: published.draft_id(),
+                operation: super::super::store::ComposerOperationKind::Send,
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
     }
     #[test]
     fn repeated_provider_identity_does_not_accept_an_older_request() {

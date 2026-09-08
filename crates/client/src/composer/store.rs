@@ -514,7 +514,12 @@ impl ClientCore {
             ClientScope::Composer {
                 thread_id: identity.thread_id.clone(),
             },
-            crate::threads::registry::revisions(revision),
+            ClientRevisions::new(
+                DomainRevision::new(revision),
+                PresentationRevision::new(revision),
+                ContentRevision::ZERO,
+                ScopedRevision::new(revision),
+            ),
             next,
             vec![],
         );
@@ -670,7 +675,12 @@ impl ClientCore {
             ClientScope::Composer {
                 thread_id: identity.thread_id.clone(),
             },
-            crate::threads::registry::revisions(revision),
+            ClientRevisions::new(
+                DomainRevision::new(revision),
+                PresentationRevision::new(revision),
+                ContentRevision::ZERO,
+                ScopedRevision::new(revision),
+            ),
             next,
             vec![],
         );
