@@ -82,6 +82,7 @@ impl Default for TimelineRowLayout {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TimelineAvatarGroup {
+    pub(crate) activity_id: String,
     pub(crate) first_row_index: usize,
     pub(crate) last_row_index: usize,
     pub(crate) source: TimelineAvatarSource,
@@ -167,6 +168,7 @@ impl TimelineGrouping {
             };
             if let Some(source) = source {
                 avatar_groups.push(TimelineAvatarGroup {
+                    activity_id: format!("avatar:{}", rows[index].key()),
                     first_row_index: index,
                     last_row_index: end,
                     source,

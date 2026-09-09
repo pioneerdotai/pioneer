@@ -1,6 +1,5 @@
 use super::super::TimelineRowTopSpacing;
-use super::format_running_elapsed;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::v_flex;
@@ -24,7 +23,7 @@ fn changed_files_label(count: usize) -> String {
     }
 }
 
-impl TimelineView {
+impl RowPresentation {
     pub(super) fn render_item_file_change(
         &self,
         entry: &TimelineEntry,
@@ -35,33 +34,21 @@ impl TimelineView {
         is_last_row: bool,
         content_width: Pixels,
         expanded: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
-        let (tool_name, changed_files, exit_code, output) = match item {
+        let (tool_name, changed_files, exit_code) = match item {
             TurnItem::FileChange {
                 tool_name,
                 changed_files,
                 exit_code,
-                stdout,
-                stderr,
                 ..
-            } => (
-                tool_name.clone(),
-                changed_files.clone(),
-                *exit_code,
-                file_change_display_text(stdout.as_deref(), stderr.as_deref(), None),
-            ),
-            _ => (
-                "apply_patch".to_owned(),
-                Vec::new(),
-                None,
-                file_change_display_text(None, None, Some(Self::timeline_entry_text(item_view))),
-            ),
+            } => (tool_name.as_str(), changed_files.as_slice(), *exit_code),
+            _ => ("apply_patch", &[][..], None),
         };
 
         let file_count = changed_files.len();
         let headline = if file_count == 0 {
-            tool_name.clone()
+            tool_name.to_owned()
         } else {
             changed_files_label(file_count)
         };
@@ -74,12 +61,9 @@ impl TimelineView {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(
-                        crate::qualification_diagnostics::spinner!(
-                            pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningFileChange,
-                        )
-                        .icon(IconName::Loader),
-                    )
+                    this.child(self.spinner_element(
+                        crate::timeline::running_indicator::ActivitySpinnerKind::FileChange,
+                    ))
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(IconName::File).size_4().opacity(0.8))
@@ -97,7 +81,7 @@ impl TimelineView {
                 .into_any_element()
         };
 
-        let running_elapsed_label = format_running_elapsed(item_view);
+        let running_elapsed_label = self.inline_elapsed();
 
         let open = expanded;
 
@@ -111,8 +95,20 @@ impl TimelineView {
             .expect("captured published file change status");
         let final_status = file_change_status_label(status.kind);
         let is_successful = status.successful;
-        let details =
-            self.file_change_details(changed_files.as_slice(), exit_code, output.as_deref(), cx);
+        let details = self.body_element().unwrap_or_else(|| {
+            let output = match item {
+                TurnItem::FileChange { stdout, stderr, .. } => {
+                    file_change_display_text(stdout.as_deref(), stderr.as_deref(), None)
+                }
+                _ => {
+                    file_change_display_text(None, None, Some(Self::timeline_entry_text(item_view)))
+                }
+            };
+            self.file_change_details(changed_files, exit_code, output.as_deref(), cx)
+        });
+        if self.body_only {
+            return details;
+        }
 
         let content = if is_running {
             Collapsible::new()
@@ -154,7 +150,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
@@ -214,7 +210,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
@@ -231,7 +227,7 @@ impl TimelineView {
         changed_files: &[String],
         exit_code: Option<i32>,
         output: Option<&str>,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let mut details = v_flex().w_full().gap_2().pt_1();
         let mut has_details = false;
@@ -316,7 +312,7 @@ impl TimelineView {
         details.into_any_element()
     }
 
-    fn file_change_output_block(&self, text: String, cx: &mut Context<Self>) -> AnyElement {
+    fn file_change_output_block(&self, text: String, cx: &mut App) -> AnyElement {
         div()
             .w_full()
             .overflow_hidden()

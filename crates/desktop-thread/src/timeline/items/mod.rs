@@ -14,7 +14,7 @@ use super::layout::TIMELINE_CONTENT_HORIZONTAL_PADDING;
 use super::layout::TIMELINE_END_BOTTOM_SPACING;
 use super::layout::TIMELINE_ITEM_BOTTOM_SPACING;
 use crate::assets::PioneerIconName;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::Icon;
 use gpui_kit::component::IconName;
 use gpui_kit::component::StyledExt;
@@ -26,7 +26,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use pioneer_client::conversation::reducer::ItemView;
 use pioneer_client::conversation::reducer::TimelineEntry;
-use pioneer_client::conversation::reducer::TimelineEntryStatus;
 use pioneer_client::security::ClientSecurityEnforcementStatus;
 use pioneer_client::security::ClientSecurityFilesystemAccess;
 use pioneer_client::security::ClientTurnSecuritySummary;
@@ -64,36 +63,6 @@ pub(super) fn format_elapsed_ms(elapsed_ms: u64) -> String {
     }
 }
 
-pub(super) fn now_unix_ms() -> i64 {
-    timeline_labels::now_unix_ms()
-}
-
-pub(super) fn format_running_elapsed(item_view: &ItemView) -> Option<String> {
-    pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
-        pioneer_client::timeline::diagnostics::TimelineStage::InlineElapsedFormat,
-        pioneer_client::timeline::diagnostics::DiagnosticAction::Executed,
-        1,
-    ));
-    running_elapsed_ms(
-        item_view.status,
-        item_view.started_at_unix_ms,
-        now_unix_ms(),
-    )
-    .map(format_elapsed_ms)
-}
-
-fn running_elapsed_ms(
-    status: TimelineEntryStatus,
-    started_at_unix_ms: Option<i64>,
-    now_unix_ms: i64,
-) -> Option<u64> {
-    if status != TimelineEntryStatus::Running {
-        return None;
-    }
-    let started_at_unix_ms = started_at_unix_ms?;
-    Some(now_unix_ms.saturating_sub(started_at_unix_ms).max(0) as u64)
-}
-
 pub(super) fn host_from_url(url: &str) -> Option<String> {
     timeline_labels::host_from_url(url)
 }
@@ -113,7 +82,7 @@ fn task_status_label(status: TaskStatus) -> String {
     }
 }
 
-impl TimelineView {
+impl RowPresentation {
     pub(super) fn turn_security_icon(summary: &ClientTurnSecuritySummary) -> PioneerIconName {
         match summary.enforcement {
             ClientSecurityEnforcementStatus::Unavailable => PioneerIconName::ShieldX,
@@ -129,7 +98,7 @@ impl TimelineView {
     pub(super) fn render_turn_security_badge(
         &self,
         summary: &ClientTurnSecuritySummary,
-        _: &mut Context<Self>,
+        _: &mut App,
     ) -> AnyElement {
         h_flex()
             .items_center()
@@ -150,7 +119,7 @@ impl TimelineView {
     pub(super) fn render_turn_security_summary(
         &self,
         summary: &ClientTurnSecuritySummary,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let diagnostic_rows = security_diagnostic_rows(summary);
 
@@ -182,7 +151,7 @@ impl TimelineView {
         &self,
         favicon_url: Option<String>,
         size: Pixels,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         favicon_url
             .map(|url| {
@@ -211,7 +180,7 @@ impl TimelineView {
         &self,
         host_label: &str,
         favicon_url: Option<String>,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         h_flex()
             .w_full()
@@ -228,22 +197,6 @@ impl TimelineView {
             .into_any_element()
     }
 
-    pub(super) fn toggle_timeline_item_expanded(
-        &mut self,
-        entry_id: &str,
-        window: &mut gpui_kit::Window,
-        cx: &mut Context<Self>,
-    ) {
-        crate::timeline::controller::DesktopTimelineController::dispatch(
-            self,
-            &crate::timeline::controller::TimelineAction::Expand {
-                entry_id: entry_id.to_owned(),
-            },
-            window,
-            cx,
-        );
-    }
-
     pub(super) fn render_turn_item_entry(
         &self,
         entry: &TimelineEntry,
@@ -255,7 +208,7 @@ impl TimelineView {
         content_width: Pixels,
         expanded: bool,
         terminal: Option<Entity<terminal::TerminalView>>,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         match item {
             TurnItem::UserMessage { .. } => self.render_item_user_message(
@@ -381,7 +334,7 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let status = task_status_label(task_item.status);
         let is_running = task_item.status == TaskStatus::Running;
@@ -464,7 +417,7 @@ impl TimelineView {
                 .border_color(cx.theme().border);
             if let Some(child_thread_id) = child_thread_id {
                 card.hover(|this| this.bg(cx.theme().muted.opacity(0.6)))
-                    .on_click(cx.listener(move |view, _, window, cx| {
+                    .on_click(self.actions.listener(move |view, _, window, cx| {
                         view.open_task_child_thread(
                             child_thread_id.clone(),
                             title.clone(),
@@ -539,9 +492,7 @@ fn task_uses_stable_card_shell(
 
 #[cfg(test)]
 mod tests {
-    use super::running_elapsed_ms;
     use super::task_uses_stable_card_shell;
-    use pioneer_client::conversation::reducer::TimelineEntryStatus;
     use pioneer_client::timeline::types::TaskAttachmentMode;
 
     #[test]
@@ -559,21 +510,44 @@ mod tests {
             None
         ));
     }
+}
 
-    #[test]
-    fn work_item_elapsed_is_visible_only_while_running() {
-        assert_eq!(
-            running_elapsed_ms(TimelineEntryStatus::Running, Some(1_000), 3_500),
-            Some(2_500)
+impl crate::screen::TimelineView {
+    pub(super) fn toggle_timeline_item_expanded(
+        &mut self,
+        entry_id: &str,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::timeline::controller::DesktopTimelineController::dispatch(
+            self,
+            &crate::timeline::controller::TimelineAction::Expand {
+                entry_id: entry_id.to_owned(),
+            },
+            window,
+            cx,
         );
+    }
+}
 
-        for status in [
-            TimelineEntryStatus::Completed,
-            TimelineEntryStatus::Blocked,
-            TimelineEntryStatus::Failed,
-            TimelineEntryStatus::Cancelled,
-        ] {
-            assert_eq!(running_elapsed_ms(status, Some(1_000), 3_500), None);
+impl crate::screen::TimelineView {
+    pub(super) fn truncate_for_card(text: &str, max_chars: usize) -> String {
+        let mut chars = text.char_indices();
+
+        for _ in 0..max_chars {
+            if chars.next().is_none() {
+                return text.to_owned();
+            }
         }
+
+        let Some((boundary, _)) = chars.next() else {
+            return text.to_owned();
+        };
+
+        let mut result = String::with_capacity(boundary.saturating_add(16));
+        result.push_str(&text[..boundary]);
+        result.push('\n');
+        result.push_str(&t!("timeline.common.truncated").to_string());
+        result
     }
 }

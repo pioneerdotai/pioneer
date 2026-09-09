@@ -1,7 +1,7 @@
 use crate::assets::PioneerIconName;
 use crate::file_opener::LocalFileTarget;
 use crate::file_opener::local_file_target;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::IconName;
 use gpui_kit::component::IconNamed;
 use gpui_kit::component::StyledExt;
@@ -197,31 +197,14 @@ impl Element for MarkdownLinkText {
     }
 }
 
-impl TimelineView {
-    pub(super) fn prepare_markdown_highlights(
-        &self,
-        document: &MarkdownPresentation,
-        cx: &mut Context<Self>,
-    ) {
-        for node in document.code_blocks() {
-            if let MarkdownBlock::Code { language, text } = &node.block {
-                self.prepare_code_highlight(
-                    markdown_node_interaction_id(&document.document_id, node.id),
-                    node.revision,
-                    text,
-                    language.as_deref(),
-                    cx,
-                );
-            }
-        }
-    }
+impl RowPresentation {
     pub(super) fn render_markdown_auto(
         &self,
         interaction_scope: &str,
         text: &str,
         document: Option<&MarkdownPresentation>,
         code_highlight_policy: CodeHighlightPolicy,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         if let Some(document) = document {
             self.render_markdown_document(interaction_scope, document, code_highlight_policy, cx)
@@ -230,7 +213,7 @@ impl TimelineView {
         }
     }
 
-    pub(super) fn render_markdown_plain(&self, text: &str, _cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_markdown_plain(&self, text: &str, _cx: &mut App) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::Markdown
         ));
@@ -268,7 +251,7 @@ impl TimelineView {
         _interaction_scope: &str,
         document: &MarkdownPresentation,
         code_highlight_policy: CodeHighlightPolicy,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::Markdown
@@ -358,7 +341,7 @@ impl TimelineView {
         node: &MarkdownNode,
         code_highlight_policy: CodeHighlightPolicy,
         document_id: &str,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let interaction_id = markdown_node_interaction_id(document_id, node.id);
         match &node.block {
@@ -405,7 +388,7 @@ impl TimelineView {
         inline: &MarkdownInline,
         variant: MarkdownTextVariant,
         interaction_id: u64,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let base = div().w_full().overflow_hidden().whitespace_normal();
         let links = normalized_markdown_links(inline.text.as_str(), &inline.marks);
@@ -441,7 +424,7 @@ impl TimelineView {
                 })
                 .collect();
             let selected_file_opener = self.active_thread_file_opener(cx);
-            let owner = cx.entity().downgrade();
+            let owner = self.actions.owner.clone();
             let element_id: ElementId = ("timeline-markdown-inline", interaction_id).into();
             let text = InteractiveText::new(element_id.clone(), styled_text).on_click(
                 ranges,
@@ -493,7 +476,7 @@ impl TimelineView {
         &self,
         text: &str,
         marks: &[MarkdownMark],
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> StyledText {
         let shared_text = if text.is_empty() {
             SharedString::new_static(" ")
@@ -510,7 +493,7 @@ impl TimelineView {
         }
     }
 
-    fn markdown_highlight(&self, mark: &MarkdownMark, cx: &mut Context<Self>) -> HighlightStyle {
+    fn markdown_highlight(&self, mark: &MarkdownMark, cx: &mut App) -> HighlightStyle {
         match &mark.kind {
             MarkdownMarkKind::Bold => HighlightStyle {
                 font_weight: Some(FontWeight::SEMIBOLD),
@@ -545,7 +528,7 @@ impl TimelineView {
         nodes: &[MarkdownNode],
         code_highlight_policy: CodeHighlightPolicy,
         document_id: &str,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let mut rows = v_flex().w_full().overflow_hidden().gap_1();
         let mut nodes = nodes.iter();
@@ -599,7 +582,7 @@ impl TimelineView {
         blocks: &[MarkdownNode],
         code_highlight_policy: CodeHighlightPolicy,
         document_id: &str,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let mut content = v_flex().w_full().gap_2();
         for block in blocks {
@@ -627,7 +610,7 @@ impl TimelineView {
         text: &str,
         code_highlight_policy: CodeHighlightPolicy,
         interaction_id: u64,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
             pioneer_client::timeline::diagnostics::TimelineStage::MarkdownCodeBlockProjection,
@@ -1048,5 +1031,25 @@ mod tests {
             MarkdownClickTarget::from_url(Arc::from("https://example.com")),
             MarkdownClickTarget::Web(Arc::from("https://example.com"))
         );
+    }
+}
+
+impl crate::screen::TimelineView {
+    pub(super) fn prepare_markdown_highlights(
+        &self,
+        document: &MarkdownPresentation,
+        cx: &mut Context<Self>,
+    ) {
+        for node in document.code_blocks() {
+            if let MarkdownBlock::Code { language, text } = &node.block {
+                self.prepare_code_highlight(
+                    markdown_node_interaction_id(&document.document_id, node.id),
+                    node.revision,
+                    text,
+                    language.as_deref(),
+                    cx,
+                );
+            }
+        }
     }
 }

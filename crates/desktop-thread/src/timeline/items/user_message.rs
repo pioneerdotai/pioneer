@@ -4,7 +4,7 @@ use super::super::layout::TIMELINE_CONTENT_HORIZONTAL_PADDING;
 use super::super::layout::TIMELINE_MESSAGE_END_BOTTOM_SPACING;
 use super::super::markdown::CodeHighlightPolicy;
 use crate::assets::PioneerIconName;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use chrono::Local;
 use chrono::TimeZone;
 use gpui_kit::component::Icon;
@@ -32,7 +32,7 @@ use pioneer_client::timeline::types::TurnAuthorSnapshot;
 use pioneer_client::timeline::types::TurnItem;
 use std::path::PathBuf;
 
-impl TimelineView {
+impl RowPresentation {
     pub(crate) fn render_item_user_message(
         &self,
         entry: &TimelineEntry,
@@ -44,7 +44,7 @@ impl TimelineView {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let (raw_text, attachments) = match item {
             TurnItem::UserMessage {
@@ -69,11 +69,7 @@ impl TimelineView {
             .unwrap_or_default();
 
         let copy_text = raw_text.to_owned();
-        let current_principal_id = self
-            .identity_input
-            .as_ref()
-            .and_then(|input| input.current_auth.as_ref())
-            .map(|auth| &auth.principal.id);
+        let current_principal_id = self.principal_id.as_ref();
         let alignment = if super::super::user_message_uses_current_principal_alignment(
             presentation,
             exact_author,
@@ -125,7 +121,7 @@ impl TimelineView {
         let context_timestamp = timestamp_text;
         let context_last_edited_timestamp = last_edited_timestamp_text;
         let context_copy_text = copy_text.clone();
-        let desktop_entity = cx.entity().downgrade();
+        let desktop_entity = self.actions.owner.clone();
         let mut row = div().flex().w_full().justify_center();
 
         row = row.pt(top_spacing.pixels());
@@ -374,7 +370,7 @@ impl TimelineView {
         attachments: Vec<ParsedUserAttachment>,
         workspace_id: Option<String>,
         align_end: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let item_id = item_id.to_owned();
         let can_read_artifacts = self.active_artifact_presentation_policy().can_open;
@@ -433,11 +429,10 @@ impl TimelineView {
                             .child(attachment.display_name),
                     )
                     .when_some(artifact_id, |this, artifact_id| {
-                        this.hover(|this| this.opacity(0.8)).on_click(cx.listener(
-                            move |view, _, _, cx| {
+                        this.hover(|this| this.opacity(0.8))
+                            .on_click(self.actions.listener(move |view, _, _, cx| {
                                 view.open_thread_artifact_in_sidebar(artifact_id.clone(), cx);
-                            },
-                        ))
+                            }))
                     })
             }))
             .into_any_element()
@@ -447,7 +442,7 @@ impl TimelineView {
         &self,
         preview_image_path: Option<PathBuf>,
         kind: ParsedUserAttachmentKind,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         if matches!(
             kind,
@@ -497,10 +492,7 @@ fn attachment_file_icon(flex_none: bool) -> gpui_kit::Div {
     )
 }
 
-fn attachment_capability_icon(
-    kind: ParsedUserAttachmentKind,
-    cx: &mut Context<TimelineView>,
-) -> gpui_kit::Div {
+fn attachment_capability_icon(kind: ParsedUserAttachmentKind, cx: &mut App) -> gpui_kit::Div {
     let icon = match kind {
         ParsedUserAttachmentKind::Skill => PioneerIconName::Zap,
         ParsedUserAttachmentKind::Mcp => PioneerIconName::Mcp,

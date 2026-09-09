@@ -35,6 +35,22 @@ impl TimelineView {
         layout: Rc<TimelineLayoutIndex>,
         cx: &mut Context<Self>,
     ) {
+        let live = layout
+            .grouping()
+            .avatar_groups()
+            .iter()
+            .filter(|group| {
+                matches!(
+                    group.source,
+                    TimelineAvatarSource::Agent {
+                        shows_running_dino: true,
+                        ..
+                    }
+                )
+            })
+            .map(|group| group.activity_id.clone())
+            .collect();
+        self.avatar_activities.borrow_mut().retain(&live);
         let avatar_demands = layout
             .grouping()
             .avatar_groups()
@@ -109,10 +125,7 @@ impl TimelineView {
                     ..
                 }
             ) {
-                self.prepare_running_dino(
-                    format!("avatar:{}:{}", group.first_row_index, group.last_row_index),
-                    cx,
-                );
+                self.prepare_running_dino(group.activity_id.clone(), cx);
             }
         }
     }
@@ -148,7 +161,7 @@ impl TimelineView {
                         ..
                     } => TimelineAvatarVisual::RunningAgent {
                         dino: self.running_turn_dino_view(
-                            format!("avatar:{}:{}", group.first_row_index, group.last_row_index),
+                            group.activity_id.clone(),
                             cx,
                         ),
                     },

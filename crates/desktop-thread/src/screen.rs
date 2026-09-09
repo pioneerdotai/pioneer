@@ -2,7 +2,7 @@
 pub(crate) use crate::timeline::state::TimelinePresentationState;
 use crate::{
     avatar::DesktopMemberAvatarState, binding::ThreadBindings, ports::*,
-    timeline::RunningIndicatorViewCache,
+    timeline::TimelineAvatarActivities,
 };
 use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::{prelude::*, *};
@@ -66,7 +66,7 @@ pub(crate) struct TimelineView {
     pub(crate) retained_context: Option<(Pixels, u64, gpui_kit::TextStyle)>,
     pub(crate) row_registry: crate::timeline::row_registry::TimelineRowRegistry,
     pub(crate) thread_timeline_view_state: crate::timeline::state::TimelineViewState,
-    pub(crate) running_indicator_views: RefCell<RunningIndicatorViewCache>,
+    pub(crate) avatar_activities: RefCell<TimelineAvatarActivities>,
     pub(crate) thread_timeline_terminal_item:
         RefCell<crate::timeline::terminal_registry::TerminalRegistry>,
     pub(crate) markdown_highlights:
@@ -92,13 +92,16 @@ impl Render for TimelineView {
     }
 }
 impl TimelineView {
-    pub(crate) fn retire_timeline_rows(&mut self) {
+    pub(crate) fn retire_timeline_rows(&mut self, cx: &mut Context<Self>) {
+        self.set_row_activities_visible(&std::collections::HashSet::new(), cx);
+        self.avatar_activities.borrow_mut().set_active(false, cx);
         crate::timeline::controller::DesktopTimelineController::exit(self);
         self.measurement_coordinator.cancel();
         self.retained_context = None;
         self.thread_timeline_view_state.prepared = None;
         self.thread_timeline_view_state.model = crate::timeline::TimelineRenderModel::empty();
         self.row_registry = Default::default();
+        self.avatar_activities = Default::default();
         self.layout_store = Default::default();
         self.markdown_highlights.borrow_mut().clear();
         self.thread_timeline_terminal_item.borrow_mut().clear();
@@ -112,11 +115,10 @@ impl TimelineView {
         self.thread_timeline_view_state.visible = visible;
         self.thread_bindings.set_active(visible);
         if visible {
-            self.running_indicator_views
-                .borrow_mut()
-                .set_active(true, cx);
+            self.avatar_activities.borrow_mut().set_active(true, cx);
             self.synchronize_inputs(window, cx);
         } else {
+            self.set_row_activities_visible(&std::collections::HashSet::new(), cx);
             crate::timeline::controller::DesktopTimelineController::exit(self);
             self.measurement_coordinator.cancel();
             self.retained_context = None;
@@ -130,9 +132,7 @@ impl TimelineView {
             self.task_review_views.clear();
             self.message_deletion_view = None;
             self.member_avatar_state.clear();
-            self.running_indicator_views
-                .borrow_mut()
-                .set_active(false, cx);
+            self.avatar_activities.borrow_mut().set_active(false, cx);
         }
     }
     pub(crate) fn current_active_thread_id(&self) -> Option<&str> {
@@ -502,7 +502,7 @@ impl TimelineView {
                 row_registry: Default::default(),
                 layout_store: Default::default(),
                 measurement_coordinator: Default::default(),
-                running_indicator_views: RefCell::default(),
+                avatar_activities: RefCell::default(),
                 thread_timeline_terminal_item: RefCell::default(),
                 markdown_highlights: RefCell::default(),
                 pending_request_views: HashMap::new(),
@@ -602,7 +602,7 @@ impl TimelineView {
             .is_some_and(|p| p.current_auth.is_some())
             && !authorized;
         if lost_access || (previous_session.is_some() && previous_session != next_session) {
-            self.retire_timeline_rows();
+            self.retire_timeline_rows(cx);
             self.timeline_access_revoked = true;
         }
         if authorized {

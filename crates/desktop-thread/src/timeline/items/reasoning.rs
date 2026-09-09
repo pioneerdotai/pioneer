@@ -1,8 +1,7 @@
 use super::super::TimelineRowTopSpacing;
 use super::super::markdown::CodeHighlightPolicy;
-use super::format_running_elapsed;
 use crate::assets::PioneerIconName;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::*;
@@ -11,43 +10,41 @@ use gpui_kit::*;
 use pioneer_client::conversation::reducer::ItemView;
 use pioneer_client::conversation::reducer::TimelineEntry;
 use pioneer_client::conversation::reducer::TimelineEntryStatus;
-use pioneer_client::timeline::labels::reasoning_text;
 use pioneer_client::timeline::types::TurnItem;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-impl TimelineView {
+impl RowPresentation {
     pub(super) fn render_item_reasoning(
         &self,
         entry: &TimelineEntry,
         item_view: &ItemView,
         content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
-        item: &TurnItem,
+        _item: &TurnItem,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
         expanded: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
-        let body = match item {
-            TurnItem::Reasoning {
-                summary, content, ..
-            } => reasoning_text(summary, content, Self::timeline_entry_text(item_view)),
-            _ => Self::timeline_entry_text(item_view).to_owned(),
-        };
-
-        let has_body = !body.trim().is_empty();
+        let body = &self.reasoning_body;
+        let has_body = self.reasoning_has_body;
 
         let code_highlight_policy = CodeHighlightPolicy::for_timeline_status(item_view.status);
-        let body_element = self.render_markdown_auto(
-            item_view.id.as_str(),
-            body.as_str(),
-            content.markdown_presentation.as_ref(),
-            code_highlight_policy,
-            cx,
-        );
+        let body_element = self.body_element().unwrap_or_else(|| {
+            self.render_markdown_auto(
+                item_view.id.as_str(),
+                body.as_ref(),
+                content.markdown_presentation.as_ref(),
+                code_highlight_policy,
+                cx,
+            )
+        });
+        if self.body_only {
+            return body_element;
+        }
 
-        let running_elapsed_label = format_running_elapsed(item_view);
+        let running_elapsed_label = self.inline_elapsed();
 
         let open = expanded;
 
@@ -81,10 +78,7 @@ impl TimelineView {
                                             .items_center()
                                             .gap_2()
                                             .child(
-                                                crate::qualification_diagnostics::spinner!(
-                                                    pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningReasoning,
-                                                )
-                                                .icon(IconName::Loader),
+                                                self.spinner_element(crate::timeline::running_indicator::ActivitySpinnerKind::Reasoning),
                                             )
                                             .child(t!("timeline.reasoning.running").to_string()),
                                     )
@@ -107,7 +101,7 @@ impl TimelineView {
                             )
                             .on_click({
                                 let entry_id = entry_id.clone();
-                                cx.listener(move |this, _, window, cx| {
+                                self.actions.listener(move |this, _, window, cx| {
                                     this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                                 })
                             }),
@@ -125,12 +119,9 @@ impl TimelineView {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                crate::qualification_diagnostics::spinner!(
-                                    pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningReasoning,
-                                )
-                                .icon(IconName::Loader),
-                            )
+                            .child(self.spinner_element(
+                                crate::timeline::running_indicator::ActivitySpinnerKind::Reasoning,
+                            ))
                             .child(t!("timeline.reasoning.running").to_string()),
                     )
                     .child(
@@ -194,7 +185,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),

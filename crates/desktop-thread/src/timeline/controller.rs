@@ -28,7 +28,7 @@ impl DesktopTimelineController {
         let Some(model) = view.thread_bindings.timeline_model(Some(&view.thread_id)) else {
             let changed = view.thread_timeline_view_state.prepared.is_some()
                 || view.measurement_coordinator.draw.is_some();
-            view.retire_timeline_rows();
+            view.retire_timeline_rows(cx);
             return changed;
         };
         if (view.thread_timeline_view_state.prepared.is_some()
@@ -125,7 +125,11 @@ impl DesktopTimelineController {
                 .as_ref()
                 .is_some_and(|input| input.current_auth.is_some());
         if !available {
+            view.set_row_activities_visible(&std::collections::HashSet::new(), cx);
+            view.avatar_activities.borrow_mut().set_active(false, cx);
             Self::exit(view);
+        } else {
+            view.avatar_activities.borrow_mut().set_active(true, cx);
         }
         let bounds = view.thread_timeline_view_state.scroll_handle.bounds();
         let rem_changed = view.thread_timeline_view_state.layout_rem != window.rem_size();
@@ -165,6 +169,12 @@ impl DesktopTimelineController {
             .iter()
             .map(|row| row.key().to_owned())
             .collect::<Vec<_>>();
+        let visible_rows = if available {
+            ids.iter().cloned().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        view.set_row_activities_visible(&visible_rows, cx);
         let mut activities = std::collections::HashSet::new();
         for row in prepared
             .model
@@ -205,13 +215,10 @@ impl DesktopTimelineController {
                 .avatar_group_bounds(group)
                 .is_some_and(|(top, bottom)| top < offset + bounds.size.height && bottom > offset)
             {
-                activities.insert(format!(
-                    "avatar:{}:{}",
-                    group.first_row_index, group.last_row_index
-                ));
+                activities.insert(group.activity_id.clone());
             }
         }
-        view.running_indicator_views
+        view.avatar_activities
             .borrow_mut()
             .set_visible_activities(&activities, cx);
         if available && let Some(workspace) = view.thread_workspace_id(&view.thread_id) {

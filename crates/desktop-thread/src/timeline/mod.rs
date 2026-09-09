@@ -7,7 +7,9 @@ pub(crate) mod layout_index;
 pub(crate) mod layout_store;
 mod markdown;
 pub(crate) mod model;
+mod row_presentation;
 pub(crate) mod row_registry;
+mod row_view;
 mod running_indicator;
 mod scroll;
 mod semantic_adapter;
@@ -25,7 +27,7 @@ pub(crate) use self::layout::TimelineRowLayout;
 pub(crate) use self::layout::TimelineRowTopSpacing;
 use self::model::TimelineRow;
 use self::model::TimelineRowKind;
-pub(crate) use self::running_indicator::RunningIndicatorViewCache;
+pub(crate) use self::running_indicator::TimelineAvatarActivities;
 pub(crate) use self::scroll::TimelineScrollState;
 use crate::screen::TimelineView;
 use gpui_kit::prelude::*;
@@ -46,14 +48,36 @@ use std::rc::Rc;
 pub(super) struct TimelineLayoutMeasurement {
     entries: Vec<(layout_store::RowMeasurementKey, AnyElement)>,
     row_width: Pixels,
+    bodies: Vec<(
+        pioneer_client::timeline::presentation::RowId,
+        Pixels,
+        AnyElement,
+    )>,
+    row_inputs: Vec<(layout_store::RowMeasurementKey, Option<TurnAuthorSnapshot>)>,
 }
 impl TimelineLayoutMeasurement {
     fn measure(
         self,
         window: &mut Window,
         cx: &mut App,
-    ) -> Vec<(layout_store::RowMeasurementKey, Pixels)> {
-        self.entries
+    ) -> (
+        Vec<(layout_store::RowMeasurementKey, Pixels)>,
+        Vec<(pioneer_client::timeline::presentation::RowId, Pixels)>,
+    ) {
+        let bodies = self
+            .bodies
+            .into_iter()
+            .map(|(id, width, mut element)| {
+                let bounds = element.layout_as_root(
+                    size(AvailableSpace::Definite(width), AvailableSpace::MaxContent),
+                    window,
+                    cx,
+                );
+                (id, bounds.height)
+            })
+            .collect();
+        let rows = self
+            .entries
             .into_iter()
             .map(|(key, mut element)| {
                 let measured = element.layout_as_root(
@@ -69,7 +93,8 @@ impl TimelineLayoutMeasurement {
                     (measured.height + TIMELINE_ROW_MEASUREMENT_GUARD).max(px(1.)),
                 )
             })
-            .collect()
+            .collect();
+        (rows, bodies)
     }
 }
 
@@ -322,6 +347,8 @@ impl TimelineView {
         cx: &mut Context<Self>,
     ) -> TimelineLayoutMeasurement {
         let mut entries = Vec::new();
+        let mut row_inputs = Vec::new();
+        let mut bodies = Vec::new();
         let expanded = self.thread_timeline_view_state.expanded.borrow();
         let principal = self
             .identity_input
@@ -334,6 +361,7 @@ impl TimelineView {
                 let author = grouping.agent_author_for_group_start(ix);
                 let key = layout_store::RowMeasurementKey {
                     id: row.id().clone(),
+                    dependencies_revision: row_view::row_dependency_revision(self, row, cx),
                     layout_revision: row.revision(),
                     content_revision: row.content_revision(),
                     presentation_revision: row.metadata_revision(),
@@ -352,27 +380,32 @@ impl TimelineView {
                     principal: principal.clone(),
                     task_child: self.active_task_thread_navigation().is_some(),
                 };
+                row_inputs.push((key.clone(), author.cloned()));
                 if self.layout_store.height(&key).is_none() {
                     let slot = self
                         .row_registry
                         .get(row.id())
                         .expect("live published row slot");
-                    entries.push((
-                        key,
-                        slot.render(
-                            self,
-                            ix + 1 == snapshot.rows().len(),
-                            layout,
-                            author,
-                            content_width,
-                            expanded.contains(row.id().as_str()),
-                            cx,
-                        ),
-                    ));
+                    let presentation = row_view::RowPresentation::new(
+                        slot.clone(),
+                        key.clone(),
+                        author.cloned(),
+                        self,
+                        cx,
+                    );
+                    if let Some(body) = presentation.body_measurement(cx) {
+                        bodies.push(body);
+                    }
+                    entries.push((key, presentation.render(cx)));
                 }
             }
         }
-        TimelineLayoutMeasurement { entries, row_width }
+        TimelineLayoutMeasurement {
+            bodies,
+            entries,
+            row_width,
+            row_inputs,
+        }
     }
 
     fn timeline_render_row_text_len(

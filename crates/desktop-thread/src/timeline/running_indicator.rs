@@ -26,9 +26,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 const MIN_DINO_FRAME_DELAY: Duration = Duration::from_millis(16);
-const INDICATOR_CACHE_TTL: Duration = Duration::from_secs(60);
-const DINO_OFFSCREEN_GRACE: Duration = Duration::from_secs(2);
-const ELAPSED_OFFSCREEN_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 struct RunningDinoFrame {
@@ -62,7 +59,7 @@ enum RunningDinoAssetState {
     Failed,
 }
 
-struct RunningDinoAssetLoader {
+pub(super) struct RunningDinoAssetLoader {
     state: Mutex<RunningDinoAssetState>,
 }
 
@@ -192,7 +189,7 @@ pub(crate) struct RunningDinoView {
     assets: Option<Arc<RunningDinoAssets>>,
     asset_request_registered: bool,
     frame_index: usize,
-    last_visible_at: Instant,
+    generation: u64,
     viewport_visible: bool,
     clock_active: bool,
     clock_task: Option<gpui_kit::Task<()>>,
@@ -201,13 +198,13 @@ pub(crate) struct RunningDinoView {
 }
 
 impl RunningDinoView {
-    fn new(assets_loader: Arc<RunningDinoAssetLoader>, active: bool) -> Self {
+    pub(super) fn new(assets_loader: Arc<RunningDinoAssetLoader>, active: bool) -> Self {
         Self {
             assets_loader,
             assets: None,
             asset_request_registered: false,
             frame_index: 0,
-            last_visible_at: Instant::now(),
+            generation: 0,
             viewport_visible: false,
             clock_active: false,
             clock_task: None,
@@ -261,6 +258,7 @@ impl RunningDinoView {
         }
         self.reduce_motion = reduced;
         if reduced {
+            self.generation += 1;
             self.clock_task.take();
             self.clock_active = false;
             self.frame_index = 0;
@@ -300,6 +298,7 @@ impl RunningDinoView {
             return;
         }
         self.clock_active = true;
+        let generation = self.generation;
         let first_delay = self
             .assets
             .as_ref()
@@ -325,23 +324,11 @@ impl RunningDinoView {
                     ));
                     let next_delay = this
                         .update(&mut cx, |view, cx| {
-                            if view.reduce_motion {
-                                view.clock_active = false;
+                            if view.generation != generation {
                                 return None;
                             }
-                            if view.suspended || (!view.viewport_visible && view.last_visible_at.elapsed() > DINO_OFFSCREEN_GRACE) {
+                            if view.reduce_motion || view.suspended || !view.viewport_visible {
                                 view.clock_active = false;
-                                // Visibility entry resumes the retained clock.
-                                // This final notification preserves the existing
-                                // grace-period completion cadence.
-                                pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(
-                                    record_animation_activity(
-                                        pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningDinoClock,
-                                        pioneer_client::timeline::diagnostics::DiagnosticAction::Requested,
-                                        pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-                                    )
-                                );
-                                cx.notify();
                                 return None;
                             }
                             let assets = view.assets.as_ref()?;
@@ -408,358 +395,280 @@ impl Render for RunningDinoView {
     }
 }
 
+impl RunningDinoView {
+    pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        let changed = self.viewport_visible != visible;
+        self.viewport_visible = visible;
+        self.suspended = !visible;
+        if !visible {
+            if changed {
+                self.generation += 1;
+            }
+            self.clock_task.take();
+            self.clock_active = false;
+            self.frame_index = 0;
+        } else {
+            self.synchronize_motion(cx);
+            self.ensure_assets(cx);
+            self.ensure_clock(cx);
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ElapsedPlacement {
+    Inline,
+    Running { show_dino: bool },
+}
+
+/// A mounted wall-clock sample advanced by monotonic time, with a floor across suspension.
+pub(super) struct ElapsedAnchor {
+    sampled_elapsed_ms: i128,
+    mounted_at: Instant,
+    floor_ms: u64,
+}
+impl ElapsedAnchor {
+    fn new(start: i64, wall: i64, now: Instant, floor_ms: u64) -> Self {
+        Self {
+            sampled_elapsed_ms: wall as i128 - start as i128,
+            mounted_at: now,
+            floor_ms,
+        }
+    }
+    fn elapsed(&self, now: Instant) -> u64 {
+        let elapsed = (self.sampled_elapsed_ms
+            + now
+                .saturating_duration_since(self.mounted_at)
+                .as_millis()
+                .min(i128::MAX as u128) as i128)
+            .clamp(0, u64::MAX as i128) as u64;
+        elapsed.max(self.floor_ms)
+    }
+}
+fn elapsed_delay(elapsed: u64) -> Duration {
+    Duration::from_millis(1_000 - elapsed % 1_000)
+}
+
 pub(crate) struct RunningElapsedView {
-    elapsed_ms: u64,
-    started_at_unix_ms: i64,
-    show_dino: bool,
-    last_visible_at: Instant,
-    viewport_visible: bool,
-    clock_active: bool,
-    clock_task: Option<gpui_kit::Task<()>>,
-    suspended: bool,
+    started_at: i64,
+    placement: ElapsedPlacement,
+    anchor: Option<ElapsedAnchor>,
+    floor_ms: u64,
+    displayed_seconds: u64,
+    task: Option<Task<()>>,
+    generation: u64,
+}
+macro_rules! record_elapsed_clock {
+    ($action:ident) => {
+        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_animation_activity(
+            pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
+            pioneer_client::timeline::diagnostics::DiagnosticAction::$action,
+            pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
+        ));
+    };
 }
 
 impl RunningElapsedView {
-    fn new(started_at_unix_ms: i64, show_dino: bool, active: bool) -> Self {
+    pub(super) fn new(started_at: i64, placement: ElapsedPlacement) -> Self {
         Self {
-            started_at_unix_ms,
-            elapsed_ms: now_unix_ms().saturating_sub(started_at_unix_ms).max(0) as u64,
-            show_dino,
-            last_visible_at: Instant::now(),
-            viewport_visible: false,
-            clock_active: false,
-            clock_task: None,
-            suspended: !active,
+            started_at,
+            placement,
+            anchor: None,
+            floor_ms: 0,
+            displayed_seconds: 0,
+            task: None,
+            generation: 0,
         }
     }
-
-    fn ensure_clock(&mut self, cx: &mut Context<Self>) {
-        if self.suspended || !self.viewport_visible || self.clock_active {
+    pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible == self.anchor.is_some() {
             return;
         }
-        let elapsed_ms = now_unix_ms().saturating_sub(self.started_at_unix_ms).max(0) as u64;
-        if self.elapsed_ms != elapsed_ms {
-            self.elapsed_ms = elapsed_ms;
-            cx.notify();
+        self.generation += 1;
+        if self.task.take().is_some() {
+            record_elapsed_clock!(Cancelled);
         }
-        self.clock_active = true;
-        let started_at_unix_ms = self.started_at_unix_ms;
-        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_animation_activity(
-            pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
-            pioneer_client::timeline::diagnostics::DiagnosticAction::Scheduled,
-            pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-        ));
-        self.clock_task = Some(cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                loop {
-                    let delay = next_elapsed_tick_delay(started_at_unix_ms, now_unix_ms());
-                    cx.background_executor().timer(delay).await;
-                    pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
-                        pioneer_client::timeline::diagnostics::DiagnosticAction::Woke,
-                        pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-                    ));
-                    let keep_running = this
-                        .update(&mut cx, |view, cx| {
-                            view.elapsed_ms = now_unix_ms().saturating_sub(view.started_at_unix_ms).max(0) as u64;
-                            if view.suspended || (!view.viewport_visible && view.last_visible_at.elapsed() > ELAPSED_OFFSCREEN_GRACE) {
-                                view.clock_active = false;
-                                // Distinguish a temporarily stalled UI from an
-                                // offscreen view without polling forever. A
-                                // mounted view renders once and restarts on the
-                                // next absolute-second boundary.
-                                pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(
-                                    record_animation_activity(
-                                        pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
-                                        pioneer_client::timeline::diagnostics::DiagnosticAction::Requested,
-                                        pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-                                    )
-                                );
-                                cx.notify();
-                                return false;
-                            }
-                            pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(
-                                record_animation_activity(
-                                    pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
-                                    pioneer_client::timeline::diagnostics::DiagnosticAction::Requested,
-                                    pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-                                )
-                            );
+        if !visible {
+            if let Some(anchor) = self.anchor.take() {
+                self.floor_ms = anchor.elapsed(Instant::now());
+            }
+            return;
+        }
+        let anchor = ElapsedAnchor::new(
+            self.started_at,
+            now_unix_ms(),
+            Instant::now(),
+            self.floor_ms,
+        );
+        let elapsed = anchor.elapsed(Instant::now());
+        self.anchor = Some(anchor);
+        self.displayed_seconds = elapsed / 1_000;
+        cx.notify();
+        let generation = self.generation;
+        self.task = Some(cx.spawn(async move |weak, cx| {
+            let mut delay = elapsed_delay(elapsed);
+            loop {
+                record_elapsed_clock!(Scheduled);
+                cx.background_executor().timer(delay).await;
+                record_elapsed_clock!(Woke);
+                let next = weak
+                    .update(cx, |view, cx| {
+                        if view.generation != generation {
+                            return None;
+                        }
+                        let elapsed = view.anchor.as_ref()?.elapsed(Instant::now());
+                        view.floor_ms = view.floor_ms.max(elapsed);
+                        let seconds = elapsed / 1_000;
+                        if seconds != view.displayed_seconds {
+                            view.displayed_seconds = seconds;
+                            record_elapsed_clock!(Requested);
                             cx.notify();
-                            true
-                        })
-                        .unwrap_or(false);
-                    if !keep_running {
-                        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_animation_activity(
-                            pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
-                            pioneer_client::timeline::diagnostics::DiagnosticAction::Cancelled,
-                            pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-                        ));
-                        break;
-                    }
-                    pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_animation_activity(
-                        pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningElapsedClock,
-                        pioneer_client::timeline::diagnostics::DiagnosticAction::Scheduled,
-                        pioneer_client::timeline::diagnostics::Visibility::NotApplicable,
-                    ));
-                }
+                        }
+                        Some(elapsed_delay(elapsed))
+                    })
+                    .ok()
+                    .flatten();
+                let Some(next) = next else {
+                    break;
+                };
+                delay = next;
             }
         }));
     }
 }
-
 impl Render for RunningElapsedView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
-            pioneer_client::timeline::diagnostics::RenderRegion::RunningElapsed
-        ));
-        let elapsed_ms = self.elapsed_ms;
-        let elapsed = if elapsed_ms >= 1_000 {
-            format_elapsed_ms(elapsed_ms)
-        } else {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.displayed_seconds == 0 && self.placement != ElapsedPlacement::Inline {
             String::new()
+        } else {
+            format_elapsed_ms(self.displayed_seconds.saturating_mul(1_000))
         };
-
         div()
             .id("running-activity-elapsed")
-            .pt_1()
-            .when(!self.show_dino, |this| this.pt_0().mb(px(2.)))
-            .font_semibold()
-            .child(elapsed)
+            .whitespace_nowrap()
+            .flex_shrink_0()
+            .text_right()
+            .when(
+                matches!(self.placement, ElapsedPlacement::Running { .. }),
+                |this| this.font_semibold().pt_1(),
+            )
+            .when(
+                self.placement == ElapsedPlacement::Running { show_dino: false },
+                |this| this.pt_0().mb(px(2.)),
+            )
+            .child(label)
     }
 }
 
-fn next_elapsed_tick_delay(started_at_unix_ms: i64, now_unix_ms: i64) -> Duration {
-    let elapsed_ms = now_unix_ms.saturating_sub(started_at_unix_ms).max(0);
-    let until_next_second = 1_000_i64.saturating_sub(elapsed_ms.rem_euclid(1_000));
-    Duration::from_millis(u64::try_from(until_next_second.max(1)).unwrap_or(1_000))
+pub(super) struct ActivityIndicatorView {
+    #[cfg_attr(not(feature = "qualification-diagnostics"), allow(dead_code))]
+    source: ActivitySpinnerKind,
+    visible: bool,
 }
-
-struct CachedIndicatorView<T> {
-    view: Entity<T>,
-    last_used: Instant,
-}
-
-struct RunningElapsedViewEntry {
-    started_at_unix_ms: i64,
-    show_dino: bool,
-    cached: CachedIndicatorView<RunningElapsedView>,
-}
-
-pub(crate) struct RunningIndicatorViewCache {
-    active: bool,
-    assets_loader: Arc<RunningDinoAssetLoader>,
-    dino: HashMap<String, CachedIndicatorView<RunningDinoView>>,
-    elapsed: HashMap<String, RunningElapsedViewEntry>,
-}
-
-impl Default for RunningIndicatorViewCache {
-    fn default() -> Self {
+impl ActivityIndicatorView {
+    pub(super) fn new(source: ActivitySpinnerKind) -> Self {
         Self {
-            active: true,
-            assets_loader: Arc::default(),
-            dino: HashMap::new(),
-            elapsed: HashMap::new(),
+            source,
+            visible: false,
+        }
+    }
+    pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
         }
     }
 }
-
-impl RunningIndicatorViewCache {
-    pub(crate) fn set_visible_activities(
-        &mut self,
-        activities: &std::collections::HashSet<String>,
-        cx: &mut App,
-    ) {
-        let now = Instant::now();
-        for (id, entry) in &self.dino {
-            let visible = activities.contains(id);
-            entry.view.update(cx, |view, cx| {
-                if view.viewport_visible != visible {
-                    view.last_visible_at = now;
-                }
-                view.viewport_visible = visible;
-                view.synchronize_motion(cx);
-                if visible {
-                    view.ensure_assets(cx);
-                    view.ensure_clock(cx);
-                }
-            });
-        }
-        for (id, entry) in &self.elapsed {
-            let visible = activities.contains(id);
-            entry.cached.view.update(cx, |view, cx| {
-                if view.viewport_visible != visible {
-                    view.last_visible_at = now;
-                }
-                view.viewport_visible = visible;
-                if visible {
-                    view.ensure_clock(cx);
-                }
-            });
-        }
-    }
-    pub(crate) fn set_active(&mut self, active: bool, cx: &mut App) {
-        self.active = active;
-        for entry in self.dino.values() {
-            entry.view.update(cx, |view, cx| {
-                if view.suspended == !active {
-                    return;
-                }
-                view.suspended = !active;
-                if !active {
-                    view.clock_task.take();
-                    view.clock_active = false;
-                } else {
-                    view.ensure_clock(cx);
-                    cx.notify();
-                }
-            });
-        }
-        for entry in self.elapsed.values() {
-            entry.cached.view.update(cx, |view, cx| {
-                if view.suspended == !active {
-                    return;
-                }
-                view.suspended = !active;
-                if !active {
-                    view.clock_task.take();
-                    view.clock_active = false;
-                } else {
-                    view.ensure_clock(cx);
-                    cx.notify();
-                }
-            });
-        }
-    }
-
-    fn prune(&mut self, now: Instant) {
-        self.dino
-            .retain(|_, entry| now.duration_since(entry.last_used) <= INDICATOR_CACHE_TTL);
-        self.elapsed
-            .retain(|_, entry| now.duration_since(entry.cached.last_used) <= INDICATOR_CACHE_TTL);
-    }
-}
-
-impl TimelineView {
-    pub(super) fn semantic_timeline_has_running_turn_row(&self) -> bool {
-        let active_thread_id = self.current_active_thread_id().map(str::to_owned);
-        let model = self.semantic_timeline_render_model(active_thread_id.as_deref());
-        model.rows.iter().any(|row| {
-            matches!(
-                row,
-                super::TimelineRenderRow::Timeline(TimelineRow {
-                    kind: TimelineRowKind::RunningTurn(_),
-                    ..
-                })
+impl Render for ActivityIndicatorView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_4().when(self.visible, |this| {
+            this.child(
+                crate::qualification_diagnostics::spinner!(self.source.diagnostic_source())
+                    .icon(gpui_kit::component::IconName::Loader),
             )
         })
     }
+}
 
+/// Published avatar activities only; clocks stop immediately when the avatar is not visible.
+#[derive(Default)]
+pub(crate) struct TimelineAvatarActivities {
+    pub(super) assets_loader: Arc<RunningDinoAssetLoader>,
+    dino: HashMap<String, Entity<RunningDinoView>>,
+    active: bool,
+}
+impl TimelineAvatarActivities {
+    pub(crate) fn set_active(&mut self, active: bool, cx: &mut App) {
+        self.active = active;
+        if !active {
+            for view in self.dino.values() {
+                view.update(cx, |view, cx| view.set_visible(false, cx));
+            }
+        }
+    }
+    pub(crate) fn set_visible_activities(
+        &mut self,
+        ids: &std::collections::HashSet<String>,
+        cx: &mut App,
+    ) {
+        for (id, view) in &self.dino {
+            view.update(cx, |view, cx| {
+                view.set_visible(self.active && ids.contains(id), cx)
+            });
+        }
+    }
+    pub(super) fn retain(&mut self, live: &std::collections::HashSet<String>) {
+        self.dino.retain(|id, _| live.contains(id));
+    }
+}
+impl TimelineView {
     pub(super) fn prepare_running_dino(
         &self,
-        activity_id: String,
+        id: String,
         cx: &mut Context<Self>,
     ) -> Entity<RunningDinoView> {
-        let now = Instant::now();
-        let mut cache = self.running_indicator_views.borrow_mut();
-        cache.prune(now);
-        if let Some(entry) = cache.dino.get_mut(&activity_id) {
-            entry.last_used = now;
-            entry.view.update(cx, |view, cx| {
-                view.ensure_assets(cx);
-                view.ensure_clock(cx);
-            });
-            return entry.view.clone();
+        let mut views = self.avatar_activities.borrow_mut();
+        if let Some(view) = views.dino.get(&id) {
+            return view.clone();
         }
-
-        let assets_loader = cache.assets_loader.clone();
-        let view = cx.new(|cx| {
-            let mut view = RunningDinoView::new(assets_loader, cache.active);
-            view.reduce_motion = cx.reduce_motion();
-            view.ensure_assets(cx);
-            view.ensure_clock(cx);
-            view
-        });
-        cache.dino.insert(
-            activity_id,
-            CachedIndicatorView {
-                view: view.clone(),
-                last_used: now,
-            },
-        );
+        let view = cx.new(|_| RunningDinoView::new(views.assets_loader.clone(), false));
+        views.dino.insert(id, view.clone());
         view
     }
-
-    pub(super) fn prepare_running_elapsed(
-        &self,
-        activity_id: String,
-        started_at_unix_ms: i64,
-        show_dino: bool,
-        cx: &mut Context<Self>,
-    ) -> Entity<RunningElapsedView> {
-        let now = Instant::now();
-        let mut cache = self.running_indicator_views.borrow_mut();
-        cache.prune(now);
-        if let Some(entry) = cache.elapsed.get_mut(&activity_id)
-            && entry.started_at_unix_ms == started_at_unix_ms
-            && entry.show_dino == show_dino
-        {
-            entry.cached.last_used = now;
-            return entry.cached.view.clone();
-        }
-
-        let view = cx.new(|cx| {
-            let mut view = RunningElapsedView::new(started_at_unix_ms, show_dino, cache.active);
-            view.ensure_clock(cx);
-            view
-        });
-        cache.elapsed.insert(
-            activity_id,
-            RunningElapsedViewEntry {
-                started_at_unix_ms,
-                show_dino,
-                cached: CachedIndicatorView {
-                    view: view.clone(),
-                    last_used: now,
-                },
-            },
-        );
-        view
-    }
-
     pub(super) fn running_turn_dino_view(
         &self,
-        activity_id: String,
-        _cx: &mut Context<Self>,
+        id: String,
+        _: &mut Context<Self>,
     ) -> Option<Entity<RunningDinoView>> {
-        self.running_indicator_views
-            .borrow()
-            .dino
-            .get(&activity_id)
-            .map(|entry| entry.view.clone())
+        self.avatar_activities.borrow().dino.get(&id).cloned()
     }
-    fn running_elapsed_view(
-        &self,
-        activity_id: String,
-        _started_at_unix_ms: i64,
-        _show_dino: bool,
-        _cx: &mut Context<Self>,
-    ) -> Option<Entity<RunningElapsedView>> {
-        self.running_indicator_views
-            .borrow()
-            .elapsed
-            .get(&activity_id)
-            .map(|entry| entry.cached.view.clone())
+    pub(super) fn semantic_timeline_has_running_turn_row(&self) -> bool {
+        self.thread_timeline_view_state
+            .model
+            .rows
+            .iter()
+            .any(|row| {
+                matches!(
+                    row,
+                    super::TimelineRenderRow::Timeline(TimelineRow {
+                        kind: TimelineRowKind::RunningTurn(_),
+                        ..
+                    })
+                )
+            })
     }
-
+}
+impl super::row_view::RowPresentation {
     pub(super) fn render_running_turn_row(
         &self,
         running_turn: &RunningTurnDisplay,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let content = self.render_running_activity_content(
             format!("turn:{}", running_turn.turn_id),
@@ -777,24 +686,22 @@ impl TimelineView {
             div().w_full().pt_5().child(content).into_any_element(),
         )
     }
-
     pub(super) fn render_running_activity_content(
         &self,
         activity_id: String,
-        started_at_unix_ms: Option<i64>,
+        _started_at_unix_ms: Option<i64>,
         state: Option<pioneer_client::timeline::types::TurnWorkState>,
         security_summary: Option<&ClientTurnSecuritySummary>,
         show_dino: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::RunningActivity
         ));
-        let started_at = started_at_unix_ms.unwrap_or(0);
         let dino = show_dino
             .then(|| self.running_turn_dino_view(format!("content:{activity_id}"), cx))
             .flatten();
-        let elapsed = self.running_elapsed_view(activity_id, started_at, show_dino, cx);
+        let elapsed = self.inline_elapsed();
         let status_label = match state {
             Some(pioneer_client::timeline::types::TurnWorkState::Starting) => {
                 t!("timeline.task.status.queued").to_string()
@@ -815,7 +722,7 @@ impl TimelineView {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .when_some(dino, |this, dino| this.child(div().size_8().child(dino)))
+                    .when(show_dino, |this| this.child(div().size_8().children(dino)))
                     .child(
                         v_flex()
                             .pt_1()
@@ -832,161 +739,123 @@ impl TimelineView {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActivitySpinnerKind {
+    Reasoning,
+    Command,
+    FileChange,
+    DynamicTool,
+    WebSearch,
+    WebFetch,
+    Download,
+}
+impl ActivitySpinnerKind {
+    #[cfg(feature = "qualification-diagnostics")]
+    fn diagnostic_source(self) -> pioneer_client::timeline::diagnostics::AnimationSourceId {
+        use pioneer_client::timeline::diagnostics::AnimationSourceId as Source;
+        match self {
+            Self::Reasoning => Source::TimelineRunningReasoning,
+            Self::Command => Source::TimelineRunningCommand,
+            Self::FileChange => Source::TimelineRunningFileChange,
+            Self::DynamicTool => Source::TimelineRunningDynamicTool,
+            Self::WebSearch => Source::TimelineRunningWebSearch,
+            Self::WebFetch => Source::TimelineRunningWebFetch,
+            Self::Download => Source::TimelineRunningDownload,
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
-    use super::decode_running_dino_assets;
-    use super::next_elapsed_tick_delay;
-    use std::time::Duration;
-
-    #[gpui_kit::test]
-    fn warm_route_retains_clock_owner_but_cancels_work_until_remount(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
-        use super::{
-            CachedIndicatorView, RunningElapsedView, RunningElapsedViewEntry,
-            RunningIndicatorViewCache,
-        };
-        use gpui_kit::AppContext;
-        let weak = cx.update(|cx| {
-            let mut cache = RunningIndicatorViewCache::default();
-            cache.set_active(false, cx);
-            let inactive = cx.new(|cx| {
-                let mut view = RunningElapsedView::new(1_000, false, cache.active);
-                view.ensure_clock(cx);
-                view
-            });
-            assert!(inactive.read(cx).clock_task.is_none());
-            assert!(inactive.read(cx).suspended);
-
-            let view = cx.new(|cx| {
-                let mut view = RunningElapsedView::new(1_000, false, true);
-                view.ensure_clock(cx);
-                view
-            });
-            let identity = view.entity_id();
-            let weak = view.downgrade();
-            cache.elapsed.insert(
-                "thread/turn".into(),
-                RunningElapsedViewEntry {
-                    started_at_unix_ms: 1_000,
-                    show_dino: false,
-                    cached: CachedIndicatorView {
-                        view,
-                        last_used: std::time::Instant::now(),
-                    },
-                },
-            );
-            cache.set_active(false, cx);
-            let retained = &cache.elapsed["thread/turn"].cached.view;
-            assert_eq!(retained.entity_id(), identity);
-            assert!(retained.read(cx).suspended);
-            assert!(retained.read(cx).clock_task.is_none());
-            retained.update(cx, |view, cx| view.ensure_clock(cx));
-            assert!(retained.read(cx).clock_task.is_none());
-            retained.update(cx, |view, _| view.elapsed_ms = 0);
-            cache.set_active(true, cx);
-            cache.set_visible_activities(
-                &std::collections::HashSet::from(["thread/turn".into()]),
-                cx,
-            );
-            let retained = &cache.elapsed["thread/turn"].cached.view;
-            assert_eq!(retained.entity_id(), identity);
-            retained.update(cx, |view, cx| view.ensure_clock(cx));
-            assert!(retained.read(cx).clock_task.is_some());
-            assert!(
-                retained.read(cx).elapsed_ms > 0,
-                "remount refreshes elapsed before the next tick"
-            );
-            drop(cache);
-            weak
-        });
-        cx.run_until_parked();
-        assert!(weak.upgrade().is_none());
+mod clock_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    #[core::prelude::v1::test]
+    fn elapsed_boundaries_and_late_wakes_use_absolute_samples() {
+        assert_eq!(elapsed_delay(1_000), Duration::from_millis(1_000));
+        assert_eq!(elapsed_delay(1_250), Duration::from_millis(750));
+        assert_eq!(elapsed_delay(6_999), Duration::from_millis(1));
+        let now = Instant::now();
+        let anchor = ElapsedAnchor::new(1_000, 2_250, now, 0);
+        assert_eq!(anchor.elapsed(now + Duration::from_millis(8_749)), 9_999);
+        assert_eq!(
+            elapsed_delay(anchor.elapsed(now + Duration::from_millis(8_749))),
+            Duration::from_millis(1)
+        );
     }
-
-    #[gpui_kit::test]
-    fn window_motion_refresh_stops_and_resumes_clock_without_viewport_input(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
-        use super::*;
-        cx.update(gpui_kit::init);
-        let assets = Arc::new(decode_running_dino_assets().unwrap());
-        let (view, cx) = cx.add_window_view(|_, cx| {
-            let mut view = RunningDinoView::new(Arc::default(), true);
-            view.assets = Some(assets);
-            view.viewport_visible = true;
-            view.ensure_clock(cx);
-            view
-        });
-        assert!(view.read_with(cx, |view, _| view.clock_active));
-        cx.update(|window, cx| {
-            cx.set_reduce_motion(true);
-            // Render remains a pure read, even with a changed platform flag.
-            view.update(cx, |view, cx| {
-                drop(view.render(window, cx));
-                assert!(!view.reduce_motion);
-                assert!(view.clock_active);
-            });
-            window.draw(cx).clear(cx);
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            assert!(view.reduce_motion);
-            assert!(!view.clock_active);
-            assert!(view.clock_task.is_none());
-            assert_eq!(view.frame_index, 0);
-        });
-        cx.update(|window, cx| {
-            cx.set_reduce_motion(false);
-            window.draw(cx).clear(cx);
-        });
-        cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            assert!(!view.reduce_motion);
-            assert!(view.clock_active);
-            assert!(view.clock_task.is_some());
-        });
-        let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
-        let _subscription = cx.update(|_, cx| {
-            let notifications = notifications.clone();
-            cx.observe(&view, move |_, _| {
-                notifications.set(notifications.get() + 1)
-            })
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.run_until_parked();
-        assert_eq!(notifications.get(), 0, "equal motion refresh is quiet");
+    #[core::prelude::v1::test]
+    fn elapsed_anchor_ignores_wall_jumps_and_remount_preserves_floor() {
+        let now = Instant::now();
+        let anchor = ElapsedAnchor::new(1_000, 2_250, now, 0);
+        let floor = anchor.elapsed(now + Duration::from_secs(10));
+        let backward = ElapsedAnchor::new(1_000, 0, now, floor);
+        assert_eq!(backward.elapsed(now), 11_250);
+        let forward = ElapsedAnchor::new(1_000, 100_000, now, floor);
+        assert_eq!(forward.elapsed(now), 99_000);
+        let revised_start = ElapsedAnchor::new(100_000, 100_250, now, 0);
+        assert_eq!(revised_start.elapsed(now), 250);
+        let future = ElapsedAnchor::new(3_000, 1_000, now, 0);
+        assert_eq!(future.elapsed(now + Duration::from_secs(1)), 0);
+        assert_eq!(future.elapsed(now + Duration::from_secs(3)), 1_000);
     }
-
-    #[test]
-    fn running_dino_is_split_into_static_frames_at_embedded_cadence() {
-        let assets = decode_running_dino_assets().expect("embedded animation should decode");
+    #[gpui_kit::test]
+    fn elapsed_visibility_owns_one_timer_and_reduced_motion_does_not_stop_it(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let view =
+            cx.new(|_| RunningElapsedView::new(now_unix_ms() - 2_250, ElapsedPlacement::Inline));
+        view.update(cx, |view, cx| {
+            assert!(view.task.is_none());
+            view.set_visible(true, cx);
+            let generation = view.generation;
+            assert!(view.task.is_some());
+            assert!(view.displayed_seconds >= 2);
+            view.set_visible(true, cx);
+            assert_eq!(view.generation, generation);
+            view.set_visible(false, cx);
+            assert!(view.task.is_none());
+            assert!(view.anchor.is_none());
+            let floor = view.floor_ms;
+            view.set_visible(true, cx);
+            assert!(view.task.is_some());
+            assert!(view.anchor.as_ref().unwrap().elapsed(Instant::now()) >= floor);
+            view.set_visible(false, cx);
+        });
+    }
+    #[core::prelude::v1::test]
+    fn embedded_dino_frames_preserve_order_and_delay_table() {
+        let assets = decode_running_dino_assets().unwrap();
         assert!(assets.frame_count() > 1);
         assert_eq!(assets.dark.len(), assets.light.len());
         for (light, dark) in assets.light.iter().zip(&assets.dark) {
+            assert_eq!(light.delay, dark.delay);
             assert_eq!(light.image.frame_count(), 1);
             assert_eq!(dark.image.frame_count(), 1);
-            assert_eq!(light.delay, dark.delay);
         }
     }
-
-    #[test]
-    fn elapsed_clock_aligns_to_absolute_seconds_without_drift() {
-        assert_eq!(
-            next_elapsed_tick_delay(1_000, 1_000),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            next_elapsed_tick_delay(1_000, 1_250),
-            Duration::from_millis(750)
-        );
-        assert_eq!(
-            next_elapsed_tick_delay(1_000, 6_999),
-            Duration::from_millis(1)
-        );
-        assert_eq!(
-            next_elapsed_tick_delay(10_000, 9_000),
-            Duration::from_secs(1)
-        );
+    #[gpui_kit::test]
+    fn dino_suspension_cancels_immediately_and_remount_starts_at_initial_frame(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let assets = decode_running_dino_assets().unwrap();
+        let view = cx.new(|_| {
+            let mut view = RunningDinoView::new(Arc::default(), false);
+            view.assets = Some(Arc::new(assets));
+            view
+        });
+        view.update(cx, |view, cx| {
+            view.set_visible(true, cx);
+            assert!(view.clock_task.is_some());
+            view.frame_index = 2;
+            view.set_visible(false, cx);
+            assert!(view.clock_task.is_none());
+            assert_eq!(view.frame_index, 0);
+            cx.set_reduce_motion(true);
+            view.set_visible(true, cx);
+            assert!(view.clock_task.is_none());
+            assert_eq!(view.frame_index, 0);
+            view.set_visible(false, cx);
+        });
     }
 }

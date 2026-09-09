@@ -116,10 +116,10 @@ impl ThreadView {
     pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
         let active = active && self.visible;
         self.screen.update(cx, |screen, cx| {
-            screen
-                .running_indicator_views
-                .borrow_mut()
-                .set_active(active, cx);
+            if !active {
+                screen.set_row_activities_visible(&std::collections::HashSet::new(), cx);
+            }
+            screen.avatar_activities.borrow_mut().set_active(active, cx);
         });
         self.composer
             .update(cx, |composer, cx| composer.set_window_active(active, cx));
@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(row_terminal(cx).entity_id(), replaced.entity_id());
         let weak = replaced.downgrade();
         drop(replaced);
-        timeline.update(cx, |view, _| view.retire_timeline_rows());
+        timeline.update(cx, |view, cx| view.retire_timeline_rows(cx));
         cx.run_until_parked();
         assert!(weak.upgrade().is_none());
     }
@@ -864,7 +864,7 @@ mod tests {
                 )
             });
             window.draw(cx).clear(cx);
-            timeline.update(cx, |view, _| view.retire_timeline_rows());
+            timeline.update(cx, |view, cx| view.retire_timeline_rows(cx));
         });
         cx.run_until_parked();
         timeline.read_with(cx, |view, _| {
@@ -1061,5 +1061,12 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
+    }
+}
+
+#[cfg(test)]
+impl ThreadView {
+    pub(crate) fn timeline_for_test(&self) -> Entity<crate::screen::TimelineView> {
+        self.screen.clone()
     }
 }

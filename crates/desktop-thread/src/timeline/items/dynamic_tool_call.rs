@@ -1,7 +1,6 @@
 use super::super::TimelineRowTopSpacing;
-use super::format_running_elapsed;
 use crate::assets::PioneerIconName;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariants;
 use gpui_kit::component::collapsible::Collapsible;
@@ -23,14 +22,13 @@ use pioneer_client::timeline::labels::TaskWaitReviewDetailRow;
 use pioneer_client::timeline::labels::TaskWaitReviewDisplay;
 use pioneer_client::timeline::labels::TimelineFinalStatusKind;
 use pioneer_client::timeline::labels::final_dynamic_tool_status;
-use pioneer_client::timeline::labels::mcp_timeline_metadata;
 use pioneer_client::timeline::labels::pretty_json;
 use pioneer_client::timeline::labels::task_wait_review_display;
 use pioneer_client::timeline::types::TurnItem;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-impl TimelineView {
+impl RowPresentation {
     pub(super) fn render_item_dynamic_tool_call(
         &self,
         entry: &TimelineEntry,
@@ -40,36 +38,17 @@ impl TimelineView {
         is_last_row: bool,
         content_width: Pixels,
         expanded: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
-        let (tool_name, arguments, display_text, success, mcp_metadata, task_wait_review) =
-            match item {
-                TurnItem::DynamicToolCall {
-                    tool_name,
-                    arguments,
-                    display,
-                    success,
-                    ..
-                } => (
-                    tool_name.clone(),
-                    pretty_json(arguments),
-                    tool_display_text(display),
-                    *success,
-                    mcp_timeline_metadata(display),
-                    task_wait_review_display(tool_name, display),
-                ),
-                _ => (
-                    "tool".to_owned(),
-                    None,
-                    Some(Self::timeline_entry_text(item_view).to_owned()),
-                    None,
-                    None,
-                    None,
-                ),
-            };
-
-        let mcp_tool_label = mcp_metadata.as_ref().map(McpTimelineMetadata::label);
-        let tool_label_source = mcp_tool_label.as_deref().unwrap_or(tool_name.as_str());
+        let (tool_name, success) = match item {
+            TurnItem::DynamicToolCall {
+                tool_name, success, ..
+            } => (tool_name.as_str(), *success),
+            _ => ("tool", None),
+        };
+        let mcp_metadata = self.tool_content().and_then(|tool| tool.mcp.as_ref());
+        let mcp_tool_label = mcp_metadata.map(McpTimelineMetadata::label);
+        let tool_label_source = mcp_tool_label.as_deref().unwrap_or(tool_name);
         let tool_label = Self::truncate_for_card(tool_label_source, 180);
         let is_running = item_view.status == TimelineEntryStatus::Running;
         let tool_row = || {
@@ -79,12 +58,9 @@ impl TimelineView {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(
-                        crate::qualification_diagnostics::spinner!(
-                            pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningDynamicTool,
-                        )
-                        .icon(IconName::Loader),
-                    )
+                    this.child(self.spinner_element(
+                        crate::timeline::running_indicator::ActivitySpinnerKind::DynamicTool,
+                    ))
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(PioneerIconName::Terminal).size_4().opacity(0.8))
@@ -102,7 +78,7 @@ impl TimelineView {
                 .into_any_element()
         };
 
-        let running_elapsed_label = format_running_elapsed(item_view);
+        let running_elapsed_label = self.inline_elapsed();
 
         let open = expanded;
 
@@ -114,13 +90,35 @@ impl TimelineView {
         let status = final_dynamic_tool_status(item_view.status, success);
         let final_status = dynamic_tool_status_label(status.kind);
         let is_successful = status.successful;
-        let details = self.dynamic_tool_details(
-            arguments.as_deref(),
-            display_text.as_deref(),
-            mcp_metadata.as_ref(),
-            task_wait_review.as_ref(),
-            cx,
-        );
+        let details = self.body_element().unwrap_or_else(|| {
+            let (arguments, display_text, task_wait_review) = match item {
+                TurnItem::DynamicToolCall {
+                    arguments,
+                    display,
+                    tool_name,
+                    ..
+                } => (
+                    pretty_json(arguments),
+                    tool_display_text(display),
+                    task_wait_review_display(tool_name, display),
+                ),
+                _ => (
+                    None,
+                    Some(Self::timeline_entry_text(item_view).to_owned()),
+                    None,
+                ),
+            };
+            self.dynamic_tool_details(
+                arguments.as_deref(),
+                display_text.as_deref(),
+                mcp_metadata,
+                task_wait_review.as_ref(),
+                cx,
+            )
+        });
+        if self.body_only {
+            return details;
+        }
 
         let content = if is_running {
             Collapsible::new()
@@ -162,7 +160,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
@@ -222,7 +220,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
@@ -240,7 +238,7 @@ impl TimelineView {
         display_text: Option<&str>,
         mcp_metadata: Option<&McpTimelineMetadata>,
         task_wait_review: Option<&TaskWaitReviewDisplay>,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let mut details = v_flex().w_full().gap_2().pt_1();
         let mut has_details = false;
@@ -314,7 +312,7 @@ impl TimelineView {
                         .ghost()
                         .icon(PioneerIconName::Mcp)
                         .tooltip(t!("timeline.tool.open_mcp_server").to_string())
-                        .on_click(cx.listener(move |view, _, _, cx| {
+                        .on_click(self.actions.listener(move |view, _, _, cx| {
                             view.open_mcp_server_details_from_timeline(server_id.clone(), cx);
                             cx.notify();
                         })),
@@ -334,60 +332,10 @@ impl TimelineView {
         details.into_any_element()
     }
 
-    pub(crate) fn reconcile_task_review_views(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
-            self.task_review_views.clear();
-            return;
-        };
-        let client = self.client.clone();
-        let items = client
-            .snapshot(&pioneer_client::core::ClientScope::Timeline {
-                thread_id: thread_id.clone(),
-            })
-            .and_then(|p| p.typed::<pioneer_client::timeline::presentation::TimelineSnapshot>())
-            .map(|p| {
-                p.payload()
-                    .rows()
-                    .iter()
-                    .filter_map(|row| row.content()?.tool.as_ref()?.task_review.as_ref())
-                    .flat_map(|r| r.items.iter().map(|item| item.candidate_id.clone()))
-                    .collect::<std::collections::HashSet<_>>()
-            })
-            .unwrap_or_default();
-        self.task_review_views
-            .retain(|(thread, candidate), _| thread == &thread_id && items.contains(candidate));
-        for candidate in items {
-            let key = (thread_id.clone(), candidate.clone());
-            if let Some(view) = self.task_review_views.get(&key) {
-                view.read(cx).observe();
-                continue;
-            }
-            let label = t!(
-                "timeline.task_review.candidate",
-                candidate_id = Self::truncate_for_card(&candidate, 96).as_str()
-            )
-            .to_string();
-            let view = crate::task_review::TaskReviewActionView::new(
-                client.clone(),
-                self.thread_bindings.registrar(),
-                thread_id.clone(),
-                candidate,
-                label,
-                window,
-                cx,
-            );
-            self.task_review_views.insert(key, view);
-        }
-    }
-
     fn render_task_wait_review_controls(
         &self,
         review: &TaskWaitReviewDisplay,
-        _cx: &mut Context<Self>,
+        _cx: &mut App,
     ) -> Option<AnyElement> {
         let thread_id = self.current_active_thread_id()?;
         let capabilities = self
@@ -431,7 +379,7 @@ impl TimelineView {
         label: String,
         text: String,
         monospace: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         div()
             .w_full()
@@ -607,6 +555,58 @@ fn task_wait_review_detail_kind_label(kind: TaskWaitReviewDetailKind) -> String 
         }
         TaskWaitReviewDetailKind::ExtractionError => {
             t!("timeline.task_review.details.extraction_error").to_string()
+        }
+    }
+}
+
+impl crate::screen::TimelineView {
+    pub(crate) fn reconcile_task_review_views(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread_id) = self.current_active_thread_id().map(str::to_owned) else {
+            self.task_review_views.clear();
+            return;
+        };
+        let client = self.client.clone();
+        let items = client
+            .snapshot(&pioneer_client::core::ClientScope::Timeline {
+                thread_id: thread_id.clone(),
+            })
+            .and_then(|p| p.typed::<pioneer_client::timeline::presentation::TimelineSnapshot>())
+            .map(|p| {
+                p.payload()
+                    .rows()
+                    .iter()
+                    .filter_map(|row| row.content()?.tool.as_ref()?.task_review.as_ref())
+                    .flat_map(|r| r.items.iter().map(|item| item.candidate_id.clone()))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        self.task_review_views
+            .retain(|(thread, candidate), _| thread == &thread_id && items.contains(candidate));
+        for candidate in items {
+            let key = (thread_id.clone(), candidate.clone());
+            if let Some(view) = self.task_review_views.get(&key) {
+                view.read(cx).observe();
+                continue;
+            }
+            let label = t!(
+                "timeline.task_review.candidate",
+                candidate_id = Self::truncate_for_card(&candidate, 96).as_str()
+            )
+            .to_string();
+            let view = crate::task_review::TaskReviewActionView::new(
+                client.clone(),
+                self.thread_bindings.registrar(),
+                thread_id.clone(),
+                candidate,
+                label,
+                window,
+                cx,
+            );
+            self.task_review_views.insert(key, view);
         }
     }
 }

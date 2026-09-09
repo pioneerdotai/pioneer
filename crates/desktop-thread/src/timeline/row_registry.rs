@@ -7,8 +7,9 @@ use std::{collections::HashMap, sync::Arc};
 #[derive(Clone)]
 pub(crate) struct TimelineRowSlotView {
     snapshot: Arc<TimelineRowSnapshot>,
-    projection: pioneer_client::conversation::ConversationViewState,
-    content: super::TimelineItemPresentations,
+    pub(super) projection: pioneer_client::conversation::ConversationViewState,
+    pub(super) content: super::TimelineItemPresentations,
+    pub(super) view: Option<gpui_kit::Entity<super::row_view::TimelineRowView>>,
     pub(crate) terminal: Option<super::terminal_registry::TerminalPresentation>,
 }
 impl TimelineRowSlotView {
@@ -34,39 +35,31 @@ impl TimelineRowSlotView {
             projection,
             content,
             terminal: None,
+            view: None,
         }
     }
+
     pub(crate) fn render(
         &self,
-        view: &crate::screen::TimelineView,
-        last: bool,
-        layout: super::TimelineRowLayout,
-        author: Option<&pioneer_client::timeline::types::TurnAuthorSnapshot>,
-        width: gpui_kit::Pixels,
-        expanded: bool,
-        cx: &mut gpui_kit::Context<crate::screen::TimelineView>,
+        height: gpui_kit::Pixels,
+        cx: &gpui_kit::App,
     ) -> gpui_kit::AnyElement {
         use gpui_kit::{prelude::*, *};
-        div()
-            .id(SharedString::from(format!(
-                "timeline-row:{}:{}",
-                view.thread_id,
-                self.snapshot.id().as_str()
-            )))
-            .w_full()
-            .child(view.render_timeline_row(
-                &self.projection,
-                &self.content,
-                self.snapshot.value(),
-                last,
-                layout,
-                author,
-                width,
-                expanded,
-                self.terminal.as_ref().map(|terminal| terminal.view.clone()),
-                cx,
-            ))
+        let Some(view) = &self.view else {
+            return div().into_any_element();
+        };
+        if view.read(cx).has_live_children() {
+            return view.clone().into_any_element();
+        }
+        view.clone()
+            .cached(StyleRefinement::default().w_full().h(height))
             .into_any_element()
+    }
+    fn replacing(snapshot: Arc<TimelineRowSnapshot>, previous: Option<&Arc<Self>>) -> Self {
+        let mut next = Self::new(snapshot);
+        next.view = previous.and_then(|old| old.view.clone());
+        next.terminal = previous.and_then(|old| old.terminal.clone());
+        next
     }
     pub(crate) fn snapshot(&self) -> &Arc<TimelineRowSnapshot> {
         &self.snapshot
@@ -94,10 +87,14 @@ impl TimelineRowRegistry {
             .rows()
             .iter()
             .map(|row| {
-                let slot = previous
-                    .remove(row.id())
+                let old = previous.remove(row.id());
+                let slot = old
+                    .as_ref()
                     .filter(|slot| slot.snapshot.revision() == row.revision())
-                    .unwrap_or_else(|| Arc::new(TimelineRowSlotView::new(row.clone())));
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(TimelineRowSlotView::replacing(row.clone(), old.as_ref()))
+                    });
                 (row.id().clone(), slot)
             })
             .collect();
@@ -126,7 +123,10 @@ impl TimelineRowRegistry {
         for row in change.inserted.iter().chain(&change.replaced) {
             self.entries.insert(
                 row.id().clone(),
-                Arc::new(TimelineRowSlotView::new(row.clone())),
+                Arc::new(TimelineRowSlotView::replacing(
+                    row.clone(),
+                    self.entries.get(row.id()),
+                )),
             );
         }
         if let Some(order) = &change.order {

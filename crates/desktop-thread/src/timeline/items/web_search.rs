@@ -1,7 +1,6 @@
 use super::super::TimelineRowTopSpacing;
-use super::format_running_elapsed;
 use super::host_from_url;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::v_flex;
@@ -21,7 +20,7 @@ fn results_count_label(count: usize) -> String {
     t!("timeline.web_search.results_count", count = count).to_string()
 }
 
-impl TimelineView {
+impl RowPresentation {
     pub(super) fn render_item_web_search(
         &self,
         entry: &TimelineEntry,
@@ -31,7 +30,7 @@ impl TimelineView {
         is_last_row: bool,
         content_width: Pixels,
         expanded: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let (search_query, result_count, results) = match item {
             TurnItem::WebSearch {
@@ -60,12 +59,9 @@ impl TimelineView {
                 .items_center()
                 .gap_2()
                 .when(is_running, |this| {
-                    this.child(
-                        crate::qualification_diagnostics::spinner!(
-                            pioneer_client::timeline::diagnostics::AnimationSourceId::TimelineRunningWebSearch,
-                        )
-                        .icon(IconName::Loader),
-                    )
+                    this.child(self.spinner_element(
+                        crate::timeline::running_indicator::ActivitySpinnerKind::WebSearch,
+                    ))
                 })
                 .when(!is_running, |this| {
                     this.child(Icon::new(IconName::Search).size_4().opacity(0.8))
@@ -83,7 +79,7 @@ impl TimelineView {
                 .into_any_element()
         };
 
-        let running_elapsed_label = format_running_elapsed(item_view);
+        let running_elapsed_label = self.inline_elapsed();
 
         let open = expanded;
 
@@ -92,33 +88,38 @@ impl TimelineView {
         entry.id.hash(&mut toggle_id_hasher);
         let toggle_id = toggle_id_hasher.finish();
 
-        let result_rows = if results.is_empty() {
-            v_flex()
-                .w_full()
-                .gap_2()
-                .pt_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .opacity(0.75)
-                        .child(t!("timeline.web_search.no_results").to_string()),
-                )
-                .into_any_element()
-        } else {
-            let mut list = v_flex()
-                .w_full()
-                .gap_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(cx.theme().border)
-                .p_1();
+        let result_rows = self.body_element().unwrap_or_else(|| {
+            if results.is_empty() {
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .opacity(0.75)
+                            .child(t!("timeline.web_search.no_results").to_string()),
+                    )
+                    .into_any_element()
+            } else {
+                let mut list = v_flex()
+                    .w_full()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .p_1();
 
-            for result in &results {
-                list = list.child(self.web_search_result_row(result, toggle_id, cx));
+                for result in &results {
+                    list = list.child(self.web_search_result_row(result, toggle_id, cx));
+                }
+
+                v_flex().w_full().pt_1().child(list).into_any_element()
             }
-
-            v_flex().w_full().pt_1().child(list).into_any_element()
-        };
+        });
+        if self.body_only {
+            return result_rows;
+        }
 
         let content = if is_running {
             Collapsible::new()
@@ -160,7 +161,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
@@ -204,7 +205,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),
@@ -220,7 +221,7 @@ impl TimelineView {
         &self,
         result: &WebSearchResultItem,
         toggle_id: u64,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let host = host_from_url(result.url.as_str()).unwrap_or_else(|| result.url.clone());
         let favicon_url = self.timeline_favicon_url(None, result.url.as_str());
@@ -258,7 +259,7 @@ impl TimelineView {
             .child(div().flex_none().text_sm().opacity(0.6).child(host))
             .on_click({
                 let url = result.url.clone();
-                cx.listener(move |_, _, _, cx| {
+                self.actions.listener(move |_, _, _, cx| {
                     cx.open_url(url.as_str());
                 })
             })

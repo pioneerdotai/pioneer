@@ -2,7 +2,7 @@ use super::super::TimelineRowTopSpacing;
 use super::super::layout::TIMELINE_MESSAGE_END_BOTTOM_SPACING;
 use super::super::markdown::CodeHighlightPolicy;
 use crate::assets::PioneerIconName;
-use crate::screen::TimelineView;
+use crate::timeline::row_view::RowPresentation;
 use chrono::Local;
 use chrono::TimeZone;
 use gpui_kit::component::Icon;
@@ -21,7 +21,7 @@ use pioneer_client::timeline::types::TurnItem;
 use std::hash::Hash;
 use std::hash::Hasher;
 
-impl TimelineView {
+impl RowPresentation {
     pub(super) fn render_item_agent_message(
         &self,
         entry: &TimelineEntry,
@@ -32,7 +32,7 @@ impl TimelineView {
         is_last_row: bool,
         content_width: Pixels,
         expanded: bool,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         let text = Self::timeline_entry_text(item_view);
         let markdown = content.markdown_presentation.as_ref();
@@ -136,7 +136,7 @@ impl TimelineView {
                         )
                         .on_click({
                             let entry_id = entry_id.clone();
-                            cx.listener(move |this, _, window, cx| {
+                            self.actions.listener(move |this, _, window, cx| {
                                 this.toggle_timeline_item_expanded(entry_id.as_str(), window, cx);
                             })
                         }),

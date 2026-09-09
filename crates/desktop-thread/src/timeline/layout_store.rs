@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowMeasurementKey {
     pub id: RowId,
+    pub dependencies_revision: u64,
     pub layout_revision: u64,
     pub content_revision: u64,
     pub presentation_revision: u64,
@@ -74,6 +75,7 @@ struct Measurement {
 #[derive(Default)]
 pub(crate) struct TimelineLayoutStore {
     entries: HashMap<RowId, Measurement>,
+    pub body_heights: HashMap<RowId, Pixels>,
     pub index: Rc<RefCell<RowLayoutIndex>>,
     order: Vec<RowId>,
     pub context_revision: u64,
@@ -105,6 +107,7 @@ impl TimelineLayoutStore {
             let live: HashSet<_> = order.iter().collect();
             for id in self.order.iter().filter(|id| !live.contains(id)) {
                 self.entries.remove(id);
+                self.body_heights.remove(id);
                 self.index.borrow_mut().remove(id);
             }
             let mut index = self.index.borrow_mut();
@@ -157,6 +160,7 @@ mod invalidation_tests {
     fn key(id: &str) -> RowMeasurementKey {
         RowMeasurementKey {
             id: serde_json::from_value(serde_json::json!(id)).unwrap(),
+            dependencies_revision: 0,
             layout_revision: 1,
             content_revision: 1,
             presentation_revision: 1,
@@ -184,6 +188,7 @@ mod invalidation_tests {
         );
         let unchanged = &store.entries[&b.id] as *const Measurement;
         let mut mutations: Vec<Box<dyn Fn(&mut RowMeasurementKey)>> = vec![
+            Box::new(|k| k.dependencies_revision += 1),
             Box::new(|k| k.layout_revision += 1),
             Box::new(|k| k.content_revision += 1),
             Box::new(|k| k.presentation_revision += 1),
