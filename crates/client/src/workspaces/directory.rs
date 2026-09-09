@@ -831,11 +831,23 @@ mod tests {
         active: Option<&str>,
         workspace: &str,
     ) -> Option<crate::composer::model_selection::ComposerModelSelection> {
-        crate::state::selectors::resolve_composer_model_selection_from(
+        let coordinators = core.thread_coordinator_snapshots();
+        let selection = crate::state::selectors::resolve_composer_model_selection_from(
             active,
             Some(workspace),
-            &core.thread_coordinator_snapshots(),
-        )
+            &coordinators,
+        );
+        if let Some(thread_id) = active {
+            let expected = coordinators.get(thread_id).and_then(|coordinator| {
+                crate::state::selectors::resolve_composer_model_selection_from(
+                    Some(thread_id),
+                    Some(&coordinator.workspace_id),
+                    &coordinators,
+                )
+            });
+            assert_eq!(core.resolved_composer_model_selection(thread_id), expected);
+        }
+        selection
     }
 
     #[test]

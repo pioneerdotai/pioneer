@@ -186,16 +186,23 @@ pub fn composer_model_selection_candidates_from(
     coordinators
         .iter()
         .filter_map(|(thread_id, coordinator)| {
-            let thread = coordinator.thread()?;
-            Some(ComposerModelSelectionCandidate {
-                thread_id: thread_id.clone(),
-                workspace_id: coordinator.workspace_id.clone(),
-                updated_at: coordinator.updated_at(),
-                has_turns: thread_has_known_turns(coordinator, thread),
-                selection: ComposerModelSelection::from_thread(thread),
-            })
+            composer_model_selection_candidate(thread_id, coordinator)
         })
         .collect()
+}
+
+pub(crate) fn composer_model_selection_candidate(
+    thread_id: &str,
+    coordinator: &ThreadCoordinator,
+) -> Option<ComposerModelSelectionCandidate> {
+    let thread = coordinator.thread()?;
+    Some(ComposerModelSelectionCandidate {
+        thread_id: thread_id.to_owned(),
+        workspace_id: coordinator.workspace_id.clone(),
+        updated_at: coordinator.updated_at(),
+        has_turns: thread_has_known_turns(coordinator, thread),
+        selection: ComposerModelSelection::from_thread(thread),
+    })
 }
 
 fn thread_has_known_turns(coordinator: &ThreadCoordinator, thread: &Thread) -> bool {

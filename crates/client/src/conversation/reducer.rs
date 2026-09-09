@@ -183,6 +183,32 @@ pub struct ConversationViewState {
 }
 
 impl ConversationViewState {
+    /// The revision is a notification counter, not a change to visible content.
+    /// Compare borrowed fields instead of cloning/serializing the whole history.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        let Self {
+            timeline,
+            turns,
+            items,
+            revision: _,
+            composer_locked,
+            in_flight_turn_id,
+            pending_request_id,
+            phase_label,
+            last_error,
+            permission_audit,
+        } = self;
+        timeline == &other.timeline
+            && turns == &other.turns
+            && items == &other.items
+            && composer_locked == &other.composer_locked
+            && in_flight_turn_id == &other.in_flight_turn_id
+            && pending_request_id == &other.pending_request_id
+            && phase_label == &other.phase_label
+            && last_error == &other.last_error
+            && permission_audit == &other.permission_audit
+    }
+
     pub fn item_by_id(&self, item_id: &str) -> Option<&ItemView> {
         self.items.iter().find(|item| item.id == item_id)
     }
