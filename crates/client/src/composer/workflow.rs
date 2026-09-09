@@ -49,10 +49,9 @@ use super::{
 };
 use crate::{
     providers::list::{
-        cli_runtime_list_params, resolve_cli_runtime_execution_backend,
+        resolve_cli_runtime_execution_backend,
         runtime_id_from_cli_runtime_provider_key,
     },
-    runtime::ClientRuntime,
     state::selectors as client_selectors,
     threads::session as thread_session,
     transport::ws::command_sender as ws_commands,
@@ -153,7 +152,7 @@ pub fn resolve_voice_turn_selection(
 }
 
 pub fn resolve_selected_execution_target(
-    runtime: &ClientRuntime,
+    core: &ClientCore,
     workspace_id: &str,
     selected_provider: Option<&str>,
 ) -> anyhow::Result<SelectedExecutionTarget> {
@@ -171,11 +170,7 @@ pub fn resolve_selected_execution_target(
         });
     };
 
-    let runtimes = ws_commands::cli_runtime_list(
-        &runtime.ws_command_sender(),
-        cli_runtime_list_params(workspace_id.to_owned()),
-    )?
-    .runtimes;
+    let runtimes = core.read_provider_runtimes(workspace_id, true)?.runtimes;
 
     selected_execution_target_from_runtimes(Some(provider_key), runtimes.as_slice())
 }
@@ -453,7 +448,7 @@ impl ClientCore {
             }
         } else {
             resolve_selected_execution_target(
-                runtime,
+                self,
                 workspace_id.as_str(),
                 selection.selected_provider.as_deref(),
             )?
@@ -723,7 +718,7 @@ impl ClientCore {
                 None
             } else {
                 resolve_selected_execution_target(
-                    self.compatibility_runtime(),
+                    self,
                     &context.workspace_id,
                     selection.selected_provider.as_deref(),
                 )?

@@ -1,8 +1,8 @@
 use super::catalog::{ProviderCatalogEntry, provider_catalog_entries};
-use crate::app::root::PioneerDesktop;
+use crate::providers::ProviderCatalogView;
 use pioneer_client::providers::catalog as client_provider_catalog;
 
-impl PioneerDesktop {
+impl ProviderCatalogView {
     pub(super) fn canonical_provider_id(raw: &str) -> String {
         client_provider_catalog::canonical_provider_id(raw)
     }

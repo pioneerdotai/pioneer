@@ -201,9 +201,9 @@ impl PioneerDesktop {
                         }
                         view.clear_authorization_epoch_cache();
                         view.gateway.current_auth = None;
-                        view.administration.clear_for_session_termination();
+
                         view.member_avatar_state.clear();
-                        view.member_workspaces_saving = false;
+
                         view.gateway.ws_connection_id = None;
                         view.gateway.connection_state = GatewayConnectionState::Disconnected;
                         view.gateway.error =

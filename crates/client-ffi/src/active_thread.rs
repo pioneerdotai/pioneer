@@ -7,7 +7,7 @@ use pioneer_client::composer::workflow::{
 };
 use pioneer_client::{
     ClientError, ClientResult,
-    administration::{AdministrationEventTracker, AdministrationRefetch},
+    administration::AdministrationRefetch,
     cli_runtime::approvals::PendingRequest,
     composer::{
         model_selection as composer_model_selection, turn_prepare::PreparedVoiceComposerSnapshot,
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -199,13 +199,11 @@ pub struct ClientActiveThreadSnapshot {
 #[derive(Clone)]
 pub struct ClientFfiActiveThreadState {
     core: Arc<pioneer_client::core::ClientCore>,
-    administration_events: Arc<Mutex<AdministrationEventTracker>>,
 }
 impl ClientFfiActiveThreadState {
     pub(crate) fn new(core: Arc<pioneer_client::core::ClientCore>) -> Self {
         Self {
             core,
-            administration_events: Default::default(),
         }
     }
 }
@@ -513,17 +511,6 @@ impl ClientFfiActiveThreadState {
         }
         let context = ClientRuntimeNotificationContext::default();
         match runtime.reduce_gateway_notification(notification, context) {
-            Some(ClientRuntimeNotification::AdministrationChanged(event)) => {
-                let invalidation = self
-                    .administration_events
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("administration lock is poisoned"))?
-                    .apply_event(&event);
-                Ok(ClientFfiNotificationReduction {
-                    administration_refetch: invalidation.effects,
-                    ..Default::default()
-                })
-            }
             Some(ClientRuntimeNotification::TaskUserNotificationDelivered(notification)) => {
                 Ok(ClientFfiNotificationReduction {
                     task_user_notification: Some(notification),

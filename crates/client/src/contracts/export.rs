@@ -77,6 +77,17 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
     use ClientContractStability as Stability;
 
     let mut contracts = vec![
+        contract_type!("provider_collection_publication.json", crate::providers::store::ProviderCollectionPublication, Domain::Providers, Kind::Snapshot, Stability::Provisional),
+        contract_type!("provider_operation_publication.json", crate::providers::operations::ProviderOperationPublication, Domain::Providers, Kind::Snapshot, Stability::Provisional),
+        contract_type!("administration_page_publication.json", crate::administration::pages::AdministrationPagePublication, Domain::Root, Kind::Snapshot, Stability::Provisional),
+        contract_type!("administration_operation_publication.json", crate::administration::operations::AdministrationOperationPublication, Domain::Root, Kind::Snapshot, Stability::Provisional),
+        contract_type!(
+            "provider_runtime_publication.json",
+            crate::providers::runtime::ProviderRuntimePublication,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
         contract_type!(
             "artifact_publication.json",
             crate::artifacts::store::ArtifactPublication,

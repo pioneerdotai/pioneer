@@ -1,0 +1,341 @@
+[dialog.folder.rename]
+title = "Переименовать папку"
+description = "Сделайте название коротким и легко запоминающимся."
+
+[dialog.thread.rename]
+title = "Переименовать"
+description = "Измените название треда."
+
+[providers.screen]
+title = "Провайдеры"
+description = "Настройте API-ключи для доступных провайдеров моделей."
+empty_connected = "Подключенных провайдеров пока нет."
+
+[providers.sidebar]
+api = "Провайдеры API"
+connected = "Подключенные"
+cli = "Провайдеры CLI"
+
+[providers.button]
+submit = "Сохранить"
+remove_key = "Удалить ключ"
+refresh = "Обновить провайдеров"
+
+[providers.dialog]
+title = "Настроить %{provider}"
+api_key_label = "API Key *"
+api_key_placeholder = "Введите API ключ"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port или socks5://host:port"
+proxy_hint = "Необязательный workspace-прокси для этого провайдера."
+replace_hint = "Для %{provider} уже настроен ключ. Сохранение заменит его."
+
+[providers.error]
+gateway_not_connected = "Шлюз не подключён."
+workspace_not_selected = "Пространство не выбрано."
+load_failed = "Не удалось загрузить конфигурацию провайдеров"
+save_failed = "Не удалось сохранить API ключ"
+delete_failed = "Не удалось удалить API ключ"
+
+[providers.cli]
+title = "CLI провайдеры"
+description = "Готовность проверяется и обновляется Gateway."
+refreshing = "Обновление"
+empty = "CLI провайдеры не настроены"
+diagnostics = "Диагностика"
+native_events = "Нативные события"
+recent_stderr = "Последний stderr"
+copied_diagnostics = "Скопирована диагностика для"
+login_code = "Код"
+login_open = "Открыть"
+login_started = "Вход CLI запущен"
+
+[providers.cli.mcp]
+runtime_not_ready = "Runtime не готов"
+unsupported_contract = "MCP-контракт провайдера не поддерживается"
+strict_isolation_failed = "Проверка изоляции MCP не пройдена"
+helper_self_probe_failed = "Самопроверка MCP helper не пройдена"
+platform_ipc_unavailable = "Безопасный локальный IPC недоступен"
+continuity_unavailable = "Перезапуск с продолжением диалога недоступен"
+readiness_unavailable = "Готовность MCP не определена"
+
+[providers.cli.detail]
+account = "Аккаунт"
+version = "Версия"
+binary = "Бинарник"
+home = "Домашняя директория/конфиг"
+shadow_home = "Shadow home"
+
+[providers.cli.value]
+disabled = "Отключено"
+
+[providers.cli.inline]
+display_name_label = "Название"
+display_name_hint = "Имя этого CLI-провайдера в списках и пикерах."
+binary_label = "Бинарник"
+binary_hint = "Путь к CLI-бинарнику для этого инстанса."
+home_label = "Домашняя директория/конфиг"
+home_hint = "Домашняя директория runtime и конфигов."
+shadow_home_label = "Shadow home"
+shadow_home_hint = "Необязательная отдельная домашняя директория аккаунта; оставьте пустым, чтобы отключить."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port или socks5://host:port"
+
+[providers.cli.action]
+add = "Добавить CLI провайдер"
+refresh = "Обновить статус"
+copy_diagnostics = "Скопировать диагностику"
+edit = "Изменить CLI провайдер"
+duplicate = "Дублировать CLI провайдер"
+disable = "Отключить CLI провайдер"
+enable = "Включить CLI провайдер"
+login = "Войти"
+open_home = "Открыть домашнюю директорию/конфиг"
+open_shadow_home = "Открыть shadow home"
+expand = "Показать детали CLI провайдера"
+collapse = "Скрыть детали CLI провайдера"
+
+[providers.cli.status_detail]
+authenticated = "Вход выполнен: %{account}"
+authenticated_with_plan = "Вход выполнен: %{account} · %{plan}"
+not_on_path = "CLI `%{binary}` не установлен или отсутствует в PATH."
+unsupported_version = "Установлена %{version}; требуется минимум %{minimum}"
+
+[providers.cli.dialog]
+title_add = "Добавить CLI провайдер"
+title_edit = "Изменить CLI провайдер"
+title_duplicate = "Дублировать CLI провайдер"
+id_label = "ID провайдера"
+display_name_label = "Отображаемое имя"
+binary_label = "Бинарник"
+home_label = "Домашняя директория/конфиг"
+shadow_home_label = "Shadow home"
+enabled_label = "Включен"
+id_placeholder = "cli_provider_work"
+
+[providers.cli.status]
+disabled = "Отключено"
+missing_binary = "Бинарник не найден"
+spawn_failed = "Ошибка запуска"
+initializing = "Инициализация"
+needs_auth = "Нужен вход"
+ready = "Готов"
+degraded = "Требует внимания"
+unsupported = "Не поддерживается"
+error = "Ошибка"
+
+[providers.cli.error]
+open_path_failed = "Не удалось открыть путь"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Claude и другие модели от Anthropic"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "Модели через AWS Bedrock"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Модели через Azure OpenAI Service"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Запуск моделей через Copilot-совместимый API"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "OpenAI-совместимый провайдер DeepSeek"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Модели Gemini от Google AI"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM и Zhipu-совместимые модели"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Быстрый вывод на оборудовании Groq"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "Прокси и шлюз LiteLLM"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "Mistral API через OpenAI-совместимую конечную точку"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "Запуск локальных моделей Ollama"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT и другие модели OpenAI"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "Маршрутизатор для множества провайдеров моделей"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Конечная точка вывода Telnyx"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "Модели xAI Grok"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Модели, размещённые в Together"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Хостинговые API моделей Fireworks"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "OpenAI-совместимая конечная точка Novita"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "API моделей Perplexity"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Конечная точка совместимости Cohere"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "API моделей Venice"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "API моделей Cerebras"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "API моделей SambaNova"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Модели, размещённые в Hyperbolic"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "OpenAI-совместимая конечная точка DeepInfra"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "Конечная точка маршрутизатора HF"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "Конечная точка AI21 Studio"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Конечная точка моделей Reka"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Конечная точка вывода Baseten"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Конечная точка вывода Nscale"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Хостинговые конечные точки моделей Anyscale"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Конечная точка Nebius AI Studio"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Бессерверная конечная точка Friendli"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Конечная точка Lepton AI"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "API моделей SiliconFlow"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "Конечная точка API AIHubMix"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "API моделей ASTRAI"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "Конечная точка моделей StepFun"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "API моделей Baichuan"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "API моделей Lingyiwanwu / Yi"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "API моделей Tencent Hunyuan"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "Конечная точка AI OVHcloud"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "Конечная точка NVIDIA NIM"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "OpenAI-совместимая конечная точка Synthetic"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Конечная точка Volcengine Ark"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "API моделей Baidu Qianfan"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "Локальный OpenAI-совместимый API LM Studio"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "Локальный OpenAI-совместимый API llama.cpp"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "Локальный OpenAI-совместимый API SGLang"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "Локальный OpenAI-совместимый API vLLM"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "Локальный OpenAI-совместимый API OSaurus"
+
+
+[buttons]
+ok = "OK"
+add = "Добавить"
+cancel = "Отмена"
+save = "Сохранить"
+dismiss = "Закрыть"
+

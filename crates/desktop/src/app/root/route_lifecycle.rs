@@ -28,6 +28,8 @@ impl LegacyScreenAdapter {
 
     pub(crate) fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.window_active = active;
+        self.providers_view.update(cx, |view, cx| view.set_window_active(active, cx));
+        self.administration_view.update(cx, |view, cx| view.set_window_active(active, cx));
         self.reconcile_route_activity(cx);
     }
     pub(in crate::app) fn reconcile_route_activity(&mut self, cx: &mut Context<Self>) {

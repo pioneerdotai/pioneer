@@ -1,8 +1,6 @@
-use super::{ADMINISTRATION_CONTENT_INVITATIONS_NODE_ID, ADMINISTRATION_CONTENT_MEMBERS_NODE_ID};
 use crate::app::root::{
-    AdministrationContentView, GatewayConnectionState, MainContentView, PioneerDesktop,
+    GatewayConnectionState, MainContentView, PioneerDesktop,
 };
-use gpui_kit::component::tree::TreeItem;
 use gpui_kit::*;
 use std::time::Duration;
 use tracing::warn;
@@ -63,7 +61,7 @@ impl PioneerDesktop {
             self.gateway.current_auth = None;
             self.gateway.capability_snapshot = None;
             self.sync_settings_sidebar_tree_state(cx);
-            self.sync_administration_sidebar_tree_state(cx);
+
             return;
         }
         self.startup
@@ -93,7 +91,7 @@ impl PioneerDesktop {
         let reload_protected_content = self.gateway.capability_snapshot.is_none();
         if reload_protected_content {
             self.sync_settings_sidebar_tree_state(cx);
-            self.sync_administration_sidebar_tree_state(cx);
+
             cx.notify();
         }
 
@@ -172,10 +170,7 @@ impl PioneerDesktop {
                                     }
                                     view.resolve_current_principal_avatar(cx);
                                     view.sync_settings_sidebar_tree_state(cx);
-                                    view.sync_administration_sidebar_tree_state(cx);
-                                    if view.main_content_view() == MainContentView::Administration {
-                                        view.refresh_current_administration_content(cx);
-                                    }
+
                                     if reload_protected_content && view.gateway.capability_snapshot.is_some() {
                                         match view.main_content_view() {
                                             MainContentView::Providers => {
@@ -209,7 +204,7 @@ impl PioneerDesktop {
                                     if principal_changed {
                                         view.gateway.capability_snapshot = None;
                                         view.sync_settings_sidebar_tree_state(cx);
-                                        view.sync_administration_sidebar_tree_state(cx);
+
                                     }
                                     view.gateway.current_auth = auth;
                                     view.gateway.capability_snapshot = view.gateway.client_runtime.client_core()
@@ -303,88 +298,8 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(in crate::app) fn open_administration_screen_from_bottom_bar(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        self.sync_administration_sidebar_tree_state(cx);
+    pub(in crate::app) fn open_administration_screen_from_bottom_bar(&mut self, cx: &mut Context<Self>) {
         self.set_main_content_view(MainContentView::Administration, cx);
-        self.refresh_current_administration_content(cx);
-    }
-
-    pub(in crate::app) fn open_administration_content(
-        &mut self,
-        content_view: AdministrationContentView,
-        cx: &mut Context<Self>,
-    ) {
-        self.navigation_intent(
-            pioneer_client::navigation::NavigationIntent::SetAdministrationRoute {
-                route: content_view,
-            },
-        );
-        self.sync_administration_sidebar_tree_state(cx);
-        self.set_main_content_view(MainContentView::Administration, cx);
-        self.refresh_current_administration_content(cx);
-    }
-
-    pub(in crate::app) fn sync_administration_sidebar_tree_state(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        let capabilities = self.principal_presentation_capabilities();
-        let mut items = Vec::with_capacity(2);
-        if capabilities.can_view_member_directory {
-            items.push((
-                AdministrationContentView::Members,
-                TreeItem::new(ADMINISTRATION_CONTENT_MEMBERS_NODE_ID, "members"),
-            ));
-        }
-        if capabilities.can_view_invitations {
-            items.push((
-                AdministrationContentView::Invitations,
-                TreeItem::new(ADMINISTRATION_CONTENT_INVITATIONS_NODE_ID, "invitations"),
-            ));
-        }
-
-        if self.gateway.capability_snapshot.is_some()
-            && !items
-                .iter()
-                .any(|(content_view, _)| *content_view == self.administration_content_view())
-        {
-            self.navigation_intent(
-                pioneer_client::navigation::NavigationIntent::SetAdministrationRoute {
-                    route: items
-                        .first()
-                        .map(|(content_view, _)| *content_view)
-                        .unwrap_or(AdministrationContentView::Members),
-                },
-            );
-        }
-
-        let selected_ix = items
-            .iter()
-            .position(|(content_view, _)| *content_view == self.administration_content_view());
-        let administration_tree_state = self.administration_tree_state.clone();
-        administration_tree_state.update(cx, |state, cx| {
-            state.set_items(
-                items.into_iter().map(|(_, item)| item).collect::<Vec<_>>(),
-                cx,
-            );
-            state.set_selected_index(selected_ix, cx);
-        });
-    }
-
-    pub(in crate::app) fn refresh_current_administration_content(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        match self.administration_content_view() {
-            AdministrationContentView::Members => {
-                self.refresh_members(false, cx);
-                self.refresh_all_workspace_members(cx);
-            }
-            AdministrationContentView::Invitations => self.refresh_invitations(false, cx),
-        }
     }
 }
 
@@ -446,7 +361,7 @@ mod tests {
                 desktop.update(cx, |view, cx| {
                     view.apply_navigation_publication(core.navigation_snapshot(), cx);
                     view.gateway.capability_snapshot = None;
-                    view.sync_administration_sidebar_tree_state(cx);
+
                     view.sync_settings_sidebar_tree_state(cx);
                 });
             });

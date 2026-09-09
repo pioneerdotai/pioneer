@@ -1,7 +1,6 @@
 use crate::{
     app::PioneerDesktop,
     components::buttonts::{default_outline_button, default_primary_button},
-    gateway::GatewayWsCommandSender,
 };
 use gpui_kit::component::{
     Icon,
@@ -45,15 +44,16 @@ pub(crate) struct ModelSelectorDialogOptions {
     pub(crate) selected_reasoning_effort: Option<String>,
     pub(crate) mode: ProviderModelSelectorMode,
     pub(crate) workspace_id: String,
-    pub(crate) ws_sender: GatewayWsCommandSender,
+    pub(crate) client: std::sync::Arc<pioneer_client::core::ClientCore>,
     pub(crate) on_save: ModelSelectorSaveCallback,
 }
 
 #[derive(Clone)]
 struct ModelSelectorDialogState {
     title: String,
-    desktop_entity: Entity<PioneerDesktop>,
-    ws_sender: GatewayWsCommandSender,
+    desktop_entity: WeakEntity<PioneerDesktop>,
+    owner: Entity<ModelSelectorOwner>,
+    client: std::sync::Arc<pioneer_client::core::ClientCore>,
     workspace_id: String,
     on_save: ModelSelectorSaveCallback,
     selector: Rc<RefCell<ProviderModelSelectorState>>,
@@ -70,33 +70,45 @@ struct ModelSelectorDialogState {
     model_row_layout_cache: Rc<RefCell<HashMap<String, CachedModelRowLayout>>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct OpenModelSelectorCliRuntimeBinding {
-    workspace_id: String,
-    selector: Weak<RefCell<ProviderModelSelectorState>>,
+struct ModelSelectorOwner {
+    client: std::sync::Weak<pioneer_client::core::ClientCore>, workspace: String,
+    selector: Weak<RefCell<ProviderModelSelectorState>>, runtime: bool,
+    subscription: Option<pioneer_client::core::ClientSubscription>,
+    navigation: pioneer_client::core::ClientSubscription,
+    window: AnyWindowHandle, task: Option<Task<()>>, providers: Option<Task<()>>, models: Option<Task<()>>,
+    demand: std::sync::Arc<()>, model_demand: Option<std::sync::Arc<()>>, closed: bool,
 }
-
-impl OpenModelSelectorCliRuntimeBinding {
-    fn new(workspace_id: String, selector: &Rc<RefCell<ProviderModelSelectorState>>) -> Self {
-        Self {
-            workspace_id,
-            selector: Rc::downgrade(selector),
-        }
+impl ModelSelectorOwner {
+    fn new(client: &std::sync::Arc<pioneer_client::core::ClientCore>, workspace: String, selector: &Rc<RefCell<ProviderModelSelectorState>>, runtime: bool, window: &mut Window, cx: &mut App) -> Entity<Self> {
+        use pioneer_client::{core::ClientScope, providers::runtime::ProviderRuntimeIntent};
+        let mut changed = client.watch_publications();
+        let subscription = runtime.then(|| client.subscribe(ClientScope::ProviderRuntime { workspace_id: workspace.clone() }, std::num::NonZeroUsize::new(8).unwrap()));
+        let navigation = client.subscribe(ClientScope::Navigation, std::num::NonZeroUsize::new(8).unwrap());
+        if runtime { client.provider_runtime_intent(ProviderRuntimeIntent::Observe { workspace_id: workspace.clone() }); }
+        let handle = window.window_handle(); let selector = Rc::downgrade(selector); let client = std::sync::Arc::downgrade(client);
+        cx.new(|cx| {
+            let task = cx.spawn(async move |owner: WeakEntity<Self>, cx| {
+                while changed.changed().await.is_ok() {
+                    if handle.update(cx, |_, window, cx| owner.update(cx, |owner, cx| {
+                        let mut changed = false;
+                        if let Some(subscription) = &owner.subscription { while subscription.try_next().is_some() { changed = true; } }
+                        while owner.navigation.try_next().is_some() { changed = true; }
+                        if !changed { return; }
+                        let Some(client) = owner.client.upgrade() else { return; };
+                        let Some(selector) = owner.selector.upgrade() else { return; };
+                        let runtimes = (client.navigation_snapshot().workspace_id() == Some(owner.workspace.as_str())).then(|| client.provider_runtime_snapshot(&owner.workspace)).flatten().map(|p| p.runtimes().iter().map(|row| row.runtime().clone()).collect()).unwrap_or_default();
+                        if selector.borrow().cli_runtimes() != &runtimes { selector.borrow_mut().sync_cli_runtime_snapshot(runtimes); gpui_kit::component::Root::update(window, cx, |_, _, cx| cx.notify()); }
+                    })).is_err() { break; }
+                }
+            });
+            Self { client, workspace, selector, runtime, subscription, navigation, window: handle, task: Some(task), providers: None, models: None, demand: std::sync::Arc::new(()), model_demand: None, closed: false }
+        })
     }
-
-    fn sync(&self, active_workspace_id: Option<&str>, runtimes: &[RuntimeSummary]) -> bool {
-        let Some(selector) = self.selector.upgrade() else {
-            return false;
-        };
-        let runtimes = if active_workspace_id == Some(self.workspace_id.as_str()) {
-            runtimes.to_vec()
-        } else {
-            Vec::new()
-        };
-        selector.borrow_mut().sync_cli_runtime_snapshot(runtimes);
-        true
-    }
+    fn refresh(&self, cx: &mut App) { let _ = self.window.update(cx, |_, window, cx| gpui_kit::component::Root::update(window, cx, |_, _, cx| cx.notify())); }
+    fn close(&mut self) { self.closed = true; self.demand = std::sync::Arc::new(()); self.model_demand = None; self.providers = None; self.models = None; self.task = None; self.subscription = None; if self.runtime { self.runtime = false; if let Some(client) = self.client.upgrade() { client.provider_runtime_intent(pioneer_client::providers::runtime::ProviderRuntimeIntent::Release { workspace_id: self.workspace.clone() }); } } }
 }
+impl Render for ModelSelectorOwner { fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div() } }
+impl Drop for ModelSelectorOwner { fn drop(&mut self) { self.close(); } }
 
 #[derive(Clone, Copy)]
 struct CachedModelRowLayout {
@@ -218,7 +230,7 @@ impl PioneerDesktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let desktop_entity = cx.entity().clone();
+        let desktop_entity = cx.weak_entity();
 
         let selector = Rc::new(RefCell::new(ProviderModelSelectorState::new_with_mode(
             options.selected_provider.clone(),
@@ -229,12 +241,9 @@ impl PioneerDesktop {
         if options.mode == ProviderModelSelectorMode::Chat {
             selector
                 .borrow_mut()
-                .sync_cli_runtime_snapshot(self.model_selector_cli_runtimes().to_vec());
+                .sync_cli_runtime_snapshot(options.client.provider_runtime_snapshot(&options.workspace_id).map(|p| p.runtimes().iter().map(|row| row.runtime().clone()).collect()).unwrap_or_default());
         }
-        self.open_model_selector_cli_runtime_binding =
-            (options.mode == ProviderModelSelectorMode::Chat).then(|| {
-                OpenModelSelectorCliRuntimeBinding::new(options.workspace_id.clone(), &selector)
-            });
+        let owner = ModelSelectorOwner::new(&options.client, options.workspace_id.clone(), &selector, options.mode == ProviderModelSelectorMode::Chat, window, cx);
 
         let provider_search_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -253,9 +262,10 @@ impl PioneerDesktop {
         let model_row_layout_cache = Rc::new(RefCell::new(HashMap::new()));
 
         let state = ModelSelectorDialogState {
+            owner,
             title: options.title,
             desktop_entity,
-            ws_sender: options.ws_sender,
+            client: options.client,
             workspace_id: options.workspace_id,
             on_save: options.on_save,
             selector,
@@ -278,34 +288,23 @@ impl PioneerDesktop {
     }
 
     fn load_providers_async(cx: &mut Context<Self>, state: &ModelSelectorDialogState) {
-        let selector = state.selector.clone();
-        let ws_sender = state.ws_sender.clone();
-        let workspace_id = state.workspace_id.clone();
-
-        cx.spawn(move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        ws_sender.provider_list(provider_list::provider_list_params(workspace_id))
-                    })
-                    .await;
-                let _ = this.update(&mut cx, |_view, cx| {
-                    match result {
-                        Ok(response) => {
-                            selector.borrow_mut().apply_provider_list_success(response);
-                        }
-                        Err(error) => {
-                            selector
-                                .borrow_mut()
-                                .apply_provider_list_error(format!("{error:#}"));
-                        }
-                    }
-                    cx.notify();
+        let client = state.client.clone(); let workspace = state.workspace_id.clone();
+        state.owner.update(cx, |owner, cx| {
+            if owner.closed { return; }
+            let demand = std::sync::Arc::downgrade(&owner.demand);
+            owner.providers = Some(cx.spawn(async move |owner: WeakEntity<ModelSelectorOwner>, cx| {
+                let result = cx.background_spawn(async move {
+                    let read = client.read_provider_collection(pioneer_client::providers::store::ProviderCollectionKey::catalog(workspace), true); drop(client);
+                    read?.wait_while(|| demand.strong_count() > 0)?.catalog_response()
+                }).await;
+                let _ = owner.update(cx, |owner, cx| {
+                    if owner.closed { return; }
+                    let Some(selector) = owner.selector.upgrade() else { return; };
+                    match result { Ok(response) => selector.borrow_mut().apply_provider_list_success(response), Err(error) => selector.borrow_mut().apply_provider_list_error(format!("{error:#}")) }
+                    owner.refresh(cx);
                 });
-            }
-        })
-        .detach();
+            }));
+        });
     }
 
     fn preload_selected_provider_models_async(
@@ -324,90 +323,36 @@ impl PioneerDesktop {
         }
     }
 
-    fn spawn_fetch_models_for_provider(
-        cx: &mut App,
-        state: ModelSelectorDialogState,
-        provider_name: String,
-    ) {
-        let selector = state.selector.clone();
-        let model_row_layout_cache = state.model_row_layout_cache.clone();
-        let dialog_state = state.clone();
-        let ws_sender = state.ws_sender.clone();
-        let desktop_entity = state.desktop_entity.clone();
-        let workspace_id = state.workspace_id.clone();
-        let mode = state.mode;
-        let provider_name_for_error = provider_name.clone();
-
-        cx.spawn(move |cx: &mut AsyncApp| {
-            let mut cx = cx.clone();
-            async move {
-                let result = cx
-                    .background_spawn(async move {
-                        if let Some(runtime_id) =
-                            provider_list::runtime_id_from_cli_runtime_provider_key(
-                                provider_name.as_str(),
-                            )
-                        {
-                            ws_sender
-                                .cli_runtime_list_models(provider_list::cli_runtime_list_models_params(
-                                    workspace_id,
-                                    runtime_id.to_owned(),
-                                ))
-                                .map(|response| {
-                                    provider_list::provider_models_response_from_cli_runtime_models_response(
-                                        provider_name,
-                                        response,
-                                    )
-                                })
-                        } else {
-                            match api_provider_model_list_kind(mode) {
-                                ApiProviderModelListKind::Chat => ws_sender.provider_list_models(
-                                    provider_list::provider_list_models_params(
-                                        workspace_id,
-                                        provider_name,
-                                    ),
-                                ),
-                                ApiProviderModelListKind::Embeddings => ws_sender
-                                    .provider_list_embedding_models(
-                                        provider_list::provider_list_embedding_models_params(
-                                            workspace_id,
-                                            provider_name,
-                                        ),
-                                    ),
-                                ApiProviderModelListKind::Transcription => ws_sender
-                                    .provider_list_transcription_models(
-                                        provider_list::provider_list_transcription_models_params(
-                                            workspace_id,
-                                            provider_name,
-                                        ),
-                                    ),
-                            }
-                        }
-                    })
-                    .await;
-                let _ = desktop_entity.update(&mut cx, |_view, cx| {
+    fn spawn_fetch_models_for_provider(cx: &mut App, state: ModelSelectorDialogState, provider_name: String) {
+        let client = state.client.clone(); let workspace = state.workspace_id.clone(); let mode = state.mode;
+        let effort = state.selected_reasoning_effort.clone(); let layouts = state.model_row_layout_cache.clone();
+        state.owner.update(cx, |owner, cx| {
+            if owner.closed { return; }
+            let token = std::sync::Arc::new(()); let demand = std::sync::Arc::downgrade(&token); owner.model_demand = Some(token);
+            owner.models = Some(cx.spawn(async move |owner: WeakEntity<ModelSelectorOwner>, cx| {
+                let provider = provider_name.clone();
+                let result = cx.background_spawn(async move {
+                    use pioneer_client::providers::store::{ProviderCollectionKey, ProviderModelKind};
+                    let purpose = match api_provider_model_list_kind(mode) { ApiProviderModelListKind::Chat => ProviderModelKind::Chat, ApiProviderModelListKind::Embeddings => ProviderModelKind::Embeddings, ApiProviderModelListKind::Transcription => ProviderModelKind::Transcription };
+                    let read = client.read_provider_collection(ProviderCollectionKey::models(workspace, provider, purpose), true); drop(client);
+                    read?.wait_while(|| demand.strong_count() > 0)?.models_response()
+                }).await;
+                let _ = owner.update(cx, |owner, cx| {
+                    if owner.closed { return; }
+                    let Some(selector) = owner.selector.upgrade() else { return; };
                     match result {
-                        Ok(response) => {
-                            if selector
-                                .borrow_mut()
-                                .apply_provider_models_success(response)
-                            {
-                                model_row_layout_cache.borrow_mut().clear();
-                                Self::clear_invalid_dialog_reasoning_effort(&dialog_state);
-                            }
-                        }
-                        Err(error) => {
-                            selector.borrow_mut().apply_provider_models_error(
-                                provider_name_for_error.as_str(),
-                                format!("{error:#}"),
-                            );
-                        }
+                        Ok(response) => { if selector.borrow_mut().apply_provider_models_success(response) {
+                            layouts.borrow_mut().clear();
+                            let selector = selector.borrow();
+                            let selected = selector.models().iter().find(|model| Some(model.id.as_str()) == selector.selected_model());
+                            if !selected.is_some_and(|model| provider_presentation::reasoning_effort_rows_for_model(model, effort.borrow().as_deref()).iter().any(|row| row.selected)) { *effort.borrow_mut() = None; }
+                        } },
+                        Err(error) => { selector.borrow_mut().apply_provider_models_error(&provider_name, format!("{error:#}")); }
                     }
-                    cx.notify();
+                    owner.refresh(cx);
                 });
-            }
-        })
-        .detach();
+            }));
+        });
     }
 
     fn show_model_selector_dialog(
@@ -422,6 +367,7 @@ impl PioneerDesktop {
             let model_trigger_loading = Self::model_trigger_loading(&state);
 
             dialog
+                .on_close({ let owner = state.owner.clone(); move |_, _, cx| owner.update(cx, |owner, _| owner.close()) })
                 .gap_1()
                 .rounded_2xl()
                 .title(div().text_base().font_semibold().child(state.title.clone()))
@@ -475,22 +421,13 @@ impl PioneerDesktop {
         });
     }
 
-    pub(crate) fn sync_open_model_selector_cli_runtime_snapshot(&mut self) {
-        let Some(binding) = self.open_model_selector_cli_runtime_binding.clone() else {
-            return;
-        };
-        let runtimes = self.model_selector_cli_runtimes().to_vec();
-        if !binding.sync(self.active_workspace_id(), runtimes.as_slice()) {
-            self.open_model_selector_cli_runtime_binding = None;
-        }
-    }
-
     fn save_model_selector_selection(
         state: ModelSelectorDialogState,
     ) -> Rc<dyn Fn(&mut App) -> bool> {
         Rc::new(move |cx| {
             let (provider, model) = state.selector.borrow().selection_parts();
             let selected_reasoning_effort = state.selected_reasoning_effort.borrow().clone();
+            if state.client.navigation_snapshot().workspace_id() != Some(state.workspace_id.as_str()) { return false; }
             state.desktop_entity.update(cx, |view, cx| {
                 let saved = (state.on_save)(
                     view,
@@ -503,7 +440,7 @@ impl PioneerDesktop {
                 );
                 cx.notify();
                 saved
-            })
+            }).unwrap_or(false)
         })
     }
 
@@ -574,19 +511,6 @@ impl PioneerDesktop {
 
     fn clear_dialog_reasoning_effort(state: &ModelSelectorDialogState) {
         *state.selected_reasoning_effort.borrow_mut() = None;
-    }
-
-    fn clear_invalid_dialog_reasoning_effort(state: &ModelSelectorDialogState) {
-        if state.selected_reasoning_effort.borrow().is_none() {
-            return;
-        }
-
-        if !Self::reasoning_effort_rows(state)
-            .iter()
-            .any(|row| row.selected)
-        {
-            Self::clear_dialog_reasoning_effort(state);
-        }
     }
 
     fn render_provider_selector_section(
@@ -779,7 +703,7 @@ impl PioneerDesktop {
 
         Self::spawn_fetch_models_for_provider(cx, state.clone(), provider_name);
 
-        let _ = state.desktop_entity.update(cx, |_, cx| cx.notify());
+        state.owner.update(cx, |owner, cx| owner.refresh(cx));
     }
 
     fn render_model_selector_section(
@@ -940,7 +864,7 @@ impl PioneerDesktop {
                     let _ = default_popover_entity.update(cx, |popover, cx| {
                         popover.dismiss(window, cx);
                     });
-                    let _ = default_state.desktop_entity.update(cx, |_, cx| cx.notify());
+                    default_state.owner.update(cx, |owner, cx| owner.refresh(cx));
                 })
                 .child(t!("chat.composer.model.reasoning_default").to_string()),
         );
@@ -977,7 +901,7 @@ impl PioneerDesktop {
                         let _ = popover_entity.update(cx, |popover, cx| {
                             popover.dismiss(window, cx);
                         });
-                        let _ = row_state.desktop_entity.update(cx, |_, cx| cx.notify());
+                        row_state.owner.update(cx, |owner, cx| owner.refresh(cx));
                     })
                     .child(row.label),
             );
@@ -1122,7 +1046,7 @@ impl PioneerDesktop {
             .overflow_hidden()
             .child(
                 v_virtual_list(
-                    state.desktop_entity.clone(),
+                    state.owner.clone(),
                     "model-virtual-list",
                     item_sizes,
                     move |_view, visible_range, _window, _cx| {
@@ -1256,7 +1180,7 @@ impl PioneerDesktop {
             .then(|| provider_presentation::transcription_model_selector_presentation(model))
             .flatten();
         let is_active = state.selector.borrow().selected_model() == Some(model_id.as_str());
-        let id: SharedString = format!("model-vl-{ix}").into();
+        let id: SharedString = format!("model-selector:{}:{}:{}:{model_id}:row", state.owner.entity_id(), state.workspace_id, model.provider).into();
 
         div()
             .id(id)
@@ -1285,7 +1209,7 @@ impl PioneerDesktop {
                 let _ = popover_entity.update(cx, |popover, cx| {
                     popover.dismiss(window, cx);
                 });
-                let _ = state.desktop_entity.update(cx, |_, cx| cx.notify());
+                state.owner.update(cx, |owner, cx| owner.refresh(cx));
             })
             .child(
                 v_flex()
@@ -1407,7 +1331,7 @@ mod tests {
             .split("fn show_model_selector_dialog")
             .nth(1)
             .expect("dialog render exists")
-            .split("pub(crate) fn sync_open_model_selector_cli_runtime_snapshot")
+            .split("fn save_model_selector_selection")
             .next()
             .expect("dialog render has a boundary");
 
@@ -1415,17 +1339,5 @@ mod tests {
         assert!(!render.contains(".read(cx)"));
     }
 
-    #[::core::prelude::v1::test]
-    fn model_selector_cli_runtime_binding_does_not_retain_a_closed_dialog() {
-        let selector = Rc::new(RefCell::new(ProviderModelSelectorState::new_with_mode(
-            None,
-            None,
-            ProviderModelSelectorMode::Chat,
-        )));
-        let binding = OpenModelSelectorCliRuntimeBinding::new("workspace".to_owned(), &selector);
 
-        assert!(binding.sync(Some("workspace"), &[]));
-        drop(selector);
-        assert!(!binding.sync(Some("workspace"), &[]));
-    }
 }

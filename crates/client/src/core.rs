@@ -183,7 +183,14 @@ pub enum ClientScope {
     Avatar {
         principal_id: String,
     },
+    AdministrationOperation,
+    AdministrationPage { page: crate::administration::pages::AdministrationPage },
     Provider,
+    ProviderOperation { workspace_id: String },
+    ProviderCollection { key: crate::providers::store::ProviderCollectionKey },
+    ProviderRuntime {
+        workspace_id: String,
+    },
     Administration {
         workspace_id: Option<String>,
     },
@@ -213,6 +220,17 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    AdministrationPresentation {
+        intent: crate::administration::operations::AdministrationPresentationIntent,
+    },
+    AdministrationCommand { command: crate::administration::operations::AdministrationCommand },
+    AdministrationPage { intent: crate::administration::pages::AdministrationPageIntent },
+    ProviderPresentation { intent: crate::providers::effects::ProviderPresentationIntent },
+    ProviderCommand { command: crate::providers::operations::ProviderCommand },
+    ProviderCollection { intent: crate::providers::store::ProviderCollectionIntent },
+    ProviderRuntime {
+        intent: crate::providers::runtime::ProviderRuntimeIntent,
+    },
     Artifact {
         intent: crate::artifacts::store::ArtifactIntent,
     },
@@ -295,6 +313,8 @@ impl ClientOperationId {
 #[serde(untagged)]
 pub enum ClientPlannedEffect {
     Notification(ClientEffect),
+    AdministrationPresentation(crate::administration::operations::AdministrationPresentationEffect),
+    ProviderPresentation(crate::providers::effects::ProviderPresentationEffect),
     GatewaySessionStorage(crate::gateway::session_refresh::GatewaySessionStorageEffect),
 }
 
@@ -772,6 +792,11 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) administration_operations: Mutex<crate::administration::operations::AdministrationOperationController>,
+    pub(crate) administration_store: Mutex<crate::administration::pages::AdministrationStore>,
+    pub(crate) provider_controller: Mutex<crate::providers::operations::ProviderController>,
+    pub(crate) provider_store: Mutex<crate::providers::store::ProviderStore>,
+    pub(crate) provider_runtimes: Mutex<crate::providers::runtime::ProviderRuntimeController>,
     pub(crate) artifact_store: Mutex<crate::artifacts::store::ArtifactStore>,
     pub(crate) artifact_downloads: Mutex<crate::artifacts::operations::ArtifactDownloadController>,
     pub(crate) thread_members: Mutex<crate::threads::members::ThreadMemberController>,
@@ -781,8 +806,6 @@ pub struct ClientCore {
         Mutex<crate::composer::voice::ComposerVoiceCleanupController>,
     pub(crate) composer_voice_readiness:
         Mutex<crate::composer::voice_readiness::ComposerVoiceReadinessController>,
-    pub(crate) composer_runtimes:
-        Mutex<crate::composer::runtime_selection::ComposerRuntimeController>,
     pub(crate) composer_models:
         Mutex<crate::composer::model_display::ComposerModelDisplayController>,
     pub(crate) composer_steers: Mutex<crate::composer::steer::ComposerSteerController>,
@@ -951,6 +974,11 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
+            administration_operations: Mutex::default(),
+            administration_store: Mutex::default(),
+            provider_controller: Mutex::default(),
+            provider_store: Mutex::default(),
+            provider_runtimes: Mutex::default(),
             artifact_store: Mutex::default(),
             artifact_downloads: Mutex::default(),
             thread_members: Mutex::default(),
@@ -958,7 +986,6 @@ impl ClientCore {
             composer_store: Mutex::default(),
             composer_voice_cleanup: Mutex::default(),
             composer_voice_readiness: Mutex::default(),
-            composer_runtimes: Mutex::default(),
             composer_models: Mutex::default(),
             composer_steers: Mutex::default(),
             composer_edits: Mutex::default(),
@@ -1239,6 +1266,14 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.administration_operations.lock().expect("administration operations poisoned").stop();
+        self.administration_store.lock().expect("administration store poisoned").stop();
+        self.provider_controller.lock().expect("provider controller poisoned").stop();
+        self.provider_store.lock().expect("provider store poisoned").stop();
+        self.provider_runtimes
+            .lock()
+            .expect("provider runtimes poisoned")
+            .stop();
         self.composer_voice_cleanup
             .lock()
             .expect("voice cleanup poisoned")
@@ -1246,10 +1281,6 @@ impl ClientCore {
         self.composer_voice_readiness
             .lock()
             .expect("voice readiness controller poisoned")
-            .stop();
-        self.composer_runtimes
-            .lock()
-            .expect("composer runtime controller poisoned")
             .stop();
         self.composer_models
             .lock()
@@ -1391,7 +1422,8 @@ impl ClientCore {
             return None;
         }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
-            self.observe_composer_runtime_notification(notification);
+            self.observe_administration_notification(notification);
+            self.observe_provider_runtime_notification(notification);
             self.observe_composer_voice_notification(notification);
             self.observe_composer_voice_readiness_notification(notification);
             self.observe_artifact_notification(notification);
@@ -1448,6 +1480,12 @@ impl ClientCore {
     pub fn shared() -> Arc<Self> {
         let core = Arc::new(Self::new());
         core.initialize_navigation();
+        core.start_administration_operation_controller();
+        core.start_administration_controller();
+        core.start_provider_runtime_controller();
+        core.start_provider_controller();
+        core.start_provider_operation_controller();
+        core.start_provider_credential_controller();
         core.start_task_notification_controller();
         core.start_task_review_controller();
         core.start_approval_action_controller();
@@ -1456,7 +1494,6 @@ impl ClientCore {
         core.start_composer_catalog_controller();
         core.start_composer_model_picker_controller();
         core.start_turn_cancellation_controller();
-        core.start_composer_runtime_controller();
         core.start_composer_voice_cleanup_controller();
         core.start_composer_voice_readiness_controller();
         core.start_composer_model_display_controller();
@@ -1742,6 +1779,15 @@ impl ClientCore {
             );
         }
         match &intent {
+            ClientIntent::AdministrationPresentation { intent } => return self.administration_presentation_intent(intent.clone()),
+            ClientIntent::AdministrationCommand { command } => return self.administration_command_intent(command.clone()),
+            ClientIntent::AdministrationPage { intent } => return self.administration_page_intent(intent.clone()),
+            ClientIntent::ProviderPresentation { intent } => return self.provider_presentation_intent(intent.clone()),
+            ClientIntent::ProviderCommand { command } => return self.provider_command_intent(command.clone()),
+            ClientIntent::ProviderCollection { intent } => return self.provider_collection_intent(intent.clone()),
+            ClientIntent::ProviderRuntime { intent } => {
+                return self.provider_runtime_intent(intent.clone());
+            }
             ClientIntent::Composer { intent } => return self.composer_intent(intent.clone()),
             ClientIntent::Artifact { intent } => return self.artifact_intent(intent.clone()),
             ClientIntent::ThreadMember { intent } => {
@@ -2281,6 +2327,11 @@ impl ClientCore {
                 .invalidate();
         }
         if evict_protected {
+            self.invalidate_administration_operations();
+            self.invalidate_administration();
+            self.invalidate_provider_runtimes();
+            self.invalidate_provider_collections();
+            self.invalidate_provider_operations();
             self.cancel_artifact_downloads(None);
             self.cancel_composer_requests();
             self.invalidate_task_reviews(None);

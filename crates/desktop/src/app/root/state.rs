@@ -25,8 +25,6 @@ impl PioneerDesktop {
             )
         });
         let settings_tree_state = cx.new(|cx| TreeState::new(cx));
-        let administration_tree_state = cx.new(|cx| TreeState::new(cx));
-        let provider_tree_state = cx.new(|cx| TreeState::new(cx));
         let skills_audit_table_state = cx.new(|cx| {
             TableState::new(
                 SkillDiagnosticsTableDelegate::new("skills-audit-table"),
@@ -72,6 +70,15 @@ impl PioneerDesktop {
             crate::app::initial::InitialGatewaySetupView::new(desktop, session_binding.clone(), cx)
         });
 
+        let providers_view = pioneer_desktop_providers::ProviderCatalogView::new(
+            crate::app::providers::provider_config(client_runtime.client_core().clone(), cx), window, cx);
+        let width = if shell_state.read(cx).sidebar_visible() { shell_state.read(cx).sidebar_width() } else { px(0.) };
+        providers_view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        let provider_layout = providers_view.downgrade();
+        let providers_layout_subscription = cx.observe(&shell_state, move |_, layout, cx| {
+            let width = if layout.read(cx).sidebar_visible() { layout.read(cx).sidebar_width() } else { px(0.) };
+            let _ = provider_layout.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        });
         let mut view = Self {
             window_active: window.is_window_active(),
             frame_presentation: None,
@@ -88,14 +95,8 @@ impl PioneerDesktop {
             agents_doc_editor: None,
             profile_editor: None,
             profile_editor_input_subscriptions: Vec::new(),
-            administration: AdministrationCache::default(),
-            workspace_members_loading: HashSet::new(),
-            open_model_selector_cli_runtime_binding: None,
-            invitations_loading: false,
-            invitations_error: None,
-            members_loading: false,
-            member_workspaces_saving: false,
-            members_error: None,
+            administration_view: pioneer_desktop_administration::AdministrationView::new(
+                crate::app::administration::administration_config(client_runtime.client_core().clone(), cx), window, cx),
             member_avatar_state: DesktopMemberAvatarState::new(
                 cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
                     .core(),
@@ -111,13 +112,12 @@ impl PioneerDesktop {
             remote_access_status_poll_generation: 0,
             self_improvement_status_poll: None,
             settings_tree_state,
-            administration_tree_state,
-            provider_tree_state,
 
             active_thread_resubscribe_pending: false,
             task_notification_surface: None,
             workspace_catalog_input: Default::default(),
-            providers: Default::default(),
+            providers_view,
+            _providers_layout_subscription: providers_layout_subscription,
             mcp_servers: Vec::new(),
             mcp_server_details: None,
             mcp_loading: false,
@@ -207,8 +207,7 @@ impl PioneerDesktop {
             view.reconcile_desktop_startup_readiness(window, cx)
         });
         view.sync_settings_sidebar_tree_state(cx);
-        view.sync_administration_sidebar_tree_state(cx);
-        view.sync_provider_sidebar_tree_state(cx);
+
         view.start_gateway_ws_event_pump(window, cx);
         view.bootstrap_gateway_runtime(cx);
 

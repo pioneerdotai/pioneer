@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 pioneer-desktop-thread.workspace = true
+pioneer-desktop-administration.workspace = true
+pioneer-desktop-providers.workspace = true
 pioneer-desktop-workspaces.workspace = true
 pioneer-desktop-update.workspace = true
 pioneer-desktop-task-notifications.workspace = true

@@ -689,19 +689,16 @@ impl ClientCore {
             while let Ok(work) = receiver.recv() {
                 let Some(core) = weak.upgrade() else { return; };
                 if !core.model_picker_work_current(&work) { continue; }
-                let sender = core.compatibility_runtime().ws_command_sender(); drop(core);
+                use crate::providers::store::{ProviderCollectionKey, ProviderModelKind};
+                let key = match &work.kind {
+                    RequestKind::Providers => ProviderCollectionKey::catalog(work.workspace.clone()),
+                    RequestKind::Models(provider) => ProviderCollectionKey::models(work.workspace.clone(), provider.clone(), ProviderModelKind::Chat),
+                };
+                let read = core.read_provider_collection(key, true); drop(core);
+                let publication = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.model_picker_work_current(&work))));
                 let result = match &work.kind {
-                    RequestKind::Providers => {
-                        let api = sender.provider_list(list::provider_list_params(work.workspace.clone())).map_err(|e| format!("{e:#}"));
-                        ModelPickerResult::Providers(api)
-                    }
-                    RequestKind::Models(provider) => ModelPickerResult::Models(
-                        if let Some(runtime) = list::runtime_id_from_cli_runtime_provider_key(provider) {
-                            sender.cli_runtime_list_models(list::cli_runtime_list_models_params(work.workspace.clone(), runtime.to_owned()))
-                                .map(|r| list::provider_models_response_from_cli_runtime_models_response(provider.clone(), r))
-                        } else { sender.provider_list_models(list::provider_list_models_params(work.workspace.clone(), provider.clone())) }
-                        .map_err(|e| format!("{e:#}"))
-                    ),
+                    RequestKind::Providers => ModelPickerResult::Providers(publication.and_then(|p| p.catalog_response()).map_err(|_| "provider_catalog_unavailable".into())),
+                    RequestKind::Models(_) => ModelPickerResult::Models(publication.and_then(|p| p.models_response()).map_err(|_| "provider_models_unavailable".into())),
                 };
                 let Some(core) = weak.upgrade() else { return; }; core.complete_composer_model_picker(work, result);
             }
@@ -754,9 +751,6 @@ mod tests {
     use pioneer_protocol::*;
     fn fixture() -> (Arc<ClientCore>, mpsc::Receiver<ModelPickerWork>) {
         let core = Arc::new(ClientCore::new());
-        core.upsert_thread(serde_json::from_value(serde_json::json!({
-            "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"provider", "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
-        })).unwrap());
         ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(
             &core,
             AuthorizationCapabilitySnapshot {
@@ -835,6 +829,16 @@ mod tests {
                 }),
             },
         );
+        let mut capability = core.thread_capability_snapshot("a").unwrap().snapshot.clone().unwrap();
+        let workspace = capability.workspace.as_mut().unwrap();
+        workspace.operational_resources = workspace.execution_draft_policy.resources.clone();
+        workspace.operational_resources.fingerprint = "synthetic-policy".into();
+        workspace.execution_draft_policy.resources = workspace.operational_resources.clone();
+        assert_eq!(core.accept_authorization_projection(0, None, capability.clone()), crate::authorization::AuthorizationProjectionAcceptance::Accepted);
+        core.upsert_thread(serde_json::from_value(serde_json::json!({
+            "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"provider", "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
+        })).unwrap());
+        ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(&core, capability);
         core.composer_intent(ComposerIntent::Open {
             thread_id: "a".into(),
             defaults: super::super::state_machine::ComposerDomainState {

@@ -1,0 +1,341 @@
+[dialog.folder.rename]
+title = "Renombrar carpeta"
+description = "Hazlo corto y fácil de recordar."
+
+[dialog.thread.rename]
+title = "Renombrar"
+description = "Actualiza el título del hilo."
+
+[providers.screen]
+title = "Proveedores"
+description = "Configura las claves API para los proveedores de modelos disponibles."
+empty_connected = "Aún no hay proveedores conectados."
+
+[providers.sidebar]
+api = "Proveedores API"
+connected = "Conectados"
+cli = "Proveedores CLI"
+
+[providers.button]
+submit = "Guardar"
+remove_key = "Eliminar clave"
+refresh = "Refresh providers"
+
+[providers.dialog]
+title = "Configurar %{provider}"
+api_key_label = "Clave API *"
+api_key_placeholder = "Introduce la clave API"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+proxy_hint = "Optional workspace-scoped proxy for this provider."
+replace_hint = "Ya hay una clave configurada para %{provider}. Al guardar se reemplazará."
+
+[providers.error]
+gateway_not_connected = "La pasarela no está conectada."
+workspace_not_selected = "No se ha seleccionado un espacio de trabajo."
+load_failed = "No se pudo cargar la configuración de proveedores"
+save_failed = "No se pudo guardar la clave API"
+delete_failed = "No se pudo eliminar la clave API"
+
+[providers.cli]
+title = "CLI Providers"
+description = "Gateway comprueba y mantiene actualizado el estado de disponibilidad."
+refreshing = "Refreshing"
+empty = "No CLI providers configured"
+diagnostics = "Diagnostics"
+native_events = "Native events"
+recent_stderr = "Recent stderr"
+copied_diagnostics = "Copied diagnostics for"
+login_code = "Code"
+login_open = "Open"
+login_started = "CLI login started"
+
+[providers.cli.mcp]
+runtime_not_ready = "Runtime is not ready"
+unsupported_contract = "Provider MCP contract is unsupported"
+strict_isolation_failed = "MCP isolation check failed"
+helper_self_probe_failed = "MCP helper self-check failed"
+platform_ipc_unavailable = "Secure local IPC is unavailable"
+continuity_unavailable = "Conversation restart/resume is unavailable"
+readiness_unavailable = "MCP readiness is unavailable"
+
+[providers.cli.detail]
+account = "Account"
+version = "Version"
+binary = "Binary"
+home = "Home/config path"
+shadow_home = "Shadow home"
+
+[providers.cli.value]
+disabled = "Disabled"
+
+[providers.cli.inline]
+display_name_label = "Display name"
+display_name_hint = "Name shown for this CLI provider in lists and pickers."
+binary_label = "Binary path"
+binary_hint = "Path to the CLI binary used by this instance."
+home_label = "Home/config path"
+home_hint = "Runtime home and configuration directory."
+shadow_home_label = "Shadow home path"
+shadow_home_hint = "Optional account-specific home; leave empty to disable."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+
+[providers.cli.action]
+add = "Add CLI Provider"
+refresh = "Refresh status"
+copy_diagnostics = "Copy diagnostics"
+edit = "Edit CLI Provider"
+duplicate = "Duplicate CLI Provider"
+disable = "Disable CLI Provider"
+enable = "Enable CLI Provider"
+login = "Log in"
+open_home = "Open home/config path"
+open_shadow_home = "Open shadow home"
+expand = "Show CLI provider details"
+collapse = "Hide CLI provider details"
+
+[providers.cli.status_detail]
+authenticated = "Authenticated as %{account}"
+authenticated_with_plan = "Authenticated as %{account} · %{plan}"
+not_on_path = "CLI `%{binary}` is not installed or not on PATH."
+unsupported_version = "Installed %{version}; minimum %{minimum}"
+
+[providers.cli.dialog]
+title_add = "Add CLI Provider"
+title_edit = "Edit CLI Provider"
+title_duplicate = "Duplicate CLI Provider"
+id_label = "Provider ID"
+display_name_label = "Display name"
+binary_label = "Binary"
+home_label = "Home/config path"
+shadow_home_label = "Shadow home"
+enabled_label = "Enabled"
+id_placeholder = "cli_provider_work"
+
+[providers.cli.status]
+disabled = "Disabled"
+missing_binary = "Missing binary"
+spawn_failed = "Spawn failed"
+initializing = "Initializing"
+needs_auth = "Needs login"
+ready = "Ready"
+degraded = "Degraded"
+unsupported = "Unsupported"
+error = "Error"
+
+[providers.cli.error]
+open_path_failed = "Open path failed"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Claude y otros modelos de Anthropic"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "Modelos a través de AWS Bedrock"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Modelos a través de Azure OpenAI Service"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Ejecuta modelos mediante una API compatible con Copilot"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "Proveedor DeepSeek compatible con OpenAI"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Modelos Gemini de Google AI"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "Modelos GLM y compatibles con Zhipu"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Inferencia rápida con hardware Groq"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "Proxy y pasarela LiteLLM"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "API de Mistral mediante un punto de conexión compatible con OpenAI"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "Ejecuta modelos locales de Ollama"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT y otros modelos de OpenAI"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "Enrutador para muchos proveedores de modelos"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Punto de conexión de inferencia de Telnyx"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "Modelos xAI Grok"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Modelos alojados por Together"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "APIs de modelos alojados por Fireworks"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "Punto de conexión Novita compatible con OpenAI"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Modelos de la API de Perplexity"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Punto de conexión de compatibilidad de Cohere"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "API de modelos de Venice"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "API de modelos de Cerebras"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "API de modelos de SambaNova"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Modelos alojados por Hyperbolic"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "Punto de conexión DeepInfra compatible con OpenAI"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "Punto de conexión del enrutador HF"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "Punto de conexión de AI21 Studio"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Punto de conexión de modelos de Reka"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Punto de conexión de inferencia de Baseten"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Punto de conexión de inferencia de Nscale"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Puntos de conexión de modelos alojados por Anyscale"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Punto de conexión de Nebius AI Studio"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Punto de conexión sin servidor de Friendli"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Punto de conexión de Lepton AI"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "API de modelos de SiliconFlow"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "Punto de conexión de API de AIHubMix"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "API de modelos de ASTRAI"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "Punto de conexión de modelos de StepFun"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "API de modelos de Baichuan"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "API de modelos Lingyiwanwu / Yi"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "API de modelos Tencent Hunyuan"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "Punto de conexión de IA de OVHcloud"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "Punto de conexión NVIDIA NIM"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "Punto de conexión Synthetic compatible con OpenAI"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Punto de conexión Volcengine Ark"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "API de modelos Baidu Qianfan"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "API local de LM Studio compatible con OpenAI"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "API local de llama.cpp compatible con OpenAI"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "API local de SGLang compatible con OpenAI"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "API local de vLLM compatible con OpenAI"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "API local de OSaurus compatible con OpenAI"
+
+
+[buttons]
+ok = "OK"
+add = "Añadir"
+cancel = "Cancelar"
+save = "Guardar"
+dismiss = "Cerrar"
+

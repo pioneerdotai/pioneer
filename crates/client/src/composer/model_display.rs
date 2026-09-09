@@ -3,7 +3,6 @@ use super::store::{ComposerOperationIdentity, ComposerPublication, DraftId};
 use crate::{
     core::{ClientCore, ClientMutationAuthority, ClientScope, ClientTransition},
     providers::{
-        list,
         presentation::{self, ProviderModelDisplayKey},
     },
 };
@@ -35,6 +34,7 @@ pub struct ComposerModelDisplayPublication {
 
 #[derive(Clone)]
 struct ModelRequest {
+    retry: bool,
     publication: ComposerModelDisplayPublication,
     auth_ticket: (u64, Option<u64>),
 }
@@ -149,7 +149,7 @@ impl ClientCore {
             label: None,
             reasoning_effort_label: None,
         };
-        let request = ModelRequest {
+        let request = ModelRequest { retry: retry.is_some(),
             publication: publication.clone(),
             auth_ticket: ticket,
         };
@@ -398,12 +398,10 @@ impl ClientCore {
                 if let ModelWork::Resolve(request) = work {
                     let Some(core) = weak.upgrade() else { return; };
                     if core.composer_model_request_is_current(&request) {
-                        let sender = core.compatibility_runtime().ws_command_sender();
-                        drop(core);
                         let key = &request.publication.key;
-                        let result = if let Some(runtime) = list::runtime_id_from_cli_runtime_provider_key(&key.provider) {
-                            sender.cli_runtime_list_models(list::cli_runtime_list_models_params(key.workspace_id.clone(), runtime.to_owned())).map(|response| list::provider_models_response_from_cli_runtime_models_response(key.provider.clone(), response))
-                        } else { sender.provider_list_models(presentation::provider_model_display_models_params(key)) };
+                        let read = core.read_provider_collection(crate::providers::store::ProviderCollectionKey::models(key.workspace_id.clone(), key.provider.clone(), crate::providers::store::ProviderModelKind::Chat), request.retry);
+                        drop(core);
+                        let result = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.composer_model_request_is_current(&request)))).and_then(|p| p.models_response());
                         let Some(core) = weak.upgrade() else { return; };
                         core.complete_composer_model_display(request, result.map_err(|error| format!("{error:#}")));
                     }

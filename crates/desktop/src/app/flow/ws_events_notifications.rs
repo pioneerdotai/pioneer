@@ -1,15 +1,14 @@
 use super::*;
-use crate::app::root::{AdministrationContentView, MainContentView};
-use pioneer_client::administration::{AdministrationEvent, AdministrationRefetch};
+use crate::app::root::MainContentView;
+use pioneer_client::administration::AdministrationEvent;
 use pioneer_client::authorization::AccessChangedPlan;
 #[cfg(test)]
 use pioneer_client::authorization::{ThreadAuthorizationScope, plan_access_changed};
 use pioneer_client::notifications::router::{
-    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction, CLIRuntimeSnapshotReduction,
+    ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
     SkillsRefreshReduction, ThreadArtifactsRefreshReduction, WorkspacePreferenceReduction,
     WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
 };
-use pioneer_client::providers::list::CliRuntimeSnapshotUpdate;
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
 use pioneer_client::workspaces::selectors as workspace_selectors;
 
@@ -115,9 +114,7 @@ impl PioneerDesktop {
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_) => {}
             ClientRuntimeNotification::SemanticTimeline(_) => {}
             ClientRuntimeNotification::VoiceSessionResult(_) => {}
-            ClientRuntimeNotification::CLIRuntimeSnapshot(reduction) => {
-                self.apply_cli_runtime_snapshot_reduction(reduction, cx);
-            }
+            ClientRuntimeNotification::CLIRuntimeSnapshot(_) => {}
             ClientRuntimeNotification::CLIRuntimePendingRequests(_) => {}
             ClientRuntimeNotification::PendingRequests { .. } => {}
             ClientRuntimeNotification::TaskUserNotificationDelivered(_) => {}
@@ -136,48 +133,9 @@ impl PioneerDesktop {
                     auth.principal.id == notification.principal_id
                 })
         );
-        let invalidation = self.administration.apply_event(&event);
-        if invalidation.apply {
-            self.apply_administration_refetches(invalidation.effects, cx);
-            if current_profile_changed {
-                self.refresh_current_principal(cx);
-            }
-        }
+        if current_profile_changed { self.refresh_current_principal(cx); }
     }
 
-    pub(in crate::app) fn apply_administration_refetches(
-        &mut self,
-        effects: Vec<AdministrationRefetch>,
-        cx: &mut Context<Self>,
-    ) {
-        for effect in effects {
-            match effect {
-                AdministrationRefetch::InvitationList
-                    if self.main_content_view() == MainContentView::Administration
-                        && self.administration_content_view()
-                            == AdministrationContentView::Invitations =>
-                {
-                    self.refresh_invitations(false, cx);
-                }
-                AdministrationRefetch::MemberDirectory => {
-                    self.members_error = None;
-                    if self.main_content_view() == MainContentView::Administration
-                        && self.administration_content_view() == AdministrationContentView::Members
-                    {
-                        self.refresh_members(false, cx);
-                    }
-                }
-                AdministrationRefetch::WorkspaceMembers { workspace_id }
-                    if self.main_content_view() == MainContentView::Administration
-                        && self.administration_content_view()
-                            == AdministrationContentView::Members =>
-                {
-                    self.refresh_workspace_members(workspace_id, cx);
-                }
-                _ => {}
-            }
-        }
-    }
 
     fn apply_access_changed_notification(
         &mut self,
@@ -196,7 +154,6 @@ impl PioneerDesktop {
             return;
         }
 
-        let administration_invalidation = self.administration.apply_access_changed(&notification);
 
         // A newer revision is one atomic fence across global, workspace and
         // thread projections. No capability from the previous generation may
@@ -212,17 +169,6 @@ impl PioneerDesktop {
         let workspace_wide = plan.change == pioneer_protocol::AccessChangeKind::WorkspaceMembership;
         let workspace_access_lost = workspace_wide
             && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
-        if workspace_wide
-            && (plan.clear_active_workspace
-                || active_workspace_id.as_deref() == Some(plan.workspace_id.as_str()))
-        {
-            // Membership/role changes fence every provider projection from
-            // the previous authorization generation. The shared client
-            // effect below reloads both catalogs through current-ACL APIs.
-            self.providers.clear_for_workspace_switch();
-            self.sync_open_model_selector_cli_runtime_snapshot();
-        }
-
         let active_editor_lost = workspace_access_lost
             && self
                 .active_agents_doc_editor_scope
@@ -262,9 +208,6 @@ impl PioneerDesktop {
             && (workspace_access_lost || !plan.invalidate_thread_ids.is_empty())
         {}
         execute_desktop_client_effects(self, plan.effects, cx);
-        if administration_invalidation.apply {
-            self.apply_administration_refetches(administration_invalidation.effects, cx);
-        }
         self.refresh_current_principal(cx);
         cx.notify();
     }
@@ -291,42 +234,6 @@ impl PioneerDesktop {
     fn apply_skills_refresh_reduction(&mut self, reduction: SkillsRefreshReduction) {
         if reduction.queue_skills_refresh {
             self.queue_skills_refresh();
-        }
-    }
-
-    fn apply_cli_runtime_snapshot_reduction(
-        &mut self,
-        reduction: CLIRuntimeSnapshotReduction,
-        cx: &mut Context<Self>,
-    ) {
-        match reduction {
-            CLIRuntimeSnapshotReduction::Upsert {
-                revision,
-                runtime,
-                removed,
-                workspace_matches: true,
-                ..
-            } => {
-                match self
-                    .providers
-                    .apply_cli_runtime_snapshot_update(revision, *runtime, removed)
-                {
-                    CliRuntimeSnapshotUpdate::Applied => {
-                        self.sync_open_model_selector_cli_runtime_snapshot();
-                        cx.notify();
-                    }
-                    CliRuntimeSnapshotUpdate::ReloadRequired => {
-                        self.load_cli_provider_snapshot(cx);
-                    }
-                    CliRuntimeSnapshotUpdate::Stale => {}
-                }
-            }
-            CLIRuntimeSnapshotReduction::Reload {
-                workspace_matches: true,
-                ..
-            } => self.load_cli_provider_snapshot(cx),
-            CLIRuntimeSnapshotReduction::Upsert { .. }
-            | CLIRuntimeSnapshotReduction::Reload { .. } => {}
         }
     }
 
@@ -600,9 +507,9 @@ mod access_change_tests {
             .map(|(production_source, _)| production_source)
             .expect("Desktop notification tests must remain outside production wiring");
 
-        assert!(production_source.contains("self.administration.apply_event(&event)"));
+        assert!(!production_source.contains("self.administration.apply_event(&event)"));
         assert!(
-            production_source.contains("self.administration.apply_access_changed(&notification)")
+            !production_source.contains("self.administration.apply_access_changed(&notification)")
         );
         assert!(
             production_source.contains(

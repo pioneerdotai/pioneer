@@ -1,10 +1,8 @@
 //! Aggregate client state.
 
 use crate::{
-    administration::AdministrationCache,
     cli_runtime::approvals::PendingRequestState,
     mcp::list::McpListState,
-    providers::list::ProviderListState,
     skills::catalog::SkillCatalogState,
     threads::{coordinator::ThreadCoordinator, start::ThreadStartCoordinator},
     timeline::semantic::SemanticTimelineState,
@@ -19,11 +17,9 @@ pub use crate::threads::tree::WorkspaceThreadState;
 
 #[derive(Default)]
 pub struct ClientState {
-    pub administration: AdministrationCache,
     pub threads: ThreadsState,
     pub workspaces: WorkspacesState,
     pub gateway: GatewayClientState,
-    pub providers: ProvidersState,
     pub pending_requests: PendingRequestState,
     pub mcp: McpState,
     pub skills: SkillsState,
@@ -73,8 +69,6 @@ pub struct GatewayClientState {
     pub settings_loading: bool,
     pub settings_error: Option<String>,
 }
-
-pub type ProvidersState = ProviderListState;
 
 pub type McpState = McpListState;
 

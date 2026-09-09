@@ -7,7 +7,7 @@ use crate::{
 };
 use pioneer_protocol::*;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, mpsc},
     thread::JoinHandle,
 };
@@ -638,6 +638,12 @@ impl ClientCore {
                         {
                             core.apply_thread_member_output(&request, Ok(output), false);
                         }
+                    }, |page| {
+                        let core = weak.upgrade().ok_or_else(|| anyhow::anyhow!("administration_read_cancelled"))?;
+                        let read = core.read_administration_page(page, true)?;
+                        drop(core);
+                        let publication = read.wait_while(&current)?;
+                        Ok(publication.members.iter().map(|row| row.member.clone()).collect())
                     });
                     let Some(core) = weak.upgrade() else {
                         return;
@@ -667,6 +673,7 @@ fn load_thread_members(
     sender: &impl crate::rpc::JsonRpcRequestTransport,
     current: impl Fn() -> bool,
     progress: impl Fn(MemberOutput),
+    directory: impl Fn(crate::administration::pages::AdministrationPage) -> anyhow::Result<Vec<MemberSummary>>,
 ) -> anyhow::Result<MemberOutput> {
     use crate::transport::ws::command_sender as commands;
     let mut output = MemberOutput::default();
@@ -713,36 +720,8 @@ fn load_thread_members(
         }
         ThreadScopeAction::ListParticipants => {}
     }
-    let workspace_result: anyhow::Result<Vec<MemberSummary>> = (|| {
-        let mut workspace_members = Vec::new();
-        let mut cursor = None;
-        let mut seen = HashSet::new();
-        loop {
-            anyhow::ensure!(current(), "Thread member request cancelled");
-            let response = commands::workspace_member_list(
-                sender,
-                WorkspaceMemberListParams {
-                    workspace_id: WorkspaceId::new(request.workspace_id.clone())?,
-                    cursor,
-                    limit: Some(100),
-                },
-            )?;
-            anyhow::ensure!(
-                response.workspace_id.as_str() == request.workspace_id,
-                "Workspace member response scope mismatch"
-            );
-            workspace_members.extend(response.members);
-            cursor = response.next_cursor;
-            let Some(next) = &cursor else {
-                break;
-            };
-            anyhow::ensure!(
-                seen.insert(next.clone()),
-                "Workspace member cursor repeated"
-            );
-        }
-        Ok(workspace_members)
-    })();
+    anyhow::ensure!(current(), "Thread member request cancelled");
+    let workspace_result = directory(crate::administration::pages::AdministrationPage::WorkspaceMembers { workspace_id: WorkspaceId::new(request.workspace_id.clone())? });
     output.workspace_request = Some(match &workspace_result {
         Ok(_) => ThreadMemberReadState::Ready,
         Err(error) => ThreadMemberReadState::Failed {
@@ -755,33 +734,7 @@ fn load_thread_members(
     }
     anyhow::ensure!(current(), "Thread member request cancelled");
     progress(output.clone());
-    let directory_result: anyhow::Result<Vec<MemberSummary>> = (|| {
-        let mut member_directory = Vec::new();
-        if request.can_read_directory {
-            let mut cursor = None;
-            let mut seen = HashSet::new();
-            loop {
-                anyhow::ensure!(current(), "Thread member request cancelled");
-                let response = commands::member_list(
-                    sender,
-                    MemberListParams {
-                        cursor,
-                        limit: Some(100),
-                    },
-                )?;
-                member_directory.extend(response.members);
-                cursor = response.next_cursor;
-                let Some(next) = &cursor else {
-                    break;
-                };
-                anyhow::ensure!(
-                    seen.insert(next.clone()),
-                    "Member directory cursor repeated"
-                );
-            }
-        }
-        Ok(member_directory)
-    })();
+    let directory_result = if request.can_read_directory { directory(crate::administration::pages::AdministrationPage::MemberDirectory) } else { Ok(Vec::new()) };
     output.directory_request = Some(match &directory_result {
         Ok(_) => ThreadMemberReadState::Ready,
         Err(error) => ThreadMemberReadState::Failed {
@@ -1025,9 +978,10 @@ mod tests {
                     ThreadMemberRequestState::Loading { .. }
                 ));
             },
+            |page| match page { crate::administration::pages::AdministrationPage::WorkspaceMembers { .. } => Ok(vec![member()]), _ => Err(anyhow::anyhow!("synthetic directory failure")) },
         )
         .unwrap();
-        assert_eq!(transport.requests.borrow().len(), 3);
+        assert_eq!(&*transport.requests.borrow(), &["thread/participants/list"]);
         core.complete_thread_members(&initial, Ok(output));
         let input = core.thread_member_snapshot("a").unwrap();
         assert_eq!(input.workspace_members, vec![member()]);
@@ -1059,39 +1013,11 @@ mod tests {
         ));
     }
     #[test]
-    fn cancellation_between_pages_stops_remaining_requests_and_repeated_cursor_is_bounded() {
+    fn cancelled_directory_read_does_not_publish_or_request_participants() {
         let active = Cell::new(true);
-        let transport = Transport {
-            requests: Default::default(),
-            on_workspace: Box::new(|| active.set(false)),
-            repeated_cursor: false,
-        };
-        assert!(
-            load_thread_members(
-                &request("a"),
-                &transport,
-                || active.get(),
-                |_| panic!("cancelled request published progress")
-            )
-            .is_err()
-        );
-        assert_eq!(&*transport.requests.borrow(), &["workspace/member/list"]);
-        let transport = Transport {
-            requests: Default::default(),
-            on_workspace: Box::new(|| {}),
-            repeated_cursor: true,
-        };
-        let output = load_thread_members(&request("a"), &transport, || true, |_| {}).unwrap();
-        assert!(output.error.unwrap().contains("cursor repeated"));
-        assert_eq!(
-            transport
-                .requests
-                .borrow()
-                .iter()
-                .filter(|method| method.as_str() == "workspace/member/list")
-                .count(),
-            2
-        );
+        let transport = Transport { requests: Default::default(), on_workspace: Box::new(|| {}), repeated_cursor: false };
+        assert!(load_thread_members(&request("a"), &transport, || active.get(), |_| panic!("cancelled progress"), |_| { active.set(false); Ok(vec![member()]) }).is_err());
+        assert!(transport.requests.borrow().is_empty());
     }
     #[test]
     fn drop_and_access_loss_fence_old_thread_completion_and_policy_change_gets_a_new_generation() {

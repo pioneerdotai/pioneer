@@ -473,8 +473,6 @@ impl PioneerDesktop {
                             view.profile_editor = None;
                             view.profile_editor_input_subscriptions.clear();
                             view.resolve_current_principal_avatar(cx);
-                            view.refresh_members(false, cx);
-                            view.refresh_all_workspace_members(cx);
                             cx.notify();
                         });
                     }

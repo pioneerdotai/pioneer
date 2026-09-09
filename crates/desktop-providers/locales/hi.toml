@@ -1,0 +1,341 @@
+[dialog.folder.rename]
+title = "फ़ोल्डर का नाम बदलें"
+description = "इसे छोटा और याद रखने में आसान रखें।"
+
+[dialog.thread.rename]
+title = "नाम बदलें"
+description = "थ्रेड का शीर्षक अपडेट करें।"
+
+[providers.screen]
+title = "प्रोवाइडर"
+description = "उपलब्ध मॉडल प्रोवाइडरों के लिए API कुंजियां कॉन्फ़िगर करें।"
+empty_connected = "अभी तक कोई कनेक्टेड प्रोवाइडर नहीं है।"
+
+[providers.sidebar]
+api = "API प्रदाता"
+connected = "कनेक्टेड"
+cli = "CLI प्रदाता"
+
+[providers.button]
+submit = "सहेजें"
+remove_key = "कुंजी हटाएँ"
+refresh = "Refresh providers"
+
+[providers.dialog]
+title = "%{provider} कॉन्फ़िगर करें"
+api_key_label = "API कुंजी *"
+api_key_placeholder = "API कुंजी दर्ज करें"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+proxy_hint = "Optional workspace-scoped proxy for this provider."
+replace_hint = "%{provider} के लिए पहले से एक कुंजी कॉन्फ़िगर है। सहेजने पर यह बदल जाएगी।"
+
+[providers.error]
+gateway_not_connected = "गेटवे कनेक्ट नहीं है।"
+workspace_not_selected = "कार्यक्षेत्र चयनित नहीं है."
+load_failed = "प्रोवाइडर कॉन्फ़िगरेशन लोड करने में विफल"
+save_failed = "API कुंजी सहेजने में विफल"
+delete_failed = "API कुंजी हटाने में विफल"
+
+[providers.cli]
+title = "CLI Providers"
+description = "Gateway उपलब्धता की जाँच करता है और उसे अद्यतन रखता है।"
+refreshing = "Refreshing"
+empty = "No CLI providers configured"
+diagnostics = "Diagnostics"
+native_events = "Native events"
+recent_stderr = "Recent stderr"
+copied_diagnostics = "Copied diagnostics for"
+login_code = "Code"
+login_open = "Open"
+login_started = "CLI login started"
+
+[providers.cli.mcp]
+runtime_not_ready = "Runtime is not ready"
+unsupported_contract = "Provider MCP contract is unsupported"
+strict_isolation_failed = "MCP isolation check failed"
+helper_self_probe_failed = "MCP helper self-check failed"
+platform_ipc_unavailable = "Secure local IPC is unavailable"
+continuity_unavailable = "Conversation restart/resume is unavailable"
+readiness_unavailable = "MCP readiness is unavailable"
+
+[providers.cli.detail]
+account = "Account"
+version = "Version"
+binary = "Binary"
+home = "Home/config path"
+shadow_home = "Shadow home"
+
+[providers.cli.value]
+disabled = "Disabled"
+
+[providers.cli.inline]
+display_name_label = "Display name"
+display_name_hint = "Name shown for this CLI provider in lists and pickers."
+binary_label = "Binary path"
+binary_hint = "Path to the CLI binary used by this instance."
+home_label = "Home/config path"
+home_hint = "Runtime home and configuration directory."
+shadow_home_label = "Shadow home path"
+shadow_home_hint = "Optional account-specific home; leave empty to disable."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+
+[providers.cli.action]
+add = "Add CLI Provider"
+refresh = "Refresh status"
+copy_diagnostics = "Copy diagnostics"
+edit = "Edit CLI Provider"
+duplicate = "Duplicate CLI Provider"
+disable = "Disable CLI Provider"
+enable = "Enable CLI Provider"
+login = "Log in"
+open_home = "Open home/config path"
+open_shadow_home = "Open shadow home"
+expand = "Show CLI provider details"
+collapse = "Hide CLI provider details"
+
+[providers.cli.status_detail]
+authenticated = "Authenticated as %{account}"
+authenticated_with_plan = "Authenticated as %{account} · %{plan}"
+not_on_path = "CLI `%{binary}` is not installed or not on PATH."
+unsupported_version = "Installed %{version}; minimum %{minimum}"
+
+[providers.cli.dialog]
+title_add = "Add CLI Provider"
+title_edit = "Edit CLI Provider"
+title_duplicate = "Duplicate CLI Provider"
+id_label = "Provider ID"
+display_name_label = "Display name"
+binary_label = "Binary"
+home_label = "Home/config path"
+shadow_home_label = "Shadow home"
+enabled_label = "Enabled"
+id_placeholder = "cli_provider_work"
+
+[providers.cli.status]
+disabled = "Disabled"
+missing_binary = "Missing binary"
+spawn_failed = "Spawn failed"
+initializing = "Initializing"
+needs_auth = "Needs login"
+ready = "Ready"
+degraded = "Degraded"
+unsupported = "Unsupported"
+error = "Error"
+
+[providers.cli.error]
+open_path_failed = "Open path failed"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Anthropic के Claude और अन्य मॉडल"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "AWS Bedrock के जरिए मॉडल"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "Azure OpenAI Service के जरिए मॉडल"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "Copilot-संगत API के जरिए मॉडल चलाएं"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "OpenAI-संगत DeepSeek प्रदाता"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "Google AI के Gemini मॉडल"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM और Zhipu-संगत मॉडल"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "Groq हार्डवेयर पर तेज अनुमान"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM प्रॉक्सी और गेटवे"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "OpenAI-संगत एंडपॉइंट के जरिए Mistral API"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "स्थानीय Ollama मॉडल चलाएं"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT और अन्य OpenAI मॉडल"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "कई मॉडल प्रदाताओं के लिए राउटर"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Telnyx अनुमान एंडपॉइंट"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "xAI Grok मॉडल"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "Together पर होस्टेड मॉडल"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Fireworks होस्टेड मॉडल API"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "Novita OpenAI-संगत एंडपॉइंट"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Perplexity API मॉडल"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Cohere संगतता एंडपॉइंट"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "Venice मॉडल API"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "Cerebras मॉडल API"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "SambaNova मॉडल API"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Hyperbolic होस्टेड मॉडल"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "DeepInfra OpenAI-संगत एंडपॉइंट"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "HF राउटर एंडपॉइंट"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "AI21 Studio एंडपॉइंट"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Reka मॉडल एंडपॉइंट"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Baseten अनुमान एंडपॉइंट"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Nscale अनुमान एंडपॉइंट"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Anyscale होस्टेड मॉडल एंडपॉइंट"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Nebius AI Studio एंडपॉइंट"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Friendli सर्वरलेस एंडपॉइंट"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Lepton AI एंडपॉइंट"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "SiliconFlow मॉडल API"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "AIHubMix API एंडपॉइंट"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "ASTRAI मॉडल API"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "StepFun मॉडल एंडपॉइंट"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "Baichuan मॉडल API"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "Lingyiwanwu / Yi मॉडल API"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "Tencent Hunyuan मॉडल API"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "OVHcloud AI एंडपॉइंट"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "NVIDIA NIM एंडपॉइंट"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "Synthetic OpenAI-संगत एंडपॉइंट"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Volcengine Ark एंडपॉइंट"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "Baidu Qianfan मॉडल API"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "स्थानीय LM Studio OpenAI-संगत API"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "स्थानीय llama.cpp OpenAI-संगत API"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "स्थानीय SGLang OpenAI-संगत API"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "स्थानीय vLLM OpenAI-संगत API"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "स्थानीय OSaurus OpenAI-संगत API"
+
+
+[buttons]
+ok = "OK"
+add = "जोड़ें"
+cancel = "रद्द करें"
+save = "सहेजें"
+dismiss = "बंद करें"
+

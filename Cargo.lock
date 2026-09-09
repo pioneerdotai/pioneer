@@ -8887,7 +8887,9 @@ dependencies = [
  "image",
  "pioneer-client",
  "pioneer-config",
+ "pioneer-desktop-administration",
  "pioneer-desktop-foundation",
+ "pioneer-desktop-providers",
  "pioneer-desktop-task-notifications",
  "pioneer-desktop-thread",
  "pioneer-desktop-update",
@@ -8923,11 +8925,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-desktop-administration"
+version = "0.51.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "pioneer-desktop-foundation"
 version = "0.51.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
+]
+
+[[package]]
+name = "pioneer-desktop-providers"
+version = "0.51.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

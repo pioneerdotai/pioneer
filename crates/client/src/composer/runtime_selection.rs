@@ -1,4 +1,4 @@
-//! Runtime readiness for draft selection. Provider administration remains independent.
+//! Draft-specific runtime readiness derived from the shared provider owner.
 use super::{
     capabilities::composer_capability_target_for_provider,
     catalog::{ComposerCatalogRequest, ComposerCatalogRequestState},
@@ -8,10 +8,16 @@ use super::{
 use crate::core::ClientMutationAuthority;
 use crate::{
     core::{ClientCore, ClientTransition},
-    providers::list::{self, CliRuntimeSnapshotLoad, CliRuntimeSnapshotUpdate, ProviderListState},
+    providers::{
+        list,
+        runtime::{
+            ProviderRuntimeDemand, ProviderRuntimeIntent, ProviderRuntimePublication,
+            ProviderRuntimeRequestState,
+        },
+    },
 };
-use pioneer_protocol::{CLIRuntimeListResponse, GatewayNotification, RuntimeSummary};
-use std::sync::{Arc, mpsc};
+use pioneer_protocol::RuntimeSummary;
+use std::sync::Arc;
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -23,37 +29,11 @@ pub struct ComposerRuntimePublication {
     pub selected_provider_ready: bool,
     pub active_runtime_supports_steer: Option<bool>,
 }
-#[derive(Clone)]
-pub(super) struct RuntimeRequest {
-    identity: ComposerOperationIdentity,
-    workspace: String,
-    auth: (u64, Option<u64>),
-    attempt: usize,
-}
 pub(super) struct ComposerRuntimeState {
     draft: DraftId,
-    list: ProviderListState,
-    request: RuntimeRequest,
-}
-#[derive(Default)]
-pub(crate) struct ComposerRuntimeController {
-    sender: Option<mpsc::SyncSender<RuntimeRequest>>,
-    task: Option<std::thread::JoinHandle<()>>,
-}
-impl ComposerRuntimeController {
-    pub(crate) fn stop(&mut self) {
-        self.sender.take();
-    }
-}
-impl Drop for ComposerRuntimeController {
-    fn drop(&mut self) {
-        self.stop();
-        if let Some(task) = self.task.take() {
-            if task.thread().id() != std::thread::current().id() {
-                let _ = task.join();
-            }
-        }
-    }
+    workspace: String,
+    _demand: ProviderRuntimeDemand,
+    snapshot: Option<Arc<ProviderRuntimePublication>>,
 }
 impl ClientCore {
     pub(crate) fn observe_composer_runtime(
@@ -62,13 +42,10 @@ impl ClientCore {
         retry: Option<DraftId>,
         picker: bool,
     ) -> Option<ClientTransition> {
-        let auth = self.current_auth_ticket();
         if self.is_stopped() {
             return None;
         }
-        let Some(coordinator) = self.thread_coordinator_snapshot(thread) else {
-            return None;
-        };
+        let coordinator = self.thread_coordinator_snapshot(thread)?;
         let workspace = coordinator.workspace_id.clone();
         let allowed = self
             .thread_capability_snapshot(thread)
@@ -80,11 +57,8 @@ impl ClientCore {
         if !allowed {
             return None;
         }
-
         let mut store = self.composer_store.lock().expect("composer store poisoned");
-        let Some(current) = store.drafts.get(thread).cloned() else {
-            return None;
-        };
+        let current = store.drafts.get(thread)?.clone();
         if store.suspended.contains(thread) || retry.is_some_and(|id| id != current.draft_id()) {
             return None;
         }
@@ -105,53 +79,45 @@ impl ClientCore {
         if store
             .runtimes
             .get(thread)
-            .is_some_and(|s| s.draft == current.draft_id())
+            .is_some_and(|s| s.draft == current.draft_id() && s.workspace == workspace)
         {
-            if let Some(publication) = current.runtime_selection() {
-                if publication.request.state == ComposerCatalogRequestState::Loading
-                    || (retry.is_none()
-                        && publication.request.state != ComposerCatalogRequestState::Cancelled)
-                {
-                    self.publish_composer_runtime_selection(&mut store, thread);
-                    return None;
-                }
+            self.publish_composer_runtime_selection(&mut store, thread);
+            drop(store);
+            if retry.is_some() {
+                self.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                    workspace_id: workspace,
+                });
             }
+            return None;
         }
+        // Registration only changes the provider owner and never calls a consumer
+        // back while the composer lock is held.
+        store.runtimes.remove(thread);
+        let demand = self.retain_provider_runtime(&workspace);
+        store.runtimes.insert(
+            thread.into(),
+            ComposerRuntimeState {
+                draft: current.draft_id(),
+                workspace: workspace.clone(),
+                _demand: demand,
+                snapshot: self.provider_runtime_snapshot(&workspace),
+            },
+        );
         store.next_operation = store
             .next_operation
             .checked_add(1)
-            .expect("runtime request generation exhausted");
+            .expect("runtime projection identity exhausted");
         let identity = ComposerOperationIdentity {
             thread_id: thread.into(),
             draft_id: current.draft_id(),
             generation: store.next_operation,
         };
-        let request = RuntimeRequest {
-            identity: identity.clone(),
-            workspace: workspace.clone(),
-            auth,
-            attempt: 0,
-        };
-        let list = store
-            .runtimes
-            .remove(thread)
-            .filter(|s| s.draft == current.draft_id())
-            .map(|s| s.list)
-            .unwrap_or_default();
-        store.runtimes.insert(
-            thread.into(),
-            ComposerRuntimeState {
-                draft: current.draft_id(),
-                list,
-                request: request.clone(),
-            },
-        );
         let mut next = (*current).clone();
         next.runtime_selection = Some(ComposerRuntimePublication {
-            identity,
-            workspace_id: workspace,
+            identity: identity.clone(),
+            workspace_id: workspace.clone(),
             request: ComposerCatalogRequest {
-                generation: request.identity.generation,
+                generation: identity.generation,
                 state: ComposerCatalogRequestState::Loading,
             },
             selected_provider: current.domain().selected_provider.clone(),
@@ -164,78 +130,8 @@ impl ClientCore {
         });
         let transition = self.publish_composer_model_display(&mut store, next);
         drop(store);
-        self.enqueue_composer_runtime(request);
+        self.sync_composer_provider_runtimes(&workspace);
         Some(transition)
-    }
-    fn enqueue_composer_runtime(&self, request: RuntimeRequest) {
-        let queued = self
-            .composer_runtimes
-            .lock()
-            .expect("composer runtimes poisoned")
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.try_send(request.clone()).is_ok());
-        if !queued {
-            self.complete_composer_runtime(
-                request,
-                Err("Runtime request queue unavailable".into()),
-            );
-        }
-    }
-    fn runtime_request_matches(&self, store: &ComposerStore, request: &RuntimeRequest) -> bool {
-        !self.is_stopped()
-            && self.current_auth_ticket() == request.auth
-            && !store.suspended.contains(&request.identity.thread_id)
-            && store
-                .runtimes
-                .get(&request.identity.thread_id)
-                .is_some_and(|s| {
-                    s.request.identity == request.identity && s.request.attempt == request.attempt
-                })
-            && store
-                .drafts
-                .get(&request.identity.thread_id)
-                .is_some_and(|draft| {
-                    draft.draft_id() == request.identity.draft_id
-                        && draft.runtime_selection().is_some_and(|p| {
-                            p.identity == request.identity
-                                && p.request.state == ComposerCatalogRequestState::Loading
-                        })
-                })
-    }
-    fn complete_composer_runtime(
-        &self,
-        request: RuntimeRequest,
-        response: Result<CLIRuntimeListResponse, String>,
-    ) {
-        let mut store = self.composer_store.lock().expect("composer store poisoned");
-        if !self.runtime_request_matches(&store, &request) {
-            return;
-        }
-        let state = store.runtimes.get_mut(&request.identity.thread_id).unwrap();
-        let outcome = match response {
-            Ok(response) => match state.list.apply_cli_runtime_snapshot_response(response) {
-                CliRuntimeSnapshotLoad::Applied => ComposerCatalogRequestState::Ready,
-                CliRuntimeSnapshotLoad::RetryRequired => ComposerCatalogRequestState::Failed {
-                    message: "Runtime snapshot predates observed update".into(),
-                },
-            },
-            Err(message) => ComposerCatalogRequestState::Failed { message },
-        };
-        if matches!(outcome, ComposerCatalogRequestState::Failed { .. }) && request.attempt < 3 {
-            let mut retry = request;
-            retry.attempt += 1;
-            state.request = retry.clone();
-            drop(store);
-            self.enqueue_composer_runtime(retry);
-            return;
-        }
-        let mut next = (**store.drafts.get(&request.identity.thread_id).unwrap()).clone();
-        next.runtime_selection.as_mut().unwrap().request.state = outcome;
-        self.publish_composer_model_display(&mut store, next);
-        self.publish_composer_runtime_selection(&mut store, &request.identity.thread_id);
-        drop(store);
-        self.resume_composer_model_picker_models(&request.identity.thread_id);
     }
     pub(super) fn composer_runtime_rows(
         store: &ComposerStore,
@@ -244,8 +140,33 @@ impl ClientCore {
         store
             .runtimes
             .get(thread)
-            .map(|s| s.list.cli_runtimes().to_vec())
+            .and_then(|s| s.snapshot.as_ref())
+            .map(|p| {
+                p.runtimes()
+                    .iter()
+                    .map(|row| row.runtime().clone())
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+    pub(crate) fn sync_composer_provider_runtimes(&self, workspace: &str) {
+        let snapshot = self.provider_runtime_snapshot(workspace);
+        let mut store = self.composer_store.lock().expect("composer store poisoned");
+        let threads: Vec<_> = store
+            .runtimes
+            .iter()
+            .filter(|(thread, s)| s.workspace == workspace && !store.suspended.contains(*thread))
+            .map(|(thread, _)| thread.clone())
+            .collect();
+        for thread in &threads {
+            let state = store.runtimes.get_mut(thread).unwrap();
+            state.snapshot = snapshot.clone();
+            self.publish_composer_runtime_selection(&mut store, thread);
+        }
+        drop(store);
+        for thread in threads {
+            self.resume_composer_model_picker_models(&thread);
+        }
     }
     fn publish_composer_runtime_selection(&self, store: &mut ComposerStore, thread: &str) {
         let Some(current) = store.drafts.get(thread).cloned() else {
@@ -255,6 +176,24 @@ impl ClientCore {
         let mut next = (*current).clone();
         let provider = next.domain().selected_provider.clone();
         if let Some(publication) = next.runtime_selection.as_mut() {
+            if let Some(snapshot) = store
+                .runtimes
+                .get(thread)
+                .and_then(|state| state.snapshot.as_ref())
+            {
+                publication.request.state = match snapshot.request() {
+                    ProviderRuntimeRequestState::Idle | ProviderRuntimeRequestState::Loading => {
+                        ComposerCatalogRequestState::Loading
+                    }
+                    ProviderRuntimeRequestState::Ready => ComposerCatalogRequestState::Ready,
+                    ProviderRuntimeRequestState::Failed => ComposerCatalogRequestState::Failed {
+                        message: "Runtime snapshot unavailable".into(),
+                    },
+                    ProviderRuntimeRequestState::Cancelled => {
+                        ComposerCatalogRequestState::Cancelled
+                    }
+                };
+            }
             publication.selected_provider = provider.clone();
             publication.selected_provider_ready =
                 list::provider_ready_for_model_selector(provider.as_deref(), &runtimes);
@@ -297,90 +236,6 @@ impl ClientCore {
         publication.active_runtime_supports_steer = None;
         self.publish_composer_model_display(&mut store, next);
     }
-    pub(crate) fn observe_composer_runtime_notification(&self, notification: &GatewayNotification) {
-        let workspace = match notification {
-            GatewayNotification::CLIRuntimeStatusChanged(n) => &n.workspace_id,
-            GatewayNotification::CLIRuntimeAccountUpdated(n) => &n.workspace_id,
-            GatewayNotification::CLIRuntimeAppsChanged(n) => &n.workspace_id,
-            _ => return,
-        };
-        let mut store = self.composer_store.lock().expect("composer store poisoned");
-        let threads: Vec<_> = store
-            .runtimes
-            .iter()
-            .filter(|(thread, state)| {
-                &state.request.workspace == workspace && !store.suspended.contains(*thread)
-            })
-            .map(|(t, _)| t.clone())
-            .collect();
-        let mut reload = Vec::new();
-        let mut changed_threads = Vec::new();
-        for thread in threads {
-            let state = store.runtimes.get_mut(&thread).unwrap();
-            let changed = match notification {
-                GatewayNotification::CLIRuntimeStatusChanged(n) => state
-                    .list
-                    .apply_cli_runtime_snapshot_update(n.revision, n.runtime.clone(), n.removed),
-                _ => CliRuntimeSnapshotUpdate::ReloadRequired,
-            };
-            match changed {
-                CliRuntimeSnapshotUpdate::Stale => {}
-                CliRuntimeSnapshotUpdate::Applied => {
-                    self.publish_composer_runtime_selection(&mut store, &thread);
-                    changed_threads.push(thread);
-                }
-                CliRuntimeSnapshotUpdate::ReloadRequired => reload.push((thread, state.draft)),
-            }
-        }
-        drop(store);
-        for thread in changed_threads {
-            self.resume_composer_model_picker_models(&thread);
-        }
-        for (thread, draft) in reload {
-            self.observe_composer_runtime(&thread, Some(draft), true);
-        }
-    }
-    pub(crate) fn start_composer_runtime_controller(self: &Arc<Self>) {
-        let (sender, receiver) = mpsc::sync_channel::<RuntimeRequest>(64);
-        let weak = Arc::downgrade(self);
-        let task = std::thread::Builder::new()
-            .name("client-composer-runtime".into())
-            .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    if request.attempt > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            [0, 500, 2000, 5000][request.attempt],
-                        ));
-                    }
-                    let Some(core) = weak.upgrade() else {
-                        return;
-                    };
-                    let matches = {
-                        let store = core.composer_store.lock().expect("composer store poisoned");
-                        core.runtime_request_matches(&store, &request)
-                    };
-                    if !matches {
-                        continue;
-                    }
-                    let sender = core.compatibility_runtime().ws_command_sender();
-                    drop(core);
-                    let response = sender
-                        .cli_runtime_list(list::cli_runtime_list_params(request.workspace.clone()))
-                        .map_err(|e| format!("{e:#}"));
-                    let Some(core) = weak.upgrade() else {
-                        return;
-                    };
-                    core.complete_composer_runtime(request, response);
-                }
-            })
-            .expect("composer runtime worker");
-        let mut owner = self
-            .composer_runtimes
-            .lock()
-            .expect("composer runtimes poisoned");
-        owner.sender = Some(sender);
-        owner.task = Some(task);
-    }
 }
 
 #[cfg(test)]
@@ -391,13 +246,8 @@ mod tests {
         core::{ClientDemand, ClientScope},
     };
     use pioneer_protocol::*;
-    fn fixture() -> (Arc<ClientCore>, mpsc::Receiver<RuntimeRequest>) {
+    fn fixture() -> Arc<ClientCore> {
         let core = Arc::new(ClientCore::new());
-        let (sender, receiver) = mpsc::sync_channel(64);
-        core.composer_runtimes.lock().unwrap().sender = Some(sender);
-        core.upsert_thread(serde_json::from_value(serde_json::json!({
-            "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"cli_runtime:codex", "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
-        })).unwrap());
         ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(
             &core,
             AuthorizationCapabilitySnapshot {
@@ -476,6 +326,16 @@ mod tests {
                 }),
             },
         );
+        let mut capability = core.thread_capability_snapshot("a").unwrap().snapshot.clone().unwrap();
+        let workspace = capability.workspace.as_mut().unwrap();
+        workspace.operational_resources = workspace.execution_draft_policy.resources.clone();
+        workspace.operational_resources.fingerprint = "synthetic-policy".into();
+        workspace.execution_draft_policy.resources = workspace.operational_resources.clone();
+        assert_eq!(core.accept_authorization_projection(0, None, capability.clone()), crate::authorization::AuthorizationProjectionAcceptance::Accepted);
+        core.upsert_thread(serde_json::from_value(serde_json::json!({
+            "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"cli_runtime:codex", "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
+        })).unwrap());
+        ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(&core, capability);
         core.composer_intent(ComposerIntent::Open {
             thread_id: "a".into(),
             defaults: super::super::state_machine::ComposerDomainState {
@@ -493,7 +353,7 @@ mod tests {
                 capability_target: None,
             },
         });
-        (core, receiver)
+        core
     }
     fn runtime(ready: bool) -> RuntimeSummary {
         serde_json::from_value(serde_json::json!({"runtime_id":"codex","kind":"codex","display_name":"Codex","enabled":true,"status":{"state":if ready {"ready"} else {"needs_auth"}},"capabilities": RuntimeCapabilities { supports_threads: true, supports_model_list: true, supports_steer: true, supports_skills: true, supports_mcp_tools: true, ..Default::default() }})).unwrap()
@@ -505,7 +365,7 @@ mod tests {
         }
     }
     fn delta(core: &ClientCore, revision: u64, ready: bool) {
-        core.observe_composer_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
             CLIRuntimeStatusChangedNotification {
                 workspace_id: "ws".into(),
                 revision,
@@ -516,15 +376,15 @@ mod tests {
     }
     #[test]
     fn selected_runtime_readiness_and_capability_target_have_one_publication_owner() {
-        let (core, rx) = fixture();
-        let request = rx.try_recv().unwrap();
+        let core = fixture();
+        let request = core.provider_runtime_request_for_test("ws").unwrap();
         assert!(
             !core
                 .composer_snapshot("a")
                 .unwrap()
                 .selected_provider_ready()
         );
-        core.complete_composer_runtime(request.clone(), Ok(response(1, true)));
+        core.complete_provider_runtime_for_test(request.clone(), Ok(response(1, true)));
         let ready = core.composer_snapshot("a").unwrap();
         assert!(ready.selected_provider_ready());
         assert_eq!(
@@ -532,7 +392,7 @@ mod tests {
             true
         );
         assert!(ready.domain().capability_target.policy().supports_skills);
-        core.complete_composer_runtime(request, Err("duplicate".into()));
+        core.complete_provider_runtime_for_test(request, Err(()));
         assert!(Arc::ptr_eq(&ready, &core.composer_snapshot("a").unwrap()));
         delta(&core, 2, false);
         let unavailable = core.composer_snapshot("a").unwrap();
@@ -542,18 +402,63 @@ mod tests {
             &unavailable,
             &core.composer_snapshot("a").unwrap()
         ));
-        assert!(rx.try_recv().is_err());
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
+    }
+    #[test]
+    fn unrelated_runtime_delta_preserves_the_selected_composer_projection() {
+        let core = fixture();
+        let work = core.provider_runtime_request_for_test("ws").unwrap();
+        core.complete_provider_runtime_for_test(work, Ok(response(1, true)));
+        let before = core.composer_snapshot("a").unwrap();
+        let mut other = runtime(false);
+        other.runtime_id = "other".into();
+        core.observe_provider_runtime_notification(&GatewayNotification::CLIRuntimeStatusChanged(
+            CLIRuntimeStatusChangedNotification {
+                workspace_id: "ws".into(),
+                revision: 2,
+                runtime: other,
+                removed: false,
+            },
+        ));
+        assert_eq!(
+            core.provider_runtime_snapshot("ws")
+                .unwrap()
+                .runtimes()
+                .len(),
+            2
+        );
+        assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+    }
+    #[test]
+    fn closing_composer_preserves_another_shells_workspace_demand() {
+        let core = fixture();
+        let work = core.provider_runtime_request_for_test("ws").unwrap();
+        core.provider_runtime_intent(ProviderRuntimeIntent::Observe {
+            workspace_id: "ws".into(),
+        });
+        assert_eq!(core.provider_runtime_request_for_test("ws").unwrap(), work);
+        core.cancel_composer_runtime("a");
+        let before = core.composer_snapshot("a").unwrap();
+        core.complete_provider_runtime_for_test(work, Ok(response(1, true)));
+        assert_eq!(
+            core.provider_runtime_snapshot("ws").unwrap().request(),
+            &ProviderRuntimeRequestState::Ready
+        );
+        assert!(Arc::ptr_eq(&before, &core.composer_snapshot("a").unwrap()));
+        core.provider_runtime_intent(ProviderRuntimeIntent::Release {
+            workspace_id: "ws".into(),
+        });
     }
     #[test]
     fn persistent_failure_is_bounded_and_only_explicit_retry_starts_a_new_generation() {
-        let (core, rx) = fixture();
-        let first = rx.try_recv().unwrap();
+        let core = fixture();
+        let first = core.provider_runtime_request_for_test("ws").unwrap();
         let mut request = first.clone();
         for attempt in 0..4 {
             assert_eq!(request.attempt, attempt);
-            core.complete_composer_runtime(request.clone(), Err("persistent".into()));
+            core.complete_provider_runtime_for_test(request.clone(), Err(()));
             if attempt < 3 {
-                request = rx.try_recv().unwrap();
+                request = core.provider_runtime_request_for_test("ws").unwrap();
             }
         }
         let draft = core.composer_snapshot("a").unwrap();
@@ -564,21 +469,21 @@ mod tests {
         for _ in 0..100 {
             core.observe_composer_runtime("a", None, false);
         }
-        assert!(rx.try_recv().is_err());
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
         core.composer_intent(ComposerIntent::RetryRuntimeSelection {
             thread_id: "a".into(),
             draft_id: draft.draft_id(),
         });
-        let retry = rx.try_recv().unwrap();
-        assert_ne!(first.identity.generation, retry.identity.generation);
-        core.complete_composer_runtime(first, Ok(response(100, true)));
+        let retry = core.provider_runtime_request_for_test("ws").unwrap();
+        assert_ne!(first.generation, retry.generation);
+        core.complete_provider_runtime_for_test(first, Ok(response(100, true)));
         assert!(
             !core
                 .composer_snapshot("a")
                 .unwrap()
                 .selected_provider_ready()
         );
-        core.complete_composer_runtime(retry, Ok(response(1, true)));
+        core.complete_provider_runtime_for_test(retry, Ok(response(1, true)));
         assert!(
             core.composer_snapshot("a")
                 .unwrap()
@@ -587,32 +492,32 @@ mod tests {
     }
     #[test]
     fn a_revision_gap_fences_the_in_flight_full_response() {
-        let (core, rx) = fixture();
-        let first = rx.try_recv().unwrap();
+        let core = fixture();
+        let first = core.provider_runtime_request_for_test("ws").unwrap();
         delta(&core, 3, false);
-        core.complete_composer_runtime(first.clone(), Ok(response(1, true)));
+        core.complete_provider_runtime_for_test(first.clone(), Ok(response(1, true)));
         assert!(
             !core
                 .composer_snapshot("a")
                 .unwrap()
                 .selected_provider_ready()
         );
-        let retry = rx.try_recv().unwrap();
-        assert_eq!(retry.identity, first.identity);
-        core.complete_composer_runtime(retry, Ok(response(3, false)));
+        let retry = core.provider_runtime_request_for_test("ws").unwrap();
+        assert_eq!(retry.generation, first.generation);
+        core.complete_provider_runtime_for_test(retry, Ok(response(3, false)));
         delta(&core, 4, true);
         assert!(
             core.composer_snapshot("a")
                 .unwrap()
                 .selected_provider_ready()
         );
-        assert!(rx.try_recv().is_err());
+        assert!(core.provider_runtime_request_for_test("ws").is_none());
     }
     #[test]
     fn route_draft_access_and_shutdown_retirement_reject_late_callbacks() {
         for scenario in 0..5 {
-            let (core, rx) = fixture();
-            let old = rx.try_recv().unwrap();
+            let core = fixture();
+            let old = core.provider_runtime_request_for_test("ws").unwrap();
             match scenario {
                 0 => {
                     let lease = core.subscribe(
@@ -640,7 +545,7 @@ mod tests {
                 _ => core.shutdown(),
             }
             let before = core.composer_snapshot("a");
-            core.complete_composer_runtime(old, Ok(response(10, true)));
+            core.complete_provider_runtime_for_test(old, Ok(response(10, true)));
             assert_eq!(before, core.composer_snapshot("a"));
         }
     }
@@ -648,25 +553,27 @@ mod tests {
 
 #[cfg(any(test, feature = "test-support"))]
 impl ClientMutationAuthority {
-    /// Resolves a synthetic runtime read through the same generation-fenced completion.
+    /// Resolves a synthetic runtime read through the shared provider controller.
     pub fn accept_composer_runtime_for_test(
         &self,
         core: &ClientCore,
         thread: &str,
-        response: CLIRuntimeListResponse,
+        response: pioneer_protocol::CLIRuntimeListResponse,
     ) {
-        let (sender, receiver) = mpsc::sync_channel(64);
-        let previous = core
-            .composer_runtimes
-            .lock()
-            .unwrap()
-            .sender
-            .replace(sender);
         core.cancel_composer_runtime(thread);
         let draft = core.composer_snapshot(thread).unwrap();
         core.observe_composer_runtime(thread, Some(draft.draft_id()), true);
-        core.composer_runtimes.lock().unwrap().sender = previous;
-        let request = receiver.try_recv().expect("synthetic runtime request");
-        core.complete_composer_runtime(request, Ok(response));
+        let workspace = core
+            .thread_coordinator_snapshot(thread)
+            .unwrap()
+            .workspace_id
+            .clone();
+        core.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+            workspace_id: workspace.clone(),
+        });
+        let request = core
+            .provider_runtime_request_for_test(&workspace)
+            .expect("synthetic runtime request");
+        core.complete_provider_runtime_for_test(request, Ok(response));
     }
 }

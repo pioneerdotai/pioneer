@@ -332,14 +332,6 @@ impl PioneerDesktop {
         )
     }
 
-    pub(crate) fn model_selector_cli_runtimes(&self) -> &[RuntimeSummary] {
-        // A transient snapshot request error must not hide a previously
-        // confirmed Gateway revision. Workspace and Gateway switches clear
-        // this cache explicitly, so retaining it here is both safe and more
-        // resilient than treating transport health as provider readiness.
-        self.providers.cli_runtimes()
-    }
-
     pub(in crate::app) fn sorted_thread_ids_for_workspace(
         &self,
         workspace_id: &str,

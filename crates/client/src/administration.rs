@@ -1,16 +1,28 @@
-//! Secret-free, non-authoritative client projections for Epic 5 administration.
+//! Client-owned administration workflows and secret-free projections.
 //!
 //! The Gateway remains the authorization and data authority. This module keeps
 //! only snapshots returned by authenticated list methods and drops them when a
 //! scoped notification says they may be stale.
 
+pub mod pages;
+pub mod operations;
+
+pub mod types {
+    pub use pioneer_protocol::{AuthMeResponse, AuthorizationCapabilitySnapshot, AuthorizationInvitationRoleOption,
+        AuthSessionRevokeParams, AuthSessionStatus, MemberDeviceCreateParams, MemberListParams,
+        MemberRemoveParams, MemberRestoreParams, MemberSummary, MemberSuspendParams, PrincipalId,
+        PrincipalKind, PrincipalStatus, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
+        WorkspaceMemberRemoveParams, InvitationCreateParams, InvitationId, InvitationListParams,
+        InvitationRevokeParams, InvitationSummary, RoleKey, Workspace};
+}
+
 use pioneer_protocol::{
-    AccessChangeKind, AccessChangedNotification, InvitationChangedNotification, InvitationId,
-    InvitationListResponse, InvitationStatus, InvitationSummary, MemberChangedNotification,
-    MemberListResponse, MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
-    WorkspaceId, WorkspaceMemberListResponse, WorkspaceMembersChangedNotification,
+    InvitationChangedNotification, InvitationId,
+    InvitationStatus, InvitationSummary, MemberChangedNotification,
+    MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
+    WorkspaceId, WorkspaceMembersChangedNotification,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::authorization::PrincipalPresentationCapabilities;
 
@@ -113,6 +125,7 @@ pub struct MemberListRow {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AdministrationAction {
+    SetMemberWorkspaces { principal_id: PrincipalId },
     CreateInvitation,
     RevokeInvitation {
         invitation_id: InvitationId,
@@ -226,7 +239,8 @@ pub fn conflict_refetch(action: &AdministrationAction) -> Vec<AdministrationRefe
         AdministrationAction::CreateInvitation | AdministrationAction::RevokeInvitation { .. } => {
             vec![AdministrationRefetch::InvitationList]
         }
-        AdministrationAction::SuspendMember { .. }
+        AdministrationAction::SetMemberWorkspaces { .. }
+        | AdministrationAction::SuspendMember { .. }
         | AdministrationAction::RestoreMember { .. }
         | AdministrationAction::RemoveMember { .. }
         | AdministrationAction::CreateRecoveryDevice { .. } => {
@@ -255,11 +269,10 @@ pub struct AdministrationInvalidation {
     pub effects: Vec<AdministrationRefetch>,
 }
 
-/// Revision-only reducer for shells whose authoritative administration rows
-/// live elsewhere (for example TanStack Query). It rejects stale realtime
-/// hints without becoming a second snapshot cache.
+/// Deduplicates realtime hints before the Client page owner refreshes its
+/// authoritative rows. It does not retain a second snapshot cache.
 #[derive(Default)]
-pub struct AdministrationEventTracker {
+pub(crate) struct AdministrationEventTracker {
     invitation_revisions: BTreeMap<InvitationId, u64>,
     member_revisions: BTreeMap<PrincipalId, u64>,
     workspace_member_revisions: BTreeMap<WorkspaceId, u64>,
@@ -313,297 +326,10 @@ impl AdministrationEventTracker {
         }
     }
 
-    fn clear_member_revisions(&mut self) {
-        self.member_revisions.clear();
-    }
 
-    fn remove_workspace(&mut self, workspace_id: &WorkspaceId) {
-        self.workspace_member_revisions.remove(workspace_id);
-    }
 }
 
-#[derive(Default)]
-pub struct AdministrationCache {
-    invitations: Vec<InvitationSummary>,
-    members: Vec<MemberSummary>,
-    member_directory_loaded: bool,
-    workspace_members: BTreeMap<WorkspaceId, Vec<MemberSummary>>,
-    invitation_next_cursor: Option<String>,
-    member_next_cursor: Option<String>,
-    workspace_member_next_cursors: BTreeMap<WorkspaceId, Option<String>>,
-    pending_action: AdministrationPendingAction,
-    event_tracker: AdministrationEventTracker,
-}
-
-impl AdministrationCache {
-    pub fn invitations(&self) -> impl Iterator<Item = &InvitationSummary> {
-        self.invitations.iter()
-    }
-
-    pub fn members(&self) -> impl Iterator<Item = &MemberSummary> {
-        self.members.iter()
-    }
-
-    pub fn member_directory_loaded(&self) -> bool {
-        self.member_directory_loaded
-    }
-
-    pub fn member_directory_complete(&self) -> bool {
-        self.member_directory_loaded && self.member_next_cursor.is_none()
-    }
-
-    pub fn workspace_members(&self, workspace_id: &WorkspaceId) -> Option<&[MemberSummary]> {
-        self.workspace_members.get(workspace_id).map(Vec::as_slice)
-    }
-
-    pub fn invitation_next_cursor(&self) -> Option<&str> {
-        self.invitation_next_cursor.as_deref()
-    }
-
-    pub fn member_next_cursor(&self) -> Option<&str> {
-        self.member_next_cursor.as_deref()
-    }
-
-    pub fn workspace_member_next_cursor(&self, workspace_id: &WorkspaceId) -> Option<&str> {
-        self.workspace_member_next_cursors
-            .get(workspace_id)
-            .and_then(Option::as_deref)
-    }
-
-    pub fn pending_action(&self) -> &AdministrationPendingAction {
-        &self.pending_action
-    }
-
-    pub fn begin_action(&mut self, action: AdministrationAction) -> bool {
-        if !matches!(self.pending_action, AdministrationPendingAction::Idle) {
-            return false;
-        }
-        self.pending_action = AdministrationPendingAction::Pending { action };
-        true
-    }
-
-    pub fn finish_action(&mut self) {
-        self.pending_action = AdministrationPendingAction::Idle;
-    }
-
-    pub fn finish_conflicted_action(&mut self) -> Vec<AdministrationRefetch> {
-        let AdministrationPendingAction::Pending { action } = &self.pending_action else {
-            return Vec::new();
-        };
-        let effects = conflict_refetch(action);
-        self.pending_action = AdministrationPendingAction::Idle;
-        effects
-    }
-
-    pub fn apply_invitation_list(&mut self, response: InvitationListResponse) {
-        self.invitations = response.invitations;
-        self.invitation_next_cursor = response.next_cursor;
-    }
-
-    /// Appends a subsequent cursor page while preserving Gateway order.
-    ///
-    /// The ordinary `apply_*` methods replace an authoritative snapshot so a
-    /// reconnect/refetch can remove stale rows. Pagination is explicit and
-    /// deduplicates an overlapping boundary without changing server order.
-    pub fn append_invitation_page(&mut self, response: InvitationListResponse) {
-        self.invitation_next_cursor = response.next_cursor.clone();
-        let mut known = self
-            .invitations
-            .iter()
-            .map(|invitation| invitation.invitation_id.clone())
-            .collect::<BTreeSet<_>>();
-        self.invitations.extend(
-            response
-                .invitations
-                .into_iter()
-                .filter(|invitation| known.insert(invitation.invitation_id.clone())),
-        );
-    }
-
-    pub fn apply_member_list(&mut self, response: MemberListResponse) {
-        self.members = response.members;
-        self.member_next_cursor = response.next_cursor;
-        self.member_directory_loaded = true;
-    }
-
-    pub fn append_member_page(&mut self, response: MemberListResponse) {
-        self.member_next_cursor = response.next_cursor.clone();
-        self.member_directory_loaded = true;
-        let mut known = self
-            .members
-            .iter()
-            .map(|member| member.principal_id.clone())
-            .collect::<BTreeSet<_>>();
-        self.members.extend(
-            response
-                .members
-                .into_iter()
-                .filter(|member| known.insert(member.principal_id.clone())),
-        );
-    }
-
-    pub fn apply_workspace_member_list(&mut self, response: WorkspaceMemberListResponse) {
-        self.workspace_member_next_cursors
-            .insert(response.workspace_id.clone(), response.next_cursor.clone());
-        self.workspace_members
-            .insert(response.workspace_id, response.members);
-    }
-
-    pub fn append_workspace_member_page(&mut self, response: WorkspaceMemberListResponse) {
-        self.workspace_member_next_cursors
-            .insert(response.workspace_id.clone(), response.next_cursor.clone());
-        let members = self
-            .workspace_members
-            .entry(response.workspace_id)
-            .or_default();
-        let mut known = members
-            .iter()
-            .map(|member| member.principal_id.clone())
-            .collect::<BTreeSet<_>>();
-        members.extend(
-            response
-                .members
-                .into_iter()
-                .filter(|member| known.insert(member.principal_id.clone())),
-        );
-    }
-
-    pub fn apply_event(&mut self, event: &AdministrationEvent) -> AdministrationInvalidation {
-        let tracked = self.event_tracker.apply_event(event);
-        if !tracked.apply {
-            return tracked;
-        }
-        match event {
-            AdministrationEvent::InvitationChanged(notification) => {
-                self.invalidate_invitation(notification)
-            }
-            AdministrationEvent::MemberChanged(notification) => {
-                self.invalidate_member(notification)
-            }
-            AdministrationEvent::WorkspaceMembersChanged(notification) => {
-                self.invalidate_workspace_members(notification)
-            }
-        }
-    }
-
-    pub fn apply_access_changed(
-        &mut self,
-        notification: &AccessChangedNotification,
-    ) -> AdministrationInvalidation {
-        if notification.change != AccessChangeKind::WorkspaceMembership {
-            return AdministrationInvalidation {
-                apply: false,
-                effects: Vec::new(),
-            };
-        }
-
-        let Ok(workspace_id) = WorkspaceId::new(notification.workspace_id.clone()) else {
-            self.members.clear();
-            self.member_next_cursor = None;
-            self.member_directory_loaded = false;
-            self.event_tracker.clear_member_revisions();
-            return AdministrationInvalidation {
-                apply: true,
-                effects: vec![AdministrationRefetch::MemberDirectory],
-            };
-        };
-        self.workspace_members.remove(&workspace_id);
-        self.workspace_member_next_cursors.remove(&workspace_id);
-        self.event_tracker.remove_workspace(&workspace_id);
-
-        // The directory visibility predicate depends on shared workspace
-        // membership, so no individual cached member can be proven visible
-        // after this change. Other workspace snapshots remain intact.
-        self.members.clear();
-        self.member_next_cursor = None;
-        self.member_directory_loaded = false;
-        self.event_tracker.clear_member_revisions();
-
-        AdministrationInvalidation {
-            apply: true,
-            effects: vec![
-                AdministrationRefetch::MemberDirectory,
-                AdministrationRefetch::WorkspaceMembers { workspace_id },
-            ],
-        }
-    }
-
-    pub fn clear_for_session_termination(&mut self) {
-        *self = Self::default();
-    }
-
-    fn invalidate_invitation(
-        &mut self,
-        notification: &InvitationChangedNotification,
-    ) -> AdministrationInvalidation {
-        self.invitations
-            .retain(|invitation| invitation.invitation_id != notification.invitation_id);
-        self.invitation_next_cursor = None;
-        changed(AdministrationRefetch::InvitationList)
-    }
-
-    fn invalidate_member(
-        &mut self,
-        notification: &MemberChangedNotification,
-    ) -> AdministrationInvalidation {
-        self.members
-            .retain(|member| member.principal_id != notification.principal_id);
-        self.member_next_cursor = None;
-        self.member_directory_loaded = false;
-        let affected_workspaces = self
-            .workspace_members
-            .iter()
-            .filter(|(_, members)| {
-                members
-                    .iter()
-                    .any(|member| member.principal_id == notification.principal_id)
-            })
-            .map(|(workspace_id, _)| workspace_id.clone())
-            .collect::<Vec<_>>();
-        for workspace_id in &affected_workspaces {
-            self.workspace_members.remove(workspace_id);
-            self.workspace_member_next_cursors.remove(workspace_id);
-        }
-        let mut effects = vec![AdministrationRefetch::MemberDirectory];
-        effects.extend(
-            affected_workspaces
-                .into_iter()
-                .map(|workspace_id| AdministrationRefetch::WorkspaceMembers { workspace_id }),
-        );
-        AdministrationInvalidation {
-            apply: true,
-            effects,
-        }
-    }
-
-    fn invalidate_workspace_members(
-        &mut self,
-        notification: &WorkspaceMembersChangedNotification,
-    ) -> AdministrationInvalidation {
-        self.workspace_members.remove(&notification.workspace_id);
-        self.workspace_member_next_cursors
-            .remove(&notification.workspace_id);
-        // Directory visibility for ordinary Members is the union of current
-        // shared workspace memberships. Any membership change can therefore
-        // add or remove directory rows even when no profile itself changed.
-        self.members.clear();
-        self.member_next_cursor = None;
-        self.member_directory_loaded = false;
-        AdministrationInvalidation {
-            apply: true,
-            effects: vec![
-                AdministrationRefetch::MemberDirectory,
-                AdministrationRefetch::WorkspaceMembers {
-                    workspace_id: notification.workspace_id.clone(),
-                },
-            ],
-        }
-    }
-}
-
-fn is_stale(previous: Option<&u64>, revision: u64) -> bool {
-    previous.is_some_and(|previous| *previous >= revision)
-}
+fn is_stale(previous: Option<&u64>, revision: u64) -> bool { previous.is_some_and(|previous| *previous >= revision) }
 
 fn no_change() -> AdministrationInvalidation {
     AdministrationInvalidation {
@@ -623,8 +349,7 @@ fn changed(effect: AdministrationRefetch) -> AdministrationInvalidation {
 mod tests {
     use super::*;
     use pioneer_protocol::{
-        InvitationInviterSummary, InvitationStatus, InvitationWorkspaceSummary, MemberSummary,
-        RoleKey,
+        MemberSummary, RoleKey,
     };
 
     fn member(principal_id: &str) -> MemberSummary {
@@ -644,295 +369,6 @@ mod tests {
             status: PrincipalStatus::Active,
             avatar_revision: None,
         }
-    }
-
-    fn invitation(invitation_id: &str) -> InvitationSummary {
-        InvitationSummary {
-            invitation_id: InvitationId::new(invitation_id).expect("valid invitation id"),
-            role_key: RoleKey::member(),
-            status: InvitationStatus::Pending,
-            revoke_reason: None,
-            inviter: InvitationInviterSummary {
-                principal_id: PrincipalId::new("PIIIIIIIIIIIIIIIIIIII")
-                    .expect("valid principal id"),
-                kind: PrincipalKind::Superuser,
-                display_name: "Inviter".to_owned(),
-                nickname: "inviter".to_owned(),
-            },
-            workspaces: vec![InvitationWorkspaceSummary {
-                workspace_id: WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA")
-                    .expect("valid workspace id"),
-                name: "A".to_owned(),
-            }],
-            created_at_unix: 1,
-            expires_at_unix: 2,
-            terminal_at_unix: None,
-        }
-    }
-
-    #[test]
-    fn scoped_events_drop_only_the_affected_snapshot_and_reject_stale_revisions() {
-        let mut cache = AdministrationCache::default();
-        cache.apply_invitation_list(InvitationListResponse {
-            invitations: vec![
-                invitation("IAAAAAAAAAAAAAAAAAAAA"),
-                invitation("IBBBBBBBBBBBBBBBBBBBB"),
-            ],
-            next_cursor: None,
-        });
-
-        let changed = AdministrationEvent::InvitationChanged(InvitationChangedNotification {
-            revision: 7,
-            invitation_id: InvitationId::new("IAAAAAAAAAAAAAAAAAAAA").expect("valid invitation id"),
-        });
-        let plan = cache.apply_event(&changed);
-        assert_eq!(plan.effects, vec![AdministrationRefetch::InvitationList]);
-        assert_eq!(cache.invitations().count(), 1);
-        assert_eq!(
-            cache.invitations().next().unwrap().invitation_id,
-            InvitationId::new("IBBBBBBBBBBBBBBBBBBBB").expect("valid invitation id")
-        );
-
-        let stale = cache.apply_event(&changed);
-        assert!(!stale.apply);
-    }
-
-    #[test]
-    fn workspace_access_change_preserves_unrelated_workspace_snapshot() {
-        let mut cache = AdministrationCache::default();
-        cache.apply_member_list(MemberListResponse {
-            members: vec![member("PAAAAAAAAAAAAAAAAAAAA")],
-            next_cursor: None,
-        });
-        cache.apply_workspace_member_list(WorkspaceMemberListResponse {
-            workspace_id: WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA").expect("valid workspace id"),
-            members: vec![member("PAAAAAAAAAAAAAAAAAAAA")],
-            next_cursor: None,
-        });
-        cache.apply_workspace_member_list(WorkspaceMemberListResponse {
-            workspace_id: WorkspaceId::new("WBBBBBBBBBBBBBBBBBBBB").expect("valid workspace id"),
-            members: vec![member("PBBBBBBBBBBBBBBBBBBBB")],
-            next_cursor: None,
-        });
-
-        let plan = cache.apply_access_changed(&AccessChangedNotification {
-            authorization_revision: 9,
-            workspace_id: "WAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            thread_id: None,
-            outcome: pioneer_protocol::AccessChangeOutcome::Revoked,
-            change: AccessChangeKind::WorkspaceMembership,
-        });
-
-        assert!(plan.apply);
-        assert!(cache.members().next().is_none());
-        assert!(
-            cache
-                .workspace_members(
-                    &WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA").expect("valid workspace id"),
-                )
-                .is_none()
-        );
-        assert_eq!(
-            cache
-                .workspace_members(
-                    &WorkspaceId::new("WBBBBBBBBBBBBBBBBBBBB").expect("valid workspace id"),
-                )
-                .unwrap()[0]
-                .principal_id,
-            PrincipalId::new("PBBBBBBBBBBBBBBBBBBBB").expect("valid principal id")
-        );
-    }
-
-    #[test]
-    fn administration_events_invalidate_every_snapshot_derived_from_the_changed_membership() {
-        let workspace_id = WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA").expect("valid workspace id");
-        let principal_id = PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("valid principal id");
-        let mut cache = AdministrationCache::default();
-        cache.apply_member_list(MemberListResponse {
-            members: vec![member(principal_id.as_str())],
-            next_cursor: None,
-        });
-        cache.apply_workspace_member_list(WorkspaceMemberListResponse {
-            workspace_id: workspace_id.clone(),
-            members: vec![member(principal_id.as_str())],
-            next_cursor: None,
-        });
-
-        let member_plan = cache.apply_event(&AdministrationEvent::MemberChanged(
-            MemberChangedNotification {
-                revision: 10,
-                principal_id: principal_id.clone(),
-            },
-        ));
-        assert_eq!(
-            member_plan.effects,
-            vec![
-                AdministrationRefetch::MemberDirectory,
-                AdministrationRefetch::WorkspaceMembers {
-                    workspace_id: workspace_id.clone(),
-                },
-            ]
-        );
-        assert!(cache.members().next().is_none());
-        assert!(!cache.member_directory_loaded());
-        assert!(cache.workspace_members(&workspace_id).is_none());
-
-        cache.apply_member_list(MemberListResponse {
-            members: vec![member(principal_id.as_str())],
-            next_cursor: None,
-        });
-        cache.apply_workspace_member_list(WorkspaceMemberListResponse {
-            workspace_id: workspace_id.clone(),
-            members: vec![member(principal_id.as_str())],
-            next_cursor: None,
-        });
-        let membership_plan = cache.apply_event(&AdministrationEvent::WorkspaceMembersChanged(
-            WorkspaceMembersChangedNotification {
-                revision: 11,
-                workspace_id: workspace_id.clone(),
-            },
-        ));
-        assert_eq!(
-            membership_plan.effects,
-            vec![
-                AdministrationRefetch::MemberDirectory,
-                AdministrationRefetch::WorkspaceMembers {
-                    workspace_id: workspace_id.clone(),
-                },
-            ]
-        );
-        assert!(cache.members().next().is_none());
-        assert!(!cache.member_directory_loaded());
-        assert!(cache.workspace_members(&workspace_id).is_none());
-    }
-
-    #[test]
-    fn session_termination_clears_cache() {
-        let mut cache = AdministrationCache::default();
-        cache.apply_member_list(MemberListResponse {
-            members: vec![member("PAAAAAAAAAAAAAAAAAAAA")],
-            next_cursor: None,
-        });
-        assert_eq!(cache.members().count(), 1);
-
-        cache.clear_for_session_termination();
-        assert_eq!(cache.members().count(), 0);
-    }
-
-    #[test]
-    fn authoritative_refetch_replaces_stale_rows_and_pages_append_in_server_order() {
-        let mut cache = AdministrationCache::default();
-        assert!(!cache.member_directory_loaded());
-        assert!(!cache.member_directory_complete());
-        cache.apply_invitation_list(InvitationListResponse {
-            invitations: vec![
-                invitation("IBBBBBBBBBBBBBBBBBBBB"),
-                invitation("IAAAAAAAAAAAAAAAAAAAA"),
-            ],
-            next_cursor: Some("page-2".to_owned()),
-        });
-        cache.append_invitation_page(InvitationListResponse {
-            invitations: vec![
-                invitation("IAAAAAAAAAAAAAAAAAAAA"),
-                invitation("ICCCCCCCCCCCCCCCCCCCC"),
-            ],
-            next_cursor: None,
-        });
-        assert_eq!(
-            cache
-                .invitations()
-                .map(|row| row.invitation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "IBBBBBBBBBBBBBBBBBBBB",
-                "IAAAAAAAAAAAAAAAAAAAA",
-                "ICCCCCCCCCCCCCCCCCCCC",
-            ]
-        );
-
-        cache.apply_invitation_list(InvitationListResponse {
-            invitations: vec![invitation("ICCCCCCCCCCCCCCCCCCCC")],
-            next_cursor: None,
-        });
-        assert_eq!(
-            cache
-                .invitations()
-                .map(|row| row.invitation_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["ICCCCCCCCCCCCCCCCCCCC"]
-        );
-
-        cache.apply_member_list(MemberListResponse {
-            members: vec![
-                member("PBBBBBBBBBBBBBBBBBBBB"),
-                member("PAAAAAAAAAAAAAAAAAAAA"),
-            ],
-            next_cursor: Some("page-2".to_owned()),
-        });
-        assert!(cache.member_directory_loaded());
-        assert!(!cache.member_directory_complete());
-        cache.append_member_page(MemberListResponse {
-            members: vec![
-                member("PAAAAAAAAAAAAAAAAAAAA"),
-                member("PCCCCCCCCCCCCCCCCCCCC"),
-            ],
-            next_cursor: None,
-        });
-        assert!(cache.member_directory_complete());
-        assert_eq!(
-            cache
-                .members()
-                .map(|row| row.principal_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "PBBBBBBBBBBBBBBBBBBBB",
-                "PAAAAAAAAAAAAAAAAAAAA",
-                "PCCCCCCCCCCCCCCCCCCCC",
-            ]
-        );
-
-        cache.apply_member_list(MemberListResponse {
-            members: vec![member("PCCCCCCCCCCCCCCCCCCCC")],
-            next_cursor: None,
-        });
-        assert_eq!(
-            cache
-                .members()
-                .map(|row| row.principal_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["PCCCCCCCCCCCCCCCCCCCC"]
-        );
-        assert!(cache.member_directory_complete());
-    }
-
-    #[test]
-    fn workspace_member_pages_append_without_replacing_the_first_page() {
-        let workspace_id = WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA").expect("valid workspace id");
-        let mut cache = AdministrationCache::default();
-        cache.apply_workspace_member_list(WorkspaceMemberListResponse {
-            workspace_id: workspace_id.clone(),
-            members: vec![member("PBBBBBBBBBBBBBBBBBBBB")],
-            next_cursor: Some("page-2".to_owned()),
-        });
-        cache.append_workspace_member_page(WorkspaceMemberListResponse {
-            workspace_id: workspace_id.clone(),
-            members: vec![
-                member("PBBBBBBBBBBBBBBBBBBBB"),
-                member("PAAAAAAAAAAAAAAAAAAAA"),
-            ],
-            next_cursor: None,
-        });
-
-        assert_eq!(
-            cache
-                .workspace_members(&workspace_id)
-                .expect("workspace snapshot")
-                .iter()
-                .map(|row| row.principal_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["PBBBBBBBBBBBBBBBBBBBB", "PAAAAAAAAAAAAAAAAAAAA"]
-        );
-        assert_eq!(cache.workspace_member_next_cursor(&workspace_id), None);
     }
 
     #[test]
@@ -1035,52 +471,7 @@ mod tests {
         assert_eq!(unknown.actions, self_row.actions);
     }
 
-    #[test]
-    fn pagination_cursors_follow_the_authoritative_pages() {
-        let mut cache = AdministrationCache::default();
-        cache.apply_invitation_list(InvitationListResponse {
-            invitations: vec![invitation("IAAAAAAAAAAAAAAAAAAAA")],
-            next_cursor: Some("invite-2".to_owned()),
-        });
-        cache.apply_member_list(MemberListResponse {
-            members: vec![member("PAAAAAAAAAAAAAAAAAAAA")],
-            next_cursor: Some("member-2".to_owned()),
-        });
-        assert_eq!(cache.invitation_next_cursor(), Some("invite-2"));
-        assert_eq!(cache.member_next_cursor(), Some("member-2"));
 
-        cache.append_invitation_page(InvitationListResponse {
-            invitations: vec![invitation("IBBBBBBBBBBBBBBBBBBBB")],
-            next_cursor: None,
-        });
-        cache.append_member_page(MemberListResponse {
-            members: vec![member("PBBBBBBBBBBBBBBBBBBBB")],
-            next_cursor: None,
-        });
-        assert_eq!(cache.invitation_next_cursor(), None);
-        assert_eq!(cache.member_next_cursor(), None);
-    }
-
-    #[test]
-    fn pending_action_is_single_owner_and_conflict_refetch_is_scoped() {
-        let workspace_id = WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA").expect("workspace id");
-        let principal_id = PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("principal id");
-        let action = AdministrationAction::RemoveWorkspaceMember {
-            workspace_id: workspace_id.clone(),
-            principal_id,
-        };
-        let mut cache = AdministrationCache::default();
-        assert!(cache.begin_action(action));
-        assert!(!cache.begin_action(AdministrationAction::RevokeInvitation {
-            invitation_id: InvitationId::new("IAAAAAAAAAAAAAAAAAAAA").expect("invitation id"),
-        }));
-        assert_eq!(
-            cache.finish_conflicted_action(),
-            vec![
-                AdministrationRefetch::MemberDirectory,
-                AdministrationRefetch::WorkspaceMembers { workspace_id },
-            ]
-        );
-        assert_eq!(cache.pending_action(), &AdministrationPendingAction::Idle);
-    }
 }
+
+mod reads;

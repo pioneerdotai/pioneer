@@ -1,5 +1,5 @@
-use crate::app::root::PioneerDesktop;
-use crate::components::buttonts::{default_outline_button, default_primary_button};
+use crate::buttons::{default_outline_button, default_primary_button};
+use crate::providers::ProviderCatalogView;
 use gpui_kit::component::{
     WindowExt,
     button::*,
@@ -19,7 +19,7 @@ use pioneer_client::providers::cli_runtime_settings::{
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-impl PioneerDesktop {
+impl ProviderCatalogView {
     pub(super) fn open_provider_configuration_dialog(
         &mut self,
         provider_id: String,
@@ -37,6 +37,7 @@ impl PioneerDesktop {
             return;
         };
 
+        let namespace = self.ui_id(provider.id, "configuration-dialog");
         let provider_title = provider.title();
         let provider_description = provider.description();
         let is_configured = self.providers.is_configured(provider.id);
@@ -57,20 +58,54 @@ impl PioneerDesktop {
             }
             state
         });
-        let desktop_entity = cx.entity().clone();
-        let did_focus_initial_field = Rc::new(Cell::new(false));
+        let proxy_form = crate::credential_form::ProxyForm::new(
+            proxy_input_state.clone(),
+            &self.client,
+            self.active_workspace_id().unwrap_or_default().to_owned(),
+            pioneer_client::providers::credentials::ProviderCredentialTarget::Api(
+                provider.id.to_owned(),
+            ),
+            current_proxy_url.clone(),
+            window,
+            cx,
+        );
+        let lifetime = self.own_dialog(
+            {
+                let key = api_key_input_state.downgrade();
+                let proxy = proxy_form.downgrade();
+                move |window, cx| {
+                    let _ = key.update(cx, |input, cx| {
+                        if !input.value().is_empty() {
+                            input.set_value("", window, cx);
+                        }
+                    });
+                    let _ = proxy.update(cx, |form, cx| form.clear(window, cx));
+                }
+            },
+            window,
+            cx,
+        );
+        lifetime.update(cx, |owner, cx| owner.track_form(&proxy_form, cx));
+        let attach = lifetime.clone();
+        let desktop_entity = cx.weak_entity();
+        let initial_focus_input = api_key_input_state.clone();
 
         let save_provider_configuration: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
             let desktop_entity = desktop_entity.clone();
             let provider_id = provider.id.to_owned();
             let api_key_input_state = api_key_input_state.clone();
             let proxy_input_state = proxy_input_state.clone();
-            let current_proxy_url = current_proxy_url.clone();
+            let proxy_form = proxy_form.clone();
+            let lifetime = lifetime.clone();
             move |cx| {
+                if !lifetime.read(cx).valid() {
+                    return false;
+                }
                 let api_key = api_key_input_state.read(cx).value().trim().to_owned();
                 let proxy_url = proxy_input_state.read(cx).value().trim().to_owned();
                 let api_key = (!api_key.is_empty()).then_some(api_key);
-                let proxy_changed = current_proxy_url.as_deref() != Some(proxy_url.as_str());
+                let current_proxy_url = proxy_form.read(cx).original();
+                let proxy_changed = current_proxy_url != Some(proxy_url.as_str());
                 let proxy_url = (proxy_changed && !proxy_url.is_empty()).then_some(proxy_url);
                 let clear_proxy =
                     proxy_changed && proxy_url.is_none() && current_proxy_url.is_some();
@@ -78,30 +113,30 @@ impl PioneerDesktop {
                     return false;
                 }
 
-                let _ = desktop_entity.update(cx, |view, cx| {
-                    view.configure_provider(
-                        provider_id.clone(),
-                        api_key.clone(),
-                        proxy_url.clone(),
-                        clear_proxy,
-                        cx,
-                    );
-                    cx.notify();
-                });
-
-                true
+                desktop_entity
+                    .update(cx, |view, cx| {
+                        view.configure_provider(
+                            provider_id.clone(),
+                            api_key.clone(),
+                            proxy_url.clone(),
+                            clear_proxy,
+                            cx,
+                        )
+                    })
+                    .unwrap_or(false)
             }
         });
 
         let delete_provider_id = is_configured.then(|| provider.id.to_owned());
 
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if !did_focus_initial_field.get() {
-                did_focus_initial_field.set(true);
-                api_key_input_state.update(cx, |state, cx| state.focus(window, cx));
-            }
-
+        window.open_dialog(cx, move |dialog, _window, cx| {
             dialog
+                .on_close({
+                    let lifetime = lifetime.clone();
+                    move |_, window, cx| {
+                        lifetime.update(cx, |owner, cx| owner.dismissed(window, cx));
+                    }
+                })
                 .gap_1()
                 .rounded_2xl()
                 .title(
@@ -131,45 +166,53 @@ impl PioneerDesktop {
                     let delete_provider_id = delete_provider_id.clone();
 
                     let mut actions = vec![
-                        default_outline_button("provider-dialog-cancel")
-                            .label(t!("buttons.cancel").to_string())
-                            .outline()
-                            .on_click(|_, window, cx| {
-                                window.close_dialog(cx);
-                            })
-                            .into_any_element(),
-                        default_primary_button("provider-dialog-save")
-                            .label(t!("providers.button.submit").to_string())
-                            .on_click({
-                                let save_provider_configuration =
-                                    save_provider_configuration.clone();
-                                move |_, window, cx| {
-                                    if save_provider_configuration(cx) {
-                                        window.close_dialog(cx);
-                                    }
+                        default_outline_button(SharedString::from(format!(
+                            "{namespace}:provider-dialog-cancel"
+                        )))
+                        .label(t!("buttons.cancel").to_string())
+                        .outline()
+                        .on_click(|_, window, cx| {
+                            window.close_dialog(cx);
+                        })
+                        .into_any_element(),
+                        default_primary_button(SharedString::from(format!(
+                            "{namespace}:provider-dialog-save"
+                        )))
+                        .label(t!("providers.button.submit").to_string())
+                        .on_click({
+                            let save_provider_configuration = save_provider_configuration.clone();
+                            move |_, window, cx| {
+                                if save_provider_configuration(cx) {
+                                    window.close_dialog(cx);
                                 }
-                            })
-                            .into_any_element(),
+                            }
+                        })
+                        .into_any_element(),
                     ];
 
                     if let Some(provider_id) = delete_provider_id.clone() {
                         actions.insert(
                             1,
-                            default_outline_button("provider-dialog-delete")
-                                .label(t!("providers.button.remove_key").to_string())
-                                .danger()
-                                .on_click({
-                                    let desktop_entity = desktop_entity.clone();
-                                    let provider_id = provider_id.clone();
-                                    move |_, window, cx| {
-                                        let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.delete_provider_api_key(provider_id.clone(), cx);
-                                            cx.notify();
-                                        });
+                            default_outline_button(SharedString::from(format!(
+                                "{namespace}:provider-dialog-delete"
+                            )))
+                            .label(t!("providers.button.remove_key").to_string())
+                            .danger()
+                            .on_click({
+                                let desktop_entity = desktop_entity.clone();
+                                let provider_id = provider_id.clone();
+                                move |_, window, cx| {
+                                    if desktop_entity
+                                        .update(cx, |view, cx| {
+                                            view.delete_provider_api_key(provider_id.clone(), cx)
+                                        })
+                                        .unwrap_or(false)
+                                    {
                                         window.close_dialog(cx);
                                     }
-                                })
-                                .into_any_element(),
+                                }
+                            })
+                            .into_any_element(),
                         );
                     }
 
@@ -202,6 +245,8 @@ impl PioneerDesktop {
                         ),
                 )
         });
+        attach.update(cx, |owner, cx| owner.attach(window, cx));
+        initial_focus_input.update(cx, |state, cx| state.focus(window, cx));
     }
 
     pub(super) fn open_cli_runtime_provider_dialog(
@@ -216,6 +261,7 @@ impl PioneerDesktop {
         {
             return;
         }
+        let namespace = self.ui_id(&draft.id, "runtime-dialog");
         self.providers.set_cli_runtime_draft(draft.clone());
 
         let id_input_state = cx.new(|cx| {
@@ -259,10 +305,22 @@ impl PioneerDesktop {
             state
         });
         let enabled_state = Rc::new(Cell::new(draft.enabled));
-        let did_focus_initial_field = Rc::new(Cell::new(false));
+        let initial_focus_input = id_input_state.clone();
         let field_error: Rc<RefCell<Option<CLIRuntimeProviderDialogFieldError>>> =
             Rc::new(RefCell::new(None));
-        let desktop_entity = cx.entity().clone();
+        let desktop_entity = cx.weak_entity();
+        let lifetime = self.own_dialog(
+            {
+                let owner = desktop_entity.clone();
+                move |_, cx| {
+                    let _ = owner.update(cx, |owner, _| owner.providers.clear_cli_runtime_draft());
+                }
+            },
+            window,
+            cx,
+        );
+        lifetime.update(cx, |owner, cx| owner.track_form(&id_input_state, cx));
+        let attach = lifetime.clone();
         let dialog_title = cli_runtime_provider_dialog_title(&draft.mode);
 
         let save_cli_provider: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
@@ -275,7 +333,11 @@ impl PioneerDesktop {
             let shadow_home_input_state = shadow_home_input_state.clone();
             let enabled_state = enabled_state.clone();
             let draft_seed = draft.clone();
+            let lifetime = lifetime.clone();
             move |cx| {
+                if !lifetime.read(cx).valid() {
+                    return false;
+                }
                 let mut draft = draft_seed.clone();
                 draft.set_text_field(
                     CLIRuntimeProviderDraftField::Id,
@@ -299,7 +361,7 @@ impl PioneerDesktop {
                 );
                 draft.enabled = enabled_state.get();
 
-                let mut result = Ok(());
+                let mut result = Err(CLIRuntimeProviderSettingsRejection::MissingSettings);
                 let _ = desktop_entity.update(cx, |view, cx| {
                     view.providers.set_cli_runtime_draft(draft.clone());
                     result = view.save_cli_runtime_provider_draft(draft.clone(), cx);
@@ -320,14 +382,16 @@ impl PioneerDesktop {
             }
         });
 
-        window.open_dialog(cx, move |dialog, window, cx| {
-            if !did_focus_initial_field.get() {
-                did_focus_initial_field.set(true);
-                id_input_state.update(cx, |state, cx| state.focus(window, cx));
-            }
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let field_error_message = field_error.borrow().clone();
 
             dialog
+                .on_close({
+                    let lifetime = lifetime.clone();
+                    move |_, window, cx| {
+                        lifetime.update(cx, |owner, cx| owner.dismissed(window, cx))
+                    }
+                })
                 .w(px(420.))
                 .gap_1()
                 .rounded_2xl()
@@ -355,31 +419,35 @@ impl PioneerDesktop {
                     let desktop_entity = desktop_entity.clone();
 
                     vec![
-                        default_outline_button("cli-runtime-provider-dialog-cancel")
-                            .label(t!("buttons.cancel").to_string())
-                            .outline()
-                            .on_click({
-                                let desktop_entity = desktop_entity.clone();
-                                move |_, window, cx| {
-                                    let _ = desktop_entity.update(cx, |view, cx| {
-                                        view.providers.clear_cli_runtime_draft();
-                                        cx.notify();
-                                    });
+                        default_outline_button(SharedString::from(format!(
+                            "{namespace}:cli-runtime-provider-dialog-cancel"
+                        )))
+                        .label(t!("buttons.cancel").to_string())
+                        .outline()
+                        .on_click({
+                            let desktop_entity = desktop_entity.clone();
+                            move |_, window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.providers.clear_cli_runtime_draft();
+                                    cx.notify();
+                                });
+                                window.close_dialog(cx);
+                            }
+                        })
+                        .into_any_element(),
+                        default_primary_button(SharedString::from(format!(
+                            "{namespace}:cli-runtime-provider-dialog-save"
+                        )))
+                        .label(t!("providers.button.submit").to_string())
+                        .on_click({
+                            let save_cli_provider = save_cli_provider.clone();
+                            move |_, window, cx| {
+                                if save_cli_provider(cx) {
                                     window.close_dialog(cx);
                                 }
-                            })
-                            .into_any_element(),
-                        default_primary_button("cli-runtime-provider-dialog-save")
-                            .label(t!("providers.button.submit").to_string())
-                            .on_click({
-                                let save_cli_provider = save_cli_provider.clone();
-                                move |_, window, cx| {
-                                    if save_cli_provider(cx) {
-                                        window.close_dialog(cx);
-                                    }
-                                }
-                            })
-                            .into_any_element(),
+                            }
+                        })
+                        .into_any_element(),
                     ]
                 }))
                 .child(
@@ -501,24 +569,28 @@ impl PioneerDesktop {
                                     ),
                                 )
                                 .child(
-                                    Switch::new("cli-runtime-provider-dialog-enabled")
-                                        .checked(enabled_state.get())
-                                        .on_click({
-                                            let enabled_state = enabled_state.clone();
-                                            let desktop_entity = desktop_entity.clone();
-                                            move |enabled, _, cx| {
-                                                enabled_state.set(*enabled);
-                                                let _ = desktop_entity.update(cx, |view, cx| {
-                                                    view.providers
-                                                        .set_cli_runtime_draft_enabled(*enabled);
-                                                    cx.notify();
-                                                });
-                                            }
-                                        }),
+                                    Switch::new(SharedString::from(format!(
+                                        "{namespace}:cli-runtime-provider-dialog-enabled"
+                                    )))
+                                    .checked(enabled_state.get())
+                                    .on_click({
+                                        let enabled_state = enabled_state.clone();
+                                        let desktop_entity = desktop_entity.clone();
+                                        move |enabled, _, cx| {
+                                            enabled_state.set(*enabled);
+                                            let _ = desktop_entity.update(cx, |view, cx| {
+                                                view.providers
+                                                    .set_cli_runtime_draft_enabled(*enabled);
+                                                cx.notify();
+                                            });
+                                        }
+                                    }),
                                 ),
                         ),
                 )
         });
+        attach.update(cx, |owner, cx| owner.attach(window, cx));
+        initial_focus_input.update(cx, |state, cx| state.focus(window, cx));
     }
 }
 

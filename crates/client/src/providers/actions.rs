@@ -1,6 +1,6 @@
 //! Provider action orchestration.
 
-use super::{catalog, list::ProviderListState};
+use super::catalog;
 use pioneer_protocol::{
     CLIRuntimeLoginStartParams, CLIRuntimeLoginStartType, CLIRuntimeProxyDeleteParams,
     CLIRuntimeProxySetParams, ProviderConfigureParams, ProviderDeleteApiKeyParams,
@@ -273,49 +273,6 @@ pub fn provider_api_key_action_matches_connection(
     current_connection_id == Some(action_connection_id)
 }
 
-pub fn mark_provider_api_key_action_started(providers: &mut ProviderListState) {
-    providers.set_error(None);
-}
-
-pub fn apply_provider_set_api_key_success(
-    providers: &mut ProviderListState,
-    canonical_provider_id: String,
-) {
-    providers.insert_configured(canonical_provider_id);
-}
-
-pub fn apply_provider_configure_success(
-    providers: &mut ProviderListState,
-    canonical_provider_id: String,
-    api_key_updated: bool,
-    proxy_url: Option<String>,
-) {
-    if api_key_updated {
-        providers.insert_configured(canonical_provider_id.clone());
-    }
-    if let Some(proxy_url) = proxy_url {
-        providers.set_provider_proxy_url(canonical_provider_id, proxy_url);
-    }
-}
-
-pub fn apply_provider_proxy_deleted(
-    providers: &mut ProviderListState,
-    canonical_provider_id: &str,
-) {
-    providers.remove_provider_proxy_url(canonical_provider_id);
-}
-
-pub fn apply_provider_delete_api_key_success(
-    providers: &mut ProviderListState,
-    canonical_provider_id: &str,
-) {
-    providers.remove_configured(canonical_provider_id);
-}
-
-pub fn apply_provider_api_key_failure(providers: &mut ProviderListState, error: String) {
-    providers.set_error(Some(error));
-}
-
 fn available_connection_id(gateway_connected: bool, connection_id: Option<u64>) -> Option<u64> {
     gateway_connected.then_some(connection_id).flatten()
 }
@@ -514,50 +471,6 @@ mod tests {
                 ProviderApiKeyActionUnavailable::WorkspaceNotSelected
             )
         ));
-    }
-
-    #[test]
-    fn api_key_result_helpers_update_provider_state() {
-        let mut providers = ProviderListState::default();
-
-        mark_provider_api_key_action_started(&mut providers);
-        apply_provider_set_api_key_success(&mut providers, "openai".to_owned());
-        assert!(providers.is_configured("openai"));
-        assert!(providers.error().is_none());
-
-        apply_provider_api_key_failure(&mut providers, "failed".to_owned());
-        assert_eq!(providers.error(), Some("failed"));
-
-        apply_provider_delete_api_key_success(&mut providers, "openai");
-        assert!(!providers.is_configured("openai"));
-        assert!(providers.error().is_none());
-    }
-
-    #[test]
-    fn provider_proxy_result_helpers_update_provider_state() {
-        let mut providers = ProviderListState::default();
-
-        apply_provider_configure_success(
-            &mut providers,
-            "openrouter".to_owned(),
-            false,
-            Some("socks5://127.0.0.1:1080".to_owned()),
-        );
-        assert_eq!(
-            providers.provider_proxy_url("openrouter"),
-            Some("socks5://127.0.0.1:1080")
-        );
-        assert!(!providers.is_configured("openrouter"));
-
-        apply_provider_configure_success(&mut providers, "openrouter".to_owned(), true, None);
-        assert!(providers.is_configured("openrouter"));
-        assert_eq!(
-            providers.provider_proxy_url("openrouter"),
-            Some("socks5://127.0.0.1:1080")
-        );
-
-        apply_provider_proxy_deleted(&mut providers, "openrouter");
-        assert_eq!(providers.provider_proxy_url("openrouter"), None);
     }
 
     #[test]

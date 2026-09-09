@@ -564,7 +564,7 @@ impl PioneerDesktop {
                 }),
                 mode: ProviderModelSelectorMode::SelfImprovement,
                 workspace_id,
-                ws_sender: self.gateway.client_runtime.ws_command_sender().clone(),
+                client: self.gateway.client_runtime.client_core().clone(),
                 on_save: Rc::new(
                     move |view: &mut PioneerDesktop, selection: ModelSelectorSelection, cx| {
                         let Some(selection) =
@@ -944,8 +944,8 @@ impl PioneerDesktop {
                                                         selected_reasoning_effort: None,
                                                         mode: ProviderModelSelectorMode::Chat,
                                                         workspace_id,
-                                                        ws_sender: view
-                                                            .gateway.client_runtime.ws_command_sender()
+                                                        client: view
+                                                            .gateway.client_runtime.client_core()
                                                             .clone(),
                                                         on_save: Rc::new(
                                                             move |view: &mut PioneerDesktop,
@@ -1389,7 +1389,7 @@ impl PioneerDesktop {
                 selected_reasoning_effort: None,
                 mode: ProviderModelSelectorMode::Transcription,
                 workspace_id,
-                ws_sender: self.gateway.client_runtime.ws_command_sender().clone(),
+                client: self.gateway.client_runtime.client_core().clone(),
                 on_save: Rc::new(
                     move |view: &mut PioneerDesktop, selection: ModelSelectorSelection, cx| {
                         view.apply_voice_input_model_selection(selection, cx)
@@ -1764,7 +1764,7 @@ impl PioneerDesktop {
                 selected_reasoning_effort: None,
                 mode: ProviderModelSelectorMode::Embeddings,
                 workspace_id,
-                ws_sender: self.gateway.client_runtime.ws_command_sender().clone(),
+                client: self.gateway.client_runtime.client_core().clone(),
                 on_save: Rc::new(
                     move |view: &mut PioneerDesktop, selection: ModelSelectorSelection, cx| {
                         view.apply_vector_search_embedding_model_selection(selection, cx)
@@ -2124,7 +2124,7 @@ impl PioneerDesktop {
                                                 selected_reasoning_effort: None,
                                                 mode: ProviderModelSelectorMode::Chat,
                                                 workspace_id,
-                                                ws_sender: view.gateway.client_runtime.ws_command_sender().clone(),
+                                                client: view.gateway.client_runtime.client_core().clone(),
                                                 on_save: Rc::new(
                                                     move |view: &mut PioneerDesktop,
                                                           selection: ModelSelectorSelection,

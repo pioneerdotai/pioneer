@@ -34,7 +34,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::*, *};
 pub(super) use pioneer_client::{
-    administration::AdministrationCache,
     agents_doc::scope::{
         AgentsDocEditorScope as ThreadAgentsDocEditorScope, ThreadAgentsDocSummaryKey,
     },
@@ -52,7 +51,6 @@ pub(super) use pioneer_client::{
         state_machine::ComposerMentionCandidate,
     },
     gateway::runtime::GatewaySetupAction,
-    providers::list::ProviderListState,
     providers::presentation::ProviderModelDisplayKey,
     providers::selectors::ProviderFilter,
     skills::{catalog::SkillManagementProjection, upload::SkillUploadProgress},
@@ -198,15 +196,7 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) agents_doc_editor: Option<Entity<AgentsDocEditor>>,
     pub(super) profile_editor: Option<Entity<ProfileEditorState>>,
     pub(super) profile_editor_input_subscriptions: Vec<Subscription>,
-    pub(super) administration: AdministrationCache,
-    pub(super) workspace_members_loading: HashSet<WorkspaceId>,
-    pub(crate) open_model_selector_cli_runtime_binding:
-        Option<crate::components::model_selector::OpenModelSelectorCliRuntimeBinding>,
-    pub(super) invitations_loading: bool,
-    pub(super) invitations_error: Option<String>,
-    pub(super) members_loading: bool,
-    pub(super) member_workspaces_saving: bool,
-    pub(super) members_error: Option<String>,
+    pub(super) administration_view: Entity<pioneer_desktop_administration::AdministrationView>,
     pub(super) member_avatar_state: DesktopMemberAvatarState,
     pub(super) voice_input_action_error: Option<String>,
     pub(super) voice_input_action_generation: u64,
@@ -216,14 +206,13 @@ pub(crate) struct LegacyScreenAdapter {
     pub(super) remote_access_status_poll_generation: u64,
     pub(super) self_improvement_status_poll: Option<Task<()>>,
     pub(super) settings_tree_state: Entity<TreeState>,
-    pub(super) administration_tree_state: Entity<TreeState>,
-    pub(super) provider_tree_state: Entity<TreeState>,
 
     pub(super) active_thread_resubscribe_pending: bool,
     pub(crate) task_notification_surface: Option<AnyView>,
     pub(super) workspace_catalog_input:
         Arc<pioneer_client::workspaces::catalog::WorkspaceCatalogPublication>,
-    pub(super) providers: ProviderListState,
+    pub(super) providers_view: Entity<pioneer_desktop_providers::ProviderCatalogView>,
+    _providers_layout_subscription: Subscription,
     pub(super) mcp_servers: Vec<McpListItem>,
     pub(super) mcp_server_details: Option<McpServerDetailsResponse>,
     pub(super) mcp_loading: bool,

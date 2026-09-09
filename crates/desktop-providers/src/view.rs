@@ -1,7 +1,7 @@
 use super::catalog::{ProviderCatalogEntry, provider_catalog_entries};
 use crate::{
-    app::root::{GatewayConnectionState, PioneerDesktop, ProviderFilter},
     assets::PioneerIconName,
+    providers::{GatewayConnectionState, ProviderCatalogView, ProviderFilter},
 };
 use gpui_kit::component::{
     button::*,
@@ -18,22 +18,19 @@ use pioneer_client::providers::diagnostics::{
     CliRuntimeMcpReadinessReason, cli_runtime_mcp_readiness_reason,
     cli_runtime_mcp_readiness_reason_from_code,
 };
-use pioneer_client::providers::{cli_runtime_settings as cli_provider_settings, selectors};
-use pioneer_protocol::{
+use pioneer_client::providers::types::{
     CLIAgentRuntimeKind, GatewayCliRuntimeInstanceSettings, RuntimeCapabilities,
     RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary,
 };
+use pioneer_client::providers::{cli_runtime_settings as cli_provider_settings, selectors};
 use std::{cmp::Ordering, collections::HashSet};
 
-impl PioneerDesktop {
+impl ProviderCatalogView {
     pub(crate) fn render_providers(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        pioneer_observability::record_qualification_diagnostic!(record_render(
-            pioneer_observability::RenderRegion::Providers
-        ));
         let desktop_entity = cx.entity().clone();
         let can_manage = self
             .principal_presentation_capabilities()
@@ -47,14 +44,11 @@ impl PioneerDesktop {
             .as_ref()
             .map(|settings| settings.cli_runtimes.instances.clone());
         let cli_runtime_input_scope_key = format!(
-            "{}:{}",
-            self.gateway
-                .ws_connection_id
-                .map(|connection_id| connection_id.to_string())
-                .unwrap_or_else(|| "disconnected".to_owned()),
+            "{}:{}:{}",
+            self.mount,
+            self.gateway.endpoint_id.as_deref().unwrap_or_default(),
             self.active_workspace_id().unwrap_or("no-workspace")
         );
-        let is_loading = self.providers.loading() || self.providers.cli_loading();
         let is_connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         let configured_provider_names = self.providers.configured_names().clone();
         let cli_runtimes = self.providers.cli_runtimes().to_vec();
@@ -124,7 +118,7 @@ impl PioneerDesktop {
                                 )
                             })
                             .child(
-                                Button::new("cli-runtime-add-provider")
+                                Button::new(self.ui_id("toolbar", "add-runtime"))
                                     .small()
                                     .ghost()
                                     .icon(IconName::Plus)
@@ -165,28 +159,12 @@ impl PioneerDesktop {
                             )
                             .into_any_element()
                     } else {
-                        Button::new("refresh-provider-config")
-                            .small()
-                            .ghost()
-                            .mt_1p5()
-                            .icon(PioneerIconName::RefreshCw)
-                            .tooltip(t!("providers.button.refresh").to_string())
-                            .disabled(!is_connected)
-                            .loading(crate::qualification_diagnostics::observed_loading!(
-                                pioneer_observability::AnimationSourceId::ProviderRefreshButton,
-                                is_loading,
-                            ))
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.refresh_configured_providers(cx);
-                                view.load_cli_provider_snapshot(cx);
-                                cx.notify();
-                            }))
-                            .into_any_element()
+                        self.refresh_button.clone().into_any_element()
                     }),
             )
             .child(
                 v_flex()
-                    .id("providers-scroll")
+                    .id(self.ui_id("catalog", "scroll"))
                     .flex_1()
                     .overflow_y_scroll()
                     .p_6()
@@ -245,9 +223,9 @@ impl PioneerDesktop {
                                                 .grid_cols(grid_columns)
                                                 .gap_3()
                                                 .children(visible_providers.iter().map(
-                                                    |(index, provider)| {
+                                                    |(_index, provider)| {
                                                         Self::render_provider_card(
-                                                            *index,
+                                                            self.ui_id(provider.id, "catalog"),
                                                             *provider,
                                                             configured_provider_names
                                                                 .contains(provider.id),
@@ -272,6 +250,7 @@ impl PioneerDesktop {
                                     self.providers.cli_loading(),
                                     &expanded_cli_runtime_ids,
                                     cli_runtime_input_scope_key.as_str(),
+                                    &self.inline_inputs,
                                     desktop_entity.clone(),
                                     window,
                                     cx,
@@ -282,13 +261,9 @@ impl PioneerDesktop {
             .into_any_element()
     }
 
-    fn provider_grid_columns(&self, window: &Window, cx: &App) -> u16 {
+    fn provider_grid_columns(&self, window: &Window, _cx: &App) -> u16 {
         let viewport_width = window.viewport_size().width;
-        let sidebar_width = if self.shell_state.read(cx).sidebar_visible() {
-            self.shell_state.read(cx).sidebar_width()
-        } else {
-            px(0.)
-        };
+        let sidebar_width = self.sidebar_width;
 
         let content_padding_x = px(48.); // .p_6 on providers scroll area
         let available_width = (viewport_width - sidebar_width - content_padding_x).max(px(0.));
@@ -305,7 +280,7 @@ impl PioneerDesktop {
     }
 
     fn render_provider_card(
-        index: usize,
+        scope: SharedString,
         provider: ProviderCatalogEntry,
         is_configured: bool,
         is_connected: bool,
@@ -318,7 +293,7 @@ impl PioneerDesktop {
         let provider_description = provider.description();
 
         v_flex()
-            .id(("provider-card", index))
+            .id(SharedString::from(format!("{scope}:row")))
             .w_full()
             .h_auto()
             .p_4()
@@ -381,7 +356,7 @@ impl PioneerDesktop {
                     .when(can_manage, |this| {
                         this.child(
                             div().mt_auto().child(
-                                Button::new(("provider-configure", index))
+                                Button::new(SharedString::from(format!("{scope}:configure")))
                                     .small()
                                     .ghost()
                                     .icon(PioneerIconName::Bolt)
@@ -416,6 +391,10 @@ impl PioneerDesktop {
         is_loading: bool,
         expanded_runtime_ids: &HashSet<String>,
         input_scope_key: &str,
+        inline_inputs: &std::collections::BTreeMap<
+            (String, String),
+            Entity<CliRuntimeInlineInputState>,
+        >,
         desktop_entity: Entity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -487,6 +466,7 @@ impl PioneerDesktop {
                                     is_connected,
                                     is_loading,
                                     input_scope_key,
+                                    inline_inputs,
                                     desktop_entity.clone(),
                                     window,
                                     cx,
@@ -505,6 +485,10 @@ impl PioneerDesktop {
         is_connected: bool,
         is_loading: bool,
         input_scope_key: &str,
+        inline_inputs: &std::collections::BTreeMap<
+            (String, String),
+            Entity<CliRuntimeInlineInputState>,
+        >,
         desktop_entity: Entity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -521,7 +505,7 @@ impl PioneerDesktop {
         let mcp_readiness = cli_runtime_mcp_readiness_reason(runtime);
 
         v_flex()
-            .id(("cli-runtime-card", index))
+            .id(SharedString::from(format!("providers:{input_scope_key}:runtimes:{runtime_id}:row")))
             .w_full()
             .border_t_1()
             .border_color(cx.theme().border)
@@ -543,7 +527,7 @@ impl PioneerDesktop {
                             .disabled(!is_connected)
                             .on_click(move |_, _, cx| {
                                 let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.open_cli_runtime_provider_path(path.clone());
+                                    view.open_cli_runtime_provider_path(path.clone(), cx);
                                     cx.notify();
                                 });
                             }),
@@ -557,7 +541,7 @@ impl PioneerDesktop {
                             .disabled(!is_connected)
                             .on_click(move |_, _, cx| {
                                 let _ = desktop_entity.update(cx, |view, cx| {
-                                    view.open_cli_runtime_provider_path(path.clone());
+                                    view.open_cli_runtime_provider_path(path.clone(), cx);
                                     cx.notify();
                                 });
                             }),
@@ -719,7 +703,7 @@ impl PioneerDesktop {
                             .gap_3()
                             .items_center()
                             .child(
-                                Button::new(("cli-runtime-expand", index))
+                                Button::new(SharedString::from(format!("providers:{input_scope_key}:runtimes:{runtime_id}:expand")))
                                     .small()
                                     .ghost()
                                     .icon(if expanded {
@@ -735,18 +719,19 @@ impl PioneerDesktop {
                                     .on_click({
                                         let runtime_id = runtime_id.clone();
                                         let desktop_entity = desktop_entity.clone();
-                                        move |_, _, cx| {
+                                        move |_, window, cx| {
                                             let _ = desktop_entity.update(cx, |view, cx| {
                                                 view.providers.toggle_cli_runtime_expanded(
                                                     runtime_id.clone(),
                                                 );
+                                                view.sync_inline_inputs(window, cx);
                                                 cx.notify();
                                             });
                                         }
                                     }),
                             )
                             .child(
-                                Switch::new(("cli-runtime-toggle-enabled", index))
+                                Switch::new(SharedString::from(format!("providers:{input_scope_key}:runtimes:{runtime_id}:enabled")))
                                     .checked(runtime.enabled)
                                     .disabled(!is_connected)
                                     .on_click({
@@ -794,6 +779,7 @@ impl PioneerDesktop {
                                             is_connected,
                                             true,
                                             input_scope_key,
+                                            inline_inputs,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -810,6 +796,7 @@ impl PioneerDesktop {
                                             is_connected,
                                             true,
                                             input_scope_key,
+                                            inline_inputs,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -826,6 +813,7 @@ impl PioneerDesktop {
                                             is_connected,
                                             true,
                                             input_scope_key,
+                                            inline_inputs,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -843,6 +831,7 @@ impl PioneerDesktop {
                                             is_connected,
                                             true,
                                             input_scope_key,
+                                            inline_inputs,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -857,6 +846,7 @@ impl PioneerDesktop {
                                             is_connected,
                                             false,
                                             input_scope_key,
+                                            inline_inputs,
                                             desktop_entity.clone(),
                                             window,
                                             cx,
@@ -1060,7 +1050,10 @@ fn cli_runtime_status_label(status: &RuntimeStatus) -> String {
     }
 }
 
-fn cli_runtime_status_dot_color(status: &RuntimeStatus, cx: &mut Context<PioneerDesktop>) -> Hsla {
+fn cli_runtime_status_dot_color(
+    status: &RuntimeStatus,
+    cx: &mut Context<ProviderCatalogView>,
+) -> Hsla {
     match status {
         RuntimeStatus::Ready => cx.theme().success,
         RuntimeStatus::NeedsAuth | RuntimeStatus::Degraded { .. } => cx.theme().warning,
@@ -1129,7 +1122,7 @@ fn cli_runtime_summary_line(runtime: &RuntimeSummary) -> String {
 }
 
 fn cli_runtime_authenticated_account_line(
-    account: &pioneer_protocol::RuntimeAccountSnapshot,
+    account: &pioneer_client::providers::types::RuntimeAccountSnapshot,
 ) -> Option<String> {
     if !account.authenticated {
         return None;
@@ -1155,7 +1148,10 @@ fn cli_runtime_authenticated_account_line(
     })
 }
 
-struct CliRuntimeInlineInputState {
+pub(crate) struct CliRuntimeInlineInputState {
+    host_value: String,
+    last_submission: Option<String>,
+    proxy: Option<Entity<crate::credential_form::ProxyForm>>,
     input: Entity<InputState>,
     _subscription: Subscription,
 }
@@ -1165,23 +1161,25 @@ fn cli_runtime_inline_settings_row(
     field_id: Option<CLIRuntimeProviderDraftField>,
     label: String,
     hint: Option<String>,
-    placeholder: String,
+    _placeholder: String,
     is_connected: bool,
     show_divider: bool,
-    input_scope_key: &str,
-    desktop_entity: Entity<PioneerDesktop>,
-    window: &mut Window,
-    cx: &mut Context<PioneerDesktop>,
+    _input_scope_key: &str,
+    inline_inputs: &std::collections::BTreeMap<
+        (String, String),
+        Entity<CliRuntimeInlineInputState>,
+    >,
+    _desktop_entity: Entity<ProviderCatalogView>,
+    _window: &mut Window,
+    cx: &mut Context<ProviderCatalogView>,
 ) -> AnyElement {
-    let input_state = cli_runtime_inline_input_state(
-        runtime,
-        field_id,
-        placeholder,
-        input_scope_key,
-        desktop_entity,
-        window,
-        cx,
+    let key = (
+        runtime.runtime_id.clone(),
+        cli_runtime_inline_field_key(field_id).to_owned(),
     );
+    let Some(input_state) = inline_inputs.get(&key) else {
+        return div().into_any_element();
+    };
     let input = input_state.read(cx).input.clone();
 
     v_flex()
@@ -1210,77 +1208,112 @@ fn cli_runtime_inline_settings_row(
         .into_any_element()
 }
 
-fn cli_runtime_inline_input_state(
-    runtime: &RuntimeSummary,
-    field_id: Option<CLIRuntimeProviderDraftField>,
-    placeholder: String,
-    input_scope_key: &str,
-    desktop_entity: Entity<PioneerDesktop>,
-    window: &mut Window,
-    cx: &mut Context<PioneerDesktop>,
-) -> Entity<CliRuntimeInlineInputState> {
-    let runtime_id = runtime.runtime_id.clone();
-    let initial_value = cli_runtime_inline_field_value(runtime, field_id);
-    let state_key = SharedString::from(format!(
-        "cli-runtime-inline-input:{}:{}:{}",
-        input_scope_key,
-        runtime_id,
-        cli_runtime_inline_field_key(field_id)
-    ));
-
-    window.use_keyed_state(state_key, cx, |window, cx| {
+impl ProviderCatalogView {
+    pub(crate) fn sync_inline_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let runtimes = cli_runtime_displayed_runtimes(
+            self.gateway
+                .settings
+                .as_ref()
+                .map(|s| s.cli_runtimes.instances.as_slice()),
+            &self.providers.cli_runtimes(),
+        );
+        let mut wanted = std::collections::BTreeSet::new();
+        if self.visible() {
+            for runtime in runtimes.iter().filter(|runtime| {
+                self.providers
+                    .expanded_cli_runtime_ids()
+                    .contains(&runtime.runtime_id)
+            }) {
+                for field_id in [
+                    Some(CLIRuntimeProviderDraftField::DisplayName),
+                    Some(CLIRuntimeProviderDraftField::BinaryPath),
+                    Some(CLIRuntimeProviderDraftField::HomePath),
+                    Some(CLIRuntimeProviderDraftField::ShadowHomePath),
+                    None,
+                ] {
+                    let key = (
+                        runtime.runtime_id.clone(),
+                        cli_runtime_inline_field_key(field_id).to_owned(),
+                    );
+                    wanted.insert(key.clone());
+                    let initial_value = cli_runtime_inline_field_value(runtime, field_id);
+                    if let Some(control) = self.inline_inputs.get(&key) {
+                        control.update(cx, |control, cx| {
+                            if let Some(operation) = self.providers.operation.as_ref().filter(|p| p.target() == runtime.runtime_id) {
+                                match operation.request() {
+                                    pioneer_client::providers::store::ProviderLoadState::Failed => control.last_submission = None,
+                                    pioneer_client::providers::store::ProviderLoadState::Ready => {
+                                        if let (Some(form), Some(value)) = (&control.proxy, control.last_submission.take()) {
+                                            form.update(cx, |form, _| form.accept_submission(value));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if control.host_value != initial_value {
+                                control.host_value = initial_value.clone();
+                                if control.proxy.is_some() {
+                                    // Reacquire the transient original from the credential boundary;
+                                    // sanitized publications must never become credential input.
+                                    control.proxy = Some(crate::credential_form::ProxyForm::new(
+                                        control.input.clone(), &self.client,
+                                        self.active_workspace_id().unwrap_or_default().to_owned(),
+                                        pioneer_client::providers::credentials::ProviderCredentialTarget::Runtime(runtime.runtime_id.clone()),
+                                        None, window, cx,
+                                    ));
+                                } else if control.input.read(cx).value().as_ref() != initial_value {
+                                    control.input.update(cx, |input, cx| input.set_value(initial_value, window, cx));
+                                }
+                            }
+                        });
+                        continue;
+                    }
+                    let placeholder = match field_id {
+                        Some(CLIRuntimeProviderDraftField::ShadowHomePath) => {
+                            t!("providers.cli.value.disabled").to_string()
+                        }
+                        Some(field) => cli_runtime_inline_field_placeholder(runtime, field),
+                        None => t!("providers.cli.inline.proxy_placeholder").to_string(),
+                    };
+                    let desktop_entity = cx.weak_entity();
+                    let runtime_id = runtime.runtime_id.clone();
+                    let host_value = initial_value.clone();
+                    let client = self.client.clone();
+                    let workspace = self.active_workspace_id().unwrap_or_default().to_owned();
+                    let control = cx.new(|cx| {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(placeholder)
                 .default_value(initial_value)
         });
+        let proxy = field_id.is_none().then(|| crate::credential_form::ProxyForm::new(input.clone(), &client, workspace, pioneer_client::providers::credentials::ProviderCredentialTarget::Runtime(runtime_id.clone()), (!host_value.is_empty()).then(|| host_value.clone()), window, cx));
         let subscription = cx.subscribe(&input, {
             let runtime_id = runtime_id.clone();
-            move |_, input, event: &InputEvent, cx| match field_id {
-                Some(field) => {
-                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                        return;
+            move |control: &mut CliRuntimeInlineInputState, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) { control.last_submission = None; return; }
+                if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) { return; }
+                let value = input.read(cx).value().trim().to_owned();
+                if control.last_submission.as_ref() == Some(&value) { return; }
+                let accepted = match field_id {
+                    Some(field) => desktop_entity.update(cx, |view, cx| view.save_cli_runtime_provider_inline_field(runtime_id.clone(), field, value.clone(), cx)).unwrap_or(false),
+                    None => {
+                        let original = control.proxy.as_ref().and_then(|form| form.read(cx).original()).unwrap_or_default();
+                        if original == value { return; }
+                        desktop_entity.update(cx, |view, cx| if value.is_empty() { view.delete_cli_runtime_proxy(runtime_id.clone(), cx) } else { view.set_cli_runtime_proxy(runtime_id.clone(), value.clone(), cx) }).unwrap_or(false)
                     }
-                    let value = input.read(cx).value().to_string();
-                    let _ = desktop_entity.update(cx, |view, cx| {
-                        view.save_cli_runtime_provider_inline_field(
-                            runtime_id.clone(),
-                            field,
-                            value,
-                            cx,
-                        );
-                        cx.notify();
-                    });
-                }
-                None => {
-                    if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                        return;
-                    }
-                    let proxy_url = input.read(cx).value().trim().to_owned();
-                    let _ = desktop_entity.update(cx, |view, cx| {
-                        let current_proxy_url = view
-                            .providers
-                            .cli_runtime_proxy_url(runtime_id.as_str())
-                            .unwrap_or_default();
-                        if current_proxy_url == proxy_url {
-                            return;
-                        }
-                        if proxy_url.is_empty() {
-                            view.delete_cli_runtime_proxy(runtime_id.clone(), cx);
-                        } else {
-                            view.set_cli_runtime_proxy(runtime_id.clone(), proxy_url.clone(), cx);
-                        }
-                        cx.notify();
-                    });
-                }
+                };
+                if accepted { control.last_submission = Some(value); }
             }
         });
 
-        CliRuntimeInlineInputState {
-            input,
-            _subscription: subscription,
+                        CliRuntimeInlineInputState { input, host_value, last_submission: None, proxy, _subscription: subscription }
+                    });
+                    self.inline_inputs.insert(key, control);
+                }
+            }
         }
-    })
+        self.inline_inputs.retain(|key, _| wanted.contains(key));
+    }
 }
 
 fn cli_runtime_inline_field_value(
@@ -1354,7 +1387,7 @@ fn cli_runtime_has_diagnostics(runtime: &RuntimeSummary) -> bool {
 
 fn cli_runtime_diagnostics_panel(
     runtime: &RuntimeSummary,
-    cx: &mut Context<PioneerDesktop>,
+    cx: &mut Context<ProviderCatalogView>,
 ) -> AnyElement {
     let stderr_start = runtime.recent_stderr.len().saturating_sub(8);
     let stderr_lines = runtime.recent_stderr[stderr_start..].to_vec();
@@ -1476,12 +1509,12 @@ mod tests {
         cli_runtime_inline_field_key, cli_runtime_inline_field_value,
         cli_runtime_mcp_readiness_reason_label,
     };
+    use pioneer_client::providers::types::{
+        CLIAgentRuntimeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
+    };
     use pioneer_client::providers::{
         cli_runtime_settings::CLIRuntimeProviderDraftField,
         diagnostics::CliRuntimeMcpReadinessReason,
-    };
-    use pioneer_protocol::{
-        CLIAgentRuntimeKind, RuntimeCapabilities, RuntimeStatus, RuntimeSummary,
     };
 
     fn runtime_summary() -> RuntimeSummary {

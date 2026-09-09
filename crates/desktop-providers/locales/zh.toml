@@ -1,0 +1,341 @@
+[dialog.folder.rename]
+title = "重命名文件夹"
+description = "请保持简短且便于记忆。"
+
+[dialog.thread.rename]
+title = "重命名"
+description = "更新话题标题。"
+
+[providers.screen]
+title = "供应商"
+description = "为可用的模型供应商配置 API 密钥。"
+empty_connected = "还没有已连接的供应商。"
+
+[providers.sidebar]
+api = "API 提供商"
+connected = "已连接"
+cli = "CLI 提供商"
+
+[providers.button]
+submit = "保存"
+remove_key = "移除密钥"
+refresh = "Refresh providers"
+
+[providers.dialog]
+title = "配置 %{provider}"
+api_key_label = "API 密钥 *"
+api_key_placeholder = "输入 API 密钥"
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+proxy_hint = "Optional workspace-scoped proxy for this provider."
+replace_hint = "%{provider} 已配置密钥。保存后将替换现有密钥。"
+
+[providers.error]
+gateway_not_connected = "网关未连接。"
+workspace_not_selected = "未选择工作区。"
+load_failed = "加载供应商配置失败"
+save_failed = "保存 API 密钥失败"
+delete_failed = "移除 API 密钥失败"
+
+[providers.cli]
+title = "CLI Providers"
+description = "就绪状态由 Gateway 检查并保持更新。"
+refreshing = "Refreshing"
+empty = "No CLI providers configured"
+diagnostics = "Diagnostics"
+native_events = "Native events"
+recent_stderr = "Recent stderr"
+copied_diagnostics = "Copied diagnostics for"
+login_code = "Code"
+login_open = "Open"
+login_started = "CLI login started"
+
+[providers.cli.mcp]
+runtime_not_ready = "Runtime is not ready"
+unsupported_contract = "Provider MCP contract is unsupported"
+strict_isolation_failed = "MCP isolation check failed"
+helper_self_probe_failed = "MCP helper self-check failed"
+platform_ipc_unavailable = "Secure local IPC is unavailable"
+continuity_unavailable = "Conversation restart/resume is unavailable"
+readiness_unavailable = "MCP readiness is unavailable"
+
+[providers.cli.detail]
+account = "Account"
+version = "Version"
+binary = "Binary"
+home = "Home/config path"
+shadow_home = "Shadow home"
+
+[providers.cli.value]
+disabled = "Disabled"
+
+[providers.cli.inline]
+display_name_label = "Display name"
+display_name_hint = "Name shown for this CLI provider in lists and pickers."
+binary_label = "Binary path"
+binary_hint = "Path to the CLI binary used by this instance."
+home_label = "Home/config path"
+home_hint = "Runtime home and configuration directory."
+shadow_home_label = "Shadow home path"
+shadow_home_hint = "Optional account-specific home; leave empty to disable."
+proxy_label = "Proxy URL"
+proxy_placeholder = "http://user:pass@host:port or socks5://host:port"
+
+[providers.cli.action]
+add = "Add CLI Provider"
+refresh = "Refresh status"
+copy_diagnostics = "Copy diagnostics"
+edit = "Edit CLI Provider"
+duplicate = "Duplicate CLI Provider"
+disable = "Disable CLI Provider"
+enable = "Enable CLI Provider"
+login = "Log in"
+open_home = "Open home/config path"
+open_shadow_home = "Open shadow home"
+expand = "Show CLI provider details"
+collapse = "Hide CLI provider details"
+
+[providers.cli.status_detail]
+authenticated = "Authenticated as %{account}"
+authenticated_with_plan = "Authenticated as %{account} · %{plan}"
+not_on_path = "CLI `%{binary}` is not installed or not on PATH."
+unsupported_version = "Installed %{version}; minimum %{minimum}"
+
+[providers.cli.dialog]
+title_add = "Add CLI Provider"
+title_edit = "Edit CLI Provider"
+title_duplicate = "Duplicate CLI Provider"
+id_label = "Provider ID"
+display_name_label = "Display name"
+binary_label = "Binary"
+home_label = "Home/config path"
+shadow_home_label = "Shadow home"
+enabled_label = "Enabled"
+id_placeholder = "cli_provider_work"
+
+[providers.cli.status]
+disabled = "Disabled"
+missing_binary = "Missing binary"
+spawn_failed = "Spawn failed"
+initializing = "Initializing"
+needs_auth = "Needs login"
+ready = "Ready"
+degraded = "Degraded"
+unsupported = "Unsupported"
+error = "Error"
+
+[providers.cli.error]
+open_path_failed = "Open path failed"
+
+[providers.catalog.anthropic]
+title = "Anthropic"
+description = "Anthropic 的 Claude 和其他模型"
+
+[providers.catalog.bedrock]
+title = "Amazon Bedrock"
+description = "通过 AWS Bedrock 使用模型"
+
+[providers.catalog.azure-openai]
+title = "Azure OpenAI"
+description = "通过 Azure OpenAI 服务使用模型"
+
+[providers.catalog.copilot]
+title = "GitHub Copilot"
+description = "通过兼容 Copilot 的 API 运行模型"
+
+[providers.catalog.deepseek]
+title = "DeepSeek"
+description = "兼容 OpenAI 的 DeepSeek 提供方"
+
+[providers.catalog.gemini]
+title = "Google Gemini"
+description = "来自 Google AI 的 Gemini 模型"
+
+[providers.catalog.glm]
+title = "GLM"
+description = "GLM 和兼容 Zhipu 的模型"
+
+[providers.catalog.groq]
+title = "Groq"
+description = "使用 Groq 硬件进行快速推理"
+
+[providers.catalog.litellm]
+title = "LiteLLM"
+description = "LiteLLM 代理和网关"
+
+[providers.catalog.mistral]
+title = "Mistral AI"
+description = "通过兼容 OpenAI 的端点使用 Mistral API"
+
+[providers.catalog.ollama]
+title = "Ollama"
+description = "运行本地 Ollama 模型"
+
+[providers.catalog.openai]
+title = "OpenAI"
+description = "GPT 和其他 OpenAI 模型"
+
+[providers.catalog.openrouter]
+title = "OpenRouter"
+description = "面向多个模型提供方的路由器"
+
+[providers.catalog.telnyx]
+title = "Telnyx"
+description = "Telnyx 推理端点"
+
+[providers.catalog.xai]
+title = "xAI"
+description = "xAI Grok 模型"
+
+[providers.catalog.together]
+title = "Together AI"
+description = "由 Together 托管的模型"
+
+[providers.catalog.fireworks]
+title = "Fireworks AI"
+description = "Fireworks 托管模型 API"
+
+[providers.catalog.novita]
+title = "Novita"
+description = "兼容 OpenAI 的 Novita 端点"
+
+[providers.catalog.perplexity]
+title = "Perplexity"
+description = "Perplexity API 模型"
+
+[providers.catalog.cohere]
+title = "Cohere"
+description = "Cohere 兼容端点"
+
+[providers.catalog.venice]
+title = "Venice"
+description = "Venice 模型 API"
+
+[providers.catalog.cerebras]
+title = "Cerebras"
+description = "Cerebras 模型 API"
+
+[providers.catalog.sambanova]
+title = "SambaNova"
+description = "SambaNova 模型 API"
+
+[providers.catalog.hyperbolic]
+title = "Hyperbolic"
+description = "Hyperbolic 托管模型"
+
+[providers.catalog.deepinfra]
+title = "DeepInfra"
+description = "兼容 OpenAI 的 DeepInfra 端点"
+
+[providers.catalog.huggingface]
+title = "Hugging Face"
+description = "HF 路由器端点"
+
+[providers.catalog.ai21]
+title = "AI21"
+description = "AI21 Studio 端点"
+
+[providers.catalog.reka]
+title = "Reka"
+description = "Reka 模型端点"
+
+[providers.catalog.baseten]
+title = "Baseten"
+description = "Baseten 推理端点"
+
+[providers.catalog.nscale]
+title = "Nscale"
+description = "Nscale 推理端点"
+
+[providers.catalog.anyscale]
+title = "Anyscale"
+description = "Anyscale 托管模型端点"
+
+[providers.catalog.nebius]
+title = "Nebius"
+description = "Nebius AI Studio 端点"
+
+[providers.catalog.friendli]
+title = "Friendli"
+description = "Friendli 无服务器端点"
+
+[providers.catalog.lepton]
+title = "Lepton"
+description = "Lepton AI 端点"
+
+[providers.catalog.siliconflow]
+title = "SiliconFlow"
+description = "SiliconFlow 模型 API"
+
+[providers.catalog.aihubmix]
+title = "AIHubMix"
+description = "AIHubMix API 端点"
+
+[providers.catalog.astrai]
+title = "ASTRAI"
+description = "ASTRAI 模型 API"
+
+[providers.catalog.stepfun]
+title = "StepFun"
+description = "StepFun 模型端点"
+
+[providers.catalog.baichuan]
+title = "Baichuan"
+description = "Baichuan 模型 API"
+
+[providers.catalog.yi]
+title = "Yi"
+description = "Lingyiwanwu / Yi 模型 API"
+
+[providers.catalog.hunyuan]
+title = "Hunyuan"
+description = "Tencent Hunyuan 模型 API"
+
+[providers.catalog.ovhcloud]
+title = "OVHcloud"
+description = "OVHcloud AI 端点"
+
+[providers.catalog.nvidia]
+title = "NVIDIA"
+description = "NVIDIA NIM 端点"
+
+[providers.catalog.synthetic]
+title = "Synthetic"
+description = "兼容 OpenAI 的 Synthetic 端点"
+
+[providers.catalog.doubao]
+title = "Doubao"
+description = "Volcengine Ark 端点"
+
+[providers.catalog.qianfan]
+title = "Qianfan"
+description = "Baidu Qianfan 模型 API"
+
+[providers.catalog.lmstudio]
+title = "LM Studio"
+description = "本地 LM Studio 兼容 OpenAI API"
+
+[providers.catalog.llamacpp]
+title = "llama.cpp"
+description = "本地 llama.cpp 兼容 OpenAI API"
+
+[providers.catalog.sglang]
+title = "SGLang"
+description = "本地 SGLang 兼容 OpenAI API"
+
+[providers.catalog.vllm]
+title = "vLLM"
+description = "本地 vLLM 兼容 OpenAI API"
+
+[providers.catalog.osaurus]
+title = "OSaurus"
+description = "本地 OSaurus 兼容 OpenAI API"
+
+
+[buttons]
+ok = "OK"
+add = "添加"
+cancel = "取消"
+save = "保存"
+dismiss = "关闭"
+

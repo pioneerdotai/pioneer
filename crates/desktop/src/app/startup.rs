@@ -68,6 +68,8 @@ impl DesktopStartupCoordinator {
         }
     }
 
+    pub(super) fn is_presenting(&self) -> bool { !self.finalized && !self.frame_scheduled }
+
     pub(super) fn diagnostic_trace(&self) -> DesktopStartupTrace {
         self.trace.clone()
     }
@@ -366,13 +368,6 @@ impl PioneerDesktop {
                 self.startup.fail(DesktopStartupStage::WorkspaceLoad);
             }
         }
-        if !self.providers.loading() {
-            if self.providers.error().is_some() {
-                self.startup.fail(DesktopStartupStage::ProviderLoad);
-            } else {
-                self.startup.succeed(DesktopStartupStage::ProviderLoad);
-            }
-        }
         if !self.thread_directory_loading() && self.current_active_thread_id().is_some() {
             self.startup.succeed(DesktopStartupStage::ThreadTreeLoad);
         }
@@ -418,7 +413,7 @@ impl PioneerDesktop {
                 && self.gateway.capability_snapshot.is_some()
                 && self.active_workspace_id().is_some()
                 && !self.workspaces_loading()
-                && !self.providers.loading()
+                && !self.provider_catalog_loading()
                 && providers_ready
                 && !self.thread_directory_loading()
                 && active_thread_ready;

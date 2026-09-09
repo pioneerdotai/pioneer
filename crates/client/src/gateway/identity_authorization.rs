@@ -216,6 +216,8 @@ impl ClientCore {
                 IdentityPublicationChange::Update,
             );
         }
+        drop(owner);
+        self.refresh_administration_member_pages();
         Ok(response)
     }
 
@@ -632,6 +634,8 @@ impl ClientCore {
                 IdentityPublicationChange::revision(changed),
             );
         }
+        drop(owner);
+        if accepted == AuthorizationProjectionAcceptance::Accepted { self.resume_administration_demand(); self.resume_provider_collection_demand(); self.resume_provider_runtime_demand(); }
         accepted
     }
 
@@ -664,6 +668,8 @@ impl ClientCore {
                 IdentityPublicationChange::revision(changed),
             );
         }
+        drop(owner);
+        if accepted == AuthorizationProjectionAcceptance::Accepted { self.resume_administration_demand(); self.resume_provider_collection_demand(); self.resume_provider_runtime_demand(); }
         accepted
     }
 }

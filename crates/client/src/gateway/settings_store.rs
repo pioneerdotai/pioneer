@@ -114,7 +114,7 @@ impl ClientCore {
         Ok(ClientGeneration::new(owner.settings_request))
     }
 
-    fn finish_gateway_settings(
+    pub(crate) fn finish_gateway_settings(
         &self,
         generation: ClientGeneration,
         result: &mut anyhow::Result<GatewaySettingsSnapshot>,

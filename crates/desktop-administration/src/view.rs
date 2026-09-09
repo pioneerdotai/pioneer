@@ -1,8 +1,9 @@
-use crate::app::root::{AdministrationContentView, PioneerDesktop};
+use crate::administration::AdministrationView;
 use gpui_kit::component::{theme::ActiveTheme, *};
 use gpui_kit::{prelude::*, *};
+use pioneer_client::navigation::AdministrationRoute as AdministrationContentView;
 
-impl PioneerDesktop {
+impl AdministrationView {
     pub(super) fn render_administration_screen(
         scroll_id: &'static str,
         title: String,
@@ -11,9 +12,6 @@ impl PioneerDesktop {
         content: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        pioneer_observability::record_qualification_diagnostic!(record_render(
-            pioneer_observability::RenderRegion::Administration
-        ));
         v_flex()
             .size_full()
             .bg(cx.theme().background)

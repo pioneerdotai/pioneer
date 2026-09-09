@@ -177,8 +177,8 @@ impl PioneerDesktop {
     ) -> AnyElement {
         match route {
             MainContentView::Settings => self.render_settings_sidebar(cx),
-            MainContentView::Providers => self.render_providers_sidebar(cx),
-            MainContentView::Administration => self.render_administration_sidebar(cx),
+            MainContentView::Providers => self.providers_view.read(cx).sidebar().into_any_element(),
+            MainContentView::Administration => self.administration_view.read(cx).sidebar().into_any_element(),
             MainContentView::McpDetails => self.render_mcp_details_sidebar(cx),
             MainContentView::Mcp => self.render_mcp_sidebar(cx),
             MainContentView::SkillDetails => self.render_skill_details_sidebar(cx),
@@ -198,8 +198,8 @@ impl Render for PioneerDesktop {
         match self.main_content_view() {
             MainContentView::Threads => div().into_any_element(),
             MainContentView::AgentsDoc => self.render_agents_doc_editor(cx),
-            MainContentView::Providers => self.render_providers(window, cx),
-            MainContentView::Administration => self.render_administration(window, cx),
+            MainContentView::Providers => self.providers_view.clone().into_any_element(),
+            MainContentView::Administration => self.administration_view.clone().into_any_element(),
             MainContentView::Mcp => self.render_mcp(window, cx),
             MainContentView::McpDetails => self.render_mcp_details(window, cx),
             MainContentView::Skills => self.render_skills(window, cx),

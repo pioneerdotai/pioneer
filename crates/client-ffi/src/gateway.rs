@@ -16,13 +16,11 @@ use pioneer_client::gateway::{
     types::{GatewayEndpoint, GatewayRegistry},
 };
 use pioneer_client::{
-    providers::list::order_transcription_selector_models,
     rpc::JsonRpcRequestTransport,
     settings::voice::{voice_input_settings_plan, voice_input_status_reduction},
 };
 #[cfg(test)]
 use pioneer_protocol::{GatewaySettingsGetResponse, GatewaySettingsUpdateResponse};
-use pioneer_protocol::{ProviderListModelsParams, ProviderListModelsResponse};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -294,21 +292,6 @@ pub fn gateway_settings_error_code(message: &str) -> &'static str {
     }
 }
 
-pub fn provider_list_transcription_models_for_bridge<TTransport>(
-    transport: &TTransport,
-    params: ProviderListModelsParams,
-) -> anyhow::Result<ProviderListModelsResponse>
-where
-    TTransport: JsonRpcRequestTransport + ?Sized,
-{
-    let mut response =
-        pioneer_client::transport::ws::command_sender::provider_list_transcription_models(
-            transport, params,
-        )?;
-    order_transcription_selector_models(response.models.as_mut_slice());
-    Ok(response)
-}
-
 pub fn voice_input_plan_for_bridge(
     request: ClientVoiceInputPlanRequest,
 ) -> ClientVoiceInputPlanResult {
@@ -333,8 +316,7 @@ mod tests {
     use pioneer_protocol::{
         GatewayGeneralSettings, GatewayMemorySettings, GatewaySettingsSnapshot,
         GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
-        GatewayVoiceInputSettings, ProviderModelCapabilities, ProviderModelInfo,
-        ProviderModelLimits, ProviderTranscriptionModelMetadata,
+        GatewayVoiceInputSettings,
     };
     use serde_json::{Value as JsonValue, json};
     use std::sync::Mutex;
@@ -411,36 +393,6 @@ mod tests {
                     error: None,
                 },
             },
-        }
-    }
-
-    fn transcription_model(id: &str, recommended: bool) -> ProviderModelInfo {
-        ProviderModelInfo {
-            id: id.to_owned(),
-            name: Some(id.to_owned()),
-            description: None,
-            created: None,
-            provider: "local".to_owned(),
-            owned_by: None,
-            limits: ProviderModelLimits::default(),
-            capabilities: ProviderModelCapabilities {
-                transcription: Some(true),
-                ..Default::default()
-            },
-            transcription: Some(ProviderTranscriptionModelMetadata {
-                engine: "test".to_owned(),
-                download_size_mb: 1,
-                accuracy_score: 1,
-                speed_score: 1,
-                supports_translation: false,
-                supported_languages: vec!["en".to_owned()],
-                supports_language_selection: false,
-                recommended,
-            }),
-            pricing: None,
-            active: Some(true),
-            family: Some("test".to_owned()),
-            lifecycle_status: None,
         }
     }
 
@@ -525,69 +477,6 @@ mod tests {
         assert_eq!(
             gateway_settings_error_code(error.to_string().as_str()),
             VOICE_RECONFIGURATION_BUSY_CODE
-        );
-    }
-
-    #[test]
-    fn provider_list_transcription_models_bridge_returns_ordered_safe_catalog() {
-        let expected_ids = [
-            "small",
-            "medium",
-            "turbo",
-            "large",
-            "breeze-asr",
-            "parakeet-tdt-0.6b-v2",
-            "parakeet-tdt-0.6b-v3",
-            "moonshine-base",
-            "moonshine-tiny-streaming-en",
-            "moonshine-small-streaming-en",
-            "moonshine-medium-streaming-en",
-            "sense-voice-int8",
-            "gigaam-v3-e2e-ctc",
-            "canary-180m-flash",
-            "canary-1b-v2",
-            "cohere-int8",
-        ];
-        let models = expected_ids
-            .iter()
-            .map(|id| transcription_model(id, *id == "parakeet-tdt-0.6b-v3"))
-            .collect();
-        let transport = ImmediateTransport::success(
-            serde_json::to_value(ProviderListModelsResponse {
-                provider: "local".to_owned(),
-                models,
-            })
-            .expect("catalog response JSON"),
-        );
-
-        let response = provider_list_transcription_models_for_bridge(
-            &transport,
-            ProviderListModelsParams {
-                workspace_id: "workspace-1".to_owned(),
-                provider: "local".to_owned(),
-            },
-        )
-        .expect("transcription models");
-
-        assert_eq!(response.models.len(), expected_ids.len());
-        assert_eq!(response.models[0].id, "parakeet-tdt-0.6b-v3");
-        let mut actual_ids = response
-            .models
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>();
-        actual_ids.sort_unstable();
-        let mut expected_ids = expected_ids.to_vec();
-        expected_ids.sort_unstable();
-        assert_eq!(actual_ids, expected_ids);
-
-        let public_json = serde_json::to_string(&response).expect("public catalog JSON");
-        for private_field in ["url", "sha256", "checksum", "artifact", "install_dir"] {
-            assert!(!public_json.contains(private_field));
-        }
-        assert_eq!(
-            transport.request()["method"],
-            pioneer_protocol::constants::methods::PROVIDER_TRANSCRIPTION_MODELS_LIST
         );
     }
 

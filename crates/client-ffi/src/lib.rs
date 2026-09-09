@@ -4,6 +4,7 @@
 //! Client domain logic remains in `pioneer-client`.
 
 mod active_thread;
+mod administration_activation;
 mod artifacts;
 mod auth;
 mod avatars;
@@ -78,7 +79,7 @@ use gateway::{
     plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
     plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
-    provider_list_transcription_models_for_bridge, validate_remote_gateway_request,
+    validate_remote_gateway_request,
     voice_input_plan_for_bridge,
 };
 use invitation::{
@@ -107,15 +108,10 @@ use pioneer_client::{
         SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
     },
     providers::{
-        list::{
-            cli_runtime_list_models_params,
-            provider_models_response_from_cli_runtime_models_response,
-            runtime_id_from_cli_runtime_provider_key,
-        },
         presentation::{
             ProviderModelDisplayKey, ProviderModelDisplayResolution, ReasoningEffortRowsRequest,
             ReasoningEffortRowsResponse, provider_model_display_key,
-            provider_model_display_models_params, reasoning_effort_rows_from_request,
+            reasoning_effort_rows_from_request,
             resolve_provider_model_display_from_response,
         },
     },
@@ -1159,12 +1155,24 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<pioneer_protocol::InvitationCreateResponse, ClientFfiError> {
+        if let Ok(request) = serde_json::from_str::<administration_activation::AdministrationActivationRequest>(input_json) {
+            request.validate()?;
+            self.require_initialized_and_connected()?;
+            let operation = self.client_runtime.core.take_administration_activation_operation(request.generation,
+                pioneer_client::administration::operations::AdministrationActivationKind::Invitation).map_err(administration_rpc_error)?;
+            return match self.client_runtime.core.execute_prepared_administration_command(operation).map_err(administration_rpc_error)? {
+                pioneer_client::administration::operations::AdministrationCompletion::InvitationCreated(response) => Ok(response),
+                _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+            };
+        }
         let params = parse_normal_params(input_json, "invitation create")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .invitation_create(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::CreateInvitation(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::InvitationCreated(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn invitation_list(
@@ -1173,9 +1181,7 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::InvitationListResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "invitation list")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .invitation_list(params)
+        self.client_runtime.core.read_administration_invitations(params)
             .map_err(administration_rpc_error)
     }
 
@@ -1185,10 +1191,12 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::InvitationRevokeResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "invitation revoke")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .invitation_revoke(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::RevokeInvitation(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::InvitationRevoked(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn member_list(
@@ -1197,9 +1205,7 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberListResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member list")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .member_list(params)
+        self.client_runtime.core.read_administration_members(params)
             .map_err(administration_rpc_error)
     }
 
@@ -1249,10 +1255,12 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member suspend")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .member_suspend(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::SuspendMember(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn member_restore(
@@ -1261,10 +1269,12 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member restore")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .member_restore(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::RestoreMember(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn member_remove(
@@ -1273,22 +1283,36 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member remove")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .member_remove(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::RemoveMember(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn member_device_create(
         &self,
         input_json: &str,
     ) -> Result<pioneer_protocol::MemberDeviceCreateResponse, ClientFfiError> {
+        if let Ok(request) = serde_json::from_str::<administration_activation::AdministrationActivationRequest>(input_json) {
+            request.validate()?;
+            self.require_initialized_and_connected()?;
+            let operation = self.client_runtime.core.take_administration_activation_operation(request.generation,
+                pioneer_client::administration::operations::AdministrationActivationKind::RecoveryDevice).map_err(administration_rpc_error)?;
+            return match self.client_runtime.core.execute_prepared_administration_command(operation).map_err(administration_rpc_error)? {
+                pioneer_client::administration::operations::AdministrationCompletion::RecoveryDeviceCreated(response) => Ok(response),
+                _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+            };
+        }
         let params = parse_normal_params(input_json, "member device create")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .member_device_create(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::CreateRecoveryDevice(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::RecoveryDeviceCreated(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn workspace_member_list(
@@ -1297,9 +1321,7 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::WorkspaceMemberListResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "workspace member list")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .workspace_member_list(params)
+        self.client_runtime.core.read_administration_workspace_members(params)
             .map_err(administration_rpc_error)
     }
 
@@ -1309,10 +1331,12 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::WorkspaceMemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "workspace member add")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .workspace_member_add(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::AddWorkspaceMember(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::WorkspaceMemberChanged(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn workspace_member_remove(
@@ -1321,10 +1345,12 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::WorkspaceMemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "workspace member remove")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime
-            .ws_command_sender()
-            .workspace_member_remove(params)
-            .map_err(administration_rpc_error)
+        match self.client_runtime.core.execute_administration_command(
+            pioneer_client::administration::operations::AdministrationCommand::RemoveWorkspaceMember(params),
+        ).map_err(administration_rpc_error)? {
+            pioneer_client::administration::operations::AdministrationCompletion::WorkspaceMemberChanged(response) => Ok(response),
+            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        }
     }
 
     fn thread_participants_list(
@@ -2038,19 +2064,17 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<ProviderListParams>(input_json)
             .map_err(|error| format!("invalid provider list params: {error}"))?;
 
-        self.client_runtime
-            .ws_command_sender()
-            .provider_list(params)
-            .map_err(|error| format!("{error:#}"))
+        self.client_runtime.core.read_provider_collection(
+            pioneer_client::providers::store::ProviderCollectionKey::catalog(params.workspace_id), false)
+            .and_then(|read| read.wait()).and_then(|p| p.catalog_response())
+            .map_err(|_| "provider_catalog_unavailable".into())
     }
 
     fn cli_runtime_list(&self, input_json: &str) -> Result<CLIRuntimeListResponse, String> {
         let params = serde_json::from_str::<CLIRuntimeListParams>(input_json)
             .map_err(|error| format!("invalid CLI runtime list params: {error}"))?;
 
-        self.client_runtime
-            .ws_command_sender()
-            .cli_runtime_list(params)
+        self.client_runtime.core.read_provider_runtimes(&params.workspace_id, false)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2058,9 +2082,7 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<CLIRuntimeRefreshParams>(input_json)
             .map_err(|error| format!("invalid CLI runtime refresh params: {error}"))?;
 
-        self.client_runtime
-            .ws_command_sender()
-            .cli_runtime_refresh(params)
+        self.client_runtime.core.refresh_provider_runtimes(params)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2071,9 +2093,9 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<CLIRuntimeListModelsParams>(input_json)
             .map_err(|error| format!("invalid CLI runtime list models params: {error}"))?;
 
-        self.client_runtime
-            .ws_command_sender()
-            .cli_runtime_list_models(params)
+        self.client_runtime.core.read_provider_collection(
+            pioneer_client::providers::store::ProviderCollectionKey::models(params.workspace_id, pioneer_client::providers::list::cli_runtime_provider_key(&params.runtime_id), pioneer_client::providers::store::ProviderModelKind::Chat), false)
+            .and_then(|read| read.wait()).and_then(|publication| publication.runtime_models_response())
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2270,29 +2292,10 @@ impl ClientFfiRuntime {
 
     fn provider_list_models(&self, input_json: &str) -> Result<ProviderListModelsResponse, String> {
         let params = serde_json::from_str::<ProviderListModelsParams>(input_json)
-            .map_err(|error| format!("invalid provider list models params: {error}"))?;
-
-        if let Some(runtime_id) = runtime_id_from_cli_runtime_provider_key(params.provider.as_str())
-        {
-            let response = self
-                .client_runtime
-                .ws_command_sender()
-                .cli_runtime_list_models(cli_runtime_list_models_params(
-                    params.workspace_id,
-                    runtime_id.to_owned(),
-                ))
-                .map_err(|error| format!("{error:#}"))?;
-
-            return Ok(provider_models_response_from_cli_runtime_models_response(
-                params.provider,
-                response,
-            ));
-        }
-
-        self.client_runtime
-            .ws_command_sender()
-            .provider_list_models(params)
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|_| "invalid provider list models params".to_owned())?;
+        self.client_runtime.core.read_provider_collection(
+            pioneer_client::providers::store::ProviderCollectionKey::models(params.workspace_id, params.provider, pioneer_client::providers::store::ProviderModelKind::Chat), false)
+            .and_then(|read| read.wait()).and_then(|p| p.models_response()).map_err(|_| "provider_models_unavailable".into())
     }
 
     fn provider_list_transcription_models(
@@ -2308,11 +2311,10 @@ impl ClientFfiRuntime {
             })?;
         self.require_initialized_and_connected()?;
 
-        provider_list_transcription_models_for_bridge(
-            &self.client_runtime.ws_command_sender(),
-            params,
-        )
-        .map_err(|error| ClientFfiError::new(format!("{error:#}"), ClientFfiError::GENERIC_CODE))
+        self.client_runtime.core.read_provider_collection(
+            pioneer_client::providers::store::ProviderCollectionKey::models(params.workspace_id, params.provider, pioneer_client::providers::store::ProviderModelKind::Transcription), false)
+            .and_then(|read| read.wait()).and_then(|p| p.models_response())
+            .map_err(|_| ClientFfiError::new("provider_models_unavailable", ClientFfiError::GENERIC_CODE))
     }
 
     fn voice_input_settings_plan(
@@ -2343,27 +2345,9 @@ impl ClientFfiRuntime {
             Some(request.model.as_str()),
         )
         .ok_or_else(|| "invalid provider model display request: empty selection".to_owned())?;
-        let response = if let Some(runtime_id) =
-            runtime_id_from_cli_runtime_provider_key(key.provider.as_str())
-        {
-            let cli_response = self
-                .client_runtime
-                .ws_command_sender()
-                .cli_runtime_list_models(cli_runtime_list_models_params(
-                    key.workspace_id.clone(),
-                    runtime_id.to_owned(),
-                ))
-                .map_err(|error| format!("{error:#}"))?;
-            provider_models_response_from_cli_runtime_models_response(
-                key.provider.clone(),
-                cli_response,
-            )
-        } else {
-            self.client_runtime
-                .ws_command_sender()
-                .provider_list_models(provider_model_display_models_params(&key))
-                .map_err(|error| format!("{error:#}"))?
-        };
+        let response = self.client_runtime.core.read_provider_collection(
+            pioneer_client::providers::store::ProviderCollectionKey::models(key.workspace_id.clone(), key.provider.clone(), pioneer_client::providers::store::ProviderModelKind::Chat), false)
+            .and_then(|read| read.wait()).and_then(|p| p.models_response()).map_err(|_| "provider_models_unavailable".to_owned())?;
 
         Ok(resolve_provider_model_display_from_response(
             &key, &response,
@@ -5599,3 +5583,6 @@ mod timeline_publication_tests;
 
 #[cfg(test)]
 mod workspace_publication_tests;
+
+#[cfg(test)]
+mod provider_runtime_tests;

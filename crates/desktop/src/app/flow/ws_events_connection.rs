@@ -33,7 +33,7 @@ impl PioneerDesktop {
 
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.active_thread_resubscribe_pending = false;
-            self.workspace_members_loading.clear();
+
             self.gateway
                 .client_runtime
                 .client_core()
@@ -54,11 +54,9 @@ impl PioneerDesktop {
             if self.gateway.connection_state != GatewayConnectionState::Connected {
                 self.gateway.current_auth = None;
                 self.gateway.capability_snapshot = None;
-                self.administration.clear_for_session_termination();
+
                 self.member_avatar_state.clear();
-                self.members_loading = false;
-                self.member_workspaces_saving = false;
-                self.members_error = None;
+
             }
             execute_desktop_client_effects(self, reduction.effects, cx);
         }

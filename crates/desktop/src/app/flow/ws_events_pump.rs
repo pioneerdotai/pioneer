@@ -18,6 +18,7 @@ impl PioneerDesktop {
         let session = self.gateway.session_binding.clone();
         let mut session_publications = session.watch();
         self.gateway.session_task = Some(cx.spawn(async move |view, cx| {
+            let mut provider_startup = None;
             let mut terminal_delivery = None;
             let mut refresh_delivery = None;
             while session_publications.changed().await.is_ok() {
@@ -30,6 +31,8 @@ impl PioneerDesktop {
                 };
                 if view
                     .update(cx, |view, cx| {
+                        let stage = publication.startup.stages.get(&pioneer_client::gateway::session_controller::StartupStage::Provider).copied();
+                        if provider_startup != stage { provider_startup = stage; if view.startup.is_presenting() { cx.notify(); } }
                         view.apply_gateway_session_publication(&publication, cx);
                         let Some(endpoint) = view
                             .gateway
@@ -138,7 +141,6 @@ impl PioneerDesktop {
                             // Watch delivery can coalesce ordinary saves. The Client already
                             // fenced their protected scopes; preserve the user's current route.
                             view.invalidate_workspace_capability_projections();
-                            view.administration = Default::default();
                             view.gateway.capability_snapshot = None;
                             view.refresh_current_principal(cx);
                         }
@@ -453,9 +455,9 @@ impl PioneerDesktop {
         self.clear_authorization_epoch_cache();
         self.gateway.current_auth = None;
         self.gateway.capability_snapshot = None;
-        self.administration.clear_for_session_termination();
+
         self.member_avatar_state.clear();
-        self.member_workspaces_saving = false;
+
         self.gateway.ws_connection_id = None;
         self.gateway.connection_state = GatewayConnectionState::Disconnected;
         self.gateway.error = Some(desktop_session_terminal_message(reason));

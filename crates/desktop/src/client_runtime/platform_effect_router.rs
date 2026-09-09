@@ -61,6 +61,8 @@ impl DesktopSessionStorageAdapter {
                     let batch = core.wait_for_publications(sequence);
                     sequence = batch.sequence;
                     for plan in batch.effects {
+                        if !matches!(plan.effect(), ClientPlannedEffect::GatewaySessionStorage(_)) { continue; }
+
                         if core.is_stopped() {
                             break;
                         }

@@ -41,6 +41,14 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 #[cfg(any(feature = "schema", test))]
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
+        schema_doc!("provider_collection_publication.json", crate::providers::store::ProviderCollectionPublication),
+        schema_doc!("provider_operation_publication.json", crate::providers::operations::ProviderOperationPublication),
+        schema_doc!("administration_page_publication.json", crate::administration::pages::AdministrationPagePublication),
+        schema_doc!("administration_operation_publication.json", crate::administration::operations::AdministrationOperationPublication),
+        schema_doc!(
+            "provider_runtime_publication.json",
+            crate::providers::runtime::ProviderRuntimePublication
+        ),
         schema_doc!(
             "artifact_publication.json",
             crate::artifacts::store::ArtifactPublication

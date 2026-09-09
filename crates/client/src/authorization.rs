@@ -555,7 +555,6 @@ pub fn apply_access_changed_to_client_state(
         return plan;
     }
 
-    state.administration.apply_access_changed(notification);
     state.gateway.authorization_revision = Some(plan.authorization_revision);
     if plan.change == AccessChangeKind::WorkspaceMembership
         && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked
@@ -581,11 +580,6 @@ pub fn apply_access_changed_to_client_state(
     let workspace_wide = plan.change == AccessChangeKind::WorkspaceMembership;
     let workspace_access_lost =
         workspace_wide && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
-    if workspace_wide && active_workspace_id.as_deref() == Some(plan.workspace_id.as_str()) {
-        // Provider paths, diagnostics, and readiness are protected workspace
-        // projections. Clear them before the asynchronous current-ACL reload.
-        state.providers.clear_for_workspace_switch();
-    }
     state
         .threads
         .coordinators
@@ -672,7 +666,6 @@ pub fn apply_access_changed_to_client_state(
         .retain(|thread_id| !invalidated_thread_ids.contains(thread_id.as_str()));
 
     if plan.clear_workspace_capability_projections {
-        state.providers.clear_for_workspace_switch();
         state.mcp = Default::default();
         state.skills = Default::default();
         state.threads.start = ThreadStartCoordinator::default();
@@ -686,7 +679,6 @@ pub fn apply_access_changed_to_client_state(
 
 pub fn clear_authorization_revision_for_endpoint_change(state: &mut ClientState) {
     state.gateway.authorization_revision = None;
-    state.administration.clear_for_session_termination();
 }
 
 #[cfg(test)]
@@ -1228,7 +1220,6 @@ mod tests {
         ]);
         state.gateway.ws_connection_id = Some(17);
         state.gateway.bootstrap_complete = true;
-        state.providers.insert_configured("openai".to_owned());
         state
             .semantic_timelines
             .thread_mut("thread_allowed".to_owned());
@@ -1265,7 +1256,6 @@ mod tests {
         assert_eq!(state.gateway.authorization_revision, Some(7));
         assert_eq!(state.gateway.ws_connection_id, Some(17));
         assert!(state.gateway.bootstrap_complete);
-        assert!(state.providers.configured_names().is_empty());
         assert_eq!(state.workspaces.workspaces, vec![workspace("ws_allowed")]);
         assert!(state.workspaces.preferred_workspace_id.is_none());
         assert!(state.threads.active_thread_id.is_none());
