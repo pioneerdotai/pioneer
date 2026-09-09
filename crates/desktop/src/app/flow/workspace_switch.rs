@@ -5,19 +5,7 @@ impl PioneerDesktop {
         &mut self,
         cx: &mut Context<Self>,
     ) {
-        match self.main_content_view() {
-            MainContentView::Skills | MainContentView::SkillDetails => {
-                self.queue_skills_refresh();
-                self.refresh_installed_skills(cx);
-            }
-            MainContentView::Mcp | MainContentView::McpDetails => {
-                self.queue_mcp_refresh();
-                self.refresh_mcp_servers(cx);
-                if self.navigation_input.mcp_server_id().is_some() {
-                    self.queue_mcp_details_refresh();
-                }
-            }
-            _ => {}
-        }
+        // Feature bindings reacquire demand from the Client workspace publication.
+        let _ = cx;
     }
 }

@@ -666,8 +666,6 @@ pub fn apply_access_changed_to_client_state(
         .retain(|thread_id| !invalidated_thread_ids.contains(thread_id.as_str()));
 
     if plan.clear_workspace_capability_projections {
-        state.mcp = Default::default();
-        state.skills = Default::default();
         state.threads.start = ThreadStartCoordinator::default();
         state.threads.start_requested = false;
         state.threads.ready_turn_resume_threads.clear();

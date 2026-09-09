@@ -477,27 +477,15 @@ impl ClientRuntimePostEventSink for DesktopPostEventSink<'_, '_> {
     }
 
     fn refresh_skills_if_requested(&mut self) -> bool {
-        if !self.app.take_skills_refresh_request() {
-            return false;
-        }
-        self.app.refresh_installed_skills(self.cx);
-        true
+        false
     }
 
     fn refresh_mcp_if_requested(&mut self) -> bool {
-        if !self.app.take_mcp_refresh_request() {
-            return false;
-        }
-        self.app.refresh_mcp_servers(self.cx);
-        true
+        false
     }
 
     fn refresh_mcp_details_if_requested(&mut self) -> bool {
-        if !self.app.take_mcp_details_refresh_request() {
-            return false;
-        }
-        self.app.refresh_mcp_server_details(self.cx);
-        true
+        false
     }
 
     fn drive_thread_start_queue(&mut self) -> bool {

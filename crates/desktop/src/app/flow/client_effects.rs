@@ -41,7 +41,13 @@ impl ClientEffectSink for DesktopClientEffectSink<'_, '_> {
     }
 
     fn queue_skills_refresh(&mut self) {
-        self.app.queue_skills_refresh();
+        if let Some(workspace) = self.app.active_workspace_id() {
+            self.app
+                .gateway
+                .client_runtime
+                .client_core()
+                .refresh_skills(workspace);
+        }
     }
 
     fn enqueue_in_flight_turns_for_resume(&mut self) {

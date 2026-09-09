@@ -77,6 +77,55 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
     use ClientContractStability as Stability;
 
     let mut contracts = vec![
+        contract_type!(
+            "mcp_catalog_publication.json",
+            crate::mcp::store::McpCatalogPublication,
+            Domain::Mcp,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_details_publication.json",
+            crate::mcp::store::McpDetailsPublication,
+            Domain::Mcp,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "mcp_action_publication.json",
+            crate::mcp::operations::McpActionPublication,
+            Domain::Mcp,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skills_catalog_publication.json",
+            crate::skills::store::SkillsCatalogPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skills_details_publication.json",
+            crate::skills::store::SkillsDetailsPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skills_action_publication.json",
+            crate::skills::operations::SkillsActionPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "skill_upload_publication.json",
+            crate::skills::upload_flow::SkillUploadPublication,
+            Domain::Skills,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
         contract_type!("provider_collection_publication.json", crate::providers::store::ProviderCollectionPublication, Domain::Providers, Kind::Snapshot, Stability::Provisional),
         contract_type!("provider_operation_publication.json", crate::providers::operations::ProviderOperationPublication, Domain::Providers, Kind::Snapshot, Stability::Provisional),
         contract_type!("administration_page_publication.json", crate::administration::pages::AdministrationPagePublication, Domain::Root, Kind::Snapshot, Stability::Provisional),

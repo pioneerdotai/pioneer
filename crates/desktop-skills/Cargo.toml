@@ -1,0 +1,17 @@
+[package]
+name = "pioneer-desktop-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["component"] }
+pioneer-client.workspace = true
+pioneer-desktop-foundation.workspace = true
+rust-i18n.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+pioneer-client = { workspace = true, features = ["test-support"] }

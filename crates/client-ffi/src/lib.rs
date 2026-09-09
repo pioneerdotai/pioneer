@@ -402,6 +402,13 @@ impl ClientFfiRuntime {
                     | ClientScope::ThreadCapability { .. }
                     | ClientScope::ThreadMember { .. }
                     | ClientScope::Artifact { .. }
+                    | ClientScope::Mcp { .. }
+                    | ClientScope::McpDetails { .. }
+                    | ClientScope::McpAction { .. }
+                    | ClientScope::Skills { .. }
+                    | ClientScope::SkillsDetails { .. }
+                    | ClientScope::SkillsAction { .. }
+                    | ClientScope::SkillsUpload { .. }
             ) =>
             {
                 Some(scope.clone())
@@ -5586,3 +5593,6 @@ mod workspace_publication_tests;
 
 #[cfg(test)]
 mod provider_runtime_tests;
+
+#[cfg(test)]
+mod catalog_binding_tests;

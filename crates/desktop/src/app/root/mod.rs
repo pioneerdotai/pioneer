@@ -14,7 +14,6 @@ use crate::{
         invitation_join::DesktopInvitationJoinState,
         member_avatars::DesktopMemberAvatarState,
         settings::ProfileEditorState,
-        skills::details::table::SkillDiagnosticsTableDelegate,
         startup::DesktopStartupCoordinator,
         thread::ThreadCoordinator,
     },
@@ -28,10 +27,7 @@ use crate::{
     components::member_picker::MemberPickerDelegate,
     gateway::{ClientRuntime, DesktopGatewayHttpClient, GatewayRuntime, GatewayWsCommandSender},
 };
-use gpui_kit::component::{
-    VirtualListScrollHandle, combobox::ComboboxState, input::TextareaState, table::TableState,
-    tree::TreeState,
-};
+use gpui_kit::component::{combobox::ComboboxState, input::TextareaState, tree::TreeState};
 use gpui_kit::{prelude::*, *};
 pub(super) use pioneer_client::{
     agents_doc::scope::{
@@ -53,7 +49,6 @@ pub(super) use pioneer_client::{
     gateway::runtime::GatewaySetupAction,
     providers::presentation::ProviderModelDisplayKey,
     providers::selectors::ProviderFilter,
-    skills::{catalog::SkillManagementProjection, upload::SkillUploadProgress},
     state::client_state::{GatewayConnectionState, GatewayStatusLevel},
     threads::scope::ThreadScopePendingAction,
     threads::start::ThreadStartCoordinator,
@@ -72,7 +67,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
 };
 use terminal::TerminalView;
 
@@ -213,34 +208,9 @@ pub(crate) struct LegacyScreenAdapter {
         Arc<pioneer_client::workspaces::catalog::WorkspaceCatalogPublication>,
     pub(super) providers_view: Entity<pioneer_desktop_providers::ProviderCatalogView>,
     _providers_layout_subscription: Subscription,
-    pub(super) mcp_servers: Vec<McpListItem>,
-    pub(super) mcp_server_details: Option<McpServerDetailsResponse>,
-    pub(super) mcp_loading: bool,
-    pub(super) mcp_details_loading: bool,
-    pub(super) mcp_error: Option<String>,
-    pub(super) mcp_refresh_requested: bool,
-    pub(super) mcp_details_refresh_requested: bool,
-    pub(super) mcp_poller: Option<gpui_kit::Task<()>>,
-    pub(super) mcp_pending_actions: HashSet<String>,
-    pub(super) mcp_list_scroll_handle: VirtualListScrollHandle,
-    pub(super) mcp_details_expanded_sections: HashSet<String>,
-    pub(super) mcp_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
-    pub(super) installed_skills: Vec<SkillListItem>,
-    pub(super) skills_catalog: Vec<SkillListItem>,
-    pub(super) skills_management: SkillManagementProjection,
-    pub(super) skills_expanded_pack_ids: HashSet<SkillPackId>,
-    pub(super) skills_pending_pack_actions: HashSet<SkillPackId>,
-    pub(super) skills_health_details: HashMap<SkillId, SkillHealthItem>,
-    pub(super) skills_loading: bool,
-    pub(super) skills_error: Option<String>,
-    pub(super) skills_upload_progress: Option<SkillUploadProgress>,
-    pub(super) skills_upload_cancel_token: Option<Arc<AtomicBool>>,
-    pub(super) skills_refresh_requested: bool,
-    pub(super) skills_poller: Option<gpui_kit::Task<()>>,
-    pub(super) skills_pending_actions: HashSet<SkillId>,
-    pub(super) skills_list_scroll_handle: VirtualListScrollHandle,
-    pub(super) skills_details_expanded_sections: HashSet<String>,
-    pub(super) skills_audit_table_state: Entity<TableState<SkillDiagnosticsTableDelegate>>,
+    pub(super) mcp_view: Entity<pioneer_desktop_mcp::McpCatalogView>,
+    pub(super) skills_view: Entity<pioneer_desktop_skills::SkillsCatalogView>,
+    _catalog_layout_subscription: Subscription,
     pub(super) pending_thread_create_visibility: ThreadVisibility,
     pub(super) gateway_setup_form_state: Entity<GatewaySetupFormState>,
     pub(super) gateway: GatewayCoordinator,

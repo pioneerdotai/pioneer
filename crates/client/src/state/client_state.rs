@@ -2,8 +2,6 @@
 
 use crate::{
     cli_runtime::approvals::PendingRequestState,
-    mcp::list::McpListState,
-    skills::catalog::SkillCatalogState,
     threads::{coordinator::ThreadCoordinator, start::ThreadStartCoordinator},
     timeline::semantic::SemanticTimelineState,
 };
@@ -21,8 +19,6 @@ pub struct ClientState {
     pub workspaces: WorkspacesState,
     pub gateway: GatewayClientState,
     pub pending_requests: PendingRequestState,
-    pub mcp: McpState,
-    pub skills: SkillsState,
     pub semantic_timelines: SemanticTimelineState,
     pub settings: SettingsState,
 }
@@ -69,10 +65,6 @@ pub struct GatewayClientState {
     pub settings_loading: bool,
     pub settings_error: Option<String>,
 }
-
-pub type McpState = McpListState;
-
-pub type SkillsState = SkillCatalogState;
 
 #[derive(Default)]
 pub struct SettingsState {

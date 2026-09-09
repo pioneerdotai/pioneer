@@ -103,3 +103,6 @@ pub mod voice;
 pub mod workspaces;
 
 pub use error::{ClientError, ClientResult};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod catalog_test_support;

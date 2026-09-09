@@ -789,47 +789,66 @@ impl ClientCore {
                     if !core.catalog_work_current(&work) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
-                    drop(core);
+                    let current = || {
+                        weak.upgrade()
+                            .is_some_and(|core| core.catalog_work_current(&work))
+                    };
                     let result = match &work.kind {
-                        ComposerCatalogKind::Skills => sender
-                            .skills_list(crate::skills::catalog::skill_list_params(
-                                work.workspace.clone(),
-                            ))
-                            .map(|response| {
-                                let split =
-                                    crate::skills::catalog::derive_skills_catalog_and_installed(
-                                        response.skills,
-                                    );
-                                CatalogResult::Skills(
-                                    crate::skills::catalog::project_skill_management(
-                                        &split.installed,
-                                        response.packs,
-                                    ),
-                                )
-                            }),
-                        ComposerCatalogKind::McpServers => sender
-                            .mcp_list(crate::mcp::list::mcp_list_params(work.workspace.clone()))
-                            .map(|response| {
+                        ComposerCatalogKind::Skills => {
+                            let read = core.read_skills_catalog(&work.workspace);
+                            drop(core);
+                            read.wait_while(current).and_then(|p| {
+                                anyhow::ensure!(
+                                    p.request == crate::skills::store::SkillsLoadState::Ready,
+                                    "skills_catalog_unavailable"
+                                );
+                                Ok(CatalogResult::Skills((*p.management).clone()))
+                            })
+                        }
+                        ComposerCatalogKind::McpServers => {
+                            let read = core.read_mcp_catalog(&work.workspace);
+                            drop(core);
+                            read.wait_while(current).and_then(|p| {
+                                anyhow::ensure!(
+                                    p.request() == crate::mcp::store::McpLoadState::Ready,
+                                    "mcp_catalog_unavailable"
+                                );
                                 let rows =
                                     capabilities::reduce_composer_mcp_server_picker_rows_response(
-                                        response, "",
+                                        pioneer_protocol::McpListResponse {
+                                            snapshot_version: 0,
+                                            generated_at: 0,
+                                            servers: p
+                                                .servers()
+                                                .iter()
+                                                .map(|s| (**s).clone())
+                                                .collect(),
+                                        },
+                                        "",
                                     );
-                                CatalogResult::Servers(rows.rows, rows.prefetch_server_ids)
-                            }),
-                        ComposerCatalogKind::McpTools { server_id } => sender
-                            .mcp_server_details(crate::mcp::details::mcp_server_details_params(
-                                work.workspace.clone(),
-                                server_id.clone(),
-                            ))
-                            .map(|response| {
-                                CatalogResult::Tools(
+                                Ok(CatalogResult::Servers(rows.rows, rows.prefetch_server_ids))
+                            })
+                        }
+                        ComposerCatalogKind::McpTools { server_id } => {
+                            let read = core.read_mcp_details(&work.workspace, server_id);
+                            drop(core);
+                            read.wait_while(current).and_then(|p| {
+                                anyhow::ensure!(
+                                    p.request() == crate::mcp::store::McpLoadState::Ready,
+                                    "mcp_details_unavailable"
+                                );
+                                let response = p
+                                    .details()
+                                    .ok_or_else(|| anyhow::anyhow!("mcp_details_unavailable"))?;
+                                Ok(CatalogResult::Tools(
                                     capabilities::reduce_composer_mcp_tool_picker_rows_response(
-                                        response, "",
+                                        (**response).clone(),
+                                        "",
                                     )
                                     .rows,
-                                )
-                            }),
+                                ))
+                            })
+                        }
                     }
                     .map_err(|error| format!("{error:#}"));
                     let Some(core) = weak.upgrade() else {

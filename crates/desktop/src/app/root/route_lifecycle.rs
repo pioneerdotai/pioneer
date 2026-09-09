@@ -28,6 +28,10 @@ impl LegacyScreenAdapter {
 
     pub(crate) fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.window_active = active;
+        self.mcp_view
+            .update(cx, |view, cx| view.set_window_active(active, cx));
+        self.skills_view
+            .update(cx, |view, cx| view.set_window_active(active, cx));
         self.providers_view.update(cx, |view, cx| view.set_window_active(active, cx));
         self.administration_view.update(cx, |view, cx| view.set_window_active(active, cx));
         self.reconcile_route_activity(cx);
@@ -37,22 +41,6 @@ impl LegacyScreenAdapter {
             .navigation
             .activity(self.main_content_view(), self.window_active);
         let active = activity == crate::desktop_navigation::RouteActivity::Active;
-        match self.main_content_view() {
-            MainContentView::Mcp | MainContentView::McpDetails if active => {
-                self.ensure_mcp_poller(cx)
-            }
-            _ => {
-                self.mcp_poller.take();
-            }
-        }
-        match self.main_content_view() {
-            MainContentView::Skills | MainContentView::SkillDetails if active => {
-                self.ensure_skills_poller(cx)
-            }
-            _ => {
-                self.skills_poller.take();
-            }
-        }
         if active
             && self.main_content_view() == MainContentView::Settings
             && self.settings_content_view() == SettingsContentView::SelfImprovement
@@ -65,17 +53,16 @@ impl LegacyScreenAdapter {
 
     pub(crate) fn close_route_bindings(&mut self, cx: &mut Context<Self>) {
         self.member_avatar_state.close();
-        self.mcp_poller.take();
-        self.skills_poller.take();
+        self.mcp_view
+            .update(cx, |view, cx| view.set_window_active(false, cx));
+        self.skills_view
+            .update(cx, |view, cx| view.set_window_active(false, cx));
         self.self_improvement_status_poll.take();
         self.gateway.compatibility_task.take();
         self.gateway.settings_task.take();
         self.gateway.identity_task.take();
         self.gateway.session_task.take();
         self.gateway.transport_verification_task.take();
-        if let Some(cancel) = self.skills_upload_cancel_token.take() {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         self.invitation_join_input_subscriptions.clear();
         self.profile_editor_input_subscriptions.clear();
     }

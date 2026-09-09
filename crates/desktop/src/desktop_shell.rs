@@ -795,24 +795,16 @@ mod tests {
         let updater = include_str!("../../desktop-update/src/view.rs");
         assert!(!updater.contains("SidebarChanged"));
         assert!(!updater.contains("DesktopShellView"));
-        let mcp = include_str!("app/mcp/lifecycle.rs");
-        let details = mcp
-            .split("fn apply_mcp_details_refresh_success_reduction(")
-            .nth(1)
-            .unwrap()
-            .split("fn apply_mcp_details_refresh_failure_reduction(")
-            .next()
-            .unwrap();
-        assert_eq!(
-            details
-                .matches("cx.emit(crate::app::SidebarChanged)")
-                .count(),
-            1
-        );
-        for poller in [mcp, include_str!("app/skills/lifecycle.rs")] {
-            let ensure = poller.split("fn ensure_").last().unwrap();
-            assert!(ensure.contains("RouteActivity::Active"));
+        let mcp = include_str!("../../desktop-mcp/src/catalog.rs");
+        let skills = include_str!("../../desktop-skills/src/catalog.rs");
+        for feature in [mcp, skills] {
+            assert!(feature.contains("self.window_active"));
+            assert!(feature.contains("self.visible()"));
+            assert!(feature.contains("same_sidebar"));
+            assert!(!feature.contains("SidebarChanged"));
         }
+        assert!(mcp.contains("acquire_mcp_demand"));
+        assert!(skills.contains("acquire_skills_demand"));
         let teardown = include_str!("app/root/route_lifecycle.rs")
             .split("fn close_route_bindings(")
             .nth(1)
@@ -858,7 +850,7 @@ mod tests {
         }
         assert_eq!(owner.matches("struct LegacyScreenAdapter").count(), 1);
         let lifecycle = include_str!("app/root/route_lifecycle.rs");
-        for release in ["mcp_poller.take()", "skills_poller.take()"] {
+        for release in ["self.mcp_view.update", "self.skills_view.update"] {
             assert!(lifecycle.contains(release), "{release}");
         }
         let old_frame = include_str!("app/root/view.rs");

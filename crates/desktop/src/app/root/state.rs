@@ -1,5 +1,4 @@
 use super::*;
-use crate::app::skills::details::table::SkillDiagnosticsTableDelegate;
 use crate::components::member_picker::{MemberPickerDelegate, new_member_picker_state};
 use crate::state;
 use gpui_kit::component::table::TableState;
@@ -25,32 +24,6 @@ impl PioneerDesktop {
             )
         });
         let settings_tree_state = cx.new(|cx| TreeState::new(cx));
-        let skills_audit_table_state = cx.new(|cx| {
-            TableState::new(
-                SkillDiagnosticsTableDelegate::new("skills-audit-table"),
-                window,
-                cx,
-            )
-            .row_selectable(false)
-            .col_selectable(false)
-            .sortable(false)
-            .col_movable(false)
-            .col_resizable(false)
-            .loop_selection(false)
-        });
-        let mcp_audit_table_state = cx.new(|cx| {
-            TableState::new(
-                SkillDiagnosticsTableDelegate::new("mcp-audit-table"),
-                window,
-                cx,
-            )
-            .row_selectable(false)
-            .col_selectable(false)
-            .sortable(false)
-            .col_movable(false)
-            .col_resizable(false)
-            .loop_selection(false)
-        });
         crate::client_runtime::DesktopRuntimeCoordinator::install(cx);
         let client_runtime = ClientRuntime::from_core(
             cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
@@ -78,6 +51,38 @@ impl PioneerDesktop {
         let providers_layout_subscription = cx.observe(&shell_state, move |_, layout, cx| {
             let width = if layout.read(cx).sidebar_visible() { layout.read(cx).sidebar_width() } else { px(0.) };
             let _ = provider_layout.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        });
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let mcp_view = pioneer_desktop_mcp::McpCatalogView::new(
+            pioneer_desktop_mcp::McpCatalogConfig::new(
+                client_runtime.client_core().clone(),
+                registrar.clone(),
+            ),
+            window,
+            cx,
+        );
+        let skills_view = pioneer_desktop_skills::SkillsCatalogView::new(
+            pioneer_desktop_skills::SkillsCatalogConfig::new(
+                client_runtime.client_core().clone(),
+                registrar,
+            ),
+            window,
+            cx,
+        );
+        mcp_view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        skills_view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        let mcp_layout = mcp_view.downgrade();
+        let skills_layout = skills_view.downgrade();
+        let catalog_layout_subscription = cx.observe(&shell_state, move |_, layout, cx| {
+            let width = if layout.read(cx).sidebar_visible() {
+                layout.read(cx).sidebar_width()
+            } else {
+                px(0.)
+            };
+            let _ = mcp_layout.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+            let _ = skills_layout.update(cx, |view, cx| view.set_sidebar_width(width, cx));
         });
         let mut view = Self {
             window_active: window.is_window_active(),
@@ -118,34 +123,9 @@ impl PioneerDesktop {
             workspace_catalog_input: Default::default(),
             providers_view,
             _providers_layout_subscription: providers_layout_subscription,
-            mcp_servers: Vec::new(),
-            mcp_server_details: None,
-            mcp_loading: false,
-            mcp_details_loading: false,
-            mcp_error: None,
-            mcp_refresh_requested: false,
-            mcp_details_refresh_requested: false,
-            mcp_poller: None,
-            mcp_pending_actions: HashSet::new(),
-            mcp_list_scroll_handle: VirtualListScrollHandle::new(),
-            mcp_details_expanded_sections: HashSet::new(),
-            mcp_audit_table_state,
-            installed_skills: Vec::new(),
-            skills_catalog: Vec::new(),
-            skills_management: SkillManagementProjection::default(),
-            skills_expanded_pack_ids: HashSet::new(),
-            skills_pending_pack_actions: HashSet::new(),
-            skills_health_details: HashMap::new(),
-            skills_loading: false,
-            skills_error: None,
-            skills_upload_progress: None,
-            skills_upload_cancel_token: None,
-            skills_refresh_requested: false,
-            skills_poller: None,
-            skills_pending_actions: HashSet::new(),
-            skills_list_scroll_handle: VirtualListScrollHandle::new(),
-            skills_details_expanded_sections: HashSet::new(),
-            skills_audit_table_state,
+            mcp_view,
+            skills_view,
+            _catalog_layout_subscription: catalog_layout_subscription,
             pending_thread_create_visibility: ThreadVisibility::Private,
             gateway_setup_form_state,
             gateway: GatewayCoordinator {

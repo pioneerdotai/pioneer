@@ -6,8 +6,8 @@ use pioneer_client::authorization::AccessChangedPlan;
 use pioneer_client::authorization::{ThreadAuthorizationScope, plan_access_changed};
 use pioneer_client::notifications::router::{
     ArtifactDeletedRefreshReduction, ArtifactThreadRefreshReduction,
-    SkillsRefreshReduction, ThreadArtifactsRefreshReduction, WorkspacePreferenceReduction,
-    WorkspaceRefreshReduction, apply_workspace_changed_to_catalog,
+    ThreadArtifactsRefreshReduction, WorkspacePreferenceReduction, WorkspaceRefreshReduction,
+    apply_workspace_changed_to_catalog,
 };
 use pioneer_client::runtime::{ClientRuntimeNotification, ClientRuntimeNotificationContext};
 use pioneer_client::workspaces::selectors as workspace_selectors;
@@ -27,7 +27,6 @@ impl PioneerDesktop {
             return;
         }
         let active_workspace = self.active_workspace_scope_for_notifications();
-        let mcp_workspace = self.mcp_workspace_scope();
         let notification_thread_workspace_matches =
             self.notification_thread_workspace_matches(&notification);
         let start = self.thread_start_coordinator();
@@ -47,9 +46,9 @@ impl PioneerDesktop {
                 .map_or(&[], |input| input.items.as_slice()),
             preferred_workspace_id: self.preferred_workspace_id(),
             workspaces: self.workspaces(),
-            mcp_workspace_id: mcp_workspace.as_deref(),
-            mcp_selected_server_id: self.navigation_input.mcp_server_id(),
-            mcp_details_loaded: self.mcp_server_details.is_some(),
+            mcp_workspace_id: None,
+            mcp_selected_server_id: None,
+            mcp_details_loaded: false,
         };
         let reduction = self
             .gateway
@@ -97,18 +96,11 @@ impl PioneerDesktop {
             ClientRuntimeNotification::WorkspaceRefresh(_) => {}
             ClientRuntimeNotification::ThreadUpdated(_) => {}
             ClientRuntimeNotification::ThreadParticipantsChanged(_) => {}
-            ClientRuntimeNotification::SkillsRefresh(reduction) => {
-                self.apply_skills_refresh_reduction(reduction);
-            }
-            ClientRuntimeNotification::McpRefresh(reduction) => {
-                self.apply_mcp_refresh_reduction(reduction);
-            }
-            ClientRuntimeNotification::McpServerStatusChanged(reduction) => {
-                self.apply_mcp_server_status_changed_reduction(reduction, cx);
-            }
-            ClientRuntimeNotification::McpServerCatalogChanged(reduction) => {
-                self.apply_mcp_server_catalog_changed_reduction(reduction, cx);
-            }
+            ClientRuntimeNotification::SkillsRefresh(_)
+            | ClientRuntimeNotification::McpRefresh(_)
+            | ClientRuntimeNotification::McpServerStatusChanged(_)
+            | ClientRuntimeNotification::McpServerCatalogChanged(_) => {}
+
             ClientRuntimeNotification::ThreadArtifactsRefresh(_)
             | ClientRuntimeNotification::ArtifactThreadRefresh(_)
             | ClientRuntimeNotification::ArtifactDeletedRefresh(_) => {}
@@ -229,12 +221,6 @@ impl PioneerDesktop {
         self.refresh_current_principal(cx);
 
         cx.notify();
-    }
-
-    fn apply_skills_refresh_reduction(&mut self, reduction: SkillsRefreshReduction) {
-        if reduction.queue_skills_refresh {
-            self.queue_skills_refresh();
-        }
     }
 
     fn active_workspace_scope_for_notifications(&self) -> Option<String> {
@@ -487,8 +473,6 @@ mod access_change_tests {
         let mutations_source = include_str!("../root/mutations.rs");
         for required in [
             "self.providers.clear_for_workspace_switch()",
-            "self.mcp_servers.clear()",
-            "self.installed_skills.clear()",
             "self.composer_domain().capabilities.clear()",
             "self.composer_domain().skill_selections.clear()",
         ] {

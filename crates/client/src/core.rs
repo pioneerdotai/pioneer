@@ -197,6 +197,26 @@ pub enum ClientScope {
     Mcp {
         workspace_id: Option<String>,
     },
+    SkillsDetails {
+        workspace_id: String,
+        skill_id: pioneer_protocol::SkillId,
+    },
+    McpAction {
+        workspace_id: String,
+        target: String,
+    },
+    SkillsAction {
+        workspace_id: String,
+        target: String,
+    },
+    SkillsUpload {
+        workspace_id: String,
+        operation_id: u64,
+    },
+    McpDetails {
+        workspace_id: String,
+        server_id: String,
+    },
     Skills {
         workspace_id: Option<String>,
     },
@@ -792,6 +812,10 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
+    pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
+    pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
+    pub(crate) mcp_store: Mutex<crate::mcp::store::McpStore>,
     pub(crate) administration_operations: Mutex<crate::administration::operations::AdministrationOperationController>,
     pub(crate) administration_store: Mutex<crate::administration::pages::AdministrationStore>,
     pub(crate) provider_controller: Mutex<crate::providers::operations::ProviderController>,
@@ -974,6 +998,10 @@ impl Default for ClientCore {
 impl ClientCore {
     pub fn new() -> Self {
         Self {
+            skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
+            skills_store: Mutex::new(crate::skills::store::SkillsStore::default()),
+            mcp_controller: Mutex::new(crate::mcp::operations::McpController::default()),
+            mcp_store: Mutex::default(),
             administration_operations: Mutex::default(),
             administration_store: Mutex::default(),
             provider_controller: Mutex::default(),
@@ -1266,6 +1294,19 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.skills_controller
+            .lock()
+            .expect("Skills controller poisoned")
+            .stop();
+        self.skills_store
+            .lock()
+            .expect("Skills store poisoned")
+            .stop();
+        self.mcp_controller
+            .lock()
+            .expect("MCP controller poisoned")
+            .stop();
+        self.mcp_store.lock().expect("MCP store poisoned").stop();
         self.administration_operations.lock().expect("administration operations poisoned").stop();
         self.administration_store.lock().expect("administration store poisoned").stop();
         self.provider_controller.lock().expect("provider controller poisoned").stop();
@@ -1406,6 +1447,15 @@ impl ClientCore {
         let _ = self.compatibility_runtime.ws_command_sender().shutdown();
     }
 
+    pub(crate) fn current_scope_demand(&self, scope: &ClientScope) -> Option<ClientDemand> {
+        self.partitions
+            .lock()
+            .expect("client partitions poisoned")
+            .demands
+            .get(scope)
+            .map(|state| state.demand)
+    }
+
     /// The single ingress dispatcher. Owned routes publish here; only unported
     /// feature routes cross the non-owning compatibility boundary.
     pub(crate) fn route_gateway_event(
@@ -1424,6 +1474,14 @@ impl ClientCore {
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);
+            if self.observe_mcp_notification(notification) {
+                return None;
+            }
+            if let pioneer_protocol::GatewayNotification::SkillsChanged(notification) = notification
+            {
+                self.refresh_skills(&notification.workspace_id);
+                return None;
+            }
             self.observe_composer_voice_notification(notification);
             self.observe_composer_voice_readiness_notification(notification);
             self.observe_artifact_notification(notification);
@@ -1466,12 +1524,11 @@ impl ClientCore {
                     self.observe_task_notification(notification);
                 }
             }
+            GatewayEventRoute::Mcp | GatewayEventRoute::Skills => {}
             GatewayEventRoute::Administration
             | GatewayEventRoute::Workspace
             | GatewayEventRoute::Memory
             | GatewayEventRoute::Provider
-            | GatewayEventRoute::Mcp
-            | GatewayEventRoute::Skills
             | GatewayEventRoute::Unknown => return Some(route),
         }
         None
@@ -1484,6 +1541,10 @@ impl ClientCore {
         core.start_administration_controller();
         core.start_provider_runtime_controller();
         core.start_provider_controller();
+        core.start_mcp_controller();
+        core.start_mcp_operation_controller();
+        core.start_skills_controller();
+        core.start_skills_operation_controller();
         core.start_provider_operation_controller();
         core.start_provider_credential_controller();
         core.start_task_notification_controller();
@@ -1913,6 +1974,8 @@ impl ClientCore {
             self.message_revision_demand_changed(&thread_scope, thread_demand);
             self.message_deletion_demand_changed(&thread_scope, thread_demand);
             self.composer_catalog_demand_changed(&thread_scope, thread_demand);
+            self.mcp_binding_demand_changed(&thread_scope, thread_demand);
+            self.skills_binding_demand_changed(&thread_scope, thread_demand);
             self.composer_model_picker_demand_changed(&thread_scope, thread_demand);
             self.turn_cancellation_demand_changed(&thread_scope, thread_demand);
             self.thread_capability_demand_changed(&thread_scope, thread_demand);
@@ -2331,6 +2394,10 @@ impl ClientCore {
             self.invalidate_administration();
             self.invalidate_provider_runtimes();
             self.invalidate_provider_collections();
+            self.invalidate_mcp();
+            self.invalidate_mcp_operations();
+            self.invalidate_skills();
+            self.invalidate_skills_operations();
             self.invalidate_provider_operations();
             self.cancel_artifact_downloads(None);
             self.cancel_composer_requests();

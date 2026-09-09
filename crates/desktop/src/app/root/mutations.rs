@@ -354,22 +354,6 @@ impl PioneerDesktop {
         self.reset_thread_start_state();
         self.clear_thread_start_queue();
         self.clear_turn_resume_queue();
-        self.mcp_servers.clear();
-        self.mcp_server_details = None;
-        self.mcp_loading = false;
-        self.mcp_details_loading = false;
-        self.mcp_error = None;
-        self.mcp_refresh_requested = false;
-        self.mcp_details_refresh_requested = false;
-        self.mcp_pending_actions.clear();
-        self.installed_skills.clear();
-        self.skills_catalog.clear();
-        self.skills_management = Default::default();
-        self.skills_health_details.clear();
-        self.skills_loading = false;
-        self.skills_error = None;
-        self.skills_refresh_requested = false;
-        self.skills_pending_actions.clear();
     }
 
     /// Clears every server-authorized projection before a connection begins a

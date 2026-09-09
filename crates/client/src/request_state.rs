@@ -1,5 +1,7 @@
 //! Generation-safe request lifecycle shared by client capabilities.
 
+pub(crate) mod poll;
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::ClientGeneration;

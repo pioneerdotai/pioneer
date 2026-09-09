@@ -178,11 +178,15 @@ impl PioneerDesktop {
         match route {
             MainContentView::Settings => self.render_settings_sidebar(cx),
             MainContentView::Providers => self.providers_view.read(cx).sidebar().into_any_element(),
-            MainContentView::Administration => self.administration_view.read(cx).sidebar().into_any_element(),
-            MainContentView::McpDetails => self.render_mcp_details_sidebar(cx),
-            MainContentView::Mcp => self.render_mcp_sidebar(cx),
-            MainContentView::SkillDetails => self.render_skill_details_sidebar(cx),
-            MainContentView::Skills => self.render_skills_sidebar(cx),
+            MainContentView::Administration => self
+                .administration_view
+                .read(cx)
+                .sidebar()
+                .into_any_element(),
+            MainContentView::McpDetails => self.mcp_view.read(cx).sidebar().into_any_element(),
+            MainContentView::Mcp => self.mcp_view.read(cx).sidebar().into_any_element(),
+            MainContentView::SkillDetails => self.skills_view.read(cx).sidebar().into_any_element(),
+            MainContentView::Skills => self.skills_view.read(cx).sidebar().into_any_element(),
             MainContentView::Threads | MainContentView::AgentsDoc => div().into_any_element(),
         }
     }
@@ -200,10 +204,10 @@ impl Render for PioneerDesktop {
             MainContentView::AgentsDoc => self.render_agents_doc_editor(cx),
             MainContentView::Providers => self.providers_view.clone().into_any_element(),
             MainContentView::Administration => self.administration_view.clone().into_any_element(),
-            MainContentView::Mcp => self.render_mcp(window, cx),
-            MainContentView::McpDetails => self.render_mcp_details(window, cx),
-            MainContentView::Skills => self.render_skills(window, cx),
-            MainContentView::SkillDetails => self.render_skill_details(window, cx),
+            MainContentView::Mcp => self.mcp_view.clone().into_any_element(),
+            MainContentView::McpDetails => self.mcp_view.clone().into_any_element(),
+            MainContentView::Skills => self.skills_view.clone().into_any_element(),
+            MainContentView::SkillDetails => self.skills_view.clone().into_any_element(),
             MainContentView::Settings => self.render_settings(window, cx),
         }
     }
