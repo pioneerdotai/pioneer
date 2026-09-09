@@ -449,6 +449,15 @@ struct SerializedClientPayload {
     encode: Option<Box<dyn Fn() -> serde_json::Value + Send + Sync>>,
 }
 impl SerializedClientPayload {
+    fn deferred<T: Serialize + Send + Sync + 'static>(payload: Arc<T>) -> Self {
+        Self {
+            value: std::sync::OnceLock::new(),
+            encode: Some(Box::new(move || {
+                serde_json::to_value(payload.as_ref())
+                    .expect("Client publication payloads must be serializable")
+            })),
+        }
+    }
     fn eager(value: serde_json::Value) -> Self {
         Self {
             value: std::sync::OnceLock::from(Arc::new(value)),
@@ -579,6 +588,64 @@ pub struct ClientChangeSet {
     predecessor: Option<ClientChangeSequence>,
     publications: Arc<[ClientPublicationReference]>,
     timeline_changes: Arc<[crate::timeline::presentation::TimelineChangeSet]>,
+}
+
+/// Catch-up metadata must not keep obsolete full histories alive. Current
+/// snapshots and in-flight deliveries own payloads; an expired reference is a
+/// delivery gap, handled by the same coherent resnapshot as journal overflow.
+struct JournalChangeSet {
+    sequence: ClientChangeSequence,
+    predecessor: Option<ClientChangeSequence>,
+    publications: Vec<JournalPublication>,
+    timeline_changes: Arc<[crate::timeline::presentation::TimelineChangeSet]>,
+}
+
+struct JournalPublication {
+    snapshot: Weak<ClientSnapshot>,
+    timeline_change: Option<Arc<crate::timeline::presentation::TimelineChangeSet>>,
+}
+
+impl JournalChangeSet {
+    fn new(change: &ClientChangeSet) -> Self {
+        Self {
+            sequence: change.sequence,
+            predecessor: change.predecessor,
+            publications: change
+                .publications
+                .iter()
+                .map(|reference| JournalPublication {
+                    snapshot: Arc::downgrade(&reference.0),
+                    timeline_change: reference.1.clone(),
+                })
+                .collect(),
+            timeline_changes: change.timeline_changes.clone(),
+        }
+    }
+
+    fn is_obsolete(&self) -> bool {
+        self.publications
+            .iter()
+            .any(|publication| publication.snapshot.strong_count() == 0)
+    }
+
+    fn upgrade(&self) -> Option<Arc<ClientChangeSet>> {
+        let publications = self
+            .publications
+            .iter()
+            .map(|publication| {
+                Some(ClientPublicationReference(
+                    publication.snapshot.upgrade()?,
+                    publication.timeline_change.clone(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Arc::new(ClientChangeSet {
+            sequence: self.sequence,
+            predecessor: self.predecessor,
+            publications: Arc::from(publications),
+            timeline_changes: self.timeline_changes.clone(),
+        }))
+    }
 }
 
 impl ClientChangeSet {
@@ -777,7 +844,22 @@ struct ClientPartitions {
     publications: HashMap<ClientScope, Arc<ClientSnapshot>>,
     demands: HashMap<ClientScope, DemandState>,
     operations: HashMap<ClientOperationId, OperationState>,
-    change_journal: VecDeque<Arc<ClientChangeSet>>,
+    change_journal: VecDeque<JournalChangeSet>,
+}
+
+impl ClientPartitions {
+    fn prune_change_journal(&mut self) {
+        // Deltas in an unusable prefix are obsolete too. Check on both commit
+        // and polling, so draining the final delivery also releases old rows
+        // when the application becomes idle.
+        if let Some(index) = self
+            .change_journal
+            .iter()
+            .rposition(JournalChangeSet::is_obsolete)
+        {
+            self.change_journal.drain(..=index);
+        }
+    }
 }
 
 /// Ordered process delivery. A resnapshot contains one coherent set of the
@@ -886,12 +968,15 @@ pub struct ClientMutationAuthority {
     pub(crate) _private: (),
 }
 
+type PayloadEquality = fn(&(dyn Any + Send + Sync), &(dyn Any + Send + Sync)) -> bool;
+
 pub struct ClientPublicationDraft {
     timeline_change: Option<crate::timeline::presentation::TimelineChangeSet>,
     scope: ClientScope,
     revisions: ClientRevisions,
     payload: Arc<dyn Any + Send + Sync>,
     serialized_payload: Arc<SerializedClientPayload>,
+    payload_eq: Option<PayloadEquality>,
 }
 
 impl ClientPublicationDraft {
@@ -929,6 +1014,7 @@ impl ClientMutationAuthority {
     ) -> ClientPublicationDraft {
         let payload = snapshot.clone();
         ClientPublicationDraft {
+            payload_eq: None,
             timeline_change: None,
             scope: ClientScope::Timeline {
                 thread_id: snapshot.thread_id().to_owned(),
@@ -956,11 +1042,37 @@ impl ClientMutationAuthority {
         let serialized_payload = serde_json::to_value(payload.as_ref())
             .expect("Client publication payloads must be serializable");
         ClientPublicationDraft {
+            payload_eq: None,
             timeline_change: None,
             scope,
             revisions,
             payload,
             serialized_payload: Arc::new(SerializedClientPayload::eager(serialized_payload)),
+        }
+    }
+
+    /// Typed sources can compare their contents without allocating JSON copies.
+    /// Encode only when a boundary consumer actually requests serialized data.
+    pub(crate) fn typed_publication<T>(
+        &self,
+        scope: ClientScope,
+        revisions: ClientRevisions,
+        payload: Arc<T>,
+    ) -> ClientPublicationDraft
+    where
+        T: Any + Send + Sync + Serialize + PartialEq,
+    {
+        ClientPublicationDraft {
+            timeline_change: None,
+            scope,
+            revisions,
+            serialized_payload: Arc::new(SerializedClientPayload::deferred(payload.clone())),
+            payload,
+            payload_eq: Some(|left, right| {
+                left.downcast_ref::<T>()
+                    .zip(right.downcast_ref::<T>())
+                    .is_some_and(|(left, right)| left == right)
+            }),
         }
     }
 }
@@ -1200,7 +1312,7 @@ impl ClientCore {
 
     pub fn wait_for_publications(&self, after: ClientChangeSequence) -> ClientPublicationBatch {
         let partitions = self.partitions.lock().expect("client partitions poisoned");
-        let partitions = if !self.is_stopped() && partitions.change_sequence <= after {
+        let mut partitions = if !self.is_stopped() && partitions.change_sequence <= after {
             self.publication_ready
                 .wait_timeout(partitions, std::time::Duration::from_millis(250))
                 .expect("client publication wait poisoned")
@@ -1208,6 +1320,7 @@ impl ClientCore {
         } else {
             partitions
         };
+        partitions.prune_change_journal();
         let mut effects: Vec<_> = partitions
             .platform_effects
             .values()
@@ -1227,8 +1340,19 @@ impl ClientCore {
         let gap = partitions
             .change_journal
             .front()
-            .is_none_or(|first| first.predecessor().unwrap_or_default() > after);
+            .is_none_or(|first| first.predecessor.unwrap_or_default() > after);
         let changes = if gap {
+            None
+        } else {
+            partitions
+                .change_journal
+                .iter()
+                .filter(|change| change.sequence > after)
+                .map(JournalChangeSet::upgrade)
+                .collect::<Option<Vec<_>>>()
+        };
+        let gap = changes.is_none();
+        let changes = changes.unwrap_or_else(|| {
             vec![Arc::new(ClientChangeSet {
                 timeline_changes: Arc::from([]),
                 sequence,
@@ -1241,14 +1365,7 @@ impl ClientCore {
                         .collect::<Vec<_>>(),
                 ),
             })]
-        } else {
-            partitions
-                .change_journal
-                .iter()
-                .filter(|change| change.sequence() > after)
-                .cloned()
-                .collect()
-        };
+        });
         ClientPublicationBatch {
             closed: self.is_stopped(),
             effects,
@@ -2146,8 +2263,13 @@ impl ClientCore {
                             );
                         }
                         if (draft.timeline_change.is_none() || draft.revisions == current_revisions)
-                            && draft.serialized_payload.get().as_ref()
-                                == current.serialized_payload().as_ref()
+                            && draft.payload_eq.map_or_else(
+                                || {
+                                    draft.serialized_payload.get().as_ref()
+                                        == current.serialized_payload().as_ref()
+                                },
+                                |equal| equal(draft.payload.as_ref(), current.payload.as_ref()),
+                            )
                         {
                             continue;
                         }
@@ -2283,10 +2405,13 @@ impl ClientCore {
                 changes: change_set,
                 effects: Arc::from(effects),
             };
+            partitions.prune_change_journal();
             if partitions.change_journal.len() == 128 {
                 partitions.change_journal.pop_front();
             }
-            partitions.change_journal.push_back(transition.changes());
+            partitions
+                .change_journal
+                .push_back(JournalChangeSet::new(transition.changes().as_ref()));
             self.deliver_change_set(transition.changes().as_ref());
             self.publication_signal.send_replace(sequence);
             self.publication_ready.notify_all();
@@ -2499,6 +2624,153 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_journal_releases_consumed_superseded_payloads() {
+        let core = Arc::new(ClientCore::new());
+        let scope = ClientScope::Thread {
+            thread_id: "large-thread".into(),
+        };
+        let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(4).unwrap());
+        let mut payloads = Vec::new();
+        for revision in 1..=96 {
+            let payload = Arc::new(format!("{revision}:{}", "x".repeat(256 * 1024)));
+            payloads.push(Arc::downgrade(&payload));
+            core.publish(
+                &authority(),
+                scope.clone(),
+                revisions(revision),
+                payload,
+                vec![],
+            );
+            drop(subscription.try_next().unwrap());
+        }
+        let retained = payloads
+            .iter()
+            .filter(|payload| payload.strong_count() > 0)
+            .count();
+        assert_eq!(
+            retained, 1,
+            "delivery history must not own obsolete full thread snapshots"
+        );
+        let batch = core.wait_for_publications(ClientChangeSequence::ZERO);
+        assert!(batch.resnapshot);
+        assert_eq!(batch.changes.len(), 1);
+        assert_eq!(
+            batch.changes[0].publications()[0].revisions(),
+            revisions(96)
+        );
+    }
+
+    #[test]
+    fn current_publications_remain_incrementally_available_without_a_transition_owner() {
+        let core = ClientCore::new();
+        for (scope, value) in [
+            (ClientScope::Settings, "settings"),
+            (ClientScope::Navigation, "navigation"),
+        ] {
+            core.publish(&authority(), scope, revisions(1), Arc::new(value), vec![]);
+        }
+        let batch = core.wait_for_publications(ClientChangeSequence::ZERO);
+        assert!(!batch.resnapshot);
+        assert_eq!(batch.changes.len(), 2);
+        assert_eq!(
+            batch.changes[1].predecessor(),
+            Some(batch.changes[0].sequence())
+        );
+    }
+
+    #[test]
+    fn typed_publications_compare_without_encoding_and_serialize_on_demand() {
+        let core = ClientCore::new();
+        let scope = ClientScope::Thread {
+            thread_id: "typed".into(),
+        };
+        let publish = |revision, value| {
+            core.transition(
+                &authority(),
+                vec![authority().typed_publication(
+                    scope.clone(),
+                    revisions(revision),
+                    Arc::new(value),
+                )],
+                vec![],
+            )
+        };
+        assert_eq!(
+            publish(1, "first").outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let first = core.snapshot(&scope).unwrap().snapshot();
+        assert_eq!(publish(2, "first").outcome(), ClientTransitionOutcome::Noop);
+        assert_eq!(
+            publish(1, "different").outcome(),
+            ClientTransitionOutcome::Rejected
+        );
+        assert!(first.serialized_payload.value.get().is_none());
+        assert_eq!(
+            publish(2, "next").outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let next = core.snapshot(&scope).unwrap().snapshot();
+        assert!(next.serialized_payload.value.get().is_none());
+        assert!(first.serialized_payload.value.get().is_none());
+        let serialized = next.serialized_payload();
+        assert_eq!(serialized.as_ref(), &serde_json::json!("next"));
+        assert!(Arc::ptr_eq(&serialized, &next.serialized_payload()));
+    }
+
+    #[test]
+    fn expired_journal_entry_returns_one_coherent_snapshot_across_scopes() {
+        let core = ClientCore::new();
+        core.publish(
+            &authority(),
+            ClientScope::Settings,
+            revisions(1),
+            Arc::new("old"),
+            vec![],
+        );
+        let initial = core.publish(
+            &authority(),
+            ClientScope::Navigation,
+            revisions(1),
+            Arc::new("thread-a"),
+            vec![],
+        );
+        let after = initial.changes().sequence();
+        drop(initial);
+        for revision in 2..=3 {
+            core.transition(
+                &authority(),
+                vec![
+                    authority().publication(
+                        ClientScope::Settings,
+                        revisions(revision),
+                        Arc::new(revision),
+                    ),
+                    authority().publication(
+                        ClientScope::Navigation,
+                        revisions(revision),
+                        Arc::new(revision),
+                    ),
+                ],
+                vec![],
+            );
+        }
+        let batch = core.wait_for_publications(after);
+        assert!(batch.resnapshot);
+        assert_eq!(batch.changes.len(), 1);
+        let change = &batch.changes[0];
+        assert_eq!(change.predecessor(), Some(after));
+        assert_eq!(change.sequence(), batch.sequence);
+        assert_eq!(change.publications().len(), 2);
+        assert!(change.timeline_changes().is_empty());
+        for publication in change.publications() {
+            assert_eq!(publication.revisions(), revisions(3));
+            assert_eq!(publication.snapshot().sequence(), batch.sequence);
+            assert_eq!(*publication.typed::<u64>().unwrap().payload(), 3);
+        }
+    }
 
     #[derive(Debug)]
     struct SharedRow {

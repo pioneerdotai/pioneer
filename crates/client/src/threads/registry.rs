@@ -36,6 +36,36 @@ pub struct ThreadDomainSnapshot {
     subscription_failed: bool,
 }
 
+fn same_coordinator_content(left: &ThreadCoordinator, right: &ThreadCoordinator) -> bool {
+    left.workspace_id == right.workspace_id
+        && left.thread() == right.thread()
+        && left.last_known_turn() == right.last_known_turn()
+        && left
+            .conversation
+            .projection()
+            .same_content(right.conversation.projection())
+        && left.resume == right.resume
+        && left.history_loaded == right.history_loaded
+        && left.history_loading == right.history_loading
+}
+
+impl PartialEq for ThreadDomainSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
+            && self.timeline_revision == other.timeline_revision
+            && self.current_principal_id == other.current_principal_id
+            && (Arc::ptr_eq(&self.coordinator, &other.coordinator)
+                || same_coordinator_content(&self.coordinator, &other.coordinator))
+            && self.semantic == other.semantic
+            && self.pending == other.pending
+            && self.cli_binding == other.cli_binding
+            && self.execution_revision == other.execution_revision
+            && self.cache_patch == other.cache_patch
+            && self.placement == other.placement
+            && self.subscription_failed == other.subscription_failed
+    }
+}
+
 impl ThreadDomainSnapshot {
     pub fn current_principal_id(&self) -> Option<&str> {
         self.current_principal_id.as_deref()
@@ -255,11 +285,55 @@ impl ThreadRegistry {
         let namespace = self.revisions.get(id).copied().unwrap_or_default();
         let old_revision = namespace.0;
         let old_timeline_revision = namespace.1;
+        let projection_changed = previous.is_none_or(|p| {
+            !p.coordinator
+                .conversation
+                .projection()
+                .same_content(store.coordinator.conversation.projection())
+        });
+        let coordinator_changed =
+            previous.is_none_or(|p| !same_coordinator_content(&p.coordinator, &store.coordinator));
+        let semantic_changed = previous.is_none_or(|p| p.semantic.as_ref() != &store.semantic);
+        let pending_changed = previous.is_none_or(|p| p.pending.as_ref() != &pending);
+        let principal_changed =
+            previous.is_none_or(|p| p.current_principal_id != self.current_principal_id);
+        let placement = self.directory.placements.get(id);
+        if !was_blocked
+            && previous.is_some_and(|p| {
+                !coordinator_changed
+                    && !semantic_changed
+                    && !pending_changed
+                    && !principal_changed
+                    && p.cli_binding == store.cli_binding
+                    && p.placement.as_ref() == placement
+                    && p.subscription_failed == store.subscription_failed
+            })
+        {
+            return Vec::new();
+        }
+        let timeline_changed = was_blocked
+            || projection_changed
+            || semantic_changed
+            || pending_changed
+            || principal_changed
+            || previous.is_none_or(|p| {
+                p.coordinator.thread().map(|t| &t.turns)
+                    != store.coordinator.thread().map(|t| &t.turns)
+            });
         let mut snapshot = ThreadDomainSnapshot {
             current_principal_id: self.current_principal_id.clone(),
-            coordinator: Arc::new(store.coordinator.snapshot_copy()),
-            semantic: Arc::new(store.semantic.clone()),
-            pending: Arc::new(pending),
+            coordinator: match previous.filter(|_| !coordinator_changed) {
+                Some(p) => p.coordinator.clone(),
+                None => Arc::new(store.coordinator.snapshot_copy()),
+            },
+            semantic: match previous.filter(|_| !semantic_changed) {
+                Some(p) => p.semantic.clone(),
+                None => Arc::new(store.semantic.clone()),
+            },
+            pending: match previous.filter(|_| !pending_changed) {
+                Some(p) => p.pending.clone(),
+                None => Arc::new(pending),
+            },
             cli_binding: store.cli_binding.clone(),
             revision: old_revision,
             timeline_revision: old_timeline_revision,
@@ -271,46 +345,13 @@ impl ThreadRegistry {
             subscription_failed: store.subscription_failed,
             cache_patch: Default::default(),
         };
-        let mut current_value =
-            serde_json::to_value(&snapshot).expect("thread snapshot serializes");
-        current_value["projection"]["revision"] = serde_json::Value::from(0);
-        if !was_blocked
-            && previous.is_some_and(|previous| {
-                let mut previous_value =
-                    serde_json::to_value(previous.as_ref()).expect("thread snapshot serializes");
-                previous_value["projection"]["revision"] = serde_json::Value::from(0);
-                current_value == previous_value
-            })
-        {
-            return Vec::new();
-        }
-        let timeline_changed = was_blocked
-            || previous.is_none_or(|previous| {
-                if previous.current_principal_id != snapshot.current_principal_id {
-                    return true;
-                }
-                if previous.semantic.as_ref() != &store.semantic
-                    || previous.pending != snapshot.pending
-                {
-                    return true;
-                }
-                let mut old = serde_json::to_value(previous.coordinator.conversation.projection())
-                    .expect("projection serializes");
-                let mut new = serde_json::to_value(snapshot.coordinator.conversation.projection())
-                    .expect("projection serializes");
-                old["revision"] = 0.into();
-                new["revision"] = 0.into();
-                old != new
-                    || previous.coordinator.thread().map(|thread| &thread.turns)
-                        != snapshot.coordinator.thread().map(|thread| &thread.turns)
-            });
         snapshot.revision += 1;
         if timeline_changed {
             snapshot.timeline_revision += 1;
         }
         let snapshot = Arc::new(snapshot);
         let authority = ClientMutationAuthority { _private: () };
-        let mut drafts = vec![authority.publication(
+        let mut drafts = vec![authority.typed_publication(
             ClientScope::Thread {
                 thread_id: id.to_owned(),
             },
@@ -457,6 +498,53 @@ impl Drop for ThreadTimelineMutation<'_> {
 }
 
 impl ClientCore {
+    /// Model refreshes need only small selection candidates, never copies of
+    /// every loaded conversation, event log, and turn payload in the process.
+    pub(crate) fn resolved_composer_model_selection(
+        &self,
+        thread_id: &str,
+    ) -> Option<crate::composer::model_selection::ComposerModelSelection> {
+        use crate::composer::model_selection::{
+            ComposerModelSelection, ComposerModelSelectionCandidate,
+            resolve_composer_model_selection,
+        };
+        let registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        let workspace = registry
+            .stores
+            .get(thread_id)
+            .map(|store| store.coordinator.workspace_id.as_str())
+            .or_else(|| {
+                registry
+                    .directory
+                    .threads
+                    .get(thread_id)
+                    .map(|thread| thread.workspace_id.as_str())
+            })?;
+        let directory = registry
+            .directory
+            .threads
+            .iter()
+            .filter(|(id, _)| !registry.stores.contains_key(*id))
+            .map(|(id, thread)| ComposerModelSelectionCandidate {
+                thread_id: id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                updated_at: thread.updated_at,
+                has_turns: !thread.turns.is_empty(),
+                selection: ComposerModelSelection::from_thread(thread),
+            });
+        let loaded = registry.stores.iter().filter_map(|(id, store)| {
+            crate::state::selectors::composer_model_selection_candidate(id, &store.coordinator)
+        });
+        resolve_composer_model_selection(
+            Some(thread_id),
+            Some(workspace),
+            directory.chain(loaded).collect(),
+        )
+    }
+
     pub fn thread_snapshot(&self, id: &str) -> Option<Arc<ThreadDomainSnapshot>> {
         self.thread_registry
             .lock()
@@ -2748,6 +2836,104 @@ mod tests {
     }
 
     #[test]
+    fn repeated_thread_updates_release_previous_source_snapshots() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let mut sources = Vec::new();
+        for revision in 0..40 {
+            let text = format!("{revision}:{}", "history".repeat(16_384));
+            core.apply_thread_timeline_page(
+                presentation_page(&[("large-message", &text)]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            let snapshot = core
+                .snapshot(&scope("a"))
+                .unwrap()
+                .typed::<ThreadDomainSnapshot>()
+                .unwrap()
+                .payload();
+            sources.push(Arc::downgrade(&snapshot));
+        }
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| source.strong_count() > 0)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn draining_last_delivery_releases_obsolete_rows_without_another_update() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let timeline_scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        let subscription = core.subscribe(timeline_scope.clone(), NonZeroUsize::new(16).unwrap());
+        let mut rows = Vec::new();
+        for text in ["first", "second", "last"] {
+            core.apply_thread_timeline_page(
+                presentation_page(&[("message", text)]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.materialize_demanded_timelines();
+            rows.push(Arc::downgrade(
+                &core
+                    .thread_presentation_snapshot("a")
+                    .unwrap()
+                    .timeline()
+                    .rows()[0],
+            ));
+        }
+        while subscription.try_next().is_some() {}
+        let sequence = core
+            .snapshot(&timeline_scope)
+            .unwrap()
+            .snapshot()
+            .sequence();
+        let idle = core.wait_for_publications(sequence);
+        assert!(idle.changes.is_empty());
+        assert_eq!(rows.iter().filter(|row| row.strong_count() > 0).count(), 1);
+    }
+
+    #[test]
+    fn semantic_updates_share_unchanged_coordinator_and_duplicate_pages_do_not_publish() {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        let first = core
+            .snapshot(&scope("a"))
+            .unwrap()
+            .typed::<ThreadDomainSnapshot>()
+            .unwrap()
+            .payload();
+        let page = presentation_page(&[("message", "body")]);
+        core.apply_thread_timeline_page(
+            page.clone(),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let next = core
+            .snapshot(&scope("a"))
+            .unwrap()
+            .typed::<ThreadDomainSnapshot>()
+            .unwrap()
+            .payload();
+        assert!(Arc::ptr_eq(&first.coordinator, &next.coordinator));
+        assert!(!Arc::ptr_eq(&first.semantic, &next.semantic));
+        core.apply_thread_timeline_page(
+            page,
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let duplicate = core
+            .snapshot(&scope("a"))
+            .unwrap()
+            .typed::<ThreadDomainSnapshot>()
+            .unwrap()
+            .payload();
+        assert!(Arc::ptr_eq(&next, &duplicate));
+    }
+
+    #[test]
     fn presentation_reinserted_identity_never_reuses_a_retired_row_revision() {
         let core = core();
         core.upsert_thread(thread("a", "ws"));
@@ -2902,6 +3088,13 @@ mod tests {
             NonZeroUsize::new(8).unwrap(),
         );
         let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let after = core
+            .snapshot(&ClientScope::Timeline {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .snapshot()
+            .sequence();
         assert_eq!(first.revision(), 1);
         assert_eq!(first.rows().len(), 2);
         assert_eq!(first.rows()[0].item().unwrap().partial_text, "latest");
@@ -2919,7 +3112,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.rows()[0], &second.rows()[0]));
         assert!(Arc::ptr_eq(&first.rows()[1], &second.rows()[1]));
         let changes = core
-            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .wait_for_publications(after)
             .changes
             .last()
             .unwrap()
@@ -2958,6 +3151,13 @@ mod tests {
             NonZeroUsize::new(8).unwrap(),
         );
         let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let after = core
+            .snapshot(&ClientScope::Timeline {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .snapshot()
+            .sequence();
         core.apply_thread_timeline_page(
             presentation_page(&[("y", "y"), ("x", "x"), ("z", "z")]),
             crate::timeline::semantic::TopLevelPageMergeMode::Reset,
@@ -2967,7 +3167,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first.rows()[0], &second.rows()[1]));
         assert!(Arc::ptr_eq(&first.rows()[1], &second.rows()[0]));
         let changes = core
-            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .wait_for_publications(after)
             .changes
             .last()
             .unwrap()
@@ -2989,13 +3189,20 @@ mod tests {
                 .map(|row| row.id().as_str())
                 .collect::<Vec<_>>()
         );
+        let after = core
+            .snapshot(&ClientScope::Timeline {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .snapshot()
+            .sequence();
         core.apply_thread_timeline_page(
             presentation_page(&[("z", "z")]),
             crate::timeline::semantic::TopLevelPageMergeMode::Reset,
         );
         core.materialize_demanded_timelines();
         let changes = core
-            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .wait_for_publications(after)
             .changes
             .last()
             .unwrap()
@@ -3270,6 +3477,13 @@ mod tests {
             NonZeroUsize::new(16).unwrap(),
         );
         let first = core.thread_presentation_snapshot("a").unwrap().timeline();
+        let after = core
+            .snapshot(&ClientScope::Timeline {
+                thread_id: "a".into(),
+            })
+            .unwrap()
+            .snapshot()
+            .sequence();
         let ids = vec![first.rows()[0].id().as_str().to_owned()];
         for presented in [false, true] {
             let actions = core.plan_thread_timeline_viewport(
@@ -3312,7 +3526,7 @@ mod tests {
                 .any(|row| Arc::ptr_eq(row, &first.rows()[0]))
         );
         let changes = core
-            .wait_for_publications(crate::core::ClientChangeSequence::ZERO)
+            .wait_for_publications(after)
             .changes
             .last()
             .unwrap()

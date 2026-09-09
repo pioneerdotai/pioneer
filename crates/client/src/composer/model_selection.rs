@@ -940,19 +940,3 @@ mod tests {
         assert!(update.loading_models);
     }
 }
-
-impl crate::core::ClientCore {
-    /// Resolve defaults from the accepted thread coordinators in this process.
-    pub(super) fn resolved_composer_model_selection(
-        &self,
-        thread_id: &str,
-    ) -> Option<ComposerModelSelection> {
-        let coordinators = self.thread_coordinator_snapshots();
-        let workspace = coordinators.get(thread_id)?.workspace_id.as_str();
-        crate::state::selectors::resolve_composer_model_selection_from(
-            Some(thread_id),
-            Some(workspace),
-            &coordinators,
-        )
-    }
-}
