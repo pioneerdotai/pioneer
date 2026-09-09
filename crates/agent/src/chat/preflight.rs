@@ -650,7 +650,6 @@ async fn request_turn_preflight_provider_json(
     request: ChatRequest,
     max_output_chars: usize,
 ) -> anyhow::Result<String> {
-    let request = super::provider::bounded_provider_request(request);
     let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
         let mut stream = provider.stream_chat(request).await?;

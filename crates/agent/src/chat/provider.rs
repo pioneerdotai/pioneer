@@ -15,8 +15,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::timeout;
 
-const HARD_MAX_PROVIDER_OUTPUT_TOKENS: u32 = 8_192;
-
 struct NativeProviderRoundMetric {
     started: Instant,
     finished: bool,
@@ -49,16 +47,6 @@ impl Drop for NativeProviderRoundMetric {
             self.finish(pioneer_observability::NativeLifecycleOutcome::Failed);
         }
     }
-}
-
-pub(super) fn bounded_provider_request(mut request: ChatRequest) -> ChatRequest {
-    request.max_tokens = Some(
-        request
-            .max_tokens
-            .unwrap_or(HARD_MAX_PROVIDER_OUTPUT_TOKENS)
-            .min(HARD_MAX_PROVIDER_OUTPUT_TOKENS),
-    );
-    request
 }
 
 #[derive(Clone, Copy)]
@@ -99,7 +87,6 @@ pub(super) async fn request_agent_round(
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
-    let request = bounded_provider_request(request);
     if provider.capabilities().streaming && !force_non_stream {
         let provider_name = provider.name().to_owned();
         let model_name = request.model.clone();
@@ -315,7 +302,6 @@ pub(super) async fn stream_provider_response(
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
-    let request = bounded_provider_request(request);
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
@@ -637,7 +623,6 @@ pub(super) async fn non_stream_provider_response(
     event_tx: &AgentEventHub,
 ) -> Result<String, ChatTurnError> {
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
-    let request = bounded_provider_request(request);
     let model_name = request.model.clone();
 
     let response = provider.chat(request).await.map_err(|error| {
@@ -1405,41 +1390,6 @@ fn extract_retry_after_ms(message_lower: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bounded_provider_request_never_allows_a_model_supplied_output_ceiling() {
-        let request = ChatRequest {
-            model: "model".to_owned(),
-            messages: Vec::new(),
-            temperature: None,
-            max_tokens: Some(u32::MAX),
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-        assert_eq!(
-            bounded_provider_request(request).max_tokens,
-            Some(HARD_MAX_PROVIDER_OUTPUT_TOKENS)
-        );
-
-        let request = ChatRequest {
-            model: "model".to_owned(),
-            messages: Vec::new(),
-            temperature: None,
-            max_tokens: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            compiled_prompt: None,
-        };
-        assert_eq!(
-            bounded_provider_request(request).max_tokens,
-            Some(HARD_MAX_PROVIDER_OUTPUT_TOKENS)
-        );
-    }
 
     #[test]
     fn openrouter_image_input_endpoint_error_is_recoverable_capability_rejection() {
