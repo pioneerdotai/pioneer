@@ -252,46 +252,19 @@ impl TimelineView {
             self.thread_timeline_view_state.layout_text_style.clone(),
         );
         let context_changed = self.retained_context.as_ref() != Some(&context);
-        for slot in &mut prepared.slots {
+        for slot in &prepared.slots {
             let unchanged = old_slots
                 .get(slot.snapshot().id())
                 .is_some_and(|old| std::sync::Arc::ptr_eq(old, slot));
             if unchanged && !context_changed {
                 continue;
             }
-            let snapshot = slot.snapshot().clone();
-            if let Some(item) = snapshot.item() {
-                if matches!(
-                    item.item,
-                    pioneer_client::timeline::types::TurnItem::CommandExecution { .. }
-                ) {
-                    let entry = pioneer_client::conversation::TimelineEntry {
-                        id: slot.snapshot().id().as_str().to_owned(),
-                        turn_id: item.turn_id.clone(),
-                        item_id: item.id.clone(),
-                        item_index: 0,
-                    };
-                    let terminal = self.prepare_command_terminal(
-                        &entry,
-                        item,
-                        prepared.content_width,
-                        old_slots
-                            .get(snapshot.id())
-                            .and_then(|slot| slot.terminal.as_ref()),
-                        cx,
-                    );
-                    std::sync::Arc::make_mut(slot).terminal = Some(terminal);
-                    self.row_registry.publish_slot(slot.clone());
-                }
-                if let Some(content) = slot
-                    .snapshot()
-                    .content()
-                    .filter(|content| !content.streaming)
-                {
-                    if let Some(document) = &content.markdown_presentation {
-                        self.prepare_markdown_highlights(document, cx);
-                    }
-                }
+            let snapshot = slot.snapshot();
+            if snapshot.item().is_some()
+                && let Some(content) = snapshot.content().filter(|content| !content.streaming)
+                && let Some(document) = &content.markdown_presentation
+            {
+                self.prepare_markdown_highlights(document, cx);
             }
         }
         for (slot, (key, author)) in prepared.slots.iter_mut().zip(&prepared.row_inputs) {

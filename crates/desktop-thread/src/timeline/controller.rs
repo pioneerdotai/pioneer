@@ -169,6 +169,14 @@ impl DesktopTimelineController {
             .iter()
             .map(|row| row.key().to_owned())
             .collect::<Vec<_>>();
+        // Terminal content stays readable when the window loses focus or the
+        // connection changes. Its lifetime follows the viewport, not animation availability.
+        let terminal_rows = if view.thread_timeline_view_state.visible {
+            ids.iter().cloned().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        view.set_row_terminals_visible(&terminal_rows, cx);
         let visible_rows = if available {
             ids.iter().cloned().collect()
         } else {

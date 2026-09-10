@@ -10,7 +10,6 @@ pub(crate) struct TimelineRowSlotView {
     pub(super) projection: pioneer_client::conversation::ConversationViewState,
     pub(super) content: super::TimelineItemPresentations,
     pub(super) view: Option<gpui_kit::Entity<super::row_view::TimelineRowView>>,
-    pub(crate) terminal: Option<super::terminal_registry::TerminalPresentation>,
 }
 impl TimelineRowSlotView {
     fn new(snapshot: Arc<TimelineRowSnapshot>) -> Self {
@@ -34,7 +33,6 @@ impl TimelineRowSlotView {
             snapshot,
             projection,
             content,
-            terminal: None,
             view: None,
         }
     }
@@ -54,7 +52,6 @@ impl TimelineRowSlotView {
     fn replacing(snapshot: Arc<TimelineRowSnapshot>, previous: Option<&Arc<Self>>) -> Self {
         let mut next = Self::new(snapshot);
         next.view = previous.and_then(|old| old.view.clone());
-        next.terminal = previous.and_then(|old| old.terminal.clone());
         next
     }
     pub(crate) fn snapshot(&self) -> &Arc<TimelineRowSnapshot> {
@@ -139,15 +136,6 @@ impl TimelineRowRegistry {
             *current = slot;
         }
     }
-    pub(crate) fn clear_terminals(&mut self) {
-        for slot in self
-            .entries
-            .values_mut()
-            .filter(|slot| slot.terminal.is_some())
-        {
-            Arc::make_mut(slot).terminal = None;
-        }
-    }
     pub(crate) fn slots(&self) -> Vec<Arc<TimelineRowSlotView>> {
         self.order
             .iter()
@@ -156,6 +144,18 @@ impl TimelineRowRegistry {
     }
     pub(crate) fn get(&self, id: &RowId) -> Option<&Arc<TimelineRowSlotView>> {
         self.entries.get(id)
+    }
+}
+
+#[cfg(test)]
+impl TimelineRowSlotView {
+    pub(crate) fn terminal_for_test(
+        &self,
+        cx: &gpui_kit::App,
+    ) -> Option<gpui_kit::Entity<terminal::TerminalView>> {
+        self.view
+            .as_ref()
+            .and_then(|view| view.read(cx).terminal_for_test())
     }
 }
 

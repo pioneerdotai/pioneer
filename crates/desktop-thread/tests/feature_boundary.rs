@@ -193,7 +193,15 @@ fn row_sources_keep_the_approved_element_and_no_optional_reuse_mechanisms() {
         assert!(!command_render.contains(forbidden));
     }
     let presentation = include_str!("../src/timeline/row_view.rs");
-    assert!(presentation.contains("terminal: slot.terminal.clone()"));
+    assert!(
+        !row.contains("terminal: Option<"),
+        "immutable slots must not retain terminal grids"
+    );
+    assert!(
+        !view.contains("prepare_command_terminal("),
+        "layout must not eagerly allocate terminals"
+    );
+    assert!(presentation.contains("fn set_row_terminals_visible("));
     assert!(presentation.contains("self.terminal.as_ref().map(|t| t.view.clone())"));
     let markdown = include_str!("../src/timeline/markdown.rs");
     let link = markdown

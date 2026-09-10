@@ -536,8 +536,29 @@ mod tests {
         let timeline = thread.read_with(cx, |thread, _| thread.screen.clone());
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.run_until_parked();
-        let row_terminal = |cx: &gpui_kit::VisualTestContext| {
-            timeline.read_with(cx, |view, _| {
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                crate::timeline::controller::DesktopTimelineController::dispatch(
+                    view,
+                    &crate::timeline::controller::TimelineAction::Expand {
+                        entry_id: "work-id".into(),
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let row_terminal = |cx: &mut gpui_kit::VisualTestContext| {
+            // This fixture drives publications without an authenticated shell;
+            // provide the viewport membership explicitly.
+            timeline.update(cx, |view, cx| {
+                view.set_row_terminals_visible(&["work-id".to_owned()].into_iter().collect(), cx);
+            });
+            timeline.read_with(cx, |view, cx| {
                 let slot = view
                     .thread_timeline_view_state
                     .prepared
@@ -557,15 +578,15 @@ mod tests {
                                 .rows
                         )
                     });
-                let terminal = slot.terminal.as_ref().expect("prepared terminal child");
+                let terminal = slot.terminal_for_test(cx).expect("visible terminal child");
                 let registered = view.row_registry.get(slot.snapshot().id()).unwrap();
                 if Arc::ptr_eq(registered.snapshot(), slot.snapshot()) {
                     assert_eq!(
-                        registered.terminal.as_ref().unwrap().view.entity_id(),
-                        terminal.view.entity_id()
+                        registered.terminal_for_test(cx).unwrap().entity_id(),
+                        terminal.entity_id()
                     );
                 }
-                terminal.view.clone()
+                terminal.clone()
             })
         };
         let active = row_terminal(cx);
@@ -595,7 +616,7 @@ mod tests {
                     .find(|slot| slot.snapshot().id().as_str() == "work-id")
                     .unwrap();
                 assert_eq!(
-                    slot.terminal.as_ref().unwrap().view.entity_id(),
+                    slot.terminal_for_test(cx).unwrap().entity_id(),
                     active.entity_id()
                 );
             });
@@ -630,7 +651,7 @@ mod tests {
                     .find(|slot| slot.snapshot().id().as_str() == "work-id")
                     .unwrap();
                 assert_eq!(
-                    slot.terminal.as_ref().unwrap().view.entity_id(),
+                    slot.terminal_for_test(cx).unwrap().entity_id(),
                     completed.entity_id()
                 );
             });

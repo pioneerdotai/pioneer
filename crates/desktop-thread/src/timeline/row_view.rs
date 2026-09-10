@@ -167,7 +167,7 @@ impl RowPresentation {
             snapshot: slot.snapshot().clone(),
             projection: slot.projection.clone(),
             content: slot.content.clone(),
-            terminal: slot.terminal.clone(),
+            terminal: None,
             body_only: false,
             body: None,
             key,
@@ -333,6 +333,7 @@ impl TimelineRowView {
             return;
         }
         presentation.body = self.presentation.body.take();
+        presentation.terminal = self.presentation.terminal.take();
         if self.presentation.activity_input() == presentation.activity_input() {
             presentation.dino = self.presentation.dino.take();
             presentation.elapsed = self.presentation.elapsed.take();
@@ -563,6 +564,31 @@ impl TimelineRowView {
         }
         self.set_visible(self.visible, cx);
     }
+    fn set_terminal(
+        &mut self,
+        terminal: Option<super::terminal_registry::TerminalPresentation>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self
+            .presentation
+            .terminal
+            .as_ref()
+            .map(|t| t.view.entity_id())
+            != terminal.as_ref().map(|t| t.view.entity_id());
+        self.presentation.terminal = terminal.clone();
+        // The measured body has its own presentation. Release its reference too.
+        if let Some((body, _)) = &self.presentation.body {
+            body.update(cx, |body, cx| {
+                body.presentation.terminal = terminal;
+                if changed {
+                    cx.notify();
+                }
+            });
+        }
+        if changed {
+            cx.notify();
+        }
+    }
     pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         if let Some(view) = &self.presentation.dino {
@@ -585,8 +611,58 @@ impl TimelineView {
     ) {
         for slot in self.row_registry.slots() {
             if let Some(view) = &slot.view {
+                let shown = visible.contains(slot.snapshot().id().as_str());
+                if view.read(cx).visible != shown {
+                    view.update(cx, |view, cx| view.set_visible(shown, cx));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_row_terminals_visible(
+        &self,
+        visible: &std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Data and geometry remain retained; terminal emulators belong only to
+        // the visible rows, not every work item loaded while scrolling history.
+        let slots = self.row_registry.slots();
+        let terminal_rows = slots
+            .iter()
+            .filter(|slot| {
+                visible.contains(slot.snapshot().id().as_str())
+                    && slot
+                        .view
+                        .as_ref()
+                        .is_some_and(|view| view.read(cx).presentation.key.expanded)
+            })
+            .map(|slot| slot.snapshot().id().as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.thread_timeline_terminal_item
+            .borrow_mut()
+            .retain(|id| terminal_rows.contains(id));
+        for slot in &slots {
+            if let Some(view) = &slot.view {
+                if !terminal_rows.contains(slot.snapshot().id().as_str())
+                    && view.read(cx).presentation.terminal.is_none()
+                {
+                    continue;
+                }
+                let terminal =
+                    if terminal_rows.contains(slot.snapshot().id().as_str()) {
+                        slot.snapshot().item().filter(|item| matches!(item.item,
+                        pioneer_client::timeline::types::TurnItem::CommandExecution { .. }))
+                        .map(|item| {
+                            let entry = &slot.projection.timeline[0];
+                            let previous = view.read(cx).presentation.terminal.clone();
+                            let width = view.read(cx).presentation.key.content_width;
+                            self.prepare_command_terminal(entry, item, width, previous.as_ref(), cx)
+                        })
+                    } else {
+                        None
+                    };
                 view.update(cx, |view, cx| {
-                    view.set_visible(visible.contains(slot.snapshot().id().as_str()), cx)
+                    view.set_terminal(terminal, cx);
                 });
             }
         }
@@ -665,6 +741,12 @@ pub(super) fn row_dependency_revision(
 
 #[cfg(test)]
 impl TimelineRowView {
+    pub(crate) fn terminal_for_test(&self) -> Option<Entity<terminal::TerminalView>> {
+        self.presentation
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.view.clone())
+    }
     pub(crate) fn render_counts(&self, cx: &App) -> (usize, usize) {
         (
             self.renders,
@@ -950,6 +1032,279 @@ mod tests {
         }
         assert!(painted, "the actual retained message must paint");
     }
+    #[gpui_kit::test]
+    fn large_work_history_retains_only_visible_expanded_terminals(cx: &mut TestAppContext) {
+        const COMMANDS: usize = 128;
+        cx.background_executor.allow_parking();
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "message");
+        let output = "history line\n".repeat(1500);
+        let work = serde_json::json!({"turnId":"turn","presentation":"expanded_terminal_no_final",
+            "state":"completed","workCount":COMMANDS,"visibleWorkCount":COMMANDS,"hiddenWorkCount":0,
+            "hasMoreBefore":false,"hasMoreAfter":false});
+        client.apply_thread_timeline_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","projectionVersion":1,
+                "blocks":[{"workspaceId":"workspace","threadId":"a","blockId":"work-block",
+                    "turnId":"turn","sortKey":"1","kind":{"kind":"turn_work","work":work}}],
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            TopLevelPageMergeMode::Reset,
+        );
+        let items = (0..COMMANDS).map(|index| {
+            let id = format!("command-{index:03}");
+            serde_json::json!({"workItemId":id,"itemId":id,"turnId":"turn","orderKey":format!("{index:03}"),
+                "sourceSequence":1,"sourceUpdatedAtUnixMicros":1,"itemType":"command_execution","status":"completed",
+                "item":{"type":"commandExecution","id":id,"toolName":"synthetic","arguments":{},
+                    "status":"completed","command":["synthetic"],
+                    "outputPolicy":{"llm":{"mode":"summary_only"},"llmRetention":{"mode":"do_not_retain"},
+                        "timeline":{"mode":"full","max_bytes":24000},"storage":{"mode":"none"},
+                        "recovery":{"mode":"none"},"deltas":{"mode":"disabled"}},
+                    "display":{"kind":"shell","stdout":output,"truncated":false},"storage":{"kind":"none"}}})
+        }).collect::<Vec<_>>();
+        client.apply_turn_work_page(
+            serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace","threadId":"a","turnId":"turn","projectionVersion":1,
+                "sourceHighWatermark":1,"projectionUpdatedAtUnixMicros":1,"work":work,"items":items,
+                "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+            }))
+            .unwrap(),
+            WorkPageMergeMode::Reset,
+        );
+        client.set_thread_turn_work_expanded("a", "turn", true);
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ThreadView::new(
+                    ThreadViewConfig::new(
+                        client.clone(),
+                        "a".into(),
+                        registrar,
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        deliver();
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |view, _| view.timeline_for_test());
+        let terminals = |cx: &gpui_kit::VisualTestContext| {
+            timeline.read_with(cx, |view, cx| {
+                view.row_registry
+                    .slots()
+                    .iter()
+                    .filter_map(|slot| slot.terminal_for_test(cx))
+                    .map(|terminal| terminal.downgrade())
+                    .collect::<Vec<_>>()
+            })
+        };
+        timeline.read_with(cx, |view, _| {
+            assert_eq!(
+                view.row_registry
+                    .slots()
+                    .iter()
+                    .filter(|s| s.snapshot().item().is_some())
+                    .count(),
+                COMMANDS
+            );
+        });
+        assert!(
+            terminals(cx).is_empty(),
+            "collapsed history must not allocate terminal grids"
+        );
+        // Simulate the viewport advancing through the entire loaded history. All
+        // commands remain expanded, as when returning to previously opened rows.
+        let mut previous: Vec<gpui_kit::WeakEntity<terminal::TerminalView>> = Vec::new();
+        for index in 0..COMMANDS {
+            let id = format!("command-{index:03}");
+            cx.update(|window, cx| {
+                timeline.update(cx, |view, cx| {
+                    super::super::controller::DesktopTimelineController::expand(
+                        view, &id, window, cx,
+                    );
+                })
+            });
+            for _ in 0..2 {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                cx.run_until_parked();
+            }
+            timeline.update(cx, |view, cx| {
+                view.set_row_terminals_visible(&[id].into_iter().collect(), cx)
+            });
+            cx.run_until_parked();
+            assert!(
+                previous.iter().all(|terminal| terminal.upgrade().is_none()),
+                "offscreen terminal survived"
+            );
+            previous = terminals(cx);
+            assert_eq!(
+                previous.len(),
+                1,
+                "terminal count must follow viewport, not loaded history"
+            );
+        }
+        // Re-enter the first command: its full source still exists and can be replayed.
+        timeline.update(cx, |view, cx| {
+            view.set_row_terminals_visible(&["command-000".to_owned()].into_iter().collect(), cx)
+        });
+        cx.run_until_parked();
+        assert!(previous.iter().all(|terminal| terminal.upgrade().is_none()));
+        previous = terminals(cx);
+        assert_eq!(previous.len(), 1);
+        timeline.read_with(cx, |view, cx| {
+            let slot = view
+                .row_registry
+                .slots()
+                .into_iter()
+                .find(|s| s.snapshot().id().as_str() == "command-000")
+                .unwrap();
+            let item = slot.snapshot().item().unwrap();
+            assert_eq!(
+                serde_json::to_value(&item.item).unwrap()["display"]["stdout"],
+                output
+            );
+            let terminal = slot.terminal_for_test(cx).unwrap();
+            assert!(
+                terminal.read(cx).dimensions().1 >= 1500,
+                "full output grid is preserved when reopened"
+            );
+        });
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                super::super::controller::DesktopTimelineController::expand(
+                    view,
+                    "command-000",
+                    window,
+                    cx,
+                );
+            })
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        timeline.update(cx, |view, cx| {
+            view.set_row_terminals_visible(&["command-000".to_owned()].into_iter().collect(), cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            previous.iter().all(|terminal| terminal.upgrade().is_none()),
+            "collapsing a visible command must release its grid"
+        );
+        assert!(terminals(cx).is_empty());
+        timeline.update(cx, |view, cx| {
+            view.set_row_terminals_visible(&["command-127".to_owned()].into_iter().collect(), cx)
+        });
+        previous = terminals(cx);
+        assert_eq!(previous.len(), 1);
+        cx.update(|window, cx| thread.update(cx, |view, cx| view.set_visible(false, window, cx)));
+        cx.run_until_parked();
+        assert!(previous.iter().all(|terminal| terminal.upgrade().is_none()));
+        assert!(terminals(cx).is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn command_terminals_are_released_when_thread_is_hidden(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "a", "message");
+        publish_work(&client, 1, false);
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            Root::new(
+                ThreadView::new(
+                    ThreadViewConfig::new(
+                        client.clone(),
+                        "a".into(),
+                        registrar,
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                        Arc::new(ThreadPorts),
+                    ),
+                    window,
+                    cx,
+                ),
+                window,
+                cx,
+            )
+        });
+        deliver();
+        cx.run_until_parked();
+        for _ in 0..4 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |view, _| view.timeline_for_test());
+        cx.update(|window, cx| {
+            timeline.update(cx, |view, cx| {
+                super::super::controller::DesktopTimelineController::dispatch(
+                    view,
+                    &super::super::controller::TimelineAction::Expand {
+                        entry_id: "commandExecution".into(),
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        timeline.update(cx, |view, cx| {
+            view.set_row_terminals_visible(
+                &["commandExecution".to_owned()].into_iter().collect(),
+                cx,
+            )
+        });
+        let terminals = timeline.read_with(cx, |view, cx| {
+            view.row_registry
+                .slots()
+                .iter()
+                .filter_map(|slot| {
+                    slot.view.as_ref().and_then(|row| {
+                        row.read(cx)
+                            .presentation
+                            .terminal
+                            .as_ref()
+                            .map(|t| t.view.downgrade())
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            !terminals.is_empty(),
+            "fixture must create a command terminal"
+        );
+        cx.update(|window, cx| thread.update(cx, |view, cx| view.set_visible(false, window, cx)));
+        cx.run_until_parked();
+        for terminal in terminals {
+            assert!(
+                terminal.upgrade().is_none(),
+                "hidden thread retains the terminal through its row or body"
+            );
+        }
+    }
+
     #[gpui_kit::test]
     fn row_owners_survive_insert_and_resize_and_drop_with_thread(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
