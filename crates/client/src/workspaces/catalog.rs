@@ -19,6 +19,7 @@ pub struct WorkspaceCatalogPublication {
     revision: u64,
     pub(super) workspaces: Vec<Workspace>,
     loading: bool,
+    pub bootstrapped_connection_id: Option<u64>,
     pub(super) action_pending: bool,
     pub(super) operation: Option<WorkspaceCatalogOperation>,
     pub(super) error: Option<String>,
@@ -88,6 +89,9 @@ impl ClientCore {
         persisted_workspace_id: Option<String>,
     ) -> anyhow::Result<super::actions::WorkspaceBootstrapSuccessReduction> {
         let connection = self.gateway_http_generation();
+        let presentation_connection = self
+            .gateway_session()
+            .presentation_connection_for(connection);
         let navigation_revision = self
             .snapshot(&ClientScope::Navigation)
             .map(|p| p.revisions().scoped().get());
@@ -143,7 +147,10 @@ impl ClientCore {
         }
         owner.request_catalog.clear();
         match &result {
-            Ok(reduction) => owner.publication.workspaces = reduction.workspaces.clone(),
+            Ok(reduction) => {
+                owner.publication.workspaces = reduction.workspaces.clone();
+                owner.publication.bootstrapped_connection_id = presentation_connection;
+            }
             Err(error) => owner.publication.error = Some(error.to_string()),
         }
         self.publish_workspace_catalog(&mut owner);

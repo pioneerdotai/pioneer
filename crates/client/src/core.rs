@@ -261,6 +261,9 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    SessionDemand {
+        demand: crate::gateway::session_driver::SessionDemand,
+    },
     SettingsModelPicker {
         intent: crate::settings::model_picker::SettingsModelPickerIntent,
     },
@@ -951,6 +954,7 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) session_driver: Mutex<crate::gateway::session_driver::SessionDriver>,
     pub(crate) invitation_commits: Mutex<crate::gateway::invitation_commits::InvitationCommits>,
     pub(crate) device_activation:
         Mutex<crate::settings::device_activation::DeviceActivationController>,
@@ -1009,6 +1013,7 @@ pub struct ClientCore {
     pub(crate) timeline_started: std::time::Instant,
     pub(crate) identity_authorization:
         Mutex<crate::gateway::identity_authorization::IdentityAuthorizationStore>,
+    pub(crate) capability_read_gate: Mutex<()>,
     pub(crate) session_refresh_slots: Mutex<HashMap<String, Weak<Mutex<bool>>>>,
     pub(crate) gateway_session: Mutex<crate::gateway::session_controller::GatewaySessionController>,
     pub(crate) session_transport: Mutex<Option<String>>,
@@ -1221,6 +1226,8 @@ impl ClientCore {
             presentation_sender: Mutex::default(),
             presentation_task: Mutex::default(),
             identity_authorization: Mutex::default(),
+            capability_read_gate: Mutex::default(),
+            session_driver: Mutex::default(),
             session_refresh_slots: Mutex::default(),
             session_transport: Mutex::default(),
             gateway_transport_leases: Mutex::default(),
@@ -1242,6 +1249,15 @@ impl ClientCore {
         endpoint_id: &str,
         event: crate::gateway::session_lifecycle::SessionLifecycleEvent,
     ) -> crate::gateway::session_controller::GatewaySessionTransition {
+        self.reduce_gateway_session_lifecycle_with_identity_policy(endpoint_id, event, true)
+    }
+
+    pub(crate) fn reduce_gateway_session_lifecycle_with_identity_policy(
+        &self,
+        endpoint_id: &str,
+        event: crate::gateway::session_lifecycle::SessionLifecycleEvent,
+        invalidate_suspended_identity: bool,
+    ) -> crate::gateway::session_controller::GatewaySessionTransition {
         if self.is_stopped() {
             return crate::gateway::session_controller::GatewaySessionTransition::stopped();
         }
@@ -1249,8 +1265,12 @@ impl ClientCore {
             &event,
             crate::gateway::session_lifecycle::SessionLifecycleEvent::AuthFailed { .. }
                 | crate::gateway::session_lifecycle::SessionLifecycleEvent::NoStoredSession
-                | crate::gateway::session_lifecycle::SessionLifecycleEvent::Suspend
-        ) {
+        ) || invalidate_suspended_identity
+            && matches!(
+                &event,
+                crate::gateway::session_lifecycle::SessionLifecycleEvent::Suspend
+            )
+        {
             self.invalidate_session_authorization(endpoint_id);
         }
         let mut owner = self
@@ -1483,6 +1503,10 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        self.session_driver
+            .lock()
+            .expect("session driver poisoned")
+            .stop();
         // Wake lifecycle waiters without inventing a visible publication revision.
         self.publication_signal.send_modify(|_| {});
         self.onboarding
@@ -1764,6 +1788,7 @@ impl ClientCore {
     pub fn shared() -> Arc<Self> {
         let core = Arc::new(Self::new());
         core.initialize_navigation();
+        core.start_session_driver();
         core.start_administration_operation_controller();
         core.start_administration_controller();
         core.start_provider_runtime_controller();
@@ -2072,6 +2097,7 @@ impl ClientCore {
             );
         }
         match &intent {
+            ClientIntent::SessionDemand { demand } => return self.session_demand(demand.clone()),
             ClientIntent::Onboarding { intent } => return self.onboarding_intent(intent.clone()),
             ClientIntent::Settings { intent } => return self.settings_intent(intent.clone()),
             ClientIntent::SettingsModelPicker { intent } => {

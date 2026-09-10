@@ -6,13 +6,11 @@ use pioneer_client::{
 };
 fn runtime(core: Arc<ClientCore>) -> ClientFfiRuntime {
     ClientFfiRuntime {
-        active_thread: ClientFfiActiveThreadState::new(core.clone()),
-        client_runtime: ClientRuntimeCompatibility { core },
+        core,
         config: Default::default(),
         client_subscriptions: Default::default(),
-        active_connection_id: Default::default(),
-        legacy_authorization_generation: Default::default(),
-        legacy_authorization_change_sequence: Default::default(),
+        observed_scopes: Default::default(),
+
         diagnostics: Default::default(),
         avatar_cache: Default::default(),
     }

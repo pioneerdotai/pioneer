@@ -562,6 +562,7 @@ impl GatewaySessionController {
         endpoint_id: &str,
         event: SessionLifecycleEvent,
     ) -> GatewaySessionTransition {
+        let preserve_identity = matches!(event, SessionLifecycleEvent::Suspend);
         let release = matches!(event, SessionLifecycleEvent::NoStoredSession);
         let next_generation = self.next_generation;
         let lifecycle = self
@@ -582,7 +583,11 @@ impl GatewaySessionController {
             )
         {
             if let Some(connection) = self.connections.get_mut(endpoint_id) {
-                connection.invalidate();
+                if preserve_identity {
+                    connection.suspend_preserving_identity();
+                } else {
+                    connection.invalidate();
+                }
             }
             self.finish_transport_verification(endpoint_id, false);
         }

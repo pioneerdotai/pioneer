@@ -11,6 +11,14 @@ use pioneer_client::core::{
 pub const CLIENT_BINDING_SCHEMA_VERSION: u32 = 1;
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientScopeLeaseRequestDto {
+    pub schema_version: u32,
+    pub scope: ClientScope,
+}
+
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientIntentDispatchDto {
@@ -242,18 +250,6 @@ pub struct ClientTransportReserveRequestDto {
 pub struct ClientTransportLeaseRequestDto {
     pub schema_version: u32,
     pub lease_id: u64,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientAccessChangePlanRequestDto {
-    pub schema_version: u32,
-    pub connection_generation: u64,
-    pub change_sequence: u64,
-    pub active_workspace_id: Option<String>,
-    pub active_thread_id: Option<String>,
-    pub known_threads: Vec<pioneer_client::authorization::ThreadAuthorizationScope>,
 }
 
 /// Steady-state timeline delivery carries a header plus exact row changes.

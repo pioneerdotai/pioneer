@@ -262,7 +262,10 @@ impl crate::core::ClientCore {
             .snapshot(&crate::core::ClientScope::Navigation)
             .map(|p| p.revisions().scoped().get());
         let result = switch_workspace(
-            &self.compatibility_runtime().ws_command_sender(),
+            &self
+                .compatibility_runtime()
+                .ws_command_sender()
+                .requests_for_connection(connection.unwrap_or_default()),
             WorkspaceSwitchRequest {
                 workspace_id,
                 current_workspace_id: navigation.workspace_id().map(str::to_owned),
@@ -298,11 +301,48 @@ impl crate::core::ClientCore {
         }
         result
     }
+    /// Create and select is one shared workflow for either shell. The catalog
+    /// owns its RPC state; a replaced session or route cannot run the follow-up.
+    pub fn create_and_select_workspace(
+        &self,
+        name: String,
+    ) -> anyhow::Result<WorkspaceCreateResult> {
+        self.create_and_select_workspace_with_ports(
+            || self.create_workspace(name),
+            |workspace| self.switch_workspace(workspace).map(|_| ()),
+        )
+    }
+
+    fn create_and_select_workspace_with_ports(
+        &self,
+        create: impl FnOnce() -> anyhow::Result<WorkspaceCreateResult>,
+        select: impl FnOnce(String) -> anyhow::Result<()>,
+    ) -> anyhow::Result<WorkspaceCreateResult> {
+        let connection = self.gateway_http_generation();
+        let authorization = self.authorization_connection_generation();
+        let navigation = self.navigation_snapshot();
+        let result = create()?;
+        if let WorkspaceCreateResult::Created { reduction } = &result {
+            anyhow::ensure!(
+                !self.is_stopped()
+                    && self.gateway_http_generation() == connection
+                    && self.authorization_connection_generation() == authorization
+                    && self.navigation_snapshot().as_ref() == navigation.as_ref(),
+                "Workspace creation follow-up is stale"
+            );
+            select(reduction.switch_workspace_id.clone())?;
+        }
+        Ok(result)
+    }
+
     pub fn create_workspace(&self, name: String) -> anyhow::Result<WorkspaceCreateResult> {
         let (generation, connection, workspaces) =
             self.begin_workspace_action(super::catalog::WorkspaceCatalogOperation::Create)?;
         let result = create_workspace(
-            &self.compatibility_runtime().ws_command_sender(),
+            &self
+                .compatibility_runtime()
+                .ws_command_sender()
+                .requests_for_connection(connection.unwrap_or_default()),
             WorkspaceCreateRequest {
                 name,
                 workspaces,
@@ -329,7 +369,10 @@ impl crate::core::ClientCore {
         let (generation, connection, workspaces) =
             self.begin_workspace_action(super::catalog::WorkspaceCatalogOperation::Rename)?;
         let result = rename_workspace(
-            &self.compatibility_runtime().ws_command_sender(),
+            &self
+                .compatibility_runtime()
+                .ws_command_sender()
+                .requests_for_connection(connection.unwrap_or_default()),
             WorkspaceRenameRequest {
                 workspace_id,
                 name,
@@ -348,5 +391,78 @@ impl crate::core::ClientCore {
             result.as_ref().err().map(|e| format!("{e:#}")),
         )?;
         result
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use std::cell::Cell;
+    fn created() -> WorkspaceCreateResult {
+        WorkspaceCreateResult::Created {
+            reduction: super::super::actions::reduce_workspace_create_success(
+                vec![],
+                Workspace {
+                    id: "created".into(),
+                    name: "Created".into(),
+                    is_active: true,
+                    is_current: false,
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            ),
+        }
+    }
+    #[test]
+    fn shared_create_select_runs_once_and_skips_rejected_create() {
+        let core = crate::core::ClientCore::new();
+        let calls = Cell::new(0);
+        core.create_and_select_workspace_with_ports(
+            || Ok(created()),
+            |id| {
+                assert_eq!(id, "created");
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        for outcome in [
+            WorkspaceCreateResult::EmptyName,
+            WorkspaceCreateResult::Busy,
+        ] {
+            let actual = core
+                .create_and_select_workspace_with_ports(
+                    || Ok(outcome.clone()),
+                    |_| panic!("rejected creation cannot select"),
+                )
+                .unwrap();
+            assert_eq!(actual, outcome);
+        }
+    }
+    #[test]
+    fn replacement_during_create_never_selects_into_a_new_scope() {
+        for replace_session in [false, true] {
+            let core = crate::core::ClientCore::new();
+            let error = core
+                .create_and_select_workspace_with_ports(
+                    || {
+                        if replace_session {
+                            core.begin_authorization_epoch(Some(("replacement".into(), 2)));
+                        } else {
+                            core.navigate(
+                                crate::navigation::NavigationIntent::SelectWorkspace {
+                                    workspace_id: Some("other".into()),
+                                },
+                                None,
+                            );
+                        }
+                        Ok(created())
+                    },
+                    |_| panic!("stale create cannot select"),
+                )
+                .unwrap_err();
+            assert_eq!(error.to_string(), "Workspace creation follow-up is stale");
+        }
     }
 }

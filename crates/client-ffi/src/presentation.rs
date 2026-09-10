@@ -6,8 +6,7 @@ use pioneer_client::authorization::{
 };
 use pioneer_protocol::{
     AuthMeResponse, AuthSessionListItem, AuthorizationCapabilitySnapshot,
-    AuthorizationThreadCapabilities, AuthorizationWorkspaceCapabilities, InvitationSummary,
-    MemberSummary, WorkspaceId,
+    AuthorizationThreadCapabilities, AuthorizationWorkspaceCapabilities, MemberSummary,
 };
 use serde::Deserialize;
 
@@ -23,55 +22,11 @@ pub struct ClientArtifactPresentationPolicyRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(test, derive(serde::Serialize))]
-pub struct ClientAuthorizationProjectionAcceptRequest {
-    /// Exact native transport epoch that produced `snapshot`. Delayed
-    /// responses from a replaced Gateway connection must never advance the
-    /// projection store for the new connection.
-    pub gateway_id: String,
-    pub connection_id: u64,
-    pub expected_principal_id: pioneer_protocol::PrincipalId,
-    #[serde(default)]
-    pub workspace_id: Option<String>,
-    #[serde(default)]
-    pub thread_id: Option<String>,
-    pub snapshot: AuthorizationCapabilitySnapshot,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientAuthorizationProjectionAcceptResult {
-    pub acceptance: pioneer_client::authorization::AuthorizationProjectionAcceptance,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot: Option<AuthorizationCapabilitySnapshot>,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientExecutionDraftReconcileRequest {
-    pub draft: pioneer_client::composer::reconciliation::ExecutionDraftSelection,
-    pub policy: pioneer_protocol::AuthorizationExecutionDraftPolicyProjection,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ClientMemberPresentationRequest {
     pub auth: AuthMeResponse,
     pub capability_snapshot: AuthorizationCapabilitySnapshot,
     pub member: MemberSummary,
     pub is_workspace_member: bool,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientInvitationListRowRequest {
-    pub auth: AuthMeResponse,
-    pub capability_snapshot: AuthorizationCapabilitySnapshot,
-    pub invitation: InvitationSummary,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -83,31 +38,11 @@ pub struct ClientCurrentPrincipalPresentationRequest {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientThreadScopePresentationRequest {
-    pub auth: AuthMeResponse,
-    pub thread: pioneer_protocol::Thread,
-    pub capabilities: AuthorizationThreadCapabilities,
-    pub participants: pioneer_protocol::ThreadParticipantsResponse,
-    pub workspace_members: pioneer_protocol::WorkspaceMemberListResponse,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClientThreadCreateVisibilityRequest {
     pub capabilities: AuthorizationWorkspaceCapabilities,
     pub origin_kind: pioneer_protocol::ThreadOriginKind,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientThreadScopeMutationPlanRequest {
-    pub workspace_id: WorkspaceId,
-    pub thread_id: String,
-    pub action: pioneer_client::threads::scope::ThreadScopeAction,
 }
 
 pub fn principal_capabilities(
@@ -135,15 +70,6 @@ pub fn artifact_presentation_policy(
     )
 }
 
-pub fn reconcile_execution_draft(
-    request: ClientExecutionDraftReconcileRequest,
-) -> pioneer_client::composer::reconciliation::ExecutionDraftReconciliation {
-    pioneer_client::composer::reconciliation::reconcile_execution_draft(
-        &request.draft,
-        &request.policy,
-    )
-}
-
 pub fn current_principal(
     request: ClientCurrentPrincipalPresentationRequest,
 ) -> Result<CurrentPrincipalPresentation, String> {
@@ -162,44 +88,12 @@ pub fn session_list_row(item: AuthSessionListItem) -> SessionListRowPresentation
     session_list_row_presentation(&item)
 }
 
-pub fn thread_scope(
-    request: ClientThreadScopePresentationRequest,
-) -> pioneer_client::threads::scope::ThreadScopePresentation {
-    let participants = if request.participants.participants.is_empty() {
-        request
-            .participants
-            .participant_ids
-            .into_iter()
-            .map(|principal_id| pioneer_protocol::ThreadParticipantSummary { principal_id })
-            .collect::<Vec<_>>()
-    } else {
-        request.participants.participants
-    };
-    pioneer_client::threads::scope::thread_scope_presentation(
-        &request.thread,
-        Some(&request.auth.principal.id),
-        thread_presentation_capabilities(Some(&request.capabilities)),
-        &participants,
-        &request.workspace_members.members,
-    )
-}
-
 pub fn thread_create_visibility(
     request: ClientThreadCreateVisibilityRequest,
 ) -> pioneer_client::threads::scope::ThreadCreateVisibilityPlan {
     pioneer_client::threads::scope::thread_create_visibility_plan(
         Some(&request.capabilities),
         request.origin_kind,
-    )
-}
-
-pub fn thread_scope_mutation_plan(
-    request: ClientThreadScopeMutationPlanRequest,
-) -> pioneer_client::threads::scope::ThreadScopeMutationPlan {
-    pioneer_client::threads::scope::plan_thread_scope_action(
-        request.workspace_id,
-        request.thread_id,
-        request.action,
     )
 }
 
@@ -213,13 +107,6 @@ pub fn member_presentation(
         capabilities,
         request.is_workspace_member,
     )
-}
-
-pub fn invitation_list_row(
-    request: ClientInvitationListRowRequest,
-) -> pioneer_client::administration::InvitationListRow {
-    let capabilities = capabilities_for_auth(&request.auth, &request.capability_snapshot);
-    pioneer_client::administration::invitation_list_row(&request.invitation, capabilities)
 }
 
 fn capabilities_for_auth(
@@ -399,37 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn invitation_row_bridge_delegates_status_and_capability_policy() {
-        let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let row = invitation_list_row(ClientInvitationListRowRequest {
-            capability_snapshot: capability_snapshot(&auth, false),
-            auth,
-            invitation: InvitationSummary {
-                invitation_id: pioneer_protocol::InvitationId::new("IAAAAAAAAAAAAAAAAAAAA")
-                    .unwrap(),
-                role_key: RoleKey::member(),
-                status: pioneer_protocol::InvitationStatus::Pending,
-                revoke_reason: None,
-                inviter: pioneer_protocol::InvitationInviterSummary {
-                    principal_id: PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
-                    kind: PrincipalKind::User,
-                    display_name: "Alice".to_owned(),
-                    nickname: "alice".to_owned(),
-                },
-                workspaces: Vec::new(),
-                created_at_unix: 1,
-                expires_at_unix: 2,
-                terminal_at_unix: None,
-            },
-        });
-        assert_eq!(
-            row.status,
-            pioneer_client::administration::InvitationPresentationStatus::Pending
-        );
-        assert!(row.can_revoke);
-    }
-
-    #[test]
     fn thread_create_visibility_bridge_uses_shared_fail_closed_plan() {
         let capabilities = AuthorizationWorkspaceCapabilities {
             can_read: true,
@@ -480,24 +336,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_scope_mutation_bridge_preserves_exact_shared_refetch_plan() {
-        let plan = thread_scope_mutation_plan(ClientThreadScopeMutationPlanRequest {
-            workspace_id: pioneer_protocol::WorkspaceId::new("WAAAAAAAAAAAAAAAAAAAA").unwrap(),
-            thread_id: "thread-a".to_owned(),
-            action: pioneer_client::threads::scope::ThreadScopeAction::AddParticipant {
-                principal_id: PrincipalId::new("PBBBBBBBBBBBBBBBBBBBB").unwrap(),
-            },
-        });
-        assert_eq!(
-            plan.refetch,
-            vec![
-                pioneer_client::threads::scope::ThreadScopeRefetch::Participants,
-                pioneer_client::threads::scope::ThreadScopeRefetch::Thread,
-            ]
-        );
-    }
-
-    #[test]
     fn current_principal_uses_only_the_coherent_server_manifest() {
         let mut auth = auth(PrincipalKind::User, Some(RoleKey::member()));
         auth.principal.avatar_revision = Some("avatar-2".to_owned());
@@ -526,105 +364,5 @@ mod tests {
         })
         .expect_err("mismatched manifest must fail closed");
         assert_eq!(error, "authorization capability principal mismatch");
-    }
-
-    #[test]
-    fn authorization_projection_rejects_a_delayed_previous_connection_epoch() {
-        let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let runtime = crate::ClientFfiRuntime::default();
-        runtime
-            .client_runtime
-            .core
-            .begin_authorization_epoch(Some(("gateway-new".into(), 12)));
-        let result = runtime
-            .authorization_projection_accept(
-                &serde_json::to_string(&ClientAuthorizationProjectionAcceptRequest {
-                    gateway_id: "gateway-old".to_owned(),
-                    connection_id: 11,
-                    expected_principal_id: auth.principal.id.clone(),
-                    workspace_id: Some("workspace-a".to_owned()),
-                    thread_id: None,
-                    snapshot: capability_snapshot(&auth, false),
-                })
-                .unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            result.acceptance,
-            pioneer_client::authorization::AuthorizationProjectionAcceptance::Incompatible
-        );
-        assert!(result.snapshot.is_none());
-        assert_eq!(runtime.client_runtime.core.authorization_revision(), None);
-    }
-
-    #[test]
-    fn authorization_projection_accepts_only_the_exact_active_connection_epoch() {
-        let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let runtime = crate::ClientFfiRuntime::default();
-        runtime
-            .client_runtime
-            .core
-            .begin_authorization_epoch(Some(("gateway-a".into(), 12)));
-        let result = runtime
-            .authorization_projection_accept(
-                &serde_json::to_string(&ClientAuthorizationProjectionAcceptRequest {
-                    gateway_id: "gateway-a".to_owned(),
-                    connection_id: 12,
-                    expected_principal_id: auth.principal.id.clone(),
-                    workspace_id: Some("workspace-a".to_owned()),
-                    thread_id: None,
-                    snapshot: capability_snapshot(&auth, false),
-                })
-                .unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            result.acceptance,
-            pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
-        );
-        assert!(result.snapshot.is_some());
-        assert_eq!(
-            runtime.client_runtime.core.authorization_revision(),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn authorization_projection_accepts_a_missing_thread_as_an_authoritative_deny() {
-        let auth = auth(PrincipalKind::User, Some(RoleKey::member()));
-        let runtime = crate::ClientFfiRuntime::default();
-        runtime
-            .client_runtime
-            .core
-            .begin_authorization_epoch(Some(("gateway-a".into(), 12)));
-        let result = runtime
-            .authorization_projection_accept(
-                &serde_json::to_string(&ClientAuthorizationProjectionAcceptRequest {
-                    gateway_id: "gateway-a".to_owned(),
-                    connection_id: 12,
-                    expected_principal_id: auth.principal.id.clone(),
-                    workspace_id: Some("workspace-a".to_owned()),
-                    thread_id: Some("thread-a".to_owned()),
-                    // The Gateway response is workspace-scoped only. It must not
-                    // satisfy a thread-scoped Mobile query.
-                    snapshot: capability_snapshot(&auth, false),
-                })
-                .unwrap(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            result.acceptance,
-            pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
-        );
-        let snapshot = result.snapshot.expect("negative thread projection");
-        assert!(snapshot.workspace.is_some());
-        assert!(snapshot.thread.is_none());
-        assert_eq!(
-            runtime.client_runtime.core.authorization_revision(),
-            Some(7)
-        );
     }
 }

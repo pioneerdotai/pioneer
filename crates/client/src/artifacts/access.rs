@@ -249,6 +249,38 @@ fn map_download_error(error: ArtifactHttpDownloadError) -> ArtifactAccessError {
 }
 
 impl crate::core::ClientCore {
+    pub fn download_artifact_action(
+        self: &Arc<Self>,
+        identity: &super::workflow::ArtifactActionIdentity,
+        operation_id: String,
+        runtime_home: PathBuf,
+    ) -> Result<(String, ArtifactHttpDownloadResult), ArtifactAccessError> {
+        self.with_artifact_authentication_retry(|| {
+            self.download_artifact_action_once(identity, operation_id.clone(), runtime_home.clone())
+        })
+    }
+    fn with_artifact_authentication_retry<T>(
+        &self,
+        mut operation: impl FnMut() -> Result<T, ArtifactAccessError>,
+    ) -> Result<T, ArtifactAccessError> {
+        let generation = self.gateway_http_generation();
+        let endpoint = self
+            .gateway_registry()
+            .and_then(|registry| registry.active_gateway_id.clone());
+        let authorization = self.authorization_connection_generation();
+        retry_artifact_authentication(&mut operation, || {
+            let (Some(generation), Some(endpoint)) = (generation, endpoint.as_deref()) else {
+                return false;
+            };
+            !self.is_stopped()
+                && self.authorization_connection_generation() == authorization
+                && self
+                    .refresh_configured_gateway_session_after_unauthorized(endpoint, generation)
+                    .is_ok()
+                && self.authorization_connection_generation() == authorization
+        })
+    }
+
     pub fn prepare_artifact_action_view(
         &self,
         identity: &super::workflow::ArtifactActionIdentity,
@@ -290,7 +322,7 @@ impl crate::core::ClientCore {
         }
     }
 
-    pub fn download_artifact_action(
+    fn download_artifact_action_once(
         self: &Arc<Self>,
         identity: &super::workflow::ArtifactActionIdentity,
         operation_id: String,
@@ -344,5 +376,98 @@ impl crate::core::ClientCore {
                 }
             }
         }
+    }
+}
+
+// Only an explicit authentication rejection is safe to replay; ambiguous
+// transport errors and non-idempotent view grant creation are never retried.
+fn retry_artifact_authentication<T>(
+    mut operation: impl FnMut() -> Result<T, ArtifactAccessError>,
+    recover: impl FnOnce() -> bool,
+) -> Result<T, ArtifactAccessError> {
+    let first = operation();
+    if first
+        .as_ref()
+        .is_err_and(|error| error.code() == ARTIFACT_AUTHENTICATION_CODE)
+        && recover()
+    {
+        operation()
+    } else {
+        first
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn authentication_recovery_replays_once_and_preserves_terminal_error() {
+        let calls = Cell::new(0);
+        let refreshes = Cell::new(0);
+        let result = retry_artifact_authentication(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(ArtifactAccessError::new(
+                        "rejected",
+                        ARTIFACT_AUTHENTICATION_CODE,
+                    ))
+                } else {
+                    Ok("verified file")
+                }
+            },
+            || {
+                refreshes.set(refreshes.get() + 1);
+                true
+            },
+        );
+        assert_eq!(result.unwrap(), "verified file");
+        assert_eq!((calls.get(), refreshes.get()), (2, 1));
+        calls.set(0);
+        let result = retry_artifact_authentication::<()>(
+            || {
+                calls.set(calls.get() + 1);
+                Err(ArtifactAccessError::new(
+                    "rejected",
+                    ARTIFACT_AUTHENTICATION_CODE,
+                ))
+            },
+            || true,
+        );
+        assert_eq!(result.unwrap_err().code(), ARTIFACT_AUTHENTICATION_CODE);
+        assert_eq!(calls.get(), 2);
+    }
+    #[test]
+    fn cancellation_revoke_and_ambiguous_transport_failures_never_replay() {
+        for code in [
+            "artifact_download_cancelled",
+            "artifact_revoked_or_unavailable",
+            "transport_failed",
+        ] {
+            let calls = Cell::new(0);
+            let result = retry_artifact_authentication::<()>(
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(ArtifactAccessError::new("failure", code))
+                },
+                || panic!("non-authentication failures must not refresh"),
+            );
+            assert_eq!(result.unwrap_err().code(), code);
+            assert_eq!(calls.get(), 1);
+        }
+        let calls = Cell::new(0);
+        let result = retry_artifact_authentication::<()>(
+            || {
+                calls.set(calls.get() + 1);
+                Err(ArtifactAccessError::new(
+                    "rejected",
+                    ARTIFACT_AUTHENTICATION_CODE,
+                ))
+            },
+            || false,
+        );
+        assert_eq!(result.unwrap_err().code(), ARTIFACT_AUTHENTICATION_CODE);
+        assert_eq!(calls.get(), 1);
     }
 }

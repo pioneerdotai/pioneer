@@ -1,34 +1,15 @@
-use pioneer_client::composer::turn_prepare::{
-    mark_pending_composer_attachments_uploading, mark_uploading_composer_attachments_failed,
-};
 use pioneer_client::composer::{
-    attachments::{
-        ComposerAttachment, ComposerAttachmentKind, composer_attachment_from_path,
-        composer_attachment_has_path, remove_composer_attachment_at,
-    },
+    attachments::{ComposerAttachment, ComposerAttachmentKind, composer_attachment_from_path},
     capabilities::{
         ComposerCapability, ComposerCapabilityMenuVisibility, ComposerCapabilityTarget,
         ComposerSubmissionPlan, SelectableMcpCapability, SelectableSkillCapability,
-        add_composer_capability, composer_capability_menu_visibility,
-        composer_capability_target_for_provider, filter_search_mcp_tool_capability_rows,
-        filter_selectable_mcp_capability_rows, filter_selectable_skill_capabilities_for_target,
-        filter_selectable_skill_capability_rows, mcp_row_to_composer_capability,
-        plan_composer_submission, remove_composer_capability_at,
-        replace_selected_mcp_composer_capabilities, selected_mcp_server_ids,
-        toggle_mcp_capability_selection, toggle_selected_capability_key,
-    },
-    draft::{
-        ComposerDraftLifecycleAction, ComposerDraftLifecycleState,
-        ComposerDraftLifecycleTransition, reduce_composer_draft_lifecycle,
-    },
-    state_machine::{
-        ComposerDomainAction, ComposerDomainState, ComposerDomainTransition,
-        reduce_composer_domain_state,
+        composer_capability_menu_visibility, composer_capability_target_for_provider,
+        filter_selectable_skill_capabilities_for_target, plan_composer_submission,
     },
 };
 use pioneer_protocol::RuntimeSummary;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::Path};
+use std::path::Path;
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -39,31 +20,6 @@ pub struct ClientComposerAttachmentFromPathRequest {
     pub file_name: Option<String>,
     #[serde(default)]
     pub kind: Option<ComposerAttachmentKind>,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerAttachmentsUpdateRequest {
-    pub attachments: Vec<ComposerAttachment>,
-    pub action: ClientComposerAttachmentsUpdateAction,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub enum ClientComposerAttachmentsUpdateAction {
-    Add { attachment: ComposerAttachment },
-    RemoveAt { index: usize },
-    MarkPendingUploading,
-    MarkUploadingFailed { error: String },
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerCapabilitiesUpdateRequest {
-    pub capabilities: Vec<ComposerCapability>,
-    pub action: ClientComposerCapabilitiesUpdateAction,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -100,90 +56,10 @@ pub struct ClientComposerSubmissionPlanRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ClientComposerDomainTransitionRequest {
-    pub state: ComposerDomainState,
-    pub action: ComposerDomainAction,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerDraftLifecycleTransitionRequest {
-    pub state: ComposerDraftLifecycleState,
-    pub action: ComposerDraftLifecycleAction,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ClientComposerSkillRowsForTargetRequest {
     #[serde(default)]
     pub rows: Vec<SelectableSkillCapability>,
     pub target: ComposerCapabilityTarget,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub enum ClientComposerCapabilitiesUpdateAction {
-    Add { capability: ComposerCapability },
-    Remove { id: String },
-    RemoveAt { index: usize },
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerSkillCapabilityFromRowRequest {
-    pub row: SelectableSkillCapability,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerMcpCapabilityFromRowRequest {
-    pub row: SelectableMcpCapability,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerMcpToggleRequest {
-    pub capabilities: Vec<ComposerCapability>,
-    pub selected_keys: Vec<String>,
-    pub server_rows: Vec<SelectableMcpCapability>,
-    pub tool_rows: Vec<SelectableMcpCapability>,
-    pub row: SelectableMcpCapability,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ClientComposerMcpToggleResult {
-    pub capabilities: Vec<ComposerCapability>,
-    pub selected_keys: Vec<String>,
-    pub collapse_active_server: bool,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerSkillToggleRequest {
-    pub selected_keys: Vec<String>,
-    pub key: String,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ClientComposerSkillToggleResult {
-    pub selected_keys: Vec<String>,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientComposerFilterSkillRowsRequest {
-    pub rows: Vec<SelectableSkillCapability>,
-    #[serde(default)]
-    pub query: String,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -222,54 +98,6 @@ pub fn composer_attachment_from_path_request(
     Ok(attachment)
 }
 
-pub fn update_composer_attachments(
-    mut request: ClientComposerAttachmentsUpdateRequest,
-) -> Vec<ComposerAttachment> {
-    match request.action {
-        ClientComposerAttachmentsUpdateAction::Add { attachment } => {
-            if !composer_attachment_has_path(
-                request.attachments.as_slice(),
-                attachment.path.as_str(),
-            ) {
-                request.attachments.push(attachment);
-            }
-        }
-        ClientComposerAttachmentsUpdateAction::RemoveAt { index } => {
-            remove_composer_attachment_at(&mut request.attachments, index);
-        }
-        ClientComposerAttachmentsUpdateAction::MarkPendingUploading => {
-            mark_pending_composer_attachments_uploading(&mut request.attachments);
-        }
-        ClientComposerAttachmentsUpdateAction::MarkUploadingFailed { error } => {
-            mark_uploading_composer_attachments_failed(&mut request.attachments, error);
-        }
-    }
-    request.attachments
-}
-
-pub fn update_composer_capabilities(
-    mut request: ClientComposerCapabilitiesUpdateRequest,
-) -> Vec<ComposerCapability> {
-    match request.action {
-        ClientComposerCapabilitiesUpdateAction::Add { capability } => {
-            add_composer_capability(&mut request.capabilities, capability);
-        }
-        ClientComposerCapabilitiesUpdateAction::Remove { id } => {
-            if let Some(index) = request
-                .capabilities
-                .iter()
-                .position(|capability| capability.id == id)
-            {
-                remove_composer_capability_at(&mut request.capabilities, index);
-            }
-        }
-        ClientComposerCapabilitiesUpdateAction::RemoveAt { index } => {
-            remove_composer_capability_at(&mut request.capabilities, index);
-        }
-    }
-    request.capabilities
-}
-
 pub fn composer_capability_target(
     request: ClientComposerCapabilityTargetRequest,
 ) -> ComposerCapabilityTarget {
@@ -296,158 +124,23 @@ pub fn composer_submission_plan(
     )
 }
 
-pub fn composer_domain_transition(
-    request: ClientComposerDomainTransitionRequest,
-) -> ComposerDomainTransition {
-    reduce_composer_domain_state(&request.state, request.action)
-}
-
-#[cfg(test)]
-mod identity_tests {
-    use super::*;
-
-    #[test]
-    fn attachment_identity_intent_matches_direct_rust_after_reorder() {
-        let state = ComposerDomainState {
-            attachments: ["inserted", "first", "target"]
-                .into_iter()
-                .map(|name| ComposerAttachment {
-                    path: format!("/synthetic/{name}.txt"),
-                    file_name: format!("{name}.txt"),
-                    kind: pioneer_client::composer::attachments::ComposerAttachmentKind::File,
-                    upload_state:
-                        pioneer_client::composer::attachments::ComposerAttachmentUploadState::Local,
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let action = ComposerDomainAction::RemoveAttachment {
-            path: "/synthetic/target.txt".into(),
-        };
-        let wire = serde_json::json!({ "state": state, "action": action });
-        let adapted = composer_domain_transition(serde_json::from_value(wire).unwrap());
-        let direct = reduce_composer_domain_state(&state, action.clone());
-        assert_eq!(adapted, direct);
-        assert_eq!(
-            adapted
-                .state
-                .attachments
-                .iter()
-                .map(|a| a.file_name.as_str())
-                .collect::<Vec<_>>(),
-            ["inserted.txt", "first.txt"]
-        );
-        let duplicate = composer_domain_transition(ClientComposerDomainTransitionRequest {
-            state: adapted.state,
-            action,
-        });
-        assert!(!duplicate.changed);
-    }
-}
-
-pub fn composer_draft_lifecycle_transition(
-    request: ClientComposerDraftLifecycleTransitionRequest,
-) -> ComposerDraftLifecycleTransition {
-    reduce_composer_draft_lifecycle(&request.state, request.action)
-}
-
 pub fn composer_skill_rows_for_target(
     request: ClientComposerSkillRowsForTargetRequest,
 ) -> Vec<SelectableSkillCapability> {
     filter_selectable_skill_capabilities_for_target(request.rows.as_slice(), request.target)
 }
 
-pub fn skill_capability_from_row(
-    request: ClientComposerSkillCapabilityFromRowRequest,
-) -> ComposerCapability {
-    ComposerCapability {
-        id: pioneer_protocol::skill_capability_key(&request.row.skill_id),
-        label: request.row.label,
-        kind: pioneer_client::composer::capabilities::ComposerCapabilityKind::Skill {
-            skill_id: request.row.skill_id,
-            owner: request.row.owner,
-            slug: request.row.slug,
-            source_kind: request.row.source_kind,
-        },
-    }
-}
-
-pub fn mcp_capability_from_row(
-    request: ClientComposerMcpCapabilityFromRowRequest,
-) -> ComposerCapability {
-    mcp_row_to_composer_capability(request.row)
-}
-
-pub fn toggle_skill_picker_selection(
-    request: ClientComposerSkillToggleRequest,
-) -> ClientComposerSkillToggleResult {
-    let mut selected = request.selected_keys.into_iter().collect::<HashSet<_>>();
-    toggle_selected_capability_key(&mut selected, request.key.as_str());
-    ClientComposerSkillToggleResult {
-        selected_keys: sorted_keys(selected),
-    }
-}
-
-pub fn toggle_mcp_picker_selection(
-    request: ClientComposerMcpToggleRequest,
-) -> ClientComposerMcpToggleResult {
-    let mut selected = request.selected_keys.into_iter().collect::<HashSet<_>>();
-    let update = toggle_mcp_capability_selection(
-        &mut selected,
-        request.server_rows.as_slice(),
-        request.tool_rows.as_slice(),
-        &request.row,
-    );
-
-    let capabilities = replace_selected_mcp_composer_capabilities(
-        request.capabilities.as_slice(),
-        request.server_rows.as_slice(),
-        request.tool_rows.as_slice(),
-        &selected,
-    );
-
-    ClientComposerMcpToggleResult {
-        capabilities,
-        selected_keys: sorted_keys(selected),
-        collapse_active_server: update.collapse_active_server,
-    }
-}
-
-pub fn filter_skill_picker_rows(
-    request: ClientComposerFilterSkillRowsRequest,
-) -> Vec<SelectableSkillCapability> {
-    filter_selectable_skill_capability_rows(request.rows.as_slice(), request.query.as_str())
-}
-
 pub fn filter_mcp_picker_rows(
     request: ClientComposerFilterMcpRowsRequest,
 ) -> ClientComposerFilterMcpRowsResult {
-    let selected = request.selected_keys.into_iter().collect::<HashSet<_>>();
-    let selected_server_ids = selected_mcp_server_ids(request.server_rows.as_slice(), &selected);
-    let query = request.query;
-    let has_query = !query.trim().is_empty();
-    let server_rows =
-        filter_selectable_mcp_capability_rows(request.server_rows.as_slice(), query.as_str());
-    let tool_rows = if has_query {
-        filter_search_mcp_tool_capability_rows(
-            request.tool_rows.as_slice(),
-            &selected_server_ids,
-            query.as_str(),
-        )
-    } else if request
-        .active_server_id
-        .as_deref()
-        .is_some_and(|server_id| selected_server_ids.contains(server_id))
-    {
-        Vec::new()
-    } else {
-        pioneer_client::composer::capabilities::filter_active_mcp_tool_capability_rows(
-            request.tool_rows.as_slice(),
+    let (server_rows, tool_rows, has_query) =
+        pioneer_client::composer::capabilities::project_mcp_picker_rows(
+            &request.server_rows,
+            &request.tool_rows,
+            &request.selected_keys,
             request.active_server_id.as_deref(),
-            query.as_str(),
-        )
-    };
-
+            &request.query,
+        );
     ClientComposerFilterMcpRowsResult {
         server_rows,
         tool_rows,
@@ -482,15 +175,10 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
-fn sorted_keys(keys: HashSet<String>) -> Vec<String> {
-    let mut keys = keys.into_iter().collect::<Vec<_>>();
-    keys.sort();
-    keys
-}
-
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+    use pioneer_client::composer::state_machine::{ComposerDomainAction, ComposerDomainState};
     use pioneer_client::{
         composer::store::ComposerIntent,
         core::{ClientCore, ClientIntent, ClientScope},
@@ -503,7 +191,7 @@ mod publication_tests {
         let direct = ClientCore::shared();
         let ffi = crate::ClientFfiRuntime::default();
         ffi.initialize(r#"{"platform":"ios"}"#).unwrap();
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             let thread: Thread = serde_json::from_value(serde_json::json!({
                 "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"provider",
                 "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
@@ -549,7 +237,7 @@ mod publication_tests {
                     },
                 );
         }
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             core.apply_pending_requests(PendingRequestsReduction::Opened(
                 PendingRequest::from_cli_runtime_opened_notification(
                     CLIRuntimeRequestOpenedNotification {
@@ -575,11 +263,7 @@ mod publication_tests {
             direct.approval_action_intent(intent.clone());
             ffi.client_intent_dispatch(&serde_json::json!({"schema_version":1,"intent":{"kind":"approval_action","intent":intent}}).to_string()).unwrap();
             let expected = direct.approval_action_snapshot("a", "request").unwrap();
-            let actual = ffi
-                .client_runtime
-                .core
-                .approval_action_snapshot("a", "request")
-                .unwrap();
+            let actual = ffi.core.approval_action_snapshot("a", "request").unwrap();
             assert_eq!(
                 serde_json::to_value(&expected).unwrap(),
                 serde_json::to_value(&actual).unwrap()
@@ -626,7 +310,7 @@ mod publication_tests {
         let direct = ClientCore::shared();
         let ffi = crate::ClientFfiRuntime::default();
         ffi.initialize(r#"{"platform":"ios"}"#).unwrap();
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             let thread: Thread = serde_json::from_value(serde_json::json!({
                 "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"provider",
                 "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
@@ -676,7 +360,7 @@ mod publication_tests {
             direct.composer_intent(intent.clone());
             ffi.client_intent_dispatch(&serde_json::json!({"schema_version":1,"intent":{"kind":"composer","intent":intent}}).to_string()).unwrap();
             let expected = direct.composer_snapshot("a").unwrap();
-            let actual = ffi.client_runtime.core.composer_snapshot("a").unwrap();
+            let actual = ffi.core.composer_snapshot("a").unwrap();
             assert_eq!(
                 serde_json::to_value(&expected).unwrap(),
                 serde_json::to_value(&actual).unwrap()
@@ -748,14 +432,14 @@ mod publication_tests {
                 "id": "turn", "status": "Completed", "permission_profile": default_turn_permission_profile_snapshot()
             }]
         })).unwrap();
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             core.upsert_thread(thread.clone());
         }
         let dispatch = |intent: ComposerIntent| {
             direct.composer_intent(intent.clone());
             ffi.client_intent_dispatch(&serde_json::json!({"schema_version": 1, "intent": {"kind": "composer", "intent": intent}}).to_string()).unwrap();
             let expected = direct.composer_snapshot("a").unwrap();
-            let actual = ffi.client_runtime.core.composer_snapshot("a").unwrap();
+            let actual = ffi.core.composer_snapshot("a").unwrap();
             assert_eq!(
                 serde_json::to_value(&expected).unwrap(),
                 serde_json::to_value(&actual).unwrap()
@@ -1001,6 +685,10 @@ mod publication_tests {
             };
             subscriptions
                 .push(direct.subscribe(scope.clone(), std::num::NonZeroUsize::new(64).unwrap()));
+            ffi.client_scope_acquire(
+                &serde_json::json!({"schema_version":1,"scope":scope}).to_string(),
+            )
+            .unwrap();
             ffi.client_scoped_snapshot(
                 &serde_json::json!({"schema_version":1,"scope":scope}).to_string(),
             )
@@ -1229,6 +917,15 @@ mod publication_tests {
         crate::ClientFfiRuntime,
         Vec<pioneer_client::core::ClientSubscription>,
     ) {
+        shared_message_fixture_with_workers(true)
+    }
+    fn shared_message_fixture_with_workers(
+        workers: bool,
+    ) -> (
+        std::sync::Arc<ClientCore>,
+        crate::ClientFfiRuntime,
+        Vec<pioneer_client::core::ClientSubscription>,
+    ) {
         use pioneer_protocol::*;
         let auth = AuthMeResponse {
             gateway: AuthGatewaySnapshot {
@@ -1258,11 +955,18 @@ mod publication_tests {
             },
             role_key: None,
         };
-        let direct = ClientCore::shared();
-        let ffi = crate::ClientFfiRuntime::default();
+        let direct = if workers {
+            ClientCore::shared()
+        } else {
+            std::sync::Arc::new(ClientCore::new())
+        };
+        let mut ffi = crate::ClientFfiRuntime::default();
+        if !workers {
+            ffi.core = std::sync::Arc::new(ClientCore::new());
+        }
         ffi.initialize(r#"{"platform":"ios"}"#).unwrap();
         let mut leases = Vec::new();
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             pioneer_client::core::ClientMutationAuthority::for_test()
                 .accept_identity_for_test(core, auth.clone())
                 .unwrap();
@@ -1367,7 +1071,7 @@ mod publication_tests {
             },
             ..Default::default()
         };
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             authority.accept_thread_capabilities_for_test(
                 core,
                 AuthorizationCapabilitySnapshot {
@@ -1419,7 +1123,7 @@ mod publication_tests {
             });
         }
 
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             let mut source = core.existing_thread_mutation("a").unwrap();
             source
                 .conversation
@@ -1454,7 +1158,7 @@ mod publication_tests {
                 serde_json::to_value(actual.outcome).unwrap()
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while [&direct, &ffi.client_runtime.core].iter().any(|core| {
+            while [&direct, &ffi.core].iter().any(|core| {
                 core.turn_cancellation_snapshot("a")
                     .is_some_and(|p| p.state == TurnCancellationState::Pending)
             }) && std::time::Instant::now() < deadline
@@ -1479,7 +1183,7 @@ mod publication_tests {
             );
             assert_eq!(
                 direct.composer_snapshot("a"),
-                ffi.client_runtime.core.composer_snapshot("a")
+                ffi.core.composer_snapshot("a")
             );
             assert_eq!(
                 direct
@@ -1490,8 +1194,7 @@ mod publication_tests {
                 "running"
             );
             assert_eq!(
-                ffi.client_runtime
-                    .core
+                ffi.core
                     .thread_coordinator_snapshot("a")
                     .unwrap()
                     .conversation
@@ -1505,9 +1208,10 @@ mod publication_tests {
         use pioneer_client::composer::model_picker::*;
         use pioneer_client::core::ClientMutationAuthority;
         use pioneer_protocol::*;
-        let (direct, ffi, _leases) = shared_message_fixture();
+        let (direct, ffi, _leases) = shared_message_fixture_with_workers(false);
         let authority = ClientMutationAuthority::for_test();
         let resources = AuthorizationOperationalResourceProjection {
+            fingerprint: "resources".into(),
             provider_models_all: true,
             cli_models_all: true,
             cli_runtimes: AuthorizationResourceSelector {
@@ -1528,46 +1232,56 @@ mod publication_tests {
             },
             ..Default::default()
         };
-        for core in [&direct, &ffi.client_runtime.core] {
-            authority.accept_thread_capabilities_for_test(
-                core,
-                AuthorizationCapabilitySnapshot {
-                    schema_version: AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
-                    authorization_revision: 1,
-                    principal_id: PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
-                    role_key: "member".into(),
-                    role: AuthorizationRolePresentation {
-                        key: "member".into(),
-                        display_name: "Synthetic".into(),
-                        description: String::new(),
-                        built_in: false,
-                    },
-                    global: Default::default(),
-                    workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
-                        workspace_id: "ws".into(),
-                        capabilities: AuthorizationWorkspaceCapabilities {
-                            can_use_providers: true,
-                            can_use_cli_runtimes: true,
-                            can_use_skills: true,
-                            can_use_mcp: true,
-                            ..Default::default()
-                        },
-                        operational_resources: resources.clone(),
-                        execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
-                            fingerprint: "policy".into(),
-                            resources: resources.clone(),
-                            permission_options: vec![],
-                            can_attach_artifacts: false,
-                            mcp_invocation_limits: Default::default(),
-                        },
-                    }),
-                    thread: Some(AuthorizationThreadCapabilitySnapshot {
-                        workspace_id: "ws".into(),
-                        thread_id: "a".into(),
-                        capabilities: Default::default(),
-                    }),
+        for core in [&direct, &ffi.core] {
+            let capabilities = AuthorizationCapabilitySnapshot {
+                schema_version: AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
+                authorization_revision: 1,
+                principal_id: PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                role_key: "member".into(),
+                role: AuthorizationRolePresentation {
+                    key: "member".into(),
+                    display_name: "Synthetic".into(),
+                    description: String::new(),
+                    built_in: false,
                 },
+                global: Default::default(),
+                workspace: Some(AuthorizationWorkspaceCapabilitySnapshot {
+                    workspace_id: "ws".into(),
+                    capabilities: AuthorizationWorkspaceCapabilities {
+                        can_use_providers: true,
+                        can_use_cli_runtimes: true,
+                        can_use_skills: true,
+                        can_use_mcp: true,
+                        ..Default::default()
+                    },
+                    operational_resources: resources.clone(),
+                    execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                        fingerprint: "policy".into(),
+                        resources: resources.clone(),
+                        permission_options: vec![],
+                        can_attach_artifacts: false,
+                        mcp_invocation_limits: Default::default(),
+                    },
+                }),
+                thread: Some(AuthorizationThreadCapabilitySnapshot {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    capabilities: Default::default(),
+                }),
+            };
+            let thread = core
+                .thread_coordinator_snapshot("a")
+                .unwrap()
+                .thread()
+                .unwrap()
+                .clone();
+            let (generation, connection) = core.current_auth_ticket();
+            assert_eq!(
+                core.accept_authorization_projection(generation, connection, capabilities.clone()),
+                pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
             );
+            core.upsert_thread(thread);
+            authority.accept_thread_capabilities_for_test(core, capabilities);
             core.composer_intent(ComposerIntent::Open {
                 thread_id: "a".into(),
                 defaults: ComposerDomainState {
@@ -1593,18 +1307,12 @@ mod publication_tests {
             draft_id,
             deferred: false,
         });
-        for core in [&direct, &ffi.client_runtime.core] {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while core
-                .composer_model_picker_snapshot("a")
-                .unwrap()
-                .providers_request
-                .state
-                == pioneer_client::composer::catalog::ComposerCatalogRequestState::Loading
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+        for core in [&direct, &ffi.core] {
+            core.provider_runtime_intent(
+                pioneer_client::providers::runtime::ProviderRuntimeIntent::Observe {
+                    workspace_id: "ws".into(),
+                },
+            );
             authority.accept_composer_runtime_for_test(
                 core,
                 "a",
@@ -1661,7 +1369,7 @@ mod publication_tests {
         });
         assert_eq!(
             direct.composer_snapshot("a"),
-            ffi.client_runtime.core.composer_snapshot("a")
+            ffi.core.composer_snapshot("a")
         );
         assert_eq!(
             direct
@@ -1725,7 +1433,7 @@ mod publication_tests {
         let skill: SkillListItem = serde_json::from_value(serde_json::json!({
             "skill_id":"AAAAAAAAAAAAAAAAAAAAA", "owner":null, "slug":"alpha", "source_kind":"user", "display_name":"Alpha", "description":"Synthetic skill", "version":null,"fingerprint":"skill", "trust_level":"community", "install":{"managed":true,"installed":true,"lifecycle_editable":true,"install_path":null,"updated_at":null}, "policy":{"enabled":true,"allow_implicit_invocation":true,"allow_implicit_invocation_editable":true}, "health":{"status":"ok","dependency_failures":[],"security_blocks":[],"validation_issues":[]},"status":"active","status_reason":null
         })).unwrap();
-        for core in [&direct, &ffi.client_runtime.core] {
+        for core in [&direct, &ffi.core] {
             authority.accept_thread_capabilities_for_test(
                 core,
                 AuthorizationCapabilitySnapshot {
@@ -1795,7 +1503,7 @@ mod publication_tests {
                 serde_json::to_value(actual.outcome).unwrap()
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while [&direct, &ffi.client_runtime.core].iter().any(|core| {
+            while [&direct, &ffi.core].iter().any(|core| {
                 core.composer_catalog_snapshot("a")
                     .is_some_and(|p| p.skill_request.state == ComposerCatalogRequestState::Loading)
             }) && std::time::Instant::now() < deadline
@@ -1819,7 +1527,7 @@ mod publication_tests {
             );
             assert_eq!(
                 direct.composer_snapshot("a"),
-                ffi.client_runtime.core.composer_snapshot("a")
+                ffi.core.composer_snapshot("a")
             );
         };
         dispatch(ComposerCatalogIntent::OpenPicker {
@@ -1900,7 +1608,7 @@ mod publication_tests {
                 serde_json::to_value(actual.outcome).unwrap()
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while [&direct, &ffi.client_runtime.core].iter().any(|core| {
+            while [&direct, &ffi.core].iter().any(|core| {
                 core.message_deletion_snapshot("a")
                     .is_some_and(|p| p.state == MessageDeletionState::Pending)
             }) && std::time::Instant::now() < deadline

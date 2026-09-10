@@ -22,7 +22,14 @@ macro_rules! schema_doc {
 
 pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
-        schema_doc!("administration_activation_request.json", crate::administration_activation::AdministrationActivationRequest),
+        schema_doc!(
+            "client_scope_lease_request_dto.json",
+            crate::client_binding::ClientScopeLeaseRequestDto
+        ),
+        schema_doc!(
+            "administration_activation_request.json",
+            crate::administration_activation::AdministrationActivationRequest
+        ),
         schema_doc!(
             "timeline_snapshot.json",
             pioneer_client::timeline::presentation::TimelineSnapshot
@@ -100,24 +107,8 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::artifacts::ClientArtifactDownloadRequest
         ),
         schema_doc!(
-            "client_artifact_download_operation_request.json",
-            crate::artifacts::ClientArtifactDownloadOperationRequest
-        ),
-        schema_doc!(
             "client_artifact_download_result.json",
             crate::artifacts::ClientArtifactDownloadResult
-        ),
-        schema_doc!(
-            "client_artifact_download_state.json",
-            crate::artifacts::ClientArtifactDownloadState
-        ),
-        schema_doc!(
-            "client_artifact_download_progress_result.json",
-            crate::artifacts::ClientArtifactDownloadProgressResult
-        ),
-        schema_doc!(
-            "client_artifact_download_cancel_result.json",
-            crate::artifacts::ClientArtifactDownloadCancelResult
         ),
         schema_doc!(
             "client_member_avatar_cache_request.json",
@@ -136,69 +127,24 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::avatars::ClientAgentAvatarCacheResult
         ),
         schema_doc!(
-            "add_and_activate_remote_gateway_registry_plan.json",
-            crate::gateway::AddAndActivateRemoteGatewayRegistryPlan
-        ),
-        schema_doc!(
-            "add_remote_gateway_plan.json",
-            crate::gateway::AddRemoteGatewayPlan
-        ),
-        schema_doc!(
-            "client_error_event.json",
-            crate::contracts::ClientErrorEvent
-        ),
-        schema_doc!(
             "client_diagnostic_event.json",
             crate::diagnostics::ClientDiagnosticEvent
-        ),
-        schema_doc!("client_event.json", crate::contracts::ClientEvent),
-        schema_doc!(
-            "client_thread_scope_presentation_request.json",
-            crate::presentation::ClientThreadScopePresentationRequest
         ),
         schema_doc!(
             "client_thread_create_visibility_request.json",
             crate::presentation::ClientThreadCreateVisibilityRequest
         ),
         schema_doc!(
-            "client_thread_scope_mutation_plan_request.json",
-            crate::presentation::ClientThreadScopeMutationPlanRequest
-        ),
-        schema_doc!(
             "client_member_presentation_request.json",
             crate::presentation::ClientMemberPresentationRequest
-        ),
-        schema_doc!(
-            "client_invitation_list_row_request.json",
-            crate::presentation::ClientInvitationListRowRequest
         ),
         schema_doc!(
             "client_current_principal_presentation_request.json",
             crate::presentation::ClientCurrentPrincipalPresentationRequest
         ),
         schema_doc!(
-            "client_authorization_projection_accept_request.json",
-            crate::presentation::ClientAuthorizationProjectionAcceptRequest
-        ),
-        schema_doc!(
-            "client_authorization_projection_accept_result.json",
-            crate::presentation::ClientAuthorizationProjectionAcceptResult
-        ),
-        schema_doc!(
             "client_artifact_presentation_policy_request.json",
             crate::presentation::ClientArtifactPresentationPolicyRequest
-        ),
-        schema_doc!(
-            "client_execution_draft_reconcile_request.json",
-            crate::presentation::ClientExecutionDraftReconcileRequest
-        ),
-        schema_doc!(
-            "client_gateway_session_lifecycle_request.json",
-            crate::auth::ClientGatewaySessionLifecycleRequest
-        ),
-        schema_doc!(
-            "client_gateway_session_lifecycle_result.json",
-            crate::auth::ClientGatewaySessionLifecycleResult
         ),
         schema_doc!(
             "client_device_activation_presentation_request.json",
@@ -225,60 +171,8 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::invitation::ClientInvitationPresentationResult
         ),
         schema_doc!(
-            "client_invitation_preview_request.json",
-            crate::invitation::ClientInvitationPreviewRequest
-        ),
-        schema_doc!(
-            "client_invitation_accept_request.json",
-            crate::invitation::ClientInvitationAcceptRequest
-        ),
-        schema_doc!(
-            "client_invitation_accept_result.json",
-            crate::invitation::ClientInvitationAcceptResult
-        ),
-        schema_doc!(
-            "client_invitation_commit_state.json",
-            crate::invitation::ClientInvitationCommitState
-        ),
-        schema_doc!(
-            "client_invitation_commit_request.json",
-            crate::invitation::ClientInvitationCommitRequest
-        ),
-        schema_doc!(
-            "client_invitation_commit_cleanup_request.json",
-            crate::invitation::ClientInvitationCommitCleanupRequest
-        ),
-        schema_doc!(
-            "client_invitation_refresh_write.json",
-            crate::invitation::ClientInvitationRefreshWrite
-        ),
-        schema_doc!(
-            "client_invitation_registry_write.json",
-            crate::invitation::ClientInvitationRegistryWrite
-        ),
-        schema_doc!(
-            "client_invitation_access_result.json",
-            crate::invitation::ClientInvitationAccessResult
-        ),
-        schema_doc!(
-            "client_invitation_commit_failure_result.json",
-            crate::invitation::ClientInvitationCommitFailureResult
-        ),
-        schema_doc!(
             "client_active_thread_clear_result.json",
             crate::active_thread::ClientActiveThreadClearResult
-        ),
-        schema_doc!(
-            "client_active_thread_event_request.json",
-            crate::active_thread::ClientActiveThreadEventRequest
-        ),
-        schema_doc!(
-            "client_active_thread_event_result.json",
-            crate::active_thread::ClientActiveThreadEventResult
-        ),
-        schema_doc!(
-            "client_access_changed_lifecycle.json",
-            crate::active_thread::ClientAccessChangedLifecycle
         ),
         schema_doc!(
             "client_active_thread_open_request.json",
@@ -291,14 +185,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "client_ensure_workspace_draft_request.json",
             crate::active_thread::ClientEnsureWorkspaceDraftRequest
-        ),
-        schema_doc!(
-            "client_active_thread_unsubscribe_request.json",
-            crate::active_thread::ClientActiveThreadUnsubscribeRequest
-        ),
-        schema_doc!(
-            "client_active_thread_unsubscribe_result.json",
-            crate::active_thread::ClientActiveThreadUnsubscribeResult
         ),
         schema_doc!(
             "client_active_thread_send_text_request.json",
@@ -325,20 +211,8 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_client::security::ClientSecurityDiagnosticRow
         ),
         schema_doc!(
-            "client_active_thread_snapshot_request.json",
-            crate::active_thread::ClientActiveThreadSnapshotRequest
-        ),
-        schema_doc!(
             "client_composer_attachment_from_path_request.json",
             crate::composer::ClientComposerAttachmentFromPathRequest
-        ),
-        schema_doc!(
-            "client_composer_attachments_update_request.json",
-            crate::composer::ClientComposerAttachmentsUpdateRequest
-        ),
-        schema_doc!(
-            "client_composer_capabilities_update_request.json",
-            crate::composer::ClientComposerCapabilitiesUpdateRequest
         ),
         schema_doc!(
             "client_composer_capability_target_request.json",
@@ -353,14 +227,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::ClientComposerSubmissionPlanRequest
         ),
         schema_doc!(
-            "client_composer_domain_transition_request.json",
-            crate::composer::ClientComposerDomainTransitionRequest
-        ),
-        schema_doc!(
-            "client_composer_draft_lifecycle_transition_request.json",
-            crate::composer::ClientComposerDraftLifecycleTransitionRequest
-        ),
-        schema_doc!(
             "client_composer_skill_rows_for_target_request.json",
             crate::composer::ClientComposerSkillRowsForTargetRequest
         ),
@@ -373,56 +239,12 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::composer::ClientComposerFilterMcpRowsResult
         ),
         schema_doc!(
-            "client_composer_filter_skill_rows_request.json",
-            crate::composer::ClientComposerFilterSkillRowsRequest
-        ),
-        schema_doc!(
-            "client_composer_mcp_capability_from_row_request.json",
-            crate::composer::ClientComposerMcpCapabilityFromRowRequest
-        ),
-        schema_doc!(
-            "client_composer_mcp_toggle_request.json",
-            crate::composer::ClientComposerMcpToggleRequest
-        ),
-        schema_doc!(
-            "client_composer_mcp_toggle_result.json",
-            crate::composer::ClientComposerMcpToggleResult
-        ),
-        schema_doc!(
-            "client_composer_skill_capability_from_row_request.json",
-            crate::composer::ClientComposerSkillCapabilityFromRowRequest
-        ),
-        schema_doc!(
-            "client_composer_skill_toggle_request.json",
-            crate::composer::ClientComposerSkillToggleRequest
-        ),
-        schema_doc!(
-            "client_composer_skill_toggle_result.json",
-            crate::composer::ClientComposerSkillToggleResult
-        ),
-        schema_doc!(
             "client_composer_skill_pack_picker_request.json",
             crate::skills::ClientComposerSkillPackPickerRequest
         ),
         schema_doc!(
-            "client_composer_skill_selection_toggle_request.json",
-            crate::skills::ClientComposerSkillSelectionToggleRequest
-        ),
-        schema_doc!(
             "client_composer_skill_chips_request.json",
             crate::skills::ClientComposerSkillChipsRequest
-        ),
-        schema_doc!(
-            "client_auth_refresh_request.json",
-            crate::auth::ClientAuthRefreshRequest
-        ),
-        schema_doc!(
-            "client_auth_activate_device_request.json",
-            crate::auth::ClientAuthDeviceActivateRequest
-        ),
-        schema_doc!(
-            "client_auth_session_cleanup_request.json",
-            crate::auth::ClientAuthSessionCleanupRequest
         ),
         schema_doc!(
             "auth_session_grant.json",
@@ -466,10 +288,6 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::AuthDeviceCreateResponse
         ),
         schema_doc!(
-            "client_access_change_plan_request_dto.json",
-            crate::client_binding::ClientAccessChangePlanRequestDto
-        ),
-        schema_doc!(
             "access_changed_plan.json",
             pioneer_client::authorization::AccessChangedPlan
         ),
@@ -482,32 +300,8 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             crate::client_binding::ClientTransportLeaseRequestDto
         ),
         schema_doc!(
-            "client_gateway_session_ensure_request.json",
-            crate::auth::ClientGatewaySessionEnsureRequest
-        ),
-        schema_doc!(
-            "client_gateway_session_control_request.json",
-            crate::auth::ClientGatewaySessionControlRequest
-        ),
-        schema_doc!(
             "gateway_session_connection_result.json",
             pioneer_client::gateway::session_connection::GatewaySessionConnectionResult
-        ),
-        schema_doc!(
-            "client_gateway_session_replace_access_request.json",
-            crate::auth::ClientGatewaySessionReplaceAccessRequest
-        ),
-        schema_doc!(
-            "client_gateway_session_replace_access_result.json",
-            crate::auth::ClientGatewaySessionReplaceAccessResult
-        ),
-        schema_doc!(
-            "client_gateway_settings_get_request.json",
-            crate::contracts::ClientGatewaySettingsGetRequest
-        ),
-        schema_doc!(
-            "client_gateway_settings_update_request.json",
-            crate::contracts::ClientGatewaySettingsUpdateRequest
         ),
         schema_doc!(
             "gateway_settings_get_response.json",
@@ -518,36 +312,12 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::GatewaySettingsUpdateResponse
         ),
         schema_doc!(
-            "client_voice_input_plan_request.json",
-            crate::contracts::ClientVoiceInputPlanRequest
-        ),
-        schema_doc!(
-            "client_voice_input_plan_result.json",
-            crate::contracts::ClientVoiceInputPlanResult
-        ),
-        schema_doc!(
-            "client_gateway_ws_timings.json",
-            crate::contracts::ClientGatewayWsTimings
-        ),
-        schema_doc!(
-            "client_pending_request_response_action.json",
-            crate::pending_requests::ClientPendingRequestResponseAction
-        ),
-        schema_doc!(
             "client_pending_request_presentation_request.json",
             crate::pending_requests::ClientPendingRequestPresentationRequest
         ),
         schema_doc!(
             "client_pending_request_presentation_result.json",
             crate::pending_requests::ClientPendingRequestPresentationResult
-        ),
-        schema_doc!(
-            "client_pending_request_response_plan_request.json",
-            crate::pending_requests::ClientPendingRequestResponsePlanRequest
-        ),
-        schema_doc!(
-            "client_pending_request_response_plan_result.json",
-            crate::pending_requests::ClientPendingRequestResponsePlanResult
         ),
         schema_doc!(
             "pending_request.json",
@@ -725,36 +495,12 @@ pub fn client_ffi_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::ThreadAgentsDocStatus
         ),
         schema_doc!(
-            "plan_activate_gateway_request.json",
-            crate::gateway::PlanActivateGatewayRequest
-        ),
-        schema_doc!(
             "load_gateway_registry_request.json",
             crate::gateway::LoadGatewayRegistryRequest
         ),
         schema_doc!(
             "load_gateway_registry_result.json",
             crate::gateway::LoadGatewayRegistryResult
-        ),
-        schema_doc!(
-            "plan_add_remote_gateway_request.json",
-            crate::gateway::PlanAddRemoteGatewayRequest
-        ),
-        schema_doc!(
-            "plan_delete_remote_gateway_request.json",
-            crate::gateway::PlanDeleteRemoteGatewayRequest
-        ),
-        schema_doc!(
-            "plan_set_gateway_workspace_request.json",
-            crate::gateway::PlanSetGatewayWorkspaceRequest
-        ),
-        schema_doc!(
-            "plan_update_remote_gateway_request.json",
-            crate::gateway::PlanUpdateRemoteGatewayRequest
-        ),
-        schema_doc!(
-            "remote_gateway_validation_request.json",
-            crate::gateway::RemoteGatewayValidationRequest
         ),
         schema_doc!(
             "thread_tree_level.json",
@@ -885,143 +631,104 @@ pub fn write_client_ffi_schemas(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn skill_pack_ffi_contracts_are_registered_and_serializable() {
+    fn scoped_boundary_schemas_are_complete_and_serializable() {
         let documents = client_ffi_schema_documents();
-
-        for expected in [
+        for name in [
+            "client_intent_dispatch_dto.json",
+            "client_scope_lease_request_dto.json",
+            "client_scoped_snapshot_request_dto.json",
+            "client_scoped_snapshot_dto.json",
+            "client_change_batch_request_dto.json",
+            "client_change_batch_dto.json",
+            "client_publication_wait_request_dto.json",
+            "client_process_change_batch_dto.json",
+            "client_effect_completion_dto.json",
+            "client_effect_cancellation_dto.json",
+            "client_sequence_gap_resnapshot_dto.json",
+            "client_transition_dto.json",
+            "client_gateway_session_validation_request.json",
+            "client_gateway_session_validation_result.json",
             "client_composer_skill_chips_request.json",
             "client_composer_skill_pack_picker_request.json",
-            "client_composer_skill_selection_toggle_request.json",
         ] {
-            let document = documents
+            let schema = &documents
                 .iter()
-                .find(|document| document.file_name == expected)
-                .unwrap_or_else(|| panic!("missing skill pack FFI contract {expected}"));
-            serde_json::to_string(&document.schema).expect("schema serializes");
+                .find(|document| document.file_name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .schema;
+            assert!(schema.as_value().is_object());
+            serde_json::to_string(schema).unwrap();
+        }
+        let mut names = std::collections::HashSet::new();
+        for document in &documents {
+            assert!(
+                names.insert(document.file_name),
+                "duplicate schema {}",
+                document.file_name
+            );
         }
     }
-
     #[test]
-    fn auth_ffi_contracts_are_registered_and_client_events_are_secret_free() {
+    fn retired_raw_ingress_and_shell_reducer_contracts_are_absent() {
         let documents = client_ffi_schema_documents();
-        for expected in [
-            "client_access_changed_lifecycle.json",
-            "client_auth_refresh_request.json",
-            "client_auth_activate_device_request.json",
-            "client_auth_session_cleanup_request.json",
+        for name in [
+            "client_event.json",
+            "client_active_thread_event_request.json",
+            "client_access_change_plan_request_dto.json",
             "client_gateway_session_lifecycle_request.json",
-            "client_gateway_session_lifecycle_result.json",
-            "client_device_activation_parse_request.json",
-            "client_device_activation_parse_result.json",
-            "client_device_activation_presentation_request.json",
-            "client_device_activation_presentation_result.json",
+            "client_gateway_session_ensure_request.json",
+            "client_gateway_session_control_request.json",
+            "client_composer_domain_transition_request.json",
+            "client_composer_draft_lifecycle_transition_request.json",
+            "client_authorization_projection_accept_request.json",
+            "client_invitation_commit_request.json",
+            "client_auth_refresh_request.json",
             "client_gateway_session_replace_access_request.json",
-            "client_gateway_session_replace_access_result.json",
-            "auth_session_grant.json",
-            "auth_refresh_grant.json",
-            "auth_me_response.json",
-            "auth_profile_update_params.json",
-            "auth_profile_update_response.json",
-            "auth_session_list_response.json",
-            "auth_session_revoke_params.json",
-            "auth_session_revoke_response.json",
-            "auth_logout_response.json",
-            "auth_device_create_response.json",
         ] {
             assert!(
-                documents
-                    .iter()
-                    .any(|document| document.file_name == expected),
-                "missing auth FFI contract {expected}"
-            );
-        }
-
-        let event = documents
-            .iter()
-            .find(|document| document.file_name == "client_event.json")
-            .expect("ClientEvent schema");
-        let schema = serde_json::to_string(&event.schema).expect("event schema serializes");
-        for forbidden in [
-            "access_token",
-            "refresh_token",
-            "activation_code",
-            "authorization_proof",
-            "policy_reason",
-        ] {
-            assert!(
-                !schema.contains(forbidden),
-                "ClientEvent exposes secret field `{forbidden}`"
+                !documents.iter().any(|document| document.file_name == name),
+                "retired schema {name}"
             );
         }
     }
-
     #[test]
-    fn epic6_ffi_contracts_are_registered_and_content_bytes_are_absent() {
+    fn publications_are_secret_free_and_thread_output_contains_no_semantic_state() {
         let documents = client_ffi_schema_documents();
-        for expected in [
-            "thread_tree_snapshot.json",
-            "thread_read_params.json",
-            "thread_read_response.json",
-            "turn_message_revisions_page_response.json",
+        for name in [
+            "client_process_change_batch_dto.json",
+            "client_active_thread_snapshot.json",
+            "timeline_snapshot.json",
         ] {
-            let document = documents
+            let mut value = documents
                 .iter()
-                .find(|document| document.file_name == expected)
-                .unwrap_or_else(|| panic!("missing Epic 6 FFI contract {expected}"));
-            let schema = serde_json::to_string(&document.schema).expect("schema serializes");
+                .find(|document| document.file_name == name)
+                .unwrap()
+                .schema
+                .as_value()
+                .clone();
+            // The process batch carries addressed native SecureStore effects.
+            // Credentials are permitted only in that existing storage envelope.
+            if name == "client_process_change_batch_dto.json" {
+                let definitions = value.get_mut("$defs").unwrap().as_object_mut().unwrap();
+                let storage = definitions
+                    .remove("GatewaySessionEnvelope")
+                    .expect("typed storage effect envelope");
+                assert!(storage["properties"]["refresh_token"].is_object());
+            }
+            let schema = serde_json::to_string(&value).unwrap();
             for forbidden in [
                 "access_token",
                 "refresh_token",
                 "authorization_header",
-                "bearer",
+                "activation_code",
+                "authorization_proof",
             ] {
-                assert!(
-                    !schema.to_ascii_lowercase().contains(forbidden),
-                    "Epic 6 FFI contract {expected} exposes `{forbidden}`"
-                );
+                assert!(!schema.contains(forbidden), "{name} exposes {forbidden}");
             }
-            assert!(
-                !schema.contains("\"bytes\""),
-                "Epic 6 FFI contract {expected} exposes attachment bytes"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod publication_schema_tests {
-    #[test]
-    fn process_batch_schema_exports_coherent_change_sets() {
-        let documents = super::client_ffi_schema_documents();
-        for name in [
-            "client_access_change_plan_request_dto.json",
-            "access_changed_plan.json",
-            "client_transport_reserve_request_dto.json",
-            "client_transport_lease_request_dto.json",
-            "client_gateway_session_lifecycle_request.json",
-            "client_gateway_session_lifecycle_result.json",
-            "client_gateway_session_ensure_request.json",
-            "client_gateway_session_control_request.json",
-            "gateway_session_connection_result.json",
-            "client_publication_wait_request_dto.json",
-            "client_process_change_batch_dto.json",
-            "client_effect_completion_dto.json",
-            "client_transition_dto.json",
-            "client_event.json",
-            "client_active_thread_event_request.json",
-            "client_gateway_session_validation_request.json",
-            "client_gateway_session_validation_result.json",
-        ] {
-            let document = documents
-                .iter()
-                .find(|document| document.file_name == name)
-                .unwrap();
-            let json = serde_json::to_string_pretty(&document.schema).unwrap();
-            assert!(document.schema.as_value().is_object());
-            if std::env::var_os("PIONEER_PRINT_PUBLICATION_SCHEMAS").is_some() {
-                println!("SCHEMA_BEGIN:{name}\n{json}\nSCHEMA_END");
+            if name == "client_active_thread_snapshot.json" {
+                assert!(value["properties"].get("semantic").is_none());
+                assert!(value["properties"].get("timeline_rows").is_none());
             }
         }
     }

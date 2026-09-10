@@ -48,15 +48,11 @@ fn provider_runtime_direct_and_versioned_dispatch_preserve_scope_and_cancellatio
 
 fn fixture(wire_core: Arc<ClientCore>) -> ClientFfiRuntime {
     ClientFfiRuntime {
-        active_thread: ClientFfiActiveThreadState::new(wire_core.clone()),
-        client_runtime: ClientRuntimeCompatibility {
-            core: wire_core.clone(),
-        },
+        core: wire_core.clone(),
         config: Default::default(),
         client_subscriptions: Default::default(),
-        active_connection_id: Default::default(),
-        legacy_authorization_generation: Default::default(),
-        legacy_authorization_change_sequence: Default::default(),
+        observed_scopes: Default::default(),
+
         diagnostics: Default::default(),
         avatar_cache: Default::default(),
     }

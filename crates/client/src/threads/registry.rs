@@ -23,6 +23,8 @@ const INACTIVE_THREAD_LIMIT: usize = 32;
 
 /// Immutable source snapshot; the contained coordinator has no mutable shell handle.
 pub struct ThreadDomainSnapshot {
+    thread_id: String,
+    draft_thread_id: Option<String>,
     coordinator: Arc<ThreadCoordinator>,
     current_principal_id: Option<String>,
     semantic: Arc<SemanticTimelineState>,
@@ -51,7 +53,9 @@ fn same_coordinator_content(left: &ThreadCoordinator, right: &ThreadCoordinator)
 
 impl PartialEq for ThreadDomainSnapshot {
     fn eq(&self, other: &Self) -> bool {
-        self.revision == other.revision
+        self.thread_id == other.thread_id
+            && self.draft_thread_id == other.draft_thread_id
+            && self.revision == other.revision
             && self.timeline_revision == other.timeline_revision
             && self.current_principal_id == other.current_principal_id
             && (Arc::ptr_eq(&self.coordinator, &other.coordinator)
@@ -103,6 +107,12 @@ impl Serialize for ThreadDomainSnapshot {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Source<'a> {
+            thread_id: &'a str,
+            draft_thread_id: Option<&'a str>,
+            domain_revision: u64,
+            timeline_revision: u64,
+            active_turn_security_summary: Option<&'a crate::security::ClientTurnSecuritySummary>,
+            active_turn_security_diagnostics: Vec<crate::security::ClientSecurityDiagnosticRow>,
             current_principal_id: Option<&'a str>,
             thread: Option<&'a Thread>,
             workspace_id: &'a str,
@@ -116,7 +126,27 @@ impl Serialize for ThreadDomainSnapshot {
             placement: Option<&'a pioneer_protocol::ThreadPlacement>,
             subscription_failed: bool,
         }
+        let summary = self
+            .coordinator
+            .conversation
+            .projection()
+            .in_flight_turn_id
+            .as_deref()
+            .and_then(|id| {
+                self.coordinator
+                    .conversation
+                    .projection()
+                    .turn_security_summary(id)
+            });
         Source {
+            thread_id: &self.thread_id,
+            draft_thread_id: self.draft_thread_id.as_deref(),
+            domain_revision: self.revision,
+            timeline_revision: self.timeline_revision,
+            active_turn_security_summary: summary,
+            active_turn_security_diagnostics: summary
+                .map(crate::security::security_diagnostic_rows)
+                .unwrap_or_default(),
             current_principal_id: self.current_principal_id.as_deref(),
             thread: self.coordinator.thread(),
             workspace_id: &self.coordinator.workspace_id,
@@ -307,6 +337,8 @@ impl ThreadRegistry {
                     && p.cli_binding == store.cli_binding
                     && p.placement.as_ref() == placement
                     && p.subscription_failed == store.subscription_failed
+                    && p.draft_thread_id.as_ref()
+                        == self.navigation.drafts.get(&store.coordinator.workspace_id)
             })
         {
             return Vec::new();
@@ -321,6 +353,12 @@ impl ThreadRegistry {
                     != store.coordinator.thread().map(|t| &t.turns)
             });
         let mut snapshot = ThreadDomainSnapshot {
+            thread_id: id.to_owned(),
+            draft_thread_id: self
+                .navigation
+                .drafts
+                .get(&store.coordinator.workspace_id)
+                .cloned(),
             current_principal_id: self.current_principal_id.clone(),
             coordinator: match previous.filter(|_| !coordinator_changed) {
                 Some(p) => p.coordinator.clone(),
@@ -2218,6 +2256,33 @@ mod tests {
     use crate::conversation::ConversationEvent;
     use pioneer_protocol::*;
     use std::num::NonZeroUsize;
+    #[test]
+    fn restored_session_resumes_only_visible_thread_subscription_and_timeline() {
+        let core = ClientCore::new();
+        core.upsert_thread(thread("visible", "workspace"));
+        core.upsert_thread(thread("hidden", "workspace"));
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "visible".into(),
+            },
+            ClientDemand::Visible,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        core.resume_visible_thread_delivery();
+        let requests: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(&requests[0], ThreadControllerRequest::Subscribe { id, .. } if id == "visible")
+        );
+        assert!(
+            matches!(&requests[1], ThreadControllerRequest::Semantic(request) if request.id == "visible")
+        );
+        core.shutdown();
+        core.resume_visible_thread_delivery();
+        assert_eq!(receiver.try_iter().count(), 0);
+    }
+
     fn thread(thread_id: &str, workspace_id: &str) -> Thread {
         Thread {
             workspace_id: workspace_id.to_owned(),
@@ -4894,6 +4959,88 @@ impl ClientCore {
 }
 
 impl ClientCore {
+    pub(crate) fn admit_opened_thread(
+        &self,
+        thread: Thread,
+        navigation: &crate::navigation::ClientNavigationState,
+    ) -> anyhow::Result<ThreadOperationToken> {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        anyhow::ensure!(
+            !self.is_stopped() && &registry.navigation == navigation,
+            "thread_open_stale"
+        );
+        let id = thread.id.clone();
+        let workspace = thread.workspace_id.clone();
+        anyhow::ensure!(registry.require(&id, &workspace), "thread_open_stale");
+        let store = registry.stores.get_mut(&id).expect("admitted thread");
+        if store
+            .coordinator
+            .thread()
+            .is_none_or(|previous| previous.updated_at <= thread.updated_at)
+        {
+            store.coordinator.set_snapshot(thread);
+        }
+        let token = ThreadOperationToken {
+            id: id.clone(),
+            generation: store.generation,
+        };
+        registry
+            .navigation
+            .apply(crate::navigation::NavigationIntent::SelectThread {
+                workspace_id: Some(workspace),
+                thread_id: Some(id.clone()),
+            });
+        let mut drafts = registry.publish(&id);
+        drafts.extend(registry.navigation_change());
+        self.transition_directory(
+            &mut registry,
+            &ClientMutationAuthority { _private: () },
+            drafts,
+            vec![],
+        );
+        Ok(token)
+    }
+
+    pub(crate) fn refresh_opened_thread_subscription(
+        &self,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+        token: ThreadOperationToken,
+        workspace: &str,
+    ) -> anyhow::Result<()> {
+        self.refresh_thread_subscription_generation(
+            transport,
+            &token.id,
+            workspace,
+            Some(token.generation),
+        )
+    }
+
+    pub(crate) fn resume_visible_thread_delivery(&self) {
+        let _identity = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        let visible = {
+            let registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            registry
+                .stores
+                .iter()
+                .filter(|(_, store)| store.demand == ClientDemand::Visible)
+                .map(|(id, store)| (id.clone(), store.coordinator.workspace_id.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (id, workspace) in visible {
+            self.schedule_thread_subscription(&id, &workspace);
+            self.refresh_thread_timeline(&id);
+        }
+    }
+
     pub fn schedule_thread_subscription(&self, id: &str, workspace: &str) {
         self.schedule_thread_connection_request(id, workspace, false);
     }

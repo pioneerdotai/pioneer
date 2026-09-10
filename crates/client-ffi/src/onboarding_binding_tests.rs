@@ -13,13 +13,11 @@ fn independent_direct_and_ffi_onboarding_replay_preserves_scope_and_single_submi
         let direct = Arc::new(ClientCore::new());
         let wire = Arc::new(ClientCore::new());
         let runtime = ClientFfiRuntime {
-            active_thread: ClientFfiActiveThreadState::new(wire.clone()),
-            client_runtime: ClientRuntimeCompatibility { core: wire.clone() },
+            core: wire.clone(),
             config: Default::default(),
             client_subscriptions: Default::default(),
-            active_connection_id: Default::default(),
-            legacy_authorization_generation: Default::default(),
-            legacy_authorization_change_sequence: Default::default(),
+            observed_scopes: Default::default(),
+
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
         };

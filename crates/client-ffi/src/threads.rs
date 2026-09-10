@@ -6,14 +6,6 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct ThreadTreeRefreshRequest {
     pub workspace_id: String,
-    #[serde(default)]
-    pub active_thread_id: Option<String>,
-    #[serde(default)]
-    pub existing_draft_thread_id: Option<String>,
-    #[serde(default)]
-    pub existing_draft_thread_workspace_id: Option<String>,
-    #[serde(default)]
-    pub has_known_threads_for_workspace: bool,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

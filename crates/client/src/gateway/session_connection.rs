@@ -72,6 +72,8 @@ pub(crate) struct GatewaySessionConnectionState {
     ready: Option<GatewaySessionReady>,
     candidate_connection_id: Option<u64>,
     connected: Option<GatewaySessionConnectionResult>,
+    presentation_connection_id: Option<u64>,
+    verified_session: Option<GatewaySessionConnectionResult>,
     failure: Option<GatewaySessionConnectionFailure>,
 }
 
@@ -82,10 +84,18 @@ impl GatewaySessionConnectionState {
             .is_some_and(|connected| connected.connection_id == connection_id)
     }
 
+    pub(crate) fn suspend_preserving_identity(&mut self) {
+        self.cancel_pending_request();
+        self.connected = None;
+        self.failure = Some(GatewaySessionConnectionFailure::Suspended);
+    }
+
     pub(crate) fn invalidate(&mut self) {
         self.pending = true;
         self.cancel_pending_request();
         self.connected = None;
+        self.presentation_connection_id = None;
+        self.verified_session = None;
     }
 
     pub(crate) fn cancel_pending_request(&mut self) {
@@ -115,6 +125,8 @@ pub struct GatewaySessionConnectionProjection {
     pub refresh_requested: bool,
     pub retry_delay_ms: Option<u64>,
     pub connected: Option<GatewaySessionConnectionResult>,
+    /// Stable accepted session identity across background suspension and token renewal.
+    pub presentation_connection_id: Option<u64>,
     pub failure: Option<GatewaySessionConnectionFailure>,
 }
 
@@ -132,6 +144,7 @@ pub(crate) fn project_connections(
                     refresh_requested: state.refresh_requested,
                     retry_delay_ms: state.retry_delay_ms,
                     connected: state.connected.clone(),
+                    presentation_connection_id: state.presentation_connection_id,
                     failure: state.failure.clone(),
                 },
             )
@@ -139,7 +152,38 @@ pub(crate) fn project_connections(
         .collect()
 }
 
+impl super::session_controller::GatewaySessionPublication {
+    pub(crate) fn presentation_connection_for(&self, connection: Option<u64>) -> Option<u64> {
+        self.connections
+            .values()
+            .find(|state| {
+                state
+                    .connected
+                    .as_ref()
+                    .is_some_and(|session| Some(session.connection_id) == connection)
+            })
+            .and_then(|state| state.presentation_connection_id)
+            .or(connection)
+    }
+}
+
 impl ClientCore {
+    pub(crate) fn preserves_suspended_authorization(&self, connection_id: u64) -> bool {
+        self.gateway_session
+            .lock()
+            .expect("Gateway session owner poisoned")
+            .connections
+            .values()
+            .any(|state| {
+                matches!(
+                    state.failure,
+                    Some(GatewaySessionConnectionFailure::Suspended)
+                ) && state
+                    .verified_session
+                    .as_ref()
+                    .is_some_and(|session| session.connection_id == connection_id)
+            })
+    }
     /// Endpoint semantics for process-local platform effects on the accepted connection.
     pub fn connected_gateway_endpoint_kind(&self) -> Option<super::types::GatewayEndpointKind> {
         let connection = self.gateway_http_generation()?;
@@ -166,7 +210,10 @@ impl ClientCore {
             .lock()
             .expect("Gateway session owner poisoned");
         let state = sessions.connections.get(endpoint)?;
-        let connected = state.connected.as_ref()?;
+        let connected = state
+            .connected
+            .as_ref()
+            .or(state.verified_session.as_ref())?;
         let ready = state.ready.as_ref()?;
         let previous = &connected.metadata;
         let next = &ready.metadata;
@@ -342,6 +389,10 @@ impl ClientCore {
         state.pending = false;
         state.candidate_connection_id = None;
         state.connected = None;
+        if matches!(failure, GatewaySessionConnectionFailure::Terminal { .. }) {
+            state.presentation_connection_id = None;
+            state.verified_session = None;
+        }
         state.failure = Some(failure.clone());
         state.refresh_requested = matches!(&failure, GatewaySessionConnectionFailure::Unavailable { code } if super::session_lifecycle::auth_code_requires_refresh(code));
         sessions.finish_transport_verification(endpoint, false);
@@ -529,12 +580,16 @@ impl ClientCore {
             state.epoch == epoch && !self.is_stopped(),
             "Gateway session connection result is stale"
         );
+        state
+            .presentation_connection_id
+            .get_or_insert(access.generation);
         state.connected = Some(GatewaySessionConnectionResult {
             connection_id: access.generation,
             connection_generation: ready.connection_generation,
             metadata: ready.metadata,
             access_expires_at_unix: access.access_expires_at_unix,
         });
+        state.verified_session = state.connected.clone();
         state.pending = false;
         state.candidate_connection_id = None;
         state.failure = None;
@@ -585,6 +640,12 @@ impl ClientCore {
     {
         let endpoint = &request.endpoint.id;
         let (flight, owner, requested_epoch) = {
+            // Admission and demand retirement share this lock. Once admitted, the
+            // connection epoch fences completion after a newer demand is installed.
+            let demand = self.session_driver.lock().expect("session driver poisoned");
+            if !demand.allows_connection(endpoint) {
+                return Err(GatewaySessionConnectionFailure::Suspended);
+            }
             let mut sessions = self
                 .gateway_session
                 .lock()
@@ -712,7 +773,11 @@ impl ClientCore {
                     state.failure = outcome.as_ref().err().cloned();
                     match &outcome {
                         Ok(connected) => {
+                            state
+                                .presentation_connection_id
+                                .get_or_insert(connected.connection_id);
                             state.connected = Some(connected.clone());
+                            state.verified_session = Some(connected.clone());
                             state.retry_attempt = 0;
                             state.retry_delay_ms = None;
                         }
@@ -728,7 +793,11 @@ impl ClientCore {
                                 Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
                             state.retry_attempt = state.retry_attempt.saturating_add(1);
                         }
-                        Err(_) => {
+                        Err(failure) => {
+                            if matches!(failure, GatewaySessionConnectionFailure::Terminal { .. }) {
+                                state.presentation_connection_id = None;
+                                state.verified_session = None;
+                            }
                             state.retry_delay_ms = None;
                         }
                     }
@@ -998,7 +1067,39 @@ impl ClientCore {
                 .is_some_and(|state| state.epoch == epoch)
     }
 
-    fn retire_session_connection(&self, endpoint: &str, suspended: bool) {
+    // Demand retirement never waits for a network operation or transport lease.
+    // A targeted disconnect cannot retire a replacement connection; the epoch
+    // check also rejects a transport attempt that has not acquired an ID yet.
+    pub(crate) fn retire_demand_session(&self, endpoint: &str) {
+        let connection_id = self
+            .gateway_session
+            .lock()
+            .expect("Gateway session owner poisoned")
+            .connections
+            .get(endpoint)
+            .and_then(|state| {
+                state.candidate_connection_id.or_else(|| {
+                    state
+                        .connected
+                        .as_ref()
+                        .map(|session| session.connection_id)
+                })
+            });
+        self.retire_session_connection(endpoint, true);
+        self.reduce_gateway_session_lifecycle_with_identity_policy(
+            endpoint,
+            SessionLifecycleEvent::Suspend,
+            false,
+        );
+        if let Some(id) = connection_id {
+            let _ = self
+                .compatibility_runtime()
+                .ws_command_sender()
+                .disconnect_connection(id);
+        }
+    }
+
+    pub(crate) fn retire_session_connection(&self, endpoint: &str, suspended: bool) {
         let mut sessions = self
             .gateway_session
             .lock()
@@ -1428,6 +1529,141 @@ mod tests {
             || Ok(auth_me()),
             || Ok(()),
         )
+    }
+
+    #[test]
+    fn demand_release_and_reacquire_preserve_identity_but_replacement_still_revokes_it() {
+        use super::super::session_driver::{SessionDemand, SessionVisibility};
+        let core = ClientCore::new();
+        connect(&core, &endpoint("endpoint"), &storage(), 1).unwrap();
+        let generation = core.authorization_connection_generation();
+        for (sequence, selected, visibility) in [
+            (1, Some("endpoint"), SessionVisibility::Foreground),
+            (2, None, SessionVisibility::Background),
+            (3, Some("endpoint"), SessionVisibility::Foreground),
+            (4, None, SessionVisibility::Background),
+        ] {
+            core.session_demand(SessionDemand {
+                endpoint_id: selected.map(str::to_owned),
+                visibility,
+                network_available: true,
+                generation: sequence,
+            });
+            assert!(core.current_auth().is_some());
+            assert_eq!(core.authorization_connection_generation(), generation);
+        }
+        core.session_demand(SessionDemand {
+            endpoint_id: Some("replacement".into()),
+            visibility: SessionVisibility::Foreground,
+            network_available: true,
+            generation: 5,
+        });
+        assert!(core.current_auth().is_none());
+        assert!(core.authorization_connection_generation() > generation);
+    }
+
+    #[test]
+    fn initial_demand_retires_preexisting_sessions_without_discarding_background_identity() {
+        use super::super::session_driver::{SessionDemand, SessionVisibility};
+        for (selected, visibility, connected, authorized) in [
+            ("endpoint", SessionVisibility::Foreground, true, true),
+            ("endpoint", SessionVisibility::Background, false, true),
+            ("replacement", SessionVisibility::Foreground, false, false),
+        ] {
+            let core = ClientCore::new();
+            connect(&core, &endpoint("endpoint"), &storage(), 1).unwrap();
+            core.session_demand(SessionDemand {
+                endpoint_id: Some(selected.into()),
+                visibility,
+                network_available: true,
+                generation: 1,
+            });
+            assert_eq!(
+                core.gateway_session().connections["endpoint"]
+                    .connected
+                    .is_some(),
+                connected
+            );
+            assert_eq!(core.current_auth().is_some(), authorized);
+        }
+    }
+
+    #[test]
+    fn background_demand_preserves_verified_identity_and_resume_reuses_presentation_identity() {
+        use super::super::session_driver::{SessionDemand, SessionVisibility};
+        let core = ClientCore::new();
+        let endpoint = endpoint("endpoint");
+        let storage = storage();
+        let demand = |generation, visibility| SessionDemand {
+            endpoint_id: Some("endpoint".into()),
+            visibility,
+            network_available: true,
+            generation,
+        };
+        core.session_demand(demand(1, SessionVisibility::Foreground));
+        connect(&core, &endpoint, &storage, 1).unwrap();
+        let generation = core.authorization_connection_generation();
+        let auth = core.current_auth().unwrap();
+        core.session_demand(demand(2, SessionVisibility::Inactive));
+        assert!(
+            core.gateway_session().connections["endpoint"]
+                .connected
+                .is_some()
+        );
+        core.session_demand(demand(3, SessionVisibility::Background));
+        assert!(
+            core.gateway_session().connections["endpoint"]
+                .connected
+                .is_none()
+        );
+        assert!(core.preserves_suspended_authorization(1));
+        assert_eq!(core.current_auth().unwrap(), auth);
+        assert_eq!(
+            connect(&core, &endpoint, &storage, 2),
+            Err(GatewaySessionConnectionFailure::Suspended)
+        );
+        core.session_demand(demand(4, SessionVisibility::Foreground));
+        let successor = grant(2);
+        let identity = AuthMeResponse {
+            gateway: successor.gateway.clone(),
+            principal: successor.principal.clone(),
+            device: successor.device.clone(),
+            session: successor.session.clone(),
+            role_key: None,
+        };
+        core.ensure_gateway_session_with_ports(
+            request(&endpoint),
+            &storage,
+            |_, _, _, _| Ok(successor.clone()),
+            |_, _, _| Ok(()),
+            |_| Ok(2),
+            || Ok(identity.clone()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(core.authorization_connection_generation(), generation);
+        let publication = core.gateway_session();
+        assert_eq!(
+            publication.connections["endpoint"].presentation_connection_id,
+            Some(1)
+        );
+        assert_eq!(
+            publication.connections["endpoint"]
+                .connected
+                .as_ref()
+                .unwrap()
+                .connection_id,
+            2
+        );
+        assert_eq!(publication.presentation_connection_for(Some(2)), Some(1));
+        assert_eq!(publication.presentation_connection_for(Some(3)), Some(3));
+        assert_eq!(publication.presentation_connection_for(None), None);
+        core.session_demand(SessionDemand {
+            endpoint_id: Some("replacement".into()),
+            ..demand(5, SessionVisibility::Foreground)
+        });
+        assert!(core.current_auth().is_none());
+        assert!(core.authorization_connection_generation() > generation);
     }
 
     #[test]
@@ -2201,7 +2437,18 @@ mod tests {
             })
         };
         entered.wait();
-        core.suspend_gateway_session("endpoint").unwrap();
+        core.session_demand(super::super::session_driver::SessionDemand {
+            endpoint_id: Some("endpoint".into()),
+            visibility: super::super::session_driver::SessionVisibility::Foreground,
+            network_available: true,
+            generation: 1,
+        });
+        core.session_demand(super::super::session_driver::SessionDemand {
+            endpoint_id: Some("endpoint".into()),
+            visibility: super::super::session_driver::SessionVisibility::Background,
+            network_available: true,
+            generation: 2,
+        });
         resume.wait();
         assert_eq!(
             worker.join().unwrap(),

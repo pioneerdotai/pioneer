@@ -13,13 +13,11 @@ fn independent_direct_and_ffi_profile_replay_preserves_owner_and_page_isolation(
         let direct = pioneer_client::catalog_test_support::settings_model_picker_client();
         let wire = pioneer_client::catalog_test_support::settings_model_picker_client();
         let runtime = ClientFfiRuntime {
-            active_thread: ClientFfiActiveThreadState::new(wire.clone()),
-            client_runtime: ClientRuntimeCompatibility { core: wire.clone() },
+            core: wire.clone(),
             config: Default::default(),
             client_subscriptions: Default::default(),
-            active_connection_id: Default::default(),
-            legacy_authorization_generation: Default::default(),
-            legacy_authorization_change_sequence: Default::default(),
+            observed_scopes: Default::default(),
+
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
         };
@@ -174,10 +172,6 @@ fn independent_direct_and_ffi_profile_replay_preserves_owner_and_page_isolation(
         for core in [&direct, &wire] {
             core.clear_authorization_projections();
         }
-        // Desktop performs this existing thread compatibility teardown when it
-        // receives access loss; FFI performs it at its next ingress. Replay both
-        // producers so the full transition sequence remains comparable.
-        direct.clear_thread_stores();
         replay(ClientIntent::Profile {
             intent: ProfileIntent::EditField {
                 expected_owner: owner,

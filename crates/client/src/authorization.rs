@@ -49,6 +49,25 @@ pub struct AuthorizationProjectionStore {
 }
 
 impl AuthorizationProjectionStore {
+    pub fn workspace_snapshots(&self) -> BTreeMap<String, AuthorizationCapabilitySnapshot> {
+        self.workspaces
+            .keys()
+            .filter_map(|id| {
+                self.snapshot(Some(id), None)
+                    .map(|value| (id.clone(), value))
+            })
+            .collect()
+    }
+    pub fn thread_snapshots(&self) -> BTreeMap<String, AuthorizationCapabilitySnapshot> {
+        self.threads
+            .iter()
+            .filter_map(|(id, thread)| {
+                self.snapshot(Some(&thread.workspace_id), Some(id))
+                    .map(|value| (id.clone(), value))
+            })
+            .collect()
+    }
+
     pub fn accepted_revision(&self) -> Option<u64> {
         self.accepted_revision
     }

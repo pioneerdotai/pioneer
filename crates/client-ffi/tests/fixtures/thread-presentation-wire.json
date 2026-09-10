@@ -7,8 +7,12 @@
         "snapshots": [
           {
             "payload": {
+              "active_turn_security_diagnostics": [],
+              "active_turn_security_summary": null,
               "cli_binding": null,
               "current_principal_id": null,
+              "domain_revision": 6,
+              "draft_thread_id": null,
               "execution_revision": 1,
               "history_loaded": false,
               "history_loading": false,
@@ -66,6 +70,8 @@
                 "updated_at": 2,
                 "workspace_id": "ws"
               },
+              "thread_id": "a",
+              "timeline_revision": 6,
               "workspace_id": "ws"
             },
             "revisions": {

@@ -14,13 +14,11 @@ fn direct_and_ffi_document_replay_preserve_drafts_failure_retry_and_scope_releas
         let direct = pioneer_client::catalog_test_support::client();
         let wire = pioneer_client::catalog_test_support::client();
         let runtime = ClientFfiRuntime {
-            active_thread: ClientFfiActiveThreadState::new(wire.clone()),
-            client_runtime: ClientRuntimeCompatibility { core: wire.clone() },
+            core: wire.clone(),
             config: Default::default(),
             client_subscriptions: Default::default(),
-            active_connection_id: Default::default(),
-            legacy_authorization_generation: Default::default(),
-            legacy_authorization_change_sequence: Default::default(),
+            observed_scopes: Default::default(),
+
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
         };

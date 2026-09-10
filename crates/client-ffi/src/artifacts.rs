@@ -1,10 +1,8 @@
 //! Secret-preserving native artifact actions for first-party mobile shells.
 
 use pioneer_client::artifacts::{
-    access::ArtifactAccessError,
-    http_download::ArtifactHttpDownloadResult,
-    operations::{ArtifactDownloadIdentity, ArtifactDownloadOperationError, ArtifactDownloadState},
-    workflow::ArtifactActionIdentity,
+    access::ArtifactAccessError, http_download::ArtifactHttpDownloadResult,
+    operations::ArtifactDownloadOperationError, workflow::ArtifactActionIdentity,
 };
 use pioneer_client::core::ClientCore;
 use serde::{Deserialize, Serialize};
@@ -65,14 +63,6 @@ pub struct ClientArtifactDownloadRequest {
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ClientArtifactDownloadOperationRequest {
-    pub operation_id: String,
-    pub generation: u64,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ClientArtifactDownloadResult {
     pub operation_id: String,
@@ -82,82 +72,6 @@ pub struct ClientArtifactDownloadResult {
     pub version_id: String,
     pub size_bytes: u64,
     pub sha256: String,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientArtifactDownloadState {
-    Queued,
-    Downloading,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ClientArtifactDownloadProgressResult {
-    pub operation_id: String,
-    pub generation: u64,
-    pub state: ClientArtifactDownloadState,
-    pub downloaded_bytes: u64,
-    pub total_bytes: u64,
-    pub resumed_from_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-}
-
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ClientArtifactDownloadCancelResult {
-    pub operation_id: String,
-    pub cancelled: bool,
-}
-
-pub(crate) fn download_progress(
-    core: &ClientCore,
-    request: ClientArtifactDownloadOperationRequest,
-) -> Result<ClientArtifactDownloadProgressResult, ClientFfiError> {
-    let input = core
-        .artifact_download_snapshot(&request.operation_id)
-        .ok_or_else(|| map_operation_error(ArtifactDownloadOperationError::NotFound))?;
-    if input.identity.generation != request.generation {
-        return Err(map_operation_error(
-            ArtifactDownloadOperationError::NotFound,
-        ));
-    }
-    Ok(ClientArtifactDownloadProgressResult {
-        operation_id: request.operation_id,
-        generation: input.identity.generation,
-        state: match input.state {
-            ArtifactDownloadState::Queued => ClientArtifactDownloadState::Queued,
-            ArtifactDownloadState::Downloading => ClientArtifactDownloadState::Downloading,
-            ArtifactDownloadState::Completed => ClientArtifactDownloadState::Completed,
-            ArtifactDownloadState::Failed => ClientArtifactDownloadState::Failed,
-            ArtifactDownloadState::Cancelled => ClientArtifactDownloadState::Cancelled,
-        },
-        downloaded_bytes: input.downloaded_bytes,
-        total_bytes: input.total_bytes,
-        resumed_from_bytes: input.resumed_from_bytes,
-        error_code: input.error_code.clone(),
-    })
-}
-
-pub(crate) fn cancel_download(
-    core: &ClientCore,
-    request: ClientArtifactDownloadOperationRequest,
-) -> Result<ClientArtifactDownloadCancelResult, ClientFfiError> {
-    let input = core
-        .artifact_download_snapshot(&request.operation_id)
-        .ok_or_else(|| map_operation_error(ArtifactDownloadOperationError::NotFound))?;
-    Ok(ClientArtifactDownloadCancelResult {
-        operation_id: request.operation_id,
-        cancelled: core.cancel_artifact_download(&ArtifactDownloadIdentity {
-            operation_id: input.identity.operation_id.clone(),
-            generation: request.generation,
-        }),
-    })
 }
 
 fn map_operation_error(error: ArtifactDownloadOperationError) -> ClientFfiError {
@@ -274,81 +188,6 @@ fn verified_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_client::artifacts::{
-        http_download::ArtifactHttpDownloadProgress, operations::ArtifactDownloadTarget,
-    };
-
-    #[test]
-    fn ffi_progress_and_cancellation_read_the_direct_client_download_owner() {
-        let runtime = crate::ClientFfiRuntime::default();
-        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
-        let core = &runtime.client_runtime.core;
-        let operation = core
-            .begin_artifact_download(
-                "synthetic".into(),
-                ArtifactDownloadTarget {
-                    thread_id: Some("thread".into()),
-                    workspace_id: "workspace".into(),
-                    artifact_id: "artifact".into(),
-                    version_id: Some("version".into()),
-                },
-            )
-            .unwrap();
-        operation.update_progress(ArtifactHttpDownloadProgress {
-            downloaded_bytes: 7,
-            total_bytes: 10,
-            resumed_from_bytes: 3,
-        });
-        let input = serde_json::json!({"operation_id": "synthetic", "generation": operation.identity().generation}).to_string();
-        let wire = runtime.artifact_download_progress(&input).unwrap();
-        let direct = core.artifact_download_snapshot("synthetic").unwrap();
-        assert_eq!(wire.state, ClientArtifactDownloadState::Downloading);
-        assert_eq!(wire.downloaded_bytes, direct.downloaded_bytes);
-        assert_eq!(wire.resumed_from_bytes, direct.resumed_from_bytes);
-        assert!(runtime.artifact_download_cancel(&input).unwrap().cancelled);
-        assert!(!runtime.artifact_download_cancel(&input).unwrap().cancelled);
-        assert!(operation.cancellation().is_cancelled());
-        assert!(!operation.finish(ArtifactDownloadState::Completed, None));
-        assert_eq!(
-            runtime.artifact_download_progress(&input).unwrap().state,
-            ClientArtifactDownloadState::Cancelled
-        );
-    }
-
-    #[test]
-    fn ffi_cancel_replay_cannot_cancel_a_reused_operation_id() {
-        let runtime = crate::ClientFfiRuntime::default();
-        runtime.initialize(r#"{"platform":"ios"}"#).unwrap();
-        let core = &runtime.client_runtime.core;
-        let target = ArtifactDownloadTarget {
-            thread_id: Some("thread".into()),
-            workspace_id: "workspace".into(),
-            artifact_id: "artifact".into(),
-            version_id: None,
-        };
-        let old = core
-            .begin_artifact_download("operation".into(), target.clone())
-            .unwrap();
-        let request = serde_json::json!({"operation_id":"operation", "generation": old.identity().generation}).to_string();
-        assert!(
-            runtime
-                .artifact_download_cancel(&request)
-                .unwrap()
-                .cancelled
-        );
-        let next = core
-            .begin_artifact_download("operation".into(), target)
-            .unwrap();
-        assert!(
-            !runtime
-                .artifact_download_cancel(&request)
-                .unwrap()
-                .cancelled
-        );
-        assert!(runtime.artifact_download_progress(&request).is_err());
-        assert!(!next.cancellation().is_cancelled());
-        assert!(!old.finish(ArtifactDownloadState::Completed, None));
-    }
 
     #[test]
     fn bridge_dtos_contain_no_access_or_authorization_fields() {

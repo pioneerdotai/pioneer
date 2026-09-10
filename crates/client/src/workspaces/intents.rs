@@ -106,10 +106,9 @@ impl ClientCore {
     pub fn execute_workspace_intent(&self, intent: WorkspaceIntent) -> anyhow::Result<()> {
         if let WorkspaceIntent::CreateWorkspace { name } = intent {
             if let super::commands::WorkspaceCreateResult::Created { reduction } =
-                self.create_workspace(name)?
+                self.create_and_select_workspace(name)?
             {
                 let workspace = reduction.switch_workspace_id;
-                self.switch_workspace(workspace.clone())?;
                 self.load_selected_workspace_directory(&workspace);
             }
             return Ok(());

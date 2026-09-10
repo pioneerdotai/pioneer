@@ -47,6 +47,15 @@ pub struct AuthSessionsStore {
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CapabilityReadState {
+    pub workspace_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct IdentityAuthorizationPublication {
     pub endpoint_id: Option<String>,
     pub connection_id: Option<u64>,
@@ -56,6 +65,11 @@ pub struct IdentityAuthorizationPublication {
     pub policy_change: Option<pioneer_protocol::AuthorizationProjectionChangedNotification>,
     pub current_auth: Option<AuthMeResponse>,
     pub capabilities: AuthorizationProjectionStore,
+    pub capability_reads: Vec<CapabilityReadState>,
+    pub identity_loading: bool,
+    pub identity_error: Option<String>,
+    pub workspace_snapshots: std::collections::BTreeMap<String, AuthorizationCapabilitySnapshot>,
+    pub thread_snapshots: std::collections::BTreeMap<String, AuthorizationCapabilitySnapshot>,
 }
 
 #[derive(Default)]
@@ -68,6 +82,10 @@ pub(crate) struct IdentityAuthorizationStore {
     projections: AuthorizationProjectionStore,
     current_auth: Option<AuthMeResponse>,
     identity_request: u64,
+    capability_reads:
+        std::collections::BTreeMap<(Option<String>, Option<String>), CapabilityReadState>,
+    identity_loading: bool,
+    identity_error: Option<String>,
     sessions: AuthSessionsStore,
     profile: crate::settings::profile::ProfileStore,
     session_request: u64,
@@ -113,6 +131,11 @@ impl IdentityAuthorizationStore {
             policy_change: self.policy_change.clone(),
             current_auth: self.current_auth.clone(),
             capabilities: self.projections.clone(),
+            capability_reads: self.capability_reads.values().cloned().collect(),
+            identity_loading: self.identity_loading,
+            identity_error: self.identity_error.clone(),
+            workspace_snapshots: self.projections.workspace_snapshots(),
+            thread_snapshots: self.projections.thread_snapshots(),
         }
     }
     fn invalidate_policy_requests(&mut self) {
@@ -128,6 +151,9 @@ impl IdentityAuthorizationStore {
             .checked_add(1)
             .expect("authorization policy generation exhausted");
         self.current_auth = None;
+        self.capability_reads.clear();
+        self.identity_loading = false;
+        self.identity_error = None;
         self.identity_request = self
             .identity_request
             .checked_add(1)
@@ -290,8 +316,27 @@ impl ClientCore {
 
     pub fn refresh_current_auth(&self) -> anyhow::Result<AuthMeResponse> {
         let (generation, connection) = self.begin_identity_request()?;
-        let auth = self.compatibility_runtime().ws_command_sender().auth_me()?;
-        self.finish_current_auth(generation, connection, auth)
+        let result = self
+            .compatibility_runtime()
+            .ws_command_sender()
+            .auth_me()
+            .and_then(|auth| self.finish_current_auth(generation, connection, auth));
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if owner.identity_request == generation && self.gateway_http_generation() == connection {
+            owner.identity_loading = false;
+            owner.identity_error = result
+                .as_ref()
+                .err()
+                .map(|_| "identity_request_failed".into());
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
+        }
+        result
     }
 
     fn begin_identity_request(&self) -> anyhow::Result<(u64, Option<u64>)> {
@@ -305,6 +350,12 @@ impl ClientCore {
                 .identity_request
                 .checked_add(1)
                 .expect("identity request generation exhausted");
+            owner.identity_loading = true;
+            owner.identity_error = None;
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
             (owner.identity_request, self.gateway_http_generation())
         };
         Ok((generation, connection))
@@ -338,7 +389,117 @@ impl ClientCore {
         Ok(auth)
     }
 
+    /// Serializes capability reads and owns their bounded recovery policy. Shells
+    /// observe the accepted projection and request state through one publication.
     pub fn refresh_identity_authorization(
+        &self,
+        params: pioneer_protocol::AuthorizationCapabilitiesParams,
+    ) -> Result<
+        (AuthMeResponse, AuthorizationCapabilitySnapshot),
+        (Option<AuthMeResponse>, anyhow::Error),
+    > {
+        let epoch = {
+            let owner = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            (
+                owner.authorization_epoch(),
+                owner.authorization_change_sequence,
+            )
+        };
+        let _gate = self
+            .capability_read_gate
+            .lock()
+            .expect("capability read gate poisoned");
+        let key = (params.workspace_id.clone(), params.thread_id.clone());
+        {
+            let mut owner = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            if self.is_stopped()
+                || epoch
+                    != (
+                        owner.authorization_epoch(),
+                        owner.authorization_change_sequence,
+                    )
+            {
+                return Err((None, anyhow::anyhow!("capability_request_stale")));
+            }
+            if !owner.capability_reads.contains_key(&key) && owner.capability_reads.len() >= 64 {
+                if let Some(retired) = owner
+                    .capability_reads
+                    .iter()
+                    .find(|(_, read)| !read.loading)
+                    .map(|(key, _)| key.clone())
+                {
+                    owner.capability_reads.remove(&retired);
+                } else {
+                    return Err((None, anyhow::anyhow!("capability_request_capacity")));
+                }
+            }
+            owner.capability_reads.insert(
+                key.clone(),
+                CapabilityReadState {
+                    workspace_id: params.workspace_id.clone(),
+                    thread_id: params.thread_id.clone(),
+                    loading: true,
+                    error: None,
+                },
+            );
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
+        }
+        let result = retry_capability_read(
+            || self.refresh_identity_authorization_once(params.clone()),
+            || {
+                let owner = self
+                    .identity_authorization
+                    .lock()
+                    .expect("identity owner poisoned");
+                !self.is_stopped()
+                    && (
+                        owner.authorization_epoch(),
+                        owner.authorization_change_sequence,
+                    ) == epoch
+            },
+            std::thread::sleep,
+        );
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if !self.is_stopped()
+            && epoch
+                == (
+                    owner.authorization_epoch(),
+                    owner.authorization_change_sequence,
+                )
+        {
+            owner.capability_reads.insert(
+                key,
+                CapabilityReadState {
+                    workspace_id: params.workspace_id,
+                    thread_id: params.thread_id,
+                    loading: false,
+                    error: result
+                        .as_ref()
+                        .err()
+                        .map(|_| "capability_request_failed".into()),
+                },
+            );
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::Update,
+            );
+        }
+        result
+    }
+
+    fn refresh_identity_authorization_once(
         &self,
         params: pioneer_protocol::AuthorizationCapabilitiesParams,
     ) -> Result<
@@ -509,7 +670,7 @@ impl ClientCore {
                     .epoch
                     .as_ref()
                     .is_some_and(|(_, id)| id == connection_id);
-                if current {
+                if current && !self.preserves_suspended_authorization(*connection_id) {
                     self.clear_authorization_projections();
                 }
             }
@@ -1752,5 +1913,124 @@ impl ClientCore {
         }
         owner.sessions.error = (!success).then(|| "secure_storage_failed".into());
         self.publish_auth_sessions(&owner.sessions);
+    }
+}
+
+fn capability_retry_allowed(attempt: usize, error: &anyhow::Error) -> bool {
+    if attempt >= 4 {
+        return false;
+    }
+    let code = crate::rpc::json_rpc_response_error(error).and_then(|error| error.machine_code());
+    !matches!(
+        code,
+        Some(
+            "gateway_identity_mismatch"
+                | "invalid_capability_scope"
+                | "invalid_credential"
+                | "session_compromised"
+                | "session_expired"
+                | "session_revoked"
+        )
+    ) && !matches!(
+        error.to_string().as_str(),
+        "Gateway returned an incompatible capability snapshot"
+            | "Gateway identity response is stale"
+    )
+}
+
+fn retry_capability_read<T>(
+    mut read: impl FnMut() -> Result<T, (Option<AuthMeResponse>, anyhow::Error)>,
+    current: impl Fn() -> bool,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<T, (Option<AuthMeResponse>, anyhow::Error)> {
+    let mut result = read();
+    for (attempt, delay) in [100, 250, 500, 1_000].into_iter().enumerate() {
+        let Err((_, error)) = &result else { break };
+        if !capability_retry_allowed(attempt, error) {
+            break;
+        }
+        wait(std::time::Duration::from_millis(delay));
+        if !current() {
+            return Err((None, anyhow::anyhow!("capability_request_stale")));
+        }
+        result = read();
+    }
+    result
+}
+
+#[cfg(test)]
+mod capability_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn transient_reads_are_bounded_and_success_ends_retry() {
+        let calls = Cell::new(0);
+        let mut delays = Vec::new();
+        let result = retry_capability_read::<()>(
+            || {
+                calls.set(calls.get() + 1);
+                Err((None, anyhow::anyhow!("temporary")))
+            },
+            || true,
+            |delay| delays.push(delay.as_millis()),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 5);
+        assert_eq!(delays, [100, 250, 500, 1_000]);
+        calls.set(0);
+        let result = retry_capability_read(
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    Ok(42)
+                } else {
+                    Err((None, anyhow::anyhow!("temporary")))
+                }
+            },
+            || true,
+            |_| {},
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.get(), 2);
+    }
+    #[test]
+    fn terminal_and_replaced_scopes_cannot_retry() {
+        for code in [
+            "session_revoked",
+            "session_compromised",
+            "invalid_capability_scope",
+            "gateway_identity_mismatch",
+        ] {
+            let result = retry_capability_read::<()>(
+                || {
+                    Err((
+                        None,
+                        anyhow::Error::new(crate::rpc::JsonRpcResponseError::server(
+                            None,
+                            "rejected",
+                            Some(code.into()),
+                        )),
+                    ))
+                },
+                || true,
+                |_| panic!("terminal reads cannot schedule retries"),
+            );
+            assert!(result.is_err());
+        }
+        let calls = Cell::new(0);
+        let current = Cell::new(true);
+        let result = retry_capability_read::<()>(
+            || {
+                calls.set(calls.get() + 1);
+                Err((None, anyhow::anyhow!("temporary")))
+            },
+            || current.get(),
+            |_| current.set(false),
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            result.unwrap_err().1.to_string(),
+            "capability_request_stale"
+        );
     }
 }
