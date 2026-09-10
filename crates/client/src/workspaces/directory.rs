@@ -246,6 +246,9 @@ pub struct ThreadDirectoryStore {
     requests: HashMap<String, u64>,
     subscriptions: HashMap<String, usize>,
     suspended_workspaces: BTreeSet<String>,
+    // An access fence clears protected data, but must not erase the need to
+    // reload it. Local projections can be recreated before that reload finishes.
+    authorization_reloads: BTreeSet<String>,
     lifecycle_generations: HashMap<String, u64>,
     request_versions: HashMap<String, u64>,
     semantic_versions: HashMap<String, u64>,
@@ -313,6 +316,9 @@ impl ThreadDirectoryStore {
     }
     pub(crate) fn invalidate(&mut self) {
         let generation = self.next_request.saturating_add(1);
+        let mut authorization_reloads = std::mem::take(&mut self.authorization_reloads);
+        authorization_reloads.extend(self.projections.publications.keys().cloned());
+        authorization_reloads.extend(self.subscriptions.keys().cloned());
         let revisions = std::mem::take(&mut self.projections.revisions);
         let subscriptions = std::mem::take(&mut self.subscriptions);
         let suspended_workspaces = std::mem::take(&mut self.suspended_workspaces);
@@ -322,6 +328,7 @@ impl ThreadDirectoryStore {
             .for_each(|generation| *generation += 1);
         *self = Self::default();
         self.subscriptions = subscriptions;
+        self.authorization_reloads = authorization_reloads;
         self.suspended_workspaces = suspended_workspaces;
         self.lifecycle_generations = lifecycle_generations;
         self.next_request = generation;
@@ -333,6 +340,7 @@ impl ThreadDirectoryStore {
             .insert(workspace.to_owned(), revision);
     }
     fn begin(&mut self, workspace: &str) -> u64 {
+        self.authorization_reloads.remove(workspace);
         self.next_request = self
             .next_request
             .checked_add(1)
@@ -472,6 +480,28 @@ impl ClientCore {
         };
         if suspended {
             self.workspace_demand_changed(scope, crate::core::ClientDemand::Suspended);
+        } else if added {
+            self.resume_workspace_directory_demand();
+        }
+    }
+    pub(crate) fn resume_workspace_directory_demand(&self) {
+        if self.is_stopped() || self.authorization_snapshot(None, None).is_none() {
+            return;
+        }
+        let workspaces = {
+            let registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            registry
+                .directory
+                .authorization_reloads
+                .difference(&registry.directory.suspended_workspaces)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for workspace in workspaces {
+            self.queue_directory_refresh(&workspace);
         }
     }
     pub(crate) fn workspace_refresh_is_demanded(&self, workspace: &str) -> bool {
@@ -479,7 +509,8 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        registry.directory.snapshot(workspace).is_some()
+        (registry.directory.snapshot(workspace).is_some()
+            || registry.directory.authorization_reloads.contains(workspace))
             && !registry.directory.suspended_workspaces.contains(workspace)
     }
     pub(crate) fn workspace_operation_generation(&self, workspace: &str) -> u64 {
@@ -510,6 +541,7 @@ impl ClientCore {
                 .directory
                 .suspended_workspaces
                 .remove(workspace);
+            self.resume_workspace_directory_demand();
             return;
         }
         self.cancel_workspace_requests(workspace);
@@ -567,6 +599,16 @@ impl ClientCore {
         &self,
         workspace: &str,
     ) -> anyhow::Result<Arc<ThreadTreePublication>> {
+        self.refresh_workspace_tree_with_transport(
+            workspace,
+            &self.transport_runtime().ws_command_sender(),
+        )
+    }
+    pub(super) fn refresh_workspace_tree_with_transport(
+        &self,
+        workspace: &str,
+        transport: &impl crate::rpc::JsonRpcRequestTransport,
+    ) -> anyhow::Result<Arc<ThreadTreePublication>> {
         anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
         let connection = self.gateway_http_generation();
         let generation = {
@@ -595,10 +637,10 @@ impl ClientCore {
                 .insert(workspace.to_owned(), version);
             generation
         };
-        let result = self
-            .transport_runtime()
-            .ws_command_sender()
-            .thread_tree(crate::threads::tree::thread_tree_params(workspace));
+        let result = crate::transport::ws::command_sender::thread_tree(
+            transport,
+            crate::threads::tree::thread_tree_params(workspace),
+        );
         let mut registry = self
             .thread_registry
             .lock()

@@ -744,6 +744,156 @@ mod tests {
         );
     }
     #[test]
+    fn startup_directory_recovers_when_capabilities_arrive_after_or_during_loading() {
+        use crate::authorization::AuthorizationProjectionAcceptance;
+        use crate::core::ClientScope;
+        use std::num::NonZeroUsize;
+
+        struct DirectoryTransport<'a> {
+            before_response: &'a dyn Fn(),
+        }
+        impl crate::rpc::JsonRpcRequestTransport for DirectoryTransport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request["method"], "thread/tree");
+                (self.before_response)();
+                response
+                    .send(Ok(serde_json::json!({
+                        "workspace_id": "ws",
+                        "threads": [{"id":"existing","workspace_id":"ws","preview":"history",
+                            "mode":"Chat","model":"model","model_provider":"provider",
+                            "created_at":1,"updated_at":1,"status":"Idle","turns":[]}],
+                        "unread":[],"folders":[],"placements":[],"agents_docs":[]
+                    })))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        // Exercise both orders deterministically, without timers or UI remounts.
+        for during_request in [false, true] {
+            let core = Arc::new(ClientCore::new());
+            let (sender, _receiver) = mpsc::sync_channel(1);
+            core.workspace_controller.lock().unwrap().sender = Some(sender);
+            let _subscription = core.subscribe(
+                ClientScope::WorkspaceTree {
+                    workspace_id: Some("ws".into()),
+                },
+                NonZeroUsize::new(8).unwrap(),
+            );
+            core.activate_thread(None, Some("ws"));
+            let capabilities = crate::catalog_test_support::client()
+                .authorization_snapshot(None, None)
+                .unwrap();
+            let accept = || {
+                let (generation, connection) = core.current_auth_ticket();
+                assert_eq!(
+                    core.accept_authorization_projection(
+                        generation,
+                        connection,
+                        capabilities.clone()
+                    ),
+                    AuthorizationProjectionAcceptance::Accepted
+                );
+            };
+            let before_response = || {
+                if during_request {
+                    accept();
+                }
+            };
+            let initial = core.refresh_workspace_tree_with_transport(
+                "ws",
+                &DirectoryTransport {
+                    before_response: &before_response,
+                },
+            );
+            if during_request {
+                assert!(initial.is_err(), "the pre-fence response must be rejected");
+            } else {
+                assert_eq!(initial.unwrap().snapshot().threads_by_id.len(), 1);
+                accept();
+            }
+            assert!(
+                core.workspace_tree("ws").is_none(),
+                "protected data is cleared"
+            );
+            assert!(
+                core.workspace_refresh_is_demanded("ws"),
+                "a fence must retain the live directory demand"
+            );
+            let mut refreshes = 0;
+            while let Some(request) = core
+                .workspace_controller
+                .lock()
+                .unwrap()
+                .next(Instant::now())
+            {
+                if let WorkspaceRequest::Refresh { workspace, .. } = request {
+                    assert_eq!(workspace, "ws");
+                    refreshes += 1;
+                }
+            }
+            assert_eq!(
+                refreshes, 1,
+                "accepted capabilities must reload the cleared directory"
+            );
+            let loaded = core
+                .refresh_workspace_tree_with_transport(
+                    "ws",
+                    &DirectoryTransport {
+                        before_response: &|| {},
+                    },
+                )
+                .unwrap();
+            assert_eq!(loaded.snapshot().threads_by_id.len(), 1);
+            assert_eq!(core.navigation_snapshot().workspace_id(), Some("ws"));
+            accept();
+            assert!(
+                core.workspace_controller.lock().unwrap().refresh.is_empty(),
+                "equal capabilities must not cause a reload loop"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_directory_reload_waits_for_capabilities_and_visible_demand() {
+        use crate::core::{ClientDemand, ClientScope};
+        use std::num::NonZeroUsize;
+        let core = crate::catalog_test_support::client();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        core.workspace_controller.lock().unwrap().sender = Some(sender);
+        let scope = ClientScope::WorkspaceTree {
+            workspace_id: Some("ws".into()),
+        };
+        let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(8).unwrap());
+        core.upsert_thread(serde_json::from_value(serde_json::json!({"id":"existing","workspace_id":"ws","preview":"","mode":"Chat","model":"model","model_provider":"provider","created_at":1,"updated_at":1,"status":"Idle","turns":[]})).unwrap());
+        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+        capabilities.authorization_revision += 1;
+        core.invalidate_authorization_revision(capabilities.authorization_revision);
+        assert!(core.workspace_tree("ws").is_none());
+        assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+        // Navigation/draft reconciliation can publish an empty local directory
+        // after the fence; its existence does not mean the server was reloaded.
+        {
+            let mut registry = core.thread_registry.lock().unwrap();
+            registry.directory.project("ws", None, false, None);
+        }
+        core.workspace_demand_changed(&scope, ClientDemand::Suspended);
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, capabilities);
+        assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+        core.workspace_demand_changed(&scope, ClientDemand::Visible);
+        assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+        drop(subscription);
+        assert!(!core.workspace_refresh_is_demanded("ws"));
+        assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+    }
+
+    #[test]
     fn repeated_hints_keep_one_follow_up_and_teardown_discards_pending_work() {
         let mut owner = WorkspaceController::default();
         for _ in 0..1000 {

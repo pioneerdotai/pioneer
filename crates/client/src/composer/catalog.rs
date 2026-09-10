@@ -163,7 +163,7 @@ struct CatalogWork {
     identity: ComposerOperationIdentity,
     workspace: String,
     kind: ComposerCatalogKind,
-    auth: (u64, Option<u64>),
+    auth: ((u64, u64), Option<u64>),
 }
 enum CatalogResult {
     Skills(SkillManagementProjection),
@@ -290,7 +290,7 @@ impl ClientCore {
         if self.is_stopped() || !self.catalog_allowed(thread, &workspace, &kind) {
             return self.reject_intent();
         }
-        let auth = self.current_auth_ticket();
+        let auth = self.composer_catalog_auth_epoch();
         let mut store = self.composer_store.lock().expect("composer store poisoned");
         if store.catalog_suspended.contains(thread)
             || store.suspended.contains(thread)
@@ -650,9 +650,18 @@ impl ClientCore {
         }
         result
     }
+    fn composer_catalog_auth_epoch(&self) -> ((u64, u64), Option<u64>) {
+        // Background auth/me reads have their own request counter. Only a
+        // replacement connection or policy invalidates a catalog read.
+        let owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        (owner.authorization_epoch(), self.gateway_http_generation())
+    }
     fn catalog_work_current(&self, work: &CatalogWork) -> bool {
         !self.is_stopped()
-            && self.current_auth_ticket() == work.auth
+            && self.composer_catalog_auth_epoch() == work.auth
             && self
                 .composer_snapshot(&work.identity.thread_id)
                 .is_some_and(|p| p.draft_id() == work.identity.draft_id)
@@ -1204,8 +1213,67 @@ mod tests {
         );
     }
     #[test]
+    fn picker_reads_finish_after_background_identity_refresh_in_both_shell_modes() {
+        for deferred in [false, true] {
+            for fail in [false, true] {
+                let (core, receiver) = fixture();
+                let identity = open(&core, ComposerPickerKind::Mcp, deferred);
+                let work = receiver.try_recv().unwrap();
+                let before = core.current_auth_ticket();
+                // A routine auth/me read advances its request ticket even if
+                // the transport fails. It does not change the session or policy.
+                let _ = core.refresh_current_auth();
+                assert_ne!(core.current_auth_ticket(), before);
+                core.complete_composer_catalog(
+                    work,
+                    if fail {
+                        Err("synthetic read failure".into())
+                    } else {
+                        Ok(CatalogResult::Servers(vec![server(false)], vec![]))
+                    },
+                );
+                let publication = core.composer_catalog_snapshot("a").unwrap();
+                assert_eq!(publication.session.as_ref().unwrap().identity, identity);
+                if fail {
+                    assert!(matches!(
+                        publication.mcp_request.state,
+                        ComposerCatalogRequestState::Failed { .. }
+                    ));
+                } else {
+                    assert_eq!(
+                        publication.mcp_request.state,
+                        ComposerCatalogRequestState::Ready
+                    );
+                    assert_eq!(publication.mcp_servers.len(), 1);
+                    observe(
+                        &core,
+                        ComposerCatalogKind::McpTools {
+                            server_id: server(false).server_id,
+                        },
+                        false,
+                    );
+                    let tools = receiver.try_recv().unwrap();
+                    let _ = core.refresh_current_auth();
+                    core.complete_composer_catalog(
+                        tools,
+                        Ok(CatalogResult::Tools(vec![server(true)])),
+                    );
+                    let publication = core.composer_catalog_snapshot("a").unwrap();
+                    assert_eq!(publication.mcp_tools.len(), 1);
+                    assert!(
+                        publication
+                            .tool_requests
+                            .values()
+                            .all(|r| r.state == ComposerCatalogRequestState::Ready)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cancelled_wrong_draft_and_unmounted_requests_cannot_restore_a_catalog() {
-        for scenario in 0..7 {
+        for scenario in 0..9 {
             let (core, receiver) = fixture();
             let scope = ClientScope::ComposerCatalog {
                 thread_id: "a".into(),
@@ -1227,7 +1295,9 @@ mod tests {
                 }
                 4 => core.clear_authorization_projections(),
                 5 => core.remove_thread_store("a"),
-                _ => core.shutdown(),
+                6 => core.shutdown(),
+                7 => core.invalidate_authorization_revision(2),
+                _ => core.begin_authorization_epoch(Some(("replacement".into(), 2))),
             }
             let before = core.composer_catalog_snapshot("a");
             core.complete_composer_catalog(work, Ok(CatalogResult::Skills(management())));

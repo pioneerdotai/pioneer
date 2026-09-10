@@ -902,6 +902,7 @@ impl ClientCore {
     }
 
     fn resume_authorized_feature_demands(&self) {
+        self.resume_workspace_directory_demand();
         self.resume_administration_demand();
         self.resume_provider_collection_demand();
         self.resume_provider_runtime_demand();
@@ -941,12 +942,7 @@ impl ClientCore {
         }
         drop(owner);
         if accepted == AuthorizationProjectionAcceptance::Accepted {
-            self.resume_administration_demand();
-            self.resume_provider_collection_demand();
-            self.resume_provider_runtime_demand();
-            self.resume_mcp_demand();
-            self.resume_skills_demand();
-            self.resume_current_settings_demand();
+            self.resume_authorized_feature_demands();
         }
         accepted
     }
