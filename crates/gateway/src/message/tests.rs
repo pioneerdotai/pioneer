@@ -28767,8 +28767,15 @@ async fn terminal_turn_completion_closes_running_execution_window() {
     assert_eq!(turn.status, TurnStatus::Completed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state() {
+#[test]
+fn periodic_native_finalization_reconciliation_updates_loaded_turn_state() {
+    run_gateway_stack_message_test(
+        "periodic_native_finalization_reconciliation_updates_loaded_turn_state",
+        periodic_native_finalization_reconciliation_updates_loaded_turn_state_impl(),
+    );
+}
+
+async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state_impl() {
     let thread_id = "thr_native_finalization_reconcile";
     let turn_id = "turn_native_finalization_reconcile";
     let (processor, crud_store, workspace_id) =
@@ -35131,8 +35138,15 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn() {
+#[test]
+fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn() {
+    run_gateway_stack_message_test(
+        "codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn",
+        codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn_impl(),
+    );
+}
+
+async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn_impl() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -35488,8 +35502,15 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
     });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread() {
+#[test]
+fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread() {
+    run_gateway_stack_message_test(
+        "cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread",
+        cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread_impl(),
+    );
+}
+
+async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -36805,8 +36826,15 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
     drop(replacement);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
+#[test]
+fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
+    run_gateway_stack_message_test(
+        "completed_cli_runtime_attempt_reconciles_running_pioneer_turn",
+        completed_cli_runtime_attempt_reconciles_running_pioneer_turn_impl(),
+    );
+}
+
+async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn_impl() {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -37941,8 +37969,15 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
+#[test]
+fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
+    run_gateway_stack_message_test(
+        "cli_runtime_stale_db_only_running_binding_schedules_recovery",
+        cli_runtime_stale_db_only_running_binding_schedules_recovery_impl(),
+    );
+}
+
+async fn cli_runtime_stale_db_only_running_binding_schedules_recovery_impl() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -38080,8 +38115,15 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
+#[test]
+fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
+    run_gateway_stack_message_test(
+        "cli_runtime_stale_scan_reconciles_db_only_terminal_binding",
+        cli_runtime_stale_scan_reconciles_db_only_terminal_binding_impl(),
+    );
+}
+
+async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding_impl() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -49589,8 +49631,15 @@ fn completed_command_execution_item(item_id: &str) -> TurnItem {
     item
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
+#[test]
+fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
+    run_gateway_stack_message_test(
+        "recovery_lifecycle_notification_is_persisted_for_history_replay",
+        recovery_lifecycle_notification_is_persisted_for_history_replay_impl(),
+    );
+}
+
+async fn recovery_lifecycle_notification_is_persisted_for_history_replay_impl() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -49696,8 +49745,15 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
+#[test]
+fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
+    run_gateway_stack_message_test(
+        "recovery_blocked_event_marks_turn_blocked_and_closes_active_window",
+        recovery_blocked_event_marks_turn_blocked_and_closes_active_window_impl(),
+    );
+}
+
+async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window_impl() {
     let thread_id = "thr_recovery_blocked_missing_snapshot";
     let turn_id = "turn_recovery_blocked_missing_snapshot";
     let (processor, crud_store, workspace_id) =
@@ -49803,8 +49859,15 @@ async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
+#[test]
+fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
+    run_gateway_stack_message_test(
+        "cli_recovery_blocked_event_surfaces_projection_root_cause",
+        cli_recovery_blocked_event_surfaces_projection_root_cause_impl(),
+    );
+}
+
+async fn cli_recovery_blocked_event_surfaces_projection_root_cause_impl() {
     let thread_id = "thr_cli_recovery_blocked_root_cause";
     let turn_id = "turn_cli_recovery_blocked_root_cause";
     let (processor, crud_store, workspace_id) =
@@ -49924,8 +49987,15 @@ async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
     )));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session() {
+#[test]
+fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session() {
+    run_gateway_stack_message_test(
+        "cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session",
+        cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session_impl(),
+    );
+}
+
+async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session_impl() {
     let thread_id = "thr_cli_recovery_blocked_cleanup";
     let turn_id = "turn_cli_recovery_blocked_cleanup";
     let (processor, crud_store, workspace_id) =
@@ -52189,8 +52259,15 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
+#[test]
+fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
+    run_gateway_stack_message_test(
+        "cli_runtime_late_terminal_event_after_blocked_turn_is_ignored",
+        cli_runtime_late_terminal_event_after_blocked_turn_is_ignored_impl(),
+    );
+}
+
+async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored_impl() {
     let thread_id = "thr_cli_late_event_after_blocked";
     let turn_id = "turn_cli_late_event_after_blocked";
     let (processor, crud_store, workspace_id) =
