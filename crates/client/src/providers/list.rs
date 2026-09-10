@@ -1,12 +1,10 @@
 //! Provider list state.
 
-use super::{
-    catalog,
-};
+use super::catalog;
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, CLIRuntimeListModelsParams,
-    CLIRuntimeListModelsResponse, CLIRuntimeListParams,
-    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    CLIRuntimeListModelsResponse, CLIRuntimeListParams, ProviderListModelsParams,
+    ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
     ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
     ProviderModelReasoningCapabilities, ProviderSummary, ReasoningCapabilitySource,
     RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
@@ -290,7 +288,10 @@ impl ProviderModelSelectorState {
     }
 
     #[cfg(test)]
-    fn apply_cli_runtime_list_success(&mut self, response: pioneer_protocol::CLIRuntimeListResponse) {
+    fn apply_cli_runtime_list_success(
+        &mut self,
+        response: pioneer_protocol::CLIRuntimeListResponse,
+    ) {
         self.sync_cli_runtime_snapshot(response.runtimes);
         self.error = None;
     }

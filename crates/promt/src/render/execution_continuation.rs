@@ -33,9 +33,7 @@ pub fn render_execution_continuation_runtime_facts(
 
     lines.push(format!(
         "Checkpoint: schema_version={}, workspace_id={}, turn_id={}",
-        checkpoint.schema_version,
-        checkpoint.workspace_id,
-        checkpoint.turn_id
+        checkpoint.schema_version, checkpoint.workspace_id, checkpoint.turn_id
     ));
 
     match checkpoint.original_request.text_preview.as_deref() {

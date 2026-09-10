@@ -326,16 +326,25 @@ mod tests {
                 }),
             },
         );
-        let mut capability = core.thread_capability_snapshot("a").unwrap().snapshot.clone().unwrap();
+        let mut capability = core
+            .thread_capability_snapshot("a")
+            .unwrap()
+            .snapshot
+            .clone()
+            .unwrap();
         let workspace = capability.workspace.as_mut().unwrap();
         workspace.operational_resources = workspace.execution_draft_policy.resources.clone();
         workspace.operational_resources.fingerprint = "synthetic-policy".into();
         workspace.execution_draft_policy.resources = workspace.operational_resources.clone();
-        assert_eq!(core.accept_authorization_projection(0, None, capability.clone()), crate::authorization::AuthorizationProjectionAcceptance::Accepted);
+        assert_eq!(
+            core.accept_authorization_projection(0, None, capability.clone()),
+            crate::authorization::AuthorizationProjectionAcceptance::Accepted
+        );
         core.upsert_thread(serde_json::from_value(serde_json::json!({
             "workspace_id":"ws", "id":"a", "preview":"", "mode":"Agent", "model":"model", "model_provider":"cli_runtime:codex", "created_at":1,"updated_at":1,"status":"Idle","origin_kind":"user","sidebar_visibility":"visible","turns":[]
         })).unwrap());
-        ClientMutationAuthority { _private: () }.accept_thread_capabilities_for_test(&core, capability);
+        ClientMutationAuthority { _private: () }
+            .accept_thread_capabilities_for_test(&core, capability);
         core.composer_intent(ComposerIntent::Open {
             thread_id: "a".into(),
             defaults: super::super::state_machine::ComposerDomainState {

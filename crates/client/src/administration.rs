@@ -4,22 +4,24 @@
 //! only snapshots returned by authenticated list methods and drops them when a
 //! scoped notification says they may be stale.
 
-pub mod pages;
 pub mod operations;
+pub mod pages;
 
 pub mod types {
-    pub use pioneer_protocol::{AuthMeResponse, AuthorizationCapabilitySnapshot, AuthorizationInvitationRoleOption,
-        AuthSessionRevokeParams, AuthSessionStatus, MemberDeviceCreateParams, MemberListParams,
-        MemberRemoveParams, MemberRestoreParams, MemberSummary, MemberSuspendParams, PrincipalId,
-        PrincipalKind, PrincipalStatus, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
-        WorkspaceMemberRemoveParams, InvitationCreateParams, InvitationId, InvitationListParams,
-        InvitationRevokeParams, InvitationSummary, RoleKey, Workspace};
+    pub use pioneer_protocol::{
+        AuthMeResponse, AuthSessionRevokeParams, AuthSessionStatus,
+        AuthorizationCapabilitySnapshot, AuthorizationInvitationRoleOption, InvitationCreateParams,
+        InvitationId, InvitationListParams, InvitationRevokeParams, InvitationSummary,
+        MemberDeviceCreateParams, MemberListParams, MemberRemoveParams, MemberRestoreParams,
+        MemberSummary, MemberSuspendParams, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
+        Workspace, WorkspaceId, WorkspaceMemberAddParams, WorkspaceMemberListParams,
+        WorkspaceMemberRemoveParams,
+    };
 }
 
 use pioneer_protocol::{
-    InvitationChangedNotification, InvitationId,
-    InvitationStatus, InvitationSummary, MemberChangedNotification,
-    MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
+    InvitationChangedNotification, InvitationId, InvitationStatus, InvitationSummary,
+    MemberChangedNotification, MemberSummary, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey,
     WorkspaceId, WorkspaceMembersChangedNotification,
 };
 use std::collections::BTreeMap;
@@ -125,7 +127,9 @@ pub struct MemberListRow {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AdministrationAction {
-    SetMemberWorkspaces { principal_id: PrincipalId },
+    SetMemberWorkspaces {
+        principal_id: PrincipalId,
+    },
     CreateInvitation,
     RevokeInvitation {
         invitation_id: InvitationId,
@@ -325,11 +329,11 @@ impl AdministrationEventTracker {
             }
         }
     }
-
-
 }
 
-fn is_stale(previous: Option<&u64>, revision: u64) -> bool { previous.is_some_and(|previous| *previous >= revision) }
+fn is_stale(previous: Option<&u64>, revision: u64) -> bool {
+    previous.is_some_and(|previous| *previous >= revision)
+}
 
 fn no_change() -> AdministrationInvalidation {
     AdministrationInvalidation {
@@ -348,9 +352,7 @@ fn changed(effect: AdministrationRefetch) -> AdministrationInvalidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pioneer_protocol::{
-        MemberSummary, RoleKey,
-    };
+    use pioneer_protocol::{MemberSummary, RoleKey};
 
     fn member(principal_id: &str) -> MemberSummary {
         MemberSummary {
@@ -470,8 +472,6 @@ mod tests {
         );
         assert_eq!(unknown.actions, self_row.actions);
     }
-
-
 }
 
 mod reads;

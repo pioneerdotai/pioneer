@@ -2,9 +2,7 @@
 use super::store::{ComposerOperationIdentity, ComposerPublication, DraftId};
 use crate::{
     core::{ClientCore, ClientMutationAuthority, ClientScope, ClientTransition},
-    providers::{
-        presentation::{self, ProviderModelDisplayKey},
-    },
+    providers::presentation::{self, ProviderModelDisplayKey},
 };
 use pioneer_protocol::ProviderListModelsResponse;
 use std::{
@@ -149,7 +147,8 @@ impl ClientCore {
             label: None,
             reasoning_effort_label: None,
         };
-        let request = ModelRequest { retry: retry.is_some(),
+        let request = ModelRequest {
+            retry: retry.is_some(),
             publication: publication.clone(),
             auth_ticket: ticket,
         };
@@ -393,23 +392,50 @@ impl ClientCore {
     pub(crate) fn start_composer_model_display_controller(self: &Arc<Self>) {
         let (sender, receiver) = mpsc::sync_channel::<ModelWork>(64);
         let weak = Arc::downgrade(self);
-        let task = std::thread::Builder::new().name("client-composer-model".into()).spawn(move || {
-            while let Ok(work) = receiver.recv() {
-                if let ModelWork::Resolve(request) = work {
-                    let Some(core) = weak.upgrade() else { return; };
-                    if core.composer_model_request_is_current(&request) {
-                        let key = &request.publication.key;
-                        let read = core.read_provider_collection(crate::providers::store::ProviderCollectionKey::models(key.workspace_id.clone(), key.provider.clone(), crate::providers::store::ProviderModelKind::Chat), request.retry);
-                        drop(core);
-                        let result = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.composer_model_request_is_current(&request)))).and_then(|p| p.models_response());
-                        let Some(core) = weak.upgrade() else { return; };
-                        core.complete_composer_model_display(request, result.map_err(|error| format!("{error:#}")));
+        let task = std::thread::Builder::new()
+            .name("client-composer-model".into())
+            .spawn(move || {
+                while let Ok(work) = receiver.recv() {
+                    if let ModelWork::Resolve(request) = work {
+                        let Some(core) = weak.upgrade() else {
+                            return;
+                        };
+                        if core.composer_model_request_is_current(&request) {
+                            let key = &request.publication.key;
+                            let read = core.read_provider_collection(
+                                crate::providers::store::ProviderCollectionKey::models(
+                                    key.workspace_id.clone(),
+                                    key.provider.clone(),
+                                    crate::providers::store::ProviderModelKind::Chat,
+                                ),
+                                request.retry,
+                            );
+                            drop(core);
+                            let result = read
+                                .and_then(|read| {
+                                    read.wait_while(|| {
+                                        weak.upgrade().is_some_and(|core| {
+                                            core.composer_model_request_is_current(&request)
+                                        })
+                                    })
+                                })
+                                .and_then(|p| p.models_response());
+                            let Some(core) = weak.upgrade() else {
+                                return;
+                            };
+                            core.complete_composer_model_display(
+                                request,
+                                result.map_err(|error| format!("{error:#}")),
+                            );
+                        }
                     }
+                    let Some(core) = weak.upgrade() else {
+                        return;
+                    };
+                    core.refresh_composer_model_selections();
                 }
-                let Some(core) = weak.upgrade() else { return; };
-                core.refresh_composer_model_selections();
-            }
-        }).expect("composer model worker");
+            })
+            .expect("composer model worker");
         let mut owner = self
             .composer_models
             .lock()

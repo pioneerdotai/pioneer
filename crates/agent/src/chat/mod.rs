@@ -7309,7 +7309,11 @@ mod tests {
         );
 
         assert_eq!(sections.len(), 1);
-        assert!(sections[0].content.contains("Initiating thread: initiating_thread_test"));
+        assert!(
+            sections[0]
+                .content
+                .contains("Initiating thread: initiating_thread_test")
+        );
         assert!(sections[0].content.contains(&format!(
             "Execution thread: {} (internal child)",
             checkpoint_context.payload.thread_id

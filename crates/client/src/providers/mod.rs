@@ -16,7 +16,13 @@ pub mod operations;
 
 /// Protocol data used by typed provider consumers.
 pub mod types {
-    pub use pioneer_protocol::{CLIAgentRuntimeKind, GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewaySettingsSnapshot, RuntimeCapabilities, RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary, RuntimeAccountSnapshot, CLIRuntimeLoginStartType, CLIRuntimeLoginStartResponse, ProviderConfigureParams, ProviderDeleteApiKeyParams, CLIRuntimeLoginStartParams, CLIRuntimeProxySetParams, CLIRuntimeProxyDeleteParams};
+    pub use pioneer_protocol::{
+        CLIAgentRuntimeKind, CLIRuntimeLoginStartParams, CLIRuntimeLoginStartResponse,
+        CLIRuntimeLoginStartType, CLIRuntimeProxyDeleteParams, CLIRuntimeProxySetParams,
+        GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewaySettingsSnapshot,
+        ProviderConfigureParams, ProviderDeleteApiKeyParams, RuntimeAccountSnapshot,
+        RuntimeCapabilities, RuntimeDiagnosticLevel, RuntimeStatus, RuntimeSummary,
+    };
 }
 
 pub mod effects;
