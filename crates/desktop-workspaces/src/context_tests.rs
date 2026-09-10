@@ -22,7 +22,7 @@ impl ClientBindingRegistrar for Registrar {
         })
     }
 }
-fn config(
+pub(super) fn config(
     core: Arc<ClientCore>,
     registrations: Rc<RefCell<HashSet<ClientScope>>>,
 ) -> WorkspaceNavigationConfig {
@@ -148,7 +148,7 @@ fn retained_workspace_root_releases_its_scoped_bindings(cx: &mut TestAppContext)
             .downcast::<WorkspaceNavigationView>()
             .unwrap()
     });
-    assert_eq!(registrations.borrow().len(), 4);
+    assert_eq!(registrations.borrow().len(), 5);
     view.update(cx, |view, cx| view.close(cx));
     assert!(registrations.borrow().is_empty());
 }

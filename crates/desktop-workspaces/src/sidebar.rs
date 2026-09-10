@@ -67,6 +67,7 @@ impl ThreadSidebarView {
         let registrations = [
             ClientScope::Navigation,
             ClientScope::Session,
+            ClientScope::GatewayDestinations,
             ClientScope::Administration { workspace_id: None },
             ClientScope::WorkspaceTree { workspace_id: None },
         ]
@@ -145,6 +146,29 @@ impl ThreadSidebarView {
         view.sync(cx);
         view
     }
+    fn workspace_bootstrap_request(
+        &self,
+        session: &pioneer_client::gateway::session_controller::GatewaySessionPublication,
+    ) -> Option<pioneer_client::workspaces::bootstrap::WorkspaceBootstrapRequest> {
+        let registry = self.client.gateway_registry()?;
+        let endpoint = session.startup.endpoint_id.as_deref()?;
+        // Connection readiness is published before onboarding commits the active
+        // registry entry. Wait for that commit so we use this gateway's preference.
+        if registry.active_gateway_id() != Some(endpoint) {
+            return None;
+        }
+        Some(
+            pioneer_client::workspaces::bootstrap::WorkspaceBootstrapRequest {
+                persisted_workspace_id: self
+                    .client
+                    .navigation_snapshot()
+                    .workspace_id()
+                    .or_else(|| registry.active_workspace_id())
+                    .map(str::to_owned),
+            },
+        )
+    }
+
     pub(super) fn sync(&mut self, cx: &mut Context<Self>) {
         let session = self.client.gateway_session();
         let authorization = self.client.authorization_revision();
@@ -156,24 +180,12 @@ impl ThreadSidebarView {
             && (self.bootstrap_connection != session.startup.connection_id
                 || (self.bootstrap_authorization != authorization
                     && catalog.workspaces().is_empty()))
+            && let Some(request) = self.workspace_bootstrap_request(&session)
         {
             self.bootstrap_connection = session.startup.connection_id;
             self.bootstrap_authorization = authorization;
-            let preferred = self
-                .client
-                .navigation_snapshot()
-                .workspace_id()
-                .map(str::to_owned)
-                .or_else(|| {
-                    self.client
-                        .gateway_registry()
-                        .as_ref()
-                        .and_then(
-                            pioneer_client::gateway::types::GatewayRegistry::active_workspace_id,
-                        )
-                        .map(str::to_owned)
-                });
-            self.client.request_workspace_bootstrap(preferred);
+            self.client
+                .request_workspace_bootstrap(request.persisted_workspace_id);
         }
         let navigation = self.client.navigation_snapshot();
         let workspace_changed = self.navigation.workspace_id() != navigation.workspace_id()
@@ -698,5 +710,153 @@ impl Drop for ThreadSidebarView {
 impl Render for ThreadSidebarView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_sidebar(cx)
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::ThreadSidebarView;
+    use gpui_kit::{AppContext, TestAppContext};
+    use pioneer_client::core::{ClientCore, ClientScope};
+    use pioneer_client::core::{
+        ClientMutationAuthority, ClientRevisions, ContentRevision, DomainRevision,
+        PresentationRevision, ScopedRevision,
+    };
+    use pioneer_client::gateway::{
+        onboarding_effects::OnboardingEnvironment,
+        registry::{GatewayRegistryConfig, default_registry},
+        session_controller::GatewaySessionPublication,
+        timings::*,
+    };
+    use pioneer_desktop_foundation::{
+        ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
+    };
+    use std::cell::RefCell;
+    use std::{collections::HashMap, sync::Arc};
+
+    #[derive(Default)]
+    struct Relay(RefCell<HashMap<ClientScope, std::sync::Weak<dyn ClientPublicationSink>>>);
+    impl ClientBindingRegistrar for Relay {
+        fn register(
+            &self,
+            scope: ClientScope,
+            sink: std::sync::Weak<dyn ClientPublicationSink>,
+        ) -> ClientBindingRegistration {
+            self.0.borrow_mut().insert(scope, sink);
+            ClientBindingRegistration::new(|| {})
+        }
+    }
+    impl Relay {
+        fn deliver(&self, core: &ClientCore, scope: ClientScope) {
+            if let Some(sink) = self
+                .0
+                .borrow()
+                .get(&scope)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                sink.publish(core.snapshot(&scope).unwrap());
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn gateway_workspace_bootstrap_waits_for_registry_commit_and_restores_each_preference(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let core = pioneer_client::catalog_test_support::settings_client();
+        let relay = Arc::new(Relay::default());
+        let mut registry = default_registry(&GatewayRegistryConfig { local: None });
+        registry.installation_id = Some("synthetic".into());
+        registry.active_gateway_id = Some("a".into());
+        registry.remotes = ["a", "b"]
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({
+                    "id":id,"name":id,"kind":"remote","gateway_base_url":"https://gateway.invalid",
+                    "server_gateway_id":"G00000000000000000001","session_ref":"synthetic-reference",
+                    "workspace_id":format!("workspace-{id}"),"service_name":null
+                }))
+                .unwrap()
+            })
+            .into();
+        let install = |registry| {
+            core.install_onboarding_environment_for_test(OnboardingEnvironment {
+            registry, binding_journals: vec![], discard_unbound_remote_candidates:false,
+            default_remote_name:"Remote".into(), remote_connect_timeout_min:std::time::Duration::ZERO,
+            installation:serde_json::from_value(serde_json::json!({"installation_id":"synthetic","display_name":"Test","client_kind":"desktop","platform":null,"client_version":null})).unwrap(),
+            timings:GatewayTimings::from_millis(10,10,10).unwrap(),
+            ws_timings:GatewayWsTimings::from_millis(10,10,10,10,20,0).unwrap(),
+            local_provisioned:false,local_install_required:false,local_update_required:false,
+        })
+        };
+        install(registry.clone());
+        let mut config = crate::context_tests::config(core.clone(), Default::default());
+        config.registrar = relay.clone();
+        let sidebar = cx.new(|cx| ThreadSidebarView::new(config, cx));
+        let mut previous_connection = None;
+        for (connection, endpoint) in [(1, "a"), (2, "b"), (3, "a"), (4, "b")] {
+            // Auth replacement has cleared navigation, but the selected registry
+            // entry still refers to the old gateway until its durable write finishes.
+            core.activate_thread(None, None);
+            let mut session = GatewaySessionPublication::default();
+            session.startup.connection_id = Some(connection);
+            session.startup.endpoint_id = Some(endpoint.into());
+            session.startup.transport_ready = true;
+            core.publish(
+                &ClientMutationAuthority::for_test(),
+                ClientScope::Session,
+                ClientRevisions::new(
+                    DomainRevision::new(connection),
+                    PresentationRevision::new(connection),
+                    ContentRevision::new(connection),
+                    ScopedRevision::new(connection),
+                ),
+                Arc::new(session),
+                vec![],
+            );
+            relay.deliver(&core, ClientScope::Session);
+            cx.run_until_parked();
+            if registry.active_gateway_id.as_deref() != Some(endpoint) {
+                sidebar.read_with(cx, |sidebar, _| {
+                    assert_eq!(
+                        sidebar.bootstrap_connection, previous_connection,
+                        "must wait for the selected gateway commit"
+                    );
+                    assert!(
+                        sidebar
+                            .workspace_bootstrap_request(&core.gateway_session())
+                            .is_none()
+                    );
+                });
+            }
+            registry.active_gateway_id = Some(endpoint.into());
+            install(registry.clone());
+            relay.deliver(&core, ClientScope::GatewayDestinations);
+            cx.run_until_parked();
+            sidebar.read_with(cx, |sidebar, _| {
+                assert_eq!(sidebar.bootstrap_connection, Some(connection));
+                let request = sidebar
+                    .workspace_bootstrap_request(&core.gateway_session())
+                    .unwrap();
+                assert_eq!(
+                    request.persisted_workspace_id,
+                    Some(format!("workspace-{endpoint}"))
+                );
+            });
+            previous_connection = Some(connection);
+        }
+        // A transport reconnect of the same gateway keeps an in-session selection.
+        core.activate_thread(None, Some("workspace-chosen"));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar
+                    .workspace_bootstrap_request(&core.gateway_session())
+                    .unwrap()
+                    .persisted_workspace_id
+                    .as_deref(),
+                Some("workspace-chosen")
+            );
+        });
+        core.shutdown();
     }
 }
