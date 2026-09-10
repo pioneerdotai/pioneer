@@ -133,7 +133,7 @@ fn assert_outcome(items: &[TurnItem], name: &str, expected_success: bool) {
 
 #[test]
 fn durable_task_management_survives_new_executions_and_runtime_reconstruction() {
-    run_standard_stack_message_test("Task capsule continuity", async {
+    run_gateway_stack_message_test("Task capsule continuity", async {
         let temp = tempfile::tempdir().unwrap();
         let connection = Database::connect(format!(
             "sqlite://{}?mode=rwc",
