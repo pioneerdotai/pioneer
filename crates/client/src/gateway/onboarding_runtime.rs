@@ -167,10 +167,20 @@ impl Drop for OnboardingHandoff<'_> {
         {
             owner.handoff = None;
         }
+        drop(owner);
+        self.core
+            .session_driver
+            .lock()
+            .expect("session driver poisoned")
+            .end_handoff(&self.endpoint);
     }
 }
 impl ClientCore {
     fn begin_onboarding_handoff(&self, id: &str) -> OnboardingHandoff<'_> {
+        self.session_driver
+            .lock()
+            .expect("session driver poisoned")
+            .begin_handoff(id);
         self.onboarding
             .lock()
             .expect("onboarding owner poisoned")
@@ -437,12 +447,37 @@ impl ClientCore {
         self.publish_onboarding(&owner)
     }
     pub(super) fn publish_onboarding(&self, owner: &OnboardingRuntime) -> ClientTransition {
-        self.publish_settings_value(
-            ClientScope::OnboardingInvitation,
-            owner.invitation.publication().clone(),
-        );
-        self.publish_settings_value(ClientScope::GatewaySetup, owner.setup.publication().clone());
-        self.publish_settings_value(ClientScope::GatewayDestinations, owner.destinations.clone())
+        // A setup or invitation intent can change only its own publication.
+        // Commit all three scopes together so its result does not get replaced
+        // by a no-op publication of the unchanged destinations.
+        let authority = ClientMutationAuthority { _private: () };
+        let revisions = |scope: &ClientScope| {
+            crate::threads::registry::revisions(
+                self.snapshot(scope)
+                    .map_or(1, |p| p.revisions().scoped().get() + 1),
+            )
+        };
+        self.transition(
+            &authority,
+            vec![
+                authority.publication(
+                    ClientScope::OnboardingInvitation,
+                    revisions(&ClientScope::OnboardingInvitation),
+                    Arc::new(owner.invitation.publication().clone()),
+                ),
+                authority.publication(
+                    ClientScope::GatewaySetup,
+                    revisions(&ClientScope::GatewaySetup),
+                    Arc::new(owner.setup.publication().clone()),
+                ),
+                authority.publication(
+                    ClientScope::GatewayDestinations,
+                    revisions(&ClientScope::GatewayDestinations),
+                    Arc::new(owner.destinations.clone()),
+                ),
+            ],
+            vec![],
+        )
     }
     /// Native adapters and compatibility launch consumers read the same committed registry.
     pub fn active_gateway_endpoint(&self) -> Option<GatewayEndpoint> {
@@ -1381,6 +1416,160 @@ mod tests {
             local_update_required: false,
         }
     }
+    #[test]
+    fn setup_and_invitation_intents_return_their_actual_publication_changes() {
+        let core = ClientCore::new();
+        let environment = environment();
+        core.onboarding.lock().unwrap().environment = Some(environment.clone());
+        core.adopt_onboarding_registry(environment.registry);
+        let destinations = core
+            .snapshot(&ClientScope::GatewayDestinations)
+            .unwrap()
+            .snapshot();
+        let opened = core.onboarding_intent(OnboardingIntent::Setup {
+            intent: GatewaySetupIntent::Open {
+                mode: GatewaySetupMode::AddGateway { allow_local: false },
+            },
+        });
+        assert_eq!(opened.outcome(), ClientTransitionOutcome::Changed);
+        assert_eq!(opened.changes().publications().len(), 1);
+        assert_eq!(
+            opened.changes().publications()[0].scope(),
+            &ClientScope::GatewaySetup
+        );
+        assert!(Arc::ptr_eq(
+            &destinations,
+            &core
+                .snapshot(&ClientScope::GatewayDestinations)
+                .unwrap()
+                .snapshot()
+        ));
+        let noop = core.onboarding_intent(OnboardingIntent::Setup {
+            intent: GatewaySetupIntent::EditName {
+                value: String::new(),
+            },
+        });
+        assert_eq!(noop.outcome(), ClientTransitionOutcome::Noop);
+        assert!(noop.changes().publications().is_empty());
+        let invitation = core.onboarding_intent(OnboardingIntent::Invitation {
+            intent: super::super::invitation_controller::InvitationIntent::Open {
+                uri: pioneer_protocol::AuthSecretString::new("invalid invitation"),
+            },
+        });
+        assert_eq!(invitation.outcome(), ClientTransitionOutcome::Changed);
+        assert!(
+            invitation
+                .changes()
+                .publications()
+                .iter()
+                .any(|p| p.scope() == &ClientScope::OnboardingInvitation)
+        );
+        assert!(Arc::ptr_eq(
+            &destinations,
+            &core
+                .snapshot(&ClientScope::GatewayDestinations)
+                .unwrap()
+                .snapshot()
+        ));
+        core.shutdown();
+    }
+
+    #[test]
+    fn selecting_another_gateway_reaches_session_storage_under_existing_demand() {
+        use super::super::session_driver::{SessionDemand, SessionVisibility};
+        let core = Arc::new(ClientCore::new());
+        let mut env = environment();
+        env.registry.remotes = ["old", "new"]
+            .map(|id| GatewayEndpoint {
+                id: id.into(),
+                name: id.into(),
+                kind: GatewayEndpointKind::Remote,
+                gateway_base_url: super::super::endpoint::GatewayBaseUrl::parse_presentation(
+                    "https://gateway.invalid",
+                )
+                .unwrap(),
+                session_ref: Some(format!("synthetic-{id}")),
+                server_gateway_id: Some(
+                    pioneer_protocol::GatewayId::new("G00000000000000000001").unwrap(),
+                ),
+                workspace_id: None,
+                service_name: None,
+            })
+            .into();
+        env.registry.active_gateway_id = Some("old".into());
+        core.onboarding.lock().unwrap().environment = Some(env.clone());
+        core.adopt_onboarding_registry(env.registry);
+        core.session_demand(SessionDemand {
+            endpoint_id: Some("old".into()),
+            visibility: SessionVisibility::Foreground,
+            network_available: true,
+            generation: 1,
+        });
+        assert_eq!(
+            core.onboarding_intent(OnboardingIntent::SelectGateway {
+                endpoint_id: "new".into()
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let work = core.onboarding.lock().unwrap().queue.pop_front().unwrap();
+        let worker_core = core.clone();
+        let worker = std::thread::spawn(move || worker_core.execute_onboarding(work));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut sequence = ClientChangeSequence::ZERO;
+        let mut read_endpoint = None;
+        while std::time::Instant::now() < deadline {
+            let batch = core.wait_for_publications(sequence);
+            sequence = batch.sequence;
+            for plan in batch.effects {
+                if let ClientPlannedEffect::GatewaySessionStorage(
+                    super::super::session_refresh::GatewaySessionStorageEffect::ReadGatewaySession { endpoint }
+                ) = plan.effect() {
+                    read_endpoint = Some(endpoint.id.clone());
+                    core.complete_effect(ClientEffectCompletion::new(plan.operation_id().clone(), plan.generation(), ClientEffectResult::GatewaySessionEnvelopeLoaded { envelope: None }));
+                }
+            }
+            if worker.is_finished() {
+                break;
+            }
+        }
+        let completed = worker.is_finished();
+        if !completed {
+            core.shutdown();
+        }
+        worker.join().unwrap();
+        assert!(
+            completed,
+            "gateway selection must finish after the storage response"
+        );
+        assert_eq!(
+            read_endpoint.as_deref(),
+            Some("new"),
+            "explicit selection must not be rejected by the old endpoint demand"
+        );
+        let destinations = core
+            .snapshot(&ClientScope::GatewayDestinations)
+            .unwrap()
+            .typed::<GatewayDestinationsPublication>()
+            .unwrap();
+        assert!(destinations.payload().pending_endpoint.is_none());
+        assert_eq!(
+            destinations.payload().selected_endpoint.as_deref(),
+            Some("old")
+        );
+        assert!(!destinations.payload().outcome.as_ref().unwrap().succeeded);
+        assert_eq!(
+            core.onboarding_intent(OnboardingIntent::Setup {
+                intent: GatewaySetupIntent::Open {
+                    mode: GatewaySetupMode::AddGateway { allow_local: false }
+                }
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        core.shutdown();
+    }
+
     #[test]
     fn failed_native_local_recovery_keeps_the_terminal_binding_for_retry() {
         let core = Arc::new(ClientCore::new());

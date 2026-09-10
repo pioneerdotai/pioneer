@@ -796,6 +796,135 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn switcher_pointer_actions_open_forms_and_select_gateway(cx: &mut TestAppContext) {
+        use gpui_kit::AppContext;
+        use gpui_kit::component::WindowExt;
+        cx.update(gpui_kit::init);
+        let endpoint = serde_json::from_value(serde_json::json!({
+            "id":"remote-a", "name":"Synthetic Gateway", "kind":"remote",
+            "gateway_base_url":"https://gateway.invalid", "server_gateway_id":"G00000000000000000001",
+            "session_ref":"synthetic-reference", "workspace_id":null, "service_name":null
+        })).unwrap();
+        let config = config_with_remotes(Arc::new(AtomicUsize::new(0)), vec![endpoint]);
+        let client = config.client.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let owner = crate::OnboardingView::new(config, window, cx);
+            let host = cx.new(|_| SwitcherHost { owner });
+            gpui_kit::component::Root::new(host, window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (selector, mode) in [
+            (
+                "gateway-add",
+                GatewaySetupMode::AddGateway { allow_local: false },
+            ),
+            (
+                "gateway-edit:remote-a",
+                GatewaySetupMode::EditGateway {
+                    endpoint_id: "remote-a".into(),
+                },
+            ),
+        ] {
+            let trigger = cx.debug_bounds("gateway-switcher-trigger").unwrap();
+            cx.simulate_click(trigger.center(), Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let action = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(action.center(), Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| {
+                assert!(
+                    window.has_active_dialog(cx),
+                    "{selector} must open a dialog"
+                )
+            });
+            let setup = client
+                .snapshot(&ClientScope::GatewaySetup)
+                .unwrap()
+                .typed::<GatewaySetupPublication>()
+                .unwrap();
+            assert_eq!(setup.payload().mode, mode);
+            cx.update(|window, cx| window.close_dialog(cx));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let trigger = cx.debug_bounds("gateway-switcher-trigger").unwrap();
+        cx.simulate_click(trigger.center(), Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let action = cx.debug_bounds("gateway-select:remote-a").unwrap();
+        cx.simulate_click(action.center(), Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let destinations = client
+            .snapshot(&ClientScope::GatewayDestinations)
+            .unwrap()
+            .typed::<pioneer_client::gateway::onboarding_runtime::GatewayDestinationsPublication>()
+            .unwrap();
+        assert_eq!(
+            destinations.payload().pending_endpoint.as_deref(),
+            Some("remote-a")
+        );
+        assert!(cx.debug_bounds("gateway-switcher-content").is_none());
+        client.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn switcher_opens_reauthentication_for_gateways_without_a_session(cx: &mut TestAppContext) {
+        use gpui_kit::AppContext;
+        use gpui_kit::component::WindowExt;
+        cx.update(gpui_kit::init);
+        let endpoints = [None, Some("G00000000000000000001")]
+            .into_iter()
+            .enumerate()
+            .map(|(i, gateway_id)| {
+                serde_json::from_value(serde_json::json!({
+                    "id":format!("remote-{i}"), "name":"Synthetic Gateway", "kind":"remote",
+                    "gateway_base_url":"https://gateway.invalid", "server_gateway_id":gateway_id,
+                    "session_ref":null, "workspace_id":null, "service_name":null
+                }))
+                .unwrap()
+            })
+            .collect();
+        let config = config_with_remotes(Arc::new(AtomicUsize::new(0)), endpoints);
+        let client = config.client.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let owner = crate::OnboardingView::new(config, window, cx);
+            let host = cx.new(|_| SwitcherHost { owner });
+            gpui_kit::component::Root::new(host, window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for i in 0..2 {
+            let trigger = cx.debug_bounds("gateway-switcher-trigger").unwrap();
+            cx.simulate_click(trigger.center(), Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let action = cx
+                .debug_bounds(["gateway-select:remote-0", "gateway-select:remote-1"][i])
+                .unwrap();
+            cx.simulate_click(action.center(), Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.update(|window, cx| {
+                assert!(
+                    window.has_active_dialog(cx),
+                    "remote-{i} must open reauthentication"
+                )
+            });
+            let setup = client
+                .snapshot(&ClientScope::GatewaySetup)
+                .unwrap()
+                .typed::<GatewaySetupPublication>()
+                .unwrap();
+            assert_eq!(
+                setup.payload().mode,
+                GatewaySetupMode::ReauthenticateGateway {
+                    endpoint_id: format!("remote-{i}"),
+                    close_on_success: true
+                }
+            );
+            assert!(cx.debug_bounds("gateway-switcher-content").is_none());
+            cx.update(|window, cx| window.close_dialog(cx));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        client.shutdown();
+    }
+
+    #[gpui_kit::test]
     fn retained_setup_preserves_selection_avoids_echo_and_submits_once(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let count = Arc::new(AtomicUsize::new(0));

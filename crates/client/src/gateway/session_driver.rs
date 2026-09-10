@@ -28,6 +28,7 @@ pub struct SessionDemand {
 #[derive(Default)]
 pub(crate) struct SessionDriver {
     demand: Option<SessionDemand>,
+    handoff: Option<(String, std::thread::ThreadId, usize)>,
     next_attempt: Option<Instant>,
     authorization_demand: Option<AuthorizationDemand>,
     wake: Option<mpsc::SyncSender<()>>,
@@ -44,15 +45,46 @@ struct AuthorizationDemand {
     workspace_id: Option<String>,
 }
 impl SessionDriver {
+    pub(super) fn begin_handoff(&mut self, endpoint: &str) {
+        let thread = std::thread::current().id();
+        if let Some((id, owner, depth)) = &mut self.handoff
+            && id == endpoint
+            && *owner == thread
+        {
+            *depth += 1;
+        } else {
+            self.handoff = Some((endpoint.to_owned(), thread, 1));
+        }
+    }
+    pub(super) fn end_handoff(&mut self, endpoint: &str) {
+        if let Some((id, owner, depth)) = &mut self.handoff
+            && id == endpoint
+            && *owner == std::thread::current().id()
+        {
+            *depth -= 1;
+            if *depth == 0 {
+                self.handoff = None;
+            }
+        }
+    }
     pub(crate) fn allows_connection(&self, endpoint: &str) -> bool {
-        self.demand.as_ref().is_none_or(|demand| {
-            demand.endpoint_id.as_deref() == Some(endpoint)
-                && demand.visibility == SessionVisibility::Foreground
-                && demand.network_available
-        })
+        let available = self.demand.as_ref().is_none_or(|demand| {
+            demand.visibility == SessionVisibility::Foreground && demand.network_available
+        });
+        if let Some((id, owner, _)) = &self.handoff {
+            // Only the explicit onboarding operation may replace the current
+            // transport. Background recovery must not reconnect the old endpoint.
+            return available && id == endpoint && *owner == std::thread::current().id();
+        }
+        available
+            && self
+                .demand
+                .as_ref()
+                .is_none_or(|demand| demand.endpoint_id.as_deref() == Some(endpoint))
     }
     pub(crate) fn stop(&mut self) {
         self.demand = None;
+        self.handoff = None;
         self.authorization_demand = None;
         self.wake.take();
     }
@@ -95,7 +127,7 @@ impl ClientCore {
         {
             return self.navigation_outcome(ClientTransitionOutcome::Stale);
         }
-        let previous_endpoints = owner
+        let mut previous_endpoints = owner
             .demand
             .as_ref()
             .and_then(|old| old.endpoint_id.as_ref())
@@ -109,6 +141,12 @@ impl ClientCore {
                 },
                 |endpoint| vec![endpoint.clone()],
             );
+        // A new lifecycle demand supersedes an in-flight explicit switch too.
+        if let Some((endpoint, _, _)) = owner.handoff.take()
+            && !previous_endpoints.contains(&endpoint)
+        {
+            previous_endpoints.push(endpoint);
+        }
         let retiring = previous_endpoints
             .into_iter()
             .filter_map(|endpoint| {
@@ -180,6 +218,9 @@ impl ClientCore {
     ) {
         let demand = {
             let owner = self.session_driver.lock().expect("session driver poisoned");
+            if owner.handoff.is_some() {
+                return;
+            }
             let Some(demand) = owner.demand.clone() else {
                 return;
             };
@@ -326,6 +367,60 @@ impl ClientCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_handoff_is_scoped_nested_and_superseded_by_background_demand() {
+        let core = ClientCore::new();
+        core.session_demand(SessionDemand {
+            endpoint_id: Some("old".into()),
+            visibility: SessionVisibility::Foreground,
+            network_available: true,
+            generation: 1,
+        });
+        {
+            let mut driver = core.session_driver.lock().unwrap();
+            assert!(driver.allows_connection("old"));
+            assert!(!driver.allows_connection("new"));
+            driver.begin_handoff("new");
+            driver.begin_handoff("new");
+            assert!(driver.allows_connection("new"));
+            assert!(!driver.allows_connection("old"));
+            driver.end_handoff("new");
+            assert!(driver.allows_connection("new"));
+            driver.end_handoff("new");
+            assert!(!driver.allows_connection("new"));
+            assert!(driver.allows_connection("old"));
+            driver.begin_handoff("new");
+        }
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let driver = core.session_driver.lock().unwrap();
+                    assert!(!driver.allows_connection("new"));
+                    assert!(!driver.allows_connection("old"));
+                })
+                .join()
+                .unwrap();
+        });
+        core.session_demand(SessionDemand {
+            endpoint_id: Some("old".into()),
+            visibility: SessionVisibility::Background,
+            network_available: true,
+            generation: 2,
+        });
+        {
+            let driver = core.session_driver.lock().unwrap();
+            assert!(driver.handoff.is_none());
+            assert!(!driver.allows_connection("new"));
+            assert!(!driver.allows_connection("old"));
+        }
+        assert!(
+            core.gateway_session().connections["new"]
+                .connected
+                .is_none()
+        );
+        core.shutdown();
+    }
 
     fn ready(core: &ClientCore) {
         core.session_demand(SessionDemand {

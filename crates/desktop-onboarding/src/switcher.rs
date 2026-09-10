@@ -234,6 +234,7 @@ impl OnboardingView {
         popover_entity: Entity<PopoverState>,
     ) -> AnyElement {
         Button::new("add-gateway")
+            .debug_selector(|| "gateway-add".into())
             .ghost()
             .xsmall()
             .compact()
@@ -276,9 +277,8 @@ impl OnboardingView {
     ) -> AnyElement {
         let endpoint_id = endpoint.id.clone();
         let endpoint_name = endpoint.name.clone();
-        let requires_reauthentication = endpoint.kind == GatewayEndpointKind::Remote
-            && endpoint.session_ref.is_none()
-            && endpoint.server_gateway_id.is_none();
+        let requires_reauthentication =
+            endpoint.kind == GatewayEndpointKind::Remote && endpoint.session_ref.is_none();
         let subtitle = gateway_endpoint_subtitle(endpoint);
         let endpoint_id_for_click = endpoint_id.clone();
         let endpoint_name_for_click = endpoint_name.clone();
@@ -286,6 +286,10 @@ impl OnboardingView {
 
         let select_button = div()
             .id(format!("gateway-option:{}", endpoint.id))
+            .debug_selector({
+                let id = endpoint.id.clone();
+                move || format!("gateway-select:{id}")
+            })
             .w_full()
             .min_w_0()
             .cursor_pointer()
@@ -408,6 +412,10 @@ impl OnboardingView {
                                 .compact()
                                 .disabled(gateway_selection_locked)
                                 .icon(PioneerIconName::Bolt)
+                                .debug_selector({
+                                    let id = endpoint.id.clone();
+                                    move || format!("gateway-edit:{id}")
+                                })
                                 .tooltip(t!("gateway.action.edit").to_string())
                                 .on_click({
                                     let desktop_entity = desktop_entity.clone();
