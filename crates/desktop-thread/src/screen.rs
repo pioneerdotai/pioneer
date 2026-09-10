@@ -99,7 +99,7 @@ impl TimelineView {
         self.thread_timeline_view_state.prepared = None;
         self.thread_timeline_view_state.model = crate::timeline::TimelineRenderModel::empty();
         self.row_registry = Default::default();
-        self.avatar_activities = Default::default();
+        self.avatar_activities = RefCell::new(TimelineAvatarActivities::new(cx));
         self.layout_store = Default::default();
         self.markdown_highlights.borrow_mut().clear();
         self.thread_timeline_terminal_item.borrow_mut().clear();
@@ -508,7 +508,7 @@ impl TimelineView {
                 row_registry: Default::default(),
                 layout_store: Default::default(),
                 measurement_coordinator: Default::default(),
-                avatar_activities: RefCell::default(),
+                avatar_activities: RefCell::new(TimelineAvatarActivities::new(cx)),
                 thread_timeline_terminal_item: RefCell::default(),
                 markdown_highlights: RefCell::default(),
                 pending_request_views: HashMap::new(),

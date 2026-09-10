@@ -25,6 +25,8 @@ use std::sync::MutexGuard;
 use std::time::Duration;
 use std::time::Instant;
 
+// The indicator is 32 logical pixels; retain enough pixels for a 4x display.
+const DINO_FRAME_MAX_PIXELS: u32 = 128;
 const MIN_DINO_FRAME_DELAY: Duration = Duration::from_millis(16);
 
 #[derive(Clone)]
@@ -62,6 +64,12 @@ enum RunningDinoAssetState {
 pub(super) struct RunningDinoAssetLoader {
     state: Mutex<RunningDinoAssetState>,
 }
+
+// RenderImage IDs also identify textures in each window's sprite atlas. Keeping
+// one bounded set across thread mounts prevents abandoned IDs accumulating there.
+#[derive(Default)]
+struct SharedRunningDinoAssets(Arc<RunningDinoAssetLoader>);
+impl Global for SharedRunningDinoAssets {}
 
 impl Default for RunningDinoAssetLoader {
     fn default() -> Self {
@@ -155,8 +163,21 @@ fn decode_running_dino_frames(
 
     Ok(frames
         .into_iter()
-        .map(|mut frame| {
+        .map(|frame| {
             let delay = Duration::from(frame.delay()).max(MIN_DINO_FRAME_DELAY);
+            let resized = image::DynamicImage::ImageRgba8(frame.into_buffer())
+                .resize(
+                    DINO_FRAME_MAX_PIXELS,
+                    DINO_FRAME_MAX_PIXELS,
+                    image::imageops::FilterType::Lanczos3,
+                )
+                .into_rgba8();
+            let mut frame = image::Frame::from_parts(
+                resized,
+                0,
+                0,
+                image::Delay::from_saturating_duration(delay),
+            );
             for pixel in frame.buffer_mut().chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
@@ -594,13 +615,19 @@ impl Render for ActivityIndicatorView {
 }
 
 /// Published avatar activities only; clocks stop immediately when the avatar is not visible.
-#[derive(Default)]
 pub(crate) struct TimelineAvatarActivities {
     pub(super) assets_loader: Arc<RunningDinoAssetLoader>,
     dino: HashMap<String, Entity<RunningDinoView>>,
     active: bool,
 }
 impl TimelineAvatarActivities {
+    pub(crate) fn new(cx: &mut App) -> Self {
+        Self {
+            assets_loader: cx.default_global::<SharedRunningDinoAssets>().0.clone(),
+            dino: HashMap::new(),
+            active: false,
+        }
+    }
     pub(crate) fn set_active(&mut self, active: bool, cx: &mut App) {
         self.active = active;
         if !active {
@@ -833,6 +860,57 @@ mod clock_tests {
             assert_eq!(dark.image.frame_count(), 1);
         }
     }
+    #[test]
+    fn running_indicator_decode_has_a_bounded_pixel_budget() {
+        let assets = decode_running_dino_assets().unwrap();
+        let frames = assets.light.iter().chain(&assets.dark);
+        let mut bytes = 0;
+        for frame in frames {
+            let size = frame.image.size(0);
+            assert!(size.width.0 <= 128 && size.height.0 <= 128);
+            bytes += frame.image.as_bytes(0).unwrap().len();
+        }
+        assert!(
+            bytes < 1024 * 1024,
+            "32px indicator retains {bytes} decoded bytes"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn running_indicator_remounts_reuse_texture_identity(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let mut identities = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let activities = cx.update(TimelineAvatarActivities::new);
+            let view = cx.new(|_| RunningDinoView::new(activities.assets_loader.clone(), false));
+            view.update(cx, |view, cx| view.set_visible(true, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                let assets = view
+                    .assets
+                    .as_ref()
+                    .expect("visible indicator must load its frames");
+                for frame in assets.light.iter().chain(&assets.dark) {
+                    identities.insert(frame.image.id);
+                }
+            });
+            view.update(cx, |view, cx| view.set_visible(false, cx));
+            let weak = view.downgrade();
+            drop(view);
+            drop(activities);
+            cx.run_until_parked();
+            assert!(
+                weak.upgrade().is_none(),
+                "shared assets must not retain retired views"
+            );
+        }
+        assert_eq!(
+            identities.len(),
+            12,
+            "remounting must not leave new image IDs in the window atlas"
+        );
+    }
+
     #[gpui_kit::test]
     fn dino_suspension_cancels_immediately_and_remount_starts_at_initial_frame(
         cx: &mut TestAppContext,
