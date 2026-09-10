@@ -105,9 +105,6 @@ impl RowPresentation {
                 format!("{} · @{}", author.display_name, author.nickname)
             }
         });
-        let active_workspace_id = self
-            .current_active_thread_id()
-            .and_then(|thread_id| self.thread_workspace_id(thread_id));
         let reply_target = presentation.and_then(|presentation| {
             composer_reply_target_from_visible_message(presentation, raw_text)
         });
@@ -319,7 +316,6 @@ impl RowPresentation {
                         this.child(self.render_user_message_attachment_badges(
                             item_view.id.as_str(),
                             attachments.clone(),
-                            active_workspace_id.clone(),
                             alignment == UserMessageAlignment::CurrentPrincipal,
                             cx,
                         ))
@@ -368,7 +364,6 @@ impl RowPresentation {
         &self,
         item_id: &str,
         attachments: Vec<ParsedUserAttachment>,
-        workspace_id: Option<String>,
         align_end: bool,
         cx: &mut App,
     ) -> AnyElement {

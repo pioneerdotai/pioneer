@@ -210,9 +210,6 @@ impl RowPresentation {
     pub(super) fn active_task_thread_navigation(&self) -> Option<()> {
         self.task_child.then_some(())
     }
-    pub(super) fn thread_workspace_id(&self, _: &str) -> Option<String> {
-        self.workspace_id.clone()
-    }
     pub(super) fn current_timeline_author_presentation(
         &self,
         _: Option<&TurnAuthorSnapshot>,

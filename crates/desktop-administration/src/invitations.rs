@@ -11,7 +11,9 @@ use pioneer_client::administration::types::{
 };
 use pioneer_client::state::client_state::GatewayConnectionState;
 use pioneer_client::{
-    administration::{InvitationPresentationStatus, invitation_list_row},
+    administration::{
+        InvitationPresentationStatus, invitation_list_row, operations::AdministrationCompletion,
+    },
     gateway::invitation::InvitationQrPresentation,
 };
 use std::collections::HashSet;
@@ -73,6 +75,36 @@ impl InvitationDialogState {
         self.selected_role_key = None;
         self.creating = false;
         self.error = None;
+    }
+
+    fn finish_creation(
+        &mut self,
+        generation: u64,
+        current: bool,
+        result: anyhow::Result<AdministrationCompletion>,
+    ) -> bool {
+        if matches!(self.phase, InvitationDialogPhase::Closed)
+            || self.generation != Some(generation)
+            || !self.creating
+        {
+            return false;
+        }
+        self.creating = false;
+        self.phase = match result {
+            Ok(AdministrationCompletion::InvitationCreated(response)) if current => Self::ready(
+                InvitationQrPresentation::from_presentation(response.presentation),
+            )
+            .unwrap_or_else(|_| {
+                InvitationDialogPhase::Failed(
+                    t!("settings.invitations.presentation_failed").to_string(),
+                )
+            }),
+            _ => {
+                self.error = Some(t!("settings.invitations.create_failed").to_string());
+                InvitationDialogPhase::Create
+            }
+        };
+        true
     }
 }
 
@@ -233,7 +265,11 @@ impl AdministrationView {
         )
     }
 
-    fn open_create_invitation_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_create_invitation_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<InvitationDialogState>> {
         if self.gateway.connection_state != GatewayConnectionState::Connected
             || !self
                 .principal_presentation_capabilities()
@@ -241,7 +277,7 @@ impl AdministrationView {
             || self.administration.pending_action()
                 != &pioneer_client::administration::AdministrationPendingAction::Idle
         {
-            return;
+            return None;
         }
 
         let workspaces = self
@@ -273,7 +309,10 @@ impl AdministrationView {
             window,
             cx,
         );
-        lifetime.update(cx, |owner, cx| owner.track_form(&state, cx));
+        lifetime.update(cx, |owner, cx| {
+            owner.retain_on_policy_refresh();
+            owner.track_form(&state, cx);
+        });
         let attach = lifetime.clone();
 
         let link_copy = {
@@ -299,6 +338,7 @@ impl AdministrationView {
             form: state.downgrade(),
             owner: desktop.clone(),
         });
+        let form = state.clone();
         window.open_dialog(cx, move |dialog, window, cx| {
             let dialog = dialog.on_close({
                 let lifetime = lifetime.clone();
@@ -311,6 +351,7 @@ impl AdministrationView {
             let (title, content, footer) = match &snapshot.phase {
                 InvitationDialogPhase::Create => {
                     let content = v_flex()
+                        .debug_selector(|| "invitation-create-form".to_owned())
                         .w_full()
                         .pt_2p5()
                         .pb_5()
@@ -539,6 +580,7 @@ impl AdministrationView {
                 .child(content)
         });
         attach.update(cx, |owner, cx| owner.attach(window, cx));
+        Some(form)
     }
 }
 
@@ -662,6 +704,10 @@ impl AdministrationView {
             .client
             .administration_command_intent(AdministrationCommand::CreateInvitation(params));
         if transition.outcome() == pioneer_client::core::ClientTransitionOutcome::Rejected {
+            state.update(cx, |form, cx| {
+                form.error = Some(t!("settings.invitations.create_failed").to_string());
+                cx.notify();
+            });
             return;
         }
         let Some(generation) = self
@@ -699,27 +745,9 @@ impl AdministrationView {
                                 | pioneer_client::administration::pages::AdministrationLoadState::Failed)
                     })
                 });
-                if matches!(form.phase, InvitationDialogPhase::Closed)
-                    || form.generation != Some(generation)
-                    || !current
-                {
-                    return;
+                if form.finish_creation(generation, current, result) {
+                    cx.notify();
                 }
-                form.creating = false;
-                match result {
-                    Ok(AdministrationCompletion::InvitationCreated(response)) => {
-                        form.phase = InvitationDialogState::ready(
-                            InvitationQrPresentation::from_presentation(response.presentation),
-                        )
-                        .unwrap_or_else(|_| {
-                            InvitationDialogPhase::Failed(
-                                t!("settings.invitations.presentation_failed").to_string(),
-                            )
-                        });
-                    }
-                    _ => form.error = Some(t!("settings.invitations.create_failed").to_string()),
-                }
-                cx.notify();
             });
         });
         self.operations.retain(|task| !task.is_ready());
@@ -801,5 +829,194 @@ impl Render for InvitationSubmit {
                 }
             })
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdministrationView, GatewayConnectionState, InvitationDialogPhase};
+    use gpui_kit::component::{Root, WindowExt};
+    use gpui_kit::{
+        AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, TestAppContext,
+        Window, div,
+    };
+    use pioneer_client::navigation::{AdministrationRoute, NavigationIntent, SemanticDestination};
+
+    struct Host(Entity<AdministrationView>);
+    impl Render for Host {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.0.clone())
+                .children(Root::render_dialog_layer(window, cx))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn real_invitation_form_and_secret_survive_policy_refresh_but_not_route_exit(
+        cx: &mut TestAppContext,
+    ) {
+        check_invitation_lifecycle(cx, false);
+    }
+
+    #[gpui_kit::test]
+    fn real_invitation_secret_is_cleared_on_authenticated_principal_change(
+        cx: &mut TestAppContext,
+    ) {
+        check_invitation_lifecycle(cx, true);
+    }
+
+    fn check_invitation_lifecycle(cx: &mut TestAppContext, replace_principal: bool) {
+        cx.update(gpui_kit::init);
+        let core = pioneer_client::catalog_test_support::settings_client();
+        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+        capabilities.authorization_revision = 2;
+        capabilities.global.can_create_invitation = true;
+        capabilities.global.can_view_invitations = true;
+        capabilities.global.invitation_role_options = vec![
+            pioneer_client::administration::types::AuthorizationInvitationRoleOption {
+                role: capabilities.role.clone(),
+                is_default: true,
+            },
+        ];
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, capabilities.clone());
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Administration {
+                    route: AdministrationRoute::Invitations,
+                },
+            },
+            None,
+        );
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = AdministrationView::new(
+                crate::administration::tests::config(core.clone()),
+                window,
+                cx,
+            );
+            let host = cx.new(|_| Host(view));
+            Root::new(host, window, cx)
+        });
+        let view = root.read_with(cx, |root, cx| {
+            root.view()
+                .clone()
+                .downcast::<Host>()
+                .unwrap()
+                .read(cx)
+                .0
+                .clone()
+        });
+        let trigger = cx.update(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            focus
+        });
+        let form = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                // Synthetic connection; all RPC replies use an in-memory transport.
+                view.gateway.connection_state = GatewayConnectionState::Connected;
+                view.open_create_invitation_dialog(window, cx)
+                    .expect("authorized form")
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("invitation-create-form").is_some());
+        // A cancelled request must leave a usable form, while the rejected
+        // completion must never install a credential from the retired epoch.
+        form.update(cx, |form, cx| {
+            form.generation = Some(7);
+            form.creating = true;
+            assert!(form.finish_creation(7, false, Err(anyhow::anyhow!("synthetic cancellation"))));
+            assert!(!form.creating);
+            assert!(form.error.is_some());
+            cx.notify();
+        });
+        core.invalidate_authorization_revision(3);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            form.read_with(cx, |form, _| matches!(
+                form.phase,
+                InvitationDialogPhase::Create
+            )),
+            "policy refresh cleared the real form"
+        );
+        assert!(cx.debug_bounds("invitation-create-form").is_some());
+        capabilities.authorization_revision = 3;
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, capabilities);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        let calls = pioneer_client::catalog_test_support::replay_invitation_creation(&core);
+        form.update(cx, |form, _| {
+            form.selected.insert("WAAAAAAAAAAAAAAAAAAAA".into());
+        });
+        // Use the owning command, queue, RPC decoder and async form callback.
+        // A second click while pending must not issue a second invitation.
+        view.update(cx, |view, cx| {
+            view.create_invitation(form.clone(), cx);
+            view.create_invitation(form.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            form.read_with(cx, |form, _| {
+                !form.creating
+                    && form.error.is_none()
+                    && matches!(form.phase, InvitationDialogPhase::Ready { .. })
+            }),
+            "successful RPC did not reach the real invitation form"
+        );
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("invitation-presentation-form")
+                .unwrap()
+                .size
+                .height
+                > gpui_kit::px(100.)
+        );
+        core.invalidate_authorization_revision(5);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        cx.run_until_parked();
+        assert!(
+            form.read_with(cx, |form, _| matches!(
+                form.phase,
+                InvitationDialogPhase::Ready { .. }
+            )),
+            "policy refresh erased the one-time result"
+        );
+        assert!(cx.debug_bounds("invitation-presentation-form").is_some());
+        // The production feature owner must dismiss and clear its own dialog.
+        if replace_principal {
+            let mut auth = core.current_auth().unwrap();
+            auth.principal.id =
+                pioneer_client::administration::types::PrincipalId::new("PBBBBBBBBBBBBBBBBBBBB")
+                    .unwrap();
+            pioneer_client::core::ClientMutationAuthority::for_test()
+                .accept_identity_for_test(&core, auth)
+                .unwrap();
+        } else {
+            core.navigate(
+                NavigationIntent::Navigate {
+                    destination: SemanticDestination::Threads,
+                },
+                None,
+            );
+        }
+        cx.update(|window, cx| view.update(cx, |view, cx| view.sync_publications(window, cx)));
+        cx.run_until_parked();
+        assert!(form.read_with(cx, |form, _| matches!(
+            form.phase,
+            InvitationDialogPhase::Closed
+        )));
+        form.update(cx, |form, _| {
+            assert!(!form.finish_creation(7, true, Err(anyhow::anyhow!("late completion"))))
+        });
+        cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            assert!(trigger.is_focused(window));
+        });
+        core.shutdown();
     }
 }

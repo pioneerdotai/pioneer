@@ -163,7 +163,7 @@ impl Drop for MessageDeletionView {
 #[cfg(test)]
 mod tests {
     use super::MessageDeletionView;
-    use gpui_kit::{AppContext, Context, IntoElement, Render, TestAppContext, Window, div};
+    use gpui_kit::{Context, IntoElement, Render, TestAppContext, Window, div};
     struct Host;
     impl Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {

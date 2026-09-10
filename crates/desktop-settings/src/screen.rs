@@ -174,6 +174,7 @@ pub(crate) struct SettingsScreenView {
     last_projection: serde_json::Value,
     active: bool,
     demand: Option<pioneer_client::settings::runtime::SettingsPageDemand>,
+    sessions_demand: Option<pioneer_client::settings::runtime::AuthSessionsDemand>,
     _binding: Arc<SettingsBinding>,
     _task: Task<()>,
     _inputs: Vec<Subscription>,
@@ -281,6 +282,7 @@ impl SettingsScreenView {
                 last_projection: serde_json::Value::Null,
                 active: false,
                 demand: None,
+                sessions_demand: None,
                 _binding: binding,
                 _task: task,
                 _inputs: inputs,
@@ -439,11 +441,8 @@ impl SettingsScreenView {
         } else {
             None
         };
-        if active && self.page.is_none() {
-            self.config
-                .client
-                .settings_intent(SettingsIntent::RefreshSessions);
-        }
+        self.sessions_demand =
+            (active && self.page.is_none()).then(|| self.config.client.acquire_auth_sessions());
         for child in self.remote.iter().chain(self.voice.iter()) {
             child.update(cx, |child, cx| child.set_active(active, cx));
         }
@@ -622,6 +621,183 @@ mod render_tests {
         GatewayVoiceInputRuntimePhase,
     };
     use std::{rc::Rc, sync::Arc};
+    struct Publications {
+        client: Arc<pioneer_client::core::ClientCore>,
+        next: std::cell::Cell<usize>,
+        routes: std::rc::Rc<
+            std::cell::RefCell<
+                std::collections::HashMap<
+                    usize,
+                    (
+                        pioneer_client::core::ClientSubscription,
+                        std::sync::Weak<dyn pioneer_desktop_foundation::ClientPublicationSink>,
+                    ),
+                >,
+            >,
+        >,
+    }
+    impl Publications {
+        fn deliver(&self) {
+            let mut deliveries = Vec::new();
+            for (subscription, sink) in self.routes.borrow_mut().values_mut() {
+                while let Some(event) = subscription.try_next() {
+                    let publication = match event {
+                        pioneer_client::core::ClientSubscriptionEvent::Publication {
+                            publication,
+                            ..
+                        } => Some(publication),
+                        pioneer_client::core::ClientSubscriptionEvent::ResnapshotRequired {
+                            scope,
+                            ..
+                        } => self.client.snapshot(&scope),
+                    };
+                    if let Some(publication) = publication {
+                        deliveries.push((sink.clone(), publication));
+                    }
+                }
+            }
+            deliveries.sort_by_key(|(_, publication)| publication.snapshot().sequence());
+            for (sink, publication) in deliveries {
+                if let Some(sink) = sink.upgrade() {
+                    sink.publish(publication);
+                }
+            }
+        }
+    }
+    impl pioneer_desktop_foundation::ClientBindingRegistrar for Publications {
+        fn register(
+            &self,
+            scope: pioneer_client::core::ClientScope,
+            sink: std::sync::Weak<dyn pioneer_desktop_foundation::ClientPublicationSink>,
+        ) -> pioneer_desktop_foundation::ClientBindingRegistration {
+            let id = self.next.get();
+            self.next.set(id + 1);
+            self.routes.borrow_mut().insert(
+                id,
+                (
+                    self.client
+                        .subscribe(scope, std::num::NonZeroUsize::new(64).unwrap()),
+                    sink,
+                ),
+            );
+            let routes = Rc::downgrade(&self.routes);
+            pioneer_desktop_foundation::ClientBindingRegistration::new(move || {
+                if let Some(routes) = routes.upgrade() {
+                    routes.borrow_mut().remove(&id);
+                }
+            })
+        }
+    }
+
+    #[gpui_kit::test]
+    fn account_done_reloads_devices_through_retained_surface_demand(cx: &mut TestAppContext) {
+        use gpui_kit::Entity;
+        use pioneer_client::{
+            catalog_test_support::{
+                replay_account_requests, revalidate_saved_profile, settings_client,
+            },
+            settings::profile::ProfileIntent,
+        };
+        cx.update(gpui_kit::init);
+        let client = settings_client();
+        let bindings = Arc::new(Publications {
+            client: client.clone(),
+            next: Default::default(),
+            routes: Default::default(),
+        });
+        let config = SettingsConfig {
+            client: client.clone(),
+            bindings: bindings.clone(),
+            platform: Rc::new(Native),
+            photos: Rc::new(Native),
+        };
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = super::SettingsView::new(config, window, cx);
+            view.update(cx, |view, cx| view.set_active(true, cx));
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        let view: Entity<super::SettingsView> =
+            root.read_with(cx, |root, _| root.view().clone().downcast().unwrap());
+        let account = view.read_with(cx, |view, cx| {
+            view.pages
+                .iter()
+                .find(|page| page.read(cx).route == SettingsContentView::Account)
+                .unwrap()
+                .clone()
+        });
+        assert_eq!(replay_account_requests(&client), (1, 0));
+        bindings.deliver();
+        cx.run_until_parked();
+        assert_eq!(
+            account.read_with(cx, |page, _| page.gateway.auth_sessions.sessions.len()),
+            1
+        );
+
+        for name in ["First", "Second"] {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let card = cx
+                .debug_bounds("settings-current-principal")
+                .unwrap()
+                .center();
+            cx.simulate_click(card, Default::default());
+            cx.run_until_parked();
+            assert!(account.read_with(cx, |page, _| page.profile_editor.is_some()));
+            client.profile_intent(ProfileIntent::EditName {
+                first_name: name.into(),
+                last_name: "User".into(),
+            });
+            bindings.deliver();
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let done = cx.debug_bounds("profile-editor-done").unwrap().center();
+            cx.simulate_click(done, Default::default());
+            assert!(client.profile().pending, "Done did not dispatch the save");
+            assert_eq!(replay_account_requests(&client), (0, 1));
+            if name == "First" {
+                bindings.deliver();
+                cx.run_until_parked();
+                assert!(!account.read_with(cx, |page, _| page.profile_editor.is_some()));
+            }
+            // Gateway's post-save policy/member notifications evict sessions.
+            // The same Account entity stays mounted; the test supplies no scope demand.
+            revalidate_saved_profile(&client);
+            bindings.deliver();
+            cx.run_until_parked();
+            assert_eq!(
+                replay_account_requests(&client),
+                (1, 0),
+                "mounted Account lost device demand after Done"
+            );
+            assert!(!account.read_with(cx, |page, _| page.profile_editor.is_some()));
+            bindings.deliver();
+            cx.run_until_parked();
+            assert_eq!(
+                account.read_with(cx, |page, _| page.gateway.auth_sessions.sessions.len()),
+                1
+            );
+            assert_eq!(
+                client.current_auth().unwrap().principal.display_name,
+                format!("{name} User")
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let row = cx
+                .debug_bounds("devices-session-action-SAAAAAAAAAAAAAAAAAAAA")
+                .expect("device action missing from rendered Account");
+            assert!(row.size.width > gpui_kit::px(0.) && row.size.height > gpui_kit::px(0.));
+            assert_eq!(replay_account_requests(&client), (0, 0));
+        }
+        view.update(cx, |view, cx| view.set_active(false, cx));
+        revalidate_saved_profile(&client);
+        assert_eq!(
+            replay_account_requests(&client),
+            (0, 0),
+            "hidden Account still requests devices"
+        );
+        view.update(cx, |view, cx| view.set_active(true, cx));
+        assert_eq!(replay_account_requests(&client), (1, 0));
+        client.shutdown();
+    }
+
     #[gpui_kit::test]
     fn settings_forms_render_retained_inputs_and_both_download_indicators(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);

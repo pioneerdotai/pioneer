@@ -294,7 +294,7 @@ impl OnboardingView {
     }
 }
 impl Render for OnboardingView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         if self.invitation_active {
             return self.invitation.clone().into_any_element();
         }

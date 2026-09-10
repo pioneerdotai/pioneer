@@ -332,8 +332,17 @@ impl AdministrationView {
             }
         })
     }
-    fn sync_publications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_publications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let previous = self.presentation_key();
+        let previous_policy = self
+            .gateway
+            .capabilities
+            .as_ref()
+            .map(|p| p.authorization_revision);
+        // A policy refresh is not a form dismissal. In particular it must not
+        // erase an already-issued one-time credential. Client commands retain
+        // their authorization fences; route and authenticated identity changes
+        // still retire the presentation below.
         let previous_scope = (
             self.visible(),
             self.administration_content_view(),
@@ -342,9 +351,9 @@ impl AdministrationView {
                 .as_ref()
                 .map(|p| p.principal.id.clone()),
             self.gateway
-                .capabilities
+                .current_auth
                 .as_ref()
-                .map(|p| p.authorization_revision),
+                .map(|auth| (auth.gateway.id.clone(), auth.session.id.clone())),
         );
         self.navigation = self.client.navigation_snapshot();
         self.workspaces = self.client.workspace_catalog();
@@ -369,13 +378,23 @@ impl AdministrationView {
                     .as_ref()
                     .map(|p| p.principal.id.clone()),
                 self.gateway
-                    .capabilities
+                    .current_auth
                     .as_ref()
-                    .map(|p| p.authorization_revision),
+                    .map(|auth| (auth.gateway.id.clone(), auth.session.id.clone())),
             )
         {
             for dialog in &self.dialogs {
                 dialog.update(cx, |dialog, cx| dialog.invalidate(window, cx));
+            }
+        } else if previous_policy
+            != self
+                .gateway
+                .capabilities
+                .as_ref()
+                .map(|p| p.authorization_revision)
+        {
+            for dialog in &self.dialogs {
+                dialog.update(cx, |dialog, cx| dialog.policy_refreshed(window, cx));
             }
         }
         self.dialogs.retain(|dialog| dialog.read(cx).open());
@@ -479,11 +498,11 @@ struct AdministrationPresentation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{AdministrationConfig, AdministrationView};
     use crate::ports::*;
     use gpui_kit::component::Root;
-    use gpui_kit::{App, AppContext, Task, TestAppContext};
+    use gpui_kit::{App, Task, TestAppContext};
     use pioneer_client::{
         avatars::{AvatarCacheError, AvatarCacheRequest, AvatarCacheResult},
         core::{ClientCore, ClientScope},
@@ -508,6 +527,15 @@ mod tests {
         }
     }
     struct Ports;
+    pub(crate) fn config(core: Arc<ClientCore>) -> AdministrationConfig {
+        AdministrationConfig::new(
+            core,
+            Arc::new(Registrar(Rc::new(RefCell::new(HashSet::new())))),
+            Arc::new(Ports),
+            Arc::new(Ports),
+            Arc::new(Ports),
+        )
+    }
     impl AdministrationActivationPort for Ports {
         fn copy(
             &self,

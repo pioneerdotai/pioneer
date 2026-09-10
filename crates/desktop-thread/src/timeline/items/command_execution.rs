@@ -55,7 +55,6 @@ impl RowPresentation {
         content_width: Pixels,
         expanded: bool,
         terminal: Option<Entity<TerminalView>>,
-        cx: &mut App,
     ) -> AnyElement {
         let command_label = match item {
             TurnItem::CommandExecution {

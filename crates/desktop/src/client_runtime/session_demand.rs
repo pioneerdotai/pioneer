@@ -1,5 +1,5 @@
 //! Process lifetime session demand over the selected endpoint publication.
-use gpui_kit::{App, AppContext, Task};
+use gpui_kit::{App, Task};
 use pioneer_client::{
     core::{ClientCore, ClientPublicationReference, ClientScope},
     gateway::{

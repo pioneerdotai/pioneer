@@ -879,37 +879,12 @@ fn gpui_tree_item_from_sidebar_item(item: &client_thread_tree::SidebarTreeItem) 
         .disabled(item.disabled)
 }
 
-fn sidebar_thread_title_from_coordinator(coordinator: Option<&ThreadCoordinator>) -> String {
-    let Some(coordinator) = coordinator else {
-        return t!("sidebar.thread.untitled").to_string();
-    };
-    let Some(thread) = coordinator.thread() else {
-        return t!("sidebar.thread.untitled").to_string();
-    };
-
-    thread_display_title(thread).unwrap_or_else(|| t!("sidebar.thread.untitled").to_string())
-}
-
 fn thread_node_key(thread_id: &str) -> String {
     client_thread_tree::sidebar_thread_node_id(thread_id)
 }
 
 fn folder_node_key(folder_id: &str) -> String {
     client_thread_tree::sidebar_folder_node_id(folder_id)
-}
-
-pub(super) fn agents_doc_tree_node_key(scope: &ThreadAgentsDocEditorScope) -> String {
-    client_thread_tree::sidebar_agents_doc_node_id_for_scope(scope)
-}
-
-#[cfg(test)]
-fn agents_doc_root_node_key() -> String {
-    client_thread_tree::sidebar_agents_doc_root_node_id()
-}
-
-#[cfg(test)]
-fn agents_doc_folder_node_key(folder_id: &str) -> String {
-    client_thread_tree::sidebar_agents_doc_folder_node_id(folder_id)
 }
 
 fn render_agents_doc_file_row(
@@ -991,22 +966,6 @@ fn tree_depth_guides(depth: usize, cx: &mut App) -> AnyElement {
     }
 
     guides.into_any_element()
-}
-
-#[cfg(test)]
-fn collect_visible_node_ids(items: &[TreeItem]) -> Vec<String> {
-    fn visit(items: &[TreeItem], out: &mut Vec<String>) {
-        for item in items {
-            out.push(item.id.to_string());
-            if item.is_expanded() {
-                visit(item.children.as_slice(), out);
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    visit(items, &mut out);
-    out
 }
 
 fn parse_sidebar_tree_node_key(value: &str) -> SidebarTreeNodeKey<'_> {

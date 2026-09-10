@@ -51,8 +51,8 @@ pub(crate) struct ComposerView {
     _binding_task: Task<()>,
 }
 impl Render for ComposerView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_composer(window, cx)
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_composer(cx)
     }
 }
 impl ComposerView {

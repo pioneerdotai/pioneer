@@ -1,9 +1,9 @@
 //! Synthetic native-storage fixtures replay the Client session contracts.
-use crate::gateway::secrets::DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION;
 use anyhow::{Context, Result};
+use pioneer_client::gateway::session_envelope::GATEWAY_SESSION_SCHEMA_VERSION;
 use pioneer_client::gateway::{
     endpoint::GatewayBaseUrl,
-    session_lifecycle::{GatewaySessionMetadata, SessionTerminalReason},
+    session_lifecycle::SessionTerminalReason,
     session_refresh::{
         GatewaySessionAccessGrant as DesktopSessionAccessGrant,
         GatewaySessionPreparation as DesktopSessionPreparation,
@@ -170,7 +170,7 @@ fn refresh_token(generation: u64) -> String {
 
 fn stored_session(generation: u64) -> DesktopGatewaySessionSecret {
     DesktopGatewaySessionSecret {
-        schema_version: DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION,
+        schema_version: GATEWAY_SESSION_SCHEMA_VERSION,
         gateway_id: gateway_id(),
         principal_id: pioneer_protocol::PrincipalId::new("P00000000000000000001").unwrap(),
         device_id: pioneer_protocol::DeviceId::new("D00000000000000000001").unwrap(),

@@ -159,9 +159,6 @@ impl DesktopUpdateController {
     pub fn snapshot(&self) -> Arc<DesktopUpdateSnapshot> {
         self.store.snapshot.clone()
     }
-    pub fn revision(&self) -> u64 {
-        self.store.revision
-    }
     pub fn error(&self) -> Option<&str> {
         self.store.error.as_deref()
     }

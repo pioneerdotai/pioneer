@@ -66,7 +66,7 @@ impl ThreadMembersView {
             let selected = cx.subscribe_in(
                 &select,
                 window,
-                |view,
+                |_,
                  select,
                  event: &gpui_kit::component::combobox::ComboboxEvent<MemberPickerDelegate>,
                  window,
@@ -278,8 +278,8 @@ impl ThreadMembersView {
     }
 }
 impl Render for ThreadMembersView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_thread_members_panel(window, cx)
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_thread_members_panel(cx)
     }
 }
 impl Drop for ThreadMembersView {

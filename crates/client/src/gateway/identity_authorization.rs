@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub(crate) enum IdentityPublicationChange {
     Update,
     Revalidate,
+    InvitationSelector { epoch: (u64, u64, Option<u64>) },
     ResetSession,
 }
 impl IdentityPublicationChange {
@@ -260,7 +261,7 @@ impl ClientCore {
         self.finish_auth_profile_update(generation, connection, response)
     }
 
-    fn finish_auth_profile_update(
+    pub(crate) fn finish_auth_profile_update(
         &self,
         generation: u64,
         connection: Option<u64>,
@@ -398,6 +399,28 @@ impl ClientCore {
         (AuthMeResponse, AuthorizationCapabilitySnapshot),
         (Option<AuthMeResponse>, anyhow::Error),
     > {
+        self.refresh_identity_authorization_with_ports(
+            params,
+            || self.refresh_current_auth(),
+            |params| {
+                self.transport_runtime()
+                    .ws_command_sender()
+                    .authorization_capabilities(params)
+            },
+        )
+    }
+
+    fn refresh_identity_authorization_with_ports(
+        &self,
+        params: pioneer_protocol::AuthorizationCapabilitiesParams,
+        mut authenticate: impl FnMut() -> anyhow::Result<AuthMeResponse>,
+        mut read: impl FnMut(
+            pioneer_protocol::AuthorizationCapabilitiesParams,
+        ) -> anyhow::Result<AuthorizationCapabilitySnapshot>,
+    ) -> Result<
+        (AuthMeResponse, AuthorizationCapabilitySnapshot),
+        (Option<AuthMeResponse>, anyhow::Error),
+    > {
         let epoch = {
             let owner = self
                 .identity_authorization
@@ -454,7 +477,13 @@ impl ClientCore {
             );
         }
         let result = retry_capability_read(
-            || self.refresh_identity_authorization_once(params.clone()),
+            || {
+                self.refresh_identity_authorization_once(
+                    params.clone(),
+                    &mut authenticate,
+                    &mut read,
+                )
+            },
             || {
                 let owner = self
                     .identity_authorization
@@ -496,17 +525,25 @@ impl ClientCore {
                 IdentityPublicationChange::Update,
             );
         }
+        drop(owner);
+        if result.is_ok() {
+            self.resume_authorized_feature_demands();
+        }
         result
     }
 
     fn refresh_identity_authorization_once(
         &self,
         params: pioneer_protocol::AuthorizationCapabilitiesParams,
+        authenticate: &mut impl FnMut() -> anyhow::Result<AuthMeResponse>,
+        read: &mut impl FnMut(
+            pioneer_protocol::AuthorizationCapabilitiesParams,
+        ) -> anyhow::Result<AuthorizationCapabilitySnapshot>,
     ) -> Result<
         (AuthMeResponse, AuthorizationCapabilitySnapshot),
         (Option<AuthMeResponse>, anyhow::Error),
     > {
-        let auth = self.refresh_current_auth().map_err(|error| (None, error))?;
+        let auth = authenticate().map_err(|error| (None, error))?;
         let (generation, connection) = {
             let owner = self
                 .identity_authorization
@@ -514,11 +551,7 @@ impl ClientCore {
                 .expect("identity owner poisoned");
             (owner.identity_request, self.gateway_http_generation())
         };
-        let snapshot = self
-            .transport_runtime()
-            .ws_command_sender()
-            .authorization_capabilities(params.clone())
-            .map_err(|error| (Some(auth.clone()), error))?;
+        let snapshot = read(params.clone()).map_err(|error| (Some(auth.clone()), error))?;
         if !crate::authorization::authorization_capability_snapshot_is_compatible(
             &snapshot,
             &auth.principal.id,
@@ -771,10 +804,23 @@ impl ClientCore {
         self.invalidate_threads_for_policy(change);
         owner.policy_change = Some(change.clone());
         owner.access_change = None;
-        self.publish_identity_authorization(
-            &owner.publication(),
-            IdentityPublicationChange::revision(changed),
-        );
+        let publication_change = if changed
+            && change.change == pioneer_protocol::AuthorizationChangeKind::ResourceSelector
+            && matches!(
+                change.affected,
+                pioneer_protocol::AuthorizationChangeScope::Invitation { .. }
+            ) {
+            IdentityPublicationChange::InvitationSelector {
+                epoch: (
+                    owner.connection_generation,
+                    owner.authorization_change_sequence,
+                    owner.epoch.as_ref().map(|(_, connection)| *connection),
+                ),
+            }
+        } else {
+            IdentityPublicationChange::revision(changed)
+        };
+        self.publish_identity_authorization(&owner.publication(), publication_change);
     }
 
     pub fn invalidate_authorization_revision(&self, revision: u64) {
@@ -850,14 +896,18 @@ impl ClientCore {
         }
         drop(owner);
         if accepted == AuthorizationProjectionAcceptance::Accepted {
-            self.resume_administration_demand();
-            self.resume_provider_collection_demand();
-            self.resume_provider_runtime_demand();
-            self.resume_mcp_demand();
-            self.resume_skills_demand();
-            self.resume_current_settings_demand();
+            self.resume_authorized_feature_demands();
         }
         accepted
+    }
+
+    fn resume_authorized_feature_demands(&self) {
+        self.resume_administration_demand();
+        self.resume_provider_collection_demand();
+        self.resume_provider_runtime_demand();
+        self.resume_mcp_demand();
+        self.resume_skills_demand();
+        self.resume_current_settings_demand();
     }
 
     pub fn accept_authorization_projection_for_connection(
@@ -1002,6 +1052,24 @@ impl ClientCore {
         &self,
         generation: ClientGeneration,
     ) -> anyhow::Result<AuthSessionListResponse> {
+        self.load_auth_sessions_with_reader(generation, |connection| {
+            connection
+                .ok_or_else(|| anyhow::anyhow!("Session connection unavailable"))
+                .and_then(|connection| {
+                    crate::transport::ws::command_sender::auth_session_list(
+                        &self
+                            .transport_runtime()
+                            .ws_command_sender()
+                            .requests_for_connection(connection),
+                    )
+                })
+        })
+    }
+    pub(crate) fn load_auth_sessions_with_reader(
+        &self,
+        generation: ClientGeneration,
+        read: impl FnOnce(Option<u64>) -> anyhow::Result<AuthSessionListResponse>,
+    ) -> anyhow::Result<AuthSessionListResponse> {
         let generation = generation.get();
         let connection = {
             let owner = self
@@ -1014,16 +1082,7 @@ impl ClientCore {
             );
             owner.session_request_connection
         };
-        let result = connection
-            .ok_or_else(|| anyhow::anyhow!("Session connection unavailable"))
-            .and_then(|connection| {
-                crate::transport::ws::command_sender::auth_session_list(
-                    &self
-                        .transport_runtime()
-                        .ws_command_sender()
-                        .requests_for_connection(connection),
-                )
-            });
+        let result = read(connection);
         anyhow::ensure!(
             self.finish_auth_sessions_request(generation, &result),
             "Session list response belongs to a superseded authorization generation"
@@ -1864,6 +1923,19 @@ impl ClientCore {
         save: crate::settings::profile::ProfileSave,
         epoch: u64,
     ) {
+        self.execute_profile_save_with_writer(save, epoch, |params, expected| {
+            self.update_auth_profile_scoped(params, Some(expected))
+        });
+    }
+    pub(crate) fn execute_profile_save_with_writer(
+        &self,
+        save: crate::settings::profile::ProfileSave,
+        epoch: u64,
+        write: impl FnOnce(
+            pioneer_protocol::AuthProfileUpdateParams,
+            (u64, u64),
+        ) -> anyhow::Result<pioneer_protocol::AuthProfileUpdateResponse>,
+    ) {
         {
             let owner = self
                 .identity_authorization
@@ -1876,7 +1948,7 @@ impl ClientCore {
                 return;
             }
         }
-        let result = self.update_auth_profile_scoped(save.params, Some((save.generation, epoch)));
+        let result = write(save.params, (save.generation, epoch));
         let mut owner = self
             .identity_authorization
             .lock()
@@ -1962,6 +2034,66 @@ fn retry_capability_read<T>(
 mod capability_retry_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn capability_rpc_completion_resumes_already_mounted_settings_and_provider_demands() {
+        use crate::providers::store::{
+            ProviderCollectionIntent, ProviderCollectionKey, ProviderLoadState,
+        };
+        use crate::settings::runtime::{SettingsIntent, SettingsPage};
+        let core = crate::catalog_test_support::settings_client();
+        let auth = core.current_auth().unwrap();
+        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+        capabilities.global.can_manage_gateway_settings = true;
+        // Reproduce initial authentication, before the first capability response.
+        core.clear_authorization_projections();
+        let (generation, connection) = core.current_auth_ticket();
+        core.finish_current_auth(generation, connection, auth.clone())
+            .unwrap();
+        let key = ProviderCollectionKey::catalog("workspace");
+        core.provider_collection_intent(ProviderCollectionIntent::Observe { key: key.clone() });
+        let _settings = core.acquire_settings_page(SettingsPage::General);
+        assert_eq!(
+            core.provider_collection_snapshot(&key).unwrap().request(),
+            ProviderLoadState::Forbidden
+        );
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Rejected
+        );
+        let requests = Cell::new(0);
+        core.refresh_identity_authorization_with_ports(
+            pioneer_protocol::AuthorizationCapabilitiesParams {
+                workspace_id: None,
+                thread_id: None,
+            },
+            || Ok(auth.clone()),
+            |_| {
+                requests.set(requests.get() + 1);
+                Ok(capabilities.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(requests.get(), 1);
+        assert!(
+            core.authorization_snapshot(None, None)
+                .unwrap()
+                .global
+                .can_manage_gateway_settings
+        );
+        // No network worker is installed in this fixture: Failed proves that the
+        // catalog request reached dispatch instead of remaining Forbidden/Cancelled.
+        assert_eq!(
+            core.provider_collection_snapshot(&key).unwrap().request(),
+            ProviderLoadState::Failed
+        );
+        // Refresh is already queued for the retained demand; a second intent coalesces.
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Noop
+        );
+    }
+
     #[test]
     fn transient_reads_are_bounded_and_success_ends_retry() {
         let calls = Cell::new(0);

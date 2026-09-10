@@ -64,6 +64,7 @@ pub struct ClientActiveThreadClearResult {
     pub unsubscribed_thread_ids: Vec<String>,
 }
 
+#[cfg(feature = "schema")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ClientActiveThreadSnapshot {

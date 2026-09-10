@@ -158,23 +158,15 @@ impl RowPresentation {
             TimelineRenderRow::Timeline(TimelineRow {
                 kind: TimelineRowKind::TurnWorkToggle(group),
                 ..
-            }) => self.render_turn_work_group_toggle(
-                group,
-                top_spacing,
-                is_last_row,
-                content_width,
-                cx,
-            ),
+            }) => {
+                self.render_turn_work_group_toggle(group, top_spacing, is_last_row, content_width)
+            }
             TimelineRenderRow::Timeline(TimelineRow {
                 kind: TimelineRowKind::CoalescedTools(group),
                 ..
-            }) => self.render_coalesced_tools_toggle(
-                group,
-                top_spacing,
-                is_last_row,
-                content_width,
-                cx,
-            ),
+            }) => {
+                self.render_coalesced_tools_toggle(group, top_spacing, is_last_row, content_width)
+            }
             TimelineRenderRow::Timeline(TimelineRow {
                 kind: TimelineRowKind::RunningTurn(running_turn),
                 ..
@@ -236,7 +228,6 @@ impl RowPresentation {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
-        cx: &mut App,
     ) -> AnyElement {
         let mut toggle_hasher = std::collections::hash_map::DefaultHasher::new();
         toggle_hasher.write(group.toggle_key.as_bytes());
@@ -286,7 +277,6 @@ impl RowPresentation {
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,
-        cx: &mut App,
     ) -> AnyElement {
         let elapsed_label = group.elapsed_ms.map(format_elapsed_ms);
         let status_label = match group.state.as_ref() {

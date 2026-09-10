@@ -1,5 +1,4 @@
 use gpui_kit::*;
-use std::rc::Rc;
 pub(crate) struct TimelineViewState {
     pub(crate) scroll_handle: gpui_kit::component::VirtualListScrollHandle,
     pub(crate) expanded: std::cell::RefCell<std::collections::HashSet<String>>,

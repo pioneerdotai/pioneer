@@ -2,7 +2,7 @@ use crate::{
     file_opener::FileOpenerId,
     settings::{self, AppLanguagePreference, FileOpenerWorkspaceScope, WindowThemePreference},
 };
-use gpui_kit::{App, AppContext, Window};
+use gpui_kit::{App, Window};
 use pioneer_client::core::{ClientCore, ClientScope};
 use pioneer_desktop_settings::{SettingsConfig, SettingsPlatform};
 use std::{rc::Rc, sync::Arc};

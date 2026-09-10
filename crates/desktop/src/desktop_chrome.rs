@@ -73,6 +73,7 @@ pub(crate) fn bottom_bar(
                 .when(can_manage_capabilities, |this| {
                     this.child(
                         Button::new("bottom-bar-open-mcp")
+                            .debug_selector(|| "bottom-bar-open-mcp".into())
                             .ghost()
                             .small()
                             .compact()
@@ -92,6 +93,7 @@ pub(crate) fn bottom_bar(
                 })
                 .child(
                     Button::new("bottom-bar-open-skills")
+                        .debug_selector(|| "bottom-bar-open-skills".into())
                         .ghost()
                         .small()
                         .compact()

@@ -5,6 +5,7 @@ use gpui_kit::{prelude::*, *};
 pub(crate) struct DialogLifetime {
     open: bool,
     valid: bool,
+    retain_on_policy_refresh: bool,
     focus: Option<FocusHandle>,
     clear: Box<dyn Fn(&mut Window, &mut App)>,
     _focus: Option<Subscription>,
@@ -18,6 +19,7 @@ impl DialogLifetime {
         cx.new(|_| Self {
             open: true,
             valid: true,
+            retain_on_policy_refresh: false,
             focus: None,
             clear: Box::new(clear),
             _focus: None,
@@ -32,6 +34,14 @@ impl DialogLifetime {
     }
     pub(crate) fn valid(&self) -> bool {
         self.open && self.valid
+    }
+    pub(crate) fn retain_on_policy_refresh(&mut self) {
+        self.retain_on_policy_refresh = true;
+    }
+    pub(crate) fn policy_refreshed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.retain_on_policy_refresh {
+            self.invalidate(window, cx);
+        }
     }
     pub(crate) fn open(&self) -> bool {
         self.open

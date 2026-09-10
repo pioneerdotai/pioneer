@@ -62,9 +62,6 @@ pub(crate) struct DesktopRouteSnapshot {
     navigation: Arc<ClientNavigationState>,
 }
 impl DesktopRouteSnapshot {
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
-    }
     pub(crate) fn window_route(&self) -> WindowRoute {
         self.window_route
     }
@@ -241,7 +238,7 @@ mod tests {
             let sidebar = store.snapshot();
             let screen = store.snapshot();
             assert!(Arc::ptr_eq(&sidebar, &screen));
-            assert_eq!(sidebar.revision(), screen.revision());
+            assert_eq!(sidebar.revision, screen.revision);
             store.publish(initial.clone());
             assert!(Arc::ptr_eq(&screen, &store.snapshot()));
         }

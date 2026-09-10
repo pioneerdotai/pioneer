@@ -106,6 +106,7 @@ impl RenderOnce for CredentialPresentationForm {
         } = self;
 
         v_flex()
+            .debug_selector(move || format!("{id_prefix}-presentation-form"))
             .w_full()
             .pt_1()
             .pb_5()

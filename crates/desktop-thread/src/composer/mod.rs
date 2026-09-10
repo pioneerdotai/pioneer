@@ -1,5 +1,4 @@
 mod capabilities;
-pub(crate) use capabilities::CapabilityPickerState;
 mod mode_selector;
 
 mod model_selector;

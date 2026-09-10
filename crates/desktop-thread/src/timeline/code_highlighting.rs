@@ -154,14 +154,6 @@ impl TimelineView {
             live.insert(id, LiveHighlight { input, view });
         }
     }
-
-    pub(super) fn render_code_highlighted_text(&self, id: u64, source: &str) -> AnyElement {
-        if let Some(owner) = self.markdown_highlights.borrow().get(&id) {
-            owner.view.clone().into_any_element()
-        } else {
-            StyledText::new(SharedString::new(Arc::<str>::from(source))).into_any_element()
-        }
-    }
 }
 
 #[cfg(test)]

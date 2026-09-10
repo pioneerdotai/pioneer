@@ -21,8 +21,6 @@ pub(crate) enum DesktopVoiceCaptureErrorKind {
     GatewaySession,
     GatewayChunk,
     GatewayFinalize,
-    GatewayCancel,
-    NoSpeech,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

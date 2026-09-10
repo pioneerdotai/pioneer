@@ -227,7 +227,6 @@ impl RowPresentation {
                 entry,
                 item_view,
                 content,
-                item,
                 top_spacing,
                 is_last_row,
                 content_width,
@@ -271,7 +270,6 @@ impl RowPresentation {
                 content_width,
                 expanded,
                 terminal,
-                cx,
             ),
             TurnItem::FileChange { .. } => self.render_item_file_change(
                 entry,

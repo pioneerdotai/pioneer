@@ -226,6 +226,7 @@ pub fn profile_editor_header(
                 .justify_end()
                 .child(
                     default_primary_button(done_button_id)
+                        .debug_selector(|| "profile-editor-done".into())
                         .w(px(76.))
                         .px_0()
                         .rounded_full()

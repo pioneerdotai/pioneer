@@ -85,6 +85,9 @@ pub(crate) struct AdministrationOperationController {
     generation: u64,
     presentation_generation: u64,
     active: Option<Operation>,
+    // Only an already dispatched invitation RPC may survive an invitation-only
+    // selector publication, which the Gateway sends before its success reply.
+    invitation_reply_epoch: Option<(u64, u64, Option<u64>)>,
     prepared: Option<AdministrationOperation>,
     publication: Option<Arc<AdministrationOperationPublication>>,
     recovery: Option<(u64, ActivationCleanup)>,
@@ -96,6 +99,7 @@ impl AdministrationOperationController {
     pub(crate) fn stop(&mut self) {
         self.sender.take();
         self.active = None;
+        self.invitation_reply_epoch = None;
         self.prepared = None;
         self.recovery = None;
         self.cleanup = None;
@@ -182,6 +186,7 @@ impl ClientCore {
                 return self.navigation_outcome(ClientTransitionOutcome::Noop);
             }
             owner.active = None;
+            owner.invitation_reply_epoch = None;
             owner.prepared = None;
             if let Some((_, cleanup)) = owner.recovery.take() {
                 owner.cleanup = Some(cleanup);
@@ -400,6 +405,7 @@ impl ClientCore {
                 action: command.action(),
             };
             owner.active = Some(operation.clone());
+            owner.invitation_reply_epoch = None;
             self.publish_administration_operation(
                 &mut owner,
                 &operation,
@@ -426,15 +432,40 @@ impl ClientCore {
         operation.execute(Arc::downgrade(self))
     }
     fn administration_operation_current(&self, operation: &Operation) -> bool {
+        let epoch = self.administration_epoch();
+        let owner = self
+            .administration_operations
+            .lock()
+            .expect("administration operations poisoned");
         !self.is_stopped()
-            && self.administration_epoch() == operation.epoch
-            && self
-                .administration_operations
-                .lock()
-                .expect("administration operations poisoned")
-                .active
-                .as_ref()
-                == Some(operation)
+            && owner.active.as_ref() == Some(operation)
+            && (epoch == operation.epoch || owner.invitation_reply_epoch == Some(epoch))
+    }
+    fn mark_invitation_request_dispatched(&self, operation: &Operation) -> anyhow::Result<()> {
+        let epoch = self.administration_epoch();
+        let mut owner = self
+            .administration_operations
+            .lock()
+            .expect("administration operations poisoned");
+        anyhow::ensure!(
+            !self.is_stopped()
+                && epoch == operation.epoch
+                && owner.active.as_ref() == Some(operation),
+            "administration_action_cancelled"
+        );
+        owner.invitation_reply_epoch = Some(epoch);
+        Ok(())
+    }
+    fn administration_reply_pending(&self, operation: &Operation) -> bool {
+        !self.is_stopped()
+            && (self.administration_operation_current(operation)
+                || self.administration_operation_snapshot().is_some_and(|p| {
+                    p.generation == operation.generation
+                        && matches!(
+                            p.request,
+                            AdministrationLoadState::Ready | AdministrationLoadState::Failed
+                        )
+                }))
     }
     fn plan_member_workspace_selection(
         &self,
@@ -491,7 +522,7 @@ impl ClientCore {
             .lock()
             .expect("administration operations poisoned");
         let current = !self.is_stopped()
-            && epoch == operation.epoch
+            && (epoch == operation.epoch || owner.invitation_reply_epoch == Some(epoch))
             && owner.active.as_ref() == Some(operation);
         if let Ok(AdministrationCompletion::RecoveryDeviceCreated(response)) = &result {
             if !self.is_stopped() && epoch == operation.epoch {
@@ -511,6 +542,7 @@ impl ClientCore {
         }
         anyhow::ensure!(current, "administration_action_cancelled");
         owner.active = None;
+        owner.invitation_reply_epoch = None;
         owner.prepared = None;
         self.publish_administration_operation(
             &mut owner,
@@ -587,6 +619,19 @@ impl ClientCore {
         self.navigation_outcome(ClientTransitionOutcome::Changed)
     }
     pub(crate) fn start_administration_operation_controller(self: &Arc<Self>) {
+        self.start_administration_operation_controller_with_executor(|operation, client| {
+            operation.execute_direct(client)
+        });
+    }
+    pub(crate) fn start_administration_operation_controller_with_executor(
+        self: &Arc<Self>,
+        execute: impl Fn(
+            AdministrationOperation,
+            std::sync::Weak<ClientCore>,
+        ) -> anyhow::Result<AdministrationCompletion>
+        + Send
+        + 'static,
+    ) {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<AdministrationWork>(1);
         let weak = Arc::downgrade(self);
         let task = std::thread::Builder::new()
@@ -612,7 +657,7 @@ impl ClientCore {
                     }
                     drop(core);
                     if let AdministrationWork::Execute { operation, reply } = work {
-                        let result = operation.execute_direct(weak.clone());
+                        let result = execute(operation, weak.clone());
                         if let Some(reply) = reply {
                             let _ = reply.try_send(result);
                         }
@@ -706,6 +751,7 @@ impl ClientCore {
             return;
         }
         owner.active = None;
+        owner.invitation_reply_epoch = None;
         owner.prepared = None;
         if let Some((_, cleanup)) = owner.recovery.take() {
             owner.cleanup = Some(cleanup);
@@ -719,16 +765,45 @@ impl ClientCore {
             AdministrationLoadState::Cancelled,
         );
     }
-    pub(crate) fn invalidate_administration_operations(&self) {
+    pub(crate) fn invalidate_administration_operations(
+        &self,
+        policy_refresh: bool,
+        invitation_selector_epoch: Option<(u64, u64, Option<u64>)>,
+    ) -> bool {
         let mut owner = self
             .administration_operations
             .lock()
             .expect("administration operations poisoned");
-        owner.active = None;
+        // The issued invitation is already held by its presentation owner.
+        // Keep only its secret-free copy/dismiss receipt during revalidation;
+        // all other protected operations are still fenced. The sole pending
+        // exception below is an invitation request already sent to the Gateway.
+        let retain_invitation = policy_refresh
+            && owner.publication.as_ref().is_some_and(|p| {
+                p.request == AdministrationLoadState::Ready
+                    && matches!(p.action, Some(AdministrationAction::CreateInvitation))
+            });
+        let retain_reply = invitation_selector_epoch.is_some_and(|epoch| {
+            owner.invitation_reply_epoch.is_some()
+                && owner.active.as_ref().is_some_and(|operation| {
+                    matches!(operation.action, AdministrationAction::CreateInvitation)
+                        && operation.epoch.0 == epoch.0
+                        && operation.epoch.2 == epoch.2
+                })
+        });
+        if retain_reply {
+            owner.invitation_reply_epoch = invitation_selector_epoch;
+        } else {
+            owner.active = None;
+            owner.invitation_reply_epoch = None;
+        }
         owner.prepared = None;
-        owner.publication = None;
+        if !retain_invitation && !retain_reply {
+            owner.publication = None;
+        }
         owner.recovery = None;
         owner.cleanup = None;
+        retain_invitation || retain_reply
     }
 }
 
@@ -788,6 +863,198 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+    #[test]
+    fn invitation_worker_delivers_reply_after_its_selector_notification_without_retry() {
+        use crate::rpc::{JsonRpcRequestTransport, JsonRpcResponseSender};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Copy)]
+        enum Interruption {
+            Selector,
+            RolePolicy,
+            Session,
+            Dismiss,
+        }
+        struct Transport {
+            core: std::sync::Weak<ClientCore>,
+            interruption: Interruption,
+            calls: Arc<AtomicUsize>,
+        }
+        impl JsonRpcRequestTransport for Transport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                payload: String,
+                reply: JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let request: JsonRpcRequest = serde_json::from_str(&payload).unwrap();
+                assert_eq!(request.method, constants::methods::INVITE_CREATE);
+                let response = crate::catalog_test_support::invitation_response();
+                let core = self.core.upgrade().unwrap();
+                // This is Gateway's actual order: committed selector publication,
+                // invitation-list notification, then the one-time JSON-RPC reply.
+                core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+                    policy_generation: PolicyGeneration::new(2).unwrap(),
+                    change: AuthorizationChangeKind::ResourceSelector,
+                    affected: AuthorizationChangeScope::Invitation {
+                        invitation_id: response.invitation.invitation_id.clone(),
+                    },
+                });
+                core.observe_administration_notification(&GatewayNotification::InvitationChanged(
+                    InvitationChangedNotification {
+                        revision: 2,
+                        invitation_id: response.invitation.invitation_id.clone(),
+                    },
+                ));
+                match self.interruption {
+                    Interruption::Selector => {}
+                    Interruption::RolePolicy => {
+                        core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+                            policy_generation: PolicyGeneration::new(3).unwrap(),
+                            change: AuthorizationChangeKind::RolePolicy,
+                            affected: AuthorizationChangeScope::Global,
+                        })
+                    }
+                    Interruption::Session => {
+                        core.begin_authorization_epoch(Some(("replacement".into(), 8)))
+                    }
+                    Interruption::Dismiss => {
+                        let generation = core.administration_operations.lock().unwrap().generation;
+                        core.administration_presentation_intent(
+                            AdministrationPresentationIntent::DismissActivation { generation },
+                        );
+                    }
+                }
+                // Cross the execute() receive timeout as well as the reducer fence.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let wire = JsonRpcResponse::from_result(request.id, &response).unwrap();
+                let value = serde_json::to_value(wire).unwrap();
+                let (_, result) = crate::rpc::decode_json_rpc_response_value(&value).unwrap();
+                reply
+                    .send(result)
+                    .map_err(|_| "synthetic receiver closed".into())
+            }
+        }
+        for interruption in [
+            Interruption::Selector,
+            Interruption::RolePolicy,
+            Interruption::Session,
+            Interruption::Dismiss,
+        ] {
+            let core = Arc::new(fixture());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let transport = Transport {
+                core: Arc::downgrade(&core),
+                interruption,
+                calls: calls.clone(),
+            };
+            core.start_administration_operation_controller_with_executor(
+                move |operation, client| {
+                    operation.execute_with_invitation_rpc(client, |params| {
+                        crate::transport::ws::command_sender::invitation_create(&transport, params)
+                    })
+                },
+            );
+            core.administration_command_intent(invite());
+            let generation = core.administration_operation_snapshot().unwrap().generation;
+            let operation = core
+                .take_administration_activation_operation(
+                    generation,
+                    AdministrationActivationKind::Invitation,
+                )
+                .unwrap();
+            let result = operation.execute(Arc::downgrade(&core));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if matches!(interruption, Interruption::Selector) {
+                assert!(
+                    matches!(result, Ok(AdministrationCompletion::InvitationCreated(_))),
+                    "committed invitation response was discarded: {:?}",
+                    result.err()
+                );
+                assert_eq!(
+                    core.administration_operation_snapshot().unwrap().request,
+                    AdministrationLoadState::Ready
+                );
+                assert_eq!(
+                    core.administration_presentation_intent(
+                        AdministrationPresentationIntent::CopyActivation { generation }
+                    )
+                    .effects()
+                    .len(),
+                    1
+                );
+            } else {
+                assert!(result.is_err(), "retired request delivered a credential");
+            }
+            core.shutdown();
+        }
+    }
+    #[test]
+    fn invitation_selector_does_not_authorize_an_undispatched_create() {
+        let core = Arc::new(fixture());
+        core.administration_command_intent(invite());
+        let generation = core.administration_operation_snapshot().unwrap().generation;
+        let operation = core
+            .take_administration_activation_operation(
+                generation,
+                AdministrationActivationKind::Invitation,
+            )
+            .unwrap();
+        core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+            policy_generation: PolicyGeneration::new(2).unwrap(),
+            change: AuthorizationChangeKind::ResourceSelector,
+            affected: AuthorizationChangeScope::Invitation {
+                invitation_id: crate::catalog_test_support::invitation_response()
+                    .invitation
+                    .invitation_id,
+            },
+        });
+        let result = operation.execute_with_invitation_rpc(Arc::downgrade(&core), |_| {
+            panic!("an undispatched command crossed the policy fence")
+        });
+        assert!(result.is_err());
+        assert!(core.administration_operation_snapshot().is_none());
+        assert!(core.prepare_administration_command(invite()).is_err());
+        core.shutdown();
+    }
+    #[test]
+    fn issued_invitation_can_be_copied_after_policy_refresh_but_not_dismissal_or_session_change() {
+        for reset_session in [false, true] {
+            let core = fixture();
+            let operation = core.prepare_administration_command(invite()).unwrap();
+            let generation = operation.identity.generation;
+            let response = crate::catalog_test_support::invitation_response();
+            core.finish_administration_command(
+                &operation.identity,
+                Ok(AdministrationCompletion::InvitationCreated(response)),
+            )
+            .unwrap();
+            core.invalidate_authorization_revision(2);
+            assert!(core.prepare_administration_command(invite()).is_err());
+            let publication = core
+                .administration_operation_snapshot()
+                .expect("issued presentation survives policy refresh");
+            assert_eq!(publication.request, AdministrationLoadState::Ready);
+            let copy = core.administration_presentation_intent(
+                AdministrationPresentationIntent::CopyActivation { generation },
+            );
+            assert_eq!(copy.effects().len(), 1);
+            if reset_session {
+                core.begin_authorization_epoch(Some(("synthetic-replacement".into(), 8)));
+            } else {
+                core.administration_presentation_intent(
+                    AdministrationPresentationIntent::DismissActivation { generation },
+                );
+            }
+            assert_eq!(
+                core.administration_presentation_intent(
+                    AdministrationPresentationIntent::CopyActivation { generation }
+                )
+                .outcome(),
+                ClientTransitionOutcome::Rejected
+            );
+        }
     }
     #[test]
     fn dismiss_activation_is_generation_scoped_and_prevents_late_claim_and_copy() {
@@ -1019,8 +1286,9 @@ impl AdministrationOperation {
                 Ok(result) => return result,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     anyhow::ensure!(
-                        client.upgrade().is_some_and(|core| !core.is_stopped()
-                            && core.administration_epoch() == identity.epoch),
+                        client
+                            .upgrade()
+                            .is_some_and(|core| core.administration_reply_pending(&identity)),
                         "administration_action_cancelled"
                     );
                 }
@@ -1031,6 +1299,18 @@ impl AdministrationOperation {
     fn execute_direct(
         self,
         client: std::sync::Weak<ClientCore>,
+    ) -> anyhow::Result<AdministrationCompletion> {
+        let sender = client
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("administration_action_cancelled"))?
+            .transport_runtime()
+            .ws_command_sender();
+        self.execute_with_invitation_rpc(client, |params| sender.invitation_create(params))
+    }
+    pub(crate) fn execute_with_invitation_rpc(
+        self,
+        client: std::sync::Weak<ClientCore>,
+        invitation_rpc: impl Fn(InvitationCreateParams) -> anyhow::Result<InvitationCreateResponse>,
     ) -> anyhow::Result<AdministrationCompletion> {
         let Self { identity, command } = self;
         let Some(core) = client.upgrade() else {
@@ -1063,11 +1343,14 @@ impl AdministrationOperation {
                     core.administration_command_allowed(&command),
                     "administration_action_forbidden"
                 );
+                if matches!(command, AdministrationCommand::CreateInvitation(_)) {
+                    core.mark_invitation_request_dispatched(&identity)?;
+                }
                 drop(core);
                 completion = match command {
-                    AdministrationCommand::CreateInvitation(p) => sender
-                        .invitation_create(p)
-                        .map(AdministrationCompletion::InvitationCreated),
+                    AdministrationCommand::CreateInvitation(p) => {
+                        invitation_rpc(p).map(AdministrationCompletion::InvitationCreated)
+                    }
                     AdministrationCommand::RevokeInvitation(p) => sender
                         .invitation_revoke(p)
                         .map(AdministrationCompletion::InvitationRevoked),

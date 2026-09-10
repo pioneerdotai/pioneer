@@ -39,7 +39,6 @@ use pioneer_client::timeline::types::MemberSummary;
 use pioneer_client::timeline::types::PersistedActorRef;
 use pioneer_client::timeline::types::PrincipalId;
 use pioneer_client::timeline::types::TurnAuthorSnapshot;
-use pioneer_client::timeline::types::WorkspaceId;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;

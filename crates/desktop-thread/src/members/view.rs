@@ -1,12 +1,10 @@
 use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
+    collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
 };
 
 use crate::{
-    assets::PioneerIconName,
-    member_picker::{MemberPicker, member_picker_items},
-    members::ThreadMembersView,
+    assets::PioneerIconName, member_picker::MemberPicker, members::ThreadMembersView,
     screen::GatewayConnectionState,
 };
 use gpui_kit::component::{
@@ -20,16 +18,11 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::*, *};
 use pioneer_client::avatars::{MemberSummary, PrincipalId};
 use pioneer_client::{
-    composer::state_machine::{ComposerMentionCandidate, composer_mention_candidates},
-    threads::scope::ThreadScopePendingAction,
+    composer::state_machine::ComposerMentionCandidate, threads::scope::ThreadScopePendingAction,
 };
 
 impl ThreadMembersView {
-    pub(crate) fn render_thread_members_panel(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(crate) fn render_thread_members_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::SidePanel
         ));
@@ -45,8 +38,6 @@ impl ThreadMembersView {
         let add_picker = self.render_thread_member_add_picker(
             candidates.clone(),
             capabilities.can_manage_private_participants && !directory_loading,
-            window,
-            cx,
         );
         let current_principal_id = self
             .identity_input
@@ -154,8 +145,6 @@ impl ThreadMembersView {
         &mut self,
         candidates: Vec<ComposerMentionCandidate>,
         private_thread_ready: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let pending = !matches!(self.thread_scope_pending(), ThreadScopePendingAction::Idle);
         let disabled = !private_thread_ready

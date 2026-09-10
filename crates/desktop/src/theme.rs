@@ -92,3 +92,24 @@ fn apply_theme_preference(cx: &mut App) {
         WindowThemePreference::Dark => Theme::change(ThemeMode::Dark, None, cx),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bundled_themes_keep_selection_and_focus_without_rectangular_list_outlines() {
+        use gpui_kit::component::{Theme, ThemeSet};
+        let set: ThemeSet = serde_json::from_str(super::BUNDLED_THEME).unwrap();
+        assert_eq!(set.themes.len(), 2);
+        for config in set.themes {
+            let mut theme = Theme {
+                mode: config.mode,
+                ..Theme::default()
+            };
+            theme.apply_config(&std::rc::Rc::new(config));
+            assert_eq!(theme.list_active_border.a, 0.0);
+            assert!(theme.sidebar_accent.a > 0.0);
+            assert!(theme.ring.a > 0.0);
+            assert!(theme.focus_ring);
+        }
+    }
+}

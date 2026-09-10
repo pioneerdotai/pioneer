@@ -464,6 +464,113 @@ fn every_production_route_retains_its_feature_and_window_close_releases_it(
 }
 
 #[gpui_kit::test]
+fn late_capabilities_enable_real_mcp_and_skills_buttons_and_revocation_closes_access(
+    cx: &mut TestAppContext,
+) {
+    use pioneer_client::navigation::{NavigationIntent, SemanticDestination};
+    use pioneer_protocol::*;
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let core = cx.update(|cx| {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let shell = cx.new(|cx| super::DesktopShellView::new(navigation, layout, window, cx));
+        Root::new(shell, window, cx)
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bottom-bar-open-mcp").is_none());
+    let skills = cx.debug_bounds("bottom-bar-open-skills").unwrap();
+    cx.simulate_click(skills.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        core.navigation_snapshot().destination(),
+        &SemanticDestination::Threads
+    );
+    let mut capabilities = AuthorizationCapabilitySnapshot {
+        schema_version: AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION,
+        authorization_revision: 1,
+        principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+        role_key: "admin".into(),
+        role: AuthorizationRolePresentation {
+            key: "admin".into(),
+            display_name: "Synthetic".into(),
+            description: String::new(),
+            built_in: false,
+        },
+        global: AuthorizationGlobalCapabilities {
+            can_manage_capabilities: true,
+            ..Default::default()
+        },
+        workspace: None,
+        thread: None,
+    };
+    let (generation, connection) = core.current_auth_ticket();
+    assert_eq!(
+        core.accept_authorization_projection(generation, connection, capabilities.clone()),
+        pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
+    );
+    cx.run_until_parked();
+    for (selector, expected) in [
+        (
+            "bottom-bar-open-mcp",
+            SemanticDestination::Mcp { server_id: None },
+        ),
+        (
+            "bottom-bar-open-skills",
+            SemanticDestination::Skills { skill_id: None },
+        ),
+    ] {
+        let button = cx
+            .debug_bounds(selector)
+            .expect("authorized production toolbar button");
+        cx.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(core.navigation_snapshot().destination(), &expected);
+        cx.update(|_, cx| {
+            let shell = root
+                .read(cx)
+                .view()
+                .clone()
+                .downcast::<super::DesktopShellView>()
+                .unwrap();
+            let shell = shell.read(cx);
+            let feature = match expected {
+                SemanticDestination::Mcp { .. } => shell.mcp.as_ref().unwrap().entity_id(),
+                SemanticDestination::Skills { .. } => shell.skills.as_ref().unwrap().entity_id(),
+                _ => unreachable!(),
+            };
+            assert_eq!(shell.selected_screen().unwrap().entity_id(), feature);
+        });
+    }
+    core.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Threads,
+        },
+        None,
+    );
+    capabilities.authorization_revision += 1;
+    capabilities.global.can_manage_capabilities = false;
+    let (generation, connection) = core.current_auth_ticket();
+    core.accept_authorization_projection(generation, connection, capabilities);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("bottom-bar-open-mcp").is_none());
+    let skills = cx.debug_bounds("bottom-bar-open-skills").unwrap();
+    cx.simulate_click(skills.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        core.navigation_snapshot().destination(),
+        &SemanticDestination::Threads
+    );
+}
+
+#[gpui_kit::test]
 fn production_navigation_pointer_keyboard_and_menu_share_one_transition(cx: &mut TestAppContext) {
     use crate::desktop_navigation::OpenProviders;
     use pioneer_client::{

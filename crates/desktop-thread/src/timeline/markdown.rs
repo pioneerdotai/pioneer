@@ -866,21 +866,6 @@ fn normalized_markdown_highlights(
     .collect()
 }
 
-fn snap_to_char_boundary_backward(text: &str, mut index: usize) -> usize {
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn snap_to_char_boundary_forward(text: &str, mut index: usize) -> usize {
-    let text_len = text.len();
-    while index < text_len && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index
-}
-
 #[cfg(test)]
 mod tests {
     use super::CodeHighlightPolicy;

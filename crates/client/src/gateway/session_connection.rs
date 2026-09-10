@@ -2174,6 +2174,87 @@ mod tests {
     }
 
     #[test]
+    fn session_driver_verifies_an_automatic_reconnect_before_requesting_capabilities() {
+        for fail in [false, true] {
+            let core = ClientCore::new();
+            let endpoint = endpoint("endpoint");
+            let storage = storage();
+            connect(&core, &endpoint, &storage, 7).unwrap();
+            core.session_demand(super::super::session_driver::SessionDemand {
+                endpoint_id: Some(endpoint.id.clone()),
+                visibility: super::super::session_driver::SessionVisibility::Foreground,
+                network_available: true,
+                generation: 1,
+            });
+            core.mark_gateway_session_disconnected(&endpoint.id, Some(7));
+            let event = crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 7,
+                endpoint_id: endpoint.id.clone(),
+                endpoint_name: endpoint.name.clone(),
+                gateway_base_url: endpoint.gateway_base_url.clone(),
+            };
+            core.observe_session_connection(&event);
+            {
+                let mut owner = core.gateway_session.lock().unwrap();
+                owner.observe_transport(&event);
+                core.publish_gateway_session(&owner);
+            }
+            assert!(core.gateway_session().startup.identity_pending);
+            let calls = std::cell::Cell::new(0);
+            core.drive_session_demand_with_ports(
+                |id| {
+                    assert_eq!(id, endpoint.id);
+                    calls.set(calls.get() + 1);
+                    if fail {
+                        anyhow::bail!("synthetic identity failure");
+                    }
+                    let ready = core.gateway_session.lock().unwrap().connections[&endpoint.id]
+                        .ready
+                        .clone()
+                        .unwrap();
+                    let access = crate::transport::http::GatewayHttpAccess {
+                        gateway_base_url: endpoint.gateway_base_url.clone(),
+                        gateway_id: ready.metadata.gateway_id,
+                        session_id: ready.metadata.session_id,
+                        generation: 7,
+                        access_expires_at_unix: ready.spec.identity.access_expires_at_unix,
+                        access_token: ready.spec.access_token,
+                    };
+                    core.verify_gateway_session_identity_with_ports(
+                        &endpoint,
+                        "synthetic",
+                        ClientKind::Mobile,
+                        access,
+                        &storage,
+                        || Ok(auth_me()),
+                    )
+                },
+                |_| panic!("unverified reconnect must not request capabilities"),
+            );
+            assert_eq!(calls.get(), 1);
+            let publication = core.gateway_session();
+            assert!(!publication.startup.identity_pending);
+            assert_eq!(publication.startup.transport_ready, !fail);
+            assert_eq!(core.current_auth().is_some(), !fail);
+            assert_eq!(
+                publication.gateway_error.as_deref(),
+                fail.then_some("gateway_identity_unavailable")
+            );
+            if !fail {
+                core.drive_session_demand_with_ports(
+                    |_| panic!("identity verification must finish before the next tick"),
+                    |_| calls.set(calls.get() + 1),
+                );
+                assert_eq!(
+                    calls.get(),
+                    2,
+                    "verified reconnect proceeds to authorization"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reconnect_identity_failure_is_scoped_and_a_stale_failure_cannot_retire_the_candidate() {
         let core = ClientCore::new();
         let endpoint = endpoint("endpoint");

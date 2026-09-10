@@ -25,16 +25,6 @@ macro_rules! observed_loading {
 /// Builds the exact stock Spinner while compiling source observation out of
 /// ordinary builds.
 macro_rules! spinner {
-    ($source_id:expr, $is_active:expr $(,)?) => {{
-        #[cfg(feature = "qualification-diagnostics")]
-        {
-            let is_active = $is_active;
-            pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(
-                record_loading_animation_source($source_id, is_active)
-            );
-        }
-        gpui_kit::component::spinner::Spinner::new()
-    }};
     ($source_id:expr $(,)?) => {{
         #[cfg(feature = "qualification-diagnostics")]
         {

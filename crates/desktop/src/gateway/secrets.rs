@@ -14,7 +14,6 @@ use pioneer_protocol::{REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-pub(crate) const DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 2;
 const RETIRED_DESKTOP_GATEWAY_SESSION_SCHEMA_VERSION: u32 = 1;
 const RETIRED_DESKTOP_GATEWAY_AUTH_TOKEN_SERVICE: &str = "pioneer.desktop.gateway_auth_token";
 

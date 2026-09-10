@@ -21,10 +21,8 @@ use pioneer_client::composer::skill_selection::ComposerSkillSelection;
 use pioneer_client::composer::skill_selection::project_composer_skill_chips;
 use pioneer_client::composer::state_machine::ComposerDomainAction;
 use pioneer_client::composer::state_machine::ComposerMentionCandidate;
-use pioneer_client::composer::state_machine::composer_workspace_mention_candidates;
 use pioneer_client::state::snapshot::ActiveThreadSnapshot;
 use pioneer_client::timeline::types::ThreadMode;
-use pioneer_client::timeline::types::WorkspaceId;
 const COMPOSER_ATTACHMENT_TEXT_FADE_WIDTH: Pixels = px(24.);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,11 +104,7 @@ fn resolve_desktop_composer_primary_action(
 }
 
 impl ComposerView {
-    pub(crate) fn render_composer(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(crate) fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
             pioneer_client::timeline::diagnostics::RenderRegion::Composer
         ));
@@ -212,7 +206,7 @@ impl ComposerView {
             "send-message"
         };
         let mention_picker = if message_mode {
-            self.render_composer_mention_picker(window, cx)
+            self.render_composer_mention_picker()
         } else {
             None
         };
@@ -486,11 +480,7 @@ impl ComposerView {
         }
     }
 
-    fn render_composer_mention_picker(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_composer_mention_picker(&mut self) -> Option<AnyElement> {
         let directory_loading = self.thread_member_directory_loading()
             || self.thread_member_input.as_ref().is_some_and(|p| {
                 p.directory_request

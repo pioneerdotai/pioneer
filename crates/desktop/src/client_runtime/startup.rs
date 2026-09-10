@@ -1,5 +1,5 @@
 //! Startup diagnostics observe Client readiness without driving feature requests.
-use gpui_kit::{App, AppContext, Task};
+use gpui_kit::{App, Task};
 use pioneer_client::core::{ClientCore, ClientPublicationReference, ClientScope};
 use pioneer_desktop_foundation::{
     ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,

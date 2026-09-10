@@ -114,10 +114,6 @@ impl VoiceInputView {
         )
     }
 
-    pub(crate) fn desktop_voice_context_locked(&self) -> bool {
-        self.desktop_voice_composer.is_active()
-    }
-
     pub(crate) fn desktop_voice_error_message(&self) -> Option<&str> {
         self.desktop_voice_composer.error_message()
     }

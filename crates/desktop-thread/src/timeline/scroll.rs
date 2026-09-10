@@ -1,6 +1,5 @@
 use super::state::TimelinePresentationState;
 use super::*;
-use pioneer_client::threads::read::{MarkThreadReadContext, plan_mark_thread_read};
 
 /// Geometry of the last rendered publication, independent of request/loading state.
 #[derive(Default)]

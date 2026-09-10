@@ -13,7 +13,7 @@ use pioneer_client::avatars::{
     AgentAvatarCacheResult, AvatarCacheError, AvatarCacheRequest, AvatarCacheResult,
     AvatarCacheSource, AvatarPublication,
 };
-use pioneer_client::avatars::{MemberSummary, PrincipalId, ProfileAvatarMediaType};
+use pioneer_client::avatars::{PrincipalId, ProfileAvatarMediaType};
 use tokio_util::sync::CancellationToken;
 
 use crate::screen::TimelineView;
@@ -281,105 +281,6 @@ impl DesktopMemberAvatarState {
         self.agent_request_generation = self.agent_request_generation.wrapping_add(1);
     }
 
-    pub(crate) fn reconcile_visible_members(
-        &mut self,
-        members: &[MemberSummary],
-    ) -> Vec<AvatarCacheRequest> {
-        let visible_ids = members
-            .iter()
-            .map(|member| member.principal_id.clone())
-            .collect::<HashSet<_>>();
-        self.visible
-            .retain(|principal_id, _| visible_ids.contains(principal_id));
-
-        members
-            .iter()
-            .filter_map(|member| {
-                self.reconcile_principal(&member.principal_id, member.avatar_revision.as_deref())
-            })
-            .collect()
-    }
-
-    pub(crate) fn reconcile_principal(
-        &mut self,
-        principal_id: &PrincipalId,
-        avatar_revision: Option<&str>,
-    ) -> Option<AvatarCacheRequest> {
-        let Some(revision) = avatar_revision else {
-            self.visible.insert(
-                principal_id.clone(),
-                DesktopMemberAvatarPresentation {
-                    principal_id: principal_id.clone(),
-                    avatar_revision: None,
-                    cached_image_path: None,
-                    media_type: None,
-                    status: DesktopMemberAvatarStatus::Placeholder,
-                },
-            );
-            return None;
-        };
-
-        let entry = self.visible.entry(principal_id.clone()).or_insert_with(|| {
-            DesktopMemberAvatarPresentation {
-                principal_id: principal_id.clone(),
-                avatar_revision: Some(revision.to_owned()),
-                cached_image_path: None,
-                media_type: None,
-                status: DesktopMemberAvatarStatus::Placeholder,
-            }
-        });
-        let should_resolve = if entry.avatar_revision.as_deref() != Some(revision) {
-            entry.avatar_revision = Some(revision.to_owned());
-            entry.cached_image_path = None;
-            entry.media_type = None;
-            true
-        } else {
-            entry.cached_image_path.is_none() && entry.status != DesktopMemberAvatarStatus::Loading
-        };
-        if !should_resolve {
-            return None;
-        }
-        if !self
-            .attempted
-            .insert(pioneer_client::avatars::avatar_identity_key(
-                principal_id.as_str(),
-                revision,
-            ))
-        {
-            return None;
-        }
-        entry.status = DesktopMemberAvatarStatus::Loading;
-        Some(AvatarCacheRequest {
-            principal_id: principal_id.clone(),
-            avatar_revision: revision.to_owned(),
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_result(&mut self, result: AvatarCacheResult) -> bool {
-        let status = if result.source == AvatarCacheSource::OfflineCache {
-            DesktopMemberAvatarStatus::Offline
-        } else {
-            DesktopMemberAvatarStatus::Ready
-        };
-        let path = result.local_path.into_path_buf();
-        let mut applied = false;
-        if let Some(entry) = self.visible.get_mut(&result.principal_id)
-            && entry.avatar_revision.as_deref() == Some(result.avatar_revision.as_str())
-        {
-            apply_presentation_result(entry, path.clone(), result.media_type, status);
-            applied = true;
-        }
-        if let Some(entry) = self
-            .historical
-            .get_mut(&(result.principal_id, result.avatar_revision))
-        {
-            apply_presentation_result(entry, path, result.media_type, status);
-            applied = true;
-        }
-        applied
-    }
-
     pub(crate) fn apply_error(
         &mut self,
         principal_id: &PrincipalId,
@@ -493,25 +394,6 @@ impl DesktopMemberAvatarState {
         Some(self.agent_request_generation)
     }
 
-    #[cfg(test)]
-    pub(crate) fn apply_agent_result(&mut self, generation: u64, result: AgentAvatarCacheResult) {
-        if self.agent_request_generation != generation
-            || !self.agent_loading.remove(result.avatar_revision.as_str())
-        {
-            return;
-        }
-        self.agent_cached_image_paths
-            .insert(result.avatar_revision, result.local_path.into_path_buf());
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_agent_error(&mut self, generation: u64, avatar_revision: &str) {
-        if self.agent_request_generation != generation {
-            return;
-        }
-        self.agent_loading.remove(avatar_revision);
-    }
-
     fn protected_path_is_current(&self, entry: &DesktopMemberAvatarPresentation) -> bool {
         let (Some(revision), Some(path)) = (&entry.avatar_revision, &entry.cached_image_path)
         else {
@@ -551,18 +433,6 @@ impl DesktopMemberAvatarState {
             })
             .map(PathBuf::as_path)
     }
-}
-
-#[cfg(test)]
-fn apply_presentation_result(
-    entry: &mut DesktopMemberAvatarPresentation,
-    path: PathBuf,
-    media_type: ProfileAvatarMediaType,
-    status: DesktopMemberAvatarStatus,
-) {
-    entry.cached_image_path = Some(path);
-    entry.media_type = Some(media_type);
-    entry.status = status;
 }
 
 fn apply_presentation_error(entry: &mut DesktopMemberAvatarPresentation, error: AvatarCacheError) {

@@ -112,3 +112,29 @@ fn parse_line_fragment(fragment: &str) -> Option<(Option<u32>, Option<u32>)> {
     let column = column.and_then(|column| column.parse::<u32>().ok());
     Some((Some(line), column))
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn local_file_links_support_positions_and_file_urls() {
+        assert_eq!(
+            local_file_target("/tmp/example.rs:42:7"),
+            Some(LocalFileTarget {
+                path: PathBuf::from("/tmp/example.rs"),
+                line: Some(42),
+                column: Some(7),
+            })
+        );
+        assert_eq!(
+            local_file_target("file:///tmp/my%20file.rs#L9C3"),
+            Some(LocalFileTarget {
+                path: PathBuf::from("/tmp/my file.rs"),
+                line: Some(9),
+                column: Some(3),
+            })
+        );
+        assert!(local_file_target("https://example.com/file.rs").is_none());
+        assert!(local_file_target("relative/file.rs").is_none());
+    }
+}

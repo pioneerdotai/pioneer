@@ -316,6 +316,7 @@ fn render_session_row(
                 ElementId::Name("devices-session-action".into()),
                 SharedString::from(item.session.id.to_string()),
             ))
+            .debug_selector(|| format!("devices-session-action-{}", item.session.id))
             .ghost()
             .compact()
             .small()

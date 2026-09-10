@@ -1,8 +1,5 @@
 use super::*;
-use pioneer_client::{
-    composer::{state_machine::ComposerDomainState, store::ComposerOperationKind},
-    core::ClientCore,
-};
+use pioneer_client::composer::{state_machine::ComposerDomainState, store::ComposerOperationKind};
 impl ComposerView {
     pub(super) fn desktop_voice_context_locked(&self) -> bool {
         self.composer_input

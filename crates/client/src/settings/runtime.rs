@@ -327,9 +327,11 @@ pub(crate) struct SettingsRuntime {
     actions: BTreeMap<SettingsPage, PageAction>,
     demands: BTreeMap<SettingsPage, bool>,
     desktop_demands: BTreeMap<SettingsPage, usize>,
+    sessions_leases: usize,
     refreshing: Option<SettingsEpoch>,
     demand_authorization: Option<u64>,
     sessions_pending: Option<SettingsEpoch>,
+    sessions_demand_authorization: Option<u64>,
     logout_cleanup: Option<crate::gateway::types::GatewayEndpoint>,
     logout_cleanup_active: bool,
     remote_key_reset_generation: u64,
@@ -355,6 +357,7 @@ impl SettingsRuntime {
         self.refreshing = None;
         self.demand_authorization = None;
         self.sessions_pending = None;
+        self.sessions_demand_authorization = None;
         self.remote_poll = None;
         self.self_poll = None;
     }
@@ -588,6 +591,9 @@ impl ClientCore {
                 return self.navigation_outcome(ClientTransitionOutcome::Noop);
             }
             runtime.sessions_pending = Some(epoch.clone());
+            if matches!(intent, SettingsIntent::RefreshSessions) {
+                runtime.sessions_demand_authorization = Some(epoch.authorization);
+            }
         }
         runtime
             .queue
@@ -783,6 +789,15 @@ impl ClientCore {
         runtime.wake();
     }
     fn execute_settings_work(&self, work: SettingsWork) {
+        self.execute_settings_work_with_sessions(work, |epoch| {
+            self.refresh_auth_sessions_for_epoch(epoch).map(|_| ())
+        });
+    }
+    fn execute_settings_work_with_sessions(
+        &self,
+        work: SettingsWork,
+        refresh_sessions: impl FnOnce(&SettingsEpoch) -> anyhow::Result<()>,
+    ) {
         let work = match work {
             SettingsWork::LogoutCleanup => {
                 self.execute_logout_cleanup();
@@ -827,9 +842,7 @@ impl ClientCore {
                 .request_gateway_settings_for_epoch(&epoch)
                 .and_then(|generation| self.load_gateway_settings(generation))
                 .map(|_| ()),
-            SettingsIntent::RefreshSessions => {
-                self.refresh_auth_sessions_for_epoch(&epoch).map(|_| ())
-            }
+            SettingsIntent::RefreshSessions => refresh_sessions(&epoch),
             SettingsIntent::RevokeSession {
                 session_id,
                 expected_status,
@@ -941,6 +954,46 @@ impl ClientCore {
         }
         drop(runtime);
         self.publish_settings_pages_locked(store);
+    }
+}
+/// Keeps the account device list demanded while its owning surface is active.
+/// Independent leases let multiple windows release their demand separately.
+pub struct AuthSessionsDemand {
+    client: std::sync::Weak<ClientCore>,
+}
+impl Drop for AuthSessionsDemand {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.upgrade() {
+            let mut runtime = client
+                .settings_runtime
+                .lock()
+                .expect("settings owner poisoned");
+            runtime.sessions_leases = runtime
+                .sessions_leases
+                .checked_sub(1)
+                .expect("auth sessions demand released without acquisition");
+        }
+    }
+}
+impl ClientCore {
+    pub fn acquire_auth_sessions(self: &Arc<Self>) -> AuthSessionsDemand {
+        let first = {
+            let mut runtime = self
+                .settings_runtime
+                .lock()
+                .expect("settings owner poisoned");
+            runtime.sessions_leases = runtime
+                .sessions_leases
+                .checked_add(1)
+                .expect("auth sessions demand exhausted");
+            runtime.sessions_leases == 1
+        };
+        if first {
+            self.settings_intent(SettingsIntent::RefreshSessions);
+        }
+        AuthSessionsDemand {
+            client: Arc::downgrade(self),
+        }
     }
 }
 pub struct SettingsPageDemand {
@@ -1085,6 +1138,200 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+    #[test]
+    fn saved_profile_policy_refresh_reloads_only_demanded_devices_without_manager_permission() {
+        for demand in [ClientDemand::Visible, ClientDemand::Suspended] {
+            let core = crate::catalog_test_support::settings_client();
+            let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+            assert!(!capabilities.global.can_manage_gateway_settings);
+            let mut auth = core.current_auth().unwrap();
+            let response = AuthSessionListResponse {
+                sessions: vec![AuthSessionListItem {
+                    current: true,
+                    last_seen_at_unix: 100,
+                    device: auth.device.clone(),
+                    session: auth.session.clone(),
+                }],
+            };
+            let refresh = |epoch: &SettingsEpoch| {
+                assert_eq!(*epoch, core.settings_epoch());
+                let request = core.request_auth_sessions()?;
+                core.load_auth_sessions_with_reader(request, |_| Ok(response.clone()))
+                    .map(|_| ())
+            };
+            core.dispatch(ClientIntent::SetScopeDemand {
+                scope: ClientScope::AuthSessions,
+                demand: ClientDemand::Visible,
+                generation: ClientGeneration::new(1),
+            });
+            let work = core
+                .settings_runtime
+                .lock()
+                .unwrap()
+                .queue
+                .pop_front()
+                .unwrap();
+            core.execute_settings_work_with_sessions(work, refresh);
+            assert_eq!(core.auth_sessions().sessions.len(), 1);
+            if demand == ClientDemand::Suspended {
+                core.dispatch(ClientIntent::SetScopeDemand {
+                    scope: ClientScope::AuthSessions,
+                    demand,
+                    generation: ClientGeneration::new(2),
+                });
+            }
+            // Gateway replies to profile.update, then publishes RoleAssignment
+            // for the same principal and MemberChanged. No route remount occurs.
+            auth.principal.display_name = "Changed Name".into();
+            let (request, connection) = core.current_auth_ticket();
+            core.finish_auth_profile_update(
+                request,
+                connection,
+                AuthProfileUpdateResponse {
+                    principal: auth.principal.clone(),
+                    changed: true,
+                },
+            )
+            .unwrap();
+            core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+                policy_generation: PolicyGeneration::new(2).unwrap(),
+                change: AuthorizationChangeKind::RoleAssignment,
+                affected: AuthorizationChangeScope::Principal {
+                    principal_id: auth.principal.id.clone(),
+                },
+            });
+            core.observe_administration_notification(&GatewayNotification::MemberChanged(
+                MemberChangedNotification {
+                    revision: 2,
+                    principal_id: auth.principal.id.clone(),
+                },
+            ));
+            assert!(core.auth_sessions().sessions.is_empty());
+            capabilities.authorization_revision = 2;
+            let (request, connection) = core.current_auth_ticket();
+            core.accept_authorization_projection(request, connection, capabilities);
+            core.resume_current_settings_demand();
+            let mut work = core
+                .settings_runtime
+                .lock()
+                .unwrap()
+                .queue
+                .drain(..)
+                .collect::<Vec<_>>();
+            if demand == ClientDemand::Suspended {
+                assert!(work.is_empty(), "a hidden device list started a request");
+            } else {
+                assert_eq!(
+                    work.len(),
+                    1,
+                    "visible devices were not reloaded exactly once"
+                );
+                assert!(matches!(
+                    &work[0],
+                    SettingsWork::Intent {
+                        intent: SettingsIntent::RefreshSessions,
+                        ..
+                    }
+                ));
+                core.execute_settings_work_with_sessions(work.pop().unwrap(), refresh);
+                assert_eq!(core.auth_sessions().sessions, response.sessions);
+                assert!(!core.auth_sessions().loading);
+                assert!(core.auth_sessions().error.is_none());
+                assert_eq!(
+                    core.current_auth().unwrap().principal.display_name,
+                    "Changed Name"
+                );
+                core.resume_current_settings_demand();
+                assert!(core.settings_runtime.lock().unwrap().queue.is_empty());
+            }
+            core.shutdown();
+        }
+    }
+    #[test]
+    fn account_leases_survive_revalidation_and_release_independently() {
+        use crate::catalog_test_support::{
+            replay_account_requests, revalidate_saved_profile, settings_client,
+        };
+        let core = settings_client();
+        let first = core.acquire_auth_sessions();
+        let second = core.acquire_auth_sessions();
+        assert_eq!(replay_account_requests(&core), (1, 0));
+        drop(first);
+        revalidate_saved_profile(&core);
+        assert_eq!(replay_account_requests(&core), (1, 0));
+        assert_eq!(core.auth_sessions().sessions.len(), 1);
+        drop(second);
+        revalidate_saved_profile(&core);
+        assert_eq!(replay_account_requests(&core), (0, 0));
+        // A mobile demand and a retained surface have independent lifetimes.
+        let last = core.acquire_auth_sessions();
+        core.dispatch(ClientIntent::SetScopeDemand {
+            scope: ClientScope::AuthSessions,
+            demand: ClientDemand::Visible,
+            generation: ClientGeneration::new(1),
+        });
+        assert_eq!(replay_account_requests(&core), (1, 0));
+        drop(last);
+        revalidate_saved_profile(&core);
+        assert_eq!(replay_account_requests(&core), (1, 0));
+        core.dispatch(ClientIntent::SetScopeDemand {
+            scope: ClientScope::AuthSessions,
+            demand: ClientDemand::Suspended,
+            generation: ClientGeneration::new(2),
+        });
+        revalidate_saved_profile(&core);
+        assert_eq!(replay_account_requests(&core), (0, 0));
+        let late = core.acquire_auth_sessions();
+        core.shutdown();
+        drop(late);
+        assert_eq!(core.settings_runtime.lock().unwrap().sessions_leases, 0);
+        assert_eq!(replay_account_requests(&core), (0, 0));
+    }
+    #[test]
+    fn account_lease_before_auth_resumes_once_when_capabilities_arrive() {
+        let fixture = crate::catalog_test_support::settings_client();
+        let core = Arc::new(ClientCore::new());
+        let _demand = core.acquire_auth_sessions();
+        assert_eq!(core.replay_account_requests(), (0, 0));
+        core.finish_current_auth(0, None, fixture.current_auth().unwrap())
+            .unwrap();
+        assert_eq!(core.replay_account_requests(), (0, 0));
+        core.accept_authorization_projection(
+            0,
+            None,
+            fixture.authorization_snapshot(None, None).unwrap(),
+        );
+        core.resume_current_settings_demand();
+        assert_eq!(core.replay_account_requests(), (1, 0));
+        core.resume_current_settings_demand();
+        assert_eq!(core.replay_account_requests(), (0, 0));
+    }
+    #[test]
+    fn devices_demand_waits_for_identity_and_capabilities_then_resumes_once() {
+        let fixture = crate::catalog_test_support::settings_client();
+        let auth = fixture.current_auth().unwrap();
+        let capabilities = fixture.authorization_snapshot(None, None).unwrap();
+        let core = ClientCore::new();
+        core.dispatch(ClientIntent::SetScopeDemand {
+            scope: ClientScope::AuthSessions,
+            demand: ClientDemand::Visible,
+            generation: ClientGeneration::new(1),
+        });
+        assert!(core.settings_runtime.lock().unwrap().queue.is_empty());
+        core.finish_current_auth(0, None, auth).unwrap();
+        assert!(core.settings_runtime.lock().unwrap().queue.is_empty());
+        core.accept_authorization_projection(0, None, capabilities);
+        core.resume_current_settings_demand();
+        let runtime = core.settings_runtime.lock().unwrap();
+        assert_eq!(runtime.queue.len(), 1);
+        assert!(matches!(
+            runtime.queue.front(),
+            Some(SettingsWork::Intent {
+                intent: SettingsIntent::RefreshSessions,
+                ..
+            })
+        ));
     }
     #[test]
     fn pages_publish_equal_values_once_and_only_the_changed_page_advances() {
@@ -1297,28 +1544,46 @@ impl ClientCore {
         &self,
         identity: &crate::gateway::identity_authorization::IdentityAuthorizationPublication,
     ) {
-        if self.is_stopped()
-            || !identity
-                .capabilities
-                .snapshot(None, None)
-                .is_some_and(|s| s.global.can_manage_gateway_settings)
-        {
+        if self.is_stopped() {
             return;
         }
-        let workspace = self.settings_workspace();
+        let Some(capabilities) = identity.capabilities.snapshot(None, None) else {
+            return;
+        };
+        let sessions_visible = self
+            .current_scope_demand(&ClientScope::AuthSessions)
+            .is_some_and(|demand| demand != ClientDemand::Suspended);
+        let epoch = SettingsEpoch {
+            authorization: identity.connection_generation,
+            policy_revision: identity.capabilities.accepted_revision(),
+            workspace: self.settings_workspace(),
+        };
         let mut runtime = self
             .settings_runtime
             .lock()
             .expect("settings owner poisoned");
-        if runtime.demand_authorization == Some(identity.connection_generation) {
+        // The account's own device list is independent of Gateway settings
+        // management. Policy eviction retires its request but not its demand.
+        if (sessions_visible || runtime.sessions_leases > 0)
+            && identity.current_auth.is_some()
+            && runtime.sessions_demand_authorization != Some(identity.connection_generation)
+        {
+            runtime.sessions_demand_authorization = Some(identity.connection_generation);
+            if runtime.sessions_pending.is_none() {
+                runtime.sessions_pending = Some(epoch.clone());
+                runtime.queue.push_back(SettingsWork::Intent {
+                    intent: SettingsIntent::RefreshSessions,
+                    epoch: epoch.clone(),
+                });
+                runtime.wake();
+            }
+        }
+        if !capabilities.global.can_manage_gateway_settings
+            || runtime.demand_authorization == Some(identity.connection_generation)
+        {
             return;
         }
         runtime.demand_authorization = Some(identity.connection_generation);
-        let epoch = SettingsEpoch {
-            authorization: identity.connection_generation,
-            policy_revision: identity.capabilities.accepted_revision(),
-            workspace,
-        };
         if runtime.active(SettingsPage::SelfImprovement) {
             runtime.self_poll = Some((Instant::now() + Duration::from_secs(5), epoch.clone()));
         }
@@ -1361,5 +1626,64 @@ impl ClientCore {
             None => None,
             _ => panic!("unexpected Settings work"),
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ClientCore {
+    /// Replay queued account work with synthetic responses, without a transport or worker.
+    pub(crate) fn replay_account_requests(&self) -> (usize, usize) {
+        let mut sessions = 0;
+        let mut profiles = 0;
+        loop {
+            let work = self.settings_runtime.lock().unwrap().queue.pop_front();
+            let Some(work) = work else { break };
+            if let SettingsWork::Profile { save, epoch } = work {
+                profiles += 1;
+                self.execute_profile_save_with_writer(save, epoch, |params, _| {
+                    let mut principal = self.current_auth().unwrap().principal;
+                    principal.display_name = params.display_name;
+                    principal.nickname = params.nickname;
+                    let (request, connection) = self.current_auth_ticket();
+                    self.finish_auth_profile_update(
+                        request,
+                        connection,
+                        AuthProfileUpdateResponse {
+                            principal,
+                            changed: true,
+                        },
+                    )
+                });
+            } else {
+                assert!(
+                    matches!(
+                        &work,
+                        SettingsWork::Intent {
+                            intent: SettingsIntent::RefreshSessions,
+                            ..
+                        }
+                    ),
+                    "unexpected account request"
+                );
+                self.execute_settings_work_with_sessions(work, |epoch| {
+                    assert_eq!(*epoch, self.settings_epoch());
+                    sessions += 1;
+                    let auth = self.current_auth().unwrap();
+                    let request = self.request_auth_sessions()?;
+                    self.load_auth_sessions_with_reader(request, |_| {
+                        Ok(AuthSessionListResponse {
+                            sessions: vec![AuthSessionListItem {
+                                current: true,
+                                last_seen_at_unix: 100,
+                                device: auth.device,
+                                session: auth.session,
+                            }],
+                        })
+                    })
+                    .map(|_| ())
+                });
+            }
+        }
+        (sessions, profiles)
     }
 }

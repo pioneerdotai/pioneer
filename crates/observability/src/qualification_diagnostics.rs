@@ -31,14 +31,14 @@ macro_rules! bounded_enum {
     };
 }
 
-/// Application-owned source lifecycle observations. `Scheduled` and `Woke`
-/// bracket an owned delay, `Requested` means that the source invoked its
-/// immediate downstream handoff, and `Executed` marks an owned animation
-/// callback. `Completed` means that the observed local source or handoff ended;
-/// it does not claim that later domain work changed state or succeeded.
-/// `Observed` records selection of an opaque stock component, not its paint or
-/// framework callback lifecycle. The source registry defines the meaningful
-/// subset and reconciliation rules for each source.
+// Application-owned source lifecycle observations. `Scheduled` and `Woke`
+// bracket an owned delay, `Requested` means that the source invoked its
+// immediate downstream handoff, and `Executed` marks an owned animation
+// callback. `Completed` means that the observed local source or handoff ended;
+// it does not claim that later domain work changed state or succeeded.
+// `Observed` records selection of an opaque stock component, not its paint or
+// framework callback lifecycle. The source registry defines the meaningful
+// subset and reconciliation rules for each source.
 bounded_enum!(AnimationAction {
     Scheduled,
     Executed,

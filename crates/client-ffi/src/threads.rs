@@ -1,3 +1,4 @@
+#[cfg(feature = "schema")]
 use pioneer_client::composer::model_selection::ComposerModelSelection;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ pub struct ThreadTreeRefreshRequest {
     pub workspace_id: String,
 }
 
+#[cfg(feature = "schema")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

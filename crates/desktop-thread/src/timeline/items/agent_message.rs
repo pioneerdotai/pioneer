@@ -17,7 +17,6 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use pioneer_client::conversation::reducer::ItemView;
 use pioneer_client::conversation::reducer::TimelineEntry;
-use pioneer_client::timeline::types::TurnItem;
 use std::hash::Hash;
 use std::hash::Hasher;
 
@@ -27,7 +26,6 @@ impl RowPresentation {
         entry: &TimelineEntry,
         item_view: &ItemView,
         content: &pioneer_client::timeline::item_presentation::TimelineItemPresentation,
-        item: &TurnItem,
         top_spacing: TimelineRowTopSpacing,
         is_last_row: bool,
         content_width: Pixels,

@@ -139,6 +139,7 @@ impl SettingsScreenView {
 
         h_flex()
             .id("settings-current-principal")
+            .debug_selector(|| "settings-current-principal".into())
             .w_full()
             .items_center()
             .justify_between()

@@ -1,10 +1,8 @@
 //! Retained presentation of the existing timeline inside one mounted thread.
-pub(crate) use crate::timeline::state::TimelinePresentationState;
 use crate::{
     avatar::DesktopMemberAvatarState, binding::ThreadBindings, ports::*,
     timeline::TimelineAvatarActivities,
 };
-use gpui_kit::component::VirtualListScrollHandle;
 use gpui_kit::{prelude::*, *};
 pub(crate) use pioneer_client::state::client_state::GatewayConnectionState;
 use pioneer_client::{
@@ -19,7 +17,7 @@ use pioneer_client::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
 };
 
@@ -148,10 +146,6 @@ impl TimelineView {
         (thread_id == self.thread_id)
             .then(|| self.workspace_input.clone())
             .flatten()
-    }
-    pub(crate) fn thread_workspace_matches(&self, thread_id: &str, workspace_id: &str) -> bool {
-        self.thread_id == thread_id
-            && self.thread_workspace_id(thread_id).as_deref() == Some(workspace_id)
     }
     pub(crate) fn thread_presentation_capabilities(
         &self,

@@ -304,11 +304,9 @@ impl ThreadArtifactsView {
             .when(
                 pioneer_client::artifacts::preview::thumbnail_preview(artifact).is_some(),
                 |this| {
-                    this.child(self.render_thread_artifact_large_preview(
-                        artifact,
-                        preview_image_path,
-                        cx,
-                    ))
+                    this.child(
+                        self.render_thread_artifact_large_preview(artifact, preview_image_path),
+                    )
                 },
             )
             .child(
@@ -470,7 +468,6 @@ impl ThreadArtifactsView {
         &self,
         artifact: &ArtifactRef,
         preview_image_path: Option<PathBuf>,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         ArtifactImagePreview {
             fallback_icon: kind_icon(artifact.kind),

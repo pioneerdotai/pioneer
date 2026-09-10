@@ -310,8 +310,6 @@ impl SkillsCatalogView {
                             .when(!management_rows.is_empty(), |this| {
                                 this.child(self.render_skill_management_virtual_list(
                                     management_rows.clone(),
-                                    can_manage,
-                                    desktop_entity.clone(),
                                     cx,
                                 ))
                             }),
@@ -323,8 +321,6 @@ impl SkillsCatalogView {
     fn render_skill_management_virtual_list(
         &self,
         rows: Rc<Vec<DesktopSkillManagementRow>>,
-        can_manage: bool,
-        desktop_entity: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item_sizes = Rc::new(

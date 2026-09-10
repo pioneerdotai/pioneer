@@ -2693,8 +2693,15 @@ impl ClientCore {
                 .store
                 .invalidate();
         }
+        let retained_invitation_presentation = evict_protected
+            && self.invalidate_administration_operations(
+                !reset_session,
+                match change {
+                    IdentityPublicationChange::InvitationSelector { epoch } => Some(epoch),
+                    _ => None,
+                },
+            );
         if evict_protected {
-            self.invalidate_administration_operations();
             self.invalidate_administration();
             self.invalidate_provider_runtimes();
             self.invalidate_provider_collections();
@@ -2804,6 +2811,8 @@ impl ClientCore {
                         | ClientScope::GatewaySetup
                         | ClientScope::GatewayDestinations
                 ) || scope == &identity_scope
+                    || (retained_invitation_presentation
+                        && scope == &ClientScope::AdministrationOperation)
                     || (matches!(scope, ClientScope::AgentsDocumentContent { .. })
                         && drafts.iter().any(|draft| &draft.scope == scope))
                     || (!reset_session

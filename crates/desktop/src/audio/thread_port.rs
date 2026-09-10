@@ -263,8 +263,6 @@ fn capture_error(error: DesktopVoiceCaptureError) -> ThreadAudioError {
         Native::GatewaySession => Port::GatewaySession,
         Native::GatewayChunk => Port::GatewayChunk,
         Native::GatewayFinalize => Port::GatewayFinalize,
-        Native::GatewayCancel => Port::GatewayCancel,
-        Native::NoSpeech => Port::NoSpeech,
         #[cfg(test)]
         Native::NotCapturing => Port::GatewaySession,
     };
@@ -299,10 +297,10 @@ mod tests {
     #[test]
     fn native_error_copy_and_category_cross_the_port_unchanged() {
         let error = capture_error(DesktopVoiceCaptureError::new(
-            DesktopVoiceCaptureErrorKind::NoSpeech,
+            DesktopVoiceCaptureErrorKind::GatewayFinalize,
             "synthetic localized copy",
         ));
-        assert_eq!(error.kind(), ThreadAudioErrorKind::NoSpeech);
+        assert_eq!(error.kind(), ThreadAudioErrorKind::GatewayFinalize);
         assert_eq!(error.message(), "synthetic localized copy");
     }
 }

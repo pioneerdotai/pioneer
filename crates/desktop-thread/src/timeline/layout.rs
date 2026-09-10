@@ -1,6 +1,7 @@
 use super::TimelinePresentationContext;
 use super::TimelineRenderRow;
 use gpui_kit::Pixels;
+#[cfg(test)]
 use gpui_kit::Size;
 use gpui_kit::px;
 use pioneer_client::conversation::reducer::ConversationViewState;
@@ -8,7 +9,6 @@ use pioneer_client::timeline::labels::is_task_timeline_agent_message;
 use pioneer_client::timeline::rows::TimelineRow;
 use pioneer_client::timeline::rows::TimelineRowKind;
 use pioneer_client::timeline::types::AgentMessagePhase;
-use pioneer_client::timeline::types::PersistedActorRef;
 use pioneer_client::timeline::types::TurnAuthorSnapshot;
 use pioneer_client::timeline::types::TurnItem;
 use std::rc::Rc;
@@ -329,6 +329,7 @@ mod tests {
     use pioneer_client::timeline::rows::UserMessagePresentation;
     use pioneer_client::timeline::semantic_render::SEMANTIC_TURN_WORK_GROUP_PREFIX;
     use pioneer_client::timeline::types::AgentExecutionId;
+    use pioneer_client::timeline::types::PersistedActorRef;
     use pioneer_client::timeline::types::PrincipalId;
     use pioneer_client::timeline::types::ThreadMode;
 
