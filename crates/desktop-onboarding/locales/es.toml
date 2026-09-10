@@ -1,0 +1,199 @@
+[common]
+address = "Dirección"
+copy = "Copiar"
+name = "Nombre"
+ok = "Aceptar"
+or = "o"
+activation_code = "Código de activación"
+
+[buttons]
+ok = "OK"
+add = "Añadir"
+cancel = "Cancelar"
+save = "Guardar"
+dismiss = "Cerrar"
+
+[errors.command]
+exit_status = "estado de salida %{status}"
+failed_with_output = "`%{command_label}` falló: %{details}"
+launchctl_print_failed = "no se pudo ejecutar `launchctl print`"
+powershell_task_status_failed = "no se pudo ejecutar powershell para el estado de la tarea programada"
+run_failed = "no se pudo ejecutar `%{command_label}`"
+systemctl_is_active_failed = "no se pudo ejecutar `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` debe ser mayor que 0"
+load_app = "no se pudo cargar la configuración de la aplicación"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` debe ser mayor que 0"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` debe ser mayor que 0"
+gateway_field_positive = "`desktop.gateway.%{field}` debe ser mayor que 0"
+ws_ping_interval_positive = "`desktop.gateway.ws_ping_interval_ms` debe ser mayor que 0"
+ws_pong_timeout_positive = "`desktop.gateway.ws_pong_timeout_ms` debe ser mayor que 0"
+ws_reconnect_initial_positive = "`desktop.gateway.ws_reconnect_initial_ms` debe ser mayor que 0"
+ws_reconnect_max_positive = "`desktop.gateway.ws_reconnect_max_ms` debe ser mayor que 0"
+ws_reconnect_initial_le_max = "`desktop.gateway.ws_reconnect_initial_ms` debe ser menor o igual que `desktop.gateway.ws_reconnect_max_ms`"
+ws_reconnect_jitter_percent_max = "`desktop.gateway.ws_reconnect_jitter_percent` debe ser menor o igual que 100, recibido %{value}"
+
+[errors.gateway]
+address_conflict_inactive_service = "la dirección `%{listen_addr}` ya está ocupada, pero el servicio configurado `%{service_name}` no está activo; detén el proceso/servicio en conflicto o cambia gateway.listen_addr"
+address_empty = "la dirección de la pasarela no debe estar vacía"
+address_already_exists = "la pasarela `%{address}` ya está en la lista"
+id_not_found = "no se encontró el id de pasarela `%{id}`"
+invalid_address = "dirección de pasarela no válida `%{normalized}`; se espera URL HTTP(S), host o host:port"
+local_delete_unsupported = "la pasarela local no se puede eliminar de la lista"
+remote_edit_only = "solo se pueden editar pasarelas remotas"
+resolve_empty = "la dirección de pasarela `%{listen_addr}` no resolvió a ninguna dirección de socket"
+resolve_failed = "no se pudo resolver la dirección de pasarela `%{listen_addr}`"
+start_command_failed_manual_help = "no se pudo instalar o iniciar automáticamente la pasarela local; vuelve a intentarlo y verifica la configuración local de la pasarela"
+startup_timeout = "el servicio de la pasarela no estuvo disponible en `%{listen_addr}` dentro de %{startup_timeout_ms}ms"
+unreachable_verify = "la pasarela `%{address}` no es accesible; verifica la dirección y que la pasarela esté en ejecución"
+validation_timeout_positive = "el tiempo de espera de validación del gateway remoto debe ser positivo, recibido %{timeout_ms} ms"
+
+[errors.registry]
+parse_failed = "no se pudo analizar el registro de la pasarela `%{path}`"
+read_failed = "no se pudo leer el registro de la pasarela `%{path}`"
+serialize_failed = "no se pudo serializar el registro de la pasarela"
+unsupported_version = "versión de registro de la pasarela `%{version}` no compatible en `%{path}`; se esperaba `%{current_registry_version}`"
+write_failed = "no se pudo escribir el registro de la pasarela `%{path}`"
+
+[errors.runtime]
+ensure_home = "no se pudo preparar el directorio base del entorno de ejecución"
+
+[errors.theme]
+watch_dir_failed = "No se pudo observar el directorio de temas"
+
+[errors.window]
+open_failed = "no se pudo abrir la ventana de escritorio"
+
+[gateway.action]
+add = "Añadir pasarela"
+connect_remote = "Conectar pasarela remota"
+delete = "Eliminar"
+edit = "Editar pasarela"
+reauthenticate = "Volver a conectar"
+start_local = "Iniciar pasarela local"
+
+[gateway.add]
+description = "Conecta una pasarela remota o inicia la pasarela local."
+description_remote_only = "Conecta una pasarela remota."
+title = "Añadir pasarela"
+
+[gateway.delete]
+confirm_description = "Esto elimina la pasarela de este escritorio. Los datos del servidor no se eliminan."
+confirm_title = "¿Eliminar %{name}?"
+
+[gateway.edit]
+description = "Actualiza los detalles de conexión de la pasarela."
+title = "Editar %{name}"
+
+[gateway.endpoint]
+local_name = "Pasarela local"
+local_with_address = "Local - %{address}"
+remote_name = "Remota %{index}"
+remote_with_address = "Remota - %{address}"
+
+[gateway.error]
+with_details = "Error de la pasarela: %{error}."
+
+[gateway.initial]
+description = "Especifica una dirección de pasarela o inicia un servicio de pasarela local."
+title = "Conectar pasarela"
+
+[gateway.popover]
+no_available = "No hay pasarelas disponibles."
+
+[gateway.reauthenticate]
+description = "Introduce un nuevo código de activación para volver a conectar este dispositivo sin cambiar la pasarela guardada."
+title = "Volver a conectar %{name}"
+
+[gateway.status]
+connected = "Pasarela conectada"
+connecting = "Conectando pasarela..."
+connecting_named = "Conectando a %{gateway_name}..."
+connecting_remote = "Conectando a la pasarela remota..."
+deleting = "Eliminando pasarela..."
+failed_check = "Error al comprobar el estado de la pasarela: %{error}"
+local_conflict = "Conflicto de la pasarela local: la dirección está ocupada por otro proceso."
+local_conflict_at = "Conflicto de la pasarela local en %{gateway_address}: la dirección está ocupada por otro proceso."
+local_stopped = "La pasarela local está detenida: %{gateway_address}. Inicia la pasarela local o cambia a una remota."
+not_configured = "La pasarela aún no está configurada. Agrega una dirección remota o inicia una pasarela local."
+remote_unavailable = "Pasarela remota no disponible: %{gateway_name} (%{gateway_address})"
+saving = "Guardando pasarela..."
+starting_local = "Iniciando pasarela local..."
+installing = "Instalando pasarela..."
+updating = "Actualizando pasarela..."
+subsystem_failed = "No se pudo inicializar el subsistema de la pasarela: %{error}"
+subsystem_not_ready = "El subsistema de la pasarela no está listo"
+unavailable = "Pasarela no disponible"
+
+[gateway.notification]
+path_update_skipped = "La pasarela se inició. Para el comando `pioneer`, puede que necesites agregar %{bin_dir} al PATH en una nueva sesión de terminal."
+
+[gateway.session_terminal]
+authentication_required = "Inicia sesión en esta pasarela con un nuevo código de activación."
+revoked = "La sesión de este dispositivo se cerró o revocó. Inicia sesión de nuevo para continuar."
+expired = "La sesión de este dispositivo caducó. Inicia sesión de nuevo para continuar."
+compromised = "La sesión se cerró por seguridad. Inicia sesión de nuevo para continuar."
+principal_suspended = "Tu cuenta está suspendida. Contacta con la administración de la pasarela."
+principal_removed = "Tu cuenta se eliminó de esta pasarela."
+gateway_mismatch = "Esta sesión pertenece a otra pasarela. Comprueba la pasarela y vuelve a vincular."
+storage_failed = "Pioneer no pudo guardar de forma segura esta sesión."
+
+[invitation.join]
+title = "Invitación"
+one_time_warning = "Esta invitación es una credencial de un solo uso. No la compartas."
+loading = "Comprobando la invitación…"
+display_name_label = "Nombre visible"
+display_name_placeholder = "Tu nombre"
+nickname_label = "Alias"
+nickname_placeholder = "tu.alias"
+avatar_label = "Imagen de perfil (opcional)"
+avatar_choose = "Elegir imagen"
+accept = "Aceptar invitación"
+gateway = "Gateway: %{name}"
+inviter = "Invitación de %{name}"
+workspaces = "Espacios de trabajo: %{names}"
+expires = "Caduca en el instante Unix %{timestamp}"
+
+[invitation.join.transport]
+secure = "Conexión cifrada segura"
+insecure = "Conexión sin cifrar"
+
+[invitation.join.error]
+title = "Invitación no disponible"
+invalid = "Este enlace de invitación no es válido o no está disponible."
+unavailable = "Esta invitación no es válida, ha caducado, fue revocada o no está disponible."
+display_name = "Introduce un nombre visible válido."
+nickname = "El alias debe tener entre 2 y 32 letras ASCII, números, puntos, guiones o guiones bajos."
+nickname_unavailable = "Ese alias ya está en uso."
+avatar = "Elige una imagen de hasta 256 KB."
+storage = "No se pudo guardar de forma segura la nueva sesión. Inténtalo de nuevo."
+transport = "No se pudo contactar con el Gateway. Inténtalo de nuevo."
+
+
+[settings.profile]
+read_only = "Perfil de solo lectura"
+edit_title = "Editar cuenta"
+edit_username_title = "Editar nombre de usuario"
+done = "Listo"
+first_name = "Nombre"
+last_name = "Apellido"
+name_hint = "Introduce tu nombre y, si quieres, añade una foto de perfil."
+change_photo = "Cambiar foto"
+remove_photo = "Eliminar foto"
+username = "Nombre de usuario"
+username_hint = "Elige un nombre de usuario público para que otros miembros puedan reconocerte."
+username_rules = "Usa entre 2 y 32 letras, números, puntos, guiones bajos o guiones. Debe comenzar con una letra o un número."
+error_invalid = "Introduce un nombre y un nombre de usuario válidos."
+error_username_unavailable = "Ese nombre de usuario ya está en uso."
+error_avatar = "Elige una imagen PNG, JPEG o WebP de hasta 1024 × 1024 y 256 KB."
+error_save = "No se pudo guardar el perfil. Inténtalo de nuevo."
+
+[settings.profile.kind]
+superuser = "Superusuario"
+member = "Miembro"
+unknown = "Tipo de cuenta desconocido"
+
+
+[invitation.join.actions]
+retry = "Reintentar"

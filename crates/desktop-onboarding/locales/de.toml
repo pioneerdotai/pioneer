@@ -1,0 +1,199 @@
+[common]
+address = "Adresse"
+copy = "Kopieren"
+name = "Name"
+ok = "OK"
+or = "oder"
+activation_code = "Aktivierungscode"
+
+[buttons]
+ok = "OK"
+add = "Hinzufügen"
+cancel = "Abbrechen"
+save = "Speichern"
+dismiss = "Schließen"
+
+[errors.command]
+exit_status = "Exit-Status %{status}"
+failed_with_output = "`%{command_label}` ist fehlgeschlagen: %{details}"
+launchctl_print_failed = "`launchctl print` konnte nicht ausgeführt werden"
+powershell_task_status_failed = "powershell konnte für den Status der geplanten Aufgabe nicht ausgeführt werden"
+run_failed = "`%{command_label}` konnte nicht ausgeführt werden"
+systemctl_is_active_failed = "`systemctl --user is-active` konnte nicht ausgeführt werden"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` muss größer als 0 sein"
+load_app = "App-Konfiguration konnte nicht geladen werden"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` muss größer als 0 sein"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` muss größer als 0 sein"
+gateway_field_positive = "`desktop.gateway.%{field}` muss größer als 0 sein"
+ws_ping_interval_positive = "`desktop.gateway.ws_ping_interval_ms` muss größer als 0 sein"
+ws_pong_timeout_positive = "`desktop.gateway.ws_pong_timeout_ms` muss größer als 0 sein"
+ws_reconnect_initial_positive = "`desktop.gateway.ws_reconnect_initial_ms` muss größer als 0 sein"
+ws_reconnect_max_positive = "`desktop.gateway.ws_reconnect_max_ms` muss größer als 0 sein"
+ws_reconnect_initial_le_max = "`desktop.gateway.ws_reconnect_initial_ms` muss kleiner oder gleich `desktop.gateway.ws_reconnect_max_ms` sein"
+ws_reconnect_jitter_percent_max = "`desktop.gateway.ws_reconnect_jitter_percent` muss kleiner oder gleich 100 sein, erhalten %{value}"
+
+[errors.gateway]
+address_conflict_inactive_service = "Adresse `%{listen_addr}` ist bereits belegt, aber der konfigurierte Dienst `%{service_name}` ist nicht aktiv; stoppe den konfliktierenden Prozess/Dienst oder ändere gateway.listen_addr"
+address_empty = "Gateway-Adresse darf nicht leer sein"
+address_already_exists = "Gateway `%{address}` ist bereits in der Gateway-Liste"
+id_not_found = "Gateway-ID `%{id}` nicht gefunden"
+invalid_address = "ungültige Gateway-Adresse `%{normalized}`; erwartet HTTP(S)-URL, Host oder host:port"
+local_delete_unsupported = "Lokales Gateway kann nicht aus der Gateway-Liste gelöscht werden"
+remote_edit_only = "Nur entfernte Gateways können bearbeitet werden"
+resolve_empty = "Gateway-Adresse `%{listen_addr}` wurde zu keiner Socket-Adresse aufgelöst"
+resolve_failed = "Gateway-Adresse `%{listen_addr}` konnte nicht aufgelöst werden"
+start_command_failed_manual_help = "lokales Gateway konnte nicht automatisch installiert oder gestartet werden; erneut versuchen und lokale Gateway-Konfiguration prüfen"
+startup_timeout = "Gateway-Dienst wurde unter `%{listen_addr}` nicht innerhalb von %{startup_timeout_ms}ms erreichbar"
+unreachable_verify = "Gateway `%{address}` ist nicht erreichbar; prüfe die Adresse und ob das Gateway läuft"
+validation_timeout_positive = "Das Zeitlimit für die Prüfung des Remote-Gateways muss positiv sein, erhalten %{timeout_ms} ms"
+
+[errors.registry]
+parse_failed = "Gateway-Registry `%{path}` konnte nicht geparst werden"
+read_failed = "Gateway-Registry `%{path}` konnte nicht gelesen werden"
+serialize_failed = "Gateway-Registry konnte nicht serialisiert werden"
+unsupported_version = "nicht unterstützte Gateway-Registry-Version `%{version}` in `%{path}`; erwartet `%{current_registry_version}`"
+write_failed = "Gateway-Registry `%{path}` konnte nicht geschrieben werden"
+
+[errors.runtime]
+ensure_home = "Home-Verzeichnis der Laufzeitumgebung konnte nicht vorbereitet werden"
+
+[errors.theme]
+watch_dir_failed = "Theme-Verzeichnis konnte nicht überwacht werden"
+
+[errors.window]
+open_failed = "Desktop-Fenster konnte nicht geöffnet werden"
+
+[gateway.action]
+add = "Gateway hinzufügen"
+connect_remote = "Entferntes Gateway verbinden"
+delete = "Löschen"
+edit = "Gateway bearbeiten"
+reauthenticate = "Erneut verbinden"
+start_local = "Lokales Gateway starten"
+
+[gateway.add]
+description = "Verbinde ein entferntes Gateway oder starte das lokale Gateway."
+description_remote_only = "Verbinde ein entferntes Gateway."
+title = "Gateway hinzufügen"
+
+[gateway.delete]
+confirm_description = "Dadurch wird das Gateway nur von diesem Desktop entfernt. Gateway-Daten auf dem Server werden nicht gelöscht."
+confirm_title = "%{name} löschen?"
+
+[gateway.edit]
+description = "Aktualisiere die Verbindungsdaten des Gateways."
+title = "%{name} bearbeiten"
+
+[gateway.endpoint]
+local_name = "Lokales Gateway"
+local_with_address = "Lokal - %{address}"
+remote_name = "Entfernt %{index}"
+remote_with_address = "Entfernt - %{address}"
+
+[gateway.error]
+with_details = "Gateway-Fehler: %{error}."
+
+[gateway.initial]
+description = "Gib eine Gateway-Adresse an oder starte einen lokalen Gateway-Dienst."
+title = "Gateway verbinden"
+
+[gateway.popover]
+no_available = "Keine verfügbaren Gateways."
+
+[gateway.reauthenticate]
+description = "Geben Sie einen neuen Aktivierungscode ein, um dieses Gerät erneut zu verbinden, ohne das gespeicherte Gateway zu ändern."
+title = "%{name} erneut verbinden"
+
+[gateway.status]
+connected = "Gateway verbunden"
+connecting = "Gateway wird verbunden..."
+connecting_named = "Verbinde mit %{gateway_name}..."
+connecting_remote = "Verbinde mit entferntem Gateway..."
+deleting = "Gateway wird gelöscht..."
+failed_check = "Gateway-Status konnte nicht geprüft werden: %{error}"
+local_conflict = "Lokaler Gateway-Konflikt: Adresse ist durch einen anderen Prozess belegt."
+local_conflict_at = "Lokaler Gateway-Konflikt bei %{gateway_address}: Adresse ist durch einen anderen Prozess belegt."
+local_stopped = "Lokales Gateway ist gestoppt: %{gateway_address}. Starte das lokale Gateway oder wechsle zu einem entfernten."
+not_configured = "Gateway ist noch nicht konfiguriert. Füge eine entfernte Adresse hinzu oder starte ein lokales Gateway."
+remote_unavailable = "Entferntes Gateway nicht verfügbar: %{gateway_name} (%{gateway_address})"
+saving = "Gateway wird gespeichert..."
+starting_local = "Lokales Gateway wird gestartet..."
+installing = "Gateway wird installiert..."
+updating = "Gateway wird aktualisiert..."
+subsystem_failed = "Gateway-Subsystem konnte nicht initialisiert werden: %{error}"
+subsystem_not_ready = "Gateway-Subsystem ist nicht bereit"
+unavailable = "Gateway ist nicht verfügbar"
+
+[gateway.notification]
+path_update_skipped = "Gateway gestartet. Für den Befehl `pioneer` müssen Sie %{bin_dir} in einer neuen Terminalsitzung eventuell manuell zu PATH hinzufügen."
+
+[gateway.session_terminal]
+authentication_required = "Melden Sie sich mit einem neuen Aktivierungscode bei diesem Gateway an."
+revoked = "Diese Gerätesitzung wurde abgemeldet oder widerrufen. Bitte erneut anmelden."
+expired = "Diese Gerätesitzung ist abgelaufen. Bitte erneut anmelden."
+compromised = "Diese Sitzung wurde aus Sicherheitsgründen geschlossen. Bitte erneut anmelden."
+principal_suspended = "Ihr Konto wurde gesperrt. Wenden Sie sich an die Gateway-Administration."
+principal_removed = "Ihr Konto wurde von diesem Gateway entfernt."
+gateway_mismatch = "Diese Sitzung gehört zu einem anderen Gateway. Gateway prüfen und erneut koppeln."
+storage_failed = "Pioneer konnte diese Gerätesitzung nicht sicher speichern."
+
+[invitation.join]
+title = "Einladung"
+one_time_warning = "Diese Einladung ist ein einmaliger Zugangsnachweis. Teile sie nicht."
+loading = "Einladung wird geprüft…"
+display_name_label = "Anzeigename"
+display_name_placeholder = "Dein Name"
+nickname_label = "Kurzname"
+nickname_placeholder = "dein.kurzname"
+avatar_label = "Profilbild (optional)"
+avatar_choose = "Bild auswählen"
+accept = "Einladung annehmen"
+gateway = "Gateway: %{name}"
+inviter = "Eingeladen von %{name}"
+workspaces = "Workspaces: %{names}"
+expires = "Läuft zum Unix-Zeitpunkt %{timestamp} ab"
+
+[invitation.join.transport]
+secure = "Sicher verschlüsselte Verbindung"
+insecure = "Unverschlüsselte Verbindung"
+
+[invitation.join.error]
+title = "Einladung nicht verfügbar"
+invalid = "Dieser Einladungslink ist ungültig oder nicht verfügbar."
+unavailable = "Diese Einladung ist ungültig, abgelaufen, widerrufen oder nicht verfügbar."
+display_name = "Gib einen gültigen Anzeigenamen ein."
+nickname = "Der Kurzname muss aus 2–32 ASCII-Buchstaben, Zahlen, Punkten, Bindestrichen oder Unterstrichen bestehen."
+nickname_unavailable = "Dieser Kurzname wird bereits verwendet."
+avatar = "Wähle ein Bild mit höchstens 256 KB."
+storage = "Die neue Sitzung konnte nicht sicher gespeichert werden. Versuche es erneut."
+transport = "Das Gateway konnte nicht erreicht werden. Versuche es erneut."
+
+
+[settings.profile]
+read_only = "Schreibgeschütztes Profil"
+edit_title = "Konto bearbeiten"
+edit_username_title = "Benutzernamen bearbeiten"
+done = "Fertig"
+first_name = "Vorname"
+last_name = "Nachname"
+name_hint = "Gib deinen Namen ein und füge bei Bedarf ein Profilfoto hinzu."
+change_photo = "Foto ändern"
+remove_photo = "Foto entfernen"
+username = "Benutzername"
+username_hint = "Wähle einen öffentlichen Benutzernamen, damit andere Mitglieder dich erkennen können."
+username_rules = "Verwende 2–32 Buchstaben, Zahlen, Punkte, Unterstriche oder Bindestriche. Das erste Zeichen muss ein Buchstabe oder eine Zahl sein."
+error_invalid = "Gib einen gültigen Namen und Benutzernamen ein."
+error_username_unavailable = "Dieser Benutzername ist bereits vergeben."
+error_avatar = "Wähle ein PNG-, JPEG- oder WebP-Bild bis 1024 × 1024 und 256 KB."
+error_save = "Das Profil konnte nicht gespeichert werden. Versuche es erneut."
+
+[settings.profile.kind]
+superuser = "Superuser"
+member = "Mitglied"
+unknown = "Unbekannter Kontotyp"
+
+
+[invitation.join.actions]
+retry = "Erneut versuchen"

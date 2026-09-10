@@ -9,6 +9,7 @@ use pioneer_protocol::{
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct GatewaySettingsStore {
     pub settings: Option<GatewaySettingsSnapshot>,
+    pub workspace_id: Option<String>,
     pub voice_input: Option<pioneer_protocol::GatewayVoiceInputSettings>,
     pub vector_refill_refresh_requested: bool,
     pub loading: bool,
@@ -85,6 +86,12 @@ impl ClientCore {
         if owner.settings != before {
             self.publish_gateway_settings(&owner.settings);
         }
+        let refresh = owner.settings.vector_refill_refresh_requested
+            && !before.vector_refill_refresh_requested;
+        drop(owner);
+        if refresh {
+            self.settings_intent(crate::settings::runtime::SettingsIntent::Refresh);
+        }
     }
 
     pub fn gateway_settings(&self) -> GatewaySettingsStore {
@@ -96,16 +103,39 @@ impl ClientCore {
     }
 
     pub fn request_gateway_settings(&self) -> anyhow::Result<ClientGeneration> {
+        self.request_gateway_settings_scoped(None)
+    }
+    pub(crate) fn request_gateway_settings_for_epoch(
+        &self,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+    ) -> anyhow::Result<ClientGeneration> {
+        self.request_gateway_settings_scoped(Some(epoch))
+    }
+    fn request_gateway_settings_scoped(
+        &self,
+        expected: Option<&crate::settings::runtime::SettingsEpoch>,
+    ) -> anyhow::Result<ClientGeneration> {
         let mut owner = self
             .identity_authorization
             .lock()
             .expect("identity owner poisoned");
         anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
+        let workspace = self.settings_workspace();
+        anyhow::ensure!(
+            expected.is_none_or(|epoch| epoch.matches_owner(&owner, workspace.clone())),
+            "Settings action scope was replaced"
+        );
+        let connection = self.gateway_http_generation();
+        anyhow::ensure!(
+            owner.connection_matches(connection),
+            "Settings connection scope was replaced"
+        );
         owner.settings_request = owner
             .settings_request
             .checked_add(1)
             .expect("settings generation exhausted");
-        owner.settings_request_connection = self.gateway_http_generation();
+        owner.settings_request_connection = connection;
+        owner.settings_request_workspace = workspace;
         owner.settings_request_notifications = owner.settings_notifications;
         owner.settings.vector_refill_refresh_requested = false;
         owner.settings.loading = true;
@@ -125,7 +155,9 @@ impl ClientCore {
             .expect("identity owner poisoned");
         if self.is_stopped()
             || owner.settings_request != generation.get()
+            || (!owner.settings.loading && !owner.settings.saving)
             || owner.settings_request_connection != self.gateway_http_generation()
+            || owner.settings_request_workspace != self.settings_workspace()
         {
             return false;
         }
@@ -154,10 +186,11 @@ impl ClientCore {
                     }
                 }
                 owner.settings.voice_input = Some(settings.voice_input.clone());
+                owner.settings.workspace_id = owner.settings_request_workspace.clone();
                 owner.settings.settings = Some(settings.clone());
                 owner.settings.error = None;
             }
-            Err(error) => owner.settings.error = Some(format!("{error:#}")),
+            Err(_) => owner.settings.error = Some("settings_load_failed".into()),
         }
         self.publish_gateway_settings(&owner.settings);
         true
@@ -172,7 +205,7 @@ impl ClientCore {
         &self,
         generation: ClientGeneration,
     ) -> anyhow::Result<GatewaySettingsGetResponse> {
-        {
+        let connection = {
             let owner = self
                 .identity_authorization
                 .lock()
@@ -180,14 +213,20 @@ impl ClientCore {
             anyhow::ensure!(
                 !self.is_stopped()
                     && owner.settings_request == generation.get()
-                    && owner.settings.loading,
+                    && owner.settings.loading
+                    && owner.settings_request_workspace == self.settings_workspace(),
                 "Settings request is no longer pending"
             );
-        }
-        let mut result = self
-            .compatibility_runtime()
-            .ws_command_sender()
-            .gateway_settings_get()
+            owner.settings_request_connection
+        };
+        let sender = self.compatibility_runtime().ws_command_sender();
+        let mut result = connection
+            .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::gateway_settings_get(
+                    &sender.requests_for_connection(connection),
+                )
+            })
             .map(|response| response.settings);
         anyhow::ensure!(
             self.finish_gateway_settings(generation, &mut result),
@@ -208,16 +247,40 @@ impl ClientCore {
         &self,
         optimistic: Option<GatewaySettingsSnapshot>,
     ) -> anyhow::Result<ClientGeneration> {
+        self.prepare_gateway_settings_update_scoped(optimistic, None)
+    }
+    pub(crate) fn prepare_gateway_settings_update_for_epoch(
+        &self,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+    ) -> anyhow::Result<ClientGeneration> {
+        self.prepare_gateway_settings_update_scoped(None, Some(epoch))
+    }
+    fn prepare_gateway_settings_update_scoped(
+        &self,
+        optimistic: Option<GatewaySettingsSnapshot>,
+        expected: Option<&crate::settings::runtime::SettingsEpoch>,
+    ) -> anyhow::Result<ClientGeneration> {
         let mut owner = self
             .identity_authorization
             .lock()
             .expect("identity owner poisoned");
         anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
+        let workspace = self.settings_workspace();
+        anyhow::ensure!(
+            expected.is_none_or(|epoch| epoch.matches_owner(&owner, workspace.clone())),
+            "Settings action scope was replaced"
+        );
+        let connection = self.gateway_http_generation();
+        anyhow::ensure!(
+            owner.connection_matches(connection),
+            "Settings connection scope was replaced"
+        );
         owner.settings_request = owner
             .settings_request
             .checked_add(1)
             .expect("settings generation exhausted");
-        owner.settings_request_connection = self.gateway_http_generation();
+        owner.settings_request_connection = connection;
+        owner.settings_request_workspace = workspace;
         owner.settings_request_notifications = owner.settings_notifications;
         owner.settings.vector_refill_refresh_requested = false;
         owner.settings.saving = true;
@@ -234,7 +297,7 @@ impl ClientCore {
         generation: ClientGeneration,
         update: GatewaySettingsUpdate,
     ) -> anyhow::Result<GatewaySettingsUpdateResponse> {
-        {
+        let connection = {
             let owner = self
                 .identity_authorization
                 .lock()
@@ -242,14 +305,21 @@ impl ClientCore {
             anyhow::ensure!(
                 !self.is_stopped()
                     && owner.settings_request == generation.get()
-                    && owner.settings.saving,
+                    && owner.settings.saving
+                    && owner.settings_request_workspace == self.settings_workspace(),
                 "Settings update is no longer pending"
             );
-        }
-        let mut result = self
-            .compatibility_runtime()
-            .ws_command_sender()
-            .gateway_settings_update(update)
+            owner.settings_request_connection
+        };
+        let sender = self.compatibility_runtime().ws_command_sender();
+        let mut result = connection
+            .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::gateway_settings_update(
+                    &sender.requests_for_connection(connection),
+                    update,
+                )
+            })
             .map(|response| response.settings);
         anyhow::ensure!(
             self.finish_gateway_settings(generation, &mut result),
@@ -259,6 +329,7 @@ impl ClientCore {
     }
 
     fn publish_gateway_settings(&self, settings: &GatewaySettingsStore) {
+        self.publish_settings_pages_locked(settings);
         use crate::core::{
             ClientMutationAuthority, ClientRevisions, ContentRevision, DomainRevision,
             PresentationRevision, ScopedRevision,
@@ -394,7 +465,7 @@ mod tests {
         assert!(core.gateway_settings().settings.unwrap().general.keepawake);
         assert!(core.finish_gateway_settings(save, &mut Ok(snapshot(true))));
         let before = core.snapshot(&ClientScope::Settings).unwrap();
-        assert!(core.finish_gateway_settings(save, &mut Ok(snapshot(true))));
+        assert!(!core.finish_gateway_settings(save, &mut Ok(snapshot(true))));
         assert!(std::sync::Arc::ptr_eq(
             &before.snapshot(),
             &core.snapshot(&ClientScope::Settings).unwrap().snapshot()

@@ -11,13 +11,7 @@ use gpui_kit::{prelude::*, *};
 
 impl PioneerDesktop {
     pub(crate) fn window_route(&self) -> crate::desktop_navigation::WindowRoute {
-        if self.invitation_join.is_some() {
-            crate::desktop_navigation::WindowRoute::InvitationJoin
-        } else if self.is_gateway_setup_required() {
-            crate::desktop_navigation::WindowRoute::GatewaySetup
-        } else {
-            crate::desktop_navigation::WindowRoute::Main
-        }
+        self.onboarding_route
     }
     pub(crate) fn title_bar_surface(
         owner: &Entity<Self>,
@@ -41,8 +35,8 @@ impl PioneerDesktop {
         owner.update(cx, |view, cx| view.render_selected_sidebar(route, cx))
     }
     fn render_title_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let invitation_join = self.invitation_join.clone();
-        let invitation_active = invitation_join.is_some();
+        let invitation_active =
+            self.onboarding_route == crate::desktop_navigation::WindowRoute::InvitationJoin;
 
         let theme_icon = if cx.theme().mode.is_dark() {
             gpui_kit::component::IconName::Sun
@@ -51,19 +45,7 @@ impl PioneerDesktop {
         };
 
         let is_gateway_setup_required = self.is_gateway_setup_required();
-        let show_gateway_switcher = !invitation_active
-            && (!is_gateway_setup_required
-                || self
-                    .gateway
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| !runtime.endpoints().is_empty()));
-        let keepawake_enabled = self
-            .gateway
-            .settings
-            .as_ref()
-            .is_some_and(|settings| settings.general.keepawake);
-        let keepawake_available = !is_gateway_setup_required && self.gateway.settings.is_some();
+        let show_gateway_switcher = !invitation_active;
         let show_task_notifications = !is_gateway_setup_required
             && self
                 .principal_presentation_capabilities()
@@ -82,7 +64,10 @@ impl PioneerDesktop {
                             .h_full()
                             .items_center()
                             .child(if show_gateway_switcher {
-                                self.gateway.switcher_view.clone().into_any_element()
+                                self.onboarding_view
+                                    .read(cx)
+                                    .gateway_switcher_surface()
+                                    .into_any_element()
                             } else {
                                 div().into_any_element()
                             }),
@@ -106,37 +91,9 @@ impl PioneerDesktop {
                                 h_flex()
                                     .gap_1()
                                     .child(if !is_gateway_setup_required {
-                                        Button::new("toggle-keepawake")
-                                            .ghost()
-                                            .small()
-                                            .compact()
-                                            .disabled(!keepawake_available)
-                                            .tooltip(
-                                                t!("settings.option.keepawake.tooltip").to_string(),
-                                            )
-                                            .child(
-                                                Icon::new(PioneerIconName::PowerOff)
-                                                    .size_3p5()
-                                                    .opacity(0.6)
-                                                    .when(keepawake_enabled, |this| {
-                                                        this.opacity(1.0)
-                                                            .text_color(cx.theme().blue)
-                                                    }),
-                                            )
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                let Some(settings) = view.gateway.settings.as_ref()
-                                                else {
-                                                    view.refresh_gateway_settings(cx);
-                                                    cx.notify();
-                                                    return;
-                                                };
-
-                                                view.apply_keepawake_setting(
-                                                    !settings.general.keepawake,
-                                                    cx,
-                                                );
-                                                cx.notify();
-                                            }))
+                                        self.settings_view
+                                            .read(cx)
+                                            .general_actions_surface()
                                             .into_any_element()
                                     } else {
                                         div().into_any_element()
@@ -176,7 +133,11 @@ impl PioneerDesktop {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match route {
-            MainContentView::Settings => self.render_settings_sidebar(cx),
+            MainContentView::Settings => self
+                .settings_view
+                .read(cx)
+                .sidebar_surface()
+                .into_any_element(),
             MainContentView::Providers => self.providers_view.read(cx).sidebar().into_any_element(),
             MainContentView::Administration => self
                 .administration_view
@@ -193,11 +154,8 @@ impl PioneerDesktop {
 }
 impl Render for PioneerDesktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(invitation) = self.invitation_join.clone() {
-            return self.render_desktop_invitation_join(invitation, window, cx);
-        }
-        if self.is_gateway_setup_required() {
-            return self.gateway.setup_view.clone().into_any_element();
+        if self.onboarding_route != crate::desktop_navigation::WindowRoute::Main {
+            return self.onboarding_view.clone().into_any_element();
         }
         match self.main_content_view() {
             MainContentView::Threads => div().into_any_element(),
@@ -208,7 +166,7 @@ impl Render for PioneerDesktop {
             MainContentView::McpDetails => self.mcp_view.clone().into_any_element(),
             MainContentView::Skills => self.skills_view.clone().into_any_element(),
             MainContentView::SkillDetails => self.skills_view.clone().into_any_element(),
-            MainContentView::Settings => self.render_settings(window, cx),
+            MainContentView::Settings => self.settings_view.clone().into_any_element(),
         }
     }
 }

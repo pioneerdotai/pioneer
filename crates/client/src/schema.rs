@@ -42,6 +42,42 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "settings_model_picker_publication.json",
+            crate::settings::model_picker::SettingsModelPickerPublication
+        ),
+        schema_doc!(
+            "gateway_setup_publication.json",
+            crate::gateway::setup_controller::GatewaySetupPublication
+        ),
+        schema_doc!(
+            "gateway_destinations_publication.json",
+            crate::gateway::onboarding_runtime::GatewayDestinationsPublication
+        ),
+        schema_doc!(
+            "invitation_publication.json",
+            crate::gateway::invitation_controller::InvitationPublication
+        ),
+        schema_doc!(
+            "settings_page_publication.json",
+            crate::settings::runtime::SettingsPagePublication
+        ),
+        schema_doc!(
+            "profile_publication.json",
+            crate::settings::profile::ProfilePublication
+        ),
+        schema_doc!(
+            "auth_sessions_store.json",
+            crate::gateway::identity_authorization::AuthSessionsStore
+        ),
+        schema_doc!(
+            "device_activation_publication.json",
+            crate::settings::device_activation::DeviceActivationPublication
+        ),
+        schema_doc!(
+            "agents_document_publication.json",
+            crate::agents_doc::controller::AgentsDocumentPublication
+        ),
+        schema_doc!(
             "mcp_catalog_publication.json",
             crate::mcp::store::McpCatalogPublication
         ),
@@ -69,10 +105,22 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             "skill_upload_publication.json",
             crate::skills::upload_flow::SkillUploadPublication
         ),
-        schema_doc!("provider_collection_publication.json", crate::providers::store::ProviderCollectionPublication),
-        schema_doc!("provider_operation_publication.json", crate::providers::operations::ProviderOperationPublication),
-        schema_doc!("administration_page_publication.json", crate::administration::pages::AdministrationPagePublication),
-        schema_doc!("administration_operation_publication.json", crate::administration::operations::AdministrationOperationPublication),
+        schema_doc!(
+            "provider_collection_publication.json",
+            crate::providers::store::ProviderCollectionPublication
+        ),
+        schema_doc!(
+            "provider_operation_publication.json",
+            crate::providers::operations::ProviderOperationPublication
+        ),
+        schema_doc!(
+            "administration_page_publication.json",
+            crate::administration::pages::AdministrationPagePublication
+        ),
+        schema_doc!(
+            "administration_operation_publication.json",
+            crate::administration::operations::AdministrationOperationPublication
+        ),
         schema_doc!(
             "provider_runtime_publication.json",
             crate::providers::runtime::ProviderRuntimePublication

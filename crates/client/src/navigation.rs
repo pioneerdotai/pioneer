@@ -448,6 +448,40 @@ impl ClientCore {
         intent: NavigationIntent,
         expected_revision: Option<u64>,
     ) -> ClientTransition {
+        // Non-settings navigation also runs while applying an authorization fence.
+        // Only a protected Settings destination needs to acquire the identity owner.
+        let protected_settings = matches!(
+            &intent,
+            NavigationIntent::SetSettingsRoute {
+                route: SettingsRoute::Memory | SettingsRoute::SelfImprovement
+            } | NavigationIntent::Navigate {
+                destination: SemanticDestination::Settings {
+                    route: SettingsRoute::Memory | SettingsRoute::SelfImprovement
+                }
+            }
+        );
+        let allowed = !protected_settings
+            || self
+                .authorization_snapshot(None, None)
+                .is_some_and(|s| s.global.can_manage_gateway_settings);
+        let intent = match intent {
+            NavigationIntent::SetSettingsRoute {
+                route: SettingsRoute::Memory | SettingsRoute::SelfImprovement,
+            } if !allowed => NavigationIntent::SetSettingsRoute {
+                route: SettingsRoute::Account,
+            },
+            NavigationIntent::Navigate {
+                destination:
+                    SemanticDestination::Settings {
+                        route: SettingsRoute::Memory | SettingsRoute::SelfImprovement,
+                    },
+            } if !allowed => NavigationIntent::Navigate {
+                destination: SemanticDestination::Settings {
+                    route: SettingsRoute::Account,
+                },
+            },
+            intent => intent,
+        };
         let mut registry = self
             .thread_registry
             .lock()
@@ -482,6 +516,18 @@ impl ClientCore {
     }
 }
 impl crate::threads::registry::ThreadRegistry {
+    pub(crate) fn restrict_settings_navigation(&mut self, allowed: bool) {
+        if !allowed
+            && matches!(
+                self.navigation.settings_route(),
+                SettingsRoute::Memory | SettingsRoute::SelfImprovement
+            )
+        {
+            self.navigation.apply(NavigationIntent::SetSettingsRoute {
+                route: SettingsRoute::Account,
+            });
+        }
+    }
     pub(crate) fn reset_navigation(&mut self) {
         self.navigation = ClientNavigationState::default();
     }
@@ -745,7 +791,12 @@ mod tests {
     }
     #[test]
     fn semantic_destinations_keep_selection_and_publish_once() {
-        let core = ClientCore::new();
+        let core = crate::catalog_test_support::client();
+        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+        capabilities.authorization_revision += 1;
+        capabilities.global.can_manage_gateway_settings = true;
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, capabilities);
         select(&core, "workspace", "thread");
         for destination in [
             SemanticDestination::Providers {

@@ -78,6 +78,69 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
 
     let mut contracts = vec![
         contract_type!(
+            "settings_model_picker_publication.json",
+            crate::settings::model_picker::SettingsModelPickerPublication,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_setup_publication.json",
+            crate::gateway::setup_controller::GatewaySetupPublication,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "gateway_destinations_publication.json",
+            crate::gateway::onboarding_runtime::GatewayDestinationsPublication,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "invitation_publication.json",
+            crate::gateway::invitation_controller::InvitationPublication,
+            Domain::Connection,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "settings_page_publication.json",
+            crate::settings::runtime::SettingsPagePublication,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "profile_publication.json",
+            crate::settings::profile::ProfilePublication,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "auth_sessions_store.json",
+            crate::gateway::identity_authorization::AuthSessionsStore,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "device_activation_publication.json",
+            crate::settings::device_activation::DeviceActivationPublication,
+            Domain::Settings,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
+            "agents_document_publication.json",
+            crate::agents_doc::controller::AgentsDocumentPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Stable
+        ),
+        contract_type!(
             "mcp_catalog_publication.json",
             crate::mcp::store::McpCatalogPublication,
             Domain::Mcp,
@@ -126,10 +189,34 @@ pub fn client_contract_types() -> Vec<ClientContractType> {
             Kind::Snapshot,
             Stability::Stable
         ),
-        contract_type!("provider_collection_publication.json", crate::providers::store::ProviderCollectionPublication, Domain::Providers, Kind::Snapshot, Stability::Provisional),
-        contract_type!("provider_operation_publication.json", crate::providers::operations::ProviderOperationPublication, Domain::Providers, Kind::Snapshot, Stability::Provisional),
-        contract_type!("administration_page_publication.json", crate::administration::pages::AdministrationPagePublication, Domain::Root, Kind::Snapshot, Stability::Provisional),
-        contract_type!("administration_operation_publication.json", crate::administration::operations::AdministrationOperationPublication, Domain::Root, Kind::Snapshot, Stability::Provisional),
+        contract_type!(
+            "provider_collection_publication.json",
+            crate::providers::store::ProviderCollectionPublication,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "provider_operation_publication.json",
+            crate::providers::operations::ProviderOperationPublication,
+            Domain::Providers,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "administration_page_publication.json",
+            crate::administration::pages::AdministrationPagePublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
+        contract_type!(
+            "administration_operation_publication.json",
+            crate::administration::operations::AdministrationOperationPublication,
+            Domain::Root,
+            Kind::Snapshot,
+            Stability::Provisional
+        ),
         contract_type!(
             "provider_runtime_publication.json",
             crate::providers::runtime::ProviderRuntimePublication,

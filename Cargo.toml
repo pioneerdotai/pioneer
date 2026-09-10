@@ -20,6 +20,9 @@ members = [
   "crates/desktop-providers",
   "crates/desktop-mcp",
   "crates/desktop-skills",
+  "crates/desktop-agents-doc",
+  "crates/desktop-onboarding",
+  "crates/desktop-settings",
   "crates/desktop-task-notifications",
   "crates/desktop-updater",
   "crates/cli",
@@ -65,6 +68,9 @@ pioneer-desktop-administration = { path = "crates/desktop-administration" }
 pioneer-desktop-providers = { path = "crates/desktop-providers" }
 pioneer-desktop-mcp = { path = "crates/desktop-mcp" }
 pioneer-desktop-skills = { path = "crates/desktop-skills" }
+pioneer-desktop-agents-doc = { path = "crates/desktop-agents-doc" }
+pioneer-desktop-onboarding = { path = "crates/desktop-onboarding" }
+pioneer-desktop-settings = { path = "crates/desktop-settings" }
 pioneer-desktop-workspaces = { path = "crates/desktop-workspaces" }
 pioneer-desktop-update = { path = "crates/desktop-update" }
 pioneer-desktop-task-notifications = { path = "crates/desktop-task-notifications" }

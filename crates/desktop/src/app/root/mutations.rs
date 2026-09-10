@@ -370,10 +370,8 @@ impl PioneerDesktop {
             .client_core()
             .clear_thread_resume_queue();
 
-        self.active_agents_doc_editor_scope = None;
         self.agents_doc_editor = None;
 
-        self.gateway.settings = None;
         self.clear_workspace_capability_projections();
     }
 

@@ -1,0 +1,199 @@
+[common]
+address = "Adresse"
+copy = "Copier"
+name = "Nom"
+ok = "OK"
+or = "ou"
+activation_code = "Code d’activation"
+
+[buttons]
+ok = "OK"
+add = "Ajouter"
+cancel = "Annuler"
+save = "Enregistrer"
+dismiss = "Fermer"
+
+[errors.command]
+exit_status = "statut de sortie %{status}"
+failed_with_output = "`%{command_label}` a échoué : %{details}"
+launchctl_print_failed = "impossible d'exécuter `launchctl print`"
+powershell_task_status_failed = "impossible d'exécuter powershell pour l'état de la tâche planifiée"
+run_failed = "impossible d'exécuter `%{command_label}`"
+systemctl_is_active_failed = "impossible d'exécuter `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` doit être supérieur à 0"
+load_app = "impossible de charger la configuration de l'application"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` doit être supérieur à 0"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` doit être supérieur à 0"
+gateway_field_positive = "`desktop.gateway.%{field}` doit être supérieur à 0"
+ws_ping_interval_positive = "`desktop.gateway.ws_ping_interval_ms` doit être supérieur à 0"
+ws_pong_timeout_positive = "`desktop.gateway.ws_pong_timeout_ms` doit être supérieur à 0"
+ws_reconnect_initial_positive = "`desktop.gateway.ws_reconnect_initial_ms` doit être supérieur à 0"
+ws_reconnect_max_positive = "`desktop.gateway.ws_reconnect_max_ms` doit être supérieur à 0"
+ws_reconnect_initial_le_max = "`desktop.gateway.ws_reconnect_initial_ms` doit être inférieur ou égal à `desktop.gateway.ws_reconnect_max_ms`"
+ws_reconnect_jitter_percent_max = "`desktop.gateway.ws_reconnect_jitter_percent` doit être inférieur ou égal à 100, reçu %{value}"
+
+[errors.gateway]
+address_conflict_inactive_service = "l'adresse `%{listen_addr}` est déjà utilisée, mais le service configuré `%{service_name}` n'est pas actif ; arrêtez le processus/service en conflit ou changez gateway.listen_addr"
+address_empty = "l'adresse de la passerelle ne doit pas être vide"
+address_already_exists = "la passerelle `%{address}` est déjà dans la liste"
+id_not_found = "id de passerelle `%{id}` introuvable"
+invalid_address = "adresse de passerelle invalide `%{normalized}` ; attendu URL HTTP(S), host ou host:port"
+local_delete_unsupported = "la passerelle locale ne peut pas être supprimée de la liste"
+remote_edit_only = "seules les passerelles distantes peuvent être modifiées"
+resolve_empty = "l'adresse de passerelle `%{listen_addr}` n'a été résolue vers aucune adresse socket"
+resolve_failed = "impossible de résoudre l'adresse de passerelle `%{listen_addr}`"
+start_command_failed_manual_help = "impossible d'installer ou de démarrer automatiquement la passerelle locale ; réessayez et vérifiez la configuration locale de la passerelle"
+startup_timeout = "le service de passerelle n'est pas devenu joignable à `%{listen_addr}` dans les %{startup_timeout_ms}ms"
+unreachable_verify = "la passerelle `%{address}` est injoignable ; vérifiez l'adresse et que la passerelle est en cours d'exécution"
+validation_timeout_positive = "le délai de validation de la passerelle distante doit être positif, reçu %{timeout_ms} ms"
+
+[errors.registry]
+parse_failed = "impossible d'analyser le registre de la passerelle `%{path}`"
+read_failed = "impossible de lire le registre de la passerelle `%{path}`"
+serialize_failed = "impossible de sérialiser le registre de la passerelle"
+unsupported_version = "version de registre de la passerelle `%{version}` non prise en charge dans `%{path}` ; attendu `%{current_registry_version}`"
+write_failed = "impossible d'écrire le registre de la passerelle `%{path}`"
+
+[errors.runtime]
+ensure_home = "impossible de préparer le répertoire principal de l'environnement d'exécution"
+
+[errors.theme]
+watch_dir_failed = "Impossible de surveiller le dossier des thèmes"
+
+[errors.window]
+open_failed = "impossible d'ouvrir la fenêtre de l'application de bureau"
+
+[gateway.action]
+add = "Ajouter une passerelle"
+connect_remote = "Connecter une passerelle distante"
+delete = "Supprimer"
+edit = "Modifier la passerelle"
+reauthenticate = "Reconnecter"
+start_local = "Démarrer la passerelle locale"
+
+[gateway.add]
+description = "Connectez une passerelle distante ou démarrez la passerelle locale."
+description_remote_only = "Connectez une passerelle distante."
+title = "Ajouter une passerelle"
+
+[gateway.delete]
+confirm_description = "Cela supprime la passerelle de cette application de bureau. Les données sur le serveur ne sont pas supprimées."
+confirm_title = "Supprimer %{name} ?"
+
+[gateway.edit]
+description = "Mettez à jour les détails de connexion de la passerelle."
+title = "Modifier %{name}"
+
+[gateway.endpoint]
+local_name = "Passerelle locale"
+local_with_address = "Locale - %{address}"
+remote_name = "Distante %{index}"
+remote_with_address = "Distante - %{address}"
+
+[gateway.error]
+with_details = "Erreur de passerelle : %{error}."
+
+[gateway.initial]
+description = "Indiquez une adresse de passerelle ou démarrez un service de passerelle locale."
+title = "Connecter la passerelle"
+
+[gateway.popover]
+no_available = "Aucune passerelle disponible."
+
+[gateway.reauthenticate]
+description = "Saisissez un nouveau code d’activation pour reconnecter cet appareil sans modifier la passerelle enregistrée."
+title = "Reconnecter %{name}"
+
+[gateway.status]
+connected = "Passerelle connectée"
+connecting = "Connexion de la passerelle..."
+connecting_named = "Connexion à %{gateway_name}..."
+connecting_remote = "Connexion à la passerelle distante..."
+deleting = "Suppression de la passerelle..."
+failed_check = "Échec de la vérification de l'état de la passerelle : %{error}"
+local_conflict = "Conflit de la passerelle locale : l'adresse est occupée par un autre processus."
+local_conflict_at = "Conflit de la passerelle locale à %{gateway_address} : l'adresse est occupée par un autre processus."
+local_stopped = "La passerelle locale est arrêtée : %{gateway_address}. Démarrez la passerelle locale ou basculez vers une distante."
+not_configured = "La passerelle n'est pas encore configurée. Ajoutez une adresse distante ou démarrez une passerelle locale."
+remote_unavailable = "Passerelle distante indisponible : %{gateway_name} (%{gateway_address})"
+saving = "Enregistrement de la passerelle..."
+starting_local = "Démarrage de la passerelle locale..."
+installing = "Installation de la passerelle..."
+updating = "Mise à jour de la passerelle..."
+subsystem_failed = "Le sous-système de passerelle n'a pas pu être initialisé : %{error}"
+subsystem_not_ready = "Le sous-système de passerelle n'est pas prêt"
+unavailable = "Passerelle indisponible"
+
+[gateway.notification]
+path_update_skipped = "La passerelle est démarrée. Pour la commande `pioneer`, vous devrez peut-être ajouter %{bin_dir} au PATH dans une nouvelle session de terminal."
+
+[gateway.session_terminal]
+authentication_required = "Connectez-vous à cette passerelle avec un nouveau code d’activation."
+revoked = "La session de cet appareil a été fermée ou révoquée. Reconnectez-vous pour continuer."
+expired = "La session de cet appareil a expiré. Reconnectez-vous pour continuer."
+compromised = "Cette session a été fermée par sécurité. Reconnectez-vous pour continuer."
+principal_suspended = "Votre compte est suspendu. Contactez l’administration de la passerelle."
+principal_removed = "Votre compte a été supprimé de cette passerelle."
+gateway_mismatch = "Cette session appartient à une autre passerelle. Vérifiez-la et associez à nouveau l’appareil."
+storage_failed = "Pioneer n’a pas pu enregistrer cette session de manière sécurisée."
+
+[invitation.join]
+title = "Invitation"
+one_time_warning = "Cette invitation est un identifiant à usage unique. Ne la partagez pas."
+loading = "Vérification de l’invitation…"
+display_name_label = "Nom affiché"
+display_name_placeholder = "Votre nom"
+nickname_label = "Pseudo"
+nickname_placeholder = "votre.pseudo"
+avatar_label = "Image de profil (facultatif)"
+avatar_choose = "Choisir une image"
+accept = "Accepter l’invitation"
+gateway = "Gateway : %{name}"
+inviter = "Invitation de %{name}"
+workspaces = "Espaces de travail : %{names}"
+expires = "Expire à l’horodatage Unix %{timestamp}"
+
+[invitation.join.transport]
+secure = "Connexion chiffrée sécurisée"
+insecure = "Connexion non chiffrée"
+
+[invitation.join.error]
+title = "Invitation indisponible"
+invalid = "Ce lien d’invitation est invalide ou indisponible."
+unavailable = "Cette invitation est invalide, expirée, révoquée ou indisponible."
+display_name = "Saisissez un nom affiché valide."
+nickname = "Le pseudo doit contenir 2 à 32 lettres ASCII, chiffres, points, tirets ou traits de soulignement."
+nickname_unavailable = "Ce pseudo est déjà utilisé."
+avatar = "Choisissez une image de 256 Ko maximum."
+storage = "La nouvelle session n’a pas pu être enregistrée de façon sécurisée. Réessayez."
+transport = "Le Gateway est inaccessible. Réessayez."
+
+
+[settings.profile]
+read_only = "Profil en lecture seule"
+edit_title = "Modifier le compte"
+edit_username_title = "Modifier le nom d’utilisateur"
+done = "Terminé"
+first_name = "Prénom"
+last_name = "Nom"
+name_hint = "Saisissez votre nom et ajoutez une photo de profil si vous le souhaitez."
+change_photo = "Modifier la photo"
+remove_photo = "Supprimer la photo"
+username = "Nom d’utilisateur"
+username_hint = "Choisissez un nom d’utilisateur public pour que les autres membres puissent vous reconnaître."
+username_rules = "Utilisez 2 à 32 lettres, chiffres, points, tirets bas ou tirets. Le premier caractère doit être une lettre ou un chiffre."
+error_invalid = "Saisissez un nom et un nom d’utilisateur valides."
+error_username_unavailable = "Ce nom d’utilisateur est déjà utilisé."
+error_avatar = "Choisissez une image PNG, JPEG ou WebP de 1024 × 1024 et 256 Ko maximum."
+error_save = "Impossible d’enregistrer le profil. Réessayez."
+
+[settings.profile.kind]
+superuser = "Superutilisateur"
+member = "Membre"
+unknown = "Type de compte inconnu"
+
+
+[invitation.join.actions]
+retry = "Réessayer"

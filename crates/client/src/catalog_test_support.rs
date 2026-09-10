@@ -43,6 +43,47 @@ pub fn client() -> Arc<ClientCore> {
     );
     core
 }
+
+/// A current principal for direct/native-boundary profile replay; no transport.
+pub fn settings_client() -> Arc<ClientCore> {
+    let core = client();
+    let device_id = DeviceId::new("DAAAAAAAAAAAAAAAAAAAA").unwrap();
+    let (generation, connection) = core.current_auth_ticket();
+    core.finish_current_auth(
+        generation,
+        connection,
+        AuthMeResponse {
+            gateway: AuthGatewaySnapshot {
+                id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+            },
+            principal: AuthPrincipalSnapshot {
+                id: PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                kind: PrincipalKind::Superuser,
+                display_name: "Synthetic User".into(),
+                nickname: "synthetic".into(),
+                avatar_revision: None,
+            },
+            device: AuthDeviceSnapshot {
+                id: device_id.clone(),
+                installation_id: "synthetic".into(),
+                display_name: "Test device".into(),
+                client_kind: ClientKind::Mobile,
+                status: DeviceStatus::Active,
+            },
+            session: AuthSessionSnapshot {
+                id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                device_id,
+                token_family_id: TokenFamilyId::new("FAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                status: AuthSessionStatus::Active,
+                refresh_generation: 1,
+                refresh_expires_at_unix: 1000,
+            },
+            role_key: None,
+        },
+    )
+    .unwrap();
+    core
+}
 pub fn skill(character: char) -> SkillListItem {
     let id = SkillId::new(character.to_string().repeat(21)).unwrap();
     SkillListItem {
@@ -126,4 +167,21 @@ pub fn mcp_detail(id: &str) -> McpServerDetailsResponse {
         },
         management: None,
     }
+}
+
+/// Settings dialog fixture with a selected workspace and server-settings permission.
+pub fn settings_model_picker_client() -> Arc<ClientCore> {
+    let core = settings_client();
+    let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+    capabilities.authorization_revision += 1;
+    capabilities.global.can_manage_gateway_settings = true;
+    let (generation, connection) = core.current_auth_ticket();
+    core.accept_authorization_projection(generation, connection, capabilities);
+    core.navigate(
+        crate::navigation::NavigationIntent::SelectWorkspace {
+            workspace_id: Some("workspace".into()),
+        },
+        None,
+    );
+    core
 }

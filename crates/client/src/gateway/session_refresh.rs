@@ -24,6 +24,9 @@ use std::time::Duration;
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum GatewaySessionStorageEffect {
+    DeleteGatewaySession {
+        endpoint: GatewayEndpoint,
+    },
     ReadGatewaySession {
         endpoint: GatewayEndpoint,
     },
@@ -52,6 +55,9 @@ impl GatewaySessionStorageError {
 }
 
 pub trait GatewaySessionStorage {
+    fn delete(&self, _endpoint: &GatewayEndpoint) -> Result<()> {
+        bail!("session deletion is unsupported by this adapter")
+    }
     fn load(&self, endpoint: &GatewayEndpoint) -> Result<Option<GatewaySessionEnvelope>>;
     fn persist(&self, endpoint: &GatewayEndpoint, envelope: &GatewaySessionEnvelope) -> Result<()>;
 }
@@ -139,6 +145,12 @@ impl ClientCore {
         C: FnMut(&GatewayBaseUrl, &str, &AuthSessionId) -> Result<()>,
     {
         let endpoint = request.endpoint;
+        anyhow::ensure!(current(), "Client session request was cancelled");
+        self.gateway_session
+            .lock()
+            .expect("session owner poisoned")
+            .endpoints
+            .insert(endpoint.id.clone(), endpoint.clone());
         let stop = |metadata, reason| {
             if current() {
                 self.reduce_gateway_session_lifecycle(
@@ -443,6 +455,19 @@ fn terminal_refresh_error(error: &AuthExchangeError) -> Option<SessionTerminalRe
 /// typed operation; the waiting session worker owns the workflow.
 pub struct GatewaySessionPlatformStorage<'a>(pub &'a ClientCore);
 impl GatewaySessionStorage for GatewaySessionPlatformStorage<'_> {
+    fn delete(&self, endpoint: &GatewayEndpoint) -> Result<()> {
+        match self
+            .0
+            .request_platform_effect(GatewaySessionStorageEffect::DeleteGatewaySession {
+                endpoint: endpoint.clone(),
+            })? {
+            crate::core::ClientEffectResult::Completed => Ok(()),
+            crate::core::ClientEffectResult::Failed { code } => {
+                Err(GatewaySessionStorageError { code }.into())
+            }
+            _ => bail!("Unexpected session storage completion"),
+        }
+    }
     fn load(&self, endpoint: &GatewayEndpoint) -> Result<Option<GatewaySessionEnvelope>> {
         match self
             .0

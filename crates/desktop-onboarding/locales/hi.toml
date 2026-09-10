@@ -1,0 +1,199 @@
+[common]
+address = "पता"
+copy = "कॉपी"
+name = "नाम"
+ok = "ठीक है"
+or = "या"
+activation_code = "सक्रियण कोड"
+
+[buttons]
+ok = "OK"
+add = "जोड़ें"
+cancel = "रद्द करें"
+save = "सहेजें"
+dismiss = "बंद करें"
+
+[errors.command]
+exit_status = "एग्जिट स्टेटस %{status}"
+failed_with_output = "`%{command_label}` विफल हुआ: %{details}"
+launchctl_print_failed = "`launchctl print` चलाने में विफल"
+powershell_task_status_failed = "शेड्यूल्ड टास्क स्थिति जांचने के लिए powershell चलाने में विफल"
+run_failed = "`%{command_label}` चलाने में विफल"
+systemctl_is_active_failed = "`systemctl --user is-active` चलाने में विफल"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` 0 से बड़ा होना चाहिए"
+load_app = "ऐप कॉन्फ़िग लोड करने में विफल"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` 0 से बड़ा होना चाहिए"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` 0 से बड़ा होना चाहिए"
+gateway_field_positive = "`desktop.gateway.%{field}` 0 से बड़ा होना चाहिए"
+ws_ping_interval_positive = "`desktop.gateway.ws_ping_interval_ms` 0 से बड़ा होना चाहिए"
+ws_pong_timeout_positive = "`desktop.gateway.ws_pong_timeout_ms` 0 से बड़ा होना चाहिए"
+ws_reconnect_initial_positive = "`desktop.gateway.ws_reconnect_initial_ms` 0 से बड़ा होना चाहिए"
+ws_reconnect_max_positive = "`desktop.gateway.ws_reconnect_max_ms` 0 से बड़ा होना चाहिए"
+ws_reconnect_initial_le_max = "`desktop.gateway.ws_reconnect_initial_ms` `desktop.gateway.ws_reconnect_max_ms` से कम या उसके बराबर होना चाहिए"
+ws_reconnect_jitter_percent_max = "`desktop.gateway.ws_reconnect_jitter_percent` 100 से कम या उसके बराबर होना चाहिए, मिला %{value}"
+
+[errors.gateway]
+address_conflict_inactive_service = "पता `%{listen_addr}` पहले से उपयोग में है, लेकिन कॉन्फ़िगर की गई सेवा `%{service_name}` सक्रिय नहीं है; टकराने वाली प्रक्रिया/सेवा रोकें या gateway.listen_addr बदलें"
+address_empty = "गेटवे पता खाली नहीं होना चाहिए"
+address_already_exists = "गेटवे `%{address}` पहले से सूची में है"
+id_not_found = "गेटवे आईडी `%{id}` नहीं मिली"
+invalid_address = "अमान्य गेटवे पता `%{normalized}`; अपेक्षित HTTP(S) URL, host या host:port"
+local_delete_unsupported = "स्थानीय गेटवे को सूची से हटाया नहीं जा सकता"
+remote_edit_only = "केवल दूरस्थ गेटवे संपादित किए जा सकते हैं"
+resolve_empty = "गेटवे पता `%{listen_addr}` किसी socket address में resolve नहीं हुआ"
+resolve_failed = "गेटवे पता `%{listen_addr}` resolve करने में विफल"
+start_command_failed_manual_help = "लोकल गेटवे को अपने-आप इंस्टॉल या शुरू नहीं किया जा सका; फिर से कोशिश करें और लोकल गेटवे कॉन्फ़िगरेशन जांचें"
+startup_timeout = "गेटवे सेवा `%{listen_addr}` पर %{startup_timeout_ms}ms के भीतर उपलब्ध नहीं हुई"
+unreachable_verify = "गेटवे `%{address}` तक पहुंच नहीं है; पता और गेटवे चल रहा है या नहीं जांचें"
+validation_timeout_positive = "रिमोट गेटवे सत्यापन टाइमआउट धनात्मक होना चाहिए, मिला %{timeout_ms} ms"
+
+[errors.registry]
+parse_failed = "गेटवे रजिस्ट्री `%{path}` पार्स करने में विफल"
+read_failed = "गेटवे रजिस्ट्री `%{path}` पढ़ने में विफल"
+serialize_failed = "गेटवे रजिस्ट्री serialize करने में विफल"
+unsupported_version = "`%{path}` में गेटवे रजिस्ट्री संस्करण `%{version}` समर्थित नहीं है; अपेक्षित `%{current_registry_version}`"
+write_failed = "गेटवे रजिस्ट्री `%{path}` लिखने में विफल"
+
+[errors.runtime]
+ensure_home = "रनटाइम परिवेश की होम डायरेक्टरी तैयार करने में विफल"
+
+[errors.theme]
+watch_dir_failed = "थीम डायरेक्टरी को वॉच करने में विफल"
+
+[errors.window]
+open_failed = "डेस्कटॉप विंडो खोलने में विफल"
+
+[gateway.action]
+add = "गेटवे जोड़ें"
+connect_remote = "दूरस्थ गेटवे से कनेक्ट करें"
+delete = "हटाएँ"
+edit = "गेटवे संपादित करें"
+reauthenticate = "फिर से कनेक्ट करें"
+start_local = "स्थानीय गेटवे शुरू करें"
+
+[gateway.add]
+description = "दूरस्थ गेटवे से कनेक्ट करें या स्थानीय गेटवे शुरू करें।"
+description_remote_only = "दूरस्थ गेटवे से कनेक्ट करें।"
+title = "गेटवे जोड़ें"
+
+[gateway.delete]
+confirm_description = "यह गेटवे को केवल इस डेस्कटॉप क्लाइंट से हटाता है। सर्वर पर गेटवे डेटा नहीं हटता।"
+confirm_title = "%{name} हटाएँ?"
+
+[gateway.edit]
+description = "गेटवे कनेक्शन विवरण अपडेट करें।"
+title = "%{name} संपादित करें"
+
+[gateway.endpoint]
+local_name = "स्थानीय गेटवे"
+local_with_address = "स्थानीय - %{address}"
+remote_name = "दूरस्थ %{index}"
+remote_with_address = "दूरस्थ - %{address}"
+
+[gateway.error]
+with_details = "गेटवे त्रुटि: %{error}."
+
+[gateway.initial]
+description = "गेटवे पता दर्ज करें या स्थानीय गेटवे सेवा शुरू करें।"
+title = "गेटवे से कनेक्ट करें"
+
+[gateway.popover]
+no_available = "कोई गेटवे उपलब्ध नहीं है।"
+
+[gateway.reauthenticate]
+description = "सहेजे गए गेटवे को बदले बिना इस डिवाइस को फिर से कनेक्ट करने के लिए नया सक्रियण कोड दर्ज करें।"
+title = "%{name} को फिर से कनेक्ट करें"
+
+[gateway.status]
+connected = "गेटवे कनेक्ट हो गया"
+connecting = "गेटवे कनेक्ट हो रहा है..."
+connecting_named = "%{gateway_name} से कनेक्ट किया जा रहा है..."
+connecting_remote = "दूरस्थ गेटवे से कनेक्ट किया जा रहा है..."
+deleting = "गेटवे हटाया जा रहा है..."
+failed_check = "गेटवे स्थिति जांचने में विफल: %{error}"
+local_conflict = "स्थानीय गेटवे टकराव: पता किसी अन्य प्रक्रिया द्वारा उपयोग में है।"
+local_conflict_at = "%{gateway_address} पर स्थानीय गेटवे टकराव: पता किसी अन्य प्रक्रिया द्वारा उपयोग में है।"
+local_stopped = "स्थानीय गेटवे रुका हुआ है: %{gateway_address}। स्थानीय गेटवे शुरू करें या दूरस्थ पर स्विच करें।"
+not_configured = "गेटवे अभी कॉन्फ़िगर नहीं है। दूरस्थ पता जोड़ें या स्थानीय गेटवे शुरू करें।"
+remote_unavailable = "दूरस्थ गेटवे उपलब्ध नहीं है: %{gateway_name} (%{gateway_address})"
+saving = "गेटवे सहेजा जा रहा है..."
+starting_local = "स्थानीय गेटवे शुरू किया जा रहा है..."
+installing = "गेटवे इंस्टॉल किया जा रहा है..."
+updating = "गेटवे अपडेट किया जा रहा है..."
+subsystem_failed = "गेटवे सबसिस्टम प्रारंभ नहीं हो सका: %{error}"
+subsystem_not_ready = "गेटवे सबसिस्टम तैयार नहीं है"
+unavailable = "गेटवे उपलब्ध नहीं है"
+
+[gateway.notification]
+path_update_skipped = "गेटवे शुरू हो गया है। `pioneer` कमांड के लिए नई टर्मिनल सत्र में %{bin_dir} को PATH में जोड़ना पड़ सकता है।"
+
+[gateway.session_terminal]
+authentication_required = "नए सक्रियण कोड से इस गेटवे में साइन इन करें।"
+revoked = "इस डिवाइस का सत्र साइन आउट या रद्द कर दिया गया है। जारी रखने के लिए फिर साइन इन करें।"
+expired = "इस डिवाइस का सत्र समाप्त हो गया है। जारी रखने के लिए फिर साइन इन करें।"
+compromised = "सुरक्षा के लिए यह सत्र बंद कर दिया गया है। जारी रखने के लिए फिर साइन इन करें।"
+principal_suspended = "आपका खाता निलंबित है। गेटवे व्यवस्थापक से संपर्क करें।"
+principal_removed = "आपका खाता इस गेटवे से हटा दिया गया है।"
+gateway_mismatch = "यह सत्र किसी दूसरे गेटवे का है। गेटवे जाँचें और फिर से पेयर करें।"
+storage_failed = "Pioneer इस डिवाइस सत्र को सुरक्षित रूप से सहेज नहीं सका।"
+
+[invitation.join]
+title = "आमंत्रण"
+one_time_warning = "यह आमंत्रण एक बार उपयोग होने वाला प्रमाण है। इसे साझा न करें।"
+loading = "आमंत्रण की जाँच हो रही है…"
+display_name_label = "दिखाई देने वाला नाम"
+display_name_placeholder = "आपका नाम"
+nickname_label = "उपनाम"
+nickname_placeholder = "आपका.उपनाम"
+avatar_label = "प्रोफ़ाइल छवि (वैकल्पिक)"
+avatar_choose = "छवि चुनें"
+accept = "आमंत्रण स्वीकार करें"
+gateway = "Gateway: %{name}"
+inviter = "%{name} ने आमंत्रित किया"
+workspaces = "वर्कस्पेस: %{names}"
+expires = "Unix समय %{timestamp} पर समाप्त होगा"
+
+[invitation.join.transport]
+secure = "सुरक्षित एन्क्रिप्टेड कनेक्शन"
+insecure = "बिना एन्क्रिप्शन का कनेक्शन"
+
+[invitation.join.error]
+title = "आमंत्रण उपलब्ध नहीं है"
+invalid = "यह आमंत्रण लिंक अमान्य या अनुपलब्ध है।"
+unavailable = "यह आमंत्रण अमान्य, समाप्त, रद्द या अनुपलब्ध है।"
+display_name = "एक मान्य दिखाई देने वाला नाम दर्ज करें।"
+nickname = "उपनाम में 2–32 ASCII अक्षर, संख्याएँ, बिंदु, हाइफ़न या अंडरस्कोर होने चाहिए।"
+nickname_unavailable = "यह उपनाम पहले से उपयोग में है।"
+avatar = "256 KB से छोटी छवि चुनें।"
+storage = "नई सेशन को सुरक्षित रूप से सहेजा नहीं जा सका। फिर कोशिश करें।"
+transport = "Gateway तक नहीं पहुँचा जा सका। फिर कोशिश करें।"
+
+
+[settings.profile]
+read_only = "केवल पढ़ने योग्य प्रोफ़ाइल"
+edit_title = "खाता संपादित करें"
+edit_username_title = "यूज़रनेम संपादित करें"
+done = "हो गया"
+first_name = "पहला नाम"
+last_name = "उपनाम"
+name_hint = "अपना नाम दर्ज करें और चाहें तो प्रोफ़ाइल फ़ोटो जोड़ें।"
+change_photo = "फ़ोटो बदलें"
+remove_photo = "फ़ोटो हटाएँ"
+username = "यूज़रनेम"
+username_hint = "एक सार्वजनिक यूज़रनेम चुनें ताकि अन्य सदस्य आपको पहचान सकें।"
+username_rules = "2–32 अक्षर, अंक, डॉट, अंडरस्कोर या हाइफ़न इस्तेमाल करें। पहला वर्ण अक्षर या अंक होना चाहिए।"
+error_invalid = "मान्य नाम और यूज़रनेम दर्ज करें।"
+error_username_unavailable = "यह यूज़रनेम पहले से उपयोग में है।"
+error_avatar = "1024 × 1024 और 256 KB तक की PNG, JPEG या WebP छवि चुनें।"
+error_save = "प्रोफ़ाइल सहेजी नहीं जा सकी। फिर कोशिश करें।"
+
+[settings.profile.kind]
+superuser = "सुपरयूज़र"
+member = "सदस्य"
+unknown = "अज्ञात खाता प्रकार"
+
+
+[invitation.join.actions]
+retry = "फिर प्रयास करें"

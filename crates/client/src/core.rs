@@ -184,10 +184,16 @@ pub enum ClientScope {
         principal_id: String,
     },
     AdministrationOperation,
-    AdministrationPage { page: crate::administration::pages::AdministrationPage },
+    AdministrationPage {
+        page: crate::administration::pages::AdministrationPage,
+    },
     Provider,
-    ProviderOperation { workspace_id: String },
-    ProviderCollection { key: crate::providers::store::ProviderCollectionKey },
+    ProviderOperation {
+        workspace_id: String,
+    },
+    ProviderCollection {
+        key: crate::providers::store::ProviderCollectionKey,
+    },
     ProviderRuntime {
         workspace_id: String,
     },
@@ -221,7 +227,22 @@ pub enum ClientScope {
         workspace_id: Option<String>,
     },
     Settings,
+    AuthSessions,
+    DeviceActivation,
+    Profile,
+    SettingsModelPicker {
+        picker_id: String,
+    },
+    SettingsPage {
+        page: crate::settings::runtime::SettingsPage,
+    },
     OnboardingInvitation,
+    GatewaySetup,
+    GatewayDestinations,
+    AgentsDocumentContent {
+        workspace_id: String,
+        folder_id: Option<String>,
+    },
     AgentsDocument {
         workspace_id: String,
     },
@@ -240,14 +261,39 @@ pub enum ClientDemand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientIntent {
+    SettingsModelPicker {
+        intent: crate::settings::model_picker::SettingsModelPickerIntent,
+    },
+    Onboarding {
+        intent: crate::gateway::onboarding_runtime::OnboardingIntent,
+    },
+    Settings {
+        intent: crate::settings::runtime::SettingsIntent,
+    },
+    Profile {
+        intent: crate::settings::profile::ProfileIntent,
+    },
+    AgentsDocument {
+        intent: crate::agents_doc::runtime::AgentsDocumentIntent,
+    },
     AdministrationPresentation {
         intent: crate::administration::operations::AdministrationPresentationIntent,
     },
-    AdministrationCommand { command: crate::administration::operations::AdministrationCommand },
-    AdministrationPage { intent: crate::administration::pages::AdministrationPageIntent },
-    ProviderPresentation { intent: crate::providers::effects::ProviderPresentationIntent },
-    ProviderCommand { command: crate::providers::operations::ProviderCommand },
-    ProviderCollection { intent: crate::providers::store::ProviderCollectionIntent },
+    AdministrationCommand {
+        command: crate::administration::operations::AdministrationCommand,
+    },
+    AdministrationPage {
+        intent: crate::administration::pages::AdministrationPageIntent,
+    },
+    ProviderPresentation {
+        intent: crate::providers::effects::ProviderPresentationIntent,
+    },
+    ProviderCommand {
+        command: crate::providers::operations::ProviderCommand,
+    },
+    ProviderCollection {
+        intent: crate::providers::store::ProviderCollectionIntent,
+    },
     ProviderRuntime {
         intent: crate::providers::runtime::ProviderRuntimeIntent,
     },
@@ -336,6 +382,7 @@ pub enum ClientPlannedEffect {
     AdministrationPresentation(crate::administration::operations::AdministrationPresentationEffect),
     ProviderPresentation(crate::providers::effects::ProviderPresentationEffect),
     GatewaySessionStorage(crate::gateway::session_refresh::GatewaySessionStorageEffect),
+    OnboardingPlatform(crate::gateway::onboarding_effects::OnboardingPlatformEffect),
 }
 
 impl From<ClientEffect> for ClientPlannedEffect {
@@ -387,6 +434,15 @@ impl ClientEffectPlan {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientEffectResult {
+    GatewayEnvironmentLoaded {
+        environment: crate::gateway::onboarding_effects::OnboardingEnvironment,
+    },
+    LocalGatewayPrepared {
+        prepared: crate::gateway::onboarding_effects::LocalGatewayPreparation,
+    },
+    LocalDeviceActivationCreated {
+        activation: pioneer_protocol::AuthSecretString,
+    },
     GatewaySessionEnvelopeLoaded {
         envelope: Option<crate::gateway::session_envelope::GatewaySessionEnvelope>,
     },
@@ -821,6 +877,7 @@ impl Drop for ClientSubscription {
             core.message_deletion_subscription_changed(&self.queue.scope, false);
             core.composer_catalog_subscription_changed(&self.queue.scope, false);
             core.composer_model_picker_subscription_changed(&self.queue.scope, false);
+            core.settings_model_picker_subscription_changed(&self.queue.scope, false);
             core.turn_cancellation_subscription_changed(&self.queue.scope, false);
             core.thread_capability_subscription_changed(&self.queue.scope, false);
             core.thread_member_subscription_changed(&self.queue.scope, false);
@@ -894,11 +951,20 @@ pub struct ClientPublicationBatch {
 
 /// The one process-local mutable owner for newly shared client state.
 pub struct ClientCore {
+    pub(crate) invitation_commits: Mutex<crate::gateway::invitation_commits::InvitationCommits>,
+    pub(crate) device_activation:
+        Mutex<crate::settings::device_activation::DeviceActivationController>,
+    pub(crate) onboarding: Mutex<crate::gateway::onboarding_runtime::OnboardingRuntime>,
+    pub(crate) settings_model_pickers:
+        Mutex<crate::settings::model_picker::SettingsModelPickerController>,
+    pub(crate) settings_runtime: Mutex<crate::settings::runtime::SettingsRuntime>,
+    pub(crate) agents_documents: Mutex<crate::agents_doc::runtime::DocumentRuntime>,
     pub(crate) skills_controller: Mutex<crate::skills::operations::SkillsController>,
     pub(crate) skills_store: Mutex<crate::skills::store::SkillsStore>,
     pub(crate) mcp_controller: Mutex<crate::mcp::operations::McpController>,
     pub(crate) mcp_store: Mutex<crate::mcp::store::McpStore>,
-    pub(crate) administration_operations: Mutex<crate::administration::operations::AdministrationOperationController>,
+    pub(crate) administration_operations:
+        Mutex<crate::administration::operations::AdministrationOperationController>,
     pub(crate) administration_store: Mutex<crate::administration::pages::AdministrationStore>,
     pub(crate) provider_controller: Mutex<crate::providers::operations::ProviderController>,
     pub(crate) provider_store: Mutex<crate::providers::store::ProviderStore>,
@@ -1111,6 +1177,12 @@ impl ClientCore {
     pub fn new() -> Self {
         Self {
             skills_controller: Mutex::new(crate::skills::operations::SkillsController::default()),
+            agents_documents: Mutex::new(Default::default()),
+            onboarding: Mutex::new(Default::default()),
+            settings_runtime: Mutex::new(Default::default()),
+            settings_model_pickers: Mutex::new(Default::default()),
+            invitation_commits: Mutex::default(),
+            device_activation: Mutex::new(Default::default()),
             skills_store: Mutex::new(crate::skills::store::SkillsStore::default()),
             mcp_controller: Mutex::new(crate::mcp::operations::McpController::default()),
             mcp_store: Mutex::default(),
@@ -1411,6 +1483,32 @@ impl ClientCore {
         if self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        // Wake lifecycle waiters without inventing a visible publication revision.
+        self.publication_signal.send_modify(|_| {});
+        self.onboarding
+            .lock()
+            .expect("onboarding owner poisoned")
+            .stop();
+        self.device_activation
+            .lock()
+            .expect("activation owner poisoned")
+            .invalidate();
+        self.invitation_commits
+            .lock()
+            .expect("invitation commits poisoned")
+            .invalidate();
+        self.agents_documents
+            .lock()
+            .expect("document owner poisoned")
+            .stop();
+        self.settings_model_pickers
+            .lock()
+            .expect("settings model picker poisoned")
+            .stop();
+        self.settings_runtime
+            .lock()
+            .expect("settings owner poisoned")
+            .stop();
         self.skills_controller
             .lock()
             .expect("Skills controller poisoned")
@@ -1424,10 +1522,22 @@ impl ClientCore {
             .expect("MCP controller poisoned")
             .stop();
         self.mcp_store.lock().expect("MCP store poisoned").stop();
-        self.administration_operations.lock().expect("administration operations poisoned").stop();
-        self.administration_store.lock().expect("administration store poisoned").stop();
-        self.provider_controller.lock().expect("provider controller poisoned").stop();
-        self.provider_store.lock().expect("provider store poisoned").stop();
+        self.administration_operations
+            .lock()
+            .expect("administration operations poisoned")
+            .stop();
+        self.administration_store
+            .lock()
+            .expect("administration store poisoned")
+            .stop();
+        self.provider_controller
+            .lock()
+            .expect("provider controller poisoned")
+            .stop();
+        self.provider_store
+            .lock()
+            .expect("provider store poisoned")
+            .stop();
         self.provider_runtimes
             .lock()
             .expect("provider runtimes poisoned")
@@ -1660,6 +1770,10 @@ impl ClientCore {
         core.start_provider_controller();
         core.start_mcp_controller();
         core.start_mcp_operation_controller();
+        core.start_agents_document_controller();
+        core.start_settings_controller();
+        core.start_settings_model_picker_controller();
+        core.start_onboarding_controller();
         core.start_skills_controller();
         core.start_skills_operation_controller();
         core.start_provider_operation_controller();
@@ -1857,6 +1971,7 @@ impl ClientCore {
         self.message_deletion_subscription_changed(&scope, true);
         self.composer_catalog_subscription_changed(&scope, true);
         self.composer_model_picker_subscription_changed(&scope, true);
+        self.settings_model_picker_subscription_changed(&scope, true);
         self.turn_cancellation_subscription_changed(&scope, true);
         self.thread_capability_subscription_changed(&scope, true);
         self.thread_member_subscription_changed(&scope, true);
@@ -1957,12 +2072,33 @@ impl ClientCore {
             );
         }
         match &intent {
-            ClientIntent::AdministrationPresentation { intent } => return self.administration_presentation_intent(intent.clone()),
-            ClientIntent::AdministrationCommand { command } => return self.administration_command_intent(command.clone()),
-            ClientIntent::AdministrationPage { intent } => return self.administration_page_intent(intent.clone()),
-            ClientIntent::ProviderPresentation { intent } => return self.provider_presentation_intent(intent.clone()),
-            ClientIntent::ProviderCommand { command } => return self.provider_command_intent(command.clone()),
-            ClientIntent::ProviderCollection { intent } => return self.provider_collection_intent(intent.clone()),
+            ClientIntent::Onboarding { intent } => return self.onboarding_intent(intent.clone()),
+            ClientIntent::Settings { intent } => return self.settings_intent(intent.clone()),
+            ClientIntent::SettingsModelPicker { intent } => {
+                return self.settings_model_picker_intent(intent.clone());
+            }
+            ClientIntent::Profile { intent } => return self.profile_intent(intent.clone()),
+            ClientIntent::AgentsDocument { intent } => {
+                return self.agents_document_intent(intent.clone());
+            }
+            ClientIntent::AdministrationPresentation { intent } => {
+                return self.administration_presentation_intent(intent.clone());
+            }
+            ClientIntent::AdministrationCommand { command } => {
+                return self.administration_command_intent(command.clone());
+            }
+            ClientIntent::AdministrationPage { intent } => {
+                return self.administration_page_intent(intent.clone());
+            }
+            ClientIntent::ProviderPresentation { intent } => {
+                return self.provider_presentation_intent(intent.clone());
+            }
+            ClientIntent::ProviderCommand { command } => {
+                return self.provider_command_intent(command.clone());
+            }
+            ClientIntent::ProviderCollection { intent } => {
+                return self.provider_collection_intent(intent.clone());
+            }
             ClientIntent::ProviderRuntime { intent } => {
                 return self.provider_runtime_intent(intent.clone());
             }
@@ -2093,7 +2229,10 @@ impl ClientCore {
             self.composer_catalog_demand_changed(&thread_scope, thread_demand);
             self.mcp_binding_demand_changed(&thread_scope, thread_demand);
             self.skills_binding_demand_changed(&thread_scope, thread_demand);
+            self.document_demand_changed(&thread_scope, thread_demand);
+            self.settings_demand_changed(&thread_scope, thread_demand);
             self.composer_model_picker_demand_changed(&thread_scope, thread_demand);
+            self.settings_model_picker_demand_changed(&thread_scope, thread_demand);
             self.turn_cancellation_demand_changed(&thread_scope, thread_demand);
             self.thread_capability_demand_changed(&thread_scope, thread_demand);
             self.thread_member_demand_changed(&thread_scope, thread_demand);
@@ -2106,6 +2245,12 @@ impl ClientCore {
     pub(crate) fn request_platform_effect(
         &self,
         effect: crate::gateway::session_refresh::GatewaySessionStorageEffect,
+    ) -> anyhow::Result<ClientEffectResult> {
+        self.request_native_effect(effect.into())
+    }
+    pub(crate) fn request_native_effect(
+        &self,
+        effect: ClientPlannedEffect,
     ) -> anyhow::Result<ClientEffectResult> {
         let (reply, received) = std::sync::mpsc::channel();
         {
@@ -2172,8 +2317,12 @@ impl ClientCore {
                     result.as_ref(),
                 ) {
                     let compatible = matches!(result, ClientEffectResult::Failed { .. }) || matches!((pending.plan.effect(), result),
+                        (ClientPlannedEffect::OnboardingPlatform(crate::gateway::onboarding_effects::OnboardingPlatformEffect::LoadGatewayEnvironment),ClientEffectResult::GatewayEnvironmentLoaded{..}) |
+                        (ClientPlannedEffect::OnboardingPlatform(crate::gateway::onboarding_effects::OnboardingPlatformEffect::PersistGatewayRegistry{..}|crate::gateway::onboarding_effects::OnboardingPlatformEffect::RemoveGatewayBindingJournal{..}),ClientEffectResult::Completed) |
+                        (ClientPlannedEffect::OnboardingPlatform(crate::gateway::onboarding_effects::OnboardingPlatformEffect::PrepareLocalGateway{..}),ClientEffectResult::LocalGatewayPrepared{..}) |
+                        (ClientPlannedEffect::OnboardingPlatform(crate::gateway::onboarding_effects::OnboardingPlatformEffect::CreateLocalDeviceActivation{..}),ClientEffectResult::LocalDeviceActivationCreated{..}) |
                         (ClientPlannedEffect::GatewaySessionStorage(crate::gateway::session_refresh::GatewaySessionStorageEffect::ReadGatewaySession { .. }), ClientEffectResult::GatewaySessionEnvelopeLoaded { .. }) |
-                        (ClientPlannedEffect::GatewaySessionStorage(crate::gateway::session_refresh::GatewaySessionStorageEffect::PersistGatewaySession { .. }), ClientEffectResult::Completed));
+                        (ClientPlannedEffect::GatewaySessionStorage(crate::gateway::session_refresh::GatewaySessionStorageEffect::PersistGatewaySession { .. } | crate::gateway::session_refresh::GatewaySessionStorageEffect::DeleteGatewaySession { .. }), ClientEffectResult::Completed));
                     if !compatible {
                         return Self::transition_without_publication(
                             &partitions,
@@ -2488,14 +2637,47 @@ impl ClientCore {
         change: crate::gateway::identity_authorization::IdentityPublicationChange,
     ) -> ClientTransition {
         use crate::gateway::identity_authorization::IdentityPublicationChange;
+        self.fence_onboarding_authorization(projections);
+        if change == IdentityPublicationChange::Update {
+            self.resume_settings_demand(projections);
+        }
         let evict_protected = change != IdentityPublicationChange::Update;
         let reset_session = change == IdentityPublicationChange::ResetSession;
         let mut composer_publications = Vec::new();
+        let mut document_fence = evict_protected.then(|| {
+            self.agents_documents
+                .lock()
+                .expect("document owner poisoned")
+        });
+        let mut document_publications = document_fence
+            .as_mut()
+            .map(|owner| self.fence_agents_documents(owner))
+            .unwrap_or_default();
         let principal = projections
             .current_auth
             .as_ref()
             .map(|auth| auth.principal.id.as_str().to_owned());
+        if reset_session {
+            self.invitation_commits
+                .lock()
+                .expect("invitation commits poisoned")
+                .invalidate();
+        }
+        let remote_key_reset_generation = if evict_protected {
+            let mut runtime = self
+                .settings_runtime
+                .lock()
+                .expect("settings owner poisoned");
+            runtime.invalidate();
+            runtime.remote_key_reset_generation()
+        } else {
+            0
+        };
         if evict_protected {
+            self.device_activation
+                .lock()
+                .expect("activation owner poisoned")
+                .invalidate();
             self.avatar_store
                 .lock()
                 .expect("avatar store poisoned")
@@ -2552,6 +2734,12 @@ impl ClientCore {
                 .lock()
                 .expect("thread registry poisoned");
             registry.fence_presentations(principal.clone());
+            registry.restrict_settings_navigation(
+                projections
+                    .capabilities
+                    .snapshot(None, None)
+                    .is_some_and(|s| s.global.can_manage_gateway_settings),
+            );
             if reset_session {
                 registry.reset_navigation();
             }
@@ -2603,6 +2791,7 @@ impl ClientCore {
             Arc::new(projections.clone()),
         )];
         drafts.append(&mut composer_publications);
+        drafts.append(&mut document_publications);
         if let Some(registry) = presentation_fence.as_mut() {
             if let Some(navigation) = registry.navigation_change() {
                 drafts.push(navigation);
@@ -2615,14 +2804,50 @@ impl ClientCore {
                     ClientScope::Navigation
                         | ClientScope::Session
                         | ClientScope::OnboardingInvitation
+                        | ClientScope::GatewaySetup
+                        | ClientScope::GatewayDestinations
                 ) || scope == &identity_scope
+                    || (matches!(scope, ClientScope::AgentsDocumentContent { .. })
+                        && drafts.iter().any(|draft| &draft.scope == scope))
                     || (!reset_session
                         && matches!(scope, ClientScope::Composer { .. })
                         && drafts.iter().any(|draft| &draft.scope == scope))
                 {
                     continue;
                 }
-                if scope == &ClientScope::Settings {
+                if scope == &ClientScope::AuthSessions {
+                    drafts.push(authority.publication(
+                        scope.clone(),
+                        next_revisions(scope),
+                        Arc::new(
+                            crate::gateway::identity_authorization::AuthSessionsStore::default(),
+                        ),
+                    ));
+                } else if scope == &ClientScope::Profile {
+                    drafts.push(authority.publication(
+                        scope.clone(),
+                        next_revisions(scope),
+                        Arc::new(crate::settings::profile::ProfilePublication::default()),
+                    ));
+                } else if matches!(scope, ClientScope::SettingsPage { .. }) {
+                    drafts.push(authority.publication(
+                        scope.clone(),
+                        next_revisions(scope),
+                        Arc::new(crate::settings::runtime::SettingsPagePublication {
+                            input_reset_generation: if matches!(
+                                scope,
+                                ClientScope::SettingsPage {
+                                    page: crate::settings::runtime::SettingsPage::RemoteAccess
+                                }
+                            ) {
+                                remote_key_reset_generation
+                            } else {
+                                0
+                            },
+                            ..Default::default()
+                        }),
+                    ));
+                } else if scope == &ClientScope::Settings {
                     drafts.push(authority.publication(
                         scope.clone(),
                         next_revisions(scope),
@@ -2660,6 +2885,7 @@ impl ClientCore {
         }
         drop(presentation_fence);
         drop(composer_fence);
+        drop(document_fence);
         self.update_thread_presentation_identity(principal);
         // Identity commits bypass transition() while applying the access fence.
         // Resume consumers waiting for workspace capabilities/model metadata too.
@@ -3403,5 +3629,11 @@ mod tests {
             &retained,
             &core.snapshot(&identity).unwrap().snapshot()
         ));
+    }
+}
+
+impl From<crate::gateway::onboarding_effects::OnboardingPlatformEffect> for ClientPlannedEffect {
+    fn from(effect: crate::gateway::onboarding_effects::OnboardingPlatformEffect) -> Self {
+        Self::OnboardingPlatform(effect)
     }
 }

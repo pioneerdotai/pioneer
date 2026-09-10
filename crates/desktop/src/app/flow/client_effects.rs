@@ -12,14 +12,6 @@ pub(in crate::app::flow) fn execute_desktop_client_effects(
     client_effects::execute_client_effects(&mut sink, effects);
 }
 
-pub(in crate::app::flow) fn execute_gateway_command_client_effects(
-    ws_sender: &crate::gateway::GatewayWsCommandSender,
-    effects: Vec<ClientEffect>,
-) {
-    let mut sink = GatewayCommandClientEffectSink { ws_sender };
-    client_effects::execute_client_effects(&mut sink, effects);
-}
-
 struct DesktopClientEffectSink<'a, 'cx> {
     app: &'a mut PioneerDesktop,
     cx: &'a mut Context<'cx, PioneerDesktop>,
@@ -62,28 +54,6 @@ impl ClientEffectSink for DesktopClientEffectSink<'_, '_> {
                 .client_runtime
                 .ws_command_sender()
                 .thread_unsubscribe(thread_id);
-        }
-    }
-}
-
-struct GatewayCommandClientEffectSink<'a> {
-    ws_sender: &'a crate::gateway::GatewayWsCommandSender,
-}
-
-impl ClientEffectSink for GatewayCommandClientEffectSink<'_> {
-    fn refresh_workspace_list(&mut self) {}
-
-    fn refresh_gateway_settings(&mut self) {}
-
-    fn refresh_provider_lists(&mut self) {}
-
-    fn queue_skills_refresh(&mut self) {}
-
-    fn enqueue_in_flight_turns_for_resume(&mut self) {}
-
-    fn unsubscribe_threads(&mut self, thread_ids: Vec<String>) {
-        for thread_id in thread_ids {
-            let _ = self.ws_sender.thread_unsubscribe(thread_id);
         }
     }
 }

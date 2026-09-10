@@ -1,21 +1,24 @@
-mod account;
-mod lifecycle;
-mod self_improvement_status;
-mod sidebar;
-mod view;
-
-pub(super) const SETTINGS_CONTENT_GENERAL_NODE_ID: &str = "settings:general";
-pub(super) const SETTINGS_CONTENT_ACCOUNT_NODE_ID: &str = "settings:account";
-pub(super) const SETTINGS_CONTENT_MEMORY_NODE_ID: &str = "settings:memory";
-pub(super) const SETTINGS_CONTENT_SELF_IMPROVEMENT_NODE_ID: &str = "settings:self-improvement";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum VoiceInputEnableAction {
-    Sent,
-    NeedsSelection,
-    Noop,
+mod platform;
+use crate::app::root::{MainContentView, PioneerDesktop, SettingsContentView};
+use gpui_kit::*;
+pub(crate) use platform::settings_config;
+impl PioneerDesktop {
+    pub(in crate::app) fn open_settings_content_from_sidebar(
+        &mut self,
+        route: SettingsContentView,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation_intent(
+            pioneer_client::navigation::NavigationIntent::SetSettingsRoute { route },
+        );
+        self.set_main_content_view(MainContentView::Settings, cx);
+    }
+    pub(in crate::app) fn refresh_gateway_settings(&mut self, _: &mut Context<Self>) {
+        if self.startup.has_presented_operational_frame() {
+            self.gateway
+                .client_runtime
+                .client_core()
+                .settings_intent(pioneer_client::settings::runtime::SettingsIntent::Refresh);
+        }
+    }
 }
-
-pub(super) use account::ProfileEditorState;
-pub(super) use pioneer_client::settings::memory::{MemoryModelSetting, MemorySettingToggle};
-pub(super) use pioneer_client::settings::self_improvement::SelfImprovementModelSetting;

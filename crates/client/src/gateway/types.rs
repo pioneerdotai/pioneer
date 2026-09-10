@@ -58,3 +58,22 @@ where
         ))
     }
 }
+
+impl GatewayRegistry {
+    pub fn active_gateway_id(&self) -> Option<&str> {
+        super::runtime::active_gateway_id(self)
+    }
+    pub fn active_gateway(&self) -> Option<&GatewayEndpoint> {
+        super::runtime::active_gateway(self)
+    }
+    pub fn active_workspace_id(&self) -> Option<&str> {
+        super::runtime::active_workspace_id(self)
+    }
+    pub fn endpoints(&self) -> Vec<GatewayEndpoint> {
+        self.local
+            .iter()
+            .cloned()
+            .chain(self.remotes.iter().cloned())
+            .collect()
+    }
+}

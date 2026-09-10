@@ -8888,9 +8888,12 @@ dependencies = [
  "pioneer-client",
  "pioneer-config",
  "pioneer-desktop-administration",
+ "pioneer-desktop-agents-doc",
  "pioneer-desktop-foundation",
  "pioneer-desktop-mcp",
+ "pioneer-desktop-onboarding",
  "pioneer-desktop-providers",
+ "pioneer-desktop-settings",
  "pioneer-desktop-skills",
  "pioneer-desktop-task-notifications",
  "pioneer-desktop-thread",
@@ -8941,11 +8944,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-desktop-agents-doc"
+version = "0.51.0"
+dependencies = [
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "tokio",
+]
+
+[[package]]
 name = "pioneer-desktop-foundation"
 version = "0.51.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
+ "serde",
 ]
 
 [[package]]
@@ -8961,6 +8976,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pioneer-desktop-onboarding"
+version = "0.51.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pioneer-desktop-providers"
 version = "0.51.0"
 dependencies = [
@@ -8972,6 +9003,22 @@ dependencies = [
  "rust-i18n",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "pioneer-desktop-settings"
+version = "0.51.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gpui-kit",
+ "pioneer-client",
+ "pioneer-desktop-foundation",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

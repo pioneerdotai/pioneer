@@ -1,15 +1,16 @@
 use super::*;
 use pioneer_client::threads::start as thread_start;
-use pioneer_client::workspaces::actions as workspace_actions;
 
 impl PioneerDesktop {
     pub(in crate::app) fn default_thread_start_scope(&self) -> String {
         let preferred_workspace_id = self.preferred_workspace_id().map(str::to_owned);
         let runtime_workspace_id = self
             .gateway
-            .runtime
+            .client_runtime
+            .client_core()
+            .gateway_registry()
             .as_ref()
-            .and_then(GatewayRuntime::active_workspace_id)
+            .and_then(pioneer_client::gateway::types::GatewayRegistry::active_workspace_id)
             .map(str::to_owned);
 
         thread_start::default_thread_start_scope(
@@ -19,44 +20,27 @@ impl PioneerDesktop {
     }
 
     pub(in crate::app) fn persist_active_gateway_workspace_id(&mut self, workspace_id: String) {
-        let Some(runtime) = self.gateway.runtime.as_mut() else {
+        let core = self.gateway.client_runtime.client_core();
+        let Some(endpoint) = core.active_gateway_endpoint() else {
             return;
         };
-        let Some(plan) = workspace_actions::plan_active_gateway_workspace_persist(
-            runtime.active_gateway_id(),
-            workspace_id,
-        ) else {
-            return;
-        };
-        let gateway_id = plan.gateway_id;
-        let workspace_id = plan.workspace_id;
-
-        if let Err(error) =
-            runtime.set_gateway_workspace_id(gateway_id.as_str(), Some(workspace_id))
-        {
-            warn!(
-                gateway_id = gateway_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to persist gateway workspace id"
-            );
-        }
+        core.onboarding_intent(
+            pioneer_client::gateway::onboarding_runtime::OnboardingIntent::SetWorkspace {
+                endpoint_id: endpoint.id,
+                workspace_id: Some(workspace_id),
+            },
+        );
     }
-
     pub(in crate::app::flow) fn clear_persisted_active_gateway_workspace_id(&mut self) {
-        let Some(runtime) = self.gateway.runtime.as_mut() else {
+        let core = self.gateway.client_runtime.client_core();
+        let Some(endpoint) = core.active_gateway_endpoint() else {
             return;
         };
-        let gateway_id = runtime.active_gateway_id().map(str::to_owned);
-        let Some(gateway_id) = gateway_id else {
-            return;
-        };
-
-        if let Err(error) = runtime.set_gateway_workspace_id(gateway_id.as_str(), None) {
-            warn!(
-                gateway_id = gateway_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to clear inaccessible gateway workspace id"
-            );
-        }
+        core.onboarding_intent(
+            pioneer_client::gateway::onboarding_runtime::OnboardingIntent::SetWorkspace {
+                endpoint_id: endpoint.id,
+                workspace_id: None,
+            },
+        );
     }
 }

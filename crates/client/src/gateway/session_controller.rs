@@ -81,6 +81,7 @@ impl StartupCoordinator {
 }
 
 pub(crate) struct GatewaySessionController {
+    pub(crate) endpoints: BTreeMap<String, super::types::GatewayEndpoint>,
     unverified_transport: Option<crate::transport::ws::GatewayWsEvent>,
     connection_delivery: Option<crate::state::reducers::GatewayConnectionReduction>,
     deferred_events: std::collections::VecDeque<crate::transport::ws::GatewayWsEvent>,
@@ -100,6 +101,7 @@ pub(crate) struct GatewaySessionController {
 impl Default for GatewaySessionController {
     fn default() -> Self {
         Self {
+            endpoints: BTreeMap::new(),
             unverified_transport: None,
             connection_delivery: None,
             deferred_events: std::collections::VecDeque::new(),

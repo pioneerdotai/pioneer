@@ -38,6 +38,7 @@ impl IdentityPublicationChange {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthSessionsStore {
+    pub owner_generation: u64,
     pub sessions: Vec<AuthSessionListItem>,
     pub loading: bool,
     pub error: Option<String>,
@@ -55,7 +56,6 @@ pub struct IdentityAuthorizationPublication {
     pub policy_change: Option<pioneer_protocol::AuthorizationProjectionChangedNotification>,
     pub current_auth: Option<AuthMeResponse>,
     pub capabilities: AuthorizationProjectionStore,
-    pub auth_sessions: AuthSessionsStore,
 }
 
 #[derive(Default)]
@@ -69,16 +69,28 @@ pub(crate) struct IdentityAuthorizationStore {
     current_auth: Option<AuthMeResponse>,
     identity_request: u64,
     sessions: AuthSessionsStore,
+    profile: crate::settings::profile::ProfileStore,
     session_request: u64,
+    policy_generation: u64,
     session_request_connection: Option<u64>,
     pub(crate) settings: super::settings_store::GatewaySettingsStore,
     pub(crate) settings_request: u64,
     pub(crate) settings_notifications: [u64; 3],
     pub(crate) settings_request_notifications: [u64; 3],
     pub(crate) settings_request_connection: Option<u64>,
+    pub(crate) settings_request_workspace: Option<String>,
 }
 
 impl IdentityAuthorizationStore {
+    pub(crate) fn authorization_epoch(&self) -> (u64, u64) {
+        (self.connection_generation, self.policy_generation)
+    }
+    pub(crate) fn connection_matches(&self, connection: Option<u64>) -> bool {
+        self.epoch.as_ref().map(|(_, id)| *id) == connection
+    }
+    pub(crate) fn policy_revision(&self) -> Option<u64> {
+        self.projections.accepted_revision()
+    }
     pub(crate) fn stop(&mut self) {
         self.connection_generation = self
             .connection_generation
@@ -101,7 +113,6 @@ impl IdentityAuthorizationStore {
             policy_change: self.policy_change.clone(),
             current_auth: self.current_auth.clone(),
             capabilities: self.projections.clone(),
-            auth_sessions: self.sessions.clone(),
         }
     }
     fn invalidate_policy_requests(&mut self) {
@@ -112,6 +123,10 @@ impl IdentityAuthorizationStore {
         self.current_auth = auth;
     }
     fn clear_sessions(&mut self) {
+        self.policy_generation = self
+            .policy_generation
+            .checked_add(1)
+            .expect("authorization policy generation exhausted");
         self.current_auth = None;
         self.identity_request = self
             .identity_request
@@ -122,6 +137,7 @@ impl IdentityAuthorizationStore {
             .checked_add(1)
             .expect("session request generation exhausted");
         self.sessions = AuthSessionsStore::default();
+        self.profile.invalidate();
         self.settings_request = self
             .settings_request
             .checked_add(1)
@@ -177,11 +193,44 @@ impl ClientCore {
         &self,
         params: pioneer_protocol::AuthProfileUpdateParams,
     ) -> anyhow::Result<pioneer_protocol::AuthProfileUpdateResponse> {
-        let (generation, connection) = self.begin_identity_request()?;
-        let response = self
+        self.update_auth_profile_scoped(params, None)
+    }
+    fn update_auth_profile_scoped(
+        &self,
+        params: pioneer_protocol::AuthProfileUpdateParams,
+        expected: Option<(u64, u64)>,
+    ) -> anyhow::Result<pioneer_protocol::AuthProfileUpdateResponse> {
+        let (generation, connection) = {
+            let mut owner = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            anyhow::ensure!(
+                !self.is_stopped()
+                    && expected
+                        .is_none_or(|(generation, epoch)| owner.connection_generation == epoch
+                            && owner.profile.accepts(generation)),
+                "Profile action scope was replaced"
+            );
+            let connection = self.gateway_http_generation();
+            anyhow::ensure!(
+                owner.connection_matches(connection),
+                "Profile connection scope was replaced"
+            );
+            owner.identity_request = owner
+                .identity_request
+                .checked_add(1)
+                .expect("identity request generation exhausted");
+            (owner.identity_request, connection)
+        };
+        let connection_id =
+            connection.ok_or_else(|| anyhow::anyhow!("Profile connection unavailable"))?;
+        let transport = self
             .compatibility_runtime()
             .ws_command_sender()
-            .auth_profile_update(params)?;
+            .requests_for_connection(connection_id);
+        let response =
+            crate::transport::ws::command_sender::auth_profile_update(&transport, params)?;
         self.finish_auth_profile_update(generation, connection, response)
     }
 
@@ -211,6 +260,8 @@ impl ClientCore {
         );
         if auth.principal != response.principal {
             auth.principal = response.principal.clone();
+            owner.profile.synchronize(Some(&response.principal));
+            self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
             self.publish_identity_authorization(
                 &owner.publication(),
                 IdentityPublicationChange::Update,
@@ -276,11 +327,13 @@ impl ClientCore {
             "Gateway identity response is stale"
         );
         if owner.current_auth.as_ref() != Some(&auth) {
+            owner.profile.synchronize(Some(&auth.principal));
             owner.current_auth = Some(auth.clone());
             self.publish_identity_authorization(
                 &owner.publication(),
                 IdentityPublicationChange::Update,
             );
+            self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
         }
         Ok(auth)
     }
@@ -641,6 +694,7 @@ impl ClientCore {
             self.resume_provider_runtime_demand();
             self.resume_mcp_demand();
             self.resume_skills_demand();
+            self.resume_current_settings_demand();
         }
         accepted
     }
@@ -681,6 +735,7 @@ impl ClientCore {
             self.resume_provider_runtime_demand();
             self.resume_mcp_demand();
             self.resume_skills_demand();
+            self.resume_current_settings_demand();
         }
         accepted
     }
@@ -696,27 +751,43 @@ impl ClientCore {
     }
 
     fn begin_auth_sessions_request(&self, revoking: Option<AuthSessionId>) -> anyhow::Result<u64> {
+        self.begin_auth_sessions_request_scoped(revoking, None)
+    }
+    fn begin_auth_sessions_request_scoped(
+        &self,
+        revoking: Option<AuthSessionId>,
+        expected: Option<(&crate::settings::runtime::SettingsEpoch, Option<u64>)>,
+    ) -> anyhow::Result<u64> {
         let mut owner = self
             .identity_authorization
             .lock()
             .expect("identity owner poisoned");
+        anyhow::ensure!(
+            expected.is_none_or(|(epoch, owner_generation)| epoch
+                .matches_owner(&owner, self.settings_workspace())
+                && owner_generation.is_none_or(|generation| generation == owner.policy_generation)),
+            "Session action scope was replaced"
+        );
         anyhow::ensure!(!self.is_stopped(), "Client session runtime is stopped");
         anyhow::ensure!(
             owner.sessions.revoking.is_none(),
             "Session action is already pending"
         );
+        let connection = self.gateway_http_generation();
+        anyhow::ensure!(
+            owner.connection_matches(connection),
+            "Session connection scope was replaced"
+        );
         owner.session_request = owner
             .session_request
             .checked_add(1)
             .expect("session request generation exhausted");
-        owner.session_request_connection = self.gateway_http_generation();
+        owner.session_request_connection = connection;
+        owner.sessions.owner_generation = owner.policy_generation;
         owner.sessions.loading = revoking.is_none();
         owner.sessions.revoking = revoking;
         owner.sessions.error = None;
-        self.publish_identity_authorization(
-            &owner.publication(),
-            IdentityPublicationChange::Update,
-        );
+        self.publish_auth_sessions(&owner.sessions);
         Ok(owner.session_request)
     }
 
@@ -731,6 +802,7 @@ impl ClientCore {
             .expect("identity owner poisoned");
         if self.is_stopped()
             || owner.session_request != generation
+            || (!owner.sessions.loading && owner.sessions.revoking.is_none())
             || owner.session_request_connection != self.gateway_http_generation()
         {
             return false;
@@ -742,12 +814,9 @@ impl ClientCore {
                 owner.sessions.sessions = response.sessions.clone();
                 owner.sessions.error = None;
             }
-            Err(error) => owner.sessions.error = Some(format!("{error:#}")),
+            Err(_) => owner.sessions.error = Some("sessions_request_failed".into()),
         }
-        self.publish_identity_authorization(
-            &owner.publication(),
-            IdentityPublicationChange::Update,
-        );
+        self.publish_auth_sessions(&owner.sessions);
         true
     }
 
@@ -756,6 +825,13 @@ impl ClientCore {
         self.load_auth_sessions(generation)
     }
 
+    pub(crate) fn refresh_auth_sessions_for_epoch(
+        &self,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+    ) -> anyhow::Result<AuthSessionListResponse> {
+        let generation = self.begin_auth_sessions_request_scoped(None, Some((epoch, None)))?;
+        self.load_auth_sessions(ClientGeneration::new(generation))
+    }
     pub fn request_auth_sessions(&self) -> anyhow::Result<ClientGeneration> {
         self.begin_auth_sessions_request(None)
             .map(ClientGeneration::new)
@@ -766,7 +842,7 @@ impl ClientCore {
         generation: ClientGeneration,
     ) -> anyhow::Result<AuthSessionListResponse> {
         let generation = generation.get();
-        {
+        let connection = {
             let owner = self
                 .identity_authorization
                 .lock()
@@ -775,11 +851,18 @@ impl ClientCore {
                 !self.is_stopped() && owner.session_request == generation && owner.sessions.loading,
                 "Session list request is no longer pending"
             );
-        }
-        let result = self
-            .compatibility_runtime()
-            .ws_command_sender()
-            .auth_session_list();
+            owner.session_request_connection
+        };
+        let result = connection
+            .ok_or_else(|| anyhow::anyhow!("Session connection unavailable"))
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::auth_session_list(
+                    &self
+                        .compatibility_runtime()
+                        .ws_command_sender()
+                        .requests_for_connection(connection),
+                )
+            });
         anyhow::ensure!(
             self.finish_auth_sessions_request(generation, &result),
             "Session list response belongs to a superseded authorization generation"
@@ -791,12 +874,48 @@ impl ClientCore {
         &self,
         params: AuthSessionRevokeParams,
     ) -> anyhow::Result<AuthSessionRevokeResponse> {
+        self.revoke_auth_session_scoped(params, None)
+    }
+    pub(crate) fn revoke_auth_session_for_epoch(
+        &self,
+        params: AuthSessionRevokeParams,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+        owner: u64,
+    ) -> anyhow::Result<AuthSessionRevokeResponse> {
+        self.revoke_auth_session_scoped(params, Some((epoch, Some(owner))))
+    }
+    fn session_request_connection(&self, generation: u64) -> anyhow::Result<u64> {
+        let owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(
+            !self.is_stopped() && owner.session_request == generation,
+            "Session action scope was replaced"
+        );
+        owner
+            .session_request_connection
+            .ok_or_else(|| anyhow::anyhow!("Session connection unavailable"))
+    }
+    fn revoke_auth_session_scoped(
+        &self,
+        params: AuthSessionRevokeParams,
+        expected: Option<(&crate::settings::runtime::SettingsEpoch, Option<u64>)>,
+    ) -> anyhow::Result<AuthSessionRevokeResponse> {
         let session_id = params.session_id.clone();
-        let generation = self.begin_auth_sessions_request(Some(session_id.clone()))?;
+        let generation =
+            self.begin_auth_sessions_request_scoped(Some(session_id.clone()), expected)?;
         let result = self
-            .compatibility_runtime()
-            .ws_command_sender()
-            .auth_session_revoke(params);
+            .session_request_connection(generation)
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::auth_session_revoke(
+                    &self
+                        .compatibility_runtime()
+                        .ws_command_sender()
+                        .requests_for_connection(connection),
+                    params,
+                )
+            });
         self.finish_auth_session_revoke(generation, &session_id, result)
     }
 
@@ -844,7 +963,7 @@ impl ClientCore {
                     }
                 }
             }
-            Err(error) => owner.sessions.error = Some(format!("{error:#}")),
+            Err(_) => owner.sessions.error = Some("sessions_request_failed".into()),
             _ => {}
         }
         if clear_protected {
@@ -855,18 +974,41 @@ impl ClientCore {
             owner.projections.clear_epoch();
             owner.clear_sessions();
         }
-        self.publish_identity_authorization(
-            &owner.publication(),
-            IdentityPublicationChange::session(clear_protected),
-        );
+        if clear_protected {
+            self.publish_identity_authorization(
+                &owner.publication(),
+                IdentityPublicationChange::ResetSession,
+            );
+        } else {
+            self.publish_auth_sessions(&owner.sessions);
+        }
         result
     }
     pub fn logout_auth_session(&self) -> anyhow::Result<pioneer_protocol::AuthLogoutResponse> {
-        let generation = self.begin_auth_sessions_request(None)?;
+        self.logout_auth_session_scoped(None)
+    }
+    pub(crate) fn logout_auth_session_for_epoch(
+        &self,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+        owner: u64,
+    ) -> anyhow::Result<pioneer_protocol::AuthLogoutResponse> {
+        self.logout_auth_session_scoped(Some((epoch, Some(owner))))
+    }
+    fn logout_auth_session_scoped(
+        &self,
+        expected: Option<(&crate::settings::runtime::SettingsEpoch, Option<u64>)>,
+    ) -> anyhow::Result<pioneer_protocol::AuthLogoutResponse> {
+        let generation = self.begin_auth_sessions_request_scoped(None, expected)?;
         let result = self
-            .compatibility_runtime()
-            .ws_command_sender()
-            .auth_logout();
+            .session_request_connection(generation)
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::auth_logout(
+                    &self
+                        .compatibility_runtime()
+                        .ws_command_sender()
+                        .requests_for_connection(connection),
+                )
+            });
         let mut owner = self
             .identity_authorization
             .lock()
@@ -886,9 +1028,9 @@ impl ClientCore {
                 owner.projections.clear_epoch();
                 owner.clear_sessions();
             }
-            Err(error) => {
+            Err(_) => {
                 owner.sessions.loading = false;
-                owner.sessions.error = Some(format!("{error:#}"));
+                owner.sessions.error = Some("sessions_request_failed".into());
             }
         }
         self.publish_identity_authorization(
@@ -943,6 +1085,104 @@ mod session_tests {
         }
     }
 
+    #[test]
+    fn stale_profile_save_cannot_allocate_a_request_for_the_replacement_principal() {
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let before = core.current_auth_ticket();
+        let params = serde_json::from_value(
+            serde_json::json!({"display_name":"Old draft","nickname":"old_draft"}),
+        )
+        .unwrap();
+        assert!(
+            core.update_auth_profile_scoped(
+                params,
+                Some((u64::MAX, core.authorization_connection_generation()))
+            )
+            .is_err()
+        );
+        assert_eq!(core.current_auth_ticket(), before);
+    }
+    #[test]
+    fn profile_request_generation_does_not_invalidate_device_confirmation_owner() {
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let peer = session(false);
+        let request = core.begin_auth_sessions_request(None).unwrap();
+        core.finish_auth_sessions_request(
+            request,
+            &Ok(AuthSessionListResponse {
+                sessions: vec![peer.clone()],
+            }),
+        );
+        let owner = core.auth_sessions().owner_generation;
+        core.begin_identity_request().unwrap();
+        assert_eq!(
+            core.settings_intent(crate::settings::runtime::SettingsIntent::RevokeSession {
+                expected_owner: owner,
+                session_id: peer.session.id,
+                expected_status: Some(peer.session.status)
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
+    }
+    #[test]
+    fn session_confirmation_owner_changes_when_permissions_are_replaced_in_same_connection() {
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let peer = session(false);
+        let first = core.begin_auth_sessions_request(None).unwrap();
+        assert!(core.finish_auth_sessions_request(
+            first,
+            &Ok(AuthSessionListResponse {
+                sessions: vec![peer.clone()]
+            })
+        ));
+        let old = core.auth_sessions().owner_generation;
+        let connection_generation = core.authorization_connection_generation();
+        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+        capabilities.authorization_revision += 1;
+        core.invalidate_authorization_revision(capabilities.authorization_revision);
+        let (generation, connection) = core.current_auth_ticket();
+        core.accept_authorization_projection(generation, connection, capabilities);
+        let next = core.begin_auth_sessions_request(None).unwrap();
+        assert!(core.finish_auth_sessions_request(
+            next,
+            &Ok(AuthSessionListResponse {
+                sessions: vec![peer.clone()]
+            })
+        ));
+        assert_eq!(
+            core.authorization_connection_generation(),
+            connection_generation
+        );
+        assert_ne!(core.auth_sessions().owner_generation, old);
+        let epoch = core.settings_epoch();
+        let session_ticket = core.identity_authorization.lock().unwrap().session_request;
+        assert!(
+            core.revoke_auth_session_for_epoch(
+                AuthSessionRevokeParams {
+                    session_id: peer.session.id.clone(),
+                    expected_status: Some(peer.session.status)
+                },
+                &epoch,
+                old
+            )
+            .is_err()
+        );
+        assert_eq!(
+            core.identity_authorization.lock().unwrap().session_request,
+            session_ticket
+        );
+        assert_eq!(
+            core.settings_intent(crate::settings::runtime::SettingsIntent::RevokeSession {
+                expected_owner: old,
+                session_id: peer.session.id,
+                expected_status: Some(peer.session.status)
+            })
+            .outcome(),
+            ClientTransitionOutcome::Rejected
+        );
+        assert!(core.auth_sessions().revoking.is_none());
+    }
     #[test]
     fn policy_refresh_preserves_screen_thread_and_unsent_composer() {
         use crate::composer::{state_machine::ComposerDomainState, store::ComposerIntent};
@@ -1415,5 +1655,102 @@ mod session_tests {
         core.shutdown();
         assert!(!core.finish_auth_sessions_request(pending, &empty));
         assert!(core.begin_auth_sessions_request(None).is_err());
+    }
+}
+
+impl ClientCore {
+    pub(crate) fn publish_auth_sessions(&self, sessions: &AuthSessionsStore) -> ClientTransition {
+        self.publish_settings_value(ClientScope::AuthSessions, sessions.clone())
+    }
+    pub fn profile(&self) -> crate::settings::profile::ProfilePublication {
+        self.identity_authorization
+            .lock()
+            .expect("identity owner poisoned")
+            .profile
+            .publication
+            .clone()
+    }
+    pub fn profile_intent(
+        &self,
+        intent: crate::settings::profile::ProfileIntent,
+    ) -> ClientTransition {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped() {
+            return self.reject_intent();
+        }
+        let principal = owner.projections.snapshot(None, None).and_then(|_| {
+            owner
+                .current_auth
+                .as_ref()
+                .map(|auth| auth.principal.clone())
+        });
+        owner.profile.synchronize(principal.as_ref());
+        let save = owner.profile.intent(intent);
+        let transition =
+            self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
+        let epoch = owner.connection_generation;
+        drop(owner);
+        if let Some(save) = save {
+            self.queue_profile_save(save, epoch);
+        }
+        transition
+    }
+    pub(crate) fn execute_profile_save(
+        &self,
+        save: crate::settings::profile::ProfileSave,
+        epoch: u64,
+    ) {
+        {
+            let owner = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            if self.is_stopped()
+                || owner.connection_generation != epoch
+                || !owner.profile.accepts(save.generation)
+            {
+                return;
+            }
+        }
+        let result = self.update_auth_profile_scoped(save.params, Some((save.generation, epoch)));
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped() || owner.connection_generation != epoch {
+            return;
+        }
+        // Server error codes, never arbitrary transport payloads, cross the profile boundary.
+        let result = result
+            .as_ref()
+            .map(|response| &response.principal)
+            .map_err(|error| {
+                let message = error.to_string();
+                ["nickname_unavailable", "avatar_invalid", "invalid_profile"]
+                    .into_iter()
+                    .find(|code| message.contains(code))
+                    .unwrap_or("profile_save_failed")
+                    .to_owned()
+            });
+        if owner.profile.complete(save.generation, result) {
+            self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
+        }
+    }
+}
+
+impl ClientCore {
+    pub(crate) fn record_session_cleanup_result(&self, epoch: u64, success: bool) {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped() || owner.connection_generation != epoch {
+            return;
+        }
+        owner.sessions.error = (!success).then(|| "secure_storage_failed".into());
+        self.publish_auth_sessions(&owner.sessions);
     }
 }

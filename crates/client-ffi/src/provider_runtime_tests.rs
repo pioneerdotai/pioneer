@@ -59,8 +59,6 @@ fn fixture(wire_core: Arc<ClientCore>) -> ClientFfiRuntime {
         legacy_authorization_change_sequence: Default::default(),
         diagnostics: Default::default(),
         avatar_cache: Default::default(),
-        invitation_commit_sequence: Default::default(),
-        invitation_commits: Default::default(),
     }
 }
 

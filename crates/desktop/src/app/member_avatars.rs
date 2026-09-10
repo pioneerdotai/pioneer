@@ -944,7 +944,9 @@ impl PioneerDesktop {
     ) -> anyhow::Result<crate::gateway::DesktopGatewayHttpClient> {
         let endpoint = self
             .gateway
-            .runtime
+            .client_runtime
+            .client_core()
+            .gateway_registry()
             .as_ref()
             .and_then(|runtime| runtime.active_gateway().cloned())
             .ok_or_else(|| anyhow::anyhow!("gateway endpoint unavailable"))?;

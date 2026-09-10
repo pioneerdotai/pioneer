@@ -1,0 +1,24 @@
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "AGENTS.md wird geladen..."
+load_error = "AGENTS.md konnte nicht geladen werden"
+retry = "Erneut versuchen"
+retry_save = "Speichern erneut versuchen"
+save_conflict = "AGENTS.md wurde an anderer Stelle geändert. Laden Sie neu oder wiederholen Sie nach dem Konflikt."
+save_conflict_missing_remote = "AGENTS.md wurde an anderer Stelle geändert, aber das entfernte Dokument konnte nicht geladen werden."
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md-Konflikt"
+description = "Das entfernte Dokument wurde geändert, bevor diese Änderung gespeichert werden konnte."
+reload_remote = "Entferntes Dokument laden"
+overwrite_remote = "Entferntes Dokument überschreiben"
+local = "Lokal"
+remote = "Entfernt"
+
+[editor.agents_doc.save_state]
+clean = "Keine ungespeicherten Änderungen"
+dirty = "Ungespeicherte Änderungen"
+saving = "Speichern..."
+saved = "Gespeichert"
+error = "Speichern fehlgeschlagen: %{message}"
+conflict = "Konflikt vor dem Speichern lösen"

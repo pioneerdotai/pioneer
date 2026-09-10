@@ -1,0 +1,24 @@
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "Loading AGENTS.md..."
+load_error = "Failed to load AGENTS.md"
+retry = "Retry"
+retry_save = "Retry save"
+save_conflict = "AGENTS.md changed elsewhere. Reload or retry after resolving the conflict."
+save_conflict_missing_remote = "AGENTS.md changed elsewhere, but the remote document could not be loaded."
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md conflict"
+description = "The remote document changed before this edit could be saved."
+reload_remote = "Reload remote"
+overwrite_remote = "Overwrite remote"
+local = "Local"
+remote = "Remote"
+
+[editor.agents_doc.save_state]
+clean = "No unsaved changes"
+dirty = "Unsaved changes"
+saving = "Saving..."
+saved = "Saved"
+error = "Save failed: %{message}"
+conflict = "Resolve conflict before saving"

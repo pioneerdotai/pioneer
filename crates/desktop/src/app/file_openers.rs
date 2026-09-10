@@ -1,69 +1,11 @@
 use crate::{
-    components::buttonts::small_outline_button,
     file_opener::{FileOpenerId, available_or_file_manager, is_file_opener_available},
     settings::{self, FileOpenerThreadScope, FileOpenerWorkspaceScope},
 };
-use gpui_kit::component::{Icon, IconName, button::Button, h_flex, theme::ActiveTheme};
-use gpui_kit::{AnyElement, App, Context, ElementId, SharedString, div, img, prelude::*, px};
+use gpui_kit::{Context, prelude::*};
 use tracing::warn;
 
 use super::PioneerDesktop;
-
-pub(in crate::app) fn file_opener_icon(opener: FileOpenerId) -> AnyElement {
-    if let Some(path) = opener.logo_path() {
-        if matches!(opener, FileOpenerId::Cursor | FileOpenerId::Zed) {
-            Icon::empty().path(path).size_3p5().into_any_element()
-        } else {
-            img(path).size_3p5().flex_none().into_any_element()
-        }
-    } else {
-        Icon::new(IconName::Folder).size_3p5().into_any_element()
-    }
-}
-
-pub(in crate::app) fn file_opener_trigger(
-    id: impl Into<ElementId>,
-    opener: FileOpenerId,
-) -> Button {
-    small_outline_button(id).compact().child(
-        h_flex()
-            .w_full()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(file_opener_icon(opener))
-            .child(div().text_sm().child(opener.label()))
-            .child(Icon::new(IconName::ChevronsUpDown).size_3p5()),
-    )
-}
-
-pub(in crate::app) fn file_opener_menu_row(
-    opener: FileOpenerId,
-    label: SharedString,
-    selected: bool,
-    cx: &App,
-) -> AnyElement {
-    let hover_background = cx.theme().accent;
-    let selected_background = cx.theme().popover.blend(hover_background.opacity(0.88));
-
-    h_flex()
-        .flex_1()
-        .h(px(26.))
-        .mx_neg_2()
-        .px_2()
-        .rounded(cx.theme().radius.min(px(8.)))
-        .items_center()
-        .gap_2()
-        .text_sm()
-        .when(selected, |row| {
-            row.bg(selected_background)
-                .text_color(cx.theme().accent_foreground)
-                .hover(move |row| row.bg(hover_background))
-        })
-        .child(file_opener_icon(opener))
-        .child(label)
-        .into_any_element()
-}
 
 impl PioneerDesktop {
     pub(in crate::app) fn active_workspace_file_opener(&self, cx: &Context<Self>) -> FileOpenerId {
@@ -175,7 +117,9 @@ impl PioneerDesktop {
             .to_owned();
         let gateway_id = self
             .gateway
-            .runtime
+            .client_runtime
+            .client_core()
+            .gateway_registry()
             .as_ref()?
             .active_gateway_id()?
             .to_owned();

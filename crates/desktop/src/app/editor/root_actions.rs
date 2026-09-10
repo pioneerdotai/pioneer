@@ -1,12 +1,33 @@
-use super::state::AgentsDocEditor;
 use crate::app::{
     root::{GatewayConnectionState, MainContentView, PioneerDesktop, ThreadAgentsDocEditorScope},
     sidebar::agents_doc_tree_node_key,
 };
-use gpui_kit::component::{input::EditorState, theme::ActiveTheme};
+use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::{prelude::*, *};
+use pioneer_desktop_agents_doc::{AgentsDocumentConfig, AgentsDocumentEditor};
 
 impl PioneerDesktop {
+    pub(crate) fn agents_document_scope(&self, cx: &App) -> Option<ThreadAgentsDocEditorScope> {
+        self.agents_doc_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).scope().clone())
+    }
+
+    pub(crate) fn present_document_close_error(
+        &mut self,
+        error: &pioneer_client::agents_doc::controller::AgentsDocumentCloseError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use pioneer_client::agents_doc::controller::AgentsDocumentCloseError;
+        if let AgentsDocumentCloseError::SaveFailed(scope)
+        | AgentsDocumentCloseError::Conflict(scope) = error
+        {
+            self.open_agents_doc_editor(scope.clone(), window, cx);
+        }
+        pioneer_desktop_agents_doc::present_close_error(error, window, cx);
+    }
+
     pub(crate) fn render_agents_doc_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         pioneer_observability::record_qualification_diagnostic!(record_render(
             pioneer_observability::RenderRegion::AgentsDoc
@@ -47,8 +68,10 @@ impl PioneerDesktop {
             },
         );
 
-        if self.active_agents_doc_editor_scope.as_ref() == Some(&scope)
-            && self.agents_doc_editor.is_some()
+        if self
+            .agents_doc_editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).scope() == &scope)
         {
             self.set_main_content_view(MainContentView::AgentsDoc, cx);
             return;
@@ -60,31 +83,16 @@ impl PioneerDesktop {
             });
         }
 
-        let (workspace_id, folder_id) = scope.clone().into_parts();
-
-        let input = cx.new(|cx| {
-            EditorState::new(window, cx)
-                .language("markdown")
-                .line_number(true)
-                .soft_wrap(true)
-                .default_value("")
-        });
-        let editor_workspace_id = workspace_id.clone();
-        let editor_folder_id = folder_id.clone();
-        let editor = cx.new(|cx| {
-            let mut editor = AgentsDocEditor::new(
-                editor_workspace_id,
-                editor_folder_id,
-                input,
-                self.gateway.client_runtime.ws_command_sender().clone(),
-                window.window_handle(),
-                window,
-                cx,
-            );
-            editor.start_load(cx);
-            editor
-        });
-        self.active_agents_doc_editor_scope = Some(scope);
+        let editor = AgentsDocumentEditor::new(
+            AgentsDocumentConfig::new(
+                self.gateway.client_runtime.client_core().clone(),
+                cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                    .registrar(),
+                scope.clone(),
+            ),
+            window,
+            cx,
+        );
         self.agents_doc_editor = Some(editor);
         self.set_main_content_view(MainContentView::AgentsDoc, cx);
     }

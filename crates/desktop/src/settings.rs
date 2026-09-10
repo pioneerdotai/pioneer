@@ -34,29 +34,9 @@ pub(crate) enum WindowOpenState {
     Fullscreen,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WindowThemePreference {
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AppLanguagePreference {
-    #[default]
-    System,
-    English,
-    Russian,
-    Chinese,
-    Hindi,
-    Spanish,
-    German,
-    French,
-    Japanese,
-}
+pub(crate) use pioneer_desktop_foundation::preferences::{
+    AppLanguagePreference, WindowThemePreference,
+};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct GeneralSettings {
@@ -155,97 +135,71 @@ pub(crate) fn thread_file_opener_override(
     })
 }
 
+fn update_settings(cx: &mut App, edit: impl FnOnce(&mut DesktopSettingsFile)) -> Result<()> {
+    ensure_loaded(cx)?;
+    let state = cx.global_mut::<DesktopSettingsState>();
+    let mut next = state.settings.clone();
+    next.version = DESKTOP_SETTINGS_VERSION;
+    edit(&mut next);
+    commit_settings(state, next, |path, value| write_settings_file(path, value))
+}
+fn commit_settings(
+    state: &mut DesktopSettingsState,
+    next: DesktopSettingsFile,
+    write: impl FnOnce(&std::path::Path, String) -> Result<()>,
+) -> Result<()> {
+    let serialized = serialize_settings(&next)?;
+    write(&state.path, serialized)?;
+    state.settings = next;
+    Ok(())
+}
 pub(crate) fn set_app_language(cx: &mut App, language: AppLanguagePreference) -> Result<()> {
-    ensure_loaded(cx)?;
-
-    let (path, serialized) = {
-        let state = cx.global_mut::<DesktopSettingsState>();
-        state.settings.version = DESKTOP_SETTINGS_VERSION;
-        state.settings.general.language = language;
-        (state.path.clone(), serialize_settings(&state.settings)?)
-    };
-
-    write_settings_file(path.as_path(), serialized)?;
-    Ok(())
+    update_settings(cx, |settings| settings.general.language = language)
 }
-
 pub(crate) fn set_window_theme(cx: &mut App, theme: WindowThemePreference) -> Result<()> {
-    ensure_loaded(cx)?;
-
-    let (path, serialized) = {
-        let state = cx.global_mut::<DesktopSettingsState>();
-        state.settings.version = DESKTOP_SETTINGS_VERSION;
-        state.settings.general.theme = theme;
-        (state.path.clone(), serialize_settings(&state.settings)?)
-    };
-
-    write_settings_file(path.as_path(), serialized)?;
-    Ok(())
+    update_settings(cx, |settings| settings.general.theme = theme)
 }
-
 pub(crate) fn set_workspace_file_opener(
     cx: &mut App,
     scope: &FileOpenerWorkspaceScope,
     opener: FileOpenerId,
 ) -> Result<()> {
-    ensure_loaded(cx)?;
-
-    let (path, serialized) = {
-        let state = cx.global_mut::<DesktopSettingsState>();
-        state.settings.version = DESKTOP_SETTINGS_VERSION;
-        if let Some(preference) = state
-            .settings
+    update_settings(cx, |settings| {
+        if let Some(preference) = settings
             .workspace_file_openers
             .iter_mut()
-            .find(|preference| preference.matches(scope))
+            .find(|p| p.matches(scope))
         {
             preference.opener = opener;
         } else {
-            state
-                .settings
+            settings
                 .workspace_file_openers
                 .push(WorkspaceFileOpenerPreference::from_scope(scope, opener));
         }
-        (state.path.clone(), serialize_settings(&state.settings)?)
-    };
-
-    write_settings_file(path.as_path(), serialized)
+    })
 }
-
 pub(crate) fn set_thread_file_opener_override(
     cx: &mut App,
     scope: &FileOpenerThreadScope,
     opener: Option<FileOpenerId>,
 ) -> Result<()> {
-    ensure_loaded(cx)?;
-
-    let (path, serialized) = {
-        let state = cx.global_mut::<DesktopSettingsState>();
-        state.settings.version = DESKTOP_SETTINGS_VERSION;
+    update_settings(cx, |settings| {
         if let Some(opener) = opener {
-            if let Some(preference) = state
-                .settings
+            if let Some(preference) = settings
                 .thread_file_openers
                 .iter_mut()
-                .find(|preference| preference.matches(scope))
+                .find(|p| p.matches(scope))
             {
                 preference.opener = opener;
             } else {
-                state
-                    .settings
+                settings
                     .thread_file_openers
                     .push(ThreadFileOpenerPreference::from_scope(scope, opener));
             }
         } else {
-            state
-                .settings
-                .thread_file_openers
-                .retain(|preference| !preference.matches(scope));
+            settings.thread_file_openers.retain(|p| !p.matches(scope));
         }
-        (state.path.clone(), serialize_settings(&state.settings)?)
-    };
-
-    write_settings_file(path.as_path(), serialized)
+    })
 }
 
 pub(crate) fn load_app_language_preference() -> Option<AppLanguagePreference> {
@@ -254,35 +208,7 @@ pub(crate) fn load_app_language_preference() -> Option<AppLanguagePreference> {
 }
 
 pub(crate) fn resolve_app_locale() -> String {
-    load_app_language_preference()
-        .unwrap_or_default()
-        .resolve_locale()
-}
-
-impl AppLanguagePreference {
-    pub(crate) fn resolve_locale(self) -> String {
-        if let Some(locale) = self.explicit_locale() {
-            return locale.to_owned();
-        }
-
-        detect_system_locale()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "en".to_owned())
-    }
-
-    fn explicit_locale(self) -> Option<&'static str> {
-        match self {
-            Self::System => None,
-            Self::English => Some("en"),
-            Self::Russian => Some("ru"),
-            Self::Chinese => Some("zh"),
-            Self::Hindi => Some("hi"),
-            Self::Spanish => Some("es"),
-            Self::German => Some("de"),
-            Self::French => Some("fr"),
-            Self::Japanese => Some("jp"),
-        }
-    }
+    resolve_language_locale(load_app_language_preference().unwrap_or_default())
 }
 
 impl WorkspaceFileOpenerPreference {
@@ -456,6 +382,35 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn preference_write_failure_preserves_previous_published_value_for_retry() {
+        let initial = DesktopSettingsFile::default();
+        let mut state = super::DesktopSettingsState {
+            path: std::path::PathBuf::from("synthetic-settings.toml"),
+            settings: initial.clone(),
+        };
+        let mut next = initial.clone();
+        next.general.theme = super::WindowThemePreference::Dark;
+        let before = serialize_settings(&state.settings).unwrap();
+        assert!(
+            super::commit_settings(&mut state, next.clone(), |_, _| Err(anyhow::anyhow!(
+                "synthetic write failure"
+            )))
+            .is_err()
+        );
+        assert_eq!(serialize_settings(&state.settings).unwrap(), before);
+        super::commit_settings(&mut state, next, |path, serialized| {
+            assert_eq!(path, std::path::Path::new("synthetic-settings.toml"));
+            assert!(serialized.contains("dark"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            state.settings.general.theme,
+            super::WindowThemePreference::Dark
+        );
+    }
+
+    #[test]
     fn desktop_settings_do_not_own_memory_settings() {
         let settings = toml::from_str::<DesktopSettingsFile>(
             r#"
@@ -556,4 +511,11 @@ opener = "webstorm"
         assert!(serialized.contains("opener = \"pycharm\""));
         assert!(serialized.contains("opener = \"webstorm\""));
     }
+}
+pub(crate) fn resolve_language_locale(language: AppLanguagePreference) -> String {
+    language
+        .explicit_locale()
+        .map(str::to_owned)
+        .or_else(|| detect_system_locale().map(str::to_owned))
+        .unwrap_or_else(|| "en".into())
 }

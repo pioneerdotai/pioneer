@@ -32,8 +32,10 @@ impl LegacyScreenAdapter {
             .update(cx, |view, cx| view.set_window_active(active, cx));
         self.skills_view
             .update(cx, |view, cx| view.set_window_active(active, cx));
-        self.providers_view.update(cx, |view, cx| view.set_window_active(active, cx));
-        self.administration_view.update(cx, |view, cx| view.set_window_active(active, cx));
+        self.providers_view
+            .update(cx, |view, cx| view.set_window_active(active, cx));
+        self.administration_view
+            .update(cx, |view, cx| view.set_window_active(active, cx));
         self.reconcile_route_activity(cx);
     }
     pub(in crate::app) fn reconcile_route_activity(&mut self, cx: &mut Context<Self>) {
@@ -41,14 +43,9 @@ impl LegacyScreenAdapter {
             .navigation
             .activity(self.main_content_view(), self.window_active);
         let active = activity == crate::desktop_navigation::RouteActivity::Active;
-        if active
-            && self.main_content_view() == MainContentView::Settings
-            && self.settings_content_view() == SettingsContentView::SelfImprovement
-        {
-            self.start_self_improvement_status_poll(cx);
-        } else {
-            self.self_improvement_status_poll.take();
-        }
+        let settings_active = active && self.main_content_view() == MainContentView::Settings;
+        self.settings_view
+            .update(cx, |view, cx| view.set_active(settings_active, cx));
     }
 
     pub(crate) fn close_route_bindings(&mut self, cx: &mut Context<Self>) {
@@ -57,13 +54,11 @@ impl LegacyScreenAdapter {
             .update(cx, |view, cx| view.set_window_active(false, cx));
         self.skills_view
             .update(cx, |view, cx| view.set_window_active(false, cx));
-        self.self_improvement_status_poll.take();
         self.gateway.compatibility_task.take();
-        self.gateway.settings_task.take();
+        self.settings_view
+            .update(cx, |view, cx| view.set_active(false, cx));
         self.gateway.identity_task.take();
         self.gateway.session_task.take();
         self.gateway.transport_verification_task.take();
-        self.invitation_join_input_subscriptions.clear();
-        self.profile_editor_input_subscriptions.clear();
     }
 }

@@ -1,6 +1,4 @@
-use crate::app::root::{
-    GatewayConnectionState, MainContentView, PioneerDesktop,
-};
+use crate::app::root::{GatewayConnectionState, MainContentView, PioneerDesktop};
 use gpui_kit::*;
 use std::time::Duration;
 use tracing::warn;
@@ -60,7 +58,6 @@ impl PioneerDesktop {
         if self.gateway.connection_state != GatewayConnectionState::Connected {
             self.gateway.current_auth = None;
             self.gateway.capability_snapshot = None;
-            self.sync_settings_sidebar_tree_state(cx);
 
             return;
         }
@@ -90,8 +87,6 @@ impl PioneerDesktop {
         }
         let reload_protected_content = self.gateway.capability_snapshot.is_none();
         if reload_protected_content {
-            self.sync_settings_sidebar_tree_state(cx);
-
             cx.notify();
         }
 
@@ -164,12 +159,10 @@ impl PioneerDesktop {
                                     if !capabilities.can_manage_workspace
                                         && view.main_content_view() == MainContentView::AgentsDoc
                                     {
-                                        view.active_agents_doc_editor_scope = None;
                                         view.agents_doc_editor = None;
                                         view.set_main_content_view(MainContentView::Threads, cx);
                                     }
                                     view.resolve_current_principal_avatar(cx);
-                                    view.sync_settings_sidebar_tree_state(cx);
 
                                     if reload_protected_content && view.gateway.capability_snapshot.is_some() {
                                         match view.main_content_view() {
@@ -203,7 +196,6 @@ impl PioneerDesktop {
                                     });
                                     if principal_changed {
                                         view.gateway.capability_snapshot = None;
-                                        view.sync_settings_sidebar_tree_state(cx);
 
                                     }
                                     view.gateway.current_auth = auth;
@@ -298,7 +290,10 @@ impl PioneerDesktop {
         .detach();
     }
 
-    pub(in crate::app) fn open_administration_screen_from_bottom_bar(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn open_administration_screen_from_bottom_bar(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
         self.set_main_content_view(MainContentView::Administration, cx);
     }
 }
@@ -361,8 +356,6 @@ mod tests {
                 desktop.update(cx, |view, cx| {
                     view.apply_navigation_publication(core.navigation_snapshot(), cx);
                     view.gateway.capability_snapshot = None;
-
-                    view.sync_settings_sidebar_tree_state(cx);
                 });
             });
             assert_eq!(core.navigation_snapshot().destination(), &destination);

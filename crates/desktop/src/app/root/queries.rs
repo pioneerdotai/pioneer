@@ -194,9 +194,6 @@ impl PioneerDesktop {
     pub(in crate::app) fn administration_content_view(&self) -> AdministrationContentView {
         self.navigation_input.administration_route()
     }
-    pub(in crate::app) fn settings_content_view(&self) -> SettingsContentView {
-        self.navigation_input.settings_route()
-    }
 
     pub(in crate::app) fn current_active_thread_id(&self) -> Option<&str> {
         self.navigation_input.active_thread_id()

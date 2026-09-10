@@ -20,6 +20,14 @@ impl DesktopPlatformEffectRouter {
         storage: &dyn GatewaySessionStorage,
     ) {
         let result = match plan.effect() {
+            ClientPlannedEffect::OnboardingPlatform(effect) => {
+                crate::gateway::onboarding_platform::execute(effect, storage)
+            }
+            ClientPlannedEffect::GatewaySessionStorage(
+                GatewaySessionStorageEffect::DeleteGatewaySession { endpoint },
+            ) => storage
+                .delete(endpoint)
+                .map(|()| ClientEffectResult::Completed),
             ClientPlannedEffect::GatewaySessionStorage(
                 GatewaySessionStorageEffect::ReadGatewaySession { endpoint },
             ) => storage
@@ -61,7 +69,7 @@ impl DesktopSessionStorageAdapter {
                     let batch = core.wait_for_publications(sequence);
                     sequence = batch.sequence;
                     for plan in batch.effects {
-                        if !matches!(plan.effect(), ClientPlannedEffect::GatewaySessionStorage(_)) { continue; }
+                        if !matches!(plan.effect(), ClientPlannedEffect::GatewaySessionStorage(_) | ClientPlannedEffect::OnboardingPlatform(_)) { continue; }
 
                         if core.is_stopped() {
                             break;
@@ -77,7 +85,12 @@ impl DesktopSessionStorageAdapter {
                                 .ok();
                         }
                         match secrets.as_ref() {
-                            Some(secrets) => router.dispatch(&core, plan, secrets),
+                            Some(secrets) => {
+                                if matches!(plan.effect(),ClientPlannedEffect::OnboardingPlatform(pioneer_client::gateway::onboarding_effects::OnboardingPlatformEffect::LoadGatewayEnvironment)) {
+                                    if secrets.purge_retired_gateway_auth_tokens().is_err(){tracing::warn!("retired Gateway credential cleanup deferred until the next startup");}
+                                }
+                                router.dispatch(&core, plan, secrets)
+                            },
                             None => {
                                 core.complete_effect(ClientEffectCompletion::new(
                                     plan.operation_id().clone(),

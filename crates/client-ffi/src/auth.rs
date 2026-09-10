@@ -30,11 +30,16 @@ pub struct ClientGatewaySessionLifecycleResult {
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientDeviceActivationPresentationRequest {
-    pub gateway_base_url: GatewayBaseUrl,
-    pub created_device: AuthDeviceCreateResponse,
-    pub app_url_scheme: PioneerAppUrlScheme,
+#[serde(untagged, deny_unknown_fields)]
+pub enum ClientDeviceActivationPresentationRequest {
+    Current {
+        generation: u64,
+    },
+    Created {
+        gateway_base_url: GatewayBaseUrl,
+        created_device: AuthDeviceCreateResponse,
+        app_url_scheme: PioneerAppUrlScheme,
+    },
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -70,14 +75,27 @@ impl ClientDeviceActivationPresentationResult {
     pub fn from_request(
         request: ClientDeviceActivationPresentationRequest,
     ) -> Result<Self, String> {
-        let gateway_base_url = request.gateway_base_url.clone();
+        let ClientDeviceActivationPresentationRequest::Created {
+            gateway_base_url,
+            created_device,
+            app_url_scheme,
+        } = request
+        else {
+            return Err("activation presentation requires its Client owner".into());
+        };
         let presentation =
             pioneer_client::gateway::device_activation::DeviceActivationQrPresentation::from_created_device_with_scheme(
-                &request.gateway_base_url,
-                request.created_device,
-                request.app_url_scheme,
+                &gateway_base_url,
+                created_device,
+                app_url_scheme,
             )
             .map_err(|error| error.to_string())?;
+        Self::from_presentation(presentation)
+    }
+    pub fn from_presentation(
+        presentation: pioneer_client::gateway::device_activation::DeviceActivationQrPresentation,
+    ) -> Result<Self, String> {
+        let gateway_base_url = presentation.gateway_base_url.clone();
         Ok(Self {
             device_id: presentation.device_id.clone(),
             session_id: presentation.session_id.clone(),
@@ -329,7 +347,7 @@ mod tests {
     fn activation_direct_call_contract_round_trips_and_redacts_debug() {
         let token = "K7M4-P9Q2".to_owned();
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
-        let request = ClientDeviceActivationPresentationRequest {
+        let request = ClientDeviceActivationPresentationRequest::Created {
             gateway_base_url: GatewayBaseUrl::parse_presentation(
                 "https://gateway.example/pioneer/",
             )

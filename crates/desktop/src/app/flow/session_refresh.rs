@@ -12,23 +12,27 @@ enum DesktopSessionConnectionMode {
 }
 
 impl PioneerDesktop {
-    pub(in crate::app::flow) fn schedule_gateway_session_refresh(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn schedule_gateway_session_refresh(&mut self, cx: &mut Context<Self>) {
         self.gateway.session_binding.synchronize(
             self.gateway
                 .client_runtime
                 .client_core()
                 .snapshot(&pioneer_client::core::ClientScope::Session),
         );
-        let Some(delay) = self.gateway.runtime.as_ref().and_then(|runtime| {
-            self.gateway.session_binding.refresh_delay(
-                runtime.active_gateway_id()?,
-                unix_timestamp_secs(),
-                DESKTOP_ACCESS_REFRESH_LEEWAY_SECONDS,
-            )
-        }) else {
+        let Some(delay) = self
+            .gateway
+            .client_runtime
+            .client_core()
+            .gateway_registry()
+            .as_ref()
+            .and_then(|runtime| {
+                self.gateway.session_binding.refresh_delay(
+                    runtime.active_gateway_id()?,
+                    unix_timestamp_secs(),
+                    DESKTOP_ACCESS_REFRESH_LEEWAY_SECONDS,
+                )
+            })
+        else {
             return;
         };
         let Some(generation) = self
@@ -111,19 +115,27 @@ impl PioneerDesktop {
     }
 
     pub(crate) fn recover_gateway_session_on_foreground(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.gateway.runtime.as_ref() else {
+        let core = self.gateway.client_runtime.client_core();
+        let registry = core.gateway_registry();
+        let Some(runtime) = registry.as_ref() else {
             return;
         };
         let Some(endpoint_id) = runtime.active_gateway_id() else {
             return;
         };
-        if runtime.session_terminal_reason(endpoint_id).is_some() {
+        if core
+            .gateway_session()
+            .terminal_reason(endpoint_id)
+            .is_some()
+        {
             return;
         }
         let disconnected = self.gateway.ws_connection_id.is_none()
             || self.gateway.connection_state == GatewayConnectionState::Disconnected;
-        let refresh_due = runtime
-            .active_session_refresh_delay(
+        let refresh_due = core
+            .gateway_session()
+            .refresh_delay(
+                endpoint_id,
                 unix_timestamp_secs(),
                 DESKTOP_ACCESS_REFRESH_LEEWAY_SECONDS,
             )
@@ -233,9 +245,11 @@ impl PioneerDesktop {
         }
         let Some(endpoint_id) = self
             .gateway
-            .runtime
+            .client_runtime
+            .client_core()
+            .gateway_registry()
             .as_ref()
-            .and_then(GatewayRuntime::active_gateway_id)
+            .and_then(pioneer_client::gateway::types::GatewayRegistry::active_gateway_id)
             .map(str::to_owned)
         else {
             return;
@@ -264,12 +278,20 @@ impl PioneerDesktop {
             async move {
                 let result = cx
                     .background_spawn(async move {
-                        let mut runtime = GatewayRuntime::load(client_core.clone())?;
-                        let outcome = match mode {
-                            DesktopSessionConnectionMode::ReplaceActive => runtime
-                                .replace_gateway_session_access(endpoint_id.as_str(), &sender)?,
-                            DesktopSessionConnectionMode::RecoverDisconnected => runtime
-                                .recover_gateway_session_access(endpoint_id.as_str(), &sender)?,
+                        let outcome=match mode{
+                            DesktopSessionConnectionMode::ReplaceActive=>match client_core.refresh_configured_gateway_session(&endpoint_id){
+                                Ok(result)=>DesktopSessionConnectionOutcome::Connected{connection_id:result.connection_id,metadata:result.metadata,access_expires_at_unix:result.access_expires_at_unix},
+                                Err(pioneer_client::gateway::session_connection::GatewaySessionConnectionFailure::Terminal{reason})=>DesktopSessionConnectionOutcome::Terminal(pioneer_client::gateway::session_refresh::GatewaySessionTerminal{metadata:None,reason}),
+                                Err(error)=>return Err(error.into()),
+                            },
+                            DesktopSessionConnectionMode::RecoverDisconnected=>match client_core.ensure_configured_gateway_session(&endpoint_id,true)?{
+                                pioneer_client::gateway::session_refresh::GatewaySessionPreparation::Terminal(terminal)=>DesktopSessionConnectionOutcome::Terminal(terminal),
+                                pioneer_client::gateway::session_refresh::GatewaySessionPreparation::Ready(ready)=>{
+                                    let access_expires_at_unix=ready.spec.identity.access_expires_at_unix;
+                                    let connection_id=client_core.start_gateway_session_transport(ready.spec.into_connect_spec(),true)?;
+                                    DesktopSessionConnectionOutcome::Connected{connection_id,metadata:ready.metadata,access_expires_at_unix}
+                                }
+                            }
                         };
                         let restored_thread = match (&outcome, active_thread_scope) {
                             (
@@ -285,7 +307,7 @@ impl PioneerDesktop {
                             }
                             _ => None,
                         };
-                        Ok::<_, anyhow::Error>((runtime, outcome, mode, restored_thread))
+                        Ok::<_, anyhow::Error>((outcome, mode, restored_thread))
                     })
                     .await;
                 let _ = this.update(&mut cx, |view, cx| {
@@ -299,12 +321,10 @@ impl PioneerDesktop {
                     }
                     match result {
                         Ok((
-                            runtime,
                             DesktopSessionConnectionOutcome::Connected { connection_id, .. },
                             mode,
                             restored_thread,
                         )) => {
-                            view.gateway.runtime = Some(runtime);
                             view.gateway.ws_connection_id = Some(connection_id);
                             if mode == DesktopSessionConnectionMode::RecoverDisconnected {
                                 view.gateway.connection_state = GatewayConnectionState::Connecting;
@@ -349,13 +369,11 @@ impl PioneerDesktop {
                             view.schedule_gateway_session_refresh(cx);
                         }
                         Ok((
-                            runtime,
                             DesktopSessionConnectionOutcome::Terminal(terminal),
                             _,
                             _,
                         )) => {
                             view.active_thread_resubscribe_pending = false;
-                            view.gateway.runtime = Some(runtime);
                             view.discard_deferred_gateway_ws_events();
                             view.gateway.ws_connection_id = None;
                             view.gateway.connection_state = GatewayConnectionState::Disconnected;

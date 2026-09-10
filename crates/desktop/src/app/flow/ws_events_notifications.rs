@@ -125,9 +125,10 @@ impl PioneerDesktop {
                     auth.principal.id == notification.principal_id
                 })
         );
-        if current_profile_changed { self.refresh_current_principal(cx); }
+        if current_profile_changed {
+            self.refresh_current_principal(cx);
+        }
     }
-
 
     fn apply_access_changed_notification(
         &mut self,
@@ -146,7 +147,6 @@ impl PioneerDesktop {
             return;
         }
 
-
         // A newer revision is one atomic fence across global, workspace and
         // thread projections. No capability from the previous generation may
         // remain readable while its replacement is fetched.
@@ -163,11 +163,10 @@ impl PioneerDesktop {
             && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked;
         let active_editor_lost = workspace_access_lost
             && self
-                .active_agents_doc_editor_scope
+                .agents_doc_editor
                 .as_ref()
-                .is_some_and(|scope| scope.workspace_id() == plan.workspace_id);
+                .is_some_and(|editor| editor.read(cx).scope().workspace_id() == plan.workspace_id);
         if active_editor_lost {
-            self.active_agents_doc_editor_scope = None;
             self.agents_doc_editor = None;
             if self.main_content_view() == MainContentView::AgentsDoc {
                 self.set_main_content_view(MainContentView::Threads, cx);
@@ -226,13 +225,16 @@ impl PioneerDesktop {
     fn active_workspace_scope_for_notifications(&self) -> Option<String> {
         let runtime_workspace_id = self
             .gateway
-            .runtime
+            .client_runtime
+            .client_core()
+            .gateway_registry()
             .as_ref()
-            .and_then(GatewayRuntime::active_workspace_id);
+            .and_then(pioneer_client::gateway::types::GatewayRegistry::active_workspace_id)
+            .map(str::to_owned);
         workspace_selectors::resolve_workspace_scope(
             self.active_workspace_id(),
             self.preferred_workspace_id(),
-            runtime_workspace_id,
+            runtime_workspace_id.as_deref(),
         )
     }
 }
@@ -443,7 +445,7 @@ mod access_change_tests {
             "self.thread_folders",
             "self.thread_placements",
             "self.thread_agents_doc_summaries",
-            "self.active_agents_doc_editor_scope = None",
+            "self.agents_doc_editor = None",
             "PendingRequestsReduction::ClearWorkspace",
             "*self.thread_timeline_view_state.borrow_mut() = Default::default()",
             "self.thread_timeline_item_expanded.borrow_mut().clear()",

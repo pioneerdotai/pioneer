@@ -1117,3 +1117,39 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+impl ProviderCollectionPublication {
+    pub(crate) fn for_test(
+        key: ProviderCollectionKey,
+        providers: Vec<ProviderSummary>,
+        models: Vec<ProviderModelInfo>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            revision: 1,
+            request: ProviderLoadState::Ready,
+            providers: providers
+                .into_iter()
+                .map(|provider| {
+                    Arc::new(ProviderCatalogRow {
+                        id: provider.name.clone(),
+                        revision: 1,
+                        provider,
+                    })
+                })
+                .collect(),
+            models: models
+                .into_iter()
+                .map(|model| {
+                    Arc::new(ProviderModelRow {
+                        id: model.id.clone(),
+                        revision: 1,
+                        model,
+                    })
+                })
+                .collect(),
+            runtime_models: None,
+        })
+    }
+}

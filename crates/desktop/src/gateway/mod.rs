@@ -1,7 +1,7 @@
-mod activation;
 mod connectivity;
 mod control;
 mod http;
+pub(crate) mod onboarding_platform;
 mod registry;
 mod runtime;
 mod secrets;
@@ -10,15 +10,13 @@ mod identity_binding;
 pub(crate) use identity_binding::IdentityAuthorizationBinding;
 mod session_binding;
 pub(crate) use session_binding::GatewaySessionBinding;
-mod timings;
+pub(crate) mod timings;
 mod ws;
 
 pub(crate) use control::GatewayInstallWarning;
 pub(crate) use http::DesktopGatewayHttpClient;
-pub(crate) use runtime::observe_startup_stage;
-pub(crate) use runtime::{DesktopInvitationCommitError, DesktopInvitationRegistryRecovery};
-pub(crate) use runtime::{DesktopSessionConnectionOutcome, DesktopSessionPreparation};
-pub use runtime::{GatewayRuntime, ensure_runtime_home_dir};
+pub(crate) use runtime::DesktopSessionConnectionOutcome;
+pub use runtime::ensure_runtime_home_dir;
 pub(crate) use ws::DesktopGatewayWsCommandSenderExt;
 pub use ws::GatewayWsCommandSender;
 
@@ -86,7 +84,7 @@ impl ClientRuntime {
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-mod settings_binding;
-pub(crate) use settings_binding::GatewaySettingsBinding;
+#[cfg(test)]
+mod session_storage_tests;

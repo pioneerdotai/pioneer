@@ -8,26 +8,14 @@ impl gpui_kit::EventEmitter<SidebarChanged> for LegacyScreenAdapter {}
 #[derive(PartialEq)]
 pub(super) struct FramePresentation {
     window_route: crate::desktop_navigation::WindowRoute,
-    switcher: bool,
-    keepawake: Option<bool>,
     can_manage: bool,
     can_notify: bool,
 }
 impl LegacyScreenAdapter {
-    pub(super) fn publish_frame_changes(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn publish_frame_changes(&mut self, cx: &mut Context<Self>) {
         let capabilities = self.principal_presentation_capabilities();
         let frame = FramePresentation {
             window_route: self.window_route(),
-            switcher: self
-                .gateway
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| !runtime.endpoints().is_empty()),
-            keepawake: self
-                .gateway
-                .settings
-                .as_ref()
-                .map(|settings| settings.general.keepawake),
             can_manage: capabilities.can_manage_capabilities,
             can_notify: capabilities.can_read_own_notifications,
         };

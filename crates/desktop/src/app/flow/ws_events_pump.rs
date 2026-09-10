@@ -1,8 +1,5 @@
 use super::helpers::desktop_session_terminal_message;
-use crate::{
-    app::root::{GatewayConnectionState, MainContentView, PioneerDesktop},
-    gateway::GatewayRuntime,
-};
+use crate::app::root::{GatewayConnectionState, MainContentView, PioneerDesktop};
 use gpui_kit::{AsyncApp, Context, WeakEntity, prelude::*};
 use pioneer_client::runtime::ClientRuntimePostEventSink;
 use pioneer_client::transport::ws::GatewayWsEvent;
@@ -35,10 +32,8 @@ impl PioneerDesktop {
                         if provider_startup != stage { provider_startup = stage; if view.startup.is_presenting() { cx.notify(); } }
                         view.apply_gateway_session_publication(&publication, cx);
                         let Some(endpoint) = view
-                            .gateway
-                            .runtime
-                            .as_ref()
-                            .and_then(GatewayRuntime::active_gateway_id)
+                            .gateway.client_runtime.client_core().gateway_registry().as_ref()
+                            .and_then(pioneer_client::gateway::types::GatewayRegistry::active_gateway_id)
                             .map(str::to_owned)
                         else {
                             return;
@@ -77,38 +72,6 @@ impl PioneerDesktop {
                         } else {
                             view.recover_gateway_session_now(cx);
                         }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
-        let settings = self.gateway.settings_binding.clone();
-        let mut settings_publications = settings.watch();
-        self.gateway.settings_task = Some(cx.spawn(async move |view, cx| {
-            let mut voice = None;
-            while settings_publications.changed().await.is_ok() {
-                let _ = *settings_publications.borrow_and_update();
-                let Some(publication) = settings.publication() else {
-                    continue;
-                };
-                if view
-                    .update(cx, |view, cx| {
-                        view.gateway.settings = publication.settings.clone();
-                        view.gateway.settings_loading = publication.loading;
-                        view.gateway.settings_error = publication.error.clone();
-                        let voice_changed = voice != publication.voice_input;
-                        voice = publication.voice_input.clone();
-                        if (publication.vector_refill_refresh_requested
-                            || (voice_changed && voice.is_some() && publication.settings.is_none()))
-                            && !publication.loading
-                            && !publication.saving
-                        {
-                            view.refresh_gateway_settings(cx);
-                        }
-                        // Settings and voice presentation still belong to their legacy feature root.
-                        cx.notify();
                     })
                     .is_err()
                 {
@@ -218,7 +181,7 @@ impl PioneerDesktop {
             .client_core()
             .partition_gateway_compatibility_events(
                 self.gateway.ws_connection_id,
-                self.gateway.connecting
+                self.gateway_busy()
                     || self
                         .gateway
                         .client_runtime
@@ -289,10 +252,7 @@ impl PioneerDesktop {
         }
     }
 
-    pub(in crate::app::flow) fn replay_deferred_gateway_ws_events(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
+    pub(in crate::app) fn replay_deferred_gateway_ws_events(&mut self, cx: &mut Context<Self>) {
         let publication = self.gateway.client_runtime.client_core().gateway_session();
         self.apply_gateway_session_publication(&publication, cx);
         let active_connection_id = self.gateway.ws_connection_id;
@@ -351,7 +311,7 @@ impl PioneerDesktop {
         publication: &pioneer_client::gateway::session_controller::GatewaySessionPublication,
         cx: &mut Context<Self>,
     ) {
-        if self.gateway.connecting {
+        if self.gateway_busy() {
             return;
         }
         let Some(endpoint_id) = publication.startup.endpoint_id.as_deref() else {
@@ -359,9 +319,11 @@ impl PioneerDesktop {
         };
         if self
             .gateway
-            .runtime
+            .client_runtime
+            .client_core()
+            .gateway_registry()
             .as_ref()
-            .and_then(GatewayRuntime::active_gateway_id)
+            .and_then(pioneer_client::gateway::types::GatewayRegistry::active_gateway_id)
             != Some(endpoint_id)
         {
             return;
@@ -380,14 +342,9 @@ impl PioneerDesktop {
             let sender = self.gateway.client_runtime.ws_command_sender().clone();
             self.gateway.transport_verification_task = Some(cx.spawn(async move |_view, cx| {
                 let _ = cx.background_spawn(async move {
-                    match GatewayRuntime::load(client_core.clone()) {
-                        Ok(runtime) => runtime.verify_gateway_session_identity(&endpoint_id, &sender).map(|_| ()),
-                        Err(error) => {
-                            client_core.reject_gateway_session_identity(&endpoint_id, connection_id,
-                                pioneer_client::gateway::session_connection::GatewaySessionConnectionFailure::Unavailable { code: format!("{error:#}") });
-                            Err(error)
-                        }
-                    }
+                    client_core.verify_configured_gateway_session(&endpoint_id).map(|_|()).map_err(|error|{
+                        client_core.reject_gateway_session_identity(&endpoint_id,connection_id,pioneer_client::gateway::session_connection::GatewaySessionConnectionFailure::Unavailable{code:"gateway_identity_unavailable".into()});error
+                    })
                 }).await;
             }));
             return;
@@ -450,7 +407,6 @@ impl PioneerDesktop {
             .client_runtime
             .client_core()
             .cancel_gateway_refresh();
-        self.gateway.auth_session_action_pending = None;
         self.discard_deferred_gateway_ws_events();
         self.clear_authorization_epoch_cache();
         self.gateway.current_auth = None;

@@ -68,7 +68,9 @@ impl DesktopStartupCoordinator {
         }
     }
 
-    pub(super) fn is_presenting(&self) -> bool { !self.finalized && !self.frame_scheduled }
+    pub(super) fn is_presenting(&self) -> bool {
+        !self.finalized && !self.frame_scheduled
+    }
 
     pub(super) fn diagnostic_trace(&self) -> DesktopStartupTrace {
         self.trace.clone()
@@ -350,7 +352,13 @@ impl PioneerDesktop {
             return;
         }
 
-        if self.gateway.runtime.is_some() {
+        if self
+            .gateway
+            .client_runtime
+            .client_core()
+            .gateway_registry()
+            .is_some()
+        {
             self.startup
                 .succeed(DesktopStartupStage::GatewayRuntimeLoad);
         }
@@ -399,10 +407,10 @@ impl PioneerDesktop {
 
         let outcome = if let Some(outcome) = self.startup.terminal_failure_outcome() {
             Some(outcome)
-        } else if self.gateway.bootstrap_complete && self.is_gateway_setup_required() {
+        } else if self.gateway_bootstrap_complete() && self.is_gateway_setup_required() {
             Some(DesktopStartupOutcome::SetupRequired)
-        } else if self.gateway.bootstrap_complete
-            && !self.gateway.connecting
+        } else if self.gateway_bootstrap_complete()
+            && !self.gateway_busy()
             && self.gateway.connection_state == GatewayConnectionState::Disconnected
         {
             Some(DesktopStartupOutcome::Degraded)

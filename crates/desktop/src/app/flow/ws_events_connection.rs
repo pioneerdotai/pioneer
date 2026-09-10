@@ -12,11 +12,6 @@ impl PioneerDesktop {
         self.gateway.connection_state = reduction.connection_state;
         self.gateway.error = reduction.gateway_error;
 
-        let settings = self.gateway.client_runtime.client_core().gateway_settings();
-        self.gateway.settings = settings.settings;
-        self.gateway.settings_loading = settings.loading;
-        self.gateway.settings_error = settings.error;
-
         self.read_workspace_catalog_output();
         if reduction.clear_active_thread {
             self.set_active_thread_id(None);
@@ -38,9 +33,6 @@ impl PioneerDesktop {
                 .client_runtime
                 .client_core()
                 .cancel_thread_requests();
-            self.voice_input_action_error = None;
-            self.voice_input_action_generation = self.voice_input_action_generation.wrapping_add(1);
-            self.pending_voice_input_enabled = None;
         }
 
         if let Some(cx) = cx.as_deref_mut() {
@@ -56,7 +48,6 @@ impl PioneerDesktop {
                 self.gateway.capability_snapshot = None;
 
                 self.member_avatar_state.clear();
-
             }
             execute_desktop_client_effects(self, reduction.effects, cx);
         }
@@ -140,7 +131,7 @@ mod authorization_epoch_tests {
             "self.read_workspace_catalog_output()",
             "self.clear_thread_conversations()",
             "self.thread_artifacts = Default::default()",
-            "self.active_agents_doc_editor_scope = None",
+            "self.agents_doc_editor = None",
             "self.clear_workspace_capability_projections()",
         ] {
             assert!(

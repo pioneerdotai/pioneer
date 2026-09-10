@@ -266,6 +266,12 @@ mod tests {
 }
 
 impl pioneer_client::gateway::session_refresh::GatewaySessionStorage for DesktopSecrets {
+    fn delete(&self, endpoint: &pioneer_client::gateway::types::GatewayEndpoint) -> Result<()> {
+        if let Some(reference) = endpoint.session_ref.as_deref() {
+            self.delete_gateway_session(reference)?;
+        }
+        Ok(())
+    }
     fn load(
         &self,
         endpoint: &pioneer_client::gateway::types::GatewayEndpoint,

@@ -26,8 +26,6 @@ use pioneer_protocol::{ArtifactRef, AuthSessionId};
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
-use super::{DesktopSessionConnectionOutcome, GatewayRuntime};
-
 #[derive(Clone)]
 pub(crate) struct DesktopGatewayHttpClient {
     endpoint_id: String,
@@ -196,22 +194,10 @@ impl GatewayHttpSessionAuthority for DesktopGatewayHttpAuthority {
             {
                 return Ok(current);
             }
-            let mut runtime = GatewayRuntime::load(client_core)
-                .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?;
-            match runtime
-                .replace_gateway_session_access_after_rejection(
-                    endpoint_id.as_str(),
-                    &sender,
-                    rejected_generation,
-                )
-                .map_err(|_| GatewayHttpAuthorityError::TemporarilyUnavailable)?
-            {
-                None | Some(DesktopSessionConnectionOutcome::Connected { .. }) => {
-                    sender.current_gateway_http_access()
-                }
-                Some(DesktopSessionConnectionOutcome::Terminal(terminal)) => {
-                    Err(GatewayHttpAuthorityError::Terminal(terminal.reason))
-                }
+            match client_core.refresh_configured_gateway_session_after_unauthorized(&endpoint_id,rejected_generation){
+                Ok(_)=>sender.current_gateway_http_access(),
+                Err(pioneer_client::gateway::session_connection::GatewaySessionConnectionFailure::Terminal{reason})=>Err(GatewayHttpAuthorityError::Terminal(reason)),
+                Err(_)=>Err(GatewayHttpAuthorityError::TemporarilyUnavailable),
             }
         })
         .await

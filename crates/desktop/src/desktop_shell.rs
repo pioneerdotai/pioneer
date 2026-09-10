@@ -54,6 +54,7 @@ pub(crate) struct DesktopShellView {
     _frame_subscription: Subscription,
     _activation_subscription: Subscription,
     route_task: Option<Task<()>>,
+    close_task: Option<Task<()>>,
     mounted_route: Arc<DesktopRouteSnapshot>,
 }
 impl DesktopShellView {
@@ -271,8 +272,9 @@ impl DesktopShellView {
         });
         let shell = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            let _ = shell.update(cx, |view, cx| view.close(window, cx));
-            true
+            shell
+                .update(cx, |view, cx| view.request_close(window, cx))
+                .unwrap_or(true)
         });
         let mut view = Self {
             thread: None,
@@ -293,6 +295,7 @@ impl DesktopShellView {
             _frame_subscription: frame_subscription,
             _activation_subscription: activation_subscription,
             route_task: Some(route_task),
+            close_task: None,
         };
         view.mount_thread(window, cx);
         view
@@ -370,7 +373,62 @@ impl DesktopShellView {
             legacy.update(cx, |legacy, cx| legacy.activate_navigation(route, cx));
         }
     }
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.close_task.is_some() {
+            return false;
+        }
+        let last_window = cx.windows().len() == 1;
+        let scope = (!last_window)
+            .then(|| {
+                self.legacy
+                    .as_ref()
+                    .and_then(|legacy| legacy.read(cx).agents_document_scope(cx))
+            })
+            .flatten();
+        if scope.is_none() && !last_window {
+            self.close(window, cx);
+            return true;
+        }
+        let core = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core();
+        let handle = window.window_handle();
+        self.close_task = Some(cx.spawn(async move |shell, cx| {
+            let result = core
+                .flush_agents_documents_before_close(scope.clone())
+                .await;
+            let _ = cx.update_window(handle, |_, window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.close_task.take();
+                    match result.and_then(|_| core.agents_documents_close_status(scope.as_ref())) {
+                        Ok(true) => {
+                            shell.close(window, cx);
+                            window.remove_window();
+                        }
+                        Ok(false) => {
+                            shell.request_close(window, cx);
+                        }
+                        Err(error) => shell.present_document_close_error(&error, window, cx),
+                    }
+                })
+            });
+        }));
+        false
+    }
+    pub(crate) fn present_document_close_error(
+        &mut self,
+        error: &pioneer_client::agents_doc::controller::AgentsDocumentCloseError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(legacy) = &self.legacy {
+            legacy.update(cx, |legacy, cx| {
+                legacy.present_document_close_error(error, window, cx)
+            });
+        }
+    }
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_task.take();
         window.close_all_dialogs(cx);
         window.close_sheet(cx);
         self.layout

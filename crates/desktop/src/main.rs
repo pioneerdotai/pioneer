@@ -14,6 +14,7 @@ mod desktop_shell;
 mod file_opener;
 mod gateway;
 mod menu;
+mod profile_photo;
 mod qualification_diagnostics;
 mod render_guard;
 mod settings;

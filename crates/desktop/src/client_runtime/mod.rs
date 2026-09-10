@@ -18,6 +18,7 @@ pub(crate) struct DesktopRuntimeCoordinator {
     storage_adapter: Option<DesktopSessionStorageAdapter>,
     _effect_router: Arc<DesktopPlatformEffectRouter>,
     _quit: Subscription,
+    quit_task: Option<gpui_kit::Task<()>>,
     #[cfg(test)]
     pub(crate) skip_native_startup: bool,
 }
@@ -40,6 +41,7 @@ impl DesktopRuntimeCoordinator {
             storage_adapter: None,
             _effect_router: Arc::new(DesktopPlatformEffectRouter),
             _quit: quit,
+            quit_task: None,
             skip_native_startup: true,
         });
     }
@@ -70,9 +72,28 @@ impl DesktopRuntimeCoordinator {
             owner
                 .binding_router
                 .update(cx, |router, _| router.shutdown());
-            owner.core.shutdown();
             let adapter = owner.storage_adapter.take();
+            let core = owner.core.clone();
+            let deadline = cx
+                .background_executor()
+                .timer(std::time::Duration::from_millis(100));
             let cleanup = cx.background_spawn(async move {
+                // OS-forced quit has GPUI's 200 ms shutdown budget. Ordinary
+                // menu/window closes already passed the unbounded save barrier.
+                // Keep this final attempt bounded, and report cancellation
+                // without logging document contents or claiming a successful save.
+                let flush = Box::pin(core.flush_agents_documents_before_close(None));
+                let deadline = Box::pin(deadline);
+                let saved = matches!(
+                    futures_util::future::select(flush, deadline).await,
+                    futures_util::future::Either::Left((Ok(()), _))
+                );
+                if !saved {
+                    tracing::warn!(
+                        "Agents document save could not finish before forced process shutdown"
+                    );
+                }
+                core.shutdown();
                 if let Some(adapter) = adapter {
                     adapter.join();
                 }
@@ -89,9 +110,52 @@ impl DesktopRuntimeCoordinator {
             storage_adapter: Some(storage_adapter),
             _effect_router: effect_router,
             _quit: quit,
+            quit_task: None,
             #[cfg(test)]
             skip_native_startup: false,
         });
+    }
+
+    /// Menu/keyboard quit waits before entering GPUI's bounded final shutdown.
+    pub(crate) fn request_quit(cx: &mut App) {
+        if !cx.has_global::<Self>() {
+            cx.quit();
+            return;
+        }
+        let owner = cx.global::<Self>();
+        if owner.quit_task.is_some() {
+            return;
+        }
+        let core = owner.core.clone();
+        let task = cx.spawn(async move |cx| {
+            let result = core.flush_agents_documents_before_close(None).await;
+            let _ = cx.update(|cx| {
+                cx.global_mut::<Self>().quit_task.take();
+                match result.and_then(|_| core.agents_documents_close_status(None)) {
+                    Ok(true) => cx.quit(),
+                    Ok(false) => Self::request_quit(cx),
+                    Err(error) => {
+                        for handle in cx.windows() {
+                            let _ = handle.update(cx, |root, window, cx| {
+                                if let Ok(root) =
+                                    root.clone().downcast::<gpui_kit::component::Root>()
+                                {
+                                    let content = root.read(cx).view().clone();
+                                    if let Ok(shell) =
+                                        content.downcast::<crate::desktop_shell::DesktopShellView>()
+                                    {
+                                        shell.update(cx, |shell, cx| {
+                                            shell.present_document_close_error(&error, window, cx)
+                                        });
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        });
+        cx.global_mut::<Self>().quit_task = Some(task);
     }
 
     /// Deliver already committed publications after a synchronous UI command.

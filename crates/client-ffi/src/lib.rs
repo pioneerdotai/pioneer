@@ -79,8 +79,7 @@ use gateway::{
     plan_activate_gateway_registry_request, plan_add_and_activate_remote_gateway_registry_request,
     plan_add_remote_gateway_request, plan_delete_remote_gateway_registry_request,
     plan_set_gateway_workspace_registry_request, plan_update_remote_gateway_registry_request,
-    validate_remote_gateway_request,
-    voice_input_plan_for_bridge,
+    validate_remote_gateway_request, voice_input_plan_for_bridge,
 };
 use invitation::{
     ClientInvitationAcceptRequest, ClientInvitationAcceptResult, ClientInvitationAccessResult,
@@ -94,7 +93,6 @@ use pending_requests::{
     ClientPendingRequestResponsePlanRequest, ClientPendingRequestResponsePlanResult,
     pending_request_presentation_for_bridge, plan_pending_request_response_for_bridge,
 };
-use pioneer_client::gateway::invitation::InvitationSessionCommitState;
 #[cfg(test)]
 use pioneer_client::timeline::semantic::WorkPageMergeMode;
 use pioneer_client::{
@@ -107,13 +105,10 @@ use pioneer_client::{
         ActivateGatewayRegistryPlan, DeleteRemoteGatewayRegistryPlan, RemoteGatewayValidation,
         SetGatewayWorkspaceRegistryPlan, UpdateRemoteGatewayRegistryPlan,
     },
-    providers::{
-        presentation::{
-            ProviderModelDisplayKey, ProviderModelDisplayResolution, ReasoningEffortRowsRequest,
-            ReasoningEffortRowsResponse, provider_model_display_key,
-            reasoning_effort_rows_from_request,
-            resolve_provider_model_display_from_response,
-        },
+    providers::presentation::{
+        ProviderModelDisplayKey, ProviderModelDisplayResolution, ReasoningEffortRowsRequest,
+        ReasoningEffortRowsResponse, provider_model_display_key,
+        reasoning_effort_rows_from_request, resolve_provider_model_display_from_response,
     },
     runtime::ClientRuntime,
     timeline::rows::{MessageRevisionPagePresentation, project_message_revision_page},
@@ -180,7 +175,9 @@ use workspaces::{
 use zeroize::Zeroizing;
 
 const FFI_VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_OUTSTANDING_INVITATION_COMMITS: usize = 16;
+#[cfg(test)]
+const MAX_OUTSTANDING_INVITATION_COMMITS: usize =
+    pioneer_client::gateway::invitation_commits::MAX_OUTSTANDING_INVITATION_COMMITS;
 
 pub struct PioneerClientFfi {
     runtime: ClientFfiRuntime,
@@ -196,9 +193,6 @@ struct ClientFfiRuntime {
     legacy_authorization_change_sequence: AtomicU64,
     diagnostics: ClientFfiDiagnostics,
     avatar_cache: ClientFfiAvatarCache,
-    invitation_commit_sequence: AtomicU64,
-    invitation_commits:
-        Mutex<HashMap<String, pioneer_client::gateway::invitation::InvitationSessionCommit>>,
 }
 
 impl Default for ClientFfiRuntime {
@@ -215,8 +209,6 @@ impl Default for ClientFfiRuntime {
             legacy_authorization_change_sequence: Default::default(),
             diagnostics: Default::default(),
             avatar_cache: Default::default(),
-            invitation_commit_sequence: Default::default(),
-            invitation_commits: Default::default(),
         }
     }
 }
@@ -265,17 +257,6 @@ impl std::ops::Deref for ClientRuntimeCompatibility {
     fn deref(&self) -> &Self::Target {
         self.core.compatibility_runtime()
     }
-}
-
-fn contains_session_termination(events: &[ClientEvent]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            ClientEvent::GatewayNotification(
-                pioneer_protocol::GatewayNotification::AuthSessionRevoked(_)
-            )
-        )
-    })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -409,6 +390,12 @@ impl ClientFfiRuntime {
                     | ClientScope::SkillsDetails { .. }
                     | ClientScope::SkillsAction { .. }
                     | ClientScope::SkillsUpload { .. }
+                    | ClientScope::AgentsDocumentContent { .. }
+                    | ClientScope::AuthSessions
+                    | ClientScope::Profile
+                    | ClientScope::DeviceActivation
+                    | ClientScope::SettingsPage { .. }
+                    | ClientScope::SettingsModelPicker { .. }
             ) =>
             {
                 Some(scope.clone())
@@ -730,6 +717,20 @@ impl ClientFfiRuntime {
                         auth::INVALID_AUTH_REQUEST_CODE,
                     )
                 })?;
+        if let auth::ClientDeviceActivationPresentationRequest::Current { generation } = request {
+            let presentation = self
+                .client_runtime
+                .core
+                .device_activation_presentation(generation)
+                .ok_or_else(|| {
+                    ClientFfiError::new(
+                        "activation presentation is no longer available",
+                        "activation_stale",
+                    )
+                })?;
+            return auth::ClientDeviceActivationPresentationResult::from_presentation(presentation)
+                .map_err(|message| ClientFfiError::new(message, auth::INVALID_AUTH_REQUEST_CODE));
+        }
         auth::ClientDeviceActivationPresentationResult::from_request(request)
             .map_err(|message| ClientFfiError::new(message, auth::INVALID_AUTH_REQUEST_CODE))
     }
@@ -907,10 +908,6 @@ impl ClientFfiRuntime {
             .core
             .logout_auth_session()
             .map_err(normal_auth_error)?;
-        self.invitation_commits
-            .lock()
-            .map_err(|_| invitation_commit_lock_error())?
-            .clear();
         Ok(response)
     }
 
@@ -958,11 +955,13 @@ impl ClientFfiRuntime {
         let presentation = invitation::parse_preview(&request).map_err(|message| {
             ClientFfiError::new(message, invitation::INVALID_INVITATION_REQUEST_CODE)
         })?;
-        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
-            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
-        runtime
-            .block_on(client.preview_invitation(&presentation))
-            .map_err(invitation::exchange_error)
+        self.client_runtime
+            .core
+            .preview_invitation_request(
+                &presentation,
+                std::time::Duration::from_millis(request.timeout_ms),
+            )
+            .map_err(invitation_request_error)
     }
 
     fn invitation_accept(
@@ -980,51 +979,20 @@ impl ClientFfiRuntime {
         let presentation = invitation::parse_accept(&request).map_err(|message| {
             ClientFfiError::new(message, invitation::INVALID_INVITATION_REQUEST_CODE)
         })?;
-        {
-            let commits = self
-                .invitation_commits
-                .lock()
-                .map_err(|_| invitation_commit_lock_error())?;
-            if !invitation_commit_capacity_available(commits.len()) {
-                return Err(invitation_commit_unavailable());
-            }
-        }
-        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
-            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
-        let accepted = runtime
-            .block_on(client.accept_invitation(&presentation, request.params))
-            .map_err(invitation::exchange_error)?;
-        let commit = pioneer_client::gateway::invitation::InvitationSessionCommit::new(
-            &presentation,
-            accepted,
-            request.expected_installation_id.as_str(),
-        )
-        .map_err(|_| {
-            ClientFfiError::new(
-                "invalid invitation session grant",
-                invitation::INVALID_INVITATION_REQUEST_CODE,
+        let (commit_id, state) = self
+            .client_runtime
+            .core
+            .accept_invitation_request(
+                &presentation,
+                request.params,
+                &request.expected_installation_id,
+                std::time::Duration::from_millis(request.timeout_ms),
             )
-        })?;
-        let state = commit.state().into();
-        let sequence = self
-            .invitation_commit_sequence
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
-        let commit_id = format!("invitation_commit_{sequence}");
-        let mut commits = match self.invitation_commits.lock() {
-            Ok(commits) => commits,
-            Err(_) => {
-                cleanup_untracked_invitation_commit(&runtime, &client, commit);
-                return Err(invitation_commit_lock_error());
-            }
-        };
-        if !invitation_commit_capacity_available(commits.len()) {
-            drop(commits);
-            cleanup_untracked_invitation_commit(&runtime, &client, commit);
-            return Err(invitation_commit_unavailable());
-        }
-        commits.insert(commit_id.clone(), commit);
-        Ok(ClientInvitationAcceptResult { commit_id, state })
+            .map_err(invitation_request_error)?;
+        Ok(ClientInvitationAcceptResult {
+            commit_id,
+            state: state.into(),
+        })
     }
 
     fn invitation_commit_take_refresh(
@@ -1033,15 +1001,9 @@ impl ClientFfiRuntime {
     ) -> Result<ClientInvitationRefreshWrite, ClientFfiError> {
         self.require_initialized()?;
         let request = parse_invitation_commit_request(input_json)?;
-        let mut commits = self
-            .invitation_commits
-            .lock()
-            .map_err(|_| invitation_commit_lock_error())?;
-        let commit = commits
-            .get_mut(request.commit_id.as_str())
-            .ok_or_else(invitation_commit_unavailable)?;
-        commit
-            .take_refresh_for_secure_storage()
+        self.client_runtime
+            .core
+            .invitation_commit_take_refresh(&request.commit_id)
             .map(ClientInvitationRefreshWrite::from)
             .map_err(|_| invitation_commit_unavailable())
     }
@@ -1052,15 +1014,9 @@ impl ClientFfiRuntime {
     ) -> Result<ClientInvitationRegistryWrite, ClientFfiError> {
         self.require_initialized()?;
         let request = parse_invitation_commit_request(input_json)?;
-        let mut commits = self
-            .invitation_commits
-            .lock()
-            .map_err(|_| invitation_commit_lock_error())?;
-        let commit = commits
-            .get_mut(request.commit_id.as_str())
-            .ok_or_else(invitation_commit_unavailable)?;
-        commit
-            .secure_storage_committed()
+        self.client_runtime
+            .core
+            .invitation_commit_secure_storage_committed(&request.commit_id)
             .map(ClientInvitationRegistryWrite::from)
             .map_err(|_| invitation_commit_unavailable())
     }
@@ -1071,17 +1027,11 @@ impl ClientFfiRuntime {
     ) -> Result<ClientInvitationAccessResult, ClientFfiError> {
         self.require_initialized()?;
         let request = parse_invitation_commit_request(input_json)?;
-        let mut commits = self
-            .invitation_commits
-            .lock()
-            .map_err(|_| invitation_commit_lock_error())?;
-        let access = commits
-            .get_mut(request.commit_id.as_str())
-            .ok_or_else(invitation_commit_unavailable)?
-            .registry_committed()
-            .map_err(|_| invitation_commit_unavailable())?;
-        commits.remove(request.commit_id.as_str());
-        Ok(access.into())
+        self.client_runtime
+            .core
+            .invitation_commit_registry_committed(&request.commit_id)
+            .map(ClientInvitationAccessResult::from)
+            .map_err(|_| invitation_commit_unavailable())
     }
 
     fn invitation_commit_registry_failed(
@@ -1090,17 +1040,10 @@ impl ClientFfiRuntime {
     ) -> Result<ClientInvitationCommitFailureResult, ClientFfiError> {
         self.require_initialized()?;
         let request = parse_invitation_commit_request(input_json)?;
-        let mut commits = self
-            .invitation_commits
-            .lock()
-            .map_err(|_| invitation_commit_lock_error())?;
-        let commit = commits
-            .get_mut(request.commit_id.as_str())
-            .ok_or_else(invitation_commit_unavailable)?;
-        commit
-            .registry_failed()
+        self.client_runtime
+            .core
+            .invitation_commit_registry_failed(&request.commit_id)
             .map_err(|_| invitation_commit_unavailable())?;
-        commits.remove(request.commit_id.as_str());
         Ok(ClientInvitationCommitFailureResult {
             released: true,
             cleanup_attempted: false,
@@ -1119,39 +1062,13 @@ impl ClientFfiRuntime {
                     invitation::INVALID_INVITATION_REQUEST_CODE,
                 )
             })?;
-        {
-            let commits = self
-                .invitation_commits
-                .lock()
-                .map_err(|_| invitation_commit_lock_error())?;
-            let commit = commits
-                .get(request.commit_id.as_str())
-                .ok_or_else(invitation_commit_unavailable)?;
-            if commit.state() != InvitationSessionCommitState::AwaitingSecureStorage {
-                return Err(invitation_commit_unavailable());
-            }
-        }
-        let (runtime, client) = auth_exchange_runtime(request.timeout_ms)
-            .map_err(|message| ClientFfiError::new(message, auth::AUTH_EXCHANGE_RUNTIME_CODE))?;
-        let commit = {
-            let mut commits = self
-                .invitation_commits
-                .lock()
-                .map_err(|_| invitation_commit_lock_error())?;
-            let commit = commits
-                .get(request.commit_id.as_str())
-                .ok_or_else(invitation_commit_unavailable)?;
-            if commit.state() != InvitationSessionCommitState::AwaitingSecureStorage {
-                return Err(invitation_commit_unavailable());
-            }
-            commits
-                .remove(request.commit_id.as_str())
-                .expect("invitation commit verified under the same lock")
-        };
-        let cleanup = commit
-            .secure_storage_failed()
-            .map_err(|_| invitation_commit_unavailable())?;
-        runtime.block_on(client.cleanup_invitation_session_best_effort(cleanup));
+        self.client_runtime
+            .core
+            .cleanup_failed_invitation_storage(
+                &request.commit_id,
+                std::time::Duration::from_millis(request.timeout_ms),
+            )
+            .map_err(invitation_request_error)?;
         Ok(ClientInvitationCommitFailureResult {
             released: true,
             cleanup_attempted: true,
@@ -1162,7 +1079,10 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<pioneer_protocol::InvitationCreateResponse, ClientFfiError> {
-        if let Ok(request) = serde_json::from_str::<administration_activation::AdministrationActivationRequest>(input_json) {
+        if let Ok(request) = serde_json::from_str::<
+            administration_activation::AdministrationActivationRequest,
+        >(input_json)
+        {
             request.validate()?;
             self.require_initialized_and_connected()?;
             let operation = self.client_runtime.core.take_administration_activation_operation(request.generation,
@@ -1188,7 +1108,9 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::InvitationListResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "invitation list")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime.core.read_administration_invitations(params)
+        self.client_runtime
+            .core
+            .read_administration_invitations(params)
             .map_err(administration_rpc_error)
     }
 
@@ -1212,7 +1134,9 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberListResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member list")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime.core.read_administration_members(params)
+        self.client_runtime
+            .core
+            .read_administration_members(params)
             .map_err(administration_rpc_error)
     }
 
@@ -1262,11 +1186,23 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member suspend")?;
         self.require_initialized_and_connected()?;
-        match self.client_runtime.core.execute_administration_command(
-            pioneer_client::administration::operations::AdministrationCommand::SuspendMember(params),
-        ).map_err(administration_rpc_error)? {
-            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(response) => Ok(response),
-            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        match self
+            .client_runtime
+            .core
+            .execute_administration_command(
+                pioneer_client::administration::operations::AdministrationCommand::SuspendMember(
+                    params,
+                ),
+            )
+            .map_err(administration_rpc_error)?
+        {
+            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(
+                response,
+            ) => Ok(response),
+            _ => Err(ClientFfiError::new(
+                "invalid administration completion",
+                "administration_completion_mismatch",
+            )),
         }
     }
 
@@ -1276,11 +1212,23 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member restore")?;
         self.require_initialized_and_connected()?;
-        match self.client_runtime.core.execute_administration_command(
-            pioneer_client::administration::operations::AdministrationCommand::RestoreMember(params),
-        ).map_err(administration_rpc_error)? {
-            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(response) => Ok(response),
-            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        match self
+            .client_runtime
+            .core
+            .execute_administration_command(
+                pioneer_client::administration::operations::AdministrationCommand::RestoreMember(
+                    params,
+                ),
+            )
+            .map_err(administration_rpc_error)?
+        {
+            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(
+                response,
+            ) => Ok(response),
+            _ => Err(ClientFfiError::new(
+                "invalid administration completion",
+                "administration_completion_mismatch",
+            )),
         }
     }
 
@@ -1290,11 +1238,23 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::MemberMutationResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "member remove")?;
         self.require_initialized_and_connected()?;
-        match self.client_runtime.core.execute_administration_command(
-            pioneer_client::administration::operations::AdministrationCommand::RemoveMember(params),
-        ).map_err(administration_rpc_error)? {
-            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(response) => Ok(response),
-            _ => Err(ClientFfiError::new("invalid administration completion", "administration_completion_mismatch")),
+        match self
+            .client_runtime
+            .core
+            .execute_administration_command(
+                pioneer_client::administration::operations::AdministrationCommand::RemoveMember(
+                    params,
+                ),
+            )
+            .map_err(administration_rpc_error)?
+        {
+            pioneer_client::administration::operations::AdministrationCompletion::MemberChanged(
+                response,
+            ) => Ok(response),
+            _ => Err(ClientFfiError::new(
+                "invalid administration completion",
+                "administration_completion_mismatch",
+            )),
         }
     }
 
@@ -1302,7 +1262,10 @@ impl ClientFfiRuntime {
         &self,
         input_json: &str,
     ) -> Result<pioneer_protocol::MemberDeviceCreateResponse, ClientFfiError> {
-        if let Ok(request) = serde_json::from_str::<administration_activation::AdministrationActivationRequest>(input_json) {
+        if let Ok(request) = serde_json::from_str::<
+            administration_activation::AdministrationActivationRequest,
+        >(input_json)
+        {
             request.validate()?;
             self.require_initialized_and_connected()?;
             let operation = self.client_runtime.core.take_administration_activation_operation(request.generation,
@@ -1328,7 +1291,9 @@ impl ClientFfiRuntime {
     ) -> Result<pioneer_protocol::WorkspaceMemberListResponse, ClientFfiError> {
         let params = parse_normal_params(input_json, "workspace member list")?;
         self.require_initialized_and_connected()?;
-        self.client_runtime.core.read_administration_workspace_members(params)
+        self.client_runtime
+            .core
+            .read_administration_workspace_members(params)
             .map_err(administration_rpc_error)
     }
 
@@ -1657,12 +1622,6 @@ impl ClientFfiRuntime {
             if !events.is_empty() {
                 #[cfg(not(feature = "qualification-diagnostics"))]
                 {
-                    if contains_session_termination(events.as_slice()) {
-                        self.invitation_commits
-                            .lock()
-                            .map_err(|_| "invitation commit state is unavailable".to_owned())?
-                            .clear();
-                    }
                     return Ok(events
                         .into_iter()
                         .filter(is_feature_compatibility_event)
@@ -1680,15 +1639,7 @@ impl ClientFfiRuntime {
                             u64::try_from(events.len()).unwrap_or(u64::MAX),
                         )
                     );
-                    let delivery_result = (|| -> Result<(), String> {
-                        if contains_session_termination(events.as_slice()) {
-                            self.invitation_commits
-                                .lock()
-                                .map_err(|_| "invitation commit state is unavailable".to_owned())?
-                                .clear();
-                        }
-                        Ok(())
-                    })();
+                    let delivery_result = (|| -> Result<(), String> { Ok(()) })();
                     pioneer_observability::record_qualification_diagnostic!(
                         record_client_delivery(
                             pioneer_observability::Shell::Mobile,
@@ -1725,10 +1676,6 @@ impl ClientFfiRuntime {
             .active_connection_id
             .lock()
             .map_err(|_| "client ffi connection lock is poisoned".to_owned())? = None;
-        self.invitation_commits
-            .lock()
-            .map_err(|_| "invitation commit state is unavailable".to_owned())?
-            .clear();
         Ok(ClientFfiGatewayDisconnectResult { disconnected: true })
     }
 
@@ -2000,15 +1947,6 @@ impl ClientFfiRuntime {
             )
         })?;
         if generation > *applied {
-            self.invitation_commits
-                .lock()
-                .map_err(|_| {
-                    ClientFfiError::new(
-                        "invitation commit state unavailable",
-                        ClientFfiError::GENERIC_CODE,
-                    )
-                })?
-                .clear();
             self.active_thread
                 .begin_authorization_epoch()
                 .map_err(|_| {
@@ -2071,9 +2009,16 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<ProviderListParams>(input_json)
             .map_err(|error| format!("invalid provider list params: {error}"))?;
 
-        self.client_runtime.core.read_provider_collection(
-            pioneer_client::providers::store::ProviderCollectionKey::catalog(params.workspace_id), false)
-            .and_then(|read| read.wait()).and_then(|p| p.catalog_response())
+        self.client_runtime
+            .core
+            .read_provider_collection(
+                pioneer_client::providers::store::ProviderCollectionKey::catalog(
+                    params.workspace_id,
+                ),
+                false,
+            )
+            .and_then(|read| read.wait())
+            .and_then(|p| p.catalog_response())
             .map_err(|_| "provider_catalog_unavailable".into())
     }
 
@@ -2081,7 +2026,9 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<CLIRuntimeListParams>(input_json)
             .map_err(|error| format!("invalid CLI runtime list params: {error}"))?;
 
-        self.client_runtime.core.read_provider_runtimes(&params.workspace_id, false)
+        self.client_runtime
+            .core
+            .read_provider_runtimes(&params.workspace_id, false)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2089,7 +2036,9 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<CLIRuntimeRefreshParams>(input_json)
             .map_err(|error| format!("invalid CLI runtime refresh params: {error}"))?;
 
-        self.client_runtime.core.refresh_provider_runtimes(params)
+        self.client_runtime
+            .core
+            .refresh_provider_runtimes(params)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2100,9 +2049,18 @@ impl ClientFfiRuntime {
         let params = serde_json::from_str::<CLIRuntimeListModelsParams>(input_json)
             .map_err(|error| format!("invalid CLI runtime list models params: {error}"))?;
 
-        self.client_runtime.core.read_provider_collection(
-            pioneer_client::providers::store::ProviderCollectionKey::models(params.workspace_id, pioneer_client::providers::list::cli_runtime_provider_key(&params.runtime_id), pioneer_client::providers::store::ProviderModelKind::Chat), false)
-            .and_then(|read| read.wait()).and_then(|publication| publication.runtime_models_response())
+        self.client_runtime
+            .core
+            .read_provider_collection(
+                pioneer_client::providers::store::ProviderCollectionKey::models(
+                    params.workspace_id,
+                    pioneer_client::providers::list::cli_runtime_provider_key(&params.runtime_id),
+                    pioneer_client::providers::store::ProviderModelKind::Chat,
+                ),
+                false,
+            )
+            .and_then(|read| read.wait())
+            .and_then(|publication| publication.runtime_models_response())
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -2300,9 +2258,19 @@ impl ClientFfiRuntime {
     fn provider_list_models(&self, input_json: &str) -> Result<ProviderListModelsResponse, String> {
         let params = serde_json::from_str::<ProviderListModelsParams>(input_json)
             .map_err(|_| "invalid provider list models params".to_owned())?;
-        self.client_runtime.core.read_provider_collection(
-            pioneer_client::providers::store::ProviderCollectionKey::models(params.workspace_id, params.provider, pioneer_client::providers::store::ProviderModelKind::Chat), false)
-            .and_then(|read| read.wait()).and_then(|p| p.models_response()).map_err(|_| "provider_models_unavailable".into())
+        self.client_runtime
+            .core
+            .read_provider_collection(
+                pioneer_client::providers::store::ProviderCollectionKey::models(
+                    params.workspace_id,
+                    params.provider,
+                    pioneer_client::providers::store::ProviderModelKind::Chat,
+                ),
+                false,
+            )
+            .and_then(|read| read.wait())
+            .and_then(|p| p.models_response())
+            .map_err(|_| "provider_models_unavailable".into())
     }
 
     fn provider_list_transcription_models(
@@ -2318,10 +2286,21 @@ impl ClientFfiRuntime {
             })?;
         self.require_initialized_and_connected()?;
 
-        self.client_runtime.core.read_provider_collection(
-            pioneer_client::providers::store::ProviderCollectionKey::models(params.workspace_id, params.provider, pioneer_client::providers::store::ProviderModelKind::Transcription), false)
-            .and_then(|read| read.wait()).and_then(|p| p.models_response())
-            .map_err(|_| ClientFfiError::new("provider_models_unavailable", ClientFfiError::GENERIC_CODE))
+        self.client_runtime
+            .core
+            .read_provider_collection(
+                pioneer_client::providers::store::ProviderCollectionKey::models(
+                    params.workspace_id,
+                    params.provider,
+                    pioneer_client::providers::store::ProviderModelKind::Transcription,
+                ),
+                false,
+            )
+            .and_then(|read| read.wait())
+            .and_then(|p| p.models_response())
+            .map_err(|_| {
+                ClientFfiError::new("provider_models_unavailable", ClientFfiError::GENERIC_CODE)
+            })
     }
 
     fn voice_input_settings_plan(
@@ -2352,9 +2331,20 @@ impl ClientFfiRuntime {
             Some(request.model.as_str()),
         )
         .ok_or_else(|| "invalid provider model display request: empty selection".to_owned())?;
-        let response = self.client_runtime.core.read_provider_collection(
-            pioneer_client::providers::store::ProviderCollectionKey::models(key.workspace_id.clone(), key.provider.clone(), pioneer_client::providers::store::ProviderModelKind::Chat), false)
-            .and_then(|read| read.wait()).and_then(|p| p.models_response()).map_err(|_| "provider_models_unavailable".to_owned())?;
+        let response = self
+            .client_runtime
+            .core
+            .read_provider_collection(
+                pioneer_client::providers::store::ProviderCollectionKey::models(
+                    key.workspace_id.clone(),
+                    key.provider.clone(),
+                    pioneer_client::providers::store::ProviderModelKind::Chat,
+                ),
+                false,
+            )
+            .and_then(|read| read.wait())
+            .and_then(|p| p.models_response())
+            .map_err(|_| "provider_models_unavailable".to_owned())?;
 
         Ok(resolve_provider_model_display_from_response(
             &key, &response,
@@ -3119,30 +3109,27 @@ fn invitation_commit_unavailable() -> ClientFfiError {
     )
 }
 
-fn invitation_commit_lock_error() -> ClientFfiError {
-    ClientFfiError::new(
-        "invitation commit state is unavailable",
-        ClientFfiError::GENERIC_CODE,
-    )
-}
-
+#[cfg(test)]
 fn invitation_commit_capacity_available(current: usize) -> bool {
     current < MAX_OUTSTANDING_INVITATION_COMMITS
 }
 
-fn cleanup_untracked_invitation_commit(
-    runtime: &tokio::runtime::Runtime,
-    client: &pioneer_client::transport::ws::auth_exchange::AuthExchangeClient,
-    mut commit: pioneer_client::gateway::invitation::InvitationSessionCommit,
-) {
-    let Ok(refresh) = commit.take_refresh_for_secure_storage() else {
-        return;
-    };
-    drop(refresh);
-    let Ok(cleanup) = commit.secure_storage_failed() else {
-        return;
-    };
-    runtime.block_on(client.cleanup_invitation_session_best_effort(cleanup));
+fn invitation_request_error(
+    error: pioneer_client::gateway::invitation_commits::InvitationRequestError,
+) -> ClientFfiError {
+    use pioneer_client::gateway::invitation_commits::InvitationRequestError;
+    match error {
+        InvitationRequestError::Exchange(error) => invitation::exchange_error(error),
+        InvitationRequestError::Runtime => ClientFfiError::new(
+            "auth exchange runtime unavailable",
+            auth::AUTH_EXCHANGE_RUNTIME_CODE,
+        ),
+        InvitationRequestError::InvalidGrant => ClientFfiError::new(
+            "invalid invitation session grant",
+            invitation::INVALID_INVITATION_REQUEST_CODE,
+        ),
+        InvitationRequestError::Unavailable => invitation_commit_unavailable(),
+    }
 }
 
 fn administration_rpc_error(error: anyhow::Error) -> ClientFfiError {
@@ -5596,3 +5583,12 @@ mod provider_runtime_tests;
 
 #[cfg(test)]
 mod catalog_binding_tests;
+
+#[cfg(test)]
+mod document_binding_tests;
+
+#[cfg(test)]
+mod onboarding_binding_tests;
+
+#[cfg(test)]
+mod settings_binding_tests;
