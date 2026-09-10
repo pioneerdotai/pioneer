@@ -49,8 +49,7 @@ use super::{
 };
 use crate::{
     providers::list::{
-        resolve_cli_runtime_execution_backend,
-        runtime_id_from_cli_runtime_provider_key,
+        resolve_cli_runtime_execution_backend, runtime_id_from_cli_runtime_provider_key,
     },
     state::selectors as client_selectors,
     threads::session as thread_session,
@@ -349,7 +348,7 @@ impl ClientCore {
         } = context;
         let skill_picker =
             self.composer_catalog_skill_picker(&operation.thread_id, operation.draft_id, "");
-        let runtime = self.compatibility_runtime();
+        let runtime = self.transport_runtime();
         let plan = self
             .composer_operation_plan(&operation)
             .filter(|plan| plan.kind == ComposerOperationKind::Send)
@@ -528,7 +527,7 @@ impl ClientCore {
             workspace_id,
             reduction,
             failure_message,
-            self.compatibility_runtime().ws_command_sender(),
+            self.transport_runtime().ws_command_sender(),
         )
     }
 
@@ -748,7 +747,7 @@ impl ClientCore {
                     == ClientTransitionOutcome::Changed,
                 "Composer voice operation cancelled"
             );
-            let sender = self.compatibility_runtime().ws_command_sender();
+            let sender = self.transport_runtime().ws_command_sender();
             let transport = ComposerUploadTransport {
                 core: self,
                 identity,

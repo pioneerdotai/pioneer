@@ -1,12 +1,9 @@
+use crate::{AppLanguagePreference, FileOpenerId, WindowThemePreference};
 use crate::{model_selector::ModelSelectorSelection, screen::*};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::settings::types::*;
 use pioneer_client::settings::{
     gateway as gateway_policy, runtime::SettingsIntent, voice as voice_policy,
-};
-use pioneer_desktop_foundation::{
-    file_opener::FileOpenerId,
-    preferences::{AppLanguagePreference, WindowThemePreference},
 };
 impl SettingsScreenView {
     fn platform_result(&mut self, result: anyhow::Result<()>) {

@@ -52,9 +52,7 @@ use crate::{
         GatewayConnectionEvent, GatewayConnectionReduction, reduce_gateway_connection_event,
     },
     timeline::semantic::SemanticTimelineLiveUpdate,
-    transport::ws::{
-        GatewayWsClient, GatewayWsCommandSender, GatewayWsEvent, should_apply_ws_event,
-    },
+    transport::ws::{GatewayWsClient, GatewayWsCommandSender, GatewayWsEvent},
     voice::{VoiceSessionResultReduction, reduce_voice_session_result_notification},
 };
 use pioneer_protocol::{
@@ -154,41 +152,6 @@ pub enum ClientRuntimeNotification {
     },
 }
 
-pub trait ClientRuntimePostEventSink {
-    fn refresh_thread_list_if_requested(&mut self) -> bool;
-    fn refresh_skills_if_requested(&mut self) -> bool;
-    fn refresh_mcp_if_requested(&mut self) -> bool;
-    fn refresh_mcp_details_if_requested(&mut self) -> bool;
-    fn drive_thread_start_queue(&mut self) -> bool;
-    fn drive_turn_resume_queue(&mut self) -> bool;
-    fn tick_thread_conversations(&mut self) -> bool;
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClientRuntimePostEventOutcome {
-    pub events_applied: bool,
-    pub refreshed_thread_list: bool,
-    pub refreshed_skills: bool,
-    pub refreshed_mcp: bool,
-    pub refreshed_mcp_details: bool,
-    pub drove_thread_start: bool,
-    pub drove_turn_resume: bool,
-    pub ticked_thread_conversations: bool,
-}
-
-impl ClientRuntimePostEventOutcome {
-    pub fn should_notify(self) -> bool {
-        self.events_applied
-            || self.refreshed_thread_list
-            || self.refreshed_skills
-            || self.refreshed_mcp
-            || self.refreshed_mcp_details
-            || self.drove_thread_start
-            || self.drove_turn_resume
-            || self.ticked_thread_conversations
-    }
-}
-
 impl ClientRuntime {
     pub fn new() -> Self {
         Self {
@@ -206,45 +169,6 @@ impl ClientRuntime {
 
     pub fn drain_ws_events(&self) -> Vec<GatewayWsEvent> {
         self.ws_client.drain_events()
-    }
-
-    pub fn drain_applicable_ws_events(
-        &self,
-        active_connection_id: Option<u64>,
-        first_event: Option<GatewayWsEvent>,
-    ) -> Vec<GatewayWsEvent> {
-        first_event
-            .into_iter()
-            .chain(self.drain_ws_events())
-            .filter(|event| should_apply_ws_event(active_connection_id, event))
-            .collect()
-    }
-
-    pub fn reduce_ws_event(
-        &self,
-        event: GatewayWsEvent,
-        context: ClientRuntimeWsEventContext,
-    ) -> ClientRuntimeWsEvent {
-        reduce_gateway_ws_event(event, context)
-    }
-
-    pub fn reduce_gateway_notification(
-        &self,
-        notification: GatewayNotification,
-        context: ClientRuntimeNotificationContext<'_>,
-    ) -> Option<ClientRuntimeNotification> {
-        reduce_gateway_notification(notification, context)
-    }
-
-    pub fn drive_post_event_batch<Sink>(
-        &self,
-        events_applied: bool,
-        sink: &mut Sink,
-    ) -> ClientRuntimePostEventOutcome
-    where
-        Sink: ClientRuntimePostEventSink,
-    {
-        drive_post_event_batch(events_applied, sink)
     }
 }
 
@@ -328,25 +252,6 @@ pub fn reduce_gateway_ws_event(
         GatewayWsEvent::Notification { notification, .. } => {
             ClientRuntimeWsEvent::Notification(notification)
         }
-    }
-}
-
-pub fn drive_post_event_batch<Sink>(
-    events_applied: bool,
-    sink: &mut Sink,
-) -> ClientRuntimePostEventOutcome
-where
-    Sink: ClientRuntimePostEventSink,
-{
-    ClientRuntimePostEventOutcome {
-        events_applied,
-        refreshed_thread_list: sink.refresh_thread_list_if_requested(),
-        refreshed_skills: sink.refresh_skills_if_requested(),
-        refreshed_mcp: sink.refresh_mcp_if_requested(),
-        refreshed_mcp_details: sink.refresh_mcp_details_if_requested(),
-        drove_thread_start: sink.drive_thread_start_queue(),
-        drove_turn_resume: sink.drive_turn_resume_queue(),
-        ticked_thread_conversations: sink.tick_thread_conversations(),
     }
 }
 
@@ -797,87 +702,6 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         }
-    }
-
-    #[derive(Default)]
-    struct RecordingPostEventSink {
-        calls: Vec<&'static str>,
-        refresh_thread_list: bool,
-        refresh_skills: bool,
-        refresh_mcp: bool,
-        refresh_mcp_details: bool,
-        drive_thread_start: bool,
-        drive_turn_resume: bool,
-        tick_thread_conversations: bool,
-    }
-
-    impl ClientRuntimePostEventSink for RecordingPostEventSink {
-        fn refresh_thread_list_if_requested(&mut self) -> bool {
-            self.calls.push("refresh_thread_list");
-            self.refresh_thread_list
-        }
-
-        fn refresh_skills_if_requested(&mut self) -> bool {
-            self.calls.push("refresh_skills");
-            self.refresh_skills
-        }
-
-        fn refresh_mcp_if_requested(&mut self) -> bool {
-            self.calls.push("refresh_mcp");
-            self.refresh_mcp
-        }
-
-        fn refresh_mcp_details_if_requested(&mut self) -> bool {
-            self.calls.push("refresh_mcp_details");
-            self.refresh_mcp_details
-        }
-
-        fn drive_thread_start_queue(&mut self) -> bool {
-            self.calls.push("drive_thread_start");
-            self.drive_thread_start
-        }
-
-        fn drive_turn_resume_queue(&mut self) -> bool {
-            self.calls.push("drive_turn_resume");
-            self.drive_turn_resume
-        }
-
-        fn tick_thread_conversations(&mut self) -> bool {
-            self.calls.push("tick_thread_conversations");
-            self.tick_thread_conversations
-        }
-    }
-
-    #[test]
-    fn runtime_filters_events_by_active_connection() {
-        let runtime = ClientRuntime::new();
-        let events = runtime.drain_applicable_ws_events(
-            Some(2),
-            Some(GatewayWsEvent::Connected {
-                connection_id: 1,
-                endpoint_id: "old".to_owned(),
-                endpoint_name: "Old".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
-                    "127.0.0.1:1",
-                )
-                .unwrap(),
-            }),
-        );
-        assert!(events.is_empty());
-
-        let events = runtime.drain_applicable_ws_events(
-            Some(2),
-            Some(GatewayWsEvent::Connected {
-                connection_id: 2,
-                endpoint_id: "new".to_owned(),
-                endpoint_name: "New".to_owned(),
-                gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
-                    "127.0.0.1:2",
-                )
-                .unwrap(),
-            }),
-        );
-        assert_eq!(events.len(), 1);
     }
 
     #[test]
@@ -1420,76 +1244,6 @@ mod tests {
             panic!("expected durable Task inbox invalidation");
         };
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn runtime_drives_post_event_batch_in_client_order() {
-        let mut sink = RecordingPostEventSink {
-            refresh_thread_list: true,
-            refresh_skills: false,
-            refresh_mcp: true,
-            refresh_mcp_details: false,
-            drive_thread_start: true,
-            drive_turn_resume: false,
-            tick_thread_conversations: true,
-            ..Default::default()
-        };
-
-        let outcome = drive_post_event_batch(false, &mut sink);
-
-        assert_eq!(
-            sink.calls,
-            vec![
-                "refresh_thread_list",
-                "refresh_skills",
-                "refresh_mcp",
-                "refresh_mcp_details",
-                "drive_thread_start",
-                "drive_turn_resume",
-                "tick_thread_conversations",
-            ]
-        );
-        assert!(!outcome.events_applied);
-        assert!(outcome.refreshed_thread_list);
-        assert!(!outcome.refreshed_skills);
-        assert!(outcome.refreshed_mcp);
-        assert!(!outcome.refreshed_mcp_details);
-        assert!(outcome.drove_thread_start);
-        assert!(!outcome.drove_turn_resume);
-        assert!(outcome.ticked_thread_conversations);
-        assert!(outcome.should_notify());
-    }
-
-    #[test]
-    fn runtime_post_event_outcome_notifies_for_applied_events_only() {
-        let mut sink = RecordingPostEventSink::default();
-
-        let outcome = ClientRuntime::new().drive_post_event_batch(true, &mut sink);
-
-        assert_eq!(
-            sink.calls,
-            vec![
-                "refresh_thread_list",
-                "refresh_skills",
-                "refresh_mcp",
-                "refresh_mcp_details",
-                "drive_thread_start",
-                "drive_turn_resume",
-                "tick_thread_conversations",
-            ]
-        );
-        assert_eq!(
-            outcome,
-            ClientRuntimePostEventOutcome {
-                events_applied: true,
-                ..Default::default()
-            }
-        );
-        assert!(outcome.should_notify());
-
-        let mut sink = RecordingPostEventSink::default();
-        let idle = drive_post_event_batch(false, &mut sink);
-        assert!(!idle.should_notify());
     }
 
     #[test]

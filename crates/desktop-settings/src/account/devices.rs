@@ -22,7 +22,7 @@ impl SettingsScreenView {
         desktop: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let snapshot = self.gateway.client_runtime.client_core().auth_sessions();
+        let snapshot = self.gateway.auth_sessions.clone();
         let sessions = snapshot.sessions;
         if snapshot.loading {
             v_flex()
@@ -141,6 +141,9 @@ impl SettingsScreenView {
                     if view
                         .update(cx, |view, cx| {
                             view.input = view.client.device_activation_publication();
+                            view.presentation = view
+                                .client
+                                .device_activation_presentation(view.input.generation);
                             cx.notify();
                         })
                         .is_err()
@@ -150,6 +153,9 @@ impl SettingsScreenView {
                 }
             });
             ActivationView {
+                presentation: client.device_activation_presentation(
+                    client.device_activation_publication().generation,
+                ),
                 input: client.device_activation_publication(),
                 client: client.clone(),
                 _binding: binding,
@@ -177,6 +183,8 @@ impl SettingsScreenView {
 struct ActivationView {
     client: Arc<ClientCore>,
     input: DeviceActivationPublication,
+    presentation:
+        Option<pioneer_client::gateway::device_activation::DeviceActivationQrPresentation>,
     _binding: Arc<SettingsBinding>,
     _task: Task<()>,
 }
@@ -187,9 +195,7 @@ impl Drop for ActivationView {
 }
 impl Render for ActivationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let presentation = self
-            .client
-            .device_activation_presentation(self.input.generation);
+        let presentation = self.presentation.clone();
         let phase = if self.input.loading {
             DeviceActivationFormPhase::Loading
         } else if let Some(p) = presentation {
@@ -224,6 +230,9 @@ impl Render for ActivationView {
                     .on_click(cx.listener(|view, _, _, cx| {
                         view.client.create_current_device_activation();
                         view.input = view.client.device_activation_publication();
+                        view.presentation = view
+                            .client
+                            .device_activation_presentation(view.input.generation);
                         cx.notify();
                     }))
                     .into_any_element(),

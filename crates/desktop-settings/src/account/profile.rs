@@ -399,11 +399,10 @@ mod retained_tests {
     use crate::platform::{
         SettingsPhotoError, SettingsPhotoPort, SettingsPhotoSelection, SettingsPlatform,
     };
+    use crate::{AppLanguagePreference, FileOpenerId, WindowThemePreference};
     use gpui_kit::{App, AppContext, Entity, Task, TestAppContext, Window};
     use pioneer_desktop_foundation::{
         ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink, ClientScope,
-        file_opener::FileOpenerId,
-        preferences::{AppLanguagePreference, WindowThemePreference},
     };
     use std::{
         rc::Rc,

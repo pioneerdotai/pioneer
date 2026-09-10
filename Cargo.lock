@@ -8877,9 +8877,7 @@ name = "pioneer-desktop"
 version = "0.51.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "base64 0.22.1",
- "chrono",
  "cpal",
  "futures-util",
  "gpui-kit",
@@ -8902,15 +8900,12 @@ dependencies = [
  "pioneer-keystore",
  "pioneer-observability",
  "pioneer-protocol",
- "pioneer-tools",
  "reqwest",
  "rust-embed",
  "rust-i18n",
- "semver",
  "serde",
  "serde_json",
- "sha2 0.11.0",
- "syntect",
+ "syn 2.0.119",
  "sys-locale",
  "tempfile",
  "terminal",
@@ -8919,9 +8914,6 @@ dependencies = [
  "tokio-util",
  "toml 1.1.5+spec-1.1.0",
  "tracing",
- "tracing-subscriber",
- "two-face",
- "unicode-width 0.2.2",
  "url",
  "webbrowser",
  "windows-sys 0.61.2",
@@ -8960,7 +8952,6 @@ version = "0.51.0"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
- "serde",
 ]
 
 [[package]]
@@ -8979,8 +8970,6 @@ dependencies = [
 name = "pioneer-desktop-onboarding"
 version = "0.51.0"
 dependencies = [
- "anyhow",
- "chrono",
  "gpui-kit",
  "pioneer-client",
  "pioneer-desktop-foundation",
@@ -8988,21 +8977,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "pioneer-desktop-providers"
 version = "0.51.0"
 dependencies = [
- "anyhow",
- "chrono",
  "gpui-kit",
  "pioneer-client",
  "pioneer-desktop-foundation",
  "rust-i18n",
  "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -9018,7 +9003,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -9075,8 +9059,7 @@ dependencies = [
  "anyhow",
  "gpui-kit",
  "pioneer-app-updater",
- "pioneer-desktop-foundation",
- "pioneer-protocol",
+ "pioneer-client",
  "reqwest",
  "semver",
  "serde",

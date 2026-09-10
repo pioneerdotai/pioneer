@@ -106,9 +106,8 @@ impl ThreadHeaderView {
                 pioneer_client::authorization::principal_presentation_capabilities(&p)
                     .can_manage_all_threads
             })
-            || self
-                .client
-                .thread_capability_snapshot(&self.thread_id)
+            || self.binding.publication(&ClientScope::ThreadCapability { thread_id: self.thread_id.clone() })
+                .and_then(|p| p.snapshot().payload::<pioneer_client::threads::capabilities::ThreadCapabilityPublication>())
                 .and_then(|p| p.snapshot.clone())
                 .and_then(|p| p.thread)
                 .is_some_and(|t| {
@@ -153,21 +152,34 @@ impl ThreadHeaderView {
 }
 impl Render for ThreadHeaderView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let coordinator = self.client.thread_coordinator_snapshot(&self.thread_id);
+        let coordinator = self
+            .binding
+            .publication(&ClientScope::Thread {
+                thread_id: self.thread_id.clone(),
+            })
+            .and_then(|p| {
+                p.snapshot()
+                    .payload::<pioneer_client::threads::registry::ThreadDomainSnapshot>()
+            })
+            .map(|p| p.coordinator());
         let thread = coordinator
             .as_ref()
             .and_then(|coordinator| coordinator.thread());
-        let navigation = self.client.navigation_snapshot();
+        let navigation = self
+            .binding
+            .publication(&ClientScope::Navigation)
+            .and_then(|p| {
+                p.snapshot()
+                    .payload::<pioneer_client::navigation::ClientNavigationState>()
+            })
+            .unwrap_or_default();
         let lineage = navigation
             .lineage()
             .iter()
             .rev()
             .find(|entry| entry.child_thread_id() == self.thread_id);
         let draft = coordinator.as_ref().is_some_and(|coordinator| {
-            self.client
-                .thread_workspace_draft(&coordinator.workspace_id)
-                .as_deref()
-                == Some(&self.thread_id)
+            navigation.draft(&coordinator.workspace_id) == Some(&self.thread_id)
         });
         let title = lineage
             .map(|entry| entry.title().to_owned())
@@ -177,7 +189,15 @@ impl Render for ThreadHeaderView {
                     .flatten()
             })
             .unwrap_or_else(|| t!("sidebar.thread.untitled").to_string());
-        let member = self.client.thread_member_snapshot(&self.thread_id);
+        let member = self
+            .binding
+            .publication(&ClientScope::ThreadMember {
+                thread_id: self.thread_id.clone(),
+            })
+            .and_then(|p| {
+                p.snapshot()
+                    .payload::<pioneer_client::threads::members::ThreadMemberPublication>()
+            });
         let pending = match member.as_ref().map(|member| &member.request) {
             Some(ThreadMemberRequestState::Loading { action }) => {
                 ThreadScopePendingAction::Pending {

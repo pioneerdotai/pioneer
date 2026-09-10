@@ -1,8 +1,5 @@
+use crate::{AppLanguagePreference, FileOpenerId, WindowThemePreference};
 use gpui_kit::{App, Window};
-use pioneer_desktop_foundation::{
-    file_opener::FileOpenerId,
-    preferences::{AppLanguagePreference, WindowThemePreference},
-};
 /// Desktop preferences and existing native integrations. Domain saves use Client intents.
 pub trait SettingsPlatform {
     fn telemetry(&self, enabled: bool);
@@ -26,7 +23,17 @@ pub trait SettingsPlatform {
     fn avatar_path(&self, principal: &str, cx: &App) -> Option<std::path::PathBuf>;
 }
 
-pub use pioneer_desktop_foundation::profile_photo::{
-    ProfilePhotoError as SettingsPhotoError, ProfilePhotoPort as SettingsPhotoPort,
-    ProfilePhotoSelection as SettingsPhotoSelection,
-};
+pub struct SettingsPhotoSelection {
+    pub preview: String,
+    pub avatar: pioneer_client::settings::types::ProfileAvatarInput,
+}
+pub enum SettingsPhotoError {
+    Picker,
+    InvalidAvatar,
+}
+pub trait SettingsPhotoPort {
+    fn select(
+        &self,
+        cx: &mut gpui_kit::App,
+    ) -> gpui_kit::Task<Result<Option<SettingsPhotoSelection>, SettingsPhotoError>>;
+}

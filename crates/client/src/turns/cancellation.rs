@@ -360,7 +360,7 @@ impl ClientCore {
                     if !core.turn_cancellation_matches(&request) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let result = sender
                         .turn_cancel(request.params.clone())

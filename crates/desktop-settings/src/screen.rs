@@ -143,19 +143,14 @@ impl Render for SettingsView {
     }
 }
 pub(crate) struct GatewayInput {
-    pub client_runtime: ClientInput,
+    pub settings_workspace_id: Option<String>,
+    pub auth_sessions: pioneer_client::gateway::identity_authorization::AuthSessionsStore,
     pub settings: Option<GatewaySettingsSnapshot>,
     pub settings_loading: bool,
     pub settings_error: Option<String>,
     pub current_auth: Option<AuthMeResponse>,
     pub capability_snapshot: Option<AuthorizationCapabilitySnapshot>,
     pub connection_state: GatewayConnectionState,
-}
-pub(crate) struct ClientInput(Arc<ClientCore>);
-impl ClientInput {
-    pub fn client_core(&self) -> &Arc<ClientCore> {
-        &self.0
-    }
 }
 pub(crate) struct SettingsScreenView {
     pub config: SettingsConfig,
@@ -295,7 +290,8 @@ impl SettingsScreenView {
     fn gateway_input(client: &Arc<ClientCore>) -> GatewayInput {
         let settings = client.gateway_settings();
         GatewayInput {
-            client_runtime: ClientInput(client.clone()),
+            settings_workspace_id: settings.workspace_id,
+            auth_sessions: client.auth_sessions(),
             settings: settings.settings,
             settings_loading: settings.loading,
             settings_error: settings.error,
@@ -321,6 +317,7 @@ impl SettingsScreenView {
           "principal":principal,
           "account":if self.page.is_none(){auth.as_ref()}else{None},
           "avatar":if self.page.is_none(){principal.as_ref().and_then(|principal|self.config.platform.avatar_path(principal,cx))}else{None},
+          "settings_workspace":(self.page==Some(SettingsPage::SelfImprovement)).then(||self.config.client.gateway_settings().workspace_id),
           "workspace":matches!(self.page,Some(SettingsPage::Memory|SettingsPage::SelfImprovement)).then(||self.config.client.navigation_snapshot().workspace_id().map(str::to_owned)),
           "secret_authority":(self.page==Some(SettingsPage::RemoteAccess)).then(||self.config.client.authorization_connection_generation()),
           "connection":self.config.client.gateway_session().status.as_ref().map(|s|s.connection_state),
@@ -483,13 +480,7 @@ impl Render for SettingsScreenView {
             return editor.clone().into_any_element();
         }
         if self.page == Some(SettingsPage::SelfImprovement)
-            && self
-                .config
-                .client
-                .gateway_settings()
-                .workspace_id
-                .as_deref()
-                != self.config.client.navigation_snapshot().workspace_id()
+            && self.gateway.settings_workspace_id != self.workspace_id
         {
             return div()
                 .p_6()

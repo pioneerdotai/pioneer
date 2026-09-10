@@ -1,6 +1,7 @@
 use crate::file_opener::FileOpenerId;
 use anyhow::{Context as _, Result};
 use gpui_kit::{App, Global};
+#[cfg(not(test))]
 use pioneer_config::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
@@ -34,9 +35,7 @@ pub(crate) enum WindowOpenState {
     Fullscreen,
 }
 
-pub(crate) use pioneer_desktop_foundation::preferences::{
-    AppLanguagePreference, WindowThemePreference,
-};
+pub(crate) use pioneer_desktop_settings::{AppLanguagePreference, WindowThemePreference};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct GeneralSettings {
@@ -268,12 +267,18 @@ impl DesktopSettingsState {
     }
 }
 
+#[cfg(not(test))]
 fn settings_path() -> Result<PathBuf> {
     let config = AppConfig::load().context("failed to load app config for desktop settings")?;
     let runtime_home = config
         .ensure_runtime_home_dir()
         .context("failed to ensure runtime home dir for desktop settings")?;
     Ok(runtime_home.join(DESKTOP_SETTINGS_FILE_NAME))
+}
+
+#[cfg(test)]
+fn settings_path() -> Result<PathBuf> {
+    Ok(crate::state::runtime_home_dir()?.join(DESKTOP_SETTINGS_FILE_NAME))
 }
 
 fn load_settings_file() -> Result<DesktopSettingsFile> {

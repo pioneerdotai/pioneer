@@ -5,7 +5,7 @@ use crate::gateway::timings::GatewayTimings;
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
-use super::compat::{is_same_gateway_version, local_gateway_version, managed_by_label};
+use super::compat::{is_same_gateway_version, local_gateway_version};
 pub(in crate::gateway) fn managed_gateway_requires_update() -> bool {
     let Some(install) = managed_gateway_install() else {
         return false;

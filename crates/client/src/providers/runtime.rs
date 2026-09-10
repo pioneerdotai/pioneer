@@ -819,7 +819,7 @@ impl ClientCore {
                             if !matches {
                                 continue;
                             }
-                            let sender = core.compatibility_runtime().ws_command_sender();
+                            let sender = core.transport_runtime().ws_command_sender();
                             drop(core);
                             let result = if let Some(runtime_id) = &request.refresh_runtime {
                                 sender

@@ -41,20 +41,16 @@ impl TimelineRowSlotView {
 
     pub(crate) fn render(
         &self,
-        height: gpui_kit::Pixels,
-        cx: &gpui_kit::App,
+        _height: gpui_kit::Pixels,
+        _cx: &gpui_kit::App,
     ) -> gpui_kit::AnyElement {
         use gpui_kit::{prelude::*, *};
         let Some(view) = &self.view else {
             return div().into_any_element();
         };
-        if view.read(cx).has_live_children() {
-            return view.clone().into_any_element();
-        }
-        view.clone()
-            .cached(StyleRefinement::default().w_full().h(height))
-            .into_any_element()
+        view.clone().into_any_element()
     }
+
     fn replacing(snapshot: Arc<TimelineRowSnapshot>, previous: Option<&Arc<Self>>) -> Self {
         let mut next = Self::new(snapshot);
         next.view = previous.and_then(|old| old.view.clone());

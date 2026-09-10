@@ -294,7 +294,7 @@ impl crate::core::ClientCore {
             .artifact_action_snapshot(identity)
             .ok_or_else(invalid_artifact)?;
         let result = (|| {
-            let sender = self.compatibility_runtime().ws_command_sender();
+            let sender = self.transport_runtime().ws_command_sender();
             let artifact = match summary {
                 Some(summary) => summary,
                 None => resolve_artifact(&sender, action.target.clone())?,
@@ -351,7 +351,7 @@ impl crate::core::ClientCore {
             return Err(map_download_error(ArtifactHttpDownloadError::Cancelled));
         }
         let result = download_artifact(
-            &self.compatibility_runtime().ws_command_sender(),
+            &self.transport_runtime().ws_command_sender(),
             runtime_home,
             action.target,
             &operation,

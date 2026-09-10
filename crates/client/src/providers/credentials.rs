@@ -143,7 +143,7 @@ impl ClientCore {
                     if !core.provider_credential_current(&request) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let result = match &request.target {
                         ProviderCredentialTarget::Api(provider) => sender

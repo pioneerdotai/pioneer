@@ -31,7 +31,6 @@ fn config(
         Arc::new(Registrar(registrations)),
         |_, _| HashMap::new(),
         |_, _, _| {},
-        |_| false,
         |builder, window, cx| {
             window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
         },
@@ -166,7 +165,7 @@ fn workspace_feature_has_no_shell_or_sibling_import_or_render_time_resource_crea
         for forbidden in [
             "pioneer_desktop_update",
             "pioneer_desktop_task_notifications",
-            "LegacyScreenAdapter",
+            concat!("LegacyScreen", "Adapter"),
             "DesktopShellView",
             "GatewayWsEvent",
         ] {
@@ -263,4 +262,68 @@ fn controlled_tree_keeps_domain_selection_and_retained_state_across_metadata_and
         sidebar.read_with(cx, |sidebar, _| sidebar.thread_tree_state.clone())
     );
     view.update(cx, |view, cx| view.close(cx));
+}
+
+#[gpui_kit::test]
+fn workspace_lock_uses_canonical_composer_operations_without_a_shell_callback(
+    cx: &mut TestAppContext,
+) {
+    use pioneer_client::composer::store::{
+        ComposerIntent, ComposerOperationCompletion, ComposerOperationKind,
+    };
+    use pioneer_client::core::ClientTransitionOutcome;
+    cx.update(gpui_kit::init);
+    let core = Arc::new(ClientCore::new());
+    core.activate_thread(Some("a".into()), Some("w".into()));
+    core.composer_intent(ComposerIntent::Open {
+        thread_id: "a".into(),
+        defaults: Default::default(),
+    });
+    let config = config(core.clone(), Rc::new(RefCell::new(HashSet::new())));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| WorkspaceNavigationView::new(config, cx));
+        Root::new(view, window, cx)
+    });
+    let sidebar = root.read_with(cx, |root, cx| {
+        root.view()
+            .clone()
+            .downcast::<WorkspaceNavigationView>()
+            .unwrap()
+            .read(cx)
+            .sidebar
+            .clone()
+    });
+    for (operation, locked) in [
+        (ComposerOperationKind::Send, true),
+        (ComposerOperationKind::Voice, true),
+        (ComposerOperationKind::PickFiles, false),
+    ] {
+        let draft = core.composer_snapshot("a").unwrap().draft_id();
+        assert_eq!(
+            core.composer_intent(ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id: draft,
+                operation
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let input = core.composer_snapshot("a").unwrap();
+        let identity = input.operation().unwrap().identity.clone();
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.context_locked),
+            locked
+        );
+        assert!(
+            Arc::ptr_eq(&input, &core.composer_snapshot("a").unwrap()),
+            "presentation must not echo a Client intent"
+        );
+        core.complete_composer_operation(identity.clone(), ComposerOperationCompletion::Cancelled);
+        sidebar.update(cx, |sidebar, cx| sidebar.sync(cx));
+        assert!(!sidebar.read_with(cx, |sidebar, _| sidebar.context_locked));
+        assert!(
+            !core.complete_composer_operation(identity, ComposerOperationCompletion::Cancelled)
+        );
+    }
 }

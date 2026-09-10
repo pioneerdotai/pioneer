@@ -4,9 +4,10 @@ mod controller;
 mod snapshot;
 mod updater;
 mod view;
+use controller::DesktopUpdateController;
 pub use controller::{
-    DesktopUpdateCompletion, DesktopUpdateController, DesktopUpdateOperation, DesktopUpdatePlan,
-    DesktopUpdatePort, DesktopUpdateStore, DesktopUpdateTransition, NativeDesktopUpdatePort,
+    DesktopUpdateCompletion, DesktopUpdateOperation, DesktopUpdatePlan, DesktopUpdatePort,
+    NativeDesktopUpdatePort,
 };
 pub use snapshot::DesktopUpdateSnapshot;
 pub use updater::relaunch::{DesktopPostUpdateReceipt, claim_post_update_receipt};

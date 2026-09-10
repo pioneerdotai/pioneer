@@ -16,7 +16,10 @@ mod ports;
 mod sidebar;
 mod view;
 pub use administration::{AdministrationConfig, AdministrationView};
-pub use ports::*;
+pub use ports::{
+    AdministrationActivationPort, AdministrationAvatarPort, AdministrationEffectCompletion,
+    AdministrationEffectIdentity, AdministrationExternalNavigationPort,
+};
 
 mod dialog_lifetime;
 

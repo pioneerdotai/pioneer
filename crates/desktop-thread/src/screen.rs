@@ -259,6 +259,18 @@ impl TimelineView {
         cx: &mut Context<Self>,
     ) {
         if self.principal_presentation_capabilities().can_use_mcp {
+            let server_id = self
+                .navigation_input
+                .workspace_id()
+                .and_then(|workspace| self.client.mcp_catalog_snapshot(workspace))
+                .and_then(|catalog| {
+                    catalog
+                        .servers()
+                        .iter()
+                        .find(|server| server.id == server_id || server.name == server_id)
+                        .map(|server| server.id.clone())
+                })
+                .unwrap_or(server_id);
             cx.emit(ThreadScreenEvent::OpenMcpServer(server_id));
         }
     }
@@ -825,7 +837,7 @@ mod tests {
         });
         let screen = host.read_with(cx, |host, _| host.0.clone().unwrap());
         screen.read_with(cx, |view, _| {
-            let model = view.semantic_timeline_render_model(Some("a"));
+            let model = view.thread_timeline_view_state.model.clone();
             assert_eq!(
                 model
                     .item_presentations

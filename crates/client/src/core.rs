@@ -1003,7 +1003,7 @@ pub struct ClientCore {
     pub(crate) workspace_catalog: Mutex<crate::workspaces::catalog::WorkspaceCatalogStore>,
     pub(crate) workspace_controller: Mutex<crate::workspaces::controller::WorkspaceController>,
     pub(crate) task_notifications: Mutex<crate::tasks::notifications::TaskNotificationController>,
-    compatibility_runtime: ClientRuntime,
+    transport_runtime: ClientRuntime,
     pub(crate) thread_request_sender:
         Mutex<Option<std::sync::mpsc::Sender<crate::threads::registry::ThreadControllerRequest>>>,
     thread_request_task: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1020,7 +1020,6 @@ pub struct ClientCore {
     pub(crate) gateway_transport_leases:
         Mutex<crate::gateway::session_controller::GatewayTransportLeases>,
     pub(crate) gateway_transport_ready: std::sync::Condvar,
-    gateway_delivery: Arc<crate::gateway::event_router::GatewayCompatibilityQueue>,
     gateway_task: Mutex<Option<std::thread::JoinHandle<()>>>,
     stopped: std::sync::atomic::AtomicBool,
     partitions: Mutex<ClientPartitions>,
@@ -1218,7 +1217,7 @@ impl ClientCore {
             workspace_catalog: Mutex::default(),
             workspace_controller: Mutex::default(),
             task_notifications: Mutex::default(),
-            compatibility_runtime: ClientRuntime::new(),
+            transport_runtime: ClientRuntime::new(),
             thread_registry: Mutex::default(),
             timeline_started: std::time::Instant::now(),
             thread_request_sender: Mutex::default(),
@@ -1233,7 +1232,6 @@ impl ClientCore {
             gateway_transport_leases: Mutex::default(),
             gateway_transport_ready: std::sync::Condvar::new(),
             gateway_session: Mutex::default(),
-            gateway_delivery: Arc::default(),
             gateway_task: Mutex::default(),
             stopped: std::sync::atomic::AtomicBool::new(false),
             partitions: Mutex::new(ClientPartitions::default()),
@@ -1333,7 +1331,7 @@ impl ClientCore {
     fn observe_gateway_transport(&self, event: &crate::transport::ws::GatewayWsEvent) {
         if self.is_stopped()
             || !self
-                .compatibility_runtime
+                .transport_runtime
                 .ws_command_sender()
                 .gateway_state_event_is_current(event)
         {
@@ -1359,7 +1357,7 @@ impl ClientCore {
         use pioneer_protocol::GatewayNotification;
         if self.is_stopped()
             || !self
-                .compatibility_runtime
+                .transport_runtime
                 .ws_command_sender()
                 .gateway_state_event_is_current(event)
         {
@@ -1670,7 +1668,6 @@ impl ClientCore {
                 });
             }
         }
-        self.gateway_delivery.close();
         self.close_gateway_transport_leases();
         self.identity_authorization
             .lock()
@@ -1695,7 +1692,7 @@ impl ClientCore {
                 .clear();
         }
         subscribers.clear();
-        let _ = self.compatibility_runtime.ws_command_sender().shutdown();
+        let _ = self.transport_runtime.ws_command_sender().shutdown();
     }
 
     pub(crate) fn current_scope_demand(&self, scope: &ClientScope) -> Option<ClientDemand> {
@@ -1707,8 +1704,8 @@ impl ClientCore {
             .map(|state| state.demand)
     }
 
-    /// The single ingress dispatcher. Owned routes publish here; only unported
-    /// feature routes cross the non-owning compatibility boundary.
+    /// The single ingress dispatcher. All mutation terminates in Client owners.
+    /// Unhandled classification is diagnostic only and is never delivered to a shell.
     pub(crate) fn route_gateway_event(
         &self,
         event: &crate::transport::ws::GatewayWsEvent,
@@ -1716,7 +1713,7 @@ impl ClientCore {
         use crate::gateway::event_router::GatewayEventRoute;
         if self.is_stopped()
             || !self
-                .compatibility_runtime
+                .transport_runtime
                 .ws_command_sender()
                 .accepts_gateway_event(event)
         {
@@ -1901,7 +1898,7 @@ impl ClientCore {
                             Some(crate::threads::registry::ThreadControllerRequest::Semantic(
                                 request,
                             )) => core.execute_thread_semantic_request(
-                                &core.compatibility_runtime.ws_command_sender(),
+                                &core.transport_runtime.ws_command_sender(),
                                 request,
                             ),
                             Some(
@@ -1928,8 +1925,7 @@ impl ClientCore {
                 })
                 .expect("Client thread request task could not start"),
         );
-        let runtime = core.compatibility_runtime.clone();
-        let delivery = core.gateway_delivery.clone();
+        let runtime = core.transport_runtime.clone();
         let weak = Arc::downgrade(&core);
         let task = std::thread::Builder::new()
             .name("client-gateway-events".into())
@@ -1939,16 +1935,9 @@ impl ClientCore {
                         let Some(core) = weak.upgrade() else {
                             return;
                         };
-                        let route = core.route_gateway_event(&event);
-                        drop(core);
-                        if let Some(route) = route {
-                            if !delivery.push(route, event) {
-                                return;
-                            }
-                        }
+                        core.route_gateway_event(&event);
                     }
                 }
-                delivery.finish();
             })
             .expect("Client Gateway event task could not start");
         *core
@@ -1958,27 +1947,9 @@ impl ClientCore {
         core
     }
 
-    pub async fn next_gateway_compatibility_event(
-        &self,
-    ) -> Option<crate::gateway::event_router::GatewayCompatibilityEvent> {
-        self.gateway_delivery.receive_async().await
-    }
-
-    pub fn receive_gateway_compatibility_event(
-        &self,
-    ) -> Option<crate::gateway::event_router::GatewayCompatibilityEvent> {
-        self.gateway_delivery.receive()
-    }
-
-    pub fn drain_gateway_compatibility_events(
-        &self,
-    ) -> Vec<crate::gateway::event_router::GatewayCompatibilityEvent> {
-        self.gateway_delivery.drain()
-    }
-
-    /// Named compatibility route for transport/reducer owners not migrated yet.
-    pub fn compatibility_runtime(&self) -> &ClientRuntime {
-        &self.compatibility_runtime
+    /// Process-local Gateway transport handle; no domain state or event delivery to shells.
+    pub fn transport_runtime(&self) -> &ClientRuntime {
+        &self.transport_runtime
     }
 
     pub fn subscribe(

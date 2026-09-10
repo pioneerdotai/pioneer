@@ -272,7 +272,7 @@ impl ClientCore {
                     if !core.composer_edit_is_current(&request.identity) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let result = sender
                         .turn_message_edit(request.params.clone())

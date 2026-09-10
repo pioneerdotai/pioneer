@@ -824,8 +824,9 @@ mod tests {
                         .prepared
                         .as_ref()
                         .unwrap()
+                        .row_inputs[0]
+                        .0
                         .expanded
-                        .contains(&row_id)
                 );
                 crate::timeline::controller::DesktopTimelineController::expand(
                     view, &row_id, window, cx,
@@ -837,8 +838,9 @@ mod tests {
                         .prepared
                         .as_ref()
                         .unwrap()
+                        .row_inputs[0]
+                        .0
                         .expanded
-                        .contains(&row_id)
                 );
             })
         });
@@ -851,8 +853,9 @@ mod tests {
                     .prepared
                     .as_ref()
                     .unwrap()
+                    .row_inputs[0]
+                    .0
                     .expanded
-                    .contains(&row_id)
             );
         });
 
@@ -916,7 +919,9 @@ mod tests {
                 let model = view
                     .screen
                     .read(cx)
-                    .semantic_timeline_render_model(Some("a"));
+                    .thread_timeline_view_state
+                    .model
+                    .clone();
                 assert_eq!(
                     model
                         .item_presentations
@@ -1045,7 +1050,9 @@ mod tests {
             assert_eq!(
                 b.screen
                     .read(cx)
-                    .semantic_timeline_render_model(Some("b"))
+                    .thread_timeline_view_state
+                    .model
+                    .clone()
                     .item_presentations
                     .values()
                     .next()

@@ -89,7 +89,7 @@ impl ClientCore {
         let cancellation = operation.cancellation();
         let result = (|| {
             let session = super::access::artifact_http_session(
-                &self.compatibility_runtime().ws_command_sender(),
+                &self.transport_runtime().ws_command_sender(),
             )?;
             let service = ArtifactHttpDownloadService::new(session, runtime_home);
             let progress = |progress| operation.update_progress(progress);

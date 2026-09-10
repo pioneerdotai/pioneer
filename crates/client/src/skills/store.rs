@@ -727,7 +727,7 @@ impl ClientCore {
                         return;
                     }
                     let request = core.next_skills_read();
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     if let Some(request) = request {
                         let response = super::catalog::load_skills_snapshot(

@@ -640,7 +640,7 @@ impl ClientCore {
         let task=std::thread::Builder::new().name("client-skills-actions".into()).spawn(move||while let Ok(work)=receiver.recv(){
             match work {
                 Work::Action(action)=>{
-                    let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){continue;}let sender=core.compatibility_runtime().ws_command_sender();drop(core);
+                    let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);
                     let result=match &action.intent {
                         SkillsIntent::Policy{skill_id,enabled,allow_implicit_invocation}=>sender.skills_policy_set(super::actions::skills_policy_set_params(&action.workspace,skill_id.clone(),*enabled,*allow_implicit_invocation)).map(|_|()),
                         SkillsIntent::Remove{skill_id}=>sender.skills_uninstall(super::actions::skills_uninstall_params(&action.workspace,skill_id.clone())).map(|_|()),
@@ -648,7 +648,7 @@ impl ClientCore {
                     };if let Some(core)=weak.upgrade(){core.complete_skills_action(action,result);}
                 }
                 Work::Abort{workspace,upload,epoch}=>{
-                    let Some(core)=weak.upgrade() else{return;};if core.is_stopped()||core.provider_runtime_epoch()!=epoch||!core.capability_management_allowed(&workspace){continue;}let sender=core.compatibility_runtime().ws_command_sender();drop(core);let _=sender.skills_upload_abort(super::upload::skills_upload_abort_params(workspace,upload));
+                    let Some(core)=weak.upgrade() else{return;};if core.is_stopped()||core.provider_runtime_epoch()!=epoch||!core.capability_management_allowed(&workspace){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);let _=sender.skills_upload_abort(super::upload::skills_upload_abort_params(workspace,upload));
                 }
                 Work::Prepare{workspace,operation,path}=>{
                     let Some(core)=weak.upgrade() else{return;};let target=core.skill_preparation_target(&workspace,operation);drop(core);let Some(target)=target else{continue;};
@@ -656,7 +656,7 @@ impl ClientCore {
                     if let Some(core)=weak.upgrade(){core.complete_skill_preparation(&workspace,operation,prepared);}else{return;}
 
                     loop {
-                        let Some(core)=weak.upgrade() else{return;};let effect=core.next_skill_upload_effect(&workspace,operation);let sender=core.compatibility_runtime().ws_command_sender();drop(core);let Some((effect,target,kind,effect_generation))=effect else{break;};
+                        let Some(core)=weak.upgrade() else{return;};let effect=core.next_skill_upload_effect(&workspace,operation);let sender=core.transport_runtime().ws_command_sender();drop(core);let Some((effect,target,kind,effect_generation))=effect else{break;};
                         let result=match effect {
                             UploadEffect::Start(params)=>sender.skills_upload_start(params).map(UploadCompletion::Start),
                             UploadEffect::Chunk{upload_id,offset,bytes}=>sender.send_skill_upload_chunk(workspace.clone(),upload_id,offset,bytes).map(UploadCompletion::Chunk),

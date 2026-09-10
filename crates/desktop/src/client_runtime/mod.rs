@@ -1,7 +1,7 @@
 mod binding_router;
-#[cfg(test)]
-pub(crate) use binding_router::test_binding_router;
 mod platform_effect_router;
+mod session_demand;
+mod startup;
 
 use platform_effect_router::{DesktopPlatformEffectRouter, DesktopSessionStorageAdapter};
 
@@ -12,20 +12,50 @@ use pioneer_desktop_foundation::ClientBindingRegistrar;
 use std::sync::Arc;
 
 pub(crate) struct DesktopRuntimeCoordinator {
+    startup: Option<startup::DesktopStartupCoordinator>,
     core: Arc<ClientCore>,
     binding_router: Entity<DesktopClientBindingRouter>,
     registrar: Arc<dyn ClientBindingRegistrar>,
+    session_demand: Option<session_demand::DesktopSessionDemand>,
     storage_adapter: Option<DesktopSessionStorageAdapter>,
     _effect_router: Arc<DesktopPlatformEffectRouter>,
     _quit: Subscription,
     quit_task: Option<gpui_kit::Task<()>>,
-    #[cfg(test)]
-    pub(crate) skip_native_startup: bool,
 }
 
 impl Global for DesktopRuntimeCoordinator {}
 
 impl DesktopRuntimeCoordinator {
+    pub(crate) fn open_window(
+        options: gpui_kit::WindowOptions,
+        cx: &mut gpui_kit::AsyncApp,
+    ) -> anyhow::Result<(
+        gpui_kit::WindowHandle<gpui_kit::component::Root>,
+        gpui_kit::WeakEntity<crate::desktop_shell::DesktopShellView>,
+    )> {
+        use gpui_kit::AppContext;
+        use gpui_kit::component::Root;
+        let mut desktop = None;
+        let handle = cx.open_window(options, |window, cx| {
+            Self::install(cx);
+            let registrar = cx.global::<Self>().registrar();
+            let navigation =
+                crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+            Self::deliver_pending(cx);
+            let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+            let shell = cx.new(|cx| {
+                crate::desktop_shell::DesktopShellView::new(navigation, layout, window, cx)
+            });
+            desktop = Some(shell.downgrade());
+            shell.update(cx, |shell, cx| shell.start_desktop_update(window, cx));
+            cx.new(|cx| Root::new(shell, window, cx))
+        })?;
+        Ok((
+            handle,
+            desktop.expect("window construction creates its shell"),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn install_for_test(cx: &mut App) {
         // Keep publications on GPUI's deterministic test executor; native client
@@ -35,14 +65,15 @@ impl DesktopRuntimeCoordinator {
         let registrar = DesktopClientBindingRouter::registrar(&binding_router, &core, cx);
         let quit = cx.on_app_quit(|_| async {});
         cx.set_global(Self {
+            startup: None,
             core,
             binding_router,
             registrar,
+            session_demand: None,
             storage_adapter: None,
             _effect_router: Arc::new(DesktopPlatformEffectRouter),
             _quit: quit,
             quit_task: None,
-            skip_native_startup: true,
         });
     }
 
@@ -55,6 +86,8 @@ impl DesktopRuntimeCoordinator {
         let storage_adapter = DesktopSessionStorageAdapter::start(core.clone(), &effect_router);
         let binding_router = cx.new(|cx| DesktopClientBindingRouter::new(core.clone(), cx));
         let registrar = DesktopClientBindingRouter::registrar(&binding_router, &core, cx);
+        let session_demand =
+            session_demand::DesktopSessionDemand::new(core.clone(), registrar.as_ref(), cx);
         let quit = cx.on_app_quit(|cx| {
             for handle in cx.windows() {
                 let _ = handle.update(cx, |root, window, cx| {
@@ -69,6 +102,8 @@ impl DesktopRuntimeCoordinator {
                 });
             }
             let mut owner = cx.remove_global::<Self>();
+            owner.startup.take();
+            owner.session_demand.take();
             owner
                 .binding_router
                 .update(cx, |router, _| router.shutdown());
@@ -103,17 +138,28 @@ impl DesktopRuntimeCoordinator {
                 drop(owner);
             }
         });
+        let startup_core = core.clone();
         cx.set_global(Self {
+            startup: None,
             core,
             binding_router,
             registrar,
+            session_demand: Some(session_demand),
             storage_adapter: Some(storage_adapter),
             _effect_router: effect_router,
             _quit: quit,
             quit_task: None,
-            #[cfg(test)]
-            skip_native_startup: false,
         });
+        startup_core.onboarding_intent(
+            pioneer_client::gateway::onboarding_runtime::OnboardingIntent::Initialize,
+        );
+    }
+
+    pub(crate) fn observe_startup(trace: pioneer_observability::DesktopStartupTrace, cx: &mut App) {
+        let owner = cx.global::<Self>();
+        let startup =
+            startup::DesktopStartupCoordinator::new(trace, owner.core(), owner.registrar(), cx);
+        cx.global_mut::<Self>().startup = Some(startup);
     }
 
     /// Menu/keyboard quit waits before entering GPUI's bounded final shutdown.

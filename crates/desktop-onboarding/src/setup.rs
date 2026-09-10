@@ -590,7 +590,7 @@ mod tests {
     };
     use gpui_kit::{App, Task, TestAppContext};
     use pioneer_desktop_foundation::{
-        ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink, profile_photo::*,
+        ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Registrar(Arc<AtomicUsize>);
@@ -607,6 +607,10 @@ mod tests {
             })
         }
     }
+    use crate::{
+        OnboardingPhotoError as ProfilePhotoError, OnboardingPhotoPort as ProfilePhotoPort,
+        OnboardingPhotoSelection as ProfilePhotoSelection,
+    };
     struct Photos;
     impl ProfilePhotoPort for Photos {
         fn select(

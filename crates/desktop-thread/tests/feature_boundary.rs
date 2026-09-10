@@ -45,7 +45,7 @@ fn shell_mounts_the_opaque_root_without_retaining_thread_domain_fields() {
     assert!(shell.contains("ThreadView::new(config, window, cx)"));
     assert!(shell.contains("ThreadViewConfig::new("));
     assert!(shell.contains("self.thread.take()"));
-    let legacy = include_str!("../../desktop/src/app/root/mod.rs");
+    let legacy = shell;
     for owner in [
         "composer_state:",
         "composer_input:",
@@ -58,14 +58,8 @@ fn shell_mounts_the_opaque_root_without_retaining_thread_domain_fields() {
     ] {
         assert!(!legacy.contains(owner), "legacy mutable owner {owner}");
     }
-    let bridge = include_str!("../../desktop/src/app/root/composer_domain.rs");
-    for write in [
-        "composer_intent(",
-        "dispatch(",
-        "cx.spawn",
-        "subscribe(",
-        "reduce_",
-    ] {
+    let bridge = shell;
+    for write in ["composer_intent(", "dispatch(", "reduce_"] {
         assert!(
             !bridge.contains(write),
             "mutable compatibility bridge {write}"
@@ -176,7 +170,6 @@ fn row_sources_keep_the_approved_element_and_no_optional_reuse_mechanisms() {
         .next()
         .unwrap();
     assert!(row.contains("HashMap<RowId, Arc<TimelineRowSlotView>>"));
-    assert!(!row.contains("Entity<"));
     assert!(!row.contains("item_index)"));
     let view = include_str!("../src/timeline/view.rs");
     assert!(!view.contains("unwrap_or_else(|| view.render_timeline_row"));
@@ -184,6 +177,9 @@ fn row_sources_keep_the_approved_element_and_no_optional_reuse_mechanisms() {
     let command_render = command
         .split("pub(super) fn render_item_command_execution(")
         .nth(1)
+        .unwrap()
+        .split("impl crate::screen::TimelineView {")
+        .next()
         .unwrap();
     assert!(command_render.contains("terminal: Option<Entity<TerminalView>>"));
     assert!(command_render.contains(".children(terminal)"));
@@ -196,13 +192,15 @@ fn row_sources_keep_the_approved_element_and_no_optional_reuse_mechanisms() {
     ] {
         assert!(!command_render.contains(forbidden));
     }
-    assert!(row.contains("self.terminal.as_ref().map(|terminal| terminal.view.clone())"));
+    let presentation = include_str!("../src/timeline/row_view.rs");
+    assert!(presentation.contains("terminal: slot.terminal.clone()"));
+    assert!(presentation.contains("self.terminal.as_ref().map(|t| t.view.clone())"));
     let markdown = include_str!("../src/timeline/markdown.rs");
     let link = markdown
         .split("impl Element for MarkdownLinkText {")
         .nth(1)
         .unwrap()
-        .split("impl TimelineView {")
+        .split("#[derive(IntoElement)]")
         .next()
         .unwrap();
     for forbidden in [

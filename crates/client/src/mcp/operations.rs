@@ -410,7 +410,7 @@ impl ClientCore {
                     if !core.mcp_action_current(&work) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     if let McpIntent::Configure { config_json } = &work.intent {
                         let result = sender.mcp_install(super::actions::mcp_install_params(

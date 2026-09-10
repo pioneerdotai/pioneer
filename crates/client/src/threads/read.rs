@@ -77,7 +77,7 @@ impl crate::core::ClientCore {
             "thread read scope is unavailable"
         );
         let response = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .thread_read(params.clone())?;
         anyhow::ensure!(

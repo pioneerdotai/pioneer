@@ -422,7 +422,7 @@ impl ClientCore {
                         core.complete_message_deletion(&request, Err(true));
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let result = sender
                         .turn_message_delete(pioneer_protocol::TurnMessageDeleteParams {

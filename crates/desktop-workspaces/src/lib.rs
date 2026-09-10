@@ -24,11 +24,9 @@ pub enum WorkspaceNavigationEvent {
 }
 pub struct WorkspaceNavigationConfig {
     client: Arc<ClientCore>,
-    workspace_preference: Rc<dyn Fn(&App) -> Option<String>>,
     registrar: Arc<dyn ClientBindingRegistrar>,
     load_expansion: Rc<dyn Fn(&str, &mut App) -> HashMap<String, bool>>,
     save_expansion: Rc<dyn Fn(&str, HashMap<String, bool>, &mut App)>,
-    context_locked: Rc<dyn Fn(&App) -> bool>,
     rename_thread_dialog: DialogPresenter,
     rename_folder_dialog: DialogPresenter,
     rename_workspace_dialog: DialogPresenter,
@@ -40,7 +38,6 @@ impl WorkspaceNavigationConfig {
         registrar: Arc<dyn ClientBindingRegistrar>,
         load_expansion: impl Fn(&str, &mut App) -> HashMap<String, bool> + 'static,
         save_expansion: impl Fn(&str, HashMap<String, bool>, &mut App) + 'static,
-        context_locked: impl Fn(&App) -> bool + 'static,
         rename_thread_dialog: impl Fn(DialogBuilder, &mut Window, &mut App) + 'static,
         rename_folder_dialog: impl Fn(DialogBuilder, &mut Window, &mut App) + 'static,
         rename_workspace_dialog: impl Fn(DialogBuilder, &mut Window, &mut App) + 'static,
@@ -48,23 +45,14 @@ impl WorkspaceNavigationConfig {
     ) -> Self {
         Self {
             client,
-            workspace_preference: Rc::new(|_| None),
             registrar,
             load_expansion: Rc::new(load_expansion),
             save_expansion: Rc::new(save_expansion),
-            context_locked: Rc::new(context_locked),
             rename_thread_dialog: Rc::new(rename_thread_dialog),
             rename_folder_dialog: Rc::new(rename_folder_dialog),
             rename_workspace_dialog: Rc::new(rename_workspace_dialog),
             create_workspace_dialog: Rc::new(create_workspace_dialog),
         }
-    }
-    pub fn with_workspace_preference(
-        mut self,
-        read: impl Fn(&App) -> Option<String> + 'static,
-    ) -> Self {
-        self.workspace_preference = Rc::new(read);
-        self
     }
 }
 pub struct WorkspaceNavigationView {
@@ -94,10 +82,6 @@ impl WorkspaceNavigationView {
             sidebar,
             _events: events,
         }
-    }
-    pub fn refresh_presentation(&mut self, cx: &mut Context<Self>) {
-        self.sidebar
-            .update(cx, |view, cx| view.refresh_presentation(cx));
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.sidebar.update(cx, |view, _| view.close());

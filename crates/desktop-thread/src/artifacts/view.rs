@@ -472,7 +472,25 @@ impl ThreadArtifactsView {
         preview_image_path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let fallback_icon = kind_icon(artifact.kind);
+        ArtifactImagePreview {
+            fallback_icon: kind_icon(artifact.kind),
+            preview_image_path,
+        }
+        .into_any_element()
+    }
+}
+
+#[derive(IntoElement)]
+struct ArtifactImagePreview {
+    fallback_icon: IconName,
+    preview_image_path: Option<PathBuf>,
+}
+impl RenderOnce for ArtifactImagePreview {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Self {
+            fallback_icon,
+            preview_image_path,
+        } = self;
         let mut container = div()
             .w_full()
             .relative()

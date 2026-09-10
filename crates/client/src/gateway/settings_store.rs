@@ -19,7 +19,7 @@ pub struct GatewaySettingsStore {
 
 impl ClientCore {
     pub(crate) fn gateway_http_generation(&self) -> Option<u64> {
-        self.compatibility_runtime()
+        self.transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
             .ok()
@@ -31,7 +31,7 @@ impl ClientCore {
             return;
         };
         if !self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .gateway_state_event_is_current(event)
         {
@@ -219,7 +219,7 @@ impl ClientCore {
             );
             owner.settings_request_connection
         };
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let mut result = connection
             .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
             .and_then(|connection| {
@@ -311,7 +311,7 @@ impl ClientCore {
             );
             owner.settings_request_connection
         };
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let mut result = connection
             .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
             .and_then(|connection| {

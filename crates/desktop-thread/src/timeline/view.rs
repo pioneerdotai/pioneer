@@ -17,9 +17,7 @@ pub(crate) struct PreparedTimeline {
         Option<pioneer_client::timeline::types::TurnAuthorSnapshot>,
     )>,
     pub(crate) model: TimelineRenderModel,
-    pub(crate) expanded: std::rc::Rc<std::collections::HashSet<String>>,
     pub(crate) slots: Vec<std::sync::Arc<super::row_registry::TimelineRowSlotView>>,
-    pub(crate) grouping: std::rc::Rc<TimelineGrouping>,
     pub(crate) item_sizes: std::rc::Rc<Vec<Size<Pixels>>>,
     pub(crate) layout_index: std::rc::Rc<TimelineLayoutIndex>,
     pub(crate) content_width: Pixels,
@@ -124,7 +122,6 @@ impl TimelineView {
             .as_ref()
             .map(|snapshot| snapshot.rows().iter().map(|row| row.id().clone()).collect())
             .unwrap_or_default();
-        let expanded = std::rc::Rc::new(self.thread_timeline_view_state.expanded.borrow().clone());
         let ticket = self
             .measurement_coordinator
             .begin(model.revision, self.layout_store.context_revision);
@@ -136,10 +133,8 @@ impl TimelineView {
             self.commit_timeline_layout(
                 PreparedTimeline {
                     row_inputs,
-                    expanded,
                     slots: self.row_registry.slots(),
                     model,
-                    grouping,
                     item_sizes,
                     layout_index,
                     content_width,
@@ -187,10 +182,8 @@ impl TimelineView {
                         view.commit_timeline_layout(
                             PreparedTimeline {
                                 row_inputs,
-                                expanded,
                                 slots: view.row_registry.slots(),
                                 model,
-                                grouping,
                                 item_sizes,
                                 layout_index,
                                 content_width,
@@ -459,10 +452,8 @@ impl TimelineView {
         };
         let PreparedTimeline {
             row_inputs: _,
-            expanded: _,
             slots,
             model: _,
-            grouping: _,
             item_sizes,
             layout_index,
             content_width,

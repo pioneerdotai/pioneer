@@ -8,15 +8,6 @@ use pioneer_config::AppConfig;
 use std::path::PathBuf;
 use tracing::info;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DesktopSessionConnectionOutcome {
-    Connected {
-        connection_id: u64,
-        metadata: pioneer_client::gateway::session_lifecycle::GatewaySessionMetadata,
-        access_expires_at_unix: u64,
-    },
-    Terminal(pioneer_client::gateway::session_refresh::GatewaySessionTerminal),
-}
 pub fn ensure_runtime_home_dir() -> Result<PathBuf> {
     let config = AppConfig::load().context(t!("errors.config.load_app").to_string())?;
     let runtime_home = config

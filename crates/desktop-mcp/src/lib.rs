@@ -21,9 +21,9 @@ mod identity;
 mod boundary_tests {
     #[test]
     fn shell_composes_catalog_roots_and_has_no_retired_catalog_owners() {
-        let root = include_str!("../../desktop/src/app/root/mod.rs");
-        let state = include_str!("../../desktop/src/app/root/state.rs");
-        let view = include_str!("../../desktop/src/app/root/view.rs");
+        let root = include_str!("../../desktop/src/desktop_shell.rs");
+        let state = root;
+        let view = root;
         for field in [
             "mcp_servers:",
             "mcp_poller_started:",
@@ -38,7 +38,7 @@ mod boundary_tests {
         for name in ["McpCatalogView", "SkillsCatalogView"] {
             assert!(state.contains(name));
         }
-        for name in ["mcp_view", "skills_view"] {
+        for name in ["self.mcp", "self.skills"] {
             assert!(root.contains(name));
             assert!(view.contains(name));
         }
@@ -67,8 +67,8 @@ mod boundary_tests {
             assert!(!source.contains("client_ffi"));
         }
         for source in [
-            include_str!("../../desktop/src/app/flow/ws_events_notifications.rs"),
-            include_str!("../../desktop/src/app/flow/ws_events_pump.rs"),
+            include_str!("../../desktop/src/desktop_shell.rs"),
+            include_str!("../../desktop/src/client_runtime/mod.rs"),
         ] {
             assert!(!source.contains("apply_mcp_server_status_changed_to_catalog"));
             assert!(!source.contains("apply_local_skill_policy"));

@@ -268,6 +268,7 @@ impl ComposerView {
         }
         self.present_composer_authorization_notice();
         self.controlled_text(window, cx);
+        self.synchronize_mention_items(window, cx);
         if self
             .identity_input
             .as_ref()

@@ -232,7 +232,7 @@ impl ClientCore {
         spec: crate::transport::ws::GatewayWsConnectSpec,
         retry_initial_failure: bool,
     ) -> Result<u64> {
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         self.start_gateway_session_transport_with_port(
             spec,
             retry_initial_failure,
@@ -316,7 +316,7 @@ impl ClientCore {
             self.publish_gateway_session(&sessions);
             epoch
         };
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let result = if retry_initial_failure {
             connect(spec, true)
         } else {
@@ -414,7 +414,7 @@ impl ClientCore {
             );
         }
         let _ = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .disconnect_connection(connection_id);
     }
@@ -429,7 +429,7 @@ impl ClientCore {
             .session_transport
             .lock()
             .expect("Gateway transport lease poisoned");
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let access = match sender.current_gateway_http_access() {
             Ok(access) => access,
             Err(crate::transport::http::GatewayHttpAuthorityError::Terminal(reason)) => {
@@ -603,7 +603,7 @@ impl ClientCore {
         request: GatewaySessionRefreshRequest<'_>,
         storage: &dyn GatewaySessionStorage,
     ) -> ConnectionOutcome {
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let cleanup_timeout = request.timeout;
         self.ensure_gateway_session_with_ports(
             request,
@@ -1093,7 +1093,7 @@ impl ClientCore {
         );
         if let Some(id) = connection_id {
             let _ = self
-                .compatibility_runtime()
+                .transport_runtime()
                 .ws_command_sender()
                 .disconnect_connection(id);
         }
@@ -1143,7 +1143,7 @@ impl ClientCore {
             if matches && lease.as_deref() == Some(&request.endpoint.id) {
                 self.retire_session_connection(&request.endpoint.id, false);
                 *lease = None;
-                self.compatibility_runtime()
+                self.transport_runtime()
                     .ws_command_sender()
                     .disconnect()
                     .map_err(connection_failure)?;
@@ -1313,7 +1313,7 @@ impl ClientCore {
                     // The receiver must not wait for the transport lease: its owner can be
                     // waiting for an RPC response delivered by this same receive task.
                     let _ = self
-                        .compatibility_runtime()
+                        .transport_runtime()
                         .ws_command_sender()
                         .disconnect_connection(*connection_id);
                 }
@@ -1331,9 +1331,7 @@ impl ClientCore {
             .expect("Gateway transport lease poisoned");
         if lease.as_deref() == Some(endpoint) {
             *lease = None;
-            self.compatibility_runtime()
-                .ws_command_sender()
-                .disconnect()?;
+            self.transport_runtime().ws_command_sender().disconnect()?;
         }
         Ok(())
     }
@@ -2160,10 +2158,7 @@ mod tests {
             },
             || {
                 assert!(!core.gateway_session().startup.transport_ready);
-                assert!(
-                    core.gateway_feature_connection_projection(Default::default())
-                        .is_none()
-                );
+                assert!(core.gateway_session().startup.identity_pending);
                 assert!(
                     core.gateway_session().connections["endpoint"]
                         .connected
@@ -2208,14 +2203,11 @@ mod tests {
         assert!(publication.connections[&endpoint.id].refresh_requested);
         assert!(!publication.connections[&endpoint.id].pending);
         assert!(core.current_auth().is_none());
-        let legacy = core
-            .gateway_feature_connection_projection(Default::default())
-            .unwrap();
         assert_eq!(
-            legacy.connection_state,
+            publication.status.as_ref().unwrap().connection_state,
             crate::state::client_state::GatewayConnectionState::Disconnected
         );
-        assert_eq!(legacy.gateway_error.as_deref(), Some("access_expired"));
+        assert_eq!(publication.gateway_error.as_deref(), Some("access_expired"));
         let revision = publication.startup.transport_revision;
         core.reject_gateway_session_identity(
             &endpoint.id,

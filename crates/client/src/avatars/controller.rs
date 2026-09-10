@@ -142,7 +142,7 @@ impl ClientCore {
         &self,
         runtime_home: PathBuf,
     ) -> Result<AvatarCacheService, AvatarCacheError> {
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let access = sender
             .current_gateway_http_access()
             .map_err(|_| AvatarCacheError::Offline)?;
@@ -238,7 +238,7 @@ impl ClientCore {
             return Err(AvatarCacheError::Cancelled);
         }
         let access = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
             .map_err(|_| AvatarCacheError::Authentication)?;
@@ -258,7 +258,7 @@ impl ClientCore {
         publication: AvatarPublication,
     ) -> Result<(), AvatarCacheError> {
         let access = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
             .map_err(|_| AvatarCacheError::Authentication)?;

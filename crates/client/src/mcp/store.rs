@@ -1013,7 +1013,7 @@ impl ClientCore {
                         return;
                     }
                     let request = core.next_mcp_read();
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     if let Some(request) = request {
                         if let Some(server) = &request.server {

@@ -233,7 +233,7 @@ impl ClientCore {
             "administration_activation_unavailable"
         );
         let access = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
             .map_err(|_| anyhow::anyhow!("administration_activation_unavailable"))?;
@@ -1047,7 +1047,7 @@ impl AdministrationOperation {
             } => core.plan_member_workspace_selection(principal_id, selected),
             command => Ok(vec![command]),
         };
-        let sender = core.compatibility_runtime().ws_command_sender();
+        let sender = core.transport_runtime().ws_command_sender();
         drop(core);
         let result = (|| {
             let mut completion = AdministrationCompletion::MemberWorkspacesChanged;

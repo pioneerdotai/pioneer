@@ -33,18 +33,9 @@ fn policy_refresh_keeps_members_dialog_open_before_and_after_result(cx: &mut Tes
             .registrar();
         let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
         let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
-        let desktop = cx.new(|cx| {
-            crate::app::LegacyScreenAdapter::new(
-                window,
-                cx,
-                pioneer_observability::DesktopStartupTrace::start(),
-                navigation.clone(),
-                layout.clone(),
-            )
-        });
-        let shell = cx.new(|cx| {
-            crate::desktop_shell::DesktopShellView::new(desktop, navigation, layout, window, cx)
-        });
+
+        let shell = cx
+            .new(|cx| crate::desktop_shell::DesktopShellView::new(navigation, layout, window, cx));
         Root::new(shell, window, cx)
     });
     cx.run_until_parked();
@@ -100,17 +91,9 @@ fn desktop_window_constructs_gateway_views_before_first_frame(cx: &mut TestAppCo
             let navigation =
                 crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
             let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
-            let desktop = cx.new(|cx| {
-                crate::app::LegacyScreenAdapter::new(
-                    window,
-                    cx,
-                    pioneer_observability::DesktopStartupTrace::start(),
-                    navigation.clone(),
-                    layout.clone(),
-                )
-            });
+
             let shell = cx.new(|cx| {
-                crate::desktop_shell::DesktopShellView::new(desktop, navigation, layout, window, cx)
+                crate::desktop_shell::DesktopShellView::new(navigation, layout, window, cx)
             });
             cx.new(|cx| Root::new(shell, window, cx))
         })
@@ -297,4 +280,268 @@ fn thread_footer_shares_the_existing_bottom_bar_allocation_and_receives_pointer_
         gpui_kit::Modifiers::default(),
     );
     assert_eq!(clicks.get(), 1);
+}
+
+#[gpui_kit::test]
+fn every_production_route_retains_its_feature_and_window_close_releases_it(
+    cx: &mut TestAppContext,
+) {
+    use super::{DesktopShellView, MainRoute, WindowRoute};
+    use pioneer_client::navigation::{
+        AdministrationRoute, NavigationIntent, SemanticDestination, SettingsRoute,
+    };
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let core = cx.update(|cx| {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let shell = cx.new(|cx| DesktopShellView::new(navigation, layout, window, cx));
+        Root::new(shell, window, cx)
+    });
+    cx.run_until_parked();
+    let shell = cx.update(|_, cx| {
+        root.read(cx)
+            .view()
+            .clone()
+            .downcast::<DesktopShellView>()
+            .unwrap()
+    });
+    let roots = cx.update(|_, cx| {
+        let s = shell.read(cx);
+        (
+            s.providers.as_ref().unwrap().entity_id(),
+            s.administration.as_ref().unwrap().entity_id(),
+            s.settings.as_ref().unwrap().entity_id(),
+            s.mcp.as_ref().unwrap().entity_id(),
+            s.skills.as_ref().unwrap().entity_id(),
+            s.onboarding.as_ref().unwrap().downgrade(),
+        )
+    });
+    let routes = [
+        (
+            SemanticDestination::Providers {
+                filter: pioneer_client::providers::selectors::ProviderFilter::Api,
+            },
+            MainRoute::Providers,
+        ),
+        (
+            SemanticDestination::Administration {
+                route: AdministrationRoute::Members,
+            },
+            MainRoute::Administration,
+        ),
+        (
+            SemanticDestination::Settings {
+                route: SettingsRoute::Account,
+            },
+            MainRoute::Settings,
+        ),
+        (SemanticDestination::Mcp { server_id: None }, MainRoute::Mcp),
+        (
+            SemanticDestination::Mcp {
+                server_id: Some("synthetic-server".into()),
+            },
+            MainRoute::McpDetails,
+        ),
+        (
+            SemanticDestination::Skills { skill_id: None },
+            MainRoute::Skills,
+        ),
+        (
+            SemanticDestination::Skills {
+                skill_id: Some(pioneer_protocol::SkillId::new("S00000000000000000001").unwrap()),
+            },
+            MainRoute::SkillDetails,
+        ),
+    ];
+    for (destination, expected) in routes {
+        core.navigate(NavigationIntent::Navigate { destination }, None);
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let s = shell.read(cx);
+            assert_eq!(s.navigation.snapshot().route(), expected);
+            let mounted = s.selected_screen().unwrap().entity_id();
+            let expected_id = match expected {
+                MainRoute::Providers => roots.0,
+                MainRoute::Administration => roots.1,
+                MainRoute::Settings => roots.2,
+                MainRoute::Mcp | MainRoute::McpDetails => roots.3,
+                MainRoute::Skills | MainRoute::SkillDetails => roots.4,
+                _ => unreachable!(),
+            };
+            assert_eq!(mounted, expected_id);
+            assert_eq!(
+                (
+                    s.providers.as_ref().unwrap().entity_id(),
+                    s.administration.as_ref().unwrap().entity_id(),
+                    s.settings.as_ref().unwrap().entity_id(),
+                    s.mcp.as_ref().unwrap().entity_id(),
+                    s.skills.as_ref().unwrap().entity_id()
+                ),
+                (roots.0, roots.1, roots.2, roots.3, roots.4)
+            );
+        });
+    }
+    core.activate_thread(Some("synthetic-thread"), Some("synthetic-workspace"));
+    core.navigate(
+        NavigationIntent::OpenAgentsDocument {
+            scope: pioneer_client::agents_doc::scope::AgentsDocEditorScope::root(
+                "synthetic-workspace",
+            ),
+        },
+        None,
+    );
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = shell.read(cx);
+        assert_eq!(
+            s.selected_screen().unwrap().entity_id(),
+            s.agents_document.as_ref().unwrap().entity_id()
+        );
+    });
+    core.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Threads,
+        },
+        None,
+    );
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = shell.read(cx);
+        assert_eq!(
+            s.selected_screen().unwrap().entity_id(),
+            s.thread.as_ref().unwrap().1.entity_id()
+        );
+    });
+    let onboarding = roots.5.upgrade().unwrap();
+    cx.update(|_, cx| {
+        onboarding.update(cx, |_, cx| {
+            cx.emit(
+                pioneer_desktop_onboarding::OnboardingEvent::NavigationChanged {
+                    invitation_active: true,
+                    setup_required: true,
+                },
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = shell.read(cx);
+        assert!(s.setup_required);
+        assert_eq!(
+            s.navigation.snapshot().window_route(),
+            WindowRoute::InvitationJoin
+        );
+        assert_eq!(
+            s.selected_screen().unwrap().entity_id(),
+            onboarding.entity_id()
+        );
+    });
+    drop(onboarding);
+    for route in [
+        WindowRoute::GatewaySetup,
+        WindowRoute::InvitationJoin,
+        WindowRoute::Main,
+    ] {
+        cx.update(|_, cx| shell.read(cx).navigation.set_window_route(route));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(shell.read(cx).navigation.snapshot().window_route(), route));
+    }
+    cx.update(|window, cx| shell.update(cx, |s, cx| s.close(window, cx)));
+    cx.run_until_parked();
+    assert!(roots.5.upgrade().is_none());
+    cx.update(|_, cx| {
+        let s = shell.read(cx);
+        assert!(s.thread.is_none() && s.sidebar.is_none() && s.identity.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn production_navigation_pointer_keyboard_and_menu_share_one_transition(cx: &mut TestAppContext) {
+    use crate::desktop_navigation::OpenProviders;
+    use pioneer_client::{
+        core::ClientScope,
+        navigation::{NavigationIntent, SemanticDestination},
+    };
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let core = cx.update(|cx| {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+    });
+    core.activate_thread(
+        Some("synthetic-thread".into()),
+        Some("synthetic-workspace".into()),
+    );
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let shell = cx.new(|cx| super::DesktopShellView::new(navigation, layout, window, cx));
+        Root::new(shell, window, cx)
+    });
+    cx.run_until_parked();
+    let shell = cx.update(|_, cx| {
+        root.read(cx)
+            .view()
+            .clone()
+            .downcast::<super::DesktopShellView>()
+            .unwrap()
+    });
+    cx.update(|_, cx| {
+        cx.bind_keys([gpui_kit::KeyBinding::new(
+            "ctrl-alt-p",
+            OpenProviders,
+            Some("DesktopShell"),
+        )])
+    });
+    for entry in 0..3 {
+        core.navigate(
+            NavigationIntent::Navigate {
+                destination: SemanticDestination::Threads,
+            },
+            None,
+        );
+        cx.run_until_parked();
+        cx.update(|window, cx| shell.read(cx).action_region.clone().focus(window, cx));
+        cx.run_until_parked();
+        let before = core
+            .snapshot(&ClientScope::Navigation)
+            .unwrap()
+            .revisions()
+            .scoped()
+            .get();
+        match entry {
+            0 => {
+                let bounds = cx
+                    .debug_bounds("bottom-bar-open-providers")
+                    .expect("production toolbar button");
+                cx.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+            }
+            1 => cx.simulate_keystrokes("ctrl-alt-p"),
+            _ => cx.dispatch_action(OpenProviders),
+        }
+        cx.run_until_parked();
+        assert!(matches!(
+            core.navigation_snapshot().destination(),
+            SemanticDestination::Providers { .. }
+        ));
+        assert_eq!(
+            core.snapshot(&ClientScope::Navigation)
+                .unwrap()
+                .revisions()
+                .scoped()
+                .get(),
+            before + 1
+        );
+    }
 }

@@ -1,6 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use gpui_kit::{App, AppContext};
-use pioneer_desktop_foundation::profile_photo::*;
+use pioneer_desktop_settings::{
+    SettingsPhotoError as ProfilePhotoError, SettingsPhotoPort as ProfilePhotoPort,
+    SettingsPhotoSelection as ProfilePhotoSelection,
+};
 use pioneer_protocol::{
     PROFILE_AVATAR_MAX_DECODED_BYTES, PROFILE_AVATAR_MAX_DIMENSION, ProfileAvatarInput,
     ProfileAvatarMediaType,
@@ -55,4 +58,38 @@ pub(crate) fn load_desktop_profile_avatar(
         anyhow::bail!("invalid profile avatar dimensions");
     }
     ProfileAvatarInput::new(media_type, BASE64_STANDARD.encode(bytes)).map_err(anyhow::Error::new)
+}
+
+impl pioneer_desktop_onboarding::OnboardingPhotoPort for DesktopProfilePhotoPort {
+    fn select(
+        &self,
+        cx: &mut gpui_kit::App,
+    ) -> gpui_kit::Task<
+        Result<
+            Option<pioneer_desktop_onboarding::OnboardingPhotoSelection>,
+            pioneer_desktop_onboarding::OnboardingPhotoError,
+        >,
+    > {
+        let selection = ProfilePhotoPort::select(self, cx);
+        cx.spawn(async move |_| {
+            selection
+                .await
+                .map(|value| {
+                    value.map(
+                        |value| pioneer_desktop_onboarding::OnboardingPhotoSelection {
+                            preview: value.preview,
+                            avatar: value.avatar,
+                        },
+                    )
+                })
+                .map_err(|error| match error {
+                    ProfilePhotoError::Picker => {
+                        pioneer_desktop_onboarding::OnboardingPhotoError::Picker
+                    }
+                    ProfilePhotoError::InvalidAvatar => {
+                        pioneer_desktop_onboarding::OnboardingPhotoError::InvalidAvatar
+                    }
+                })
+        })
+    }
 }

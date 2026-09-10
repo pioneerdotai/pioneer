@@ -635,7 +635,7 @@ impl ClientCore {
                         .wait_duration(core.timeline_started.elapsed());
                     drop(runtime);
                     drop(identity);
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     if let Some(request) = request {
                         let scope = &request.scope;

@@ -28,20 +28,14 @@ pub(super) fn gateway_endpoint_subtitle(endpoint: &GatewayEndpoint) -> String {
 }
 
 impl OnboardingView {
-    pub(crate) fn render_gateways_popover(
-        &self,
+    fn render_gateways_popover(
         desktop_entity: Entity<Self>,
-        publication: Option<
-            &pioneer_client::gateway::session_controller::GatewaySessionPublication,
-        >,
+        projection: &SwitcherProjection,
         show_spinner: bool,
         cx: &gpui_kit::App,
     ) -> AnyElement {
-        let destinations = self.destinations();
-        let connecting = destinations.loading || destinations.pending_endpoint.is_some();
-        let scoped_status = publication
-            .and_then(|p| p.status.as_ref())
-            .filter(|_| !connecting);
+        let connecting = projection.loading || projection.pending.is_some();
+        let scoped_status = projection.status.as_ref().filter(|_| !connecting);
         let gateway_status_color =
             match scoped_status.map_or(GatewayStatusLevel::Neutral, |s| s.status_level) {
                 GatewayStatusLevel::Neutral => cx.theme().muted_foreground,
@@ -49,19 +43,8 @@ impl OnboardingView {
                 GatewayStatusLevel::Degraded => cx.theme().warning,
                 GatewayStatusLevel::Failed => cx.theme().danger,
             };
-        let gateway_endpoints = self
-            .config
-            .client
-            .gateway_registry()
-            .map(|registry| {
-                let local_id = registry
-                    .local
-                    .as_ref()
-                    .map_or("", |local| local.id.as_str());
-                pioneer_client::gateway::runtime::selectable_gateway_endpoints(&registry, local_id)
-            })
-            .unwrap_or_default();
-        let active_gateway_id = destinations.selected_endpoint;
+        let gateway_endpoints = &projection.endpoints;
+        let active_gateway_id = projection.selected.clone();
         let active_gateway = active_gateway_id
             .as_deref()
             .and_then(|id| gateway_endpoints.iter().find(|endpoint| endpoint.id == id))
@@ -80,9 +63,9 @@ impl OnboardingView {
             })
             .unwrap_or_else(|| t!("gateway.status.connecting").to_string());
         let gateway_hover_error = if scoped_status.is_some() {
-            publication.and_then(|publication| publication.gateway_error.clone())
+            projection.session_error.clone()
         } else {
-            destinations.error.clone()
+            projection.error.clone()
         };
 
         let gateway_selection_locked = connecting;
@@ -466,7 +449,18 @@ impl SwitcherProjection {
         let destinations=client.snapshot(&ClientScope::GatewayDestinations).and_then(|p|p.typed::<pioneer_client::gateway::onboarding_runtime::GatewayDestinationsPublication>()).map(|p|p.payload().as_ref().clone()).unwrap_or_default();
         let session = client.gateway_session();
         Self {
-            endpoints: destinations.endpoints,
+            endpoints: client
+                .gateway_registry()
+                .map(|registry| {
+                    let local_id = registry
+                        .local
+                        .as_ref()
+                        .map_or("", |local| local.id.as_str());
+                    pioneer_client::gateway::runtime::selectable_gateway_endpoints(
+                        &registry, local_id,
+                    )
+                })
+                .unwrap_or_default(),
             selected: destinations.selected_endpoint,
             loading: destinations.loading,
             pending: destinations.pending_endpoint,
@@ -524,30 +518,17 @@ impl Render for GatewaySwitcherView {
         let Some(owner) = self.owner.as_ref().and_then(WeakEntity::upgrade) else {
             return div().into_any_element();
         };
-        let registry = self.config.client.gateway_registry();
-        if registry.as_ref().is_none_or(|registry| {
-            pioneer_client::gateway::runtime::selectable_gateway_endpoints(
-                registry,
-                registry
-                    .local
-                    .as_ref()
-                    .map_or("", |local| local.id.as_str()),
-            )
-            .is_empty()
-        }) {
+        if self.projection.endpoints.is_empty() {
             return div().into_any_element();
         }
-        let session = self.config.client.gateway_session();
-        let destinations = owner.read(cx).destinations();
-        let loading = destinations.loading
-            || destinations.pending_endpoint.is_some()
-            || session
+        let loading = self.projection.loading
+            || self.projection.pending.is_some()
+            || self
+                .projection
                 .status
                 .as_ref()
                 .is_some_and(|s| s.connection_state.is_transitioning());
-        owner
-            .read(cx)
-            .render_gateways_popover(owner.clone(), Some(&session), loading, cx)
+        OnboardingView::render_gateways_popover(owner, &self.projection, loading, cx)
     }
 }
 

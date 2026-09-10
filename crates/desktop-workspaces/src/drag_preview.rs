@@ -13,8 +13,18 @@ pub(crate) struct SidebarTreeDragPayload {
     pub(crate) item: SidebarTreeDragItem,
 }
 
-impl Render for SidebarTreeDragPayload {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+// GPUI's drag session API requires a transient Render host. The preview itself
+// is a value; the framework creates/drops this host with the drag operation.
+pub(crate) struct SidebarDragSession(pub(crate) SidebarTreeDragPayload);
+impl Render for SidebarDragSession {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        SidebarTreeDragPreview(self.0.clone())
+    }
+}
+#[derive(IntoElement)]
+struct SidebarTreeDragPreview(SidebarTreeDragPayload);
+impl RenderOnce for SidebarTreeDragPreview {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
             .px_3()
             .py_1()
@@ -25,7 +35,7 @@ impl Render for SidebarTreeDragPayload {
             .border_color(cx.theme().border)
             .rounded_md()
             .shadow_md()
-            .child(match self.item {
+            .child(match self.0.item {
                 SidebarTreeDragItem::Thread { .. } => Icon::new(IconName::File)
                     .size_4()
                     .text_color(cx.theme().popover_foreground)
@@ -40,7 +50,7 @@ impl Render for SidebarTreeDragPayload {
                     .text_sm()
                     .font_light()
                     .text_color(cx.theme().popover_foreground)
-                    .child(self.label.clone()),
+                    .child(self.0.label),
             )
     }
 }

@@ -1159,7 +1159,7 @@ mod connection_generation_tests {
         use crate::gateway::event_router::GatewayEventRoute;
         use pioneer_protocol::{GatewayNotification, GatewayVoiceInputStatusChangedNotification};
         let core = ClientCore::new();
-        let sender = core.compatibility_runtime().ws_command_sender();
+        let sender = core.transport_runtime().ws_command_sender();
         let id = sender
             .begin_connection_attempt()
             .unwrap()
@@ -1197,7 +1197,6 @@ mod connection_generation_tests {
             core.route_gateway_event(&feature),
             Some(GatewayEventRoute::Unknown)
         );
-        assert!(core.drain_gateway_compatibility_events().is_empty());
         sender.disconnect_connection(id).unwrap();
         assert_eq!(core.route_gateway_event(&feature), None);
         assert_eq!(core.route_gateway_event(&settings), None);

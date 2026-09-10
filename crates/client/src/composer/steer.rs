@@ -164,7 +164,7 @@ impl ClientCore {
                         core.finish_composer_steer(&request, Ok(()));
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let target = request.plan.steer_target.as_ref().unwrap();
                     let params = crate::turns::steer::plan_cli_runtime_turn_steer(

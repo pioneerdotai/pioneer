@@ -115,7 +115,7 @@ impl ClientCore {
             generation
         };
         let mut result = super::bootstrap::bootstrap_workspace_catalog(
-            &self.compatibility_runtime().ws_command_sender(),
+            &self.transport_runtime().ws_command_sender(),
             super::bootstrap::WorkspaceBootstrapRequest {
                 persisted_workspace_id,
             },

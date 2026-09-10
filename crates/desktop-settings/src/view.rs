@@ -1,3 +1,4 @@
+use crate::{AppLanguagePreference, FileOpenerId, WindowThemePreference};
 use crate::{
     buttons::small_outline_button,
     file_openers::{file_opener_menu_row, file_opener_trigger},
@@ -24,10 +25,6 @@ use pioneer_client::settings::types::{
     GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
     GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
     GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
-};
-use pioneer_desktop_foundation::{
-    file_opener::FileOpenerId,
-    preferences::{AppLanguagePreference, WindowThemePreference},
 };
 use std::rc::Rc;
 
@@ -531,7 +528,7 @@ impl SettingsScreenView {
                 }),
                 mode: ProviderModelSelectorMode::SelfImprovement,
                 workspace_id,
-                client: self.gateway.client_runtime.client_core().clone(),
+                client: self.config.client.clone(),
                 on_save: Rc::new(
                     move |view: &mut SettingsScreenView, selection: ModelSelectorSelection, cx| {
                         let Some(selection) =
@@ -597,35 +594,36 @@ impl SettingsScreenView {
                     .content(move |_, _, popover_cx| {
                         let popover_entity: Entity<PopoverState> = popover_cx.entity();
 
-                        v_flex().children(LANGUAGE_OPTIONS.iter().enumerate().map(
-                            |(index, option)| {
-                                let option = *option;
+                        v_flex().children(LANGUAGE_OPTIONS.iter().map(|option| {
+                            let option = *option;
 
-                                let option_label = Self::language_option_label(option);
-                                let is_selected = option == selected_language;
+                            let option_label = Self::language_option_label(option);
+                            let is_selected = option == selected_language;
 
-                                let desktop_entity = desktop_entity.clone();
-                                let popover_entity = popover_entity.clone();
+                            let desktop_entity = desktop_entity.clone();
+                            let popover_entity = popover_entity.clone();
 
-                                Button::new(("settings-language-option", index))
-                                    .ghost()
-                                    .small()
-                                    .rounded_none()
-                                    .h_7()
-                                    .justify_start()
-                                    .selected(is_selected)
-                                    .label(option_label)
-                                    .on_click(move |_, window, cx| {
-                                        let _ = desktop_entity.update(cx, |view, cx| {
-                                            view.apply_language_setting(option, cx);
-                                            cx.notify();
-                                        });
-                                        let _ = popover_entity.update(cx, |popover, cx| {
-                                            popover.dismiss(window, cx);
-                                        });
-                                    })
-                            },
-                        ))
+                            Button::new(SharedString::from(format!(
+                                "settings-language-option:{}",
+                                option.identity_key()
+                            )))
+                            .ghost()
+                            .small()
+                            .rounded_none()
+                            .h_7()
+                            .justify_start()
+                            .selected(is_selected)
+                            .label(option_label)
+                            .on_click(move |_, window, cx| {
+                                let _ = desktop_entity.update(cx, |view, cx| {
+                                    view.apply_language_setting(option, cx);
+                                    cx.notify();
+                                });
+                                let _ = popover_entity.update(cx, |popover, cx| {
+                                    popover.dismiss(window, cx);
+                                });
+                            })
+                        }))
                     }),
             )
             .into_any_element()
@@ -916,7 +914,7 @@ impl SettingsScreenView {
                                                         mode: ProviderModelSelectorMode::Chat,
                                                         workspace_id,
                                                         client: view
-                                                            .gateway.client_runtime.client_core()
+                                                            .config.client
                                                             .clone(),
                                                         on_save: Rc::new(
                                                             move |view: &mut SettingsScreenView,
@@ -1360,7 +1358,7 @@ impl SettingsScreenView {
                 selected_reasoning_effort: None,
                 mode: ProviderModelSelectorMode::Transcription,
                 workspace_id,
-                client: self.gateway.client_runtime.client_core().clone(),
+                client: self.config.client.clone(),
                 on_save: Rc::new(
                     move |view: &mut SettingsScreenView, selection: ModelSelectorSelection, cx| {
                         view.apply_voice_input_model_selection(selection, cx)
@@ -1684,7 +1682,7 @@ impl SettingsScreenView {
                 selected_reasoning_effort: None,
                 mode: ProviderModelSelectorMode::Embeddings,
                 workspace_id,
-                client: self.gateway.client_runtime.client_core().clone(),
+                client: self.config.client.clone(),
                 on_save: Rc::new(
                     move |view: &mut SettingsScreenView, selection: ModelSelectorSelection, cx| {
                         view.apply_vector_search_embedding_model_selection(selection, cx)
@@ -2044,7 +2042,7 @@ impl SettingsScreenView {
                                                 selected_reasoning_effort: None,
                                                 mode: ProviderModelSelectorMode::Chat,
                                                 workspace_id,
-                                                client: view.gateway.client_runtime.client_core().clone(),
+                                                client: view.config.client.clone(),
                                                 on_save: Rc::new(
                                                     move |view: &mut SettingsScreenView,
                                                           selection: ModelSelectorSelection,
@@ -2140,21 +2138,22 @@ impl SettingsScreenView {
             )
             .child(
                 ButtonGroup::new("settings-theme-group")
-                    .children(options.into_iter().enumerate().map(
-                        |(index, (preference, label))| {
-                            let is_selected = selected_theme == preference;
+                    .children(options.into_iter().map(|(preference, label)| {
+                        let is_selected = selected_theme == preference;
 
-                            small_outline_button(("settings-theme-option", index))
-                                .selected(is_selected)
-                                .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(Self::theme_icon(preference))
-                                        .child(div().text_sm().child(label)),
-                                )
-                        },
-                    ))
+                        small_outline_button(SharedString::from(format!(
+                            "settings-theme-option:{}",
+                            preference.identity_key()
+                        )))
+                        .selected(is_selected)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Self::theme_icon(preference))
+                                .child(div().text_sm().child(label)),
+                        )
+                    }))
                     .on_click(move |selected_indices, window, cx| {
                         let Some(index) = selected_indices.first().copied() else {
                             return;

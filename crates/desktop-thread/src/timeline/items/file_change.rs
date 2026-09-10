@@ -255,10 +255,12 @@ impl RowPresentation {
                 .border_color(cx.theme().border)
                 .p_1();
 
-            for (index, path) in changed_files.iter().take(40).enumerate() {
+            let mut occurrences = std::collections::HashMap::<&str, usize>::new();
+            for path in changed_files.iter().take(40) {
+                let identity = file_change_path_identity(path, &mut occurrences);
                 list = list.child(
                     h_flex()
-                        .id(("file-change-path", index))
+                        .id(identity)
                         .w_full()
                         .items_center()
                         .gap_2()
@@ -351,5 +353,40 @@ fn file_change_status_label(kind: TimelineFinalStatusKind) -> String {
         TimelineFinalStatusKind::Failed => t!("timeline.file_change.failed").to_string(),
         TimelineFinalStatusKind::Running => t!("timeline.file_change.running").to_string(),
         TimelineFinalStatusKind::Completed => t!("timeline.file_change.completed").to_string(),
+    }
+}
+
+fn file_change_path_identity<'a>(
+    path: &'a str,
+    occurrences: &mut std::collections::HashMap<&'a str, usize>,
+) -> (SharedString, usize) {
+    let occurrence = occurrences.entry(path).or_default();
+    let identity = (
+        SharedString::from(format!("file-change-path:{path}")),
+        *occurrence,
+    );
+    *occurrence += 1;
+    identity
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::file_change_path_identity;
+    #[::core::prelude::v1::test]
+    fn path_identity_survives_reordering_and_distinguishes_duplicate_occurrences() {
+        let identities = |paths: &[&str]| {
+            let mut occurrences = std::collections::HashMap::new();
+            paths
+                .iter()
+                .map(|path| file_change_path_identity(path, &mut occurrences))
+                .collect::<Vec<_>>()
+        };
+        let before = identities(&["a.rs", "b.rs", "a.rs"]);
+        let after = identities(&["new.rs", "b.rs", "a.rs", "a.rs"]);
+        assert_eq!(before[0], after[2]);
+        assert_eq!(before[1], after[1]);
+        assert_eq!(before[2], after[3]);
+        assert_ne!(before[0], before[2]);
+        assert_ne!(after[0], after[1]);
     }
 }

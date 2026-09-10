@@ -133,16 +133,14 @@ fn client_contract_remains_shell_neutral() {
 }
 
 #[test]
-fn foundation_is_not_consumed_by_a_feature_implementation() {
-    let desktop_sources = workspace_root().join("crates/desktop/src");
-    for path in rust_sources(&desktop_sources) {
-        let source = fs::read_to_string(&path).expect("Desktop source must be readable");
-        assert!(
-            !source.contains("pioneer_desktop_foundation"),
-            "{} consumes Foundation before feature extraction",
-            path.display()
-        );
-    }
+fn shell_uses_the_registrar_seam_without_exporting_its_concrete_router() {
+    let root = workspace_root();
+    let router =
+        fs::read_to_string(root.join("crates/desktop/src/client_runtime/binding_router.rs"))
+            .unwrap();
+    assert!(router.contains("ClientBindingRegistrar"));
+    let foundation = fs::read_to_string(root.join("crates/desktop-foundation/src/lib.rs")).unwrap();
+    assert!(!foundation.contains("DesktopClientBindingRouter"));
 }
 
 #[test]

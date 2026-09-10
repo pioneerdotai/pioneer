@@ -1,0 +1,214 @@
+# Handwritten architecture contract. Changes to owners, edges or unit kinds
+# require architecture review; this is not an inventory generated from source.
+version = 1
+platforms = ["desktop", "ios", "android"]
+ui_cases = [
+ "access.revoked.fail_closed", "administration.invitations", "administration.members",
+ "agents_doc.editor", "composer.attachments", "composer.capabilities.skills", "composer.default",
+ "composer.mode.permission", "composer.model.reasoning", "composer.voice", "gateway.setup.initial",
+ "gateway.switcher.menu", "invitation.join.flow", "layout.extremes", "mcp.details", "mcp.list",
+ "providers.catalog", "providers.model_selector", "session.connectivity", "settings.account.devices",
+ "settings.account.profile", "settings.general", "settings.memory", "settings.self_improvement",
+ "shell.launch.loading", "shell.navigation.default", "shell.overlay.dialog", "shell.overlay.notification",
+ "sidebar.thread_tree.empty", "sidebar.thread_tree.populated", "skills.details", "skills.list",
+ "task.notifications", "thread.empty", "thread.header", "thread.side_panel.artifacts",
+ "thread.side_panel.members", "timeline.long.virtualized", "timeline.markdown.rich",
+ "timeline.message.actions", "timeline.pending.approval", "timeline.row.mutation",
+ "timeline.running.indicators", "timeline.static.mixed", "timeline.streaming.agent",
+ "timeline.task.work", "workspace.selector"
+]
+# No optional scene cache has accepted external benefit evidence.
+scene_caches = []
+custom_elements = ["desktop-thread/src/timeline/markdown.rs:MarkdownLinkText"]
+foundation_modules = ["avatar", "binding", "identity"]
+foundation_sources = ["avatar.rs", "binding.rs", "identity.rs", "lib.rs"]
+# Framework creates this transient host through on_drag's Entity<W: Render> API.
+# Its value preview has no retained UI behavior or cache.
+framework_hosts = ["desktop-workspaces/src/drag_preview.rs:SidebarDragSession"]
+
+[[features]]
+package = "pioneer-desktop-workspaces"
+path = "desktop-workspaces"
+root = "WorkspaceNavigationView"
+constructor = "WorkspaceNavigationView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-update"
+path = "desktop-update"
+root = "DesktopUpdateView"
+constructor = "DesktopUpdateView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-app-updater"]
+[[features]]
+package = "pioneer-desktop-task-notifications"
+path = "desktop-task-notifications"
+root = "TaskNotificationView"
+constructor = "TaskNotificationView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-thread"
+path = "desktop-thread"
+root = "ThreadView"
+constructor = "ThreadView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation", "terminal"]
+[[features]]
+package = "pioneer-desktop-providers"
+path = "desktop-providers"
+root = "ProviderCatalogView"
+constructor = "ProviderCatalogView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-administration"
+path = "desktop-administration"
+root = "AdministrationView"
+constructor = "AdministrationView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-mcp"
+path = "desktop-mcp"
+root = "McpCatalogView"
+constructor = "McpCatalogView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-skills"
+path = "desktop-skills"
+root = "SkillsCatalogView"
+constructor = "SkillsCatalogView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-settings"
+path = "desktop-settings"
+root = "SettingsView"
+constructor = "SettingsView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-onboarding"
+path = "desktop-onboarding"
+root = "OnboardingView"
+constructor = "OnboardingView::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+[[features]]
+package = "pioneer-desktop-agents-doc"
+path = "desktop-agents-doc"
+root = "AgentsDocumentEditor"
+constructor = "AgentsDocumentEditor::new"
+public_modules = []
+edges = ["pioneer-client", "pioneer-desktop-foundation"]
+
+# Retained toolkit delegates implement behavior under the named owner.
+# Value surfaces implement RenderOnce and never retain resources.
+[units]
+"TUI-01" = { kind = "Entity", owner = "DesktopShellView", symbol = "DesktopShellView", file = "desktop/src/desktop_shell.rs" }
+"TUI-02" = { kind = "RenderOnce", owner = "DesktopShellView", symbol = "TitleBarSurface", file = "desktop/src/desktop_shell.rs" }
+"TUI-03" = { kind = "RenderOnce", owner = "DesktopShellView", symbol = "ScreenHostView", file = "desktop/src/desktop_shell.rs" }
+"TUI-04" = { kind = "Behavior", owner = "DesktopShellView", symbol = "h_resizable", file = "desktop/src/desktop_shell.rs" }
+"TUI-05" = { kind = "RenderOnce", owner = "DesktopShellView", symbol = "BottomBarSurface", file = "desktop/src/desktop_shell.rs" }
+"TUI-06" = { kind = "RenderOnce", owner = "OnboardingView", symbol = "OnboardingSurface", file = "desktop-onboarding/src/lib.rs" }
+"TUI-07" = { kind = "Entity", owner = "OnboardingView", symbol = "OnboardingView", file = "desktop-onboarding/src/lib.rs" }
+"TUI-08" = { kind = "Entity", owner = "OnboardingView", symbol = "OnboardingView", file = "desktop-onboarding/src/lib.rs" }
+"TUI-09" = { kind = "Behavior", owner = "WorkspaceNavigationView", symbol = "Popover", file = "desktop-workspaces/src/catalog_view.rs" }
+"TUI-10" = { kind = "Behavior", owner = "WorkspaceNavigationView", symbol = "Tree", file = "desktop-workspaces/src/tree_view.rs" }
+"TUI-11" = { kind = "RenderOnce", owner = "WorkspaceNavigationView", symbol = "SidebarTreeDragPreview", file = "desktop-workspaces/src/drag_preview.rs" }
+"TUI-12" = { kind = "Entity", owner = "DesktopUpdateView", symbol = "DesktopUpdateView", file = "desktop-update/src/view.rs" }
+"TUI-13" = { kind = "Entity", owner = "TaskNotificationView", symbol = "TaskNotificationView", file = "desktop-task-notifications/src/lib.rs" }
+"TUI-14" = { kind = "Entity", owner = "ThreadView", symbol = "ThreadView", file = "desktop-thread/src/thread.rs" }
+"TUI-15" = { kind = "RenderOnce", owner = "ThreadView", symbol = "ThreadHeader", file = "desktop-thread/src/header.rs" }
+"TUI-16" = { kind = "Entity", owner = "ThreadView", symbol = "TimelineView", file = "desktop-thread/src/screen.rs" }
+"TUI-17" = { kind = "Entity", owner = "TimelineView", symbol = "TimelineRowView", file = "desktop-thread/src/timeline/row_view.rs" }
+"TUI-18" = { kind = "Behavior", owner = "TimelineView", symbol = "Button", file = "desktop-thread/src/timeline/view.rs" }
+"TUI-19" = { kind = "RenderOnce", owner = "TimelineRowView", symbol = "MarkdownDocumentSurface", file = "desktop-thread/src/timeline/markdown.rs" }
+"TUI-20" = { kind = "Element", owner = "TimelineRowView", symbol = "MarkdownLinkText", file = "desktop-thread/src/timeline/markdown.rs" }
+"TUI-21" = { kind = "Entity", owner = "TimelineRowView", symbol = "MarkdownHighlightController", file = "desktop-thread/src/timeline/code_highlighting.rs" }
+"TUI-22" = { kind = "Behavior", owner = "TimelineRowView", symbol = "TerminalView", file = "desktop-thread/src/timeline/terminal_registry.rs" }
+"TUI-23" = { kind = "Entity", owner = "TimelineRowView", symbol = "RunningDinoView", file = "desktop-thread/src/timeline/running_indicator.rs" }
+"TUI-24" = { kind = "Entity", owner = "TimelineRowView", symbol = "RunningElapsedView", file = "desktop-thread/src/timeline/running_indicator.rs" }
+"TUI-25" = { kind = "Entity", owner = "TimelineRowView", symbol = "ActivityIndicatorView", file = "desktop-thread/src/timeline/running_indicator.rs" }
+"TUI-26" = { kind = "Entity", owner = "TimelineRowView", symbol = "WorkItemBodyView", file = "desktop-thread/src/timeline/row_view.rs" }
+"TUI-27" = { kind = "Entity", owner = "ThreadView", symbol = "ComposerView", file = "desktop-thread/src/composer/owner.rs" }
+"TUI-28" = { kind = "Behavior", owner = "ComposerView", symbol = "TextareaState", file = "desktop-thread/src/composer/owner.rs" }
+"TUI-29" = { kind = "Behavior", owner = "ComposerView", symbol = "Popover", file = "desktop-thread/src/model_picker.rs" }
+"TUI-30" = { kind = "Entity", owner = "ComposerView", symbol = "VoiceInputView", file = "desktop-thread/src/composer/voice_owner.rs" }
+"TUI-31" = { kind = "Entity", owner = "ThreadView", symbol = "ThreadArtifactsView", file = "desktop-thread/src/artifacts/mod.rs" }
+"TUI-32" = { kind = "RenderOnce", owner = "ThreadArtifactsView", symbol = "ArtifactImagePreview", file = "desktop-thread/src/artifacts/view.rs" }
+"TUI-33" = { kind = "Entity", owner = "ThreadView", symbol = "ThreadMembersView", file = "desktop-thread/src/members/mod.rs" }
+"TUI-34" = { kind = "Entity", owner = "AgentsDocumentEditor", symbol = "AgentsDocumentEditor", file = "desktop-agents-doc/src/view.rs" }
+"TUI-35" = { kind = "Entity", owner = "ProviderCatalogView", symbol = "ProviderCatalogView", file = "desktop-providers/src/providers.rs" }
+"TUI-36" = { kind = "Entity", owner = "AdministrationView", symbol = "AdministrationView", file = "desktop-administration/src/administration.rs" }
+"TUI-37" = { kind = "Entity", owner = "McpCatalogView", symbol = "McpCatalogView", file = "desktop-mcp/src/catalog.rs" }
+"TUI-38" = { kind = "Entity", owner = "SkillsCatalogView", symbol = "SkillsCatalogView", file = "desktop-skills/src/catalog.rs" }
+"TUI-39" = { kind = "Entity", owner = "SettingsView", symbol = "SettingsView", file = "desktop-settings/src/screen.rs" }
+"TUI-40" = { kind = "RenderOnce", owner = "SettingsView", symbol = "DeviceActivationForm", file = "desktop-settings/src/device_activation_form.rs" }
+"TUI-41" = { kind = "Entity", owner = "SettingsView", symbol = "ProgressIndicatorView", file = "desktop-settings/src/progress.rs" }
+"TUI-42" = { kind = "Behavior", owner = "Root", symbol = "Root::render_dialog_layer", file = "desktop/src/desktop_shell.rs" }
+"TUI-43" = { kind = "Behavior", owner = "Root", symbol = "Popover", file = "desktop-thread/src/model_picker.rs" }
+"TUI-44" = { kind = "Behavior", owner = "Root", symbol = "Root::render_notification_layer", file = "desktop/src/desktop_shell.rs" }
+"TUI-45" = { kind = "RenderOnce", owner = "OnboardingView", symbol = "OnboardingSurface", file = "desktop-onboarding/src/lib.rs" }
+"TUI-46" = { kind = "RenderOnce", owner = "owning feature", symbol = "AvatarSurface", file = "desktop-foundation/src/avatar.rs" }
+"TUI-47" = { kind = "Behavior", owner = "OnboardingView", symbol = "Popover", file = "desktop-onboarding/src/switcher.rs" }
+
+[caches]
+avatar_bytes = { owner = "Client AvatarStore", source = "client/src/avatars.rs", max_files = 2048, max_age_days = 30 }
+artifact_preview = { owner = "Client ArtifactRegistry", source = "client/src/artifacts/preview.rs", max_bytes = 536870912, max_input_bytes = 524288 }
+
+[divergence_owners]
+"BDL-01" = "DesktopShellView / Mobile navigator"
+"BDL-02" = "owning feature / Mobile gesture owner"
+"BDL-03" = "Thread terminal / Mobile command row"
+"BDL-04" = "Desktop typed native ports / Mobile document and release adapters"
+"BDL-05" = "ShellStateStore and ThreadPanelLayoutStore / Mobile safe-area layout"
+"BDL-06" = "Thread Markdown renderer / Mobile enriched Markdown"
+"BDL-07" = "Thread row activity / Mobile activity presentation"
+"BDL-08" = "Root and focused capability / Mobile accessibility and back navigation"
+"BDL-09" = "Desktop jp resources / Mobile ja resources"
+"BDL-10" = "DesktopClientBindingRouter / MobileClientBinding"
+
+# Private behavior delegates implementing the corresponding target region.
+[supporting_units]
+"desktop-onboarding:InvitationJoinScreenView" = ["Render", "OnboardingView", "TUI-08"]
+"desktop-workspaces:WorkspaceNavigationView" = ["Render", "WorkspaceNavigationView", "TUI-10"]
+"desktop:SidebarHostView" = ["Render", "DesktopShellView", "TUI-04"]
+"desktop:DesktopBody" = ["RenderOnce", "DesktopShellView", "TUI-04"]
+"desktop-workspaces:ThreadSidebarView" = ["Render", "WorkspaceNavigationView", "TUI-10"]
+"desktop-workspaces:WorkspaceSelectorTrigger" = ["RenderOnce", "WorkspaceNavigationView", "TUI-09"]
+"desktop-onboarding:GatewaySetupScreenView" = ["Render", "OnboardingView", "TUI-07"]
+"desktop-onboarding:GatewaySwitcherView" = ["Render", "OnboardingView", "TUI-47"]
+"desktop-administration:InvitationSubmit" = ["Render", "AdministrationView", "TUI-36"]
+"desktop-administration:ActivationCopyButton" = ["Render", "AdministrationView", "TUI-40"]
+"desktop-administration:AdministrationSidebar" = ["Render", "AdministrationView", "TUI-36"]
+"desktop-administration:LoadingIndicator" = ["Render", "AdministrationView", "TUI-36"]
+"desktop-administration:DeviceActivationForm" = ["RenderOnce", "AdministrationView", "TUI-40"]
+"desktop-administration:CredentialPresentationForm" = ["RenderOnce", "AdministrationView", "TUI-40"]
+"desktop-providers:ProviderSidebar" = ["Render", "ProviderCatalogView", "TUI-35"]
+"desktop-providers:RefreshButton" = ["Render", "ProviderCatalogView", "TUI-35"]
+"desktop-mcp:CatalogSidebar" = ["Render", "McpCatalogView", "TUI-37"]
+"desktop-mcp:McpServerRow" = ["Render", "McpCatalogView", "TUI-37"]
+"desktop-skills:CatalogSidebar" = ["Render", "SkillsCatalogView", "TUI-38"]
+"desktop-skills:SkillManagementRowView" = ["Render", "SkillsCatalogView", "TUI-38"]
+"desktop-skills:UploadView" = ["Render", "SkillsCatalogView", "TUI-38"]
+"desktop-settings:ActivationView" = ["Render", "SettingsView", "TUI-40"]
+"desktop-settings:ProfileEditor" = ["Render", "SettingsView", "TUI-39"]
+"desktop-settings:SettingsScreenView" = ["Render", "SettingsView", "TUI-39"]
+"desktop-settings:SettingsSidebarView" = ["Render", "SettingsView", "TUI-39"]
+"desktop-settings:GeneralActionsView" = ["Render", "SettingsView", "TUI-39"]
+"desktop-settings:ModelSelectorOwner" = ["Render", "SettingsView", "TUI-39"]
+"desktop-settings:SelectorPopoverTrigger" = ["RenderOnce", "SettingsView", "TUI-39"]
+"desktop-settings:CredentialPresentationForm" = ["RenderOnce", "SettingsView", "TUI-40"]
+"desktop-thread:ThreadHeaderView" = ["Render", "ThreadView", "TUI-15"]
+"desktop-thread:ThreadFooterView" = ["Render", "ThreadView", "TUI-14"]
+"desktop-thread:ThreadPanelControlsView" = ["Render", "ThreadView", "TUI-31"]
+"desktop-thread:ThreadSidePanelHostView" = ["Render", "ThreadView", "TUI-31"]
+"desktop-thread:MessageRevisionContent" = ["Render", "ThreadView", "TUI-18"]
+"desktop-thread:ComposerModelPickerView" = ["Render", "ComposerView", "TUI-29"]
+"desktop-thread:SelectorPopoverTrigger" = ["RenderOnce", "ComposerView", "TUI-29"]
+"desktop-thread:PendingRequestView" = ["Render", "ThreadView", "TUI-26"]
+"desktop-thread:MemberPicker" = ["RenderOnce", "ThreadMembersView", "TUI-33"]
+"desktop-thread:TaskReviewActionView" = ["Render", "ThreadView", "TUI-26"]

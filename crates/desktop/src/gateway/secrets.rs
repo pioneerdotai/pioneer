@@ -129,13 +129,6 @@ impl DesktopSecrets {
             .context("failed to delete desktop Gateway session from keystore")
     }
 
-    pub(crate) fn has_gateway_session(&self, session_ref: &str) -> Result<bool> {
-        let id = desktop_gateway_session_secret_id(session_ref)?;
-        self.store
-            .exists(&id)
-            .context("failed to inspect desktop Gateway session keystore entry")
-    }
-
     pub(crate) fn purge_retired_gateway_auth_tokens(&self) -> Result<usize> {
         let entries = self
             .store

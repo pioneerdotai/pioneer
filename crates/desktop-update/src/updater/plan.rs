@@ -1,6 +1,6 @@
 use super::{download::DESKTOP_UPDATES_DIR, manifest::DESKTOP_UPDATE_PRODUCT};
 use anyhow::{Context as _, Result, anyhow, bail};
-use pioneer_protocol::generate_id;
+use pioneer_client::rpc::request::new_request_id;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -70,7 +70,7 @@ pub(crate) fn prepare_desktop_update_apply(
     let appimage_path = current_appimage_path();
     let install_root_path = resolve_install_root_path(&current_exe_path, appimage_path.as_deref())?;
     let bundled_helper_path = resolve_helper_sidecar_path(&current_exe_path)?;
-    let attempt_id = generate_id(DESKTOP_UPDATE_ATTEMPT_ID_LEN);
+    let attempt_id = new_request_id();
     let relaunch_requested_at_unix_ms = current_unix_timestamp_ms();
     let staging_dir = runtime_home
         .join(DESKTOP_UPDATES_DIR)

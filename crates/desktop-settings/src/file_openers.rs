@@ -1,7 +1,7 @@
+use crate::FileOpenerId;
 use crate::buttons::small_outline_button;
 use gpui_kit::component::{button::Button, *};
 use gpui_kit::{prelude::*, *};
-use pioneer_desktop_foundation::file_opener::FileOpenerId;
 pub(crate) fn file_opener_icon(opener: FileOpenerId) -> AnyElement {
     if let Some(path) = opener.logo_path() {
         if matches!(opener, FileOpenerId::Cursor | FileOpenerId::Zed) {

@@ -26,7 +26,7 @@ fn feature_boundary_keeps_bindings_private_and_render_paths_free_of_new_primitiv
             );
         }
     }
-    let shell = source.join("../../desktop/src/app/root/mod.rs");
+    let shell = source.join("../../desktop/src/desktop_shell.rs");
     let shell = std::fs::read_to_string(shell).unwrap();
     assert!(!shell.contains("ProviderListState"));
     assert!(!shell.contains("AdministrationCache"));

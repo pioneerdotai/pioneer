@@ -379,7 +379,7 @@ impl ClientCore {
                         core.complete_message_revisions(&request, Err(()));
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     let transport = sender
                         .requests_for_connection(request.ticket.1.expect("authenticated request"));
                     drop(core);

@@ -147,7 +147,7 @@ impl ClientCore {
             .workspace_tree(&workspace)
             .ok_or_else(|| anyhow::anyhow!("Workspace directory unavailable"))?;
         let tree = snapshot.snapshot();
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let ensure_thread = |id: &str, manage: bool| -> anyhow::Result<()> {
             anyhow::ensure!(
                 tree.threads_by_id

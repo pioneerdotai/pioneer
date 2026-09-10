@@ -22,19 +22,12 @@ use pioneer_desktop_foundation::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
-    hash::{Hash, Hasher},
     rc::Rc,
     sync::Arc,
 };
 const MODEL_ROW_MIN_HEIGHT: f32 = 32.0;
 const MODEL_LIST_MAX_HEIGHT: f32 = 260.0;
 const SELECTOR_POPOVER_FALLBACK_WIDTH: f32 = 380.0;
-#[derive(Clone, Copy)]
-struct CachedModelRowLayout {
-    layout_hash: u64,
-    height_px: f32,
-}
 struct ModelPickerBinding {
     scope: ClientScope,
     sequence: Cell<u64>,
@@ -78,7 +71,6 @@ struct ModelSelectorDialogState {
     provider_trigger_width_px: Rc<RefCell<f32>>,
     model_trigger_width_px: Rc<RefCell<f32>>,
     reasoning_trigger_width_px: Rc<RefCell<f32>>,
-    model_row_layout_cache: Rc<RefCell<HashMap<String, CachedModelRowLayout>>>,
 }
 impl ModelSelectorDialogState {
     fn send(&self, intent: ComposerModelPickerIntent, cx: &mut App) {
@@ -124,11 +116,6 @@ impl ComposerModelPickerView {
                         let input = view.binding.input.borrow().clone();
                         match input {
                             Some(input) if input.identity == view.identity && !input.closed => {
-                                if input.models_request.generation
-                                    != view.state.input.models_request.generation
-                                {
-                                    view.state.model_row_layout_cache.borrow_mut().clear();
-                                }
                                 view.state.input = input;
                             }
                             _ => view.close(window, cx),
@@ -160,7 +147,6 @@ impl ComposerModelPickerView {
             provider_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
             model_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
             reasoning_trigger_width_px: Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH)),
-            model_row_layout_cache: Rc::new(RefCell::new(HashMap::new())),
         };
         Self {
             client,
@@ -537,7 +523,6 @@ impl ComposerModelPickerView {
             },
             cx,
         );
-        state.model_row_layout_cache.borrow_mut().clear();
         popover_entity.update(cx, |state, cx| state.dismiss(window, cx));
     }
 
@@ -945,19 +930,6 @@ impl ComposerModelPickerView {
                 .iter()
                 .enumerate()
                 .map(|(ix, model)| {
-                    let layout_hash = Self::model_row_layout_hash(model, row_width);
-                    if let Some(cached_height_px) = {
-                        let cache = state.model_row_layout_cache.borrow();
-                        cache.get(model.id.as_str()).and_then(|cached| {
-                            (cached.layout_hash == layout_hash).then_some(cached.height_px)
-                        })
-                    } {
-                        return gpui_kit::size(
-                            px(0.),
-                            px(cached_height_px).max(px(MODEL_ROW_MIN_HEIGHT)),
-                        );
-                    }
-
                     let mut row = Self::render_model_virtual_list_row(
                         state.clone(),
                         popover_entity.clone(),
@@ -977,33 +949,10 @@ impl ComposerModelPickerView {
                         popover_cx,
                     );
                     let measured_height = measured.height.max(px(MODEL_ROW_MIN_HEIGHT));
-                    state.model_row_layout_cache.borrow_mut().insert(
-                        model.id.clone(),
-                        CachedModelRowLayout {
-                            layout_hash,
-                            height_px: measured_height.as_f32(),
-                        },
-                    );
-
                     gpui_kit::size(px(0.), measured_height)
                 })
                 .collect::<Vec<_>>(),
         )
-    }
-
-    fn model_row_layout_hash(model: &ProviderModelInfo, row_width: Pixels) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        model.id.hash(&mut hasher);
-        model.name.hash(&mut hasher);
-        model.description.hash(&mut hasher);
-        if let Some(metadata) = model.transcription.as_ref() {
-            metadata.engine.hash(&mut hasher);
-            metadata.download_size_mb.hash(&mut hasher);
-            metadata.supported_languages.hash(&mut hasher);
-            metadata.recommended.hash(&mut hasher);
-        }
-        row_width.as_f32().to_bits().hash(&mut hasher);
-        hasher.finish()
     }
 
     #[allow(clippy::too_many_arguments)]

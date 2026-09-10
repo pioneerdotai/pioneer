@@ -625,26 +625,38 @@ impl ClientCore {
                         );
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let current = || {
                         weak.upgrade()
                             .is_some_and(|core| core.thread_member_request_matches(&request))
                     };
-                    let result = load_thread_members(&request, &sender, current, |output| {
-                        if let Some(core) = weak
-                            .upgrade()
-                            .filter(|core| core.thread_member_request_matches(&request))
-                        {
-                            core.apply_thread_member_output(&request, Ok(output), false);
-                        }
-                    }, |page| {
-                        let core = weak.upgrade().ok_or_else(|| anyhow::anyhow!("administration_read_cancelled"))?;
-                        let read = core.read_administration_page(page, true)?;
-                        drop(core);
-                        let publication = read.wait_while(&current)?;
-                        Ok(publication.members.iter().map(|row| row.member.clone()).collect())
-                    });
+                    let result = load_thread_members(
+                        &request,
+                        &sender,
+                        current,
+                        |output| {
+                            if let Some(core) = weak
+                                .upgrade()
+                                .filter(|core| core.thread_member_request_matches(&request))
+                            {
+                                core.apply_thread_member_output(&request, Ok(output), false);
+                            }
+                        },
+                        |page| {
+                            let core = weak
+                                .upgrade()
+                                .ok_or_else(|| anyhow::anyhow!("administration_read_cancelled"))?;
+                            let read = core.read_administration_page(page, true)?;
+                            drop(core);
+                            let publication = read.wait_while(&current)?;
+                            Ok(publication
+                                .members
+                                .iter()
+                                .map(|row| row.member.clone())
+                                .collect())
+                        },
+                    );
                     let Some(core) = weak.upgrade() else {
                         return;
                     };
@@ -673,7 +685,9 @@ fn load_thread_members(
     sender: &impl crate::rpc::JsonRpcRequestTransport,
     current: impl Fn() -> bool,
     progress: impl Fn(MemberOutput),
-    directory: impl Fn(crate::administration::pages::AdministrationPage) -> anyhow::Result<Vec<MemberSummary>>,
+    directory: impl Fn(
+        crate::administration::pages::AdministrationPage,
+    ) -> anyhow::Result<Vec<MemberSummary>>,
 ) -> anyhow::Result<MemberOutput> {
     use crate::transport::ws::command_sender as commands;
     let mut output = MemberOutput::default();
@@ -721,7 +735,11 @@ fn load_thread_members(
         ThreadScopeAction::ListParticipants => {}
     }
     anyhow::ensure!(current(), "Thread member request cancelled");
-    let workspace_result = directory(crate::administration::pages::AdministrationPage::WorkspaceMembers { workspace_id: WorkspaceId::new(request.workspace_id.clone())? });
+    let workspace_result = directory(
+        crate::administration::pages::AdministrationPage::WorkspaceMembers {
+            workspace_id: WorkspaceId::new(request.workspace_id.clone())?,
+        },
+    );
     output.workspace_request = Some(match &workspace_result {
         Ok(_) => ThreadMemberReadState::Ready,
         Err(error) => ThreadMemberReadState::Failed {
@@ -734,7 +752,11 @@ fn load_thread_members(
     }
     anyhow::ensure!(current(), "Thread member request cancelled");
     progress(output.clone());
-    let directory_result = if request.can_read_directory { directory(crate::administration::pages::AdministrationPage::MemberDirectory) } else { Ok(Vec::new()) };
+    let directory_result = if request.can_read_directory {
+        directory(crate::administration::pages::AdministrationPage::MemberDirectory)
+    } else {
+        Ok(Vec::new())
+    };
     output.directory_request = Some(match &directory_result {
         Ok(_) => ThreadMemberReadState::Ready,
         Err(error) => ThreadMemberReadState::Failed {
@@ -978,7 +1000,12 @@ mod tests {
                     ThreadMemberRequestState::Loading { .. }
                 ));
             },
-            |page| match page { crate::administration::pages::AdministrationPage::WorkspaceMembers { .. } => Ok(vec![member()]), _ => Err(anyhow::anyhow!("synthetic directory failure")) },
+            |page| match page {
+                crate::administration::pages::AdministrationPage::WorkspaceMembers { .. } => {
+                    Ok(vec![member()])
+                }
+                _ => Err(anyhow::anyhow!("synthetic directory failure")),
+            },
         )
         .unwrap();
         assert_eq!(&*transport.requests.borrow(), &["thread/participants/list"]);
@@ -1015,8 +1042,24 @@ mod tests {
     #[test]
     fn cancelled_directory_read_does_not_publish_or_request_participants() {
         let active = Cell::new(true);
-        let transport = Transport { requests: Default::default(), on_workspace: Box::new(|| {}), repeated_cursor: false };
-        assert!(load_thread_members(&request("a"), &transport, || active.get(), |_| panic!("cancelled progress"), |_| { active.set(false); Ok(vec![member()]) }).is_err());
+        let transport = Transport {
+            requests: Default::default(),
+            on_workspace: Box::new(|| {}),
+            repeated_cursor: false,
+        };
+        assert!(
+            load_thread_members(
+                &request("a"),
+                &transport,
+                || active.get(),
+                |_| panic!("cancelled progress"),
+                |_| {
+                    active.set(false);
+                    Ok(vec![member()])
+                }
+            )
+            .is_err()
+        );
         assert!(transport.requests.borrow().is_empty());
     }
     #[test]

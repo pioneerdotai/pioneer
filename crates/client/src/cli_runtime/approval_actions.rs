@@ -449,7 +449,7 @@ impl ClientCore {
                         core.complete_approval_action(&request, Ok(()));
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let result = match &request.action {
                         PendingRequestResponseAction::CLIRuntime { params, .. } => sender

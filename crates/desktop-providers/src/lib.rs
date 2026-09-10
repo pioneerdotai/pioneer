@@ -16,7 +16,10 @@ mod providers;
 mod queries;
 mod sidebar;
 mod view;
-pub use ports::*;
+pub use ports::{
+    ProviderCredentialPort, ProviderEffectCompletion, ProviderEffectIdentity,
+    ProviderExternalNavigationPort,
+};
 pub use providers::{ProviderCatalogConfig, ProviderCatalogView};
 
 mod dialog_lifetime;

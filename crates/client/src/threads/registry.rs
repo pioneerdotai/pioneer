@@ -4568,7 +4568,7 @@ impl ClientCore {
             ids
         };
         for id in ids {
-            self.execute_thread_resume(&self.compatibility_runtime().ws_command_sender(), &id);
+            self.execute_thread_resume(&self.transport_runtime().ws_command_sender(), &id);
         }
     }
     pub fn execute_thread_resume(
@@ -5115,7 +5115,7 @@ impl ClientCore {
         }
         if binding {
             let result = crate::transport::ws::command_sender::cli_runtime_thread_binding_get(
-                &self.compatibility_runtime().ws_command_sender(),
+                &self.transport_runtime().ws_command_sender(),
                 pioneer_protocol::CLIRuntimeThreadBindingGetParams {
                     workspace_id: workspace.into(),
                     thread_id: id.into(),
@@ -5146,7 +5146,7 @@ impl ClientCore {
             self.observe_composer_runtime(id, None, false);
         } else {
             let result = self.refresh_thread_subscription_generation(
-                &self.compatibility_runtime().ws_command_sender(),
+                &self.transport_runtime().ws_command_sender(),
                 id,
                 workspace,
                 Some(generation),

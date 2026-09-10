@@ -252,7 +252,7 @@ impl ClientCore {
         let connection_id =
             connection.ok_or_else(|| anyhow::anyhow!("Profile connection unavailable"))?;
         let transport = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .requests_for_connection(connection_id);
         let response =
@@ -317,7 +317,7 @@ impl ClientCore {
     pub fn refresh_current_auth(&self) -> anyhow::Result<AuthMeResponse> {
         let (generation, connection) = self.begin_identity_request()?;
         let result = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .auth_me()
             .and_then(|auth| self.finish_current_auth(generation, connection, auth));
@@ -515,7 +515,7 @@ impl ClientCore {
             (owner.identity_request, self.gateway_http_generation())
         };
         let snapshot = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .authorization_capabilities(params.clone())
             .map_err(|error| (Some(auth.clone()), error))?;
@@ -1019,7 +1019,7 @@ impl ClientCore {
             .and_then(|connection| {
                 crate::transport::ws::command_sender::auth_session_list(
                     &self
-                        .compatibility_runtime()
+                        .transport_runtime()
                         .ws_command_sender()
                         .requests_for_connection(connection),
                 )
@@ -1071,7 +1071,7 @@ impl ClientCore {
             .and_then(|connection| {
                 crate::transport::ws::command_sender::auth_session_revoke(
                     &self
-                        .compatibility_runtime()
+                        .transport_runtime()
                         .ws_command_sender()
                         .requests_for_connection(connection),
                     params,
@@ -1110,7 +1110,7 @@ impl ClientCore {
                 .iter()
                 .any(|item| &item.session.id == session_id && item.current)
                 || self
-                    .compatibility_runtime()
+                    .transport_runtime()
                     .ws_command_sender()
                     .current_gateway_http_access()
                     .is_ok_and(|access| &access.session_id == session_id));
@@ -1165,7 +1165,7 @@ impl ClientCore {
             .and_then(|connection| {
                 crate::transport::ws::command_sender::auth_logout(
                     &self
-                        .compatibility_runtime()
+                        .transport_runtime()
                         .ws_command_sender()
                         .requests_for_connection(connection),
                 )

@@ -5,9 +5,8 @@ edition.workspace = true
 license.workspace = true
 [dependencies]
 gpui-kit = { workspace = true, features = ["component"] }
-pioneer-desktop-foundation.workspace = true
 pioneer-app-updater = { path = "../desktop-updater" }
-pioneer-protocol.workspace = true
+pioneer-client.workspace = true
 anyhow.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true

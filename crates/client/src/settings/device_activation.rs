@@ -73,7 +73,7 @@ impl ClientCore {
             .lock()
             .expect("identity owner poisoned");
         let access = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
             .ok();
@@ -155,7 +155,7 @@ impl ClientCore {
                 if let Some(connection) = connection.filter(|_| allowed) {
                     let _ = crate::transport::ws::command_sender::auth_session_revoke(
                         &self
-                            .compatibility_runtime()
+                            .transport_runtime()
                             .ws_command_sender()
                             .requests_for_connection(connection),
                         AuthSessionRevokeParams {
@@ -191,7 +191,7 @@ impl ClientCore {
                     .and_then(|connection| {
                         crate::transport::ws::command_sender::auth_device_create(
                             &self
-                                .compatibility_runtime()
+                                .transport_runtime()
                                 .ws_command_sender()
                                 .requests_for_connection(connection),
                         )
@@ -208,7 +208,7 @@ impl ClientCore {
         }
         let epoch = self.authorization_connection_generation();
         match self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
         {

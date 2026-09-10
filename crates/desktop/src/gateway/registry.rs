@@ -4,7 +4,6 @@ use pioneer_client::gateway::migration::{GatewayRegistryLoad, load_registry_json
 use pioneer_client::gateway::registry::{
     CURRENT_GATEWAY_REGISTRY_VERSION, GatewayLocalRegistryConfig, GatewayRegistryConfig,
     default_registry as default_client_registry, normalize_registry as normalize_client_registry,
-    setup_required as client_setup_required,
 };
 use pioneer_client::gateway::types::GatewayRegistry;
 use pioneer_config::AppConfig;
@@ -109,10 +108,6 @@ pub(crate) fn default_registry(config: &AppConfig) -> Result<GatewayRegistry> {
     let mut registry = default_client_registry(&registry_config(config)?);
     ensure_installation_id(&mut registry);
     Ok(registry)
-}
-
-pub(crate) fn setup_required(registry: &GatewayRegistry) -> bool {
-    client_setup_required(registry)
 }
 
 pub(crate) fn normalize_registry(registry: &mut GatewayRegistry, config: &AppConfig) -> Result<()> {

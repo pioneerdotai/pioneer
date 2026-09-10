@@ -620,7 +620,7 @@ impl ClientFfiRuntime {
             })?;
         self.avatar_cache.resolve(
             &self.core,
-            &self.core.compatibility_runtime().ws_command_sender(),
+            &self.core.transport_runtime().ws_command_sender(),
             self.native_cache_runtime_home()?,
             request,
         )
@@ -640,7 +640,7 @@ impl ClientFfiRuntime {
             })?;
         self.avatar_cache.resolve_agent(
             &self.core,
-            &self.core.compatibility_runtime().ws_command_sender(),
+            &self.core.transport_runtime().ws_command_sender(),
             self.native_cache_runtime_home()?,
             request,
         )
@@ -726,7 +726,7 @@ impl ClientFfiRuntime {
                 )
             })?;
         thread_files::open_thread_file_view(
-            &self.core.compatibility_runtime().ws_command_sender(),
+            &self.core.transport_runtime().ws_command_sender(),
             request,
         )
     }
@@ -1088,7 +1088,7 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ClientActiveThreadOpenRequest>(input_json)
             .map_err(|_| "invalid active thread open request".to_owned())?;
 
-        active_thread::open_thread(&self.core, self.core.compatibility_runtime(), request)
+        active_thread::open_thread(&self.core, self.core.transport_runtime(), request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -1096,7 +1096,7 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ClientActiveThreadOpenByIdRequest>(input_json)
             .map_err(|_| "invalid active thread open by id request".to_owned())?;
 
-        active_thread::open_thread_by_id(&self.core, self.core.compatibility_runtime(), request)
+        active_thread::open_thread_by_id(&self.core, self.core.transport_runtime(), request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -1104,12 +1104,8 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ClientEnsureWorkspaceDraftRequest>(input_json)
             .map_err(|_| "invalid active thread new request".to_owned())?;
 
-        active_thread::open_or_create_new_thread(
-            &self.core,
-            self.core.compatibility_runtime(),
-            request,
-        )
-        .map_err(|error| format!("{error:#}"))
+        active_thread::open_or_create_new_thread(&self.core, self.core.transport_runtime(), request)
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn active_thread_send_text(
@@ -1119,7 +1115,7 @@ impl ClientFfiRuntime {
         let request = serde_json::from_str::<ClientActiveThreadSendTextRequest>(input_json)
             .map_err(|_| "invalid active thread send text request".to_owned())?;
 
-        active_thread::send_text_turn(&self.core, self.core.compatibility_runtime(), request)
+        active_thread::send_text_turn(&self.core, self.core.transport_runtime(), request)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -1132,14 +1128,14 @@ impl ClientFfiRuntime {
 
         active_thread::prepare_voice_composer_snapshot(
             &self.core,
-            self.core.compatibility_runtime(),
+            self.core.transport_runtime(),
             request,
         )
         .map_err(|error| format!("{error:#}"))
     }
 
     fn active_thread_clear(&self) -> Result<ClientActiveThreadClearResult, String> {
-        active_thread::clear(&self.core, self.core.compatibility_runtime())
+        active_thread::clear(&self.core, self.core.transport_runtime())
             .map_err(|error| format!("{error:#}"))
     }
 

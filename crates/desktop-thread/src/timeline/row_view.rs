@@ -390,16 +390,9 @@ impl RowPresentation {
         self.body
             .as_ref()
             .filter(|_| !self.body_only)
-            .map(|(view, height)| {
-                if !self.task_review_views.is_empty() {
-                    view.clone().into_any_element()
-                } else {
-                    view.clone()
-                        .cached(StyleRefinement::default().w_full().h(*height))
-                        .into_any_element()
-                }
-            })
+            .map(|(view, _)| view.clone().into_any_element())
     }
+
     pub(super) fn render_body(&self, cx: &mut App) -> AnyElement {
         let width = self.key.content_width
             - if self.key.grouping.avatar_group_kind == Some(TimelineAvatarGroupKind::Agent) {
@@ -439,14 +432,6 @@ impl RowPresentation {
             body.render_body(cx),
         ))
     }
-    pub(super) fn has_live_children(&self) -> bool {
-        !self.task_review_views.is_empty()
-            || self.dino.is_some()
-            || self.elapsed.is_some()
-            || self.snapshot.item().is_some_and(|item| {
-                item.status == pioneer_client::conversation::TimelineEntryStatus::Running
-            })
-    }
 }
 struct WorkItemBodyView {
     #[cfg(test)]
@@ -460,11 +445,6 @@ impl Render for WorkItemBodyView {
             self.renders += 1;
         }
         self.presentation.render_body(cx)
-    }
-}
-impl TimelineRowView {
-    pub(super) fn has_live_children(&self) -> bool {
-        self.presentation.has_live_children()
     }
 }
 
@@ -1095,7 +1075,7 @@ mod tests {
         }
     }
     #[gpui_kit::test]
-    fn all_work_families_keep_inline_geometry_and_skip_body_on_stock_spinner_frame(
+    fn all_work_families_keep_inline_geometry_and_retained_identity_without_scene_cache(
         cx: &mut TestAppContext,
     ) {
         cx.background_executor.allow_parking();
@@ -1142,7 +1122,7 @@ mod tests {
         for row in rows {
             for width in [px(320.), px(600.), px(760.)] {
                 // Measure the unchanged inline presentation and the retained version at
-                // the same actual width. Cache dimensions must not invent geometry.
+                // the same actual width. Retained bodies must not invent geometry.
                 let mut input = row.read_with(cx, |view, _| view.presentation.clone());
                 input.key.content_width = width;
                 input.key.expanded = true;
@@ -1181,6 +1161,10 @@ mod tests {
                 cx.run_until_parked();
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 cx.run_until_parked();
+                let retained_body = row.read_with(cx, |v, _| {
+                    v.presentation.body.as_ref().unwrap().0.entity_id()
+                });
+                let prepared_snapshot = row.read_with(cx, |v, _| v.presentation.snapshot.clone());
                 let before = row.read_with(cx, |v, cx| v.render_counts(cx));
                 let callbacks = cx.update(|window, cx| window.simulate_next_frame(cx));
                 assert!(callbacks > 0, "stock Spinner must schedule a frame");
@@ -1188,10 +1172,17 @@ mod tests {
                 cx.run_until_parked();
                 let after = row.read_with(cx, |v, cx| v.render_counts(cx));
                 assert!(after.0 > before.0);
-                assert_eq!(
-                    after.1, before.1,
-                    "Spinner must not rebuild body at {width:?}"
-                );
+                assert!(after.1 > before.1, "uncached body must render at {width:?}");
+                row.read_with(cx, |v, _| {
+                    assert_eq!(
+                        v.presentation.body.as_ref().unwrap().0.entity_id(),
+                        retained_body
+                    );
+                    assert!(
+                        Arc::ptr_eq(&v.presentation.snapshot, &prepared_snapshot),
+                        "animation cannot reprepare semantic input"
+                    );
+                });
                 row.update(cx, |v, cx| v.set_visible(false, cx));
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 cx.run_until_parked();

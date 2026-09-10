@@ -719,7 +719,7 @@ impl ClientCore {
                     if !core.provider_collection_request_current(&request) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let key = &request.key;
                     let result = match &key.collection {

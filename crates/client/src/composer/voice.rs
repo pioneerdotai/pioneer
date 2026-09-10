@@ -85,7 +85,7 @@ impl ClientCore {
     ) -> anyhow::Result<super::store::ComposerOperationPlan> {
         self.prepare_composer_voice_capture_with(identity.clone(), |workspace_id| {
             self.wait_composer_session_refresh(&identity)?;
-            let sender = self.compatibility_runtime().ws_command_sender();
+            let sender = self.transport_runtime().ws_command_sender();
             let access = sender
                 .current_gateway_http_access()
                 .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
@@ -215,7 +215,7 @@ impl ClientCore {
         request: ComposerVoiceStartRequest,
     ) -> anyhow::Result<VoiceSessionStartResponse> {
         self.prepare_composer_voice_capture(request.operation.clone())?;
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let access = sender
             .current_gateway_http_access()
             .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
@@ -372,7 +372,7 @@ impl ClientCore {
         duration_ms: Option<u32>,
         pcm_chunk: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let access = sender
             .current_gateway_http_access()
             .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
@@ -404,7 +404,7 @@ impl ClientCore {
         &self,
         request: ComposerVoiceFinalizeRequest,
     ) -> anyhow::Result<VoiceSessionFinalizeResponse> {
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let access = sender
             .current_gateway_http_access()
             .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
@@ -484,7 +484,7 @@ impl ClientCore {
     }
 
     fn voice_session_authority(&self) -> Option<(String, String, String)> {
-        self.compatibility_runtime()
+        self.transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
             .ok()
@@ -500,7 +500,7 @@ impl ClientCore {
         &self,
         request: ComposerVoiceCancelRequest,
     ) -> anyhow::Result<VoiceSessionCancelResponse> {
-        let sender = self.compatibility_runtime().ws_command_sender();
+        let sender = self.transport_runtime().ws_command_sender();
         let Ok(access) = sender.current_gateway_http_access() else {
             return Ok(VoiceSessionCancelResponse { cancelled: false });
         };

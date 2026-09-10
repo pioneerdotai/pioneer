@@ -447,7 +447,7 @@ impl ProviderOperation {
             core.provider_operation_current(&self.identity),
             "provider_action_cancelled"
         );
-        let sender = core.compatibility_runtime().ws_command_sender();
+        let sender = core.transport_runtime().ws_command_sender();
         let settings = match &self.command {
             ProviderCommand::SaveRuntime { draft, .. } => {
                 Some(plan_cli_runtime_provider_draft_update(

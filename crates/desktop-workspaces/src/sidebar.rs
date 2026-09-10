@@ -31,8 +31,6 @@ pub(super) struct ThreadSidebarView {
     pub client: Arc<ClientCore>,
     load_expansion: Rc<dyn Fn(&str, &mut App) -> HashMap<String, bool>>,
     save_expansion: Rc<dyn Fn(&str, HashMap<String, bool>, &mut App)>,
-    context_lock: Rc<dyn Fn(&App) -> bool>,
-    workspace_preference: Rc<dyn Fn(&App) -> Option<String>>,
     bootstrap_connection: Option<u64>,
     bootstrap_authorization: Option<u64>,
     pub rename_thread_dialog: crate::DialogPresenter,
@@ -45,6 +43,7 @@ pub(super) struct ThreadSidebarView {
     binding: Arc<Binding>,
     registrations: Vec<ClientBindingRegistration>,
     tree_registration: Option<ClientBindingRegistration>,
+    composer_registration: Option<ClientBindingRegistration>,
     pub input: Option<Arc<ThreadTreePublication>>,
     pub catalog: Arc<WorkspaceCatalogPublication>,
     navigation: Arc<ClientNavigationState>,
@@ -115,8 +114,6 @@ impl ThreadSidebarView {
         let mut view = Self {
             load_expansion: config.load_expansion,
             save_expansion: config.save_expansion,
-            context_lock: config.context_locked,
-            workspace_preference: config.workspace_preference,
             bootstrap_connection: None,
             bootstrap_authorization: None,
             rename_thread_dialog: config.rename_thread_dialog,
@@ -129,6 +126,7 @@ impl ThreadSidebarView {
             binding,
             registrations,
             tree_registration: None,
+            composer_registration: None,
             input: None,
             catalog,
             navigation,
@@ -166,7 +164,15 @@ impl ThreadSidebarView {
                 .navigation_snapshot()
                 .workspace_id()
                 .map(str::to_owned)
-                .or_else(|| (self.workspace_preference)(cx));
+                .or_else(|| {
+                    self.client
+                        .gateway_registry()
+                        .as_ref()
+                        .and_then(
+                            pioneer_client::gateway::types::GatewayRegistry::active_workspace_id,
+                        )
+                        .map(str::to_owned)
+                });
             self.client.request_workspace_bootstrap(preferred);
         }
         let navigation = self.client.navigation_snapshot();
@@ -199,6 +205,37 @@ impl ThreadSidebarView {
                 ));
             }
         }
+        if self.navigation.active_thread_id() != navigation.active_thread_id()
+            || self.composer_registration.is_none()
+        {
+            self.composer_registration.take();
+            self.binding
+                .publications
+                .borrow_mut()
+                .retain(|scope, _| !matches!(scope, ClientScope::Composer { .. }));
+            if let Some(thread) = navigation.active_thread_id() {
+                let sink: Arc<dyn ClientPublicationSink> = self.binding.clone();
+                self.composer_registration = Some(self.registrar.register(
+                    ClientScope::Composer {
+                        thread_id: thread.into(),
+                    },
+                    Arc::downgrade(&sink),
+                ));
+            }
+        }
+        if self.navigation.workspace_id() != navigation.workspace_id() {
+            if let (Some(workspace), Some(endpoint)) = (
+                navigation.workspace_id(),
+                self.client.active_gateway_endpoint(),
+            ) {
+                self.client.onboarding_intent(
+                    pioneer_client::gateway::onboarding_runtime::OnboardingIntent::SetWorkspace {
+                        endpoint_id: endpoint.id,
+                        workspace_id: Some(workspace.to_owned()),
+                    },
+                );
+            }
+        }
         self.active_agents_doc_editor_scope = navigation.agents_document_scope().cloned();
         if let Some(scope) = &self.active_agents_doc_editor_scope {
             self.selected_node =
@@ -226,7 +263,7 @@ impl ThreadSidebarView {
                     snapshot.thread.as_ref().map(|thread| &thread.capabilities),
                 )
             });
-        self.context_locked = (self.context_lock)(cx);
+        self.context_locked = self.composer_context_locked();
         self.rebuild_sidebar_tree_state(cx);
         let workspace = self.navigation.workspace_id();
         let thread = self.navigation.active_thread_id();
@@ -247,17 +284,22 @@ impl ThreadSidebarView {
         }
     }
 
-    pub fn refresh_presentation(&mut self, cx: &mut Context<Self>) {
-        let locked = (self.context_lock)(cx);
-        if locked != self.context_locked {
-            self.context_locked = locked;
-            cx.notify();
-        }
+    fn composer_context_locked(&self) -> bool {
+        use pioneer_client::composer::store::ComposerOperationKind;
+        self.navigation
+            .active_thread_id()
+            .and_then(|thread| self.client.composer_snapshot(thread))
+            .and_then(|p| p.operation().cloned())
+            .is_some_and(|operation| match operation.kind {
+                ComposerOperationKind::Send | ComposerOperationKind::Voice => operation.pending(),
+                _ => false,
+            })
     }
     pub fn close(&mut self) {
         self.changes.take();
         self.tree_events.take();
         self.tree_registration.take();
+        self.composer_registration.take();
         self.registrations.clear();
         self.input = None;
     }

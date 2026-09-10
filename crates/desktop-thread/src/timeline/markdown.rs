@@ -197,6 +197,16 @@ impl Element for MarkdownLinkText {
     }
 }
 
+#[derive(IntoElement)]
+struct MarkdownDocumentSurface {
+    content: AnyElement,
+}
+impl RenderOnce for MarkdownDocumentSurface {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.content
+    }
+}
+
 impl RowPresentation {
     pub(super) fn render_markdown_auto(
         &self,
@@ -280,7 +290,7 @@ impl RowPresentation {
                     row_count: None,
                 },
             );
-            return element;
+            return MarkdownDocumentSurface { content: element }.into_any_element();
         }
 
         let mut content = v_flex().w_full().overflow_hidden().gap_0();
@@ -313,7 +323,7 @@ impl RowPresentation {
                 row_count: None,
             },
         );
-        element
+        MarkdownDocumentSurface { content: element }.into_any_element()
     }
 
     fn markdown_block_spacing(

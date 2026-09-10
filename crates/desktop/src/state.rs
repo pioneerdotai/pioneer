@@ -1,6 +1,7 @@
 use crate::settings::WindowOpenState;
 use anyhow::{Context as _, Result};
 use gpui_kit::{App, Global};
+#[cfg(not(test))]
 use pioneer_config::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::PathBuf};
@@ -188,11 +189,25 @@ fn state_path() -> Result<PathBuf> {
     Ok(runtime_home_dir()?.join(DESKTOP_STATE_FILE_NAME))
 }
 
+#[cfg(not(test))]
 pub(crate) fn runtime_home_dir() -> Result<PathBuf> {
     let config = AppConfig::load().context("failed to load app config for desktop state")?;
     config
         .ensure_runtime_home_dir()
         .context("failed to ensure runtime home dir for desktop state")
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_home_dir() -> Result<PathBuf> {
+    static FIXTURE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    Ok(FIXTURE
+        .get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures");
+            std::fs::create_dir_all(&root).expect("create synthetic fixture root");
+            tempfile::tempdir_in(root).expect("synthetic Desktop state")
+        })
+        .path()
+        .to_path_buf())
 }
 
 fn load_state_file_from_path(path: &std::path::Path) -> Result<DesktopStateFile> {

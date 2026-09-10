@@ -297,7 +297,9 @@ impl ThreadSidebarView {
                                 })
                                 .when(can_manage_workspace, |this| {
                                     this.on_drag(thread_payload, |drag, _, _, cx| {
-                                        cx.new(|_| drag.clone())
+                                        cx.new(|_| {
+                                            crate::drag_preview::SidebarDragSession(drag.clone())
+                                        })
                                     })
                                 })
                                 .context_menu(move |menu, _, _| {
@@ -509,7 +511,7 @@ impl ThreadSidebarView {
                                         .on_action(folder_edit_agents_doc_action_listener)
                                         .on_action(folder_remove_agents_doc_action_listener)
                                         .on_drag(folder_payload, |drag, _, _, cx| {
-                                            cx.new(|_| drag.clone())
+                                            cx.new(|_| crate::drag_preview::SidebarDragSession(drag.clone()))
                                         })
                                         .can_drop({
                                             let folder_id = folder_id.to_owned();

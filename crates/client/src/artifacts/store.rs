@@ -493,7 +493,7 @@ impl ClientCore {
             while let Ok(request) = receiver.recv() {
                 let Some(core) = weak.upgrade() else { return; };
                 if !core.artifact_read_matches(&request) { core.complete_artifact_read(&request, Err("Artifact request cancelled".into())); continue; }
-                let sender = core.compatibility_runtime().ws_command_sender();
+                let sender = core.transport_runtime().ws_command_sender();
                 drop(core);
                 let current = || weak.upgrade().is_some_and(|core| core.artifact_read_matches(&request));
                 let result = load_artifacts(&request, &sender, current, |delay| runtime.block_on(async {

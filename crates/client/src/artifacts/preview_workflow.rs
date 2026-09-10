@@ -283,7 +283,7 @@ impl ClientCore {
                         continue;
                     }
                     let session = super::access::artifact_http_session(
-                        &core.compatibility_runtime().ws_command_sender(),
+                        &core.transport_runtime().ws_command_sender(),
                     );
                     drop(core);
                     let result = (|| {

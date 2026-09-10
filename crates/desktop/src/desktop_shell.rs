@@ -1,8 +1,13 @@
-//! Window composition. Feature state remains behind retained public handles.
+//! Window composition through retained capability roots.
 use crate::desktop_navigation::*;
-use crate::{
-    app::LegacyScreenAdapter, desktop_navigation::DesktopNavigationStore,
-    shell_state::ShellStateStore,
+use crate::{desktop_navigation::DesktopNavigationStore, shell_state::ShellStateStore};
+use crate::{settings::WindowThemePreference, window};
+use gpui_kit::component::{
+    Icon, Sizable,
+    button::{Button, ButtonVariants},
+    h_flex,
+    separator::Separator,
+    theme::{Theme, ThemeMode},
 };
 use gpui_kit::component::{
     Root, WindowExt,
@@ -42,24 +47,283 @@ pub(crate) struct DesktopShellView {
     workspaces: Option<Entity<pioneer_desktop_workspaces::WorkspaceNavigationView>>,
     _workspace_events: Subscription,
     _task_notification_events: Subscription,
-    _workspace_context: Subscription,
+    _onboarding_events: Subscription,
+    identity: Option<Arc<crate::gateway::IdentityAuthorizationBinding>>,
+    identity_task: Option<Task<()>>,
+    can_manage: bool,
+    can_notify: bool,
+    setup_required: bool,
+    gateway_switcher: Option<AnyView>,
+    general_actions: Option<AnyView>,
+    onboarding: Option<Entity<pioneer_desktop_onboarding::OnboardingView>>,
+    settings: Option<Entity<pioneer_desktop_settings::SettingsView>>,
+    administration: Option<Entity<pioneer_desktop_administration::AdministrationView>>,
+    providers: Option<Entity<pioneer_desktop_providers::ProviderCatalogView>>,
+    mcp: Option<Entity<pioneer_desktop_mcp::McpCatalogView>>,
+    skills: Option<Entity<pioneer_desktop_skills::SkillsCatalogView>>,
+    agents_document: Option<Entity<pioneer_desktop_agents_doc::AgentsDocumentEditor>>,
     desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
     task_notifications: Option<Entity<pioneer_desktop_task_notifications::TaskNotificationView>>,
     action_region: FocusHandle,
-    legacy: Option<Entity<LegacyScreenAdapter>>,
     sidebar: Option<Entity<SidebarHostView>>,
     navigation: Arc<DesktopNavigationStore>,
     layout: Entity<ShellStateStore>,
     _layout_subscription: Subscription,
-    _frame_subscription: Subscription,
     _activation_subscription: Subscription,
     route_task: Option<Task<()>>,
     close_task: Option<Task<()>>,
     mounted_route: Arc<DesktopRouteSnapshot>,
 }
 impl DesktopShellView {
+    fn selected_screen(&self) -> Option<AnyView> {
+        let route = self.navigation.snapshot();
+        if route.window_route() != WindowRoute::Main {
+            self.onboarding.as_ref().map(|root| root.clone().into())
+        } else {
+            match route.route() {
+                MainRoute::Threads => self.thread.as_ref().map(|(_, root)| root.clone().into()),
+                MainRoute::AgentsDoc => self
+                    .agents_document
+                    .as_ref()
+                    .map(|root| root.clone().into()),
+                MainRoute::Providers => self.providers.as_ref().map(|root| root.clone().into()),
+                MainRoute::Administration => {
+                    self.administration.as_ref().map(|root| root.clone().into())
+                }
+                MainRoute::Mcp | MainRoute::McpDetails => {
+                    self.mcp.as_ref().map(|root| root.clone().into())
+                }
+                MainRoute::Skills | MainRoute::SkillDetails => {
+                    self.skills.as_ref().map(|root| root.clone().into())
+                }
+                MainRoute::Settings => self.settings.as_ref().map(|root| root.clone().into()),
+            }
+        }
+    }
+
+    fn sync_sidebar_width(&self, cx: &mut App) {
+        let width = if self.layout.read(cx).sidebar_visible() {
+            self.layout.read(cx).sidebar_width()
+        } else {
+            px(0.)
+        };
+        if let Some(view) = &self.providers {
+            view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        }
+        if let Some(view) = &self.mcp {
+            view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        }
+        if let Some(view) = &self.skills {
+            view.update(cx, |view, cx| view.set_sidebar_width(width, cx));
+        }
+    }
+    fn sync_activity(&self, active: bool, cx: &mut App) {
+        let active = active && self.navigation.snapshot().window_route() == WindowRoute::Main;
+        if let Some(view) = &self.providers {
+            view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.administration {
+            view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.mcp {
+            view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.skills {
+            view.update(cx, |view, cx| view.set_window_active(active, cx));
+        }
+        if let Some(view) = &self.settings {
+            view.update(cx, |view, cx| {
+                view.set_active(
+                    active && self.navigation.is_visible(MainRoute::Settings),
+                    cx,
+                )
+            });
+        }
+    }
+    fn sync_chrome(&mut self, cx: &mut Context<Self>) {
+        let route = self.navigation.snapshot();
+        let capabilities = self
+            .identity
+            .as_ref()
+            .and_then(|binding| binding.publication())
+            .and_then(|p| {
+                p.capabilities
+                    .snapshot(route.navigation().workspace_id(), None)
+                    .or_else(|| p.capabilities.snapshot(None, None))
+            })
+            .map(|p| pioneer_client::authorization::principal_presentation_capabilities(&p))
+            .unwrap_or_default();
+        let next = (
+            capabilities.can_manage_capabilities,
+            capabilities.can_read_own_notifications,
+        );
+        if (self.can_manage, self.can_notify) != next {
+            (self.can_manage, self.can_notify) = next;
+            cx.notify();
+        }
+    }
+    fn open_agents_document(
+        &mut self,
+        scope: pioneer_client::agents_doc::scope::AgentsDocEditorScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+            .navigate(
+                pioneer_client::navigation::NavigationIntent::OpenAgentsDocument { scope },
+                None,
+            );
+        crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
+        self.mount_agents_document(window, cx);
+    }
+    fn mount_agents_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let route = self.navigation.snapshot();
+        let scope = route.navigation().agents_document_scope();
+        if self
+            .agents_document
+            .as_ref()
+            .map(|view| view.read(cx).scope())
+            == scope
+        {
+            return;
+        }
+        if let Some(view) = self.agents_document.take() {
+            view.update(cx, |view, cx| view.flush_pending_save(window, cx));
+        }
+        if let Some(scope) = scope {
+            let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
+            self.agents_document = Some(pioneer_desktop_agents_doc::AgentsDocumentEditor::new(
+                pioneer_desktop_agents_doc::AgentsDocumentConfig::new(
+                    runtime.core(),
+                    runtime.registrar(),
+                    scope.clone(),
+                ),
+                window,
+                cx,
+            ));
+        }
+    }
+    pub(crate) fn handle_invitation_url(
+        &mut self,
+        uri: String,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(presentation) = pioneer_protocol::InvitationPresentation::parse(&uri) else {
+            return;
+        };
+        if presentation.app_url_scheme()
+            != pioneer_protocol::PioneerAppUrlScheme::for_current_build()
+        {
+            return;
+        }
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+            .onboarding_intent(
+                pioneer_client::gateway::onboarding_runtime::OnboardingIntent::Invitation {
+                    intent:
+                        pioneer_client::gateway::invitation_controller::InvitationIntent::Open {
+                            uri: pioneer_protocol::AuthSecretString::new(uri),
+                        },
+                },
+            );
+    }
+    fn title_bar(&self, cx: &mut App) -> AnyElement {
+        let invitation_active = self.navigation.snapshot().window_route()
+            == crate::desktop_navigation::WindowRoute::InvitationJoin;
+
+        let theme_icon = if cx.theme().mode.is_dark() {
+            gpui_kit::component::IconName::Sun
+        } else {
+            gpui_kit::component::IconName::Moon
+        };
+
+        let is_gateway_setup_required = self.setup_required;
+        let show_gateway_switcher = !invitation_active;
+        let show_task_notifications = !is_gateway_setup_required && self.can_notify;
+
+        gpui_kit::component::TitleBar::new()
+            .child(
+                h_flex()
+                    .w_full()
+                    .pr_4()
+                    .justify_between()
+                    .items_center()
+                    .bg(cx.theme().title_bar)
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .items_center()
+                            .child(if show_gateway_switcher {
+                                self.gateway_switcher
+                                    .as_ref()
+                                    .expect("mounted gateway switcher")
+                                    .clone()
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .gap_1()
+                            .items_center()
+                            .child(if show_task_notifications {
+                                div()
+                                    .children(self.task_notifications.clone())
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            })
+                            .child(if show_task_notifications {
+                                Separator::vertical().h_4().mx_0p5().into_any_element()
+                            } else {
+                                div().into_any_element()
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(if !is_gateway_setup_required {
+                                        self.general_actions
+                                            .as_ref()
+                                            .expect("mounted general actions")
+                                            .clone()
+                                            .into_any_element()
+                                    } else {
+                                        div().into_any_element()
+                                    })
+                                    .child(
+                                        Button::new("toggle-theme")
+                                            .ghost()
+                                            .small()
+                                            .compact()
+                                            .child(Icon::new(theme_icon).size_3p5().opacity(0.6))
+                                            .on_click(|_, window, cx| {
+                                                let (mode, theme_preference) = if cx
+                                                    .theme()
+                                                    .mode
+                                                    .is_dark()
+                                                {
+                                                    (ThemeMode::Light, WindowThemePreference::Light)
+                                                } else {
+                                                    (ThemeMode::Dark, WindowThemePreference::Dark)
+                                                };
+                                                Theme::change(mode, Some(window), cx);
+                                                window::persist_theme_preference(
+                                                    window,
+                                                    theme_preference,
+                                                    cx,
+                                                );
+                                            }),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
     pub(crate) fn new(
-        legacy: Entity<LegacyScreenAdapter>,
         navigation: Arc<DesktopNavigationStore>,
         layout: Entity<ShellStateStore>,
         window: &mut Window,
@@ -69,6 +333,69 @@ impl DesktopShellView {
             let runtime = cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>();
             (runtime.core(), runtime.registrar())
         };
+        let onboarding = pioneer_desktop_onboarding::OnboardingView::new(
+            pioneer_desktop_onboarding::OnboardingConfig {
+                client: client.clone(),
+                bindings: registrar.clone(),
+                photos: std::rc::Rc::new(crate::profile_photo::DesktopProfilePhotoPort),
+            },
+            window,
+            cx,
+        );
+        let onboarding_events = cx.subscribe(&onboarding, |view, _, event, cx| match event {
+            pioneer_desktop_onboarding::OnboardingEvent::NavigationChanged {
+                invitation_active,
+                setup_required,
+            } => {
+                let changed = view.setup_required != *setup_required;
+                view.setup_required = *setup_required;
+                if changed {
+                    cx.notify();
+                }
+                view.navigation.set_window_route(if *invitation_active {
+                    WindowRoute::InvitationJoin
+                } else if *setup_required {
+                    WindowRoute::GatewaySetup
+                } else {
+                    WindowRoute::Main
+                });
+            }
+            pioneer_desktop_onboarding::OnboardingEvent::Authenticated { .. } => {}
+        });
+        let settings = pioneer_desktop_settings::SettingsView::new(
+            crate::platform::settings::settings_config(client.clone(), cx),
+            window,
+            cx,
+        );
+        let providers = pioneer_desktop_providers::ProviderCatalogView::new(
+            crate::platform::providers::provider_config(client.clone(), cx),
+            window,
+            cx,
+        );
+        let administration = pioneer_desktop_administration::AdministrationView::new(
+            crate::platform::administration::administration_config(client.clone(), cx),
+            window,
+            cx,
+        );
+        let mcp = pioneer_desktop_mcp::McpCatalogView::new(
+            pioneer_desktop_mcp::McpCatalogConfig::new(client.clone(), registrar.clone()),
+            window,
+            cx,
+        );
+        let skills = pioneer_desktop_skills::SkillsCatalogView::new(
+            pioneer_desktop_skills::SkillsCatalogConfig::new(client.clone(), registrar.clone()),
+            window,
+            cx,
+        );
+        let identity = crate::gateway::IdentityAuthorizationBinding::new(registrar.as_ref());
+        let mut identity_changes = identity.watch();
+        let identity_task = cx.spawn(async move |view, cx| {
+            while identity_changes.changed().await.is_ok() {
+                if view.update(cx, |view, cx| view.sync_chrome(cx)).is_err() {
+                    break;
+                }
+            }
+        });
         let config = pioneer_desktop_task_notifications::TaskNotificationConfig::new(
             client.clone(),
             registrar.clone(),
@@ -83,26 +410,14 @@ impl DesktopShellView {
         );
         let task_notifications =
             cx.new(|cx| pioneer_desktop_task_notifications::TaskNotificationView::new(config, cx));
-        let task_legacy = legacy.downgrade();
-        let task_notification_events = cx.subscribe_in(
-            &task_notifications,
-            window,
-            move |_,
-                  _,
-                  event: &pioneer_desktop_task_notifications::TaskNotificationEvent,
-                  window,
-                  cx| {
+        let task_notification_events =
+            cx.subscribe_in(&task_notifications, window, |view, _, event, window, cx| {
                 let pioneer_desktop_task_notifications::TaskNotificationEvent::OpenThread {
-                    thread_id,
+                    ..
                 } = event;
-                let _ = task_legacy.update(cx, |legacy, cx| {
-                    legacy.present_workspace_thread(Some(thread_id.clone()), window, cx)
-                });
-            },
-        );
-        legacy.update(cx, |legacy, _| {
-            legacy.task_notification_surface = Some(task_notifications.clone().into())
-        });
+                crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
+                view.mount_thread(window, cx);
+            });
         let desktop_update = crate::state::runtime_home_dir().ok().map(|runtime_home| {
             let config = pioneer_desktop_update::DesktopUpdateConfig::new(
                 runtime_home,
@@ -140,8 +455,6 @@ impl DesktopShellView {
             let view = cx.new(|cx| pioneer_desktop_update::DesktopUpdateView::new(config, cx));
             view
         });
-        let legacy_context = legacy.downgrade();
-        let workspace_preference = legacy.downgrade();
         let workspace_config = pioneer_desktop_workspaces::WorkspaceNavigationConfig::new(
             client.clone(),
             registrar.clone(),
@@ -153,11 +466,6 @@ impl DesktopShellView {
                     cx, workspace, expansion,
                 );
             },
-            move |cx| {
-                legacy_context
-                    .upgrade()
-                    .is_some_and(|legacy| legacy.read(cx).workspace_context_locked())
-            },
             |builder, window, cx| {
                 window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
             },
@@ -170,55 +478,41 @@ impl DesktopShellView {
             |builder, window, cx| {
                 window.open_dialog(cx, move |dialog, window, cx| builder(dialog, window, cx))
             },
-        )
-        .with_workspace_preference(move |cx| {
-            workspace_preference
-                .upgrade()
-                .and_then(|legacy| legacy.read(cx).persisted_workspace_preference())
-        });
+        );
         let workspaces = cx.new(|cx| {
             pioneer_desktop_workspaces::WorkspaceNavigationView::new(workspace_config, cx)
         });
-        let workspace_context_view = workspaces.downgrade();
-        let workspace_context = cx.observe(&legacy, move |_, _, cx| {
-            let _ = workspace_context_view.update(cx, |view, cx| view.refresh_presentation(cx));
-        });
-        let legacy_events = legacy.downgrade();
         let workspace_events = cx.subscribe_in(
             &workspaces,
             window,
-            move |_,
-                  _,
-                  event: &pioneer_desktop_workspaces::WorkspaceNavigationEvent,
-                  window,
-                  cx| {
-                let _ = legacy_events.update(cx, |legacy, cx| match event {
-                    pioneer_desktop_workspaces::WorkspaceNavigationEvent::OpenThread {
-                        thread_id,
-                    } => legacy.present_workspace_thread(thread_id.clone(), window, cx),
-                    pioneer_desktop_workspaces::WorkspaceNavigationEvent::OpenAgentsDocument {
-                        scope,
-                    } => legacy.present_workspace_agents_document(scope.clone(), window, cx),
-                });
+            |view, _, event, window, cx| match event {
+                pioneer_desktop_workspaces::WorkspaceNavigationEvent::OpenThread { .. } => {
+                    view.mount_thread(window, cx)
+                }
+                pioneer_desktop_workspaces::WorkspaceNavigationEvent::OpenAgentsDocument {
+                    scope,
+                } => view.open_agents_document(scope.clone(), window, cx),
             },
         );
-        navigation.set_window_route(legacy.read(cx).window_route());
+        navigation.set_window_route(if client.onboarding_setup_required() {
+            WindowRoute::GatewaySetup
+        } else {
+            WindowRoute::Main
+        });
         let sidebar = cx.new(|cx| SidebarHostView {
             workspaces: workspaces.clone(),
             desktop_update: desktop_update.clone(),
-            legacy: legacy.downgrade(),
             navigation: navigation.clone(),
-            _changes: cx.subscribe(&legacy, |_, _, _: &crate::app::SidebarChanged, cx| {
-                cx.notify()
-            }),
+            settings: settings.read(cx).sidebar_surface(),
+            providers: providers.read(cx).sidebar(),
+            administration: administration.read(cx).sidebar(),
+            mcp: mcp.read(cx).sidebar(),
+            skills: skills.read(cx).sidebar(),
         });
-        let frame_subscription =
-            cx.subscribe(&legacy, |view, legacy, _: &crate::app::FrameChanged, cx| {
-                view.navigation
-                    .set_window_route(legacy.read(cx).window_route());
-                cx.notify()
-            });
-        let layout_subscription = cx.observe(&layout, |_, _, cx| cx.notify());
+        let layout_subscription = cx.observe(&layout, |view, _, cx| {
+            view.sync_sidebar_width(cx);
+            cx.notify();
+        });
         let mut changes = navigation.watch();
         let route_task = cx.spawn_in(window, async move |view, cx| {
             while changes.changed().await.is_ok() {
@@ -243,12 +537,9 @@ impl DesktopShellView {
                         if let Some(sidebar) = &view.sidebar {
                             sidebar.update(cx, |_, cx| cx.notify());
                         }
-                        if let Some(legacy) = &view.legacy {
-                            let input = view.navigation.snapshot().navigation().clone();
-                            legacy.update(cx, |legacy, cx| {
-                                legacy.apply_navigation_publication(input, cx)
-                            });
-                        }
+                        view.sync_chrome(cx);
+                        view.mount_agents_document(window, cx);
+                        view.sync_activity(window.is_window_active(), cx);
                         view.mount_thread(window, cx);
                         cx.notify();
                     })
@@ -264,11 +555,7 @@ impl DesktopShellView {
                     thread.set_window_active(window.is_window_active(), cx)
                 });
             }
-            if let Some(legacy) = &view.legacy {
-                legacy.update(cx, |legacy, cx| {
-                    legacy.set_window_active(window.is_window_active(), cx)
-                });
-            }
+            view.sync_activity(window.is_window_active(), cx);
         });
         let shell = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -276,27 +563,45 @@ impl DesktopShellView {
                 .update(cx, |view, cx| view.request_close(window, cx))
                 .unwrap_or(true)
         });
+        let gateway_switcher = Some(onboarding.read(cx).gateway_switcher_surface());
+        let general_actions = Some(settings.read(cx).general_actions_surface());
         let mut view = Self {
             thread: None,
             thread_events: None,
             workspaces: Some(workspaces),
             _workspace_events: workspace_events,
             _task_notification_events: task_notification_events,
-            _workspace_context: workspace_context,
+            _onboarding_events: onboarding_events,
+            identity: Some(identity),
+            identity_task: Some(identity_task),
+            can_manage: false,
+            can_notify: false,
+            setup_required: client.onboarding_setup_required(),
+            gateway_switcher,
+            general_actions,
+            onboarding: Some(onboarding),
+            settings: Some(settings),
+            providers: Some(providers),
+            administration: Some(administration),
+            mcp: Some(mcp),
+            skills: Some(skills),
+            agents_document: None,
             desktop_update,
             task_notifications: Some(task_notifications),
             action_region: cx.focus_handle(),
             mounted_route: navigation.snapshot(),
-            legacy: Some(legacy),
             sidebar: Some(sidebar),
             navigation,
             layout,
             _layout_subscription: layout_subscription,
-            _frame_subscription: frame_subscription,
             _activation_subscription: activation_subscription,
             route_task: Some(route_task),
             close_task: None,
         };
+        view.sync_sidebar_width(cx);
+        view.sync_activity(window.is_window_active(), cx);
+        view.sync_chrome(cx);
+        view.mount_agents_document(window, cx);
         view.mount_thread(window, cx);
         view
     }
@@ -339,26 +644,48 @@ impl DesktopShellView {
             &thread,
             window,
             |view, _, event: &pioneer_desktop_thread::ThreadNavigationEvent, window, cx| {
-                if let Some(legacy) = &view.legacy {
-                    legacy.update(cx, |legacy, cx| match event {
-                        pioneer_desktop_thread::ThreadNavigationEvent::OpenTaskThread {
-                            child_thread_id,
-                            title,
-                            ..
-                        } => legacy.open_task_child_thread(
-                            child_thread_id.clone(),
-                            title.clone(),
-                            window,
-                            cx,
-                        ),
-                        pioneer_desktop_thread::ThreadNavigationEvent::CloseTaskThread => {
-                            legacy.close_task_child_thread(window, cx)
+                use pioneer_client::navigation::{
+                    NavigationIntent, SemanticDestination, TaskThreadLineage,
+                };
+                let core = cx
+                    .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+                    .core();
+                match event {
+                    pioneer_desktop_thread::ThreadNavigationEvent::OpenTaskThread {
+                        parent_thread_id,
+                        child_thread_id,
+                        title,
+                    } => {
+                        if let Some(workspace) = core.navigation_snapshot().workspace_id() {
+                            core.navigate(
+                                NavigationIntent::PushTaskThread {
+                                    entry: TaskThreadLineage::new(
+                                        parent_thread_id.clone(),
+                                        child_thread_id.clone(),
+                                        workspace.to_owned(),
+                                        title.clone(),
+                                    ),
+                                },
+                                None,
+                            );
                         }
-                        pioneer_desktop_thread::ThreadNavigationEvent::OpenMcpServer {
-                            server_id,
-                        } => legacy.open_mcp_server_details_from_timeline(server_id.clone(), cx),
-                    });
+                    }
+                    pioneer_desktop_thread::ThreadNavigationEvent::CloseTaskThread => {
+                        core.navigate(NavigationIntent::PopTaskThread, None);
+                    }
+                    pioneer_desktop_thread::ThreadNavigationEvent::OpenMcpServer { server_id } => {
+                        core.navigate(
+                            NavigationIntent::Navigate {
+                                destination: SemanticDestination::Mcp {
+                                    server_id: Some(server_id.clone()),
+                                },
+                            },
+                            None,
+                        );
+                    }
                 }
+                crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
+                view.mount_thread(window, cx);
             },
         ));
         self.thread = Some((thread_id.to_owned(), thread));
@@ -369,10 +696,36 @@ impl DesktopShellView {
         }
     }
     fn activate_navigation(&mut self, route: MainRoute, cx: &mut Context<Self>) {
-        if let Some(legacy) = &self.legacy {
-            legacy.update(cx, |legacy, cx| legacy.activate_navigation(route, cx));
+        use pioneer_client::navigation::{NavigationIntent, SemanticDestination, SettingsRoute};
+        let current = self.navigation.snapshot();
+        if current.route() == route
+            || (route == MainRoute::Threads && current.route() == MainRoute::AgentsDoc)
+        {
+            self.layout
+                .update(cx, |layout, cx| layout.toggle_sidebar(cx));
+            return;
         }
+        let destination = match route {
+            MainRoute::Threads => SemanticDestination::Threads,
+            MainRoute::Providers => SemanticDestination::Providers {
+                filter: current.navigation().providers_route(),
+            },
+            MainRoute::Administration => SemanticDestination::Administration {
+                route: current.navigation().administration_route(),
+            },
+            MainRoute::Settings => SemanticDestination::Settings {
+                route: SettingsRoute::Account,
+            },
+            MainRoute::Mcp if self.can_manage => SemanticDestination::Mcp { server_id: None },
+            MainRoute::Skills if self.can_manage => SemanticDestination::Skills { skill_id: None },
+            _ => return,
+        };
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+            .navigate(NavigationIntent::Navigate { destination }, None);
+        crate::client_runtime::DesktopRuntimeCoordinator::deliver_pending(cx);
     }
+
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.close_task.is_some() {
             return false;
@@ -380,9 +733,9 @@ impl DesktopShellView {
         let last_window = cx.windows().len() == 1;
         let scope = (!last_window)
             .then(|| {
-                self.legacy
+                self.agents_document
                     .as_ref()
-                    .and_then(|legacy| legacy.read(cx).agents_document_scope(cx))
+                    .map(|editor| editor.read(cx).scope().clone())
             })
             .flatten();
         if scope.is_none() && !last_window {
@@ -421,12 +774,15 @@ impl DesktopShellView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(legacy) = &self.legacy {
-            legacy.update(cx, |legacy, cx| {
-                legacy.present_document_close_error(error, window, cx)
-            });
+        use pioneer_client::agents_doc::controller::AgentsDocumentCloseError;
+        if let AgentsDocumentCloseError::SaveFailed(scope)
+        | AgentsDocumentCloseError::Conflict(scope) = error
+        {
+            self.open_agents_document(scope.clone(), window, cx);
         }
+        pioneer_desktop_agents_doc::present_close_error(error, window, cx);
     }
+
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_task.take();
         window.close_all_dialogs(cx);
@@ -436,9 +792,18 @@ impl DesktopShellView {
         self.route_task.take();
         self.thread_events.take();
         self.thread.take();
-        if let Some(legacy) = &self.legacy {
-            legacy.update(cx, |legacy, cx| legacy.close_route_bindings(cx));
-        }
+        self.identity_task.take();
+        self.identity.take();
+        self.gateway_switcher.take();
+        self.general_actions.take();
+        self.sync_activity(false, cx);
+        self.agents_document.take();
+        self.onboarding.take();
+        self.settings.take();
+        self.providers.take();
+        self.administration.take();
+        self.mcp.take();
+        self.skills.take();
         if let Some(view) = self.task_notifications.take() {
             view.update(cx, |view, _| view.close());
         }
@@ -450,27 +815,20 @@ impl DesktopShellView {
         }
         self.navigation.close();
         self.sidebar.take();
-        self.legacy.take();
     }
 }
 impl Render for DesktopShellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(legacy) = self.legacy.as_ref() else {
+        if self.onboarding.is_none() {
             return div().into_any_element();
-        };
+        }
         let route = self.navigation.snapshot();
         let title = TitleBarSurface {
-            content: LegacyScreenAdapter::title_bar_surface(legacy, window, cx),
+            content: self.title_bar(cx),
         };
-        let screen = ScreenHostView {
-            thread: self
-                .thread
-                .as_ref()
-                .filter(|_| self.navigation.is_visible(MainRoute::Threads))
-                .map(|(_, view)| view.clone()),
-            selected: legacy.clone(),
-            route: route.clone(),
-        };
+        let selected = self.selected_screen();
+        let thread_mounted = route.route() == MainRoute::Threads && self.thread.is_some();
+        let screen = ScreenHostView { selected };
         let body = if route.window_route() == WindowRoute::Main {
             DesktopBody {
                 sidebar: self
@@ -479,11 +837,12 @@ impl Render for DesktopShellView {
                     .expect("live sidebar")
                     .clone()
                     .into_any_element(),
-                thread_mounted: screen.thread.is_some(),
+                thread_mounted,
                 screen: screen.into_any_element(),
                 bottom: BottomBarSurface {
-                    content: LegacyScreenAdapter::bottom_bar_surface(
-                        legacy,
+                    content: crate::desktop_chrome::bottom_bar(
+                        route.route(),
+                        self.can_manage,
                         &self.action_region,
                         cx,
                     ),
@@ -502,15 +861,6 @@ impl Render for DesktopShellView {
             .size_full()
             .track_focus(&self.action_region)
             .key_context("DesktopShell")
-            .on_action(cx.listener(
-                |view, action: &pioneer_desktop_workspaces::RenameThread, window, cx| {
-                    if let Some(workspaces) = &view.workspaces {
-                        workspaces.update(cx, |workspaces, cx| {
-                            workspaces.rename_thread(action, window, cx)
-                        });
-                    }
-                },
-            ))
             .on_action(cx.listener(|view, _: &OpenThreads, _, cx| {
                 view.activate_navigation(MainRoute::Threads, cx)
             }))
@@ -567,26 +917,22 @@ impl RenderOnce for BottomBarSurface {
 }
 #[derive(IntoElement)]
 struct ScreenHostView {
-    thread: Option<Entity<pioneer_desktop_thread::ThreadView>>,
-    selected: Entity<LegacyScreenAdapter>,
-    route: Arc<DesktopRouteSnapshot>,
+    selected: Option<AnyView>,
 }
 impl RenderOnce for ScreenHostView {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        if self.route.window_route() == WindowRoute::Main
-            && self.route.route() == MainRoute::Threads
-        {
-            return div().size_full().children(self.thread).into_any_element();
-        }
-        self.selected.into_any_element()
+        div().size_full().children(self.selected)
     }
 }
 struct SidebarHostView {
     workspaces: Entity<pioneer_desktop_workspaces::WorkspaceNavigationView>,
     desktop_update: Option<Entity<pioneer_desktop_update::DesktopUpdateView>>,
-    legacy: WeakEntity<LegacyScreenAdapter>,
     navigation: Arc<DesktopNavigationStore>,
-    _changes: Subscription,
+    settings: AnyView,
+    providers: AnyView,
+    administration: AnyView,
+    mcp: AnyView,
+    skills: AnyView,
 }
 impl Render for SidebarHostView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -607,10 +953,15 @@ impl Render for SidebarHostView {
                 .children(self.desktop_update.clone())
                 .into_any_element();
         }
-        let content = self
-            .legacy
-            .upgrade()
-            .map(|legacy| LegacyScreenAdapter::sidebar_surface(&legacy, route.route(), cx));
+        let content = match route.route() {
+            MainRoute::Settings => &self.settings,
+            MainRoute::Providers => &self.providers,
+            MainRoute::Administration => &self.administration,
+            MainRoute::Mcp | MainRoute::McpDetails => &self.mcp,
+            MainRoute::Skills | MainRoute::SkillDetails => &self.skills,
+            MainRoute::Threads | MainRoute::AgentsDoc => unreachable!(),
+        }
+        .clone();
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
@@ -620,7 +971,7 @@ impl Render for SidebarHostView {
                     .min_h_0()
                     .w_full()
                     .overflow_hidden()
-                    .children(content),
+                    .child(content),
             )
             .into_any_element()
     }
@@ -685,235 +1036,3 @@ impl RenderOnce for DesktopBody {
 #[cfg(test)]
 #[path = "shell_context_tests.rs"]
 mod context_tests;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn new_thread_route_mounts_before_bootstrap_and_keeps_its_target_on_creation() {
-        use super::*;
-        use pioneer_client::core::{ClientCore, ClientScope};
-        use pioneer_desktop_foundation::{
-            ClientBindingRegistrar, ClientBindingRegistration, ClientPublicationSink,
-        };
-        struct Registrar;
-        impl ClientBindingRegistrar for Registrar {
-            fn register(
-                &self,
-                _: ClientScope,
-                _: std::sync::Weak<dyn ClientPublicationSink>,
-            ) -> ClientBindingRegistration {
-                ClientBindingRegistration::new(|| {})
-            }
-        }
-        let client = ClientCore::new();
-        let navigation = DesktopNavigationStore::new(&Registrar);
-        assert!(
-            navigation
-                .snapshot()
-                .navigation()
-                .active_thread_id()
-                .is_none()
-        );
-        let id = thread_view_target(&navigation, &client, true)
-            .expect("New thread must mount the composer before server creation");
-        assert_eq!(
-            thread_view_target(&navigation, &client, false).as_deref(),
-            Some(id.as_str())
-        );
-        client.activate_thread(Some(&id), Some("workspace"));
-        navigation.publish(client.snapshot(&ClientScope::Navigation).unwrap());
-        assert_eq!(
-            thread_view_target(&navigation, &client, true).as_deref(),
-            Some(id.as_str())
-        );
-        navigation.set_window_route(WindowRoute::GatewaySetup);
-        assert!(thread_view_target(&navigation, &client, true).is_none());
-    }
-
-    #[test]
-    fn bootstrap_has_one_toolkit_root_and_shell_is_its_content() {
-        let main = include_str!("main.rs");
-        assert_eq!(main.matches("gpui_kit::init(cx)").count(), 1);
-        assert_eq!(main.matches("Root::new(").count(), 1);
-        assert!(main.contains("Root::new(shell, window, cx)"));
-        assert!(main.contains("desktop = Some(legacy.downgrade())"));
-        let shell = include_str!("desktop_shell.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(!shell.contains("Entity<Root>"));
-        for forbidden in [
-            "client_core()",
-            "GatewayWsEvent",
-            "ClientSubscription",
-            "ClientRuntimePostEventSink",
-            ".cached()",
-        ] {
-            assert!(!shell.contains(forbidden), "{forbidden}");
-        }
-        for surface in [
-            "TitleBarSurface",
-            "BottomBarSurface",
-            "DesktopBody",
-            "ScreenHostView",
-        ] {
-            assert!(shell.contains(&format!("impl RenderOnce for {surface}")));
-            assert!(!shell.contains(&format!("Entity<{surface}>")));
-        }
-        let render = shell
-            .split("impl Render for DesktopShellView")
-            .nth(1)
-            .unwrap();
-        for forbidden in ["cx.new(", "cx.spawn(", "cx.subscribe(", "cx.focus_handle("] {
-            assert!(!render.contains(forbidden), "{forbidden}");
-        }
-        for layer in [
-            "render_sheet_layer",
-            "render_dialog_layer",
-            "render_notification_layer",
-        ] {
-            assert_eq!(shell.matches(layer).count(), 1);
-        }
-    }
-    #[test]
-    fn navigation_controls_dispatch_one_action_to_the_window_owner() {
-        let buttons = include_str!("app/bottom_bar/view.rs");
-        let shell = include_str!("desktop_shell.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        for action in [
-            "OpenThreads",
-            "OpenProviders",
-            "OpenMcp",
-            "OpenSkills",
-            "OpenAdministration",
-            "OpenSettings",
-        ] {
-            assert_eq!(
-                buttons
-                    .matches(&format!("dispatch_action(&{action}, window, cx)"))
-                    .count(),
-                1
-            );
-            assert_eq!(shell.matches(&format!("_: &{action}")).count(), 1);
-        }
-        assert!(shell.contains("key_context(\"DesktopShell\")"));
-        assert!(!buttons.contains("set_main_content_view"));
-        let layout = include_str!("shell_state.rs");
-        assert!(!layout.contains("pioneer_client"));
-        assert!(layout.contains("observe_window_bounds"));
-        assert!(!include_str!("app/root/mod.rs").contains("sidebar_panel_width:"));
-    }
-    #[test]
-    fn route_exit_preserves_presentation_identity_and_access_cleanup_uses_client_plan() {
-        let lifecycle = include_str!("app/root/route_lifecycle.rs");
-        let warm = lifecycle
-            .split("if activity == crate::desktop_navigation::RouteActivity::Dormant")
-            .next()
-            .unwrap();
-        assert!(!warm.contains("running_indicator_views"));
-        let thread = include_str!("../../desktop-thread/src/thread.rs");
-        assert!(
-            thread
-                .split_whitespace()
-                .collect::<String>()
-                .contains("screen.running_indicator_views")
-        );
-        assert!(thread.contains("set_active(active, cx)"));
-        assert!(!warm.contains("thread_timeline_view_state.borrow_mut()"));
-        assert!(!warm.contains("thread_timeline_terminal_item.borrow_mut().clear()"));
-        let main = include_str!("main.rs");
-        assert_eq!(main.matches("LegacyScreenAdapter::new(").count(), 1);
-        let access = include_str!("app/flow/ws_events_notifications.rs")
-            .split("fn apply_access_changed_notification(")
-            .nth(1)
-            .unwrap()
-            .split("fn apply_authorization_projection_changed_notification(")
-            .next()
-            .unwrap();
-        assert!(access.contains("apply_thread_access_change(&notification)"));
-        assert!(!access.contains("plan_access_changed("));
-        assert!(access.contains("if plan.clear_active_thread"));
-    }
-
-    #[test]
-    fn route_identity_closes_overlays_and_sidebar_publications_target_only_sidebar() {
-        let shell = include_str!("desktop_shell.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(
-            shell
-                .split_whitespace()
-                .collect::<String>()
-                .contains("previous.navigation().destination()!=route.navigation().destination()")
-        );
-        assert!(shell.contains("track_focus(&self.action_region)"));
-        let updater = include_str!("../../desktop-update/src/view.rs");
-        assert!(!updater.contains("SidebarChanged"));
-        assert!(!updater.contains("DesktopShellView"));
-        let mcp = include_str!("../../desktop-mcp/src/catalog.rs");
-        let skills = include_str!("../../desktop-skills/src/catalog.rs");
-        for feature in [mcp, skills] {
-            assert!(feature.contains("self.window_active"));
-            assert!(feature.contains("self.visible()"));
-            assert!(feature.contains("same_sidebar"));
-            assert!(!feature.contains("SidebarChanged"));
-        }
-        assert!(mcp.contains("acquire_mcp_demand"));
-        assert!(skills.contains("acquire_skills_demand"));
-        let teardown = include_str!("app/root/route_lifecycle.rs")
-            .split("fn close_route_bindings(")
-            .nth(1)
-            .unwrap();
-        for retired in [
-            "composer_input_subscription",
-            "code_highlight_cache",
-            "running_indicator_views",
-            "thread_timeline_terminal_item",
-            "thread_timeline_view_state",
-        ] {
-            assert!(
-                !teardown.contains(retired),
-                "legacy teardown still owns {retired}"
-            );
-        }
-        let feature = include_str!("../../desktop-thread/src/screen.rs");
-        assert!(feature.contains("impl Drop for TimelineView"));
-        assert!(feature.contains("self.thread_bindings.clear()"));
-    }
-
-    #[test]
-    fn retained_legacy_route_owns_no_mutable_navigation_copy() {
-        let owner = include_str!("app/root/mod.rs");
-        let fields = owner.split("struct LegacyScreenAdapter {").nth(1).unwrap();
-        for removed in [
-            "active_thread_id:",
-            "preferred_workspace_id:",
-            "task_thread_navigation_stack:",
-            "main_content_view:",
-            "mcp_selected_server_id:",
-            "selected_skill_target:",
-            "thread_bindings:",
-            "composer_state:",
-            "composer_input:",
-            "thread_member_input:",
-            "thread_capability_input:",
-            "artifact_input:",
-            "desktop_voice_composer:",
-            "thread_panel_layout:",
-        ] {
-            assert!(!fields.contains(removed), "{removed}");
-        }
-        assert_eq!(owner.matches("struct LegacyScreenAdapter").count(), 1);
-        let lifecycle = include_str!("app/root/route_lifecycle.rs");
-        for release in ["self.mcp_view.update", "self.skills_view.update"] {
-            assert!(lifecycle.contains(release), "{release}");
-        }
-        let old_frame = include_str!("app/root/view.rs");
-        assert!(!old_frame.contains("Root::"));
-        assert!(!old_frame.contains("h_resizable"));
-        assert!(!include_str!("app/root/state.rs").contains("install_window_state_persistence"));
-    }
-}

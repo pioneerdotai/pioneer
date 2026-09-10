@@ -10,9 +10,6 @@ pioneer-client.workspace = true
 pioneer-desktop-foundation.workspace = true
 rust-i18n.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
-anyhow.workspace = true
-chrono.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

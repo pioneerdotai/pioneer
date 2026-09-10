@@ -22,3 +22,8 @@ mod assets;
 mod device_activation_form;
 mod file_openers;
 mod general_actions;
+
+mod file_opener_types;
+mod preferences_types;
+pub use file_opener_types::FileOpenerId;
+pub use preferences_types::{AppLanguagePreference, WindowThemePreference};

@@ -245,10 +245,6 @@ impl TimelineLayoutIndex {
         self.grouping.as_ref()
     }
 
-    pub(crate) fn grouping_rc(&self) -> Rc<TimelineGrouping> {
-        self.grouping.clone()
-    }
-
     pub(crate) fn avatar_group_bounds(
         &self,
         group: &TimelineAvatarGroup,

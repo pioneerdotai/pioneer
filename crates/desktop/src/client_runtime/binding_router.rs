@@ -45,28 +45,6 @@ struct Registrar {
     wake: Weak<Notify>,
 }
 
-#[cfg(test)]
-pub(crate) fn test_binding_router(
-    core: Arc<ClientCore>,
-) -> (Arc<dyn ClientBindingRegistrar>, impl Fn()) {
-    let routes = Rc::new(RefCell::new(Routes {
-        active: true,
-        ..Routes::default()
-    }));
-    let wake = Arc::new(Notify::new());
-    let registrar = Arc::new(Registrar {
-        core: Arc::downgrade(&core),
-        routes: Rc::downgrade(&routes),
-        wake: Arc::downgrade(&wake),
-    });
-    let router = DesktopClientBindingRouter {
-        routes,
-        wake,
-        task: None,
-    };
-    (registrar, move || router.deliver_pending(&core))
-}
-
 impl ClientBindingRegistrar for Registrar {
     fn register(
         &self,

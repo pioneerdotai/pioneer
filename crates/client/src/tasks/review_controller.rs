@@ -687,7 +687,7 @@ impl ClientCore {
                     if !core.task_review_request_is_current(&request) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let result = match request.params.clone() {
                         ReviewRequestParams::Accept(params) => {

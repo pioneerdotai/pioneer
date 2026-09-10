@@ -1024,10 +1024,7 @@ impl ClientCore {
                 reason: crate::gateway::session_lifecycle::SessionTerminalReason::SessionRevoked,
             },
         );
-        let disconnect = self
-            .compatibility_runtime()
-            .ws_command_sender()
-            .disconnect();
+        let disconnect = self.transport_runtime().ws_command_sender().disconnect();
         {
             let mut runtime = self
                 .settings_runtime

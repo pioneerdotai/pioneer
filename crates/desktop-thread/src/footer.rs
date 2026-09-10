@@ -20,6 +20,7 @@ pub(crate) struct ThreadFooterView {
     thread_id: String,
     binding: Arc<ThreadBindings>,
     controls: Entity<ThreadPanelControlsView>,
+    status: ActiveThreadStatusSnapshot,
     _changes: Task<()>,
 }
 impl ThreadFooterView {
@@ -53,20 +54,32 @@ impl ThreadFooterView {
                 if input.drain().is_empty() {
                     continue;
                 }
-                if view.update(cx, |_, cx| cx.notify()).is_err() {
+                if view
+                    .update(cx, |view, cx| {
+                        let status = view.status_input();
+                        if status != view.status {
+                            view.status = status;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         });
-        Self {
+        let mut view = Self {
+            status: ActiveThreadStatusSnapshot::GatewayDisconnected,
             client,
             thread_id,
             binding,
             controls,
             _changes: task,
-        }
+        };
+        view.status = view.status_input();
+        view
     }
-    fn status_text(&self) -> String {
+    fn status_input(&self) -> ActiveThreadStatusSnapshot {
         let coordinator = self.client.thread_coordinator_snapshot(&self.thread_id);
         let draft = coordinator.as_ref().is_some_and(|coordinator| {
             self.client
@@ -83,7 +96,10 @@ impl ThreadFooterView {
             self.client.thread_start_snapshot().in_progress,
         )
         .status;
-        match snapshot {
+        snapshot
+    }
+    fn status_text(&self) -> String {
+        match &self.status {
             ActiveThreadStatusSnapshot::GatewayDisconnected => {
                 t!("bottom_bar.gateway_disconnected")
             }

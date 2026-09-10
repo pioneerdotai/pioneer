@@ -416,7 +416,7 @@ impl ClientCore {
                     if !core.begin_voice_readiness_poll(&mut request) {
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     drop(core);
                     let response = sender
                         .voice_status(VoiceStatusParams {

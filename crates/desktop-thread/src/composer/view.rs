@@ -453,28 +453,16 @@ impl ComposerView {
             .into_any_element()
     }
 
-    fn render_composer_mention_picker(
+    pub(super) fn synchronize_mention_items(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let directory_loading = self.thread_member_directory_loading()
-            || self.thread_member_input.as_ref().is_some_and(|p| {
-                p.directory_request
-                    == pioneer_client::threads::members::ThreadMemberReadState::Loading
-            });
+    ) {
         let candidates = self
             .thread_member_input
             .as_ref()
             .map(|p| p.mention_candidates.clone())
             .unwrap_or_default();
-
-        // There is no useful action when a workspace has no active members to
-        // mention. Keep the toolbar clean instead of opening an empty picker.
-        if candidates.is_empty() && !directory_loading {
-            return None;
-        }
-
         // Updating the Combobox items on every render resets SearchableVec's
         // current query and makes typing appear to have no effect. Keep the
         // source candidates in the view and replace the items only when the
@@ -495,6 +483,29 @@ impl ComposerView {
             self.composer_mention_select.update(cx, |state, cx| {
                 state.set_items(select_items, window, cx);
             });
+        }
+    }
+
+    fn render_composer_mention_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let directory_loading = self.thread_member_directory_loading()
+            || self.thread_member_input.as_ref().is_some_and(|p| {
+                p.directory_request
+                    == pioneer_client::threads::members::ThreadMemberReadState::Loading
+            });
+        let candidates = self
+            .thread_member_input
+            .as_ref()
+            .map(|p| p.mention_candidates.clone())
+            .unwrap_or_default();
+
+        // There is no useful action when a workspace has no active members to
+        // mention. Keep the toolbar clean instead of opening an empty picker.
+        if candidates.is_empty() && !directory_loading {
+            return None;
         }
 
         let trigger = if directory_loading || self.composer_upload_in_progress() {

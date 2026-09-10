@@ -437,7 +437,7 @@ impl ClientCore {
                         core.open_task_notification(request);
                         continue;
                     }
-                    let sender = core.compatibility_runtime().ws_command_sender();
+                    let sender = core.transport_runtime().ws_command_sender();
                     let result = if let Some((id, _)) = &request.notification {
                         sender
                             .task_user_notification_acknowledge(
@@ -616,7 +616,7 @@ impl ClientCore {
             return;
         };
         let result = (|| -> anyhow::Result<pioneer_protocol::Thread> {
-            let sender = self.compatibility_runtime().ws_command_sender();
+            let sender = self.transport_runtime().ws_command_sender();
             let task: pioneer_protocol::TaskGetResponse = crate::rpc::send_json_rpc_request_typed(
                 &sender,
                 pioneer_protocol::constants::methods::TASK_GET,

@@ -222,7 +222,6 @@ pub(crate) struct TimelineRenderModel {
     pub groups: std::sync::Arc<Vec<pioneer_client::timeline::presentation::TimelineGroup>>,
     pub projection: std::sync::Arc<ConversationViewState>,
     pub rows: std::sync::Arc<Vec<TimelineRenderRow>>,
-    pub row_revisions: std::sync::Arc<HashMap<String, u64>>,
 }
 
 impl TimelineRenderModel {
@@ -235,7 +234,6 @@ impl TimelineRenderModel {
             groups: Default::default(),
             projection: std::sync::Arc::new(ConversationViewState::default()),
             rows: std::sync::Arc::new(Vec::new()),
-            row_revisions: std::sync::Arc::new(HashMap::new()),
         }
     }
 }

@@ -596,7 +596,7 @@ impl ClientCore {
             generation
         };
         let result = self
-            .compatibility_runtime()
+            .transport_runtime()
             .ws_command_sender()
             .thread_tree(crate::threads::tree::thread_tree_params(workspace));
         let mut registry = self

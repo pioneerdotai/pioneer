@@ -24,8 +24,6 @@ use pioneer_client::settings::model_picker::{
 use pioneer_client::settings::types::ProviderModelInfo;
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
-    hash::{Hash, Hasher},
     rc::Rc,
 };
 
@@ -75,7 +73,6 @@ struct ModelSelectorDialogState {
     provider_trigger_width_px: Rc<RefCell<f32>>,
     model_trigger_width_px: Rc<RefCell<f32>>,
     reasoning_trigger_width_px: Rc<RefCell<f32>>,
-    model_row_layout_cache: Rc<RefCell<HashMap<String, CachedModelRowLayout>>>,
 }
 
 impl ModelSelectorDialogState {
@@ -198,12 +195,6 @@ impl Drop for ModelSelectorOwner {
     fn drop(&mut self) {
         self.close();
     }
-}
-
-#[derive(Clone, Copy)]
-struct CachedModelRowLayout {
-    layout_hash: u64,
-    height_px: f32,
 }
 
 #[derive(IntoElement)]
@@ -346,7 +337,6 @@ impl SettingsScreenView {
         let provider_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
         let model_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
         let reasoning_trigger_width_px = Rc::new(RefCell::new(SELECTOR_POPOVER_FALLBACK_WIDTH));
-        let model_row_layout_cache = Rc::new(RefCell::new(HashMap::new()));
 
         let state = ModelSelectorDialogState {
             closed: owner.read(cx).closed.clone(),
@@ -367,7 +357,6 @@ impl SettingsScreenView {
             provider_trigger_width_px,
             model_trigger_width_px,
             reasoning_trigger_width_px,
-            model_row_layout_cache,
         };
 
         Self::show_model_selector_dialog(window, cx, state);
@@ -728,7 +717,6 @@ impl SettingsScreenView {
             expected_owner: state.generation,
             provider: provider_name,
         });
-        state.model_row_layout_cache.borrow_mut().clear();
 
         let _ = popover_entity.update(cx, |state, cx| {
             state.dismiss(window, cx);
@@ -1133,19 +1121,6 @@ impl SettingsScreenView {
                 .iter()
                 .enumerate()
                 .map(|(ix, model)| {
-                    let layout_hash = Self::model_row_layout_hash(model, row_width);
-                    if let Some(cached_height_px) = {
-                        let cache = state.model_row_layout_cache.borrow();
-                        cache.get(model.id.as_str()).and_then(|cached| {
-                            (cached.layout_hash == layout_hash).then_some(cached.height_px)
-                        })
-                    } {
-                        return gpui_kit::size(
-                            px(0.),
-                            px(cached_height_px).max(px(MODEL_ROW_MIN_HEIGHT)),
-                        );
-                    }
-
                     let mut row = Self::render_model_virtual_list_row(
                         state.clone(),
                         popover_entity.clone(),
@@ -1165,33 +1140,10 @@ impl SettingsScreenView {
                         popover_cx,
                     );
                     let measured_height = measured.height.max(px(MODEL_ROW_MIN_HEIGHT));
-                    state.model_row_layout_cache.borrow_mut().insert(
-                        model.id.clone(),
-                        CachedModelRowLayout {
-                            layout_hash,
-                            height_px: measured_height.as_f32(),
-                        },
-                    );
-
                     gpui_kit::size(px(0.), measured_height)
                 })
                 .collect::<Vec<_>>(),
         )
-    }
-
-    fn model_row_layout_hash(model: &ProviderModelInfo, row_width: Pixels) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        model.id.hash(&mut hasher);
-        model.name.hash(&mut hasher);
-        model.description.hash(&mut hasher);
-        if let Some(metadata) = model.transcription.as_ref() {
-            metadata.engine.hash(&mut hasher);
-            metadata.download_size_mb.hash(&mut hasher);
-            metadata.supported_languages.hash(&mut hasher);
-            metadata.recommended.hash(&mut hasher);
-        }
-        row_width.as_f32().to_bits().hash(&mut hasher);
-        hasher.finish()
     }
 
     #[allow(clippy::too_many_arguments)]

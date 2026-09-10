@@ -25,7 +25,7 @@ use std::sync::Arc;
 pub struct OnboardingConfig {
     pub client: Arc<ClientCore>,
     pub bindings: Arc<dyn ClientBindingRegistrar>,
-    pub photos: std::rc::Rc<dyn pioneer_desktop_foundation::profile_photo::ProfilePhotoPort>,
+    pub photos: std::rc::Rc<dyn OnboardingPhotoPort>,
 }
 #[derive(Clone, Debug)]
 pub enum OnboardingEvent {
@@ -42,6 +42,7 @@ pub struct OnboardingView {
     setup: Entity<setup::GatewaySetupScreenView>,
     invitation: Entity<invitation::InvitationJoinScreenView>,
     invitation_active: bool,
+    reauthentication_name: Option<String>,
     switcher: Entity<switcher::GatewaySwitcherView>,
     authenticated: Option<(String, String)>,
     route: Option<(bool, bool)>,
@@ -85,6 +86,7 @@ impl OnboardingView {
                 setup,
                 invitation,
                 invitation_active: false,
+                reauthentication_name: reauthentication_name(&config.client),
                 switcher,
                 authenticated: None,
                 route: None,
@@ -101,6 +103,11 @@ impl OnboardingView {
         view
     }
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = reauthentication_name(&self.config.client);
+        if self.reauthentication_name != name {
+            self.reauthentication_name = name;
+            cx.notify();
+        }
         for warning in self.destinations().warnings {
             if warning.id <= self.last_warning {
                 continue;
@@ -291,23 +298,12 @@ impl Render for OnboardingView {
         if self.invitation_active {
             return self.invitation.clone().into_any_element();
         }
-        let reauthentication = self
-            .config
-            .client
-            .gateway_registry()
-            .and_then(|registry| registry.active_gateway().cloned())
-            .filter(|endpoint| {
-                endpoint.kind == pioneer_client::gateway::types::GatewayEndpointKind::Remote
-                    && endpoint.session_ref.is_none()
-            });
-        let (title, description) = reauthentication
-            .map(|endpoint| {
+        let (title, description) = self
+            .reauthentication_name
+            .as_ref()
+            .map(|name| {
                 (
-                    t!(
-                        "gateway.reauthenticate.title",
-                        name = endpoint.name.as_str()
-                    )
-                    .to_string(),
+                    t!("gateway.reauthenticate.title", name = name.as_str()).to_string(),
                     t!("gateway.reauthenticate.description").to_string(),
                 )
             })
@@ -317,6 +313,28 @@ impl Render for OnboardingView {
                     t!("gateway.initial.description").to_string(),
                 )
             });
+        OnboardingSurface {
+            title,
+            description,
+            content: self.setup.clone().into(),
+        }
+        .into_any_element()
+    }
+}
+
+#[derive(IntoElement)]
+struct OnboardingSurface {
+    title: String,
+    description: String,
+    content: AnyView,
+}
+impl RenderOnce for OnboardingSurface {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Self {
+            title,
+            description,
+            content,
+        } = self;
         v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -353,8 +371,34 @@ impl Render for OnboardingView {
                                     .child(description),
                             ),
                     )
-                    .child(self.setup.clone()),
+                    .child(content),
             )
             .into_any_element()
     }
+}
+
+pub struct OnboardingPhotoSelection {
+    pub preview: String,
+    pub avatar: pioneer_client::settings::types::ProfileAvatarInput,
+}
+pub enum OnboardingPhotoError {
+    Picker,
+    InvalidAvatar,
+}
+pub trait OnboardingPhotoPort {
+    fn select(
+        &self,
+        cx: &mut gpui_kit::App,
+    ) -> gpui_kit::Task<Result<Option<OnboardingPhotoSelection>, OnboardingPhotoError>>;
+}
+
+fn reauthentication_name(client: &ClientCore) -> Option<String> {
+    client
+        .gateway_registry()?
+        .active_gateway()
+        .filter(|endpoint| {
+            endpoint.kind == pioneer_client::gateway::types::GatewayEndpointKind::Remote
+                && endpoint.session_ref.is_none()
+        })
+        .map(|endpoint| endpoint.name.clone())
 }

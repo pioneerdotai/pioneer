@@ -263,7 +263,7 @@ impl crate::core::ClientCore {
             .map(|p| p.revisions().scoped().get());
         let result = switch_workspace(
             &self
-                .compatibility_runtime()
+                .transport_runtime()
                 .ws_command_sender()
                 .requests_for_connection(connection.unwrap_or_default()),
             WorkspaceSwitchRequest {
@@ -340,7 +340,7 @@ impl crate::core::ClientCore {
             self.begin_workspace_action(super::catalog::WorkspaceCatalogOperation::Create)?;
         let result = create_workspace(
             &self
-                .compatibility_runtime()
+                .transport_runtime()
                 .ws_command_sender()
                 .requests_for_connection(connection.unwrap_or_default()),
             WorkspaceCreateRequest {
@@ -370,7 +370,7 @@ impl crate::core::ClientCore {
             self.begin_workspace_action(super::catalog::WorkspaceCatalogOperation::Rename)?;
         let result = rename_workspace(
             &self
-                .compatibility_runtime()
+                .transport_runtime()
                 .ws_command_sender()
                 .requests_for_connection(connection.unwrap_or_default()),
             WorkspaceRenameRequest {

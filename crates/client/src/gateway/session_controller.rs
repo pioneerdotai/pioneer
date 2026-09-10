@@ -83,8 +83,7 @@ impl StartupCoordinator {
 pub(crate) struct GatewaySessionController {
     pub(crate) endpoints: BTreeMap<String, super::types::GatewayEndpoint>,
     unverified_transport: Option<crate::transport::ws::GatewayWsEvent>,
-    connection_delivery: Option<crate::state::reducers::GatewayConnectionReduction>,
-    deferred_events: std::collections::VecDeque<crate::transport::ws::GatewayWsEvent>,
+    transport_reduction: Option<crate::state::reducers::GatewayConnectionReduction>,
     operation_epoch: u64,
     refresh_generation: u64,
     refresh_in_flight: bool,
@@ -103,8 +102,7 @@ impl Default for GatewaySessionController {
         Self {
             endpoints: BTreeMap::new(),
             unverified_transport: None,
-            connection_delivery: None,
-            deferred_events: std::collections::VecDeque::new(),
+            transport_reduction: None,
             operation_epoch: 0,
             refresh_generation: 0,
             refresh_in_flight: false,
@@ -174,96 +172,6 @@ impl crate::core::ClientCore {
         result
     }
 
-    pub fn partition_gateway_compatibility_events(
-        &self,
-        active_connection_id: Option<u64>,
-        replacing: bool,
-        events: impl IntoIterator<Item = crate::transport::ws::GatewayWsEvent>,
-    ) -> Vec<crate::transport::ws::GatewayWsEvent> {
-        let mut owner = self
-            .gateway_session
-            .lock()
-            .expect("Gateway session owner poisoned");
-        if self.is_stopped() {
-            return vec![];
-        }
-        let mut applicable = Vec::new();
-        for event in events {
-            if crate::transport::ws::should_apply_ws_event(active_connection_id, &event) {
-                applicable.push(event);
-            } else if replacing {
-                if owner.deferred_events.len() == 32 {
-                    owner.deferred_events.pop_front();
-                }
-                owner.deferred_events.push_back(event);
-            }
-        }
-        applicable
-    }
-
-    pub fn replay_gateway_compatibility_events(
-        &self,
-        active_connection_id: Option<u64>,
-        notifications_only: bool,
-    ) -> Vec<crate::transport::ws::GatewayWsEvent> {
-        let mut owner = self
-            .gateway_session
-            .lock()
-            .expect("Gateway session owner poisoned");
-        owner
-            .deferred_events
-            .drain(..)
-            .filter(|event| {
-                !self.is_stopped()
-                    && crate::transport::ws::should_apply_ws_event(active_connection_id, event)
-                    && (!notifications_only
-                        || matches!(
-                            event,
-                            crate::transport::ws::GatewayWsEvent::Notification { .. }
-                        ))
-            })
-            .collect()
-    }
-
-    pub fn discard_gateway_compatibility_events(&self) {
-        self.gateway_session
-            .lock()
-            .expect("Gateway session owner poisoned")
-            .deferred_events
-            .clear();
-    }
-
-    /// Immutable input for the remaining Desktop workspace/thread bootstrap owner.
-    /// Session state was already reduced at ingress; only unported feature context
-    /// is selected here until those feature owners consume their own scopes.
-    pub fn gateway_feature_connection_projection(
-        &self,
-        context: crate::runtime::ClientRuntimeWsEventContext,
-    ) -> Option<crate::state::reducers::GatewayConnectionReduction> {
-        use crate::state::client_state::GatewayConnectionState;
-        let owner = self
-            .gateway_session
-            .lock()
-            .expect("Gateway session owner poisoned");
-        if self.is_stopped() || owner.startup.identity_pending {
-            return None;
-        }
-        let mut reduction = owner.connection_delivery.clone()?;
-        if reduction.connection_state == GatewayConnectionState::Connected
-            && context.queue_skills_refresh
-        {
-            reduction
-                .effects
-                .push(crate::notifications::effects::ClientEffect::QueueSkillsRefresh);
-        }
-        if reduction.connection_state != GatewayConnectionState::Connecting
-            && reduction.connection_state != GatewayConnectionState::Connected
-        {
-            reduction.clear_active_thread = !context.should_resume_in_flight_turn;
-        }
-        Some(reduction)
-    }
-
     pub fn gateway_operation_epoch(&self) -> u64 {
         self.gateway_session
             .lock()
@@ -289,7 +197,6 @@ impl crate::core::ClientCore {
             .checked_add(1)
             .expect("Gateway refresh generation exhausted");
         owner.refresh_in_flight = false;
-        owner.deferred_events.clear();
         for connection in owner.connections.values_mut() {
             connection.cancel_pending_request();
         }
@@ -436,8 +343,7 @@ impl GatewaySessionController {
         self.lifecycles.clear();
         self.access_expiries.clear();
         self.unverified_transport = None;
-        self.connection_delivery = None;
-        self.deferred_events.clear();
+        self.transport_reduction = None;
         self.refresh_in_flight = false;
         self.startup.identity_pending = false;
         self.startup.transport_ready = false;
@@ -508,7 +414,7 @@ impl GatewaySessionController {
         else {
             return;
         };
-        if self.connection_delivery.as_ref() != Some(&reduction)
+        if self.transport_reduction.as_ref() != Some(&reduction)
             || self.startup.connection_id != Some(crate::transport::ws::event_connection_id(event))
         {
             self.startup.transport_revision = self
@@ -516,7 +422,7 @@ impl GatewaySessionController {
                 .transport_revision
                 .checked_add(1)
                 .expect("transport revision exhausted");
-            self.connection_delivery = Some(reduction.clone());
+            self.transport_reduction = Some(reduction.clone());
         }
         let connection_id = crate::transport::ws::event_connection_id(event);
         self.status = Some(GatewayStatusProjection {
@@ -710,86 +616,6 @@ mod tests {
     use super::super::session_lifecycle::{GatewaySessionMetadata, SessionTerminalReason};
     use super::*;
     use crate::core::{ClientCore, ClientScope};
-
-    #[test]
-    fn deferred_compatibility_delivery_is_bounded_epoch_scoped_and_dropped_on_shutdown() {
-        use crate::transport::ws::GatewayWsEvent;
-        let event = |connection_id| GatewayWsEvent::Connecting {
-            connection_id,
-            endpoint_id: "synthetic".into(),
-            endpoint_name: "Synthetic".into(),
-            endpoint_kind: super::super::types::GatewayEndpointKind::Remote,
-        };
-        let core = ClientCore::new();
-        assert!(
-            core.partition_gateway_compatibility_events(Some(7), true, [event(8)])
-                .is_empty()
-        );
-        assert_eq!(
-            core.replay_gateway_compatibility_events(Some(8), false)
-                .len(),
-            1
-        );
-        assert!(
-            core.partition_gateway_compatibility_events(None, true, (1..=33).map(event))
-                .is_empty()
-        );
-        {
-            let owner = core.gateway_session.lock().unwrap();
-            assert_eq!(owner.deferred_events.len(), 32);
-            assert_eq!(
-                owner
-                    .deferred_events
-                    .front()
-                    .map(crate::transport::ws::event_connection_id),
-                Some(2)
-            );
-        }
-        assert!(
-            core.replay_gateway_compatibility_events(Some(1), false)
-                .is_empty()
-        );
-        core.partition_gateway_compatibility_events(None, true, [event(8)]);
-        assert!(
-            core.replay_gateway_compatibility_events(Some(8), true)
-                .is_empty()
-        );
-        let notification = GatewayWsEvent::Notification {
-            connection_id: 8,
-            notification: pioneer_protocol::GatewayNotification::Unknown(
-                pioneer_protocol::UnknownGatewayNotification {
-                    method: "synthetic.notification".into(),
-                    workspace_id: None,
-                    thread_id: None,
-                    turn_id: None,
-                    item_id: None,
-                    params: serde_json::json!({}),
-                },
-            ),
-        };
-        core.partition_gateway_compatibility_events(None, true, [notification]);
-        assert_eq!(
-            core.replay_gateway_compatibility_events(Some(8), true)
-                .len(),
-            1
-        );
-        core.partition_gateway_compatibility_events(None, true, [event(8)]);
-        core.begin_gateway_operation();
-        assert!(
-            core.replay_gateway_compatibility_events(Some(8), false)
-                .is_empty()
-        );
-        core.partition_gateway_compatibility_events(None, true, [event(8)]);
-        core.shutdown();
-        assert!(
-            core.replay_gateway_compatibility_events(Some(8), false)
-                .is_empty()
-        );
-        assert!(
-            core.partition_gateway_compatibility_events(Some(8), false, [event(8)])
-                .is_empty()
-        );
-    }
 
     #[test]
     fn refresh_clock_and_operation_generations_reject_duplicate_and_superseded_callbacks() {
