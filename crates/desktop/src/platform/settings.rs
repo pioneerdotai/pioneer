@@ -79,25 +79,31 @@ impl SettingsPlatform for DesktopSettingsPlatform {
             .ok_or_else(|| anyhow::anyhow!("workspace preference scope is unavailable"))?;
         settings::set_workspace_file_opener(cx, &scope, value)
     }
-    fn avatar_path(&self, principal: &str, _: &App) -> Option<std::path::PathBuf> {
-        let auth = self.client.current_auth()?;
-        if auth.principal.id.as_str() != principal {
-            return None;
-        }
-        let p = self
-            .client
-            .snapshot(&ClientScope::Avatar {
-                principal_id: principal.into(),
-            })?
-            .typed::<pioneer_client::avatars::AvatarPublication>()?;
-        if auth.principal.avatar_revision.as_deref() != Some(p.payload().avatar_revision()) {
-            return None;
-        }
-        p.payload().local_path().map(|p| p.as_path().to_path_buf())
-    }
-
     fn telemetry(&self, enabled: bool) {
         pioneer_observability::set_telemetry_enabled(enabled);
+    }
+}
+impl pioneer_desktop_settings::SettingsAvatarPort for DesktopSettingsPlatform {
+    fn resolve(
+        &self,
+        request: pioneer_client::avatars::AvatarCacheRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+        cx: &mut App,
+    ) -> gpui_kit::Task<
+        Result<
+            pioneer_client::avatars::AvatarCacheResult,
+            pioneer_client::avatars::AvatarCacheError,
+        >,
+    > {
+        use gpui_kit::AppContext;
+        use pioneer_client::avatars::AvatarCacheError;
+        let client = self.client.clone();
+        cx.background_spawn(async move {
+            let home = crate::state::runtime_home_dir().map_err(|_| AvatarCacheError::Offline)?;
+            let service = client.avatar_cache_service(home)?;
+            let runtime = tokio::runtime::Runtime::new().map_err(|_| AvatarCacheError::Offline)?;
+            runtime.block_on(client.resolve_member_avatar(&service, request, cancellation))
+        })
     }
 }
 pub(crate) fn settings_config(client: Arc<ClientCore>, cx: &App) -> SettingsConfig {
@@ -106,6 +112,7 @@ pub(crate) fn settings_config(client: Arc<ClientCore>, cx: &App) -> SettingsConf
     });
     SettingsConfig {
         platform: platform.clone(),
+        avatars: platform.clone(),
         photos: Rc::new(crate::profile_photo::DesktopProfilePhotoPort),
         client,
         bindings: cx

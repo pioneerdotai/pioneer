@@ -121,7 +121,7 @@ impl ProfileEditor {
                 ],
                 &config.bindings,
             );
-            binding.set_avatar_scope(input.principal_id.as_deref(), &config.bindings);
+            binding.observe_avatar(&config, cx);
             let mut changed = binding.changed.subscribe();
             let handle = window.window_handle();
             let task = cx.spawn(async move |view: WeakEntity<Self>, cx| {
@@ -152,8 +152,7 @@ impl ProfileEditor {
     }
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next = self.config.client.profile();
-        self._binding
-            .set_avatar_scope(next.principal_id.as_deref(), &self.config.bindings);
+        self._binding.observe_avatar(&self.config, cx);
         if next == self.input {
             cx.notify();
             return;
@@ -290,7 +289,7 @@ impl Render for ProfileEditor {
                     .input
                     .principal_id
                     .as_ref()
-                    .and_then(|p| self.config.platform.avatar_path(p, cx)),
+                    .and_then(|p| self.config.avatar_path(p)),
             };
             let has_avatar = match self.input.avatar {
                 ProfileAvatarSelection::Unchanged => self.input.has_saved_avatar,
@@ -447,8 +446,20 @@ mod retained_tests {
         ) -> anyhow::Result<()> {
             panic!("unexpected native effect");
         }
-        fn avatar_path(&self, _: &str, _: &App) -> Option<std::path::PathBuf> {
-            None
+    }
+    impl crate::SettingsAvatarPort for Native {
+        fn resolve(
+            &self,
+            _: pioneer_client::avatars::AvatarCacheRequest,
+            _: tokio_util::sync::CancellationToken,
+            _: &mut App,
+        ) -> Task<
+            Result<
+                pioneer_client::avatars::AvatarCacheResult,
+                pioneer_client::avatars::AvatarCacheError,
+            >,
+        > {
+            panic!("unexpected avatar request");
         }
     }
     impl SettingsPhotoPort for Native {
@@ -496,6 +507,7 @@ mod retained_tests {
             bindings: Arc::new(Registrar(count.clone())),
             platform: Rc::new(Native),
             photos: Rc::new(Native),
+            avatars: Rc::new(Native),
         };
         let (root, cx) = cx.add_window_view(|window, cx| {
             let editor = ProfileEditor::new(config, window, cx);
@@ -523,7 +535,8 @@ mod retained_tests {
             input.entity_id(),
             editor.read_with(cx, |view, _| view.first_name.entity_id())
         );
-        assert_eq!(count.load(Ordering::SeqCst), 3);
+        // A principal without a photo needs only Profile and Administration bindings.
+        assert_eq!(count.load(Ordering::SeqCst), 2);
         cx.update(|_, cx| {
             host.update(cx, |host, cx| {
                 host.editor.take();

@@ -14,7 +14,8 @@ mod self_improvement_status;
 mod sidebar;
 mod view;
 pub use platform::{
-    SettingsPhotoError, SettingsPhotoPort, SettingsPhotoSelection, SettingsPlatform,
+    SettingsAvatarPort, SettingsPhotoError, SettingsPhotoPort, SettingsPhotoSelection,
+    SettingsPlatform,
 };
 pub use screen::{SettingsConfig, SettingsView};
 mod actions;

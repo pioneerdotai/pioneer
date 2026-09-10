@@ -304,3 +304,35 @@ pub fn revalidate_saved_profile(core: &ClientCore) {
     let (request, connection) = core.current_auth_ticket();
     core.accept_authorization_projection(request, connection, capabilities);
 }
+
+/// Replays an authenticated profile response with a changed (or removed) avatar.
+pub fn set_current_avatar_revision(core: &ClientCore, revision: Option<&str>) {
+    let mut auth = core.current_auth().unwrap();
+    auth.principal.avatar_revision = revision.map(str::to_owned);
+    let (generation, connection) = core.current_auth_ticket();
+    core.finish_current_auth(generation, connection, auth)
+        .unwrap();
+}
+
+/// Supplies the immutable result of the authenticated avatar cache in boundary tests.
+pub fn publish_cached_avatar(core: &ClientCore, revision: &str, path: &str) {
+    let principal = core.current_auth().unwrap().principal.id;
+    let scope = ClientScope::Avatar {
+        principal_id: crate::avatars::avatar_identity_key(principal.as_str(), revision),
+    };
+    let next = core
+        .snapshot(&scope)
+        .map_or(1, |p| p.revisions().scoped().get() + 1);
+    let avatar: crate::avatars::AvatarPublication = serde_json::from_value(serde_json::json!({
+        "principal_id": principal, "avatar_revision": revision, "local_path": path,
+        "media_type": null, "source": null, "error": null,
+    }))
+    .unwrap();
+    core.publish(
+        &ClientMutationAuthority { _private: () },
+        scope,
+        crate::threads::registry::revisions(next),
+        Arc::new(avatar),
+        vec![],
+    );
+}

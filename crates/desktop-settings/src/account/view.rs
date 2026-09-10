@@ -25,11 +25,11 @@ impl SettingsScreenView {
                     &snapshot.role,
                 )
             });
-        let principal_avatar_path = self.gateway.current_auth.as_ref().and_then(|auth| {
-            self.config
-                .platform
-                .avatar_path(auth.principal.id.as_str(), cx)
-        });
+        let principal_avatar_path = self
+            .gateway
+            .current_auth
+            .as_ref()
+            .and_then(|auth| self.config.avatar_path(auth.principal.id.as_str()));
         let devices = self.render_auth_sessions_content(desktop.clone(), cx);
 
         v_flex()

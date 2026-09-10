@@ -20,7 +20,6 @@ pub trait SettingsPlatform {
         value: FileOpenerId,
         cx: &mut App,
     ) -> anyhow::Result<()>;
-    fn avatar_path(&self, principal: &str, cx: &App) -> Option<std::path::PathBuf>;
 }
 
 pub struct SettingsPhotoSelection {
@@ -36,4 +35,19 @@ pub trait SettingsPhotoPort {
         &self,
         cx: &mut gpui_kit::App,
     ) -> gpui_kit::Task<Result<Option<SettingsPhotoSelection>, SettingsPhotoError>>;
+}
+
+/// Authenticated avatar I/O using the shared Client cache owner.
+pub trait SettingsAvatarPort {
+    fn resolve(
+        &self,
+        request: pioneer_client::avatars::AvatarCacheRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+        cx: &mut App,
+    ) -> gpui_kit::Task<
+        Result<
+            pioneer_client::avatars::AvatarCacheResult,
+            pioneer_client::avatars::AvatarCacheError,
+        >,
+    >;
 }

@@ -10,6 +10,7 @@ pioneer-client.workspace = true
 pioneer-desktop-foundation.workspace = true
 rust-i18n.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

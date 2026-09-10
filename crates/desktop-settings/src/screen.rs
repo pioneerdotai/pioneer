@@ -36,7 +36,29 @@ pub struct SettingsConfig {
     pub client: Arc<ClientCore>,
     pub bindings: Arc<dyn ClientBindingRegistrar>,
     pub platform: Rc<dyn SettingsPlatform>,
+    pub avatars: Rc<dyn crate::platform::SettingsAvatarPort>,
     pub photos: Rc<dyn crate::platform::SettingsPhotoPort>,
+}
+impl SettingsConfig {
+    pub(crate) fn avatar_path(&self, principal: &str) -> Option<std::path::PathBuf> {
+        use pioneer_client::avatars::{AvatarPublication, avatar_identity_key};
+        let auth = self.client.current_auth()?;
+        if auth.principal.id.as_str() != principal {
+            return None;
+        }
+        let revision = auth.principal.avatar_revision.as_deref()?;
+        let publication = self
+            .client
+            .snapshot(&ClientScope::Avatar {
+                principal_id: avatar_identity_key(principal, revision),
+            })?
+            .typed::<AvatarPublication>()?;
+        let avatar = publication.payload();
+        if avatar.principal_id() != principal || avatar.avatar_revision() != revision {
+            return None;
+        }
+        avatar.local_path().map(|path| path.as_path().to_path_buf())
+    }
 }
 pub struct SettingsView {
     config: SettingsConfig,
@@ -307,6 +329,9 @@ impl SettingsScreenView {
         }
     }
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page.is_none() {
+            self._binding.sync_avatar(&self.config, self.active, cx);
+        }
         let page_scope = self
             .page
             .map(|page| ClientScope::SettingsPage { page })
@@ -318,7 +343,7 @@ impl SettingsScreenView {
           "manager":self.config.client.authorization_snapshot(None,None).is_some_and(|s|s.global.can_manage_gateway_settings),
           "principal":principal,
           "account":if self.page.is_none(){auth.as_ref()}else{None},
-          "avatar":if self.page.is_none(){principal.as_ref().and_then(|principal|self.config.platform.avatar_path(principal,cx))}else{None},
+          "avatar":if self.page.is_none(){principal.as_ref().and_then(|principal|self.config.avatar_path(principal))}else{None},
           "settings_workspace":(self.page==Some(SettingsPage::SelfImprovement)).then(||self.config.client.gateway_settings().workspace_id),
           "workspace":matches!(self.page,Some(SettingsPage::Memory|SettingsPage::SelfImprovement)).then(||self.config.client.navigation_snapshot().workspace_id().map(str::to_owned)),
           "secret_authority":(self.page==Some(SettingsPage::RemoteAccess)).then(||self.config.client.authorization_connection_generation()),
@@ -365,15 +390,6 @@ impl SettingsScreenView {
                     )
                 });
             }
-        }
-        if self.page.is_none() {
-            self._binding.set_avatar_scope(
-                self.gateway
-                    .current_auth
-                    .as_ref()
-                    .map(|a| a.principal.id.as_str()),
-                &self.config.bindings,
-            );
         }
         self.workspace_id = self
             .config
@@ -435,6 +451,9 @@ impl SettingsScreenView {
             return;
         }
         self.active = active;
+        if self.page.is_none() {
+            self._binding.sync_avatar(&self.config, active, cx);
+        }
         self.demand = if active {
             self.page
                 .map(|page| self.config.client.acquire_settings_page(page))
@@ -689,6 +708,176 @@ mod render_tests {
         }
     }
 
+    #[derive(Default)]
+    struct AvatarRequests(
+        std::cell::RefCell<
+            Vec<(
+                pioneer_client::avatars::AvatarCacheRequest,
+                tokio_util::sync::CancellationToken,
+            )>,
+        >,
+    );
+    impl crate::SettingsAvatarPort for AvatarRequests {
+        fn resolve(
+            &self,
+            request: pioneer_client::avatars::AvatarCacheRequest,
+            cancellation: tokio_util::sync::CancellationToken,
+            cx: &mut gpui_kit::App,
+        ) -> gpui_kit::Task<
+            Result<
+                pioneer_client::avatars::AvatarCacheResult,
+                pioneer_client::avatars::AvatarCacheError,
+            >,
+        > {
+            use gpui_kit::AppContext;
+            self.0.borrow_mut().push((request, cancellation));
+            cx.background_spawn(std::future::pending())
+        }
+    }
+
+    fn account_avatar_replay(cx: &mut TestAppContext, warm: bool) {
+        use pioneer_client::catalog_test_support::{
+            publish_cached_avatar, set_current_avatar_revision, settings_client,
+        };
+        cx.update(gpui_kit::init);
+        let client = settings_client();
+        let principal = client.current_auth().unwrap().principal.id.to_string();
+        set_current_avatar_revision(&client, Some("first"));
+        if warm {
+            publish_cached_avatar(&client, "first", "/tmp/account-first.png");
+        }
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "The GPUI binding API uses Arc registrars on the UI thread."
+        )]
+        let bindings = Arc::new(Publications {
+            client: client.clone(),
+            next: Default::default(),
+            routes: Default::default(),
+        });
+        let avatars = Rc::new(AvatarRequests::default());
+        let config = SettingsConfig {
+            client: client.clone(),
+            bindings: bindings.clone(),
+            platform: Rc::new(Native),
+            photos: Rc::new(Native),
+            avatars: avatars.clone(),
+        };
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let account = SettingsScreenView::new(
+                config.clone(),
+                SettingsContentView::Account,
+                None,
+                window,
+                cx,
+            );
+            account.update(cx, |page, cx| page.set_active(true, cx));
+            gpui_kit::component::Root::new(account, window, cx)
+        });
+        let account: gpui_kit::Entity<SettingsScreenView> =
+            root.read_with(cx, |root, _| root.view().clone().downcast().unwrap());
+        pioneer_client::catalog_test_support::replay_account_requests(&client);
+        bindings.deliver();
+        cx.run_until_parked();
+        assert_eq!(
+            avatars.0.borrow().len(),
+            usize::from(!warm),
+            "Account must fetch only a missing avatar"
+        );
+        if !warm {
+            // Opening and closing the editor during a load must leave Account's request alive.
+            account.update_in(cx, |page, window, cx| page.open_profile_editor(window, cx));
+            cx.run_until_parked();
+            assert_eq!(avatars.0.borrow().len(), 1);
+            account.update(cx, |page, _| {
+                page.profile_editor = None;
+            });
+            cx.run_until_parked();
+            assert!(!avatars.0.borrow()[0].1.is_cancelled());
+            assert!(config.avatar_path(&principal).is_none());
+            assert_eq!(avatars.0.borrow()[0].0.principal_id.as_str(), principal);
+            publish_cached_avatar(&client, "first", "/tmp/account-first.png");
+            bindings.deliver();
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            config.avatar_path(&principal),
+            Some("/tmp/account-first.png".into())
+        );
+        assert_eq!(
+            account.read_with(cx, |page, _| page.last_projection["avatar"].clone()),
+            "/tmp/account-first.png"
+        );
+        // Profile editor uses the same cache without issuing a second request.
+        account.update_in(cx, |page, window, cx| page.open_profile_editor(window, cx));
+        cx.run_until_parked();
+        assert!(account.read_with(cx, |page, _| page.profile_editor.is_some()));
+        assert_eq!(avatars.0.borrow().len(), usize::from(!warm));
+        account.update(cx, |page, _| {
+            page.profile_editor = None;
+        });
+        cx.run_until_parked();
+
+        set_current_avatar_revision(&client, Some("second"));
+        bindings.deliver();
+        cx.run_until_parked();
+        assert!(
+            config.avatar_path(&principal).is_none(),
+            "old avatar must not stand in for a new revision"
+        );
+        assert_eq!(
+            avatars.0.borrow().last().unwrap().0.avatar_revision,
+            "second"
+        );
+        publish_cached_avatar(&client, "first", "/tmp/stale-avatar.png");
+        bindings.deliver();
+        cx.run_until_parked();
+        assert!(config.avatar_path(&principal).is_none());
+        publish_cached_avatar(&client, "second", "/tmp/account-second.png");
+        bindings.deliver();
+        cx.run_until_parked();
+        assert_eq!(
+            account.read_with(cx, |page, _| page.last_projection["avatar"].clone()),
+            "/tmp/account-second.png"
+        );
+        set_current_avatar_revision(&client, None);
+        bindings.deliver();
+        cx.run_until_parked();
+        assert!(config.avatar_path(&principal).is_none());
+        assert!(
+            avatars
+                .0
+                .borrow()
+                .iter()
+                .all(|(_, token)| token.is_cancelled())
+        );
+        assert!(account.read_with(cx, |page, _| page.last_projection["avatar"].is_null()));
+
+        set_current_avatar_revision(&client, Some("third"));
+        bindings.deliver();
+        cx.run_until_parked();
+        account.update(cx, |page, cx| page.set_active(false, cx));
+        assert!(
+            avatars
+                .0
+                .borrow()
+                .iter()
+                .all(|(_, token)| token.is_cancelled())
+        );
+        assert_eq!(config.avatar_path("another-principal"), None);
+        client.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn account_loads_avatar_without_visiting_members(cx: &mut TestAppContext) {
+        account_avatar_replay(cx, false);
+    }
+
+    #[gpui_kit::test]
+    fn account_reuses_members_avatar_and_observes_replacement(cx: &mut TestAppContext) {
+        account_avatar_replay(cx, true);
+    }
+
     #[gpui_kit::test]
     fn account_done_reloads_devices_through_retained_surface_demand(cx: &mut TestAppContext) {
         use gpui_kit::Entity;
@@ -710,6 +899,7 @@ mod render_tests {
             bindings: bindings.clone(),
             platform: Rc::new(Native),
             photos: Rc::new(Native),
+            avatars: Rc::new(Native),
         };
         let (root, cx) = cx.add_window_view(|window, cx| {
             let view = super::SettingsView::new(config, window, cx);
@@ -828,6 +1018,7 @@ mod render_tests {
                 bindings: Arc::new(Registrar(Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
                 platform: Rc::new(Native),
                 photos: Rc::new(Native),
+                avatars: Rc::new(Native),
             };
             let (_, window_cx) = cx.add_window_view(|window, cx| {
                 let view = SettingsScreenView::new(config, route, page, window, cx);
