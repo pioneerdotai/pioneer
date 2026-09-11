@@ -51,6 +51,7 @@ const TEST_PARENT_TURN_ID: &str = "T12345678901234567890";
 const TEST_REVIEWER_EXECUTION_ID: &str = "E22345678901234567890";
 const TEST_REVIEWER_THREAD_ID: &str = "H22345678901234567890";
 const TEST_PRESENTATION_SNAPSHOT_ID: &str = "S12345678901234567890";
+const TASK_TEST_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct CompletingSystemExecutor;
@@ -343,6 +344,26 @@ impl TaskExecutor for CancellationFailingSystemExecutor {
     ) -> TaskRuntimeResult<()> {
         Ok(())
     }
+}
+
+fn run_task_stack_test<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let thread = std::thread::Builder::new()
+        .name("tasks-stack-test".to_owned())
+        .stack_size(TASK_TEST_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
+            runtime.block_on(future);
+        })
+        .unwrap_or_else(|error| panic!("{name} thread should start: {error}"));
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 async fn runtime() -> TaskRuntime {
@@ -4971,8 +4992,15 @@ async fn scheduled_agent_task_executes_from_version_one_child_launch_grant_witho
     );
 }
 
-#[tokio::test]
-async fn invalid_due_task_is_isolated_from_new_immediate_task() {
+#[test]
+fn invalid_due_task_is_isolated_from_new_immediate_task() {
+    run_task_stack_test(
+        "invalid due Task isolation",
+        invalid_due_task_is_isolated_from_new_immediate_task_impl(),
+    );
+}
+
+async fn invalid_due_task_is_isolated_from_new_immediate_task_impl() {
     let runtime = runtime().await;
     runtime
         .register_executor(Arc::new(CompletingSystemExecutor))
