@@ -142,16 +142,10 @@ const GATEWAY_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// uses a bounded 8 MiB worker stack. Keeping this policy here prevents the
 /// standalone and service entry points from drifting apart.
 pub fn build_gateway_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    gateway_runtime_builder().build()
-}
-
-/// Shared runtime policy; tests may override worker count and thread names.
-pub(crate) fn gateway_runtime_builder() -> tokio::runtime::Builder {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(GATEWAY_WORKER_STACK_SIZE);
-    builder
+        .thread_stack_size(GATEWAY_WORKER_STACK_SIZE)
+        .build()
 }
 
 fn create_voice_input_supervisor(

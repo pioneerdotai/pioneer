@@ -1713,7 +1713,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
 
 #[test]
 fn capability_persistence_order_materializes_before_skill_install_and_native_start() {
-    crate::gateway_runtime_builder()
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -1725,11 +1725,11 @@ fn capability_persistence_order_materializes_before_skill_install_and_native_sta
         });
 }
 
-fn run_gateway_stack_message_test<F>(name: &'static str, future: F)
+fn run_standard_stack_message_test<F>(name: &'static str, future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let runtime = crate::gateway_runtime_builder()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -1949,7 +1949,7 @@ async fn capability_persistence_order_impl() {
 
 #[test]
 fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "gateway CLI skill full-turn matrix test",
         gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl(),
     );
@@ -2127,7 +2127,7 @@ async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_imp
 
 #[test]
 fn cli_runtime_system_skill_rejected_before_write_or_materialization() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "CLI system skill rejection test",
         cli_runtime_system_skill_rejected_before_write_or_materialization_impl(),
     );
@@ -2193,7 +2193,7 @@ async fn cli_runtime_system_skill_rejected_before_write_or_materialization_impl(
 
 #[test]
 fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "native-agent system skill control test",
         cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_flow_impl(),
     );
@@ -2259,7 +2259,7 @@ async fn cli_runtime_skill_native_agent_control_keeps_system_skill_in_pioneer_fl
 
 #[test]
 fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Codex skill restart test",
         codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_impl(),
     );
@@ -2301,7 +2301,7 @@ async fn codex_cli_runtime_new_skill_closes_one_cached_session_before_restart_im
 
 #[test]
 fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart() {
-    crate::gateway_runtime_builder()
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -2364,7 +2364,7 @@ async fn claude_cli_runtime_new_skill_closes_one_cached_session_before_restart_i
 
 #[test]
 fn claude_skill_not_model_invocable_rejects_before_write_and_native() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Claude non-invocable skill rejection test",
         claude_skill_not_model_invocable_rejects_before_write_and_native_impl(),
     );
@@ -2429,7 +2429,7 @@ async fn claude_skill_not_model_invocable_rejects_before_write_and_native_impl()
 
 #[test]
 fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "CLI skill preflight failure test",
         cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_turn_impl(),
     );
@@ -2552,7 +2552,7 @@ async fn cli_runtime_skill_preflight_collision_and_copy_failure_do_not_start_tur
 
 #[test]
 fn cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "combined CLI preflight failure test",
         cli_runtime_skill_preflight_mcp_and_resolver_failures_have_zero_side_effects_impl(),
     );
@@ -9026,16 +9026,9 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .expect("materialized test thread should become durable in memory");
 }
 
-#[test]
-fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground() {
-    run_gateway_stack_message_test(
-        "collaborative composer admits message and detached task",
-        collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground_impl(),
-    );
-}
-
-async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground_impl()
- {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground()
+{
     let base_dir = unique_temp_dir("collaborative_composer_pack_presentation");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -9310,7 +9303,7 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
 
 #[test]
 fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "concurrent collaborative frozen-command test",
         assert_concurrent_collaborative_tasks_receive_independent_frozen_commands(),
     );
@@ -9704,7 +9697,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
 
 #[test]
 fn collaborative_child_stop_cancels_task_and_survives_late_delivery() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "collaborative child cancellation and late delivery test",
         assert_collaborative_child_stop_cancels_task_and_survives_late_delivery(),
     );
@@ -11339,7 +11332,7 @@ async fn first_voice_turn_materializes_runtime_draft() {
 
 #[test]
 fn voice_turn_start_replay_does_not_dispatch_provider_again() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "voice turn admission replay",
         voice_turn_start_replay_does_not_dispatch_provider_again_impl(),
     );
@@ -11454,15 +11447,8 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
     assert_eq!(turn.status, TurnStatus::Completed);
 }
 
-#[test]
-fn collaborative_voice_composer_admits_detached_task() {
-    run_gateway_stack_message_test(
-        "collaborative voice composer admits detached task",
-        collaborative_voice_composer_admits_detached_task_impl(),
-    );
-}
-
-async fn collaborative_voice_composer_admits_detached_task_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collaborative_voice_composer_admits_detached_task() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -11564,15 +11550,8 @@ async fn collaborative_voice_composer_admits_detached_task_impl() {
     assert_eq!(parent_turn.status, TurnStatus::Completed);
 }
 
-#[test]
-fn task_run_voice_composer_stays_foreground() {
-    run_gateway_stack_message_test(
-        "task run voice composer stays foreground",
-        task_run_voice_composer_stays_foreground_impl(),
-    );
-}
-
-async fn task_run_voice_composer_stays_foreground_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_run_voice_composer_stays_foreground() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -11700,7 +11679,7 @@ async fn task_run_voice_composer_stays_foreground_impl() {
 
 #[test]
 fn voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "voice transcript starts turn with authorized context attachments",
         voice_session_transcript_starts_turn_and_preserves_authorized_context_attachments_impl(),
     );
@@ -16219,7 +16198,7 @@ fn force_fail_tool_item_marks_in_progress_tool_as_failed() {
 
 #[test]
 fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "review-disabled immediate Task Agent run",
         review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_returns_result_impl(
         ),
@@ -16556,7 +16535,7 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
 
 #[test]
 fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "review-enabled child Task completion",
         review_enabled_child_completion_creates_pending_candidate_without_finalizing_run_impl(),
     );
@@ -16694,7 +16673,7 @@ async fn review_enabled_child_completion_creates_pending_candidate_without_final
 
 #[test]
 fn review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "review-enabled execution-window continuation",
         review_enabled_window_continuation_does_not_create_revision_and_preserves_candidate_impl(),
     );
@@ -16879,7 +16858,7 @@ async fn review_enabled_window_continuation_does_not_create_revision_and_preserv
 
 #[test]
 fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task review accept and delivery",
         task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(),
     );
@@ -17190,7 +17169,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
 
 #[test]
 fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task review observations scope",
         phase_11_task_tool_provider_review_required_observations_are_scoped_to_parent_turn_body(),
     );
@@ -17359,7 +17338,7 @@ async fn phase_11_task_tool_provider_review_required_observations_are_scoped_to_
 
 #[test]
 fn task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task review revision dispatch",
         task_revise_rpc_rejects_candidate_and_dispatches_same_thread_revision_impl(),
     );
@@ -17569,7 +17548,7 @@ async fn dispatch_revision_turn_for_test(
 
 #[test]
 fn task_revise_dispatch_failure_blocks_revision_turn_and_run() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task revision dispatch failure",
         task_revise_dispatch_failure_blocks_revision_turn_and_run_impl(),
     );
@@ -17726,7 +17705,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
 
 #[test]
 fn task_revise_restart_reuses_in_progress_revision_turn() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task review revision restart",
         task_revise_restart_reuses_in_progress_revision_turn_impl(),
     );
@@ -17849,7 +17828,7 @@ async fn task_revise_restart_reuses_in_progress_revision_turn_impl() {
 
 #[test]
 fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "review-enabled invalid Task result",
         review_enabled_invalid_result_creates_extraction_failed_candidate_impl(),
     );
@@ -17955,7 +17934,7 @@ async fn review_enabled_invalid_result_creates_extraction_failed_candidate_impl(
 
 #[test]
 fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "waiting-review Task cancellation",
         waiting_review_cancel_cancels_candidate_locks_and_no_delivery_impl(),
     );
@@ -18120,7 +18099,7 @@ async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery_impl() {
 
 #[test]
 fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "parent cancellation of attached review subtree",
         parent_cancel_attached_subtree_cancels_waiting_review_candidate_body(),
     );
@@ -18229,7 +18208,7 @@ async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate_body() 
 
 #[test]
 fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "waiting-review Task detach rejection",
         waiting_review_detach_is_blocked_and_candidate_stays_active_impl(),
     );
@@ -18330,7 +18309,7 @@ async fn waiting_review_detach_is_blocked_and_candidate_stays_active_impl() {
 
 #[test]
 fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "hidden Task preflight ordering",
         hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_body(),
     );
@@ -18424,7 +18403,7 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
 
 #[test]
 fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "recovered hidden Task preflight ordering",
         recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(),
     );
@@ -18887,7 +18866,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
 
 #[test]
 fn failed_child_task_run_opens_recovery_without_candidate() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "failed child Task recovery test",
         failed_child_task_run_opens_recovery_without_candidate_impl(),
     );
@@ -18983,7 +18962,7 @@ async fn failed_child_task_run_opens_recovery_without_candidate_impl() {
 
 #[test]
 fn detached_task_block_preserves_child_reason_in_parent_timeline() {
-    run_gateway_stack_message_test("detached child block reason", async {
+    run_standard_stack_message_test("detached child block reason", async {
         let provider = Arc::new(HangingChildProvider::new());
         let providers = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
@@ -19065,7 +19044,7 @@ fn detached_task_block_preserves_child_reason_in_parent_timeline() {
 
 #[test]
 fn blocked_execution_window_recovery_blocks_child_task_run_without_failure() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "blocked execution window child Task recovery",
         blocked_execution_window_recovery_blocks_child_task_run_without_failure_impl(),
     );
@@ -19249,7 +19228,7 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
 
 #[test]
 fn execution_window_continuation_keeps_task_run_turn_in_progress() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task execution-window continuation test",
         execution_window_continuation_keeps_task_run_turn_in_progress_impl(),
     );
@@ -19389,7 +19368,7 @@ async fn execution_window_continuation_keeps_task_run_turn_in_progress_impl() {
 
 #[test]
 fn exhausted_window_does_not_create_candidate_until_child_turn_completes() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "exhausted Task execution-window candidate test",
         exhausted_window_does_not_create_candidate_until_child_turn_completes_impl(),
     );
@@ -19610,7 +19589,7 @@ async fn exhausted_window_does_not_create_candidate_until_child_turn_completes_i
 
 #[test]
 fn scheduled_task_agent_run_routes_occurrence_to_exact_delivery_thread() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "scheduled Task Agent exact-thread occurrence turn",
         scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl(),
     );
@@ -19937,7 +19916,7 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
 
 #[test]
 fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "immediate detached Task occurrence delivery",
         immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body(),
     );
@@ -20397,7 +20376,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
 
 #[test]
 fn composer_work_replays_exact_launch_payload_in_hidden_task_child() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Composer exact hidden-task launch test",
         assert_composer_work_replays_exact_launch_payload_in_hidden_task_child(),
     );
@@ -21624,7 +21603,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
 
 #[test]
 fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "detached native Composer delivery test",
         detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_impl(),
     );
@@ -21852,7 +21831,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
 
 #[test]
 fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "detached native Task FIFO continuation",
         detached_native_tasks_share_parent_continuation_and_run_fifo_impl(),
     );
@@ -22020,7 +21999,7 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
 
 #[test]
 fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "detached native Task cancellation and continuation",
         cancelling_detached_native_task_interrupts_runtime_and_releases_continuation_impl(),
     );
@@ -22190,7 +22169,7 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
 
 #[test]
 fn cancelling_detached_native_child_turn_cancels_parent_task_anchor() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "detached native child cancellation projection test",
         assert_detached_native_child_turn_cancellation(),
     );
@@ -22424,7 +22403,7 @@ async fn assert_detached_native_child_turn_cancellation() {
 
 #[test]
 fn detached_composer_work_matches_parent_llm_prompts_end_to_end() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "detached Composer prompt parity test",
         detached_composer_work_matches_parent_llm_prompts_end_to_end_impl(),
     );
@@ -22636,7 +22615,7 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
 
 #[test]
 fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "detached Composer full request parity test",
         detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(),
     );
@@ -23559,7 +23538,7 @@ async fn task_depth_limit_rejects_subtask_creation() {
 
 #[test]
 fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "nested Task root lineage and permissions",
         nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions_body(),
     );
@@ -23754,7 +23733,7 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "supervised native Task permission grant",
         supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect_body(),
     );
@@ -24072,7 +24051,7 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn supervised_native_task_apply_patch_creates_approved_missing_destination_tree() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "supervised native Task Apply Patch missing destination grant",
         supervised_native_task_apply_patch_creates_approved_missing_destination_tree_body(),
     );
@@ -24343,7 +24322,7 @@ async fn supervised_native_task_apply_patch_creates_approved_missing_destination
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effect() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "supervised direct Agent permission grant",
         supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effect_body(),
     );
@@ -24560,7 +24539,7 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
 
 #[test]
 fn task_list_inside_child_turn_hides_its_execution_wrapper() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task list hides its execution wrapper",
         task_list_inside_child_turn_hides_its_execution_wrapper_impl(),
     );
@@ -24640,7 +24619,7 @@ async fn task_list_inside_child_turn_hides_its_execution_wrapper_impl() {
 
 #[test]
 fn task_detach_updates_lifecycle_policy() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task detach lifecycle update",
         task_detach_updates_lifecycle_policy_impl(),
     );
@@ -24991,7 +24970,7 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
 
 #[test]
 fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Task delivery lineage parent turn",
         task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl(),
     );
@@ -28890,15 +28869,8 @@ async fn terminal_turn_completion_closes_running_execution_window() {
     assert_eq!(turn.status, TurnStatus::Completed);
 }
 
-#[test]
-fn periodic_native_finalization_reconciliation_updates_loaded_turn_state() {
-    run_gateway_stack_message_test(
-        "periodic_native_finalization_reconciliation_updates_loaded_turn_state",
-        periodic_native_finalization_reconciliation_updates_loaded_turn_state_impl(),
-    );
-}
-
-async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn periodic_native_finalization_reconciliation_updates_loaded_turn_state() {
     let thread_id = "thr_native_finalization_reconcile";
     let turn_id = "turn_native_finalization_reconcile";
     let (processor, crud_store, workspace_id) =
@@ -32464,7 +32436,7 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
 
 #[test]
 fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Codex full-access security test",
         codex_cli_runtime_full_access_sets_danger_full_access_permissions_profile_impl(),
     );
@@ -32582,7 +32554,7 @@ async fn codex_cli_runtime_full_access_sets_danger_full_access_permissions_profi
 
 #[test]
 fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli() {
-    run_gateway_stack_message_test("production self-improvement vertical E2E", async {
+    run_standard_stack_message_test("production self-improvement vertical E2E", async {
         timeout(
             Duration::from_secs(120),
             production_self_improvement_vertical_e2e_reaches_native_and_excludes_cli_impl(),
@@ -33495,7 +33467,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
 
 #[test]
 fn codex_cli_runtime_supervised_sets_read_only_permissions_profile() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Codex supervised security test",
         codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl(),
     );
@@ -33575,7 +33547,7 @@ async fn codex_cli_runtime_supervised_sets_read_only_permissions_profile_impl() 
 
 #[test]
 fn claude_cli_runtime_supervised_uses_provider_permission_mode() {
-    crate::gateway_runtime_builder()
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -33638,7 +33610,7 @@ async fn claude_cli_runtime_supervised_uses_provider_permission_mode_impl() {
 
 #[test]
 fn claude_cli_runtime_ignores_legacy_provider_sandbox_option() {
-    crate::gateway_runtime_builder()
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -33707,7 +33679,7 @@ async fn claude_cli_runtime_ignores_legacy_provider_sandbox_option_impl() {
 
 #[test]
 fn claude_auto_accept_provider_mode_is_persisted_before_runtime_start() {
-    crate::gateway_runtime_builder()
+    tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -35144,7 +35116,7 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
 
 #[test]
 fn cli_runtime_stale_silent_running_binding_schedules_recovery() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "cli_runtime_stale_silent_running_binding_schedules_recovery",
         cli_runtime_stale_silent_running_binding_schedules_recovery_impl(),
     );
@@ -35261,15 +35233,8 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
     assert_eq!(cli_session.closes.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn() {
-    run_gateway_stack_message_test(
-        "codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn",
-        codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn_impl(),
-    );
-}
-
-async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing_turn() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -35625,15 +35590,8 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
     });
 }
 
-#[test]
-fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread() {
-    run_gateway_stack_message_test(
-        "cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread",
-        cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread_impl(),
-    );
-}
-
-async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_thread() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -36320,7 +36278,7 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
 
 #[test]
 fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "Codex Goal execution segment test",
         codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl(),
     );
@@ -36949,15 +36907,8 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
     drop(replacement);
 }
 
-#[test]
-fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
-    run_gateway_stack_message_test(
-        "completed_cli_runtime_attempt_reconciles_running_pioneer_turn",
-        completed_cli_runtime_attempt_reconciles_running_pioneer_turn_impl(),
-    );
-}
-
-async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
     let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -38092,15 +38043,8 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
     );
 }
 
-#[test]
-fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
-    run_gateway_stack_message_test(
-        "cli_runtime_stale_db_only_running_binding_schedules_recovery",
-        cli_runtime_stale_db_only_running_binding_schedules_recovery_impl(),
-    );
-}
-
-async fn cli_runtime_stale_db_only_running_binding_schedules_recovery_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -38238,15 +38182,8 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery_impl() {
     assert_eq!(pending_jobs[0].trigger, RecoveryTrigger::RuntimeFailure);
 }
 
-#[test]
-fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
-    run_gateway_stack_message_test(
-        "cli_runtime_stale_scan_reconciles_db_only_terminal_binding",
-        cli_runtime_stale_scan_reconciles_db_only_terminal_binding_impl(),
-    );
-}
-
-async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
     let (tx, _rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -44606,7 +44543,7 @@ async fn turn_get_returns_turn_snapshot() {
 
 #[test]
 fn turn_cancel_interrupts_running_turn_and_is_idempotent() {
-    run_gateway_stack_message_test(
+    run_standard_stack_message_test(
         "turn cancel interruption and idempotency test",
         assert_turn_cancel_interrupts_running_turn_and_is_idempotent(),
     );
@@ -45933,7 +45870,7 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let runtime = crate::gateway_runtime_builder()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name(name)
         .enable_all()
@@ -49754,15 +49691,8 @@ fn completed_command_execution_item(item_id: &str) -> TurnItem {
     item
 }
 
-#[test]
-fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
-    run_gateway_stack_message_test(
-        "recovery_lifecycle_notification_is_persisted_for_history_replay",
-        recovery_lifecycle_notification_is_persisted_for_history_replay_impl(),
-    );
-}
-
-async fn recovery_lifecycle_notification_is_persisted_for_history_replay_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
     let (tx, mut rx) = mpsc::channel(16);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -49868,15 +49798,8 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay_impl() 
     )));
 }
 
-#[test]
-fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
-    run_gateway_stack_message_test(
-        "recovery_blocked_event_marks_turn_blocked_and_closes_active_window",
-        recovery_blocked_event_marks_turn_blocked_and_closes_active_window_impl(),
-    );
-}
-
-async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window() {
     let thread_id = "thr_recovery_blocked_missing_snapshot";
     let turn_id = "turn_recovery_blocked_missing_snapshot";
     let (processor, crud_store, workspace_id) =
@@ -49982,15 +49905,8 @@ async fn recovery_blocked_event_marks_turn_blocked_and_closes_active_window_impl
     )));
 }
 
-#[test]
-fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
-    run_gateway_stack_message_test(
-        "cli_recovery_blocked_event_surfaces_projection_root_cause",
-        cli_recovery_blocked_event_surfaces_projection_root_cause_impl(),
-    );
-}
-
-async fn cli_recovery_blocked_event_surfaces_projection_root_cause_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_recovery_blocked_event_surfaces_projection_root_cause() {
     let thread_id = "thr_cli_recovery_blocked_root_cause";
     let turn_id = "turn_cli_recovery_blocked_root_cause";
     let (processor, crud_store, workspace_id) =
@@ -50110,15 +50026,8 @@ async fn cli_recovery_blocked_event_surfaces_projection_root_cause_impl() {
     )));
 }
 
-#[test]
-fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session() {
-    run_gateway_stack_message_test(
-        "cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session",
-        cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session_impl(),
-    );
-}
-
-async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_recovery_blocked_event_expires_pending_requests_and_closes_runtime_session() {
     let thread_id = "thr_cli_recovery_blocked_cleanup";
     let turn_id = "turn_cli_recovery_blocked_cleanup";
     let (processor, crud_store, workspace_id) =
@@ -52382,15 +52291,8 @@ async fn cli_runtime_terminal_event_expires_pending_requests_for_turn() {
     );
 }
 
-#[test]
-fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
-    run_gateway_stack_message_test(
-        "cli_runtime_late_terminal_event_after_blocked_turn_is_ignored",
-        cli_runtime_late_terminal_event_after_blocked_turn_is_ignored_impl(),
-    );
-}
-
-async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored_impl() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_runtime_late_terminal_event_after_blocked_turn_is_ignored() {
     let thread_id = "thr_cli_late_event_after_blocked";
     let turn_id = "turn_cli_late_event_after_blocked";
     let (processor, crud_store, workspace_id) =
