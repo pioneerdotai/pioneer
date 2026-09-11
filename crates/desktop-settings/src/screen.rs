@@ -879,7 +879,7 @@ mod render_tests {
     }
 
     #[gpui_kit::test]
-    fn account_done_reloads_devices_through_retained_surface_demand(cx: &mut TestAppContext) {
+    fn account_done_preserves_devices_across_data_revalidation(cx: &mut TestAppContext) {
         use gpui_kit::Entity;
         use pioneer_client::{
             catalog_test_support::{
@@ -948,15 +948,15 @@ mod render_tests {
                 cx.run_until_parked();
                 assert!(!account.read_with(cx, |page, _| page.profile_editor.is_some()));
             }
-            // Gateway's post-save policy/member notifications evict sessions.
-            // The same Account entity stays mounted; the test supplies no scope demand.
+            // Profile/member data notifications do not advance the authorization
+            // generation, so the mounted Account keeps its current device snapshot.
             revalidate_saved_profile(&client);
             bindings.deliver();
             cx.run_until_parked();
             assert_eq!(
                 replay_account_requests(&client),
-                (1, 0),
-                "mounted Account lost device demand after Done"
+                (0, 0),
+                "profile data revalidation unnecessarily reloaded devices"
             );
             assert!(!account.read_with(cx, |page, _| page.profile_editor.is_some()));
             bindings.deliver();
