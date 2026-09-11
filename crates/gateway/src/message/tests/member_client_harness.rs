@@ -144,8 +144,15 @@ async fn start_member_thread(
     response.thread
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_logout() {
+#[test]
+fn hermetic_member_shared_client_covers_policy_and_access_loss_without_logout() {
+    run_gateway_stack_message_test(
+        "hermetic member shared client policy and access loss",
+        hermetic_member_shared_client_covers_policy_and_access_loss_without_logout_impl(),
+    );
+}
+
+async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_logout_impl() {
     let session_lifecycle = connect_member_session();
     let (workspace_manager, crud_store, affected_workspace_id) = setup_workspace_manager().await;
     let unrelated_workspace_id = "W0000000000000000000B";
@@ -745,8 +752,15 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
     assert_eq!(refreshed.workspaces[0].id, unrelated_workspace_id);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn member_full_access_cli_request_is_capped_before_codex_permissions_adaptation() {
+#[test]
+fn member_full_access_cli_request_is_capped_before_codex_permissions_adaptation() {
+    run_gateway_stack_message_test(
+        "member full access CLI request capability cap",
+        member_full_access_cli_request_is_capped_before_codex_permissions_adaptation_impl(),
+    );
+}
+
+async fn member_full_access_cli_request_is_capped_before_codex_permissions_adaptation_impl() {
     let member_principal = register_member_principal();
     let mut harness = setup_cli_runtime_security_harness_for_principal(
         Some(CLIAgentRuntimeKind::Codex),
