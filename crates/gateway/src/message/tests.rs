@@ -9026,9 +9026,16 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .expect("materialized test thread should become durable in memory");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground()
-{
+#[test]
+fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground() {
+    run_gateway_stack_message_test(
+        "collaborative composer admits message and detached task",
+        collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground_impl(),
+    );
+}
+
+async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground_impl()
+ {
     let base_dir = unique_temp_dir("collaborative_composer_pack_presentation");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -11447,8 +11454,15 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
     assert_eq!(turn.status, TurnStatus::Completed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn collaborative_voice_composer_admits_detached_task() {
+#[test]
+fn collaborative_voice_composer_admits_detached_task() {
+    run_gateway_stack_message_test(
+        "collaborative voice composer admits detached task",
+        collaborative_voice_composer_admits_detached_task_impl(),
+    );
+}
+
+async fn collaborative_voice_composer_admits_detached_task_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -11550,8 +11564,15 @@ async fn collaborative_voice_composer_admits_detached_task() {
     assert_eq!(parent_turn.status, TurnStatus::Completed);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_run_voice_composer_stays_foreground() {
+#[test]
+fn task_run_voice_composer_stays_foreground() {
+    run_gateway_stack_message_test(
+        "task run voice composer stays foreground",
+        task_run_voice_composer_stays_foreground_impl(),
+    );
+}
+
+async fn task_run_voice_composer_stays_foreground_impl() {
     let (tx, mut rx) = mpsc::channel(128);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
