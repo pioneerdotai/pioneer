@@ -47,6 +47,32 @@ pub(crate) struct GatewayInput {
     pub(crate) current_auth: Option<AuthMeResponse>,
     pub(crate) connection_state: GatewayConnectionState,
     pub(crate) capabilities: Option<AuthorizationCapabilitySnapshot>,
+    permissions_epoch: Option<(u64, u64)>,
+}
+impl GatewayInput {
+    fn read(client: &ClientCore) -> Self {
+        let identity = client.snapshot(&ClientScope::Administration { workspace_id: None })
+            .and_then(|p| p.typed::<pioneer_client::gateway::identity_authorization::IdentityAuthorizationPublication>())
+            .map(|p| p.payload());
+        let capabilities = identity
+            .as_ref()
+            .and_then(|p| p.capabilities.snapshot(None, None));
+        Self {
+            current_auth: identity.as_ref().and_then(|p| p.current_auth.clone()),
+            permissions_epoch: identity
+                .as_ref()
+                .filter(|_| capabilities.is_some())
+                .map(|p| (p.connection_generation, p.authorization_change_sequence)),
+            capabilities,
+            connection_state: client
+                .gateway_session()
+                .status
+                .as_ref()
+                .map_or(GatewayConnectionState::Disconnected, |status| {
+                    status.connection_state
+                }),
+        }
+    }
 }
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(1);
 pub struct AdministrationView {
@@ -102,17 +128,7 @@ impl AdministrationView {
                 dialogs: Vec::new(),
                 _release: release,
                 administration: AdministrationInput::read(&client),
-                gateway: GatewayInput {
-                    current_auth: client.current_auth(),
-                    connection_state: client
-                        .gateway_session()
-                        .status
-                        .as_ref()
-                        .map_or(GatewayConnectionState::Disconnected, |status| {
-                            status.connection_state
-                        }),
-                    capabilities: client.authorization_snapshot(None, None),
-                },
+                gateway: GatewayInput::read(&client),
                 navigation: client.navigation_snapshot(),
                 workspaces: client.workspace_catalog(),
                 client,
@@ -334,11 +350,7 @@ impl AdministrationView {
     }
     pub(crate) fn sync_publications(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let previous = self.presentation_key();
-        let previous_policy = self
-            .gateway
-            .capabilities
-            .as_ref()
-            .map(|p| p.authorization_revision);
+        let previous_policy = self.gateway.permissions_epoch;
         // A policy refresh is not a form dismissal. In particular it must not
         // erase an already-issued one-time credential. Client commands retain
         // their authorization fences; route and authenticated identity changes
@@ -357,18 +369,7 @@ impl AdministrationView {
         );
         self.navigation = self.client.navigation_snapshot();
         self.workspaces = self.client.workspace_catalog();
-        self.gateway = GatewayInput {
-            current_auth: self.client.current_auth(),
-            connection_state: self
-                .client
-                .gateway_session()
-                .status
-                .as_ref()
-                .map_or(GatewayConnectionState::Disconnected, |status| {
-                    status.connection_state
-                }),
-            capabilities: self.client.authorization_snapshot(None, None),
-        };
+        self.gateway = GatewayInput::read(&self.client);
         if previous_scope
             != (
                 self.visible(),
@@ -386,13 +387,7 @@ impl AdministrationView {
             for dialog in &self.dialogs {
                 dialog.update(cx, |dialog, cx| dialog.invalidate(window, cx));
             }
-        } else if previous_policy
-            != self
-                .gateway
-                .capabilities
-                .as_ref()
-                .map(|p| p.authorization_revision)
-        {
+        } else if previous_policy != self.gateway.permissions_epoch {
             for dialog in &self.dialogs {
                 dialog.update(cx, |dialog, cx| dialog.policy_refreshed(window, cx));
             }

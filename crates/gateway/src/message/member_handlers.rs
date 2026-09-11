@@ -22,23 +22,7 @@ use super::MessageProcessor;
 
 impl MessageProcessor {
     pub(in crate::message) async fn publish_profile_change(&self, principal_id: &PrincipalId) {
-        let change = self
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::RoleAssignment,
-                pioneer_protocol::AuthorizationChangeScope::Principal {
-                    principal_id: principal_id.clone(),
-                },
-            )
-            .await
-            .expect("profile change must advance durable policy generation");
-        let revision = change.policy_generation.get();
-        self.send_notification_to_authorized_member_connections(
-            principal_id,
-            events::AUTHORIZATION_PROJECTION_CHANGED,
-            &change,
-        )
-        .await;
+        let revision = self.next_administration_revision();
         self.send_notification_to_authorized_member_connections(
             principal_id,
             events::MEMBER_CHANGED,
@@ -436,19 +420,18 @@ impl MessageProcessor {
         workspace_id: WorkspaceId,
         target_principal_id: PrincipalId,
     ) {
-        let signal = self
-            .publish_committed_authorization_invalidation(
-                AccessChangeKind::WorkspaceMembership,
-                Some(target_principal_id.clone()),
-                workspace_id.to_string(),
-                None,
-            )
-            .await;
+        self.publish_committed_authorization_invalidation(
+            AccessChangeKind::WorkspaceMembership,
+            Some(target_principal_id.clone()),
+            workspace_id.to_string(),
+            None,
+        )
+        .await;
         self.send_notification_to_authorized_workspace_connections(
             workspace_id.as_str(),
             events::WORKSPACE_MEMBERS_CHANGED,
             &WorkspaceMembersChangedNotification {
-                revision: signal.authorization_revision,
+                revision: self.next_administration_revision(),
                 workspace_id: workspace_id.clone(),
             },
         )
@@ -457,7 +440,7 @@ impl MessageProcessor {
             &target_principal_id,
             events::MEMBER_CHANGED,
             &MemberChangedNotification {
-                revision: signal.authorization_revision,
+                revision: self.next_administration_revision(),
                 principal_id: target_principal_id.clone(),
             },
         )
@@ -486,17 +469,16 @@ impl MessageProcessor {
             &role_change,
         )
         .await;
-        let mut revision = role_change.policy_generation.get();
+        let mut revision = self.next_administration_revision();
         for workspace_id in workspace_ids {
-            revision = self
-                .publish_committed_authorization_invalidation(
-                    AccessChangeKind::WorkspaceMembership,
-                    Some(target_principal_id.clone()),
-                    workspace_id.to_string(),
-                    None,
-                )
-                .await
-                .authorization_revision;
+            self.publish_committed_authorization_invalidation(
+                AccessChangeKind::WorkspaceMembership,
+                Some(target_principal_id.clone()),
+                workspace_id.to_string(),
+                None,
+            )
+            .await;
+            revision = self.next_administration_revision();
             self.send_notification_to_authorized_workspace_connections(
                 workspace_id.as_str(),
                 events::WORKSPACE_MEMBERS_CHANGED,
@@ -508,11 +490,7 @@ impl MessageProcessor {
             .await;
         }
         for invitation_id in invitation_ids {
-            revision = self
-                .publish_invitation_selector_change(invitation_id)
-                .await
-                .policy_generation
-                .get();
+            revision = self.next_administration_revision();
             self.send_scoped_invitation_changed_notification(invitation_id, revision)
                 .await;
         }

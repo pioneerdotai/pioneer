@@ -161,7 +161,8 @@ pub use repositories::task_actor_contract::{
     upsert_task_occurrence_contract,
 };
 pub use repositories::thread::{
-    advance_thread_read_cursor, find_thread_read_cursor, thread_read_cursor_from_model,
+    ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
+    thread_read_cursor_from_model,
 };
 pub use repositories::turn::{
     NewTurnMessageRevision, PersistedTurnCollaboration, collaboration_from_model,
@@ -20227,7 +20228,7 @@ impl CrudStore {
         name: Option<&str>,
         access_class: Option<PersistedThreadAccessClass>,
         archived: Option<bool>,
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<ThreadManagementChange>> {
         let workspace_id = workspace_id.to_owned();
         let thread_id = thread_id.to_owned();
         let member_principal_id = member_principal_id.cloned();

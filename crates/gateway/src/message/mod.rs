@@ -598,6 +598,7 @@ pub struct MessageProcessor {
     tool_loop_config: ToolLoopConfig,
     memory_loop_config: Arc<StdRwLock<MemoryLoopConfig>>,
     thread_episodic_runtime_config: Arc<StdRwLock<ThreadEpisodicRuntimeConfig>>,
+    administration_snapshot_version: Arc<AtomicU64>,
     skills_snapshot_version: Arc<AtomicU64>,
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
@@ -1165,6 +1166,7 @@ impl MessageProcessor {
             thread_episodic_runtime_config: Arc::new(StdRwLock::new(
                 thread_episodic_runtime_config,
             )),
+            administration_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,
@@ -1352,47 +1354,13 @@ impl MessageProcessor {
         signal
     }
 
-    async fn publish_resource_selector_change(
-        &self,
-        workspace_id: &str,
-    ) -> pioneer_protocol::AuthorizationProjectionChangedNotification {
-        let change = self
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
-                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
-                    workspace_id: workspace_id.to_owned(),
-                    selector: "workspace_capability_catalog".to_owned(),
-                },
-            )
-            .await
-            .expect("resource selector change must advance durable policy generation");
-        self.send_notification_to_authorized_workspace_connections(
-            workspace_id,
-            pioneer_protocol::constants::events::AUTHORIZATION_PROJECTION_CHANGED,
-            &change,
-        )
-        .await;
-        change
-    }
-
-    async fn publish_invitation_selector_change(
-        &self,
-        invitation_id: &pioneer_protocol::InvitationId,
-    ) -> pioneer_protocol::AuthorizationProjectionChangedNotification {
-        let change = self
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
-                pioneer_protocol::AuthorizationChangeScope::Invitation {
-                    invitation_id: invitation_id.clone(),
-                },
-            )
-            .await
-            .expect("invitation selector change must advance durable policy generation");
-        self.send_scoped_invitation_authorization_changed_notification(invitation_id, &change)
-            .await;
-        change
+    /// Data notifications have their own sequence. Profile and invitation changes
+    /// do not change role grants or ACLs and must not advance the policy fence.
+    fn next_administration_revision(&self) -> u64 {
+        self.administration_snapshot_version
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .expect("administration revision exhausted")
     }
 
     #[cfg(test)]
@@ -4458,6 +4426,7 @@ impl MessageProcessor {
             thread_episodic_runtime_config: Arc::new(StdRwLock::new(
                 ThreadEpisodicRuntimeConfig::default(),
             )),
+            administration_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,

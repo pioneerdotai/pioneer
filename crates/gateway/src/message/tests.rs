@@ -5998,6 +5998,102 @@ async fn setup_provider_api_key_processor(
 }
 
 #[tokio::test]
+async fn data_notifications_do_not_advance_authorization_generation() {
+    let (processor, _, mut rx, _, _, workspace_id, _) =
+        setup_provider_api_key_processor("catalog_notifications_policy").await;
+    let before =
+        pioneer_crud::current_policy_generation(&processor.crud_store.database_connection())
+            .await
+            .unwrap();
+    for change in ["install", "update", "policy", "uninstall"] {
+        processor
+            .notify_skills_changed(
+                &workspace_id,
+                change,
+                vec![pioneer_protocol::SkillChangedItem {
+                    skill_id: pioneer_protocol::SkillId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                    owner: None,
+                    slug: "synthetic".into(),
+                    source_kind: "user".into(),
+                    change_type: change.into(),
+                    fingerprint_before: None,
+                    fingerprint_after: None,
+                }],
+                1,
+            )
+            .await;
+        assert_eq!(
+            pioneer_crud::current_policy_generation(&processor.crud_store.database_connection())
+                .await
+                .unwrap(),
+            before
+        );
+    }
+    for action in [
+        pioneer_protocol::McpChangedAction::Install,
+        pioneer_protocol::McpChangedAction::Update,
+        pioneer_protocol::McpChangedAction::Policy,
+        pioneer_protocol::McpChangedAction::Uninstall,
+    ] {
+        processor
+            .notify_mcp_changed(
+                &workspace_id,
+                vec![pioneer_protocol::McpChangedItem {
+                    name: "synthetic".into(),
+                    source_kind: pioneer_protocol::McpSourceKind::Config,
+                    action,
+                }],
+                1,
+            )
+            .await;
+        assert_eq!(
+            pioneer_crud::current_policy_generation(&processor.crud_store.database_connection())
+                .await
+                .unwrap(),
+            before
+        );
+    }
+    let data_revision = processor.next_administration_revision();
+    assert!(processor.next_administration_revision() > data_revision);
+    processor
+        .publish_profile_change(&authenticated_test_superuser().principal_id)
+        .await;
+    assert_eq!(
+        pioneer_crud::current_policy_generation(&processor.crud_store.database_connection())
+            .await
+            .unwrap(),
+        before,
+        "data revisions and profile updates must not advance the policy fence",
+    );
+    let mut methods = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        if let Message::Text(text) = message {
+            let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+            methods.push(value["method"].as_str().unwrap().to_owned());
+        }
+    }
+    assert!(
+        !methods
+            .iter()
+            .any(|m| m == pioneer_protocol::constants::events::AUTHORIZATION_PROJECTION_CHANGED)
+    );
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| m.as_str() == pioneer_protocol::constants::events::SKILLS_CHANGED)
+            .count(),
+        4
+    );
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|m| m.as_str() == pioneer_protocol::constants::events::MCP_CHANGED)
+            .count(),
+        4
+    );
+}
+
+#[tokio::test]
 async fn provider_api_key_handlers_use_keystore_without_settings_write() {
     let (
         processor,
@@ -9283,7 +9379,10 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             )
             .await
             .expect("concurrent Composer source visibility should persist"),
-        Some(true),
+        Some(pioneer_crud::ThreadManagementChange {
+            changed: true,
+            access_changed: true
+        }),
         "self-improvement source regression requires an explicitly workspace-visible root"
     );
     let connection_context = processor
@@ -14729,7 +14828,10 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
             )
             .await
             .expect("change thread visibility"),
-        Some(true)
+        Some(pioneer_crud::ThreadManagementChange {
+            changed: true,
+            access_changed: true
+        })
     );
     processor
         .send_notification_to_thread_subscribers(

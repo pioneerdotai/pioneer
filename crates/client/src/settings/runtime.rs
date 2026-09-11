@@ -288,7 +288,7 @@ impl SettingsIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SettingsEpoch {
     authorization: u64,
-    policy_revision: Option<u64>,
+    permissions_generation: Option<u64>,
     workspace: Option<String>,
 }
 impl SettingsEpoch {
@@ -298,7 +298,7 @@ impl SettingsEpoch {
         workspace: Option<String>,
     ) -> bool {
         self.authorization == owner.authorization_epoch().0
-            && self.policy_revision == owner.policy_revision()
+            && self.permissions_generation == owner.permissions_generation()
             && self.workspace == workspace
     }
 }
@@ -395,7 +395,7 @@ impl ClientCore {
             .expect("identity owner poisoned");
         SettingsEpoch {
             authorization: identity.authorization_epoch().0,
-            policy_revision: identity.policy_revision(),
+            permissions_generation: identity.permissions_generation(),
             workspace: self.settings_workspace(),
         }
     }
@@ -558,7 +558,7 @@ impl ClientCore {
             .lock()
             .expect("identity owner poisoned");
         if identity.authorization_epoch().0 != epoch.authorization
-            || identity.policy_revision() != epoch.policy_revision
+            || identity.permissions_generation() != epoch.permissions_generation
             || self.settings_workspace() != epoch.workspace
         {
             return self.reject_intent();
@@ -903,7 +903,7 @@ impl ClientCore {
             .expect("identity owner poisoned");
         if self.is_stopped()
             || identity.authorization_epoch().0 != epoch.authorization
-            || identity.policy_revision() != epoch.policy_revision
+            || identity.permissions_generation() != epoch.permissions_generation
             || self.settings_workspace() != epoch.workspace
         {
             drop(identity);
@@ -1140,7 +1140,7 @@ mod tests {
         }
     }
     #[test]
-    fn saved_profile_policy_refresh_reloads_only_demanded_devices_without_manager_permission() {
+    fn saved_profile_policy_hint_preserves_devices_without_reloading() {
         for demand in [ClientDemand::Visible, ClientDemand::Suspended] {
             let core = crate::catalog_test_support::settings_client();
             let mut capabilities = core.authorization_snapshot(None, None).unwrap();
@@ -1207,44 +1207,24 @@ mod tests {
                     principal_id: auth.principal.id.clone(),
                 },
             ));
-            assert!(core.auth_sessions().sessions.is_empty());
+            assert_eq!(core.auth_sessions().sessions, response.sessions);
             capabilities.authorization_revision = 2;
             let (request, connection) = core.current_auth_ticket();
             core.accept_authorization_projection(request, connection, capabilities);
             core.resume_current_settings_demand();
-            let mut work = core
+            let work = core
                 .settings_runtime
                 .lock()
                 .unwrap()
                 .queue
                 .drain(..)
                 .collect::<Vec<_>>();
-            if demand == ClientDemand::Suspended {
-                assert!(work.is_empty(), "a hidden device list started a request");
-            } else {
-                assert_eq!(
-                    work.len(),
-                    1,
-                    "visible devices were not reloaded exactly once"
-                );
-                assert!(matches!(
-                    &work[0],
-                    SettingsWork::Intent {
-                        intent: SettingsIntent::RefreshSessions,
-                        ..
-                    }
-                ));
-                core.execute_settings_work_with_sessions(work.pop().unwrap(), refresh);
-                assert_eq!(core.auth_sessions().sessions, response.sessions);
-                assert!(!core.auth_sessions().loading);
-                assert!(core.auth_sessions().error.is_none());
-                assert_eq!(
-                    core.current_auth().unwrap().principal.display_name,
-                    "Changed Name"
-                );
-                core.resume_current_settings_demand();
-                assert!(core.settings_runtime.lock().unwrap().queue.is_empty());
-            }
+            assert!(work.is_empty(), "unchanged permissions reloaded devices");
+            assert_eq!(core.auth_sessions().sessions, response.sessions);
+            assert_eq!(
+                core.current_auth().unwrap().principal.display_name,
+                "Changed Name"
+            );
             core.shutdown();
         }
     }
@@ -1259,7 +1239,7 @@ mod tests {
         assert_eq!(replay_account_requests(&core), (1, 0));
         drop(first);
         revalidate_saved_profile(&core);
-        assert_eq!(replay_account_requests(&core), (1, 0));
+        assert_eq!(replay_account_requests(&core), (0, 0));
         assert_eq!(core.auth_sessions().sessions.len(), 1);
         drop(second);
         revalidate_saved_profile(&core);
@@ -1274,7 +1254,7 @@ mod tests {
         assert_eq!(replay_account_requests(&core), (1, 0));
         drop(last);
         revalidate_saved_profile(&core);
-        assert_eq!(replay_account_requests(&core), (1, 0));
+        assert_eq!(replay_account_requests(&core), (0, 0));
         core.dispatch(ClientIntent::SetScopeDemand {
             scope: ClientScope::AuthSessions,
             demand: ClientDemand::Suspended,
@@ -1555,7 +1535,10 @@ impl ClientCore {
             .is_some_and(|demand| demand != ClientDemand::Suspended);
         let epoch = SettingsEpoch {
             authorization: identity.connection_generation,
-            policy_revision: identity.capabilities.accepted_revision(),
+            permissions_generation: identity
+                .capabilities
+                .accepted_revision()
+                .map(|_| identity.authorization_change_sequence),
             workspace: self.settings_workspace(),
         };
         let mut runtime = self

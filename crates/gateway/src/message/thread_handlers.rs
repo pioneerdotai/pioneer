@@ -1115,7 +1115,6 @@ impl MessageProcessor {
             .await;
             return;
         }
-        let visibility_changed = params.visibility.is_some();
 
         let workspace_id = authorization.workspace_id().to_owned();
         let access_class = params.visibility.map(|visibility| match visibility {
@@ -1124,7 +1123,7 @@ impl MessageProcessor {
         });
         let scoped_principal_id =
             (!authorization.decision().is_absolute()).then(|| authorization.principal_id());
-        let changed = match self
+        let mutation = match self
             .crud_store
             .update_user_thread_management(
                 authorization.workspace_id(),
@@ -1158,7 +1157,9 @@ impl MessageProcessor {
                 return;
             }
         };
-        if changed && params.visibility.is_some() {
+        let changed = mutation.changed;
+        let visibility_changed = mutation.access_changed;
+        if visibility_changed {
             self.publish_committed_authorization_invalidation(
                 AccessChangeKind::ThreadVisibility,
                 None,

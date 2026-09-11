@@ -32,7 +32,7 @@ pub(super) struct ThreadSidebarView {
     load_expansion: Rc<dyn Fn(&str, &mut App) -> HashMap<String, bool>>,
     save_expansion: Rc<dyn Fn(&str, HashMap<String, bool>, &mut App)>,
     bootstrap_connection: Option<u64>,
-    bootstrap_authorization: Option<u64>,
+    bootstrap_authorization: Option<(u64, u64)>,
     pub rename_thread_dialog: crate::DialogPresenter,
     pub rename_folder_dialog: crate::DialogPresenter,
     pub rename_workspace_dialog: crate::DialogPresenter,
@@ -171,7 +171,7 @@ impl ThreadSidebarView {
 
     pub(super) fn sync(&mut self, cx: &mut Context<Self>) {
         let session = self.client.gateway_session();
-        let authorization = self.client.authorization_revision();
+        let authorization = self.client.authorization_permissions_epoch();
         let catalog = self.client.workspace_catalog();
         if session.startup.transport_ready
             && !session.startup.identity_pending

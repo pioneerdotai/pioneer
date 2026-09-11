@@ -791,63 +791,6 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(super) async fn send_scoped_invitation_authorization_changed_notification(
-        &self,
-        invitation_id: &pioneer_protocol::InvitationId,
-        change: &pioneer_protocol::AuthorizationProjectionChangedNotification,
-    ) {
-        let Some(invitation) =
-            pioneer_crud::load_invitation(&self.crud_store.database_connection(), invitation_id)
-                .await
-                .ok()
-                .flatten()
-        else {
-            tracing::warn!(
-                invitation_id = %invitation_id,
-                "committed invitation authorization notification could not reload authoritative owner"
-            );
-            return;
-        };
-        let Ok(inviter_principal_id) =
-            pioneer_protocol::PrincipalId::new(invitation.created_by_principal_id)
-        else {
-            return;
-        };
-        let candidates = self.session_manager.connection_ids().await;
-        let initially_authorized = self
-            .authorized_invitation_notification_recipients(&inviter_principal_id, candidates)
-            .await;
-        if initially_authorized.is_empty() {
-            return;
-        }
-        let serialization_authorized = self
-            .authorized_invitation_notification_recipients(
-                &inviter_principal_id,
-                initially_authorized,
-            )
-            .await;
-        if serialization_authorized.is_empty() {
-            return;
-        }
-        let Some(serialized) =
-            self.serialize_notification(events::AUTHORIZATION_PROJECTION_CHANGED, change)
-        else {
-            return;
-        };
-        let authorized = self
-            .authorized_invitation_notification_recipients(
-                &inviter_principal_id,
-                serialization_authorized,
-            )
-            .await;
-        self.send_serialized_notification_to_connections(
-            events::AUTHORIZATION_PROJECTION_CHANGED,
-            &serialized,
-            authorized,
-        )
-        .await;
-    }
-
     pub(super) async fn authorized_invitation_notification_recipients(
         &self,
         inviter_principal_id: &pioneer_protocol::PrincipalId,

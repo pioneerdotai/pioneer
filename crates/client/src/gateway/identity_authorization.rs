@@ -16,7 +16,6 @@ use std::sync::Arc;
 pub(crate) enum IdentityPublicationChange {
     Update,
     Revalidate,
-    InvitationSelector { epoch: (u64, u64, Option<u64>) },
     ResetSession,
 }
 impl IdentityPublicationChange {
@@ -81,8 +80,12 @@ pub(crate) struct IdentityAuthorizationStore {
     policy_change: Option<pioneer_protocol::AuthorizationProjectionChangedNotification>,
     epoch: Option<(String, u64)>,
     projections: AuthorizationProjectionStore,
+    pending_revision: Option<u64>,
+    revalidation_after: Option<std::time::Instant>,
     current_auth: Option<AuthMeResponse>,
     identity_request: u64,
+    identity_read_request: u64,
+    profile_write_request: u64,
     capability_reads:
         std::collections::BTreeMap<(Option<String>, Option<String>), CapabilityReadState>,
     identity_loading: bool,
@@ -107,8 +110,10 @@ impl IdentityAuthorizationStore {
     pub(crate) fn connection_matches(&self, connection: Option<u64>) -> bool {
         self.epoch.as_ref().map(|(_, id)| *id) == connection
     }
-    pub(crate) fn policy_revision(&self) -> Option<u64> {
-        self.projections.accepted_revision()
+    pub(crate) fn permissions_generation(&self) -> Option<u64> {
+        self.projections
+            .accepted_revision()
+            .map(|_| self.authorization_change_sequence)
     }
     pub(crate) fn stop(&mut self) {
         self.connection_generation = self
@@ -119,6 +124,8 @@ impl IdentityAuthorizationStore {
         self.access_change = None;
         self.policy_change = None;
         self.projections.clear_epoch();
+        self.pending_revision = None;
+        self.revalidation_after = None;
         self.clear_sessions();
     }
 
@@ -227,7 +234,7 @@ impl ClientCore {
         params: pioneer_protocol::AuthProfileUpdateParams,
         expected: Option<(u64, u64)>,
     ) -> anyhow::Result<pioneer_protocol::AuthProfileUpdateResponse> {
-        let (generation, connection) = {
+        let (generation, connection, write) = {
             let mut owner = self
                 .identity_authorization
                 .lock()
@@ -244,11 +251,15 @@ impl ClientCore {
                 owner.connection_matches(connection),
                 "Profile connection scope was replaced"
             );
-            owner.identity_request = owner
-                .identity_request
+            owner.profile_write_request = owner
+                .profile_write_request
                 .checked_add(1)
-                .expect("identity request generation exhausted");
-            (owner.identity_request, connection)
+                .expect("profile write sequence exhausted");
+            (
+                owner.identity_request,
+                connection,
+                owner.profile_write_request,
+            )
         };
         let connection_id =
             connection.ok_or_else(|| anyhow::anyhow!("Profile connection unavailable"))?;
@@ -258,13 +269,24 @@ impl ClientCore {
             .requests_for_connection(connection_id);
         let response =
             crate::transport::ws::command_sender::auth_profile_update(&transport, params)?;
-        self.finish_auth_profile_update(generation, connection, response)
+        self.finish_auth_profile_write(generation, connection, Some(write), response)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn finish_auth_profile_update(
         &self,
         generation: u64,
         connection: Option<u64>,
+        response: pioneer_protocol::AuthProfileUpdateResponse,
+    ) -> anyhow::Result<pioneer_protocol::AuthProfileUpdateResponse> {
+        self.finish_auth_profile_write(generation, connection, None, response)
+    }
+
+    fn finish_auth_profile_write(
+        &self,
+        generation: u64,
+        connection: Option<u64>,
+        write: Option<u64>,
         response: pioneer_protocol::AuthProfileUpdateResponse,
     ) -> anyhow::Result<pioneer_protocol::AuthProfileUpdateResponse> {
         let mut owner = self
@@ -274,6 +296,7 @@ impl ClientCore {
         anyhow::ensure!(
             !self.is_stopped()
                 && owner.identity_request == generation
+                && write.is_none_or(|write| owner.profile_write_request == write)
                 && self.gateway_http_generation() == connection,
             "Gateway profile response is stale"
         );
@@ -288,6 +311,14 @@ impl ClientCore {
         if auth.principal != response.principal {
             auth.principal = response.principal.clone();
             owner.profile.synchronize(Some(&response.principal));
+            // An identity read started before this write completed must not
+            // restore the old profile after the successful mutation.
+            owner.identity_read_request = owner
+                .identity_read_request
+                .checked_add(1)
+                .expect("identity read sequence exhausted");
+            owner.identity_loading = false;
+            owner.identity_error = None;
             self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
             self.publish_identity_authorization(
                 &owner.publication(),
@@ -316,50 +347,72 @@ impl ClientCore {
     }
 
     pub fn refresh_current_auth(&self) -> anyhow::Result<AuthMeResponse> {
-        let (generation, connection) = self.begin_identity_request()?;
-        let result = self
-            .transport_runtime()
-            .ws_command_sender()
-            .auth_me()
-            .and_then(|auth| self.finish_current_auth(generation, connection, auth));
+        let (generation, read, connection) = self.begin_identity_request()?;
+        let result = self.transport_runtime().ws_command_sender().auth_me();
         let mut owner = self
             .identity_authorization
             .lock()
             .expect("identity owner poisoned");
-        if owner.identity_request == generation && self.gateway_http_generation() == connection {
-            owner.identity_loading = false;
-            owner.identity_error = result
-                .as_ref()
-                .err()
-                .map(|_| "identity_request_failed".into());
-            self.publish_identity_authorization(
-                &owner.publication(),
-                IdentityPublicationChange::Update,
-            );
+        anyhow::ensure!(
+            !self.is_stopped()
+                && owner.identity_request == generation
+                && self.gateway_http_generation() == connection,
+            "Gateway identity response is stale"
+        );
+        anyhow::ensure!(
+            owner.identity_read_request == read,
+            "identity_read_superseded"
+        );
+        owner.identity_loading = false;
+        owner.identity_error = result
+            .as_ref()
+            .err()
+            .map(|_| "identity_request_failed".into());
+        if let Ok(auth) = &result {
+            self.apply_current_auth(&mut owner, auth);
         }
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::Update,
+        );
         result
     }
 
-    fn begin_identity_request(&self) -> anyhow::Result<(u64, Option<u64>)> {
-        let (generation, connection) = {
-            let mut owner = self
-                .identity_authorization
-                .lock()
-                .expect("identity owner poisoned");
-            anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
-            owner.identity_request = owner
-                .identity_request
-                .checked_add(1)
-                .expect("identity request generation exhausted");
-            owner.identity_loading = true;
-            owner.identity_error = None;
+    fn begin_identity_request(&self) -> anyhow::Result<(u64, u64, Option<u64>)> {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
+        // A background identity read supersedes older identity reads, not the
+        // thread/catalog/action requests sharing the verified subject.
+        owner.identity_read_request = owner
+            .identity_read_request
+            .checked_add(1)
+            .expect("identity read sequence exhausted");
+        owner.identity_loading = true;
+        owner.identity_error = None;
+        self.publish_identity_authorization(
+            &owner.publication(),
+            IdentityPublicationChange::Update,
+        );
+        Ok((
+            owner.identity_request,
+            owner.identity_read_request,
+            self.gateway_http_generation(),
+        ))
+    }
+
+    fn apply_current_auth(&self, owner: &mut IdentityAuthorizationStore, auth: &AuthMeResponse) {
+        if owner.current_auth.as_ref() != Some(auth) {
+            owner.profile.synchronize(Some(&auth.principal));
+            owner.current_auth = Some(auth.clone());
             self.publish_identity_authorization(
                 &owner.publication(),
                 IdentityPublicationChange::Update,
             );
-            (owner.identity_request, self.gateway_http_generation())
-        };
-        Ok((generation, connection))
+            self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
+        }
     }
 
     pub(crate) fn finish_current_auth(
@@ -378,15 +431,7 @@ impl ClientCore {
                 && self.gateway_http_generation() == connection,
             "Gateway identity response is stale"
         );
-        if owner.current_auth.as_ref() != Some(&auth) {
-            owner.profile.synchronize(Some(&auth.principal));
-            owner.current_auth = Some(auth.clone());
-            self.publish_identity_authorization(
-                &owner.publication(),
-                IdentityPublicationChange::Update,
-            );
-            self.publish_settings_value(ClientScope::Profile, owner.profile.publication.clone());
-        }
+        self.apply_current_auth(&mut owner, &auth);
         Ok(auth)
     }
 
@@ -563,6 +608,72 @@ impl ClientCore {
                 anyhow::anyhow!("Gateway returned an incompatible capability snapshot"),
             ));
         }
+        let owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped()
+            || owner.identity_request != generation
+            || self.gateway_http_generation() != connection
+        {
+            return Err((None, anyhow::anyhow!("Gateway identity response is stale")));
+        }
+        if owner.current_auth.as_ref() != Some(&auth) {
+            return Err((None, anyhow::anyhow!("identity_read_superseded")));
+        }
+        let previous = owner.projections.clone();
+        let pending = owner.pending_revision;
+        drop(owner);
+        let revision = snapshot.authorization_revision;
+        if pending.is_some_and(|minimum| revision < minimum) {
+            return Err((Some(auth), anyhow::anyhow!("capability_request_stale")));
+        }
+        let advancing = previous
+            .accepted_revision()
+            .is_some_and(|old| revision > old);
+        let mut next = if advancing {
+            AuthorizationProjectionStore::default()
+        } else {
+            previous.clone()
+        };
+        if next.accept(snapshot.clone()) != AuthorizationProjectionAcceptance::Accepted {
+            return Err((
+                Some(auth),
+                anyhow::anyhow!("Gateway returned an incompatible capability snapshot"),
+            ));
+        }
+        if advancing {
+            let scopes = previous
+                .workspace_snapshots()
+                .into_values()
+                .chain(previous.thread_snapshots().into_values());
+            for old in scopes {
+                let scope = pioneer_protocol::AuthorizationCapabilitiesParams {
+                    workspace_id: old.workspace.map(|w| w.workspace_id),
+                    thread_id: old.thread.map(|t| t.thread_id),
+                };
+                if scope == params {
+                    continue;
+                }
+                let replacement =
+                    read(scope.clone()).map_err(|error| (Some(auth.clone()), error))?;
+                if replacement.authorization_revision != revision {
+                    return Err((Some(auth), anyhow::anyhow!("capability_request_stale")));
+                }
+                if !crate::authorization::authorization_capability_snapshot_is_compatible(
+                    &replacement,
+                    &auth.principal.id,
+                    scope.workspace_id.as_deref(),
+                    scope.thread_id.as_deref(),
+                ) || next.accept(replacement) != AuthorizationProjectionAcceptance::Accepted
+                {
+                    return Err((
+                        Some(auth),
+                        anyhow::anyhow!("Gateway returned an incompatible capability snapshot"),
+                    ));
+                }
+            }
+        }
         let mut owner = self
             .identity_authorization
             .lock()
@@ -570,21 +681,34 @@ impl ClientCore {
         if self.is_stopped()
             || owner.identity_request != generation
             || self.gateway_http_generation() != connection
+            || owner.projections != previous
             || owner.current_auth.as_ref() != Some(&auth)
+            || owner
+                .pending_revision
+                .is_some_and(|minimum| revision < minimum)
         {
-            return Err((None, anyhow::anyhow!("Gateway identity response is stale")));
+            return Err((None, anyhow::anyhow!("capability_request_stale")));
         }
-        let previous = owner.projections.accepted_revision();
-        if owner.projections.accept(snapshot.clone()) != AuthorizationProjectionAcceptance::Accepted
-        {
-            return Err((
-                Some(auth),
-                anyhow::anyhow!("Gateway returned an incompatible capability snapshot"),
-            ));
-        }
-        let changed = previous != owner.projections.accepted_revision();
+        let changed = previous.permissions_changed(&next);
+        owner.projections = next;
+        owner.pending_revision = None;
+        owner.revalidation_after = None;
         if changed {
             owner.invalidate_policy_requests();
+            owner.authorization_change_sequence = owner
+                .authorization_change_sequence
+                .checked_add(1)
+                .expect("authorization change sequence exhausted");
+            // The read can discover changes whose notification was missed.
+            // Retire protected caches only now, after the effective comparison.
+            self.invalidate_threads_for_policy(
+                &pioneer_protocol::AuthorizationProjectionChangedNotification {
+                    policy_generation: pioneer_protocol::PolicyGeneration::new(revision)
+                        .expect("accepted authorization revision is nonzero"),
+                    change: pioneer_protocol::AuthorizationChangeKind::RolePolicy,
+                    affected: pioneer_protocol::AuthorizationChangeScope::Global,
+                },
+            );
         }
         owner.current_auth = Some(auth.clone());
         self.publish_identity_authorization(
@@ -615,6 +739,8 @@ impl ClientCore {
             .checked_add(1)
             .expect("authorization connection generation exhausted");
         owner.projections.clear_epoch();
+        owner.pending_revision = None;
+        owner.revalidation_after = None;
         owner.clear_sessions();
         self.publish_identity_authorization(
             &owner.publication(),
@@ -674,6 +800,8 @@ impl ClientCore {
             .checked_add(1)
             .expect("authorization connection generation exhausted");
         owner.projections.clear_epoch();
+        owner.pending_revision = None;
+        owner.revalidation_after = None;
         owner.clear_sessions();
         self.publish_identity_authorization(
             &owner.publication(),
@@ -724,6 +852,8 @@ impl ClientCore {
             .checked_add(1)
             .expect("authorization connection generation exhausted");
         owner.projections.clear_epoch();
+        owner.pending_revision = None;
+        owner.revalidation_after = None;
         owner.clear_sessions();
         self.publish_identity_authorization(
             &owner.publication(),
@@ -735,6 +865,29 @@ impl ClientCore {
         &self,
         change: &pioneer_protocol::AccessChangedNotification,
     ) {
+        if change.outcome == pioneer_protocol::AccessChangeOutcome::Retained {
+            let Some(policy_generation) =
+                pioneer_protocol::PolicyGeneration::new(change.authorization_revision)
+            else {
+                return;
+            };
+            self.observe_policy_change(
+                &pioneer_protocol::AuthorizationProjectionChangedNotification {
+                    policy_generation,
+                    change: pioneer_protocol::AuthorizationChangeKind::WorkspaceAcl,
+                    affected: match &change.thread_id {
+                        Some(thread_id) => pioneer_protocol::AuthorizationChangeScope::Thread {
+                            workspace_id: change.workspace_id.clone(),
+                            thread_id: thread_id.clone(),
+                        },
+                        None => pioneer_protocol::AuthorizationChangeScope::Workspace {
+                            workspace_id: change.workspace_id.clone(),
+                        },
+                    },
+                },
+            );
+            return;
+        }
         let mut owner = self
             .identity_authorization
             .lock()
@@ -784,43 +937,57 @@ impl ClientCore {
             || owner
                 .projections
                 .accepted_revision()
-                .is_some_and(|current| revision < current)
-            || owner.policy_change.as_ref() == Some(change)
+                .is_some_and(|old| revision <= old)
+            || owner.pending_revision.is_some_and(|old| revision <= old)
         {
             return;
         }
-        let changed = owner
-            .projections
-            .accepted_revision()
-            .is_none_or(|current| revision > current);
-        owner.projections.invalidate_for_revision(revision);
-        if changed {
-            owner.invalidate_policy_requests();
-        }
-        owner.authorization_change_sequence = owner
-            .authorization_change_sequence
-            .checked_add(1)
-            .expect("authorization change sequence exhausted");
-        self.invalidate_threads_for_policy(change);
+        // A generation is a hint to re-read, not evidence that this principal's
+        // permissions changed. Keep the published grants and feature owners until
+        // a coherent replacement has been compared. Explicit revocations still
+        // use observe_access_change and retire protected data immediately.
+        owner.pending_revision = Some(revision);
+        owner.revalidation_after = None;
         owner.policy_change = Some(change.clone());
-        owner.access_change = None;
-        let publication_change = if changed
-            && change.change == pioneer_protocol::AuthorizationChangeKind::ResourceSelector
-            && matches!(
-                change.affected,
-                pioneer_protocol::AuthorizationChangeScope::Invitation { .. }
-            ) {
-            IdentityPublicationChange::InvitationSelector {
-                epoch: (
-                    owner.connection_generation,
-                    owner.authorization_change_sequence,
-                    owner.epoch.as_ref().map(|(_, connection)| *connection),
-                ),
-            }
-        } else {
-            IdentityPublicationChange::revision(changed)
-        };
-        self.publish_identity_authorization(&owner.publication(), publication_change);
+    }
+
+    pub(crate) fn observe_principal_data_change(
+        &self,
+        principal_id: &pioneer_protocol::PrincipalId,
+    ) {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped()
+            || owner
+                .current_auth
+                .as_ref()
+                .is_none_or(|auth| &auth.principal.id != principal_id)
+        {
+            return;
+        }
+        // Refresh profile data on peer devices without fabricating a role change.
+        let revision = owner.projections.accepted_revision().unwrap_or(0);
+        owner.pending_revision = Some(owner.pending_revision.unwrap_or(0).max(revision));
+        owner.revalidation_after = None;
+    }
+
+    pub(super) fn authorization_revalidation_due(&self) -> bool {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if owner.pending_revision.is_none()
+            || owner
+                .revalidation_after
+                .is_some_and(|at| at > std::time::Instant::now())
+        {
+            return false;
+        }
+        owner.revalidation_after =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        true
     }
 
     pub fn invalidate_authorization_revision(&self, revision: u64) {
@@ -838,11 +1005,37 @@ impl ClientCore {
         owner.projections.invalidate_for_revision(revision);
         if changed {
             owner.invalidate_policy_requests();
+            owner.authorization_change_sequence = owner
+                .authorization_change_sequence
+                .checked_add(1)
+                .expect("authorization change sequence exhausted");
         }
         self.publish_identity_authorization(
             &owner.publication(),
             IdentityPublicationChange::revision(changed),
         );
+    }
+
+    /// Connection and effective-permission generation for retained consumers.
+    /// Desktop bindings use this directly; mobile observes the same generation
+    /// in IdentityAuthorizationPublication. Revalidation alone does not advance it.
+    pub fn authorization_permissions_epoch(&self) -> Option<(u64, u64)> {
+        let owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        owner.projections.snapshot(None, None)?;
+        Some((
+            owner.connection_generation,
+            owner.authorization_change_sequence,
+        ))
+    }
+
+    pub(crate) fn authorization_operation_epoch(&self) -> (u64, u64) {
+        self.identity_authorization
+            .lock()
+            .expect("identity owner poisoned")
+            .authorization_epoch()
     }
 
     pub fn authorization_revision(&self) -> Option<u64> {
@@ -881,6 +1074,39 @@ impl ClientCore {
             || owner.epoch.as_ref().map(|(_, id)| *id) != connection_id
         {
             return AuthorizationProjectionAcceptance::Incompatible;
+        }
+        if owner
+            .projections
+            .accepted_revision()
+            .is_some_and(|old| snapshot.authorization_revision > old)
+            && let Some(auth) = owner.current_auth.clone()
+        {
+            // A thread-scoped response can discover a newer generation before
+            // its notification. It must use the same coherent comparison path.
+            let params = pioneer_protocol::AuthorizationCapabilitiesParams {
+                workspace_id: snapshot.workspace.as_ref().map(|w| w.workspace_id.clone()),
+                thread_id: snapshot.thread.as_ref().map(|t| t.thread_id.clone()),
+            };
+            drop(owner);
+            let mut initial = Some(snapshot);
+            return if self
+                .refresh_identity_authorization_with_ports(
+                    params,
+                    || Ok(auth.clone()),
+                    |params| match initial.take() {
+                        Some(snapshot) => Ok(snapshot),
+                        None => self
+                            .transport_runtime()
+                            .ws_command_sender()
+                            .authorization_capabilities(params),
+                    },
+                )
+                .is_ok()
+            {
+                AuthorizationProjectionAcceptance::Accepted
+            } else {
+                AuthorizationProjectionAcceptance::Stale
+            };
         }
         let previous_revision = owner.projections.accepted_revision();
         let accepted = owner.projections.accept(snapshot);
@@ -1188,6 +1414,8 @@ impl ClientCore {
                 .checked_add(1)
                 .expect("authorization connection generation exhausted");
             owner.projections.clear_epoch();
+            owner.pending_revision = None;
+            owner.revalidation_after = None;
             owner.clear_sessions();
         }
         if clear_protected {
@@ -1242,6 +1470,8 @@ impl ClientCore {
                     .checked_add(1)
                     .expect("authorization connection generation exhausted");
                 owner.projections.clear_epoch();
+                owner.pending_revision = None;
+                owner.revalidation_after = None;
                 owner.clear_sessions();
             }
             Err(_) => {
@@ -1501,13 +1731,14 @@ mod session_tests {
                     .is_some()
                 );
                 assert!(
-                    core.snapshot(&ClientScope::Thread {
-                        thread_id: "thread".into()
-                    })
-                    .unwrap()
-                    .snapshot()
-                    .serialized_payload()
-                    .is_null()
+                    !core
+                        .snapshot(&ClientScope::Thread {
+                            thread_id: "thread".into()
+                        })
+                        .unwrap()
+                        .snapshot()
+                        .serialized_payload()
+                        .is_null()
                 );
                 assert!(
                     core.authorization_snapshot(Some("workspace"), None)
@@ -2030,6 +2261,193 @@ fn retry_capability_read<T>(
 mod capability_retry_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn policy_revalidation_compares_grants_atomically_without_resetting_equal_presentations() {
+        use crate::composer::{state_machine::ComposerDomainState, store::ComposerIntent};
+        use pioneer_protocol::*;
+        let core = crate::catalog_test_support::settings_client();
+        let auth = core.current_auth().unwrap();
+        let global = core.authorization_snapshot(None, None).unwrap();
+        for workspace_id in ["one", "two"] {
+            let resources = AuthorizationOperationalResourceProjection {
+                fingerprint: "old-receipt".into(),
+                ..Default::default()
+            };
+            let mut scoped = global.clone();
+            scoped.workspace = Some(AuthorizationWorkspaceCapabilitySnapshot {
+                workspace_id: workspace_id.into(),
+                capabilities: Default::default(),
+                operational_resources: resources.clone(),
+                execution_draft_policy: AuthorizationExecutionDraftPolicyProjection {
+                    fingerprint: "old-draft-receipt".into(),
+                    resources,
+                    permission_options: vec![],
+                    can_attach_artifacts: false,
+                    mcp_invocation_limits: Default::default(),
+                },
+            });
+            let ticket = core.current_auth_ticket();
+            assert_eq!(
+                core.accept_authorization_projection(ticket.0, ticket.1, scoped),
+                AuthorizationProjectionAcceptance::Accepted
+            );
+        }
+        core.composer_intent(ComposerIntent::Open {
+            thread_id: "draft".into(),
+            defaults: ComposerDomainState::default(),
+        });
+        let scope = ClientScope::Composer {
+            thread_id: "draft".into(),
+        };
+        let before = core.snapshot(&scope).unwrap().snapshot();
+        let operation_epoch = core.authorization_operation_epoch();
+        let before_sequence = core
+            .identity_authorization
+            .lock()
+            .unwrap()
+            .authorization_change_sequence;
+        for (revision, changed) in [(2, false), (3, false), (4, true)] {
+            let previous = core
+                .identity_authorization
+                .lock()
+                .unwrap()
+                .projections
+                .clone();
+            core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+                policy_generation: PolicyGeneration::new(revision).unwrap(),
+                change: AuthorizationChangeKind::RoleAssignment,
+                affected: AuthorizationChangeScope::Global,
+            });
+            assert!(Arc::ptr_eq(
+                &before,
+                &core.snapshot(&scope).unwrap().snapshot()
+            ));
+            assert_eq!(core.authorization_revision(), Some(revision - 1));
+            let calls = Cell::new(0);
+            core.refresh_identity_authorization_with_ports(
+                AuthorizationCapabilitiesParams {
+                    workspace_id: None,
+                    thread_id: None,
+                },
+                || Ok(auth.clone()),
+                |params| {
+                    calls.set(calls.get() + 1);
+                    // All old scopes remain visible until every response agrees.
+                    assert_eq!(core.authorization_revision(), Some(revision - 1));
+                    assert!(core.authorization_snapshot(Some("two"), None).is_some());
+                    let mut next = previous
+                        .snapshot(params.workspace_id.as_deref(), params.thread_id.as_deref())
+                        .unwrap();
+                    next.authorization_revision = revision;
+                    if changed {
+                        next.global.can_manage_capabilities = false;
+                    }
+                    if let Some(workspace) = next.workspace.as_mut() {
+                        workspace.operational_resources.fingerprint = format!("receipt-{revision}");
+                        workspace.execution_draft_policy.resources.fingerprint =
+                            format!("receipt-{revision}");
+                        workspace.execution_draft_policy.fingerprint = format!("draft-{revision}");
+                    }
+                    Ok(next)
+                },
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 3);
+            assert_eq!(core.authorization_revision(), Some(revision));
+            assert_eq!(
+                core.authorization_operation_epoch() == operation_epoch,
+                !changed
+            );
+            assert_eq!(
+                core.identity_authorization
+                    .lock()
+                    .unwrap()
+                    .authorization_change_sequence,
+                before_sequence + u64::from(changed)
+            );
+            assert_eq!(
+                Arc::ptr_eq(&before, &core.snapshot(&scope).unwrap().snapshot()),
+                !changed
+            );
+        }
+    }
+
+    #[test]
+    fn identity_reads_do_not_retire_requests_owned_by_the_verified_subject() {
+        let core = crate::catalog_test_support::settings_client();
+        let ticket = core.current_auth_ticket();
+        let epoch = core.authorization_operation_epoch();
+        let first = core.begin_identity_request().unwrap();
+        let second = core.begin_identity_request().unwrap();
+        assert_ne!(
+            first.1, second.1,
+            "new reads supersede old identity replies"
+        );
+        assert_eq!(
+            core.current_auth_ticket(),
+            ticket,
+            "background verification retired feature requests"
+        );
+        assert_eq!(core.authorization_operation_epoch(), epoch);
+        core.clear_authorization_projections();
+        assert_ne!(
+            core.current_auth_ticket(),
+            ticket,
+            "session loss must retire feature requests"
+        );
+    }
+
+    #[test]
+    fn failed_policy_revalidation_keeps_last_complete_grants_and_remains_retryable() {
+        use pioneer_protocol::*;
+        let core = crate::catalog_test_support::settings_client();
+        let auth = core.current_auth().unwrap();
+        let before = core.authorization_snapshot(None, None).unwrap();
+        core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+            policy_generation: PolicyGeneration::new(2).unwrap(),
+            change: AuthorizationChangeKind::RoleAssignment,
+            affected: AuthorizationChangeScope::Global,
+        });
+        let result = core.refresh_identity_authorization_once(
+            AuthorizationCapabilitiesParams {
+                workspace_id: None,
+                thread_id: None,
+            },
+            &mut || Ok(auth.clone()),
+            &mut |_| Err(anyhow::anyhow!("offline")),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            core.authorization_snapshot(None, None),
+            Some(before.clone())
+        );
+        assert!(core.authorization_revalidation_due());
+        assert!(!core.authorization_revalidation_due());
+        let result = core.refresh_identity_authorization_once(
+            AuthorizationCapabilitiesParams {
+                workspace_id: None,
+                thread_id: None,
+            },
+            &mut || Ok(auth.clone()),
+            &mut |_| {
+                core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+                    policy_generation: PolicyGeneration::new(3).unwrap(),
+                    change: AuthorizationChangeKind::RoleAssignment,
+                    affected: AuthorizationChangeScope::Global,
+                });
+                let mut stale = before.clone();
+                stale.authorization_revision = 2;
+                stale.global.can_manage_capabilities = false;
+                Ok(stale)
+            },
+        );
+        assert!(
+            result.is_err(),
+            "an obsolete response crossed a newer policy hint"
+        );
+        assert_eq!(core.authorization_snapshot(None, None), Some(before));
+    }
 
     #[test]
     fn capability_rpc_completion_resumes_already_mounted_settings_and_provider_demands() {

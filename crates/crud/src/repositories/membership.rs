@@ -1751,8 +1751,32 @@ mod tests {
                 )
                 .await
                 .expect("creator publish and archive"),
-            Some(true)
+            Some(crate::ThreadManagementChange {
+                changed: true,
+                access_changed: true
+            })
         );
+        // Supplying the current visibility alongside another changed field is
+        // a data update, not an ACL mutation. Comparison stays in the transaction.
+        for (name, changed) in [("Renamed again", true), ("Renamed again", false)] {
+            assert_eq!(
+                store
+                    .update_user_thread_management(
+                        fixture.red_workspace_id.as_str(),
+                        thread_id.as_str(),
+                        Some(&fixture.member_id),
+                        Some(name),
+                        Some(PersistedThreadAccessClass::Workspace),
+                        Some(true),
+                    )
+                    .await
+                    .unwrap(),
+                Some(crate::ThreadManagementChange {
+                    changed,
+                    access_changed: false
+                }),
+            );
+        }
         let published = thread::Entity::find_by_id(thread_id.clone())
             .one(&fixture.database)
             .await
@@ -1760,7 +1784,7 @@ mod tests {
             .expect("published thread exists");
         assert_eq!(published.access_class, "workspace");
         assert_eq!(published.status, "closed");
-        assert_eq!(published.name.as_deref(), Some("Renamed"));
+        assert_eq!(published.name.as_deref(), Some("Renamed again"));
 
         assert_eq!(
             store
@@ -1774,7 +1798,10 @@ mod tests {
                 )
                 .await
                 .expect("Superuser private restore"),
-            Some(true)
+            Some(crate::ThreadManagementChange {
+                changed: true,
+                access_changed: true
+            })
         );
         let restored = thread::Entity::find_by_id(thread_id.clone())
             .one(&fixture.database)

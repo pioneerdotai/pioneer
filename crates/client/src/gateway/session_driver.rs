@@ -271,7 +271,8 @@ impl ClientCore {
                 let missing = self
                     .authorization_snapshot(workspace_id.as_deref(), None)
                     .is_none();
-                let dispatch = {
+                let revalidation_due = self.authorization_revalidation_due();
+                let (dispatch, reconnected) = {
                     let mut owner = self.session_driver.lock().expect("session driver poisoned");
                     if owner.demand.as_ref() != Some(&demand) {
                         return;
@@ -284,13 +285,19 @@ impl ClientCore {
                         .as_ref()
                         .is_some_and(|old| old.transport_revision != intent.transport_revision);
                     owner.authorization_demand = Some(intent);
-                    (missing || reconnected) && changed
+                    (
+                        revalidation_due || (missing || reconnected) && changed,
+                        reconnected,
+                    )
                 };
                 if dispatch {
                     refresh_authorization(pioneer_protocol::AuthorizationCapabilitiesParams {
                         workspace_id,
                         thread_id: None,
                     });
+                    if reconnected {
+                        self.reconcile_administration_after_reconnect();
+                    }
                     return;
                 }
             }

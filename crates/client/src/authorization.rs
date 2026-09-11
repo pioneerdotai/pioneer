@@ -49,6 +49,35 @@ pub struct AuthorizationProjectionStore {
 }
 
 impl AuthorizationProjectionStore {
+    /// Compare effective grants, not revision-dependent transport receipts.
+    /// Learning a previously unseen scope is not a change to an existing grant.
+    pub(crate) fn permissions_changed(&self, next: &Self) -> bool {
+        fn semantic_workspace(
+            value: &pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot,
+        ) -> pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot {
+            let mut value = value.clone();
+            value.operational_resources.fingerprint.clear();
+            value.execution_draft_policy.fingerprint.clear();
+            value.execution_draft_policy.resources.fingerprint.clear();
+            value
+        }
+        self.manifest.as_ref().is_some_and(|old| {
+            next.manifest.as_ref().is_none_or(|new| {
+                old.schema_version != new.schema_version
+                    || old.principal_id != new.principal_id
+                    || old.role_key != new.role_key
+                    || old.global != new.global
+            })
+        }) || self.workspaces.iter().any(|(id, old)| {
+            next.workspaces
+                .get(id)
+                .is_none_or(|new| semantic_workspace(old) != semantic_workspace(new))
+        }) || self
+            .threads
+            .iter()
+            .any(|(id, old)| next.threads.get(id) != Some(old))
+    }
+
     pub fn workspace_snapshots(&self) -> BTreeMap<String, AuthorizationCapabilitySnapshot> {
         self.workspaces
             .keys()
@@ -757,6 +786,49 @@ mod tests {
                     capabilities: AuthorizationThreadCapabilities::default(),
                 }
             }),
+        }
+    }
+
+    #[test]
+    fn effective_grants_ignore_receipts_but_detect_every_permission_scope() {
+        let mut old = AuthorizationProjectionStore::default();
+        old.accept(projection_snapshot(
+            7,
+            "role",
+            Some("workspace"),
+            Some("thread"),
+        ));
+        for change in 0..7 {
+            let mut response = projection_snapshot(8, "role", Some("workspace"), Some("thread"));
+            let workspace = response.workspace.as_mut().unwrap();
+            match change {
+                0 => response.role.display_name = "New label".into(),
+                1 => response.global.can_create_workspace = true,
+                2 => workspace.capabilities.can_use_mcp = true,
+                3 => {
+                    workspace.operational_resources.skills.all = true;
+                    workspace.execution_draft_policy.resources =
+                        workspace.operational_resources.clone();
+                }
+                4 => {
+                    workspace
+                        .execution_draft_policy
+                        .mcp_invocation_limits
+                        .max_arguments_bytes += 1
+                }
+                5 => response.thread.as_mut().unwrap().capabilities.can_read = true,
+                6 => {
+                    response.workspace = None;
+                    response.thread = None;
+                }
+                _ => unreachable!(),
+            }
+            let mut next = AuthorizationProjectionStore::default();
+            assert_eq!(
+                next.accept(response),
+                AuthorizationProjectionAcceptance::Accepted
+            );
+            assert_eq!(old.permissions_changed(&next), change != 0, "case {change}");
         }
     }
 

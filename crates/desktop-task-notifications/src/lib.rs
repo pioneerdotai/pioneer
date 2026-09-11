@@ -141,7 +141,7 @@ pub struct TaskNotificationView {
     delivered: HashMap<String, NativeDelivery>,
     changes: Option<Task<()>>,
     focus: FocusHandle,
-    authorization_revision: u64,
+    permissions_epoch: (Option<(u64, u64)>, Option<u64>),
     opened_operation: u64,
 }
 impl EventEmitter<TaskNotificationEvent> for TaskNotificationView {}
@@ -177,7 +177,7 @@ impl TaskNotificationView {
             delivered: HashMap::new(),
             changes: Some(task),
             focus: cx.focus_handle(),
-            authorization_revision: 0,
+            permissions_epoch: (None, None),
             opened_operation: 0,
         };
         view.sync(cx);
@@ -210,14 +210,12 @@ impl TaskNotificationView {
             }
             cx.notify();
         }
-        let authorization_revision = self
-            .binding
-            .publications
-            .borrow()
-            .get(&ClientScope::Administration { workspace_id: None })
-            .map_or(0, |p| p.revisions().scoped().get());
-        if workspace_changed || authorization_revision != self.authorization_revision {
-            self.authorization_revision = authorization_revision;
+        let permissions_epoch = (
+            self.client.authorization_permissions_epoch(),
+            self.client.gateway_session().startup.connection_id,
+        );
+        if workspace_changed || permissions_epoch != self.permissions_epoch {
+            self.permissions_epoch = permissions_epoch;
             self.refresh();
         }
         let next = self

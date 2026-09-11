@@ -554,7 +554,16 @@ impl ClientCore {
             },
         );
         drop(owner);
+        let invitation_merged = match &result {
+            Ok(AdministrationCompletion::InvitationCreated(response)) => {
+                self.merge_created_invitation(&response.invitation)
+            }
+            _ => false,
+        };
         for target in super::conflict_refetch(&operation.action) {
+            if invitation_merged && matches!(target, super::AdministrationRefetch::InvitationList) {
+                continue;
+            }
             let page = match target {
                 super::AdministrationRefetch::InvitationList => AdministrationPage::Invitations,
                 super::AdministrationRefetch::MemberDirectory => AdministrationPage::Members,
@@ -872,6 +881,7 @@ mod tests {
         enum Interruption {
             Selector,
             RolePolicy,
+            Revocation,
             Session,
             Dismiss,
         }
@@ -892,7 +902,7 @@ mod tests {
                 assert_eq!(request.method, constants::methods::INVITE_CREATE);
                 let response = crate::catalog_test_support::invitation_response();
                 let core = self.core.upgrade().unwrap();
-                // This is Gateway's actual order: committed selector publication,
+                // Compatibility with older Gateways: a selector hint,
                 // invitation-list notification, then the one-time JSON-RPC reply.
                 core.observe_policy_change(&AuthorizationProjectionChangedNotification {
                     policy_generation: PolicyGeneration::new(2).unwrap(),
@@ -916,6 +926,7 @@ mod tests {
                             affected: AuthorizationChangeScope::Global,
                         })
                     }
+                    Interruption::Revocation => core.invalidate_authorization_revision(3),
                     Interruption::Session => {
                         core.begin_authorization_epoch(Some(("replacement".into(), 8)))
                     }
@@ -939,6 +950,7 @@ mod tests {
         for interruption in [
             Interruption::Selector,
             Interruption::RolePolicy,
+            Interruption::Revocation,
             Interruption::Session,
             Interruption::Dismiss,
         ] {
@@ -966,7 +978,10 @@ mod tests {
                 .unwrap();
             let result = operation.execute(Arc::downgrade(&core));
             assert_eq!(calls.load(Ordering::SeqCst), 1);
-            if matches!(interruption, Interruption::Selector) {
+            if matches!(
+                interruption,
+                Interruption::Selector | Interruption::RolePolicy
+            ) {
                 assert!(
                     matches!(result, Ok(AdministrationCompletion::InvitationCreated(_))),
                     "committed invitation response was discarded: {:?}",
@@ -991,7 +1006,7 @@ mod tests {
         }
     }
     #[test]
-    fn invitation_selector_does_not_authorize_an_undispatched_create() {
+    fn actual_revocation_does_not_authorize_an_undispatched_create() {
         let core = Arc::new(fixture());
         core.administration_command_intent(invite());
         let generation = core.administration_operation_snapshot().unwrap().generation;
@@ -1010,6 +1025,7 @@ mod tests {
                     .invitation_id,
             },
         });
+        core.invalidate_authorization_revision(3);
         let result = operation.execute_with_invitation_rpc(Arc::downgrade(&core), |_| {
             panic!("an undispatched command crossed the policy fence")
         });

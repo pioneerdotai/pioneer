@@ -506,6 +506,14 @@ pub async fn find_thread_by_id<C: ConnectionTrait>(
 /// Member callers pass their principal as `expected_creator`; Superuser passes
 /// `None`. Membership rows are deliberately untouched so a
 /// private→workspace→private roundtrip restores the same explicit audience.
+/// Change receipt derived from the old row inside the same writer transaction.
+/// A rename/archive with an unchanged visibility must not invalidate authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadManagementChange {
+    pub changed: bool,
+    pub access_changed: bool,
+}
+
 pub async fn update_user_thread_management(
     db: &DatabaseTransaction,
     workspace_id: &str,
@@ -515,7 +523,7 @@ pub async fn update_user_thread_management(
     access_class: Option<super::membership::PersistedThreadAccessClass>,
     archived: Option<bool>,
     updated_at: DateTimeWithTimeZone,
-) -> Result<Option<bool>> {
+) -> Result<Option<ThreadManagementChange>> {
     let Some(model) = thread::Entity::find_by_id(thread_id.to_owned())
         .filter(thread::Column::WorkspaceId.eq(workspace_id.to_owned()))
         .one(db)
@@ -588,7 +596,10 @@ pub async fn update_user_thread_management(
             .await
             .context("failed to update exact user thread management state")?;
     }
-    Ok(Some(changed))
+    Ok(Some(ThreadManagementChange {
+        changed,
+        access_changed: access_class.is_some_and(|next| next != current_access),
+    }))
 }
 
 pub async fn list_threads_by_workspace<C: ConnectionTrait>(

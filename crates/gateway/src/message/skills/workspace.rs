@@ -392,7 +392,7 @@ impl MessageProcessor {
             .collect()
     }
 
-    pub(super) async fn notify_skills_changed(
+    pub(in crate::message) async fn notify_skills_changed(
         &self,
         workspace_id: &str,
         reason: &str,
@@ -411,7 +411,8 @@ impl MessageProcessor {
         pack_changes: Vec<SkillPackChangedItem>,
         created_at: i64,
     ) {
-        self.publish_resource_selector_change(workspace_id).await;
+        // Catalog availability changes do not change role/ACL grants. The
+        // domain event refreshes consumers without fencing all client screens.
         let notification = skill_projection_changed_notification(
             workspace_id,
             self.next_skills_snapshot_version(),

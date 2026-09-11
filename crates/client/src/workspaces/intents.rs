@@ -86,7 +86,7 @@ impl ClientCore {
     ) -> anyhow::Result<pioneer_protocol::ThreadUpdateResponse> {
         let connection = self.gateway_http_generation();
         let authorization = self.authorization_connection_generation();
-        let authorization_revision = self.authorization_revision();
+        let authorization_epoch = self.authorization_operation_epoch();
         let generation = self.workspace_operation_generation(&params.workspace_id);
         let response =
             crate::transport::ws::command_sender::thread_update(transport, params.clone())?;
@@ -94,7 +94,7 @@ impl ClientCore {
             !self.is_stopped()
                 && self.gateway_http_generation() == connection
                 && self.authorization_connection_generation() == authorization
-                && self.authorization_revision() == authorization_revision
+                && self.authorization_operation_epoch() == authorization_epoch
                 && self.workspace_operation_generation(&params.workspace_id) == generation
                 && response.thread.id == params.thread_id
                 && response.thread.workspace_id == params.workspace_id,
@@ -129,13 +129,13 @@ impl ClientCore {
         }
         let connection = self.gateway_http_generation();
         let authorization_generation = self.authorization_connection_generation();
-        let authorization_revision = self.authorization_revision();
+        let authorization_epoch = self.authorization_operation_epoch();
         let operation_generation = self.workspace_operation_generation(&workspace);
         let still_current = || {
             !self.is_stopped()
                 && self.gateway_http_generation() == connection
                 && self.authorization_connection_generation() == authorization_generation
-                && self.authorization_revision() == authorization_revision
+                && self.authorization_operation_epoch() == authorization_epoch
                 && self.workspace_operation_generation(&workspace) == operation_generation
         };
         let authorization = self

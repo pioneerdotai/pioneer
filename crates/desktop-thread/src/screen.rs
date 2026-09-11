@@ -595,13 +595,15 @@ impl TimelineView {
         let next_session = identity
             .as_ref()
             .map(|p| (p.endpoint_id.clone(), p.connection_generation));
-        let policy_changed = self
-            .identity_input
-            .as_ref()
-            .map(|p| p.capabilities.accepted_revision())
-            != identity
-                .as_ref()
-                .map(|p| p.capabilities.accepted_revision());
+        let policy_changed = self.identity_input.as_ref().and_then(|p| {
+            p.capabilities
+                .snapshot(None, None)
+                .map(|_| p.authorization_change_sequence)
+        }) != identity.as_ref().and_then(|p| {
+            p.capabilities
+                .snapshot(None, None)
+                .map(|_| p.authorization_change_sequence)
+        });
         let authorized = identity.as_ref().is_some_and(|p| p.current_auth.is_some());
         let lost_access = self
             .identity_input

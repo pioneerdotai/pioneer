@@ -121,6 +121,10 @@ impl AuthorizationInvalidationHub {
         Ok(self.current_generation().await?.get())
     }
 
+    /// Publish only a committed difference in role assignments or ACL grants.
+    /// Callers must use the mutation's in-transaction change receipt (or a newly
+    /// created principal/grant). Catalog/profile/invitation data notifications
+    /// have independent revisions and never pass through this policy fence.
     pub(crate) async fn publish_change(
         &self,
         change: AuthorizationChangeKind,

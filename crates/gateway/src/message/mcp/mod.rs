@@ -351,8 +351,8 @@ impl MessageProcessor {
             return;
         }
 
-        self.publish_resource_selector_change(workspace_id).await;
-
+        // Runtime configuration changes availability, not authorization grants.
+        // Keep this on the MCP notification stream instead of a policy fence.
         let snapshot_version = self.next_mcp_snapshot_version();
         let notification = McpChangedNotification {
             workspace_id: workspace_id.to_owned(),

@@ -160,6 +160,29 @@ impl ClientCore {
             }
         }
     }
+    pub(crate) fn reconcile_administration_after_reconnect(&self) {
+        let pages: Vec<_> = {
+            let mut owner = self
+                .administration_store
+                .lock()
+                .expect("administration store poisoned");
+            owner
+                .pages
+                .iter_mut()
+                .filter(|(_, state)| state.demand > 0)
+                .map(|(page, state)| {
+                    // A request on the retired transport cannot satisfy this demand.
+                    // Preserve the displayed rows while reconciling missed data events.
+                    state.request = None;
+                    page.clone()
+                })
+                .collect()
+        };
+        for page in pages {
+            self.administration_page_intent(AdministrationPageIntent::Refresh { page });
+        }
+    }
+
     pub(crate) fn refresh_administration_member_pages(&self) {
         let pages: Vec<_> = self
             .administration_store
@@ -303,6 +326,15 @@ impl ClientCore {
             next.request_cursor = None;
             next.request = AdministrationLoadState::Cancelled;
             return self.publish_administration_page(state, next);
+        }
+        if !allowed
+            && matches!(page, AdministrationPage::Invitations)
+            && state.publication.request == AdministrationLoadState::Cancelled
+            && !state.publication.invitations.is_empty()
+        {
+            // Retained by an invitation-only selector fence. Wait for the
+            // capability read to resume demand instead of clearing the rows.
+            return self.navigation_outcome(ClientTransitionOutcome::Noop);
         }
         if !allowed {
             state.request = None;
@@ -524,25 +556,83 @@ impl ClientCore {
         }
         transition
     }
-    pub(crate) fn invalidate_administration(&self) {
+    /// Merge a successful local create into an authorized, loaded list. A cold
+    /// or invalidated list still needs its authoritative initial read.
+    pub(crate) fn merge_created_invitation(&self, invitation: &InvitationSummary) -> bool {
+        let Some(auth) = self.authorization_snapshot(None, None) else {
+            return false;
+        };
+        let capabilities = principal_presentation_capabilities(&auth);
+        if !capabilities.can_view_invitations {
+            return false;
+        }
+        let mut owner = self
+            .administration_store
+            .lock()
+            .expect("administration store poisoned");
+        let Some(state) = owner.pages.get_mut(&AdministrationPage::Invitations) else {
+            return false;
+        };
+        if state.publication.request != AdministrationLoadState::Ready || state.request.is_some() {
+            return false;
+        }
+        let mut next = (*state.publication).clone();
+        let previous = next
+            .invitations
+            .iter()
+            .position(|row| row.id == invitation.invitation_id);
+        let presentation = super::invitation_list_row(invitation, capabilities);
+        if previous.is_some_and(|i| {
+            next.invitations[i].invitation == *invitation
+                && next.invitations[i].presentation == presentation
+        }) {
+            return true;
+        }
+        let row = Arc::new(AdministrationInvitationRow {
+            id: invitation.invitation_id.clone(),
+            revision: previous.map_or(1, |i| {
+                next.invitations[i]
+                    .revision
+                    .checked_add(1)
+                    .expect("invitation revision exhausted")
+            }),
+            invitation: invitation.clone(),
+            presentation,
+        });
+        if let Some(i) = previous {
+            next.invitations[i] = row;
+        } else {
+            next.invitations.insert(0, row);
+        }
+        self.publish_administration_page(state, next);
+        true
+    }
+    pub(crate) fn invalidate_administration(&self, retain_invitations: bool) {
         let mut owner = self
             .administration_store
             .lock()
             .expect("administration store poisoned");
         owner.events = AdministrationEventTracker::default();
-        for state in owner.pages.values_mut() {
+        for (page, state) in &mut owner.pages {
             state.request = None;
             state.cursors.clear();
             let mut next = (*state.publication).clone();
             next.members.clear();
-            next.invitations.clear();
-            next.next_cursor = None;
+            // An invitation selector update changes one invitation, not access
+            // to the other rows. Keep them visible during reconciliation.
+            if !retain_invitations || !matches!(page, AdministrationPage::Invitations) {
+                next.invitations.clear();
+                next.next_cursor = None;
+            }
             next.request_cursor = None;
             next.request = AdministrationLoadState::Cancelled;
             state.publication = Arc::new(next);
         }
     }
     pub(crate) fn observe_administration_notification(&self, notification: &GatewayNotification) {
+        if let GatewayNotification::MemberChanged(change) = notification {
+            self.observe_principal_data_change(&change.principal_id);
+        }
         let event = match notification {
             GatewayNotification::InvitationChanged(n) => {
                 AdministrationEvent::InvitationChanged(n.clone())
@@ -597,7 +687,9 @@ impl ClientCore {
                 state.request = None;
                 state.cursors.clear();
                 next.next_cursor = None;
-                next.request = AdministrationLoadState::Idle;
+                if next.request != AdministrationLoadState::Cancelled {
+                    next.request = AdministrationLoadState::Idle;
+                }
                 self.publish_administration_page(state, next);
                 if state.demand > 0 {
                     reload.push(page.clone());
@@ -708,6 +800,83 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(64);
         core.administration_store.lock().unwrap().sender = Some(sender);
         (core, receiver)
+    }
+    #[test]
+    fn created_invitation_merges_without_reload_or_losing_rows_and_cursor() {
+        let (core, rx) = fixture();
+        core.administration_page_intent(AdministrationPageIntent::Observe {
+            page: AdministrationPage::Invitations,
+        });
+        let request = rx.try_recv().unwrap();
+        let created = crate::catalog_test_support::invitation_response().invitation;
+        let mut old = created.clone();
+        old.invitation_id = InvitationId::new("IBBBBBBBBBBBBBBBBBBBB").unwrap();
+        core.complete_administration_page(
+            &request,
+            Ok(PageResult::Invitations(InvitationListResponse {
+                invitations: vec![old],
+                next_cursor: Some("next-page".into()),
+            })),
+        );
+        let before = core
+            .administration_page_snapshot(&AdministrationPage::Invitations)
+            .unwrap();
+        assert!(core.merge_created_invitation(&created));
+        let after = core
+            .administration_page_snapshot(&AdministrationPage::Invitations)
+            .unwrap();
+        assert_eq!(after.invitations.len(), 2);
+        assert_eq!(after.invitations[0].id, created.invitation_id);
+        assert!(Arc::ptr_eq(&before.invitations[0], &after.invitations[1]));
+        assert_eq!(after.next_cursor, before.next_cursor);
+        assert_eq!(after.request, AdministrationLoadState::Ready);
+        assert!(rx.try_recv().is_err());
+        assert!(core.merge_created_invitation(&created));
+        assert!(Arc::ptr_eq(
+            &after,
+            &core
+                .administration_page_snapshot(&AdministrationPage::Invitations)
+                .unwrap()
+        ));
+    }
+    #[test]
+    fn invitation_selector_retains_list_but_access_change_clears_it() {
+        let (core, rx) = fixture();
+        let page = AdministrationPage::Invitations;
+        core.administration_page_intent(AdministrationPageIntent::Observe { page: page.clone() });
+        let request = rx.try_recv().unwrap();
+        let invitation = crate::catalog_test_support::invitation_response().invitation;
+        core.complete_administration_page(
+            &request,
+            Ok(PageResult::Invitations(InvitationListResponse {
+                invitations: vec![invitation.clone()],
+                next_cursor: None,
+            })),
+        );
+        let before = core.administration_page_snapshot(&page).unwrap();
+        core.observe_policy_change(&AuthorizationProjectionChangedNotification {
+            policy_generation: PolicyGeneration::new(2).unwrap(),
+            change: AuthorizationChangeKind::ResourceSelector,
+            affected: AuthorizationChangeScope::Invitation {
+                invitation_id: InvitationId::new("IBBBBBBBBBBBBBBBBBBBB").unwrap(),
+            },
+        });
+        let after = core.administration_page_snapshot(&page).unwrap();
+        assert_eq!(after.invitations.len(), 1);
+        assert!(Arc::ptr_eq(&before.invitations[0], &after.invitations[0]));
+        core.administration_page_intent(AdministrationPageIntent::Refresh { page: page.clone() });
+        assert_eq!(
+            core.administration_page_snapshot(&page)
+                .unwrap()
+                .invitations
+                .len(),
+            1
+        );
+        core.invalidate_authorization_revision(3);
+        assert!(
+            core.administration_page_snapshot(&page)
+                .is_none_or(|p| p.invitations.is_empty())
+        );
     }
     fn member(id: &str) -> MemberSummary {
         serde_json::from_value(

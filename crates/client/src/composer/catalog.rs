@@ -1223,7 +1223,7 @@ mod tests {
                 // A routine auth/me read advances its request ticket even if
                 // the transport fails. It does not change the session or policy.
                 let _ = core.refresh_current_auth();
-                assert_ne!(core.current_auth_ticket(), before);
+                assert_eq!(core.current_auth_ticket(), before);
                 core.complete_composer_catalog(
                     work,
                     if fail {

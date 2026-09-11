@@ -79,7 +79,7 @@ impl ClientCore {
             .ok();
         let connection = access.as_ref().map(|access| access.generation);
         if identity.authorization_epoch().0 != epoch
-            || identity.policy_revision().is_none()
+            || identity.permissions_generation().is_none()
             || !identity.connection_matches(connection)
             || access
                 .as_ref()
@@ -218,7 +218,8 @@ impl ClientCore {
                     .identity_authorization
                     .lock()
                     .expect("identity owner poisoned");
-                if identity.authorization_epoch().0 != epoch || identity.policy_revision().is_none()
+                if identity.authorization_epoch().0 != epoch
+                    || identity.permissions_generation().is_none()
                 {
                     return self.reject_intent();
                 }

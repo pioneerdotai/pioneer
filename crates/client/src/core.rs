@@ -2693,16 +2693,10 @@ impl ClientCore {
                 .store
                 .invalidate();
         }
-        let retained_invitation_presentation = evict_protected
-            && self.invalidate_administration_operations(
-                !reset_session,
-                match change {
-                    IdentityPublicationChange::InvitationSelector { epoch } => Some(epoch),
-                    _ => None,
-                },
-            );
+        let retained_invitation_presentation =
+            evict_protected && self.invalidate_administration_operations(!reset_session, None);
         if evict_protected {
-            self.invalidate_administration();
+            self.invalidate_administration(false);
             self.invalidate_provider_runtimes();
             self.invalidate_provider_collections();
             self.invalidate_mcp();
