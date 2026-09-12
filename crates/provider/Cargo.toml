@@ -28,8 +28,8 @@ mime_guess.workspace = true
 tempfile.workspace = true
 image.workspace = true
 tiktoken-rs.workspace = true
-lopdf = { version = "0.39", default-features = false }
-symphonia = { version = "0.5.5", default-features = false, features = ["all"] }
+lopdf = { version = "0.45", default-features = false }
+symphonia = { version = "0.6", default-features = false, features = ["all"] }
 mp4parse = "0.17"
 
 [dev-dependencies]

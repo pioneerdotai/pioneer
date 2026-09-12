@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Mutex, Once};
 
 use sentry::integrations::tracing::{
     EventFilter, EventMapping, breadcrumb_from_event, event_from_event,
@@ -170,17 +170,17 @@ pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
     load_local_dotenv();
 
     let dsn = configured_value(target.dsn_env(), target.build_dsn())?;
-    let dsn = dsn.parse().ok()?;
+    let dsn = dsn.parse::<sentry::types::Dsn>().ok()?;
     let environment =
         configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT).map(Cow::Owned);
 
-    let guard = sentry::init(ClientOptions {
-        dsn: Some(dsn),
-        release: Some(Cow::Owned(format!("pioneer@{}", env!("CARGO_PKG_VERSION")))),
-        environment,
-        before_send: Some(Arc::new(|event| telemetry_enabled().then_some(event))),
-        ..Default::default()
-    });
+    let mut options = ClientOptions::new()
+        .release(format!("pioneer@{}", env!("CARGO_PKG_VERSION")))
+        .before_send(|event| telemetry_enabled().then_some(event));
+    if let Some(environment) = environment {
+        options = options.environment(environment);
+    }
+    let guard = sentry::init((dsn, options));
 
     sentry::configure_scope(|scope| {
         scope.set_tag("pioneer.target", target.tag());
@@ -427,10 +427,10 @@ where
         )));
     }
     if filter.contains(EventFilter::Event) {
-        items.push(EventMapping::Event(event_from_event(
+        items.push(EventMapping::Event(Box::new(event_from_event(
             event,
             None::<&TracingContext<'_, S>>,
-        )));
+        ))));
     }
     EventMapping::Combined(items.into())
 }

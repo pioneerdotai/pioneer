@@ -103,12 +103,12 @@ serde_yaml = "0.9"
 semver = "1"
 toml = "1.1"
 schemars = { version = "1.2", features = ["derive"] }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-uuid = "1.24"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+uuid = "1.26"
 
 # Async
-axum = { version = "=0.8.9", features = ["ws"] }
-tokio = { version = "1.52", features = ["full"] }
+axum = { version = "0.8.9", features = ["ws"] }
+tokio = { version = "1.53", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -118,7 +118,7 @@ log = "0.4"
 env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
-sentry = { version = "0.48", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
+sentry = { version = "0.49", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
 dotenvy = "0.15"
 opentelemetry = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
@@ -131,9 +131,9 @@ markdown = "1"
 
 # Tokenization
 tiktoken-rs = "0.12"
-syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
 two-face = { version = "=0.5.1", default-features = false, features = ["syntect-onig"] }
-unicode-width = "=0.2.2"
+unicode-width = "0.2"
 webbrowser = { version = "1.2.4", features = ["hardened"] }
 
 # Utils
@@ -143,7 +143,7 @@ futures-timer = "3"
 async-trait = "0.1"
 tokio-stream = "0.1"
 config = "0.15"
-dirs = "6"
+dirs = "7"
 rand = "0.10"
 webclaw-core = { git = "https://github.com/0xMassi/webclaw", package = "webclaw-core", default-features = false }
 nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-features = false }
@@ -151,7 +151,7 @@ scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 xcap = "0.9"
-xa11y = "0.11"
+xa11y = "0.14"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"
@@ -186,8 +186,8 @@ sha2 = "0.11"
 zeroize = "1"
 subtle = "2.6"
 hex = "0.4"
-icu_collator = "2.2.1"
-base64 = "0.22"
+icu_collator = "2.3"
+base64 = "0.23"
 url = "2"
 libc = "0.2"
 mime_guess = "2"
@@ -198,11 +198,11 @@ tar = "0.4"
 windows-sys = "0.61"
 
 # Database
-sea-orm = "2.0.0-rc.43"
-sea-orm-migration = "2.0.0-rc.43"
+sea-orm = "2.0"
+sea-orm-migration = "2.0"
 rusqlite = { version = "0.39", default-features = false, features = ["functions", "blob", "bundled", "array"] }
-zstd = { version = "0.13", features = ["experimental"] }
+zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
-process-wrap = { version = "9.1.0", features = ["tokio1"] }
+rmcp = { version = "3.3", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+process-wrap = { version = "10", features = ["tokio1"] }

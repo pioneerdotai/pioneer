@@ -257,10 +257,9 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
         return Ok(duration);
     }
     use symphonia::core::{
-        formats::FormatOptions,
+        formats::{FormatOptions, probe::Hint},
         io::{MediaSourceStream, MediaSourceStreamOptions},
         meta::MetadataOptions,
-        probe::Hint,
     };
     let source = MediaSourceStream::new(
         Box::new(Cursor::new(bytes.to_vec())),
@@ -268,27 +267,32 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
     );
     let mut hint = Hint::new();
     hint.mime_type(mime);
-    let mut probe = symphonia::default::get_probe().format(
+    let mut format = symphonia::default::get_probe().probe(
         &hint,
         source,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
     let mut bases = BTreeMap::new();
     let mut duration = 0_u64;
-    let mut all_known = !probe.format.tracks().is_empty();
-    for track in probe.format.tracks() {
-        let params = &track.codec_params;
-        let base = params.time_base.or_else(|| {
-            params
-                .sample_rate
-                .filter(|rate| *rate > 0)
-                .map(|rate| symphonia::core::units::TimeBase::new(1, rate))
+    let mut all_known = !format.tracks().is_empty();
+    for track in format.tracks() {
+        let base = track.time_base.or_else(|| {
+            track
+                .codec_params
+                .as_ref()
+                .and_then(|params| params.audio())
+                .and_then(|params| params.sample_rate)
+                .and_then(symphonia::core::units::TimeBase::try_from_recip)
         });
         if let Some(base) = base {
             bases.insert(track.id, base);
-            if let Some(frames) = params.n_frames {
-                duration = duration.max(ticks_millis(frames.saturating_add(1), base));
+            if let Some(ticks) = track
+                .duration
+                .map(symphonia::core::units::Duration::get)
+                .or(track.num_frames)
+            {
+                duration = duration.max(ticks_millis(ticks.saturating_add(1), base));
             } else {
                 all_known = false;
             }
@@ -300,14 +304,16 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
         // Demux packet timestamps without decoding or transcribing audio/video.
         let mut complete = false;
         for _ in 0..1_000_000 {
-            match probe.format.next_packet() {
-                Ok(packet) => {
-                    if let Some(base) = bases.get(&packet.track_id()) {
-                        duration = duration.max(ticks_millis(
-                            packet.ts.saturating_add(packet.dur).saturating_add(1),
-                            *base,
-                        ));
+            match format.next_packet() {
+                Ok(Some(packet)) => {
+                    if let Some(base) = bases.get(&packet.track_id) {
+                        let end = packet.pts.saturating_add(packet.dur).get().max(0) as u64;
+                        duration = duration.max(ticks_millis(end.saturating_add(1), *base));
                     }
+                }
+                Ok(None) => {
+                    complete = true;
+                    break;
                 }
                 Err(symphonia::core::errors::Error::IoError(error))
                     if error.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -328,9 +334,9 @@ fn duration_millis(bytes: &[u8], mime: &str) -> Result<u64> {
 }
 fn ticks_millis(ticks: u64, base: symphonia::core::units::TimeBase) -> u64 {
     (u128::from(ticks)
-        .saturating_mul(u128::from(base.numer))
+        .saturating_mul(u128::from(base.numer.get()))
         .saturating_mul(1000)
-        .div_ceil(u128::from(base.denom)))
+        .div_ceil(u128::from(base.denom.get())))
     .min(u128::from(u64::MAX)) as u64
 }
 

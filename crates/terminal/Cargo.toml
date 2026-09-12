@@ -9,7 +9,7 @@ authors = ["Leonard Seibold <git[@]zrtx.de"]
 
 [dependencies]
 gpui-kit.workspace = true
-alacritty_terminal = "0.25.1"
+alacritty_terminal = "0.26"
 anyhow = "1"
 portable-pty = "0.9"
 ropey = "1"
