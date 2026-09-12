@@ -2245,13 +2245,8 @@ async fn dispatch_agent_action_outbox_row(
                     anyhow::anyhow!("committed StartAgent CLI Turn has no security snapshot")
                 })?
                 .snapshot;
-            let history = processor
-                .load_conversation_history_for_workspace(
-                    execution.workspace_id.as_str(),
-                    dispatch.thread_id.as_str(),
-                    dispatch.turn_id.as_str(),
-                )
-                .await;
+            // Main CLI execution receives the new command, never a Pioneer
+            // history projection or a summary prepared for native continuation.
             // The outbox owns activation. Clear only the in-memory rehydrated
             // draft before the shared CLI admission path recreates the same
             // deterministic, already-durable Turn idempotently.
@@ -2269,7 +2264,6 @@ async fn dispatch_agent_action_outbox_row(
                     authority,
                     dispatch.thread_id.clone(),
                     dispatch.thread_id,
-                    history,
                     input_author,
                 )
                 .await?;

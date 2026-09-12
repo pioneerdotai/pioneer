@@ -188,6 +188,15 @@ impl GatewayGeneralSettings {
 
     fn effective(&self, config: &GatewayConfig) -> pioneer_protocol::GatewayGeneralSettings {
         pioneer_protocol::GatewayGeneralSettings {
+            default_model: legacy_model_selection(
+                config.thread.default_model_provider.as_deref(),
+                config.thread.default_model.as_deref(),
+            ),
+            compaction_model: legacy_model_selection(
+                config.thread.summary_model_provider.as_deref(),
+                config.thread.summary_model.as_deref(),
+            ),
+            context_compaction_enabled: true,
             keepawake: self.keepawake.unwrap_or(config.keepawake),
             telemetry_enabled: self.telemetry_enabled.unwrap_or(config.telemetry.enabled),
             preflight_model: model_selection_to_protocol(
@@ -349,6 +358,14 @@ struct GatewayThreadEpisodicSettingsOverride {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct GatewayWorkspaceSettingsOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_model: Option<pioneer_protocol::GatewayModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_model: Option<pioneer_protocol::GatewayModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_compaction_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    cli_compaction_models: BTreeMap<String, pioneer_protocol::GatewayModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     self_improvement: Option<GatewaySelfImprovementConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -721,7 +738,7 @@ impl GatewaySettings {
         has_remote_access_key: bool,
         remote_access_status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot,
     ) -> pioneer_protocol::GatewaySettingsSnapshot {
-        let general = self.effective_general_settings(config);
+        let general = self.effective_general_settings_for_workspace(config, workspace_id);
         pioneer_protocol::GatewaySettingsSnapshot {
             self_improvement_status: None,
             general,
@@ -735,7 +752,7 @@ impl GatewaySettings {
                     workspace_id,
                 )
                 .to_protocol(),
-            cli_runtimes: self.effective_cli_runtime_settings(config),
+            cli_runtimes: self.effective_cli_runtime_settings_for_workspace(config, workspace_id),
             remote_access: self.effective_remote_access_settings(
                 &config.remote_access,
                 has_remote_access_key,
@@ -759,7 +776,35 @@ impl GatewaySettings {
     ) -> Result<GatewaySettingsChangeSet> {
         let mut changes = GatewaySettingsChangeSet::default();
         let normalized_workspace_id = normalize_workspace_settings_key(workspace_id);
-        if let Some(general) = update.general {
+        if let Some(mut general) = update.general {
+            if general.default_model.is_some()
+                || general.compaction_model.is_some()
+                || general.context_compaction_enabled.is_some()
+            {
+                let workspace_id = normalized_workspace_id.as_deref().context(
+                    "workspace context is required to update model or compaction settings",
+                )?;
+                let default_model = general
+                    .default_model
+                    .take()
+                    .map(|value| value.normalized().map_err(anyhow::Error::msg))
+                    .transpose()?;
+                let compaction_model = general
+                    .compaction_model
+                    .take()
+                    .map(|value| value.normalized().map_err(anyhow::Error::msg))
+                    .transpose()?;
+                let workspace = self.workspaces.entry(workspace_id.into()).or_default();
+                if let Some(value) = default_model {
+                    workspace.default_model = Some(value);
+                }
+                if let Some(value) = compaction_model {
+                    workspace.compaction_model = Some(value);
+                }
+                if let Some(value) = general.context_compaction_enabled.take() {
+                    workspace.context_compaction_enabled = Some(value);
+                }
+            }
             changes.general = self.general.apply_protocol_update(general);
         }
         if let Some(memory) = update.memory {
@@ -799,8 +844,44 @@ impl GatewaySettings {
                     normalized_workspace_id.as_deref(),
                 );
         }
-        if let Some(cli_runtimes) = update.cli_runtimes {
-            self.set_cli_runtime_settings(cli_runtimes)?;
+        if let Some(mut cli_runtimes) = update.cli_runtimes {
+            let mut overrides = Vec::new();
+            for instance in &mut cli_runtimes.instances {
+                if let Some(selection) = instance.compaction_model.take() {
+                    let selection = selection.normalized().map_err(anyhow::Error::msg)?;
+                    if let pioneer_protocol::GatewayModelSelection::Explicit {
+                        transport,
+                        instance: selected_instance,
+                        ..
+                    } = &selection
+                    {
+                        let expected = match instance.kind {
+                            pioneer_protocol::CLIAgentRuntimeKind::Codex => {
+                                pioneer_protocol::ModelSelectionTransport::Codex
+                            }
+                            pioneer_protocol::CLIAgentRuntimeKind::Claude => {
+                                pioneer_protocol::ModelSelectionTransport::Claude
+                            }
+                        };
+                        anyhow::ensure!(
+                            selected_instance == &instance.id && transport == &expected,
+                            "CLI compaction override must select its own instance"
+                        );
+                    }
+                    overrides.push((instance.id.clone(), selection));
+                }
+            }
+            let cli_runtimes = GatewayCliRuntimeSettingsOverride::from_protocol(cli_runtimes)?;
+            if !overrides.is_empty() {
+                let workspace_id = normalized_workspace_id
+                    .as_deref()
+                    .context("workspace context is required to update CLI compaction models")?;
+                let workspace = self.workspaces.entry(workspace_id.into()).or_default();
+                for (id, selection) in overrides {
+                    workspace.cli_compaction_models.insert(id, selection);
+                }
+            }
+            self.cli_runtimes = Some(cli_runtimes);
             changes.cli_runtimes = true;
         }
         if let Some(remote_access) = update.remote_access {
@@ -900,6 +981,66 @@ impl GatewaySettings {
         self.workspaces
             .get(workspace_id)
             .and_then(|workspace| workspace.self_improvement.as_ref())
+    }
+
+    pub fn effective_general_settings_for_workspace(
+        &self,
+        config: &GatewayConfig,
+        workspace_id: Option<&str>,
+    ) -> pioneer_protocol::GatewayGeneralSettings {
+        let mut general = self.effective_general_settings(config);
+        if let Some(workspace) = workspace_id.and_then(|id| self.workspaces.get(id)) {
+            if let Some(selection) = &workspace.default_model {
+                general.default_model = selection.clone();
+            }
+            if let Some(selection) = &workspace.compaction_model {
+                general.compaction_model = selection.clone();
+            }
+            general.context_compaction_enabled =
+                workspace.context_compaction_enabled.unwrap_or(true);
+        }
+        general
+    }
+
+    pub fn effective_cli_runtime_settings_for_workspace(
+        &self,
+        config: &GatewayConfig,
+        workspace_id: Option<&str>,
+    ) -> pioneer_protocol::GatewayCliRuntimeSettings {
+        let mut settings = self.effective_cli_runtime_settings(config);
+        let overrides = workspace_id.and_then(|id| self.workspaces.get(id));
+        for instance in &mut settings.instances {
+            instance.compaction_model = Some(
+                overrides
+                    .and_then(|value| value.cli_compaction_models.get(&instance.id))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        settings
+    }
+
+    pub(crate) fn workspace_model_settings(&self) -> BTreeMap<String, WorkspaceModelSettings> {
+        self.workspaces
+            .iter()
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    WorkspaceModelSettings {
+                        default_model: value.default_model.clone().unwrap_or_default(),
+                        compaction_model: value.compaction_model.clone(),
+                        enabled: value.context_compaction_enabled.unwrap_or(true),
+                        cli_overrides: value
+                            .cli_compaction_models
+                            .iter()
+                            .filter_map(|(id, selection)| {
+                                compaction_selection(selection).map(|value| (id.clone(), value))
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect()
     }
 
     pub fn apply_to_gateway_memory_config(
@@ -1945,6 +2086,7 @@ fn cli_runtime_settings_from_gateway_config(
             .map(|instance| {
                 let instance_id = instance.id.clone();
                 pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                    compaction_model: None,
                     id: instance_id.clone(),
                     kind: cli_runtime_kind_to_protocol(instance.kind),
                     display_name: instance.display_name,
@@ -2848,6 +2990,9 @@ backend = "keystore"
         settings
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
+                    default_model: None,
+                    compaction_model: None,
+                    context_compaction_enabled: None,
                     keepawake: Some(true),
                     telemetry_enabled: Some(false),
                     preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
@@ -4086,6 +4231,7 @@ backend = "keystore"
                 cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
                     instances: vec![
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            compaction_model: None,
                             id: "Codex Personal".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex Personal".to_owned(),
@@ -4096,6 +4242,7 @@ backend = "keystore"
                             shadow_home_path: None,
                         },
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            compaction_model: None,
                             id: "codex_work".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex Work".to_owned(),
@@ -4377,6 +4524,7 @@ backend = "keystore"
                 cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
                     instances: vec![
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            compaction_model: None,
                             id: "codex_one".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex CLI".to_owned(),
@@ -4387,6 +4535,7 @@ backend = "keystore"
                             shadow_home_path: None,
                         },
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            compaction_model: None,
                             id: "codex_two".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "codex cli".to_owned(),
@@ -4408,6 +4557,7 @@ backend = "keystore"
                 cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
                     instances: vec![
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            compaction_model: None,
                             id: "codex_one".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex One".to_owned(),
@@ -4418,6 +4568,7 @@ backend = "keystore"
                             shadow_home_path: None,
                         },
                         pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                            compaction_model: None,
                             id: "codex_two".to_owned(),
                             kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                             display_name: "Codex Two".to_owned(),
@@ -4438,6 +4589,7 @@ backend = "keystore"
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 cli_runtimes: Some(pioneer_protocol::GatewayCliRuntimeSettings {
                     instances: vec![pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                        compaction_model: None,
                         id: "codex_bad".to_owned(),
                         kind: pioneer_protocol::CLIAgentRuntimeKind::Codex,
                         display_name: "Codex Bad".to_owned(),
@@ -4747,6 +4899,146 @@ model = "legacy-model"
         std::env::temp_dir().join(format!("pioneer-settings-tests-{nanos}-{id}"))
     }
 
+    #[test]
+    fn workspace_compaction_settings_roundtrip_reset_and_scope() {
+        use pioneer_protocol::{
+            GatewayGeneralSettingsUpdate, GatewayModelSelection as Selection,
+            GatewaySettingsUpdate, ModelSelectionTransport as Transport,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        let config = gateway_config_with_keepawake(false);
+        let selected = Selection::Explicit {
+            transport: Transport::Claude,
+            instance: "claude".into(),
+            model: "claude-selected".into(),
+            reasoning_effort: Some("high".into()),
+        };
+        let update = GatewaySettingsUpdate {
+            general: Some(GatewayGeneralSettingsUpdate {
+                default_model: Some(selected.clone()),
+                compaction_model: Some(selected.clone()),
+                context_compaction_enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(settings.apply_protocol_update(update.clone()).is_err());
+        settings
+            .apply_protocol_update_for_workspace(update, Some("a"))
+            .unwrap();
+        save_gateway_settings(&path, &settings).unwrap();
+        let mut settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        let a = settings.effective_general_settings_for_workspace(&config, Some("a"));
+        let b = settings.effective_general_settings_for_workspace(&config, Some("b"));
+        assert_eq!(a.default_model, selected);
+        assert_eq!(a.compaction_model, selected);
+        assert!(!a.context_compaction_enabled);
+        assert!(b.context_compaction_enabled);
+        assert_eq!(b.compaction_model, Selection::Inherit);
+        let admitted = settings.workspace_model_settings().remove("a").unwrap();
+        settings
+            .apply_protocol_update_for_workspace(
+                GatewaySettingsUpdate {
+                    general: Some(GatewayGeneralSettingsUpdate {
+                        compaction_model: Some(Selection::Inherit),
+                        context_compaction_enabled: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Some("a"),
+            )
+            .unwrap();
+        // Already captured operation settings do not change with the admission gate.
+        assert!(!admitted.enabled);
+        assert_eq!(admitted.compaction_model, Some(selected.clone()));
+        let reset = settings.effective_general_settings_for_workspace(&config, Some("a"));
+        assert_eq!(reset.default_model, selected);
+        assert_eq!(reset.compaction_model, Selection::Inherit);
+        assert!(reset.context_compaction_enabled);
+        save_gateway_settings(&path, &settings).unwrap();
+        let reloaded = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        assert_eq!(
+            reloaded.workspace_model_settings()["a"].compaction_model,
+            Some(Selection::Inherit)
+        );
+    }
+
+    #[test]
+    fn workspace_cli_compaction_override_requires_own_instance_and_preserves_omissions() {
+        use pioneer_protocol::{
+            GatewayCliRuntimeSettings, GatewayModelSelection as Selection, GatewaySettingsUpdate,
+            ModelSelectionTransport as Transport,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        let config = gateway_config_with_keepawake(false);
+        let mut runtimes = GatewayCliRuntimeSettings::default();
+        let selected = Selection::Explicit {
+            transport: Transport::Codex,
+            instance: "codex".into(),
+            model: "codex-selected".into(),
+            reasoning_effort: Some("high".into()),
+        };
+        runtimes.instances[0].compaction_model = Some(selected.clone());
+        let update = GatewaySettingsUpdate {
+            cli_runtimes: Some(runtimes.clone()),
+            ..Default::default()
+        };
+        assert!(settings.apply_protocol_update(update.clone()).is_err());
+        settings
+            .apply_protocol_update_for_workspace(update, Some("a"))
+            .unwrap();
+        let mut invalid = runtimes;
+        invalid.instances[0].compaction_model = Some(Selection::Explicit {
+            transport: Transport::Claude,
+            instance: "claude".into(),
+            model: "other".into(),
+            reasoning_effort: None,
+        });
+        assert!(
+            settings
+                .apply_protocol_update_for_workspace(
+                    GatewaySettingsUpdate {
+                        cli_runtimes: Some(invalid),
+                        ..Default::default()
+                    },
+                    Some("a")
+                )
+                .is_err()
+        );
+        // An older client updating the global instance catalog omits the override.
+        settings
+            .apply_protocol_update(GatewaySettingsUpdate {
+                cli_runtimes: Some(GatewayCliRuntimeSettings::default()),
+                ..Default::default()
+            })
+            .unwrap();
+        save_gateway_settings(&path, &settings).unwrap();
+        let settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
+        let a = settings.effective_cli_runtime_settings_for_workspace(&config, Some("a"));
+        let b = settings.effective_cli_runtime_settings_for_workspace(&config, Some("b"));
+        let codex_a = a
+            .instances
+            .iter()
+            .find(|instance| instance.id == "codex")
+            .unwrap();
+        let codex_b = b
+            .instances
+            .iter()
+            .find(|instance| instance.id == "codex")
+            .unwrap();
+        assert_eq!(codex_a.compaction_model, Some(selected));
+        assert_eq!(codex_b.compaction_model, Some(Selection::Inherit));
+        assert_eq!(
+            settings.workspace_model_settings()["a"].cli_overrides["codex"].model,
+            "codex-selected"
+        );
+    }
+
     fn gateway_config_with_keepawake(keepawake: bool) -> GatewayConfig {
         GatewayConfig {
             settings_version: 1,
@@ -4760,8 +5052,8 @@ model = "legacy-model"
             preflight_model: Default::default(),
             telemetry: Default::default(),
             thread: GatewayThreadConfig {
-                default_model: "gpt-5.4".to_owned(),
-                default_model_provider: "openai".to_owned(),
+                default_model: Some("gpt-5.4".to_owned()),
+                default_model_provider: Some("openai".to_owned()),
                 summary_model: None,
                 summary_model_provider: None,
                 title_model: None,
@@ -4804,5 +5096,70 @@ model = "legacy-model"
                 ..GatewayAuthConfig::default()
             },
         }
+    }
+}
+
+fn compaction_selection(
+    value: &pioneer_protocol::GatewayModelSelection,
+) -> Option<pioneer_compaction::ModelSelection> {
+    let pioneer_protocol::GatewayModelSelection::Explicit {
+        transport,
+        instance,
+        model,
+        reasoning_effort,
+    } = value
+    else {
+        return None;
+    };
+    Some(pioneer_compaction::ModelSelection {
+        transport: match transport {
+            pioneer_protocol::ModelSelectionTransport::Api => pioneer_compaction::Transport::Api,
+            pioneer_protocol::ModelSelectionTransport::Codex => {
+                pioneer_compaction::Transport::Codex
+            }
+            pioneer_protocol::ModelSelectionTransport::Claude => {
+                pioneer_compaction::Transport::Claude
+            }
+        },
+        instance: instance.clone(),
+        model: model.clone(),
+        effort: reasoning_effort.clone(),
+    })
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceModelSettings {
+    pub default_model: pioneer_protocol::GatewayModelSelection,
+    pub compaction_model: Option<pioneer_protocol::GatewayModelSelection>,
+    pub enabled: bool,
+    pub cli_overrides: BTreeMap<String, pioneer_compaction::ModelSelection>,
+}
+impl WorkspaceModelSettings {
+    pub fn compaction(
+        &self,
+        legacy: &pioneer_compaction::CompactionSettings,
+    ) -> pioneer_compaction::CompactionSettings {
+        pioneer_compaction::CompactionSettings {
+            enabled: self.enabled,
+            selection: match &self.compaction_model {
+                Some(value) => compaction_selection(value),
+                None => legacy.selection.clone(),
+            },
+        }
+    }
+}
+
+fn legacy_model_selection(
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> pioneer_protocol::GatewayModelSelection {
+    if provider.is_none() && model.is_none() {
+        return pioneer_protocol::GatewayModelSelection::Inherit;
+    }
+    pioneer_protocol::GatewayModelSelection::Explicit {
+        transport: pioneer_protocol::ModelSelectionTransport::Api,
+        instance: provider.unwrap_or_default().to_owned(),
+        model: model.unwrap_or_default().to_owned(),
+        reasoning_effort: None,
     }
 }

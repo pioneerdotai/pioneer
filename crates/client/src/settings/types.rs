@@ -5,11 +5,12 @@ pub use pioneer_protocol::{
     PROFILE_AVATAR_MAX_DECODED_BYTES, ProfileAvatarInput,
 };
 pub use pioneer_protocol::{
-    GatewayMemoryModelSelection, GatewayMemorySettings, GatewayRemoteAccessErrorKind,
-    GatewayRemoteAccessSettings, GatewayRemoteAccessState, GatewaySelfImprovementModelSelection,
-    GatewaySelfImprovementSettings, GatewayThreadEpisodicVectorLocalModelStatus,
-    GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorRefillStatus,
-    GatewayThreadEpisodicVectorSearchSettings, GatewayVoiceInputProvider,
-    GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings, ProviderModelInfo, RuntimeSummary,
-    SelfImprovementPhase, SelfImprovementStatusReason,
+    GatewayGeneralSettings, GatewayMemoryModelSelection, GatewayMemorySettings,
+    GatewayModelSelection, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
+    GatewayRemoteAccessState, GatewaySelfImprovementModelSelection, GatewaySelfImprovementSettings,
+    GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
+    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
+    GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
+    ModelSelectionTransport, ProviderModelInfo, RuntimeSummary, SelfImprovementPhase,
+    SelfImprovementStatusReason,
 };

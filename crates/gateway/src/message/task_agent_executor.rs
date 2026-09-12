@@ -1773,28 +1773,25 @@ impl TaskAgentExecutor {
             .system_thread_start_seeded(context.workspace_id.clone(), thread_params, None, None)
             .await
             .context("failed to create hidden task thread")?;
-        let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
-            Some(
-                load_task_execution_conversation_scope(
-                    processor,
-                    task,
-                    run,
-                    parent,
-                    child_runtime.task_run_turn.kind,
-                    child_thread_id.as_str(),
-                    child_turn_id.as_str(),
-                    thread_outcome.started_notification.thread.model.as_str(),
-                    thread_outcome
-                        .started_notification
-                        .thread
-                        .model_provider
-                        .as_str(),
-                )
-                .await?,
+        let frozen_conversation_scope = Some(
+            load_task_execution_conversation_scope(
+                processor,
+                task,
+                agent_spec,
+                run,
+                parent,
+                child_runtime.task_run_turn.kind,
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                thread_outcome.started_notification.thread.model.as_str(),
+                thread_outcome
+                    .started_notification
+                    .thread
+                    .model_provider
+                    .as_str(),
             )
-        } else {
-            None
-        };
+            .await?,
+        );
         let frozen_parent_history = frozen_conversation_scope
             .as_ref()
             .map(|(_, history)| history.as_slice());
@@ -1935,10 +1932,6 @@ impl TaskAgentExecutor {
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
             let action_author = input_author;
             return message_future(async move {
-                let conversation_history = frozen_conversation_scope
-                    .as_ref()
-                    .map(|(_, history)| history.clone())
-                    .unwrap_or_default();
                 // Child-scoped authorization is revalidated while CLI MCP and skill
                 // projections are committed. Persist the durable lineage first so
                 // those checks can prove that the hidden thread belongs to the
@@ -1980,7 +1973,6 @@ impl TaskAgentExecutor {
                             continuation_thread_id,
                             task_run_id,
                             execution_id,
-                            conversation_history,
                             action_author,
                             turn_response,
                         )
@@ -2130,12 +2122,14 @@ impl TaskAgentExecutor {
         let workflow_processor = Arc::clone(processor);
         let workflow_context = (*context).clone();
         let workflow_task = (*task).clone();
+        let workflow_agent_spec = agent_spec.clone();
         let workflow_run = (*run).clone();
         let workflow_parent = (*parent).clone();
         message_fresh_task(async move {
             let processor = &workflow_processor;
             let context = &workflow_context;
             let task = &workflow_task;
+            let agent_spec = &workflow_agent_spec;
             let run = &workflow_run;
             let parent = &workflow_parent;
             let turn_outcome = processor
@@ -2450,6 +2444,7 @@ impl TaskAgentExecutor {
             load_task_execution_conversation_scope(
                 processor,
                 task,
+                agent_spec,
                 run,
                 parent,
                 child_runtime.task_run_turn.kind,
@@ -2829,28 +2824,25 @@ impl TaskAgentExecutor {
             .await
             .context("failed to restore revision task thread")?;
         let child_permission_profile = turn_settings.permission_profile.clone();
-        let frozen_conversation_scope = if task_attachment(task) == TaskAttachmentMode::Detached {
-            Some(
-                load_task_execution_conversation_scope(
-                    processor,
-                    task,
-                    run,
-                    &parent,
-                    child_runtime.task_run_turn.kind,
-                    child_runtime.task_run_turn.thread_id.as_str(),
-                    child_runtime.task_run_turn.turn_id.as_str(),
-                    thread_outcome.started_notification.thread.model.as_str(),
-                    thread_outcome
-                        .started_notification
-                        .thread
-                        .model_provider
-                        .as_str(),
-                )
-                .await?,
+        let frozen_conversation_scope = Some(
+            load_task_execution_conversation_scope(
+                processor,
+                task,
+                agent_spec,
+                run,
+                &parent,
+                child_runtime.task_run_turn.kind,
+                child_runtime.task_run_turn.thread_id.as_str(),
+                child_runtime.task_run_turn.turn_id.as_str(),
+                thread_outcome.started_notification.thread.model.as_str(),
+                thread_outcome
+                    .started_notification
+                    .thread
+                    .model_provider
+                    .as_str(),
             )
-        } else {
-            None
-        };
+            .await?,
+        );
         let input = materialize_child_task_input(
             materialize_child_task_prompt(
                 processor,
@@ -2926,10 +2918,6 @@ impl TaskAgentExecutor {
                     parent.parent_thread_id.clone(),
                     run.id.clone(),
                     execution.id.clone(),
-                    frozen_conversation_scope
-                        .as_ref()
-                        .map(|(_, history)| history.clone())
-                        .unwrap_or_default(),
                     action_author,
                     turn_response.clone(),
                 )
@@ -3450,6 +3438,7 @@ impl TaskAgentExecutor {
             load_task_execution_conversation_scope(
                 processor,
                 task,
+                agent_spec,
                 run,
                 &parent,
                 child_runtime.task_run_turn.kind,
@@ -4085,8 +4074,10 @@ impl TaskAgentExecutor {
         }
         let (hook_runtime_context, history) =
             crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+                processor.crud_store.as_ref(),
                 &runtime_snapshot,
             )
+            .await
             .context("failed to restore frozen Task conversation scope")?;
         let agent_skill_overlay =
             crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
@@ -4628,6 +4619,14 @@ impl TaskAgentExecutor {
             .get_task(child_runtime.task_run_turn.task_id.as_str())
             .await?
             .ok_or_else(|| anyhow!("task `{}` not found", child_runtime.task_run_turn.task_id))?;
+        // Freeze the completed source before a pending/accepted candidate can
+        // become visible to reviewer acceptance or the delivery worker.
+        crate::compaction::frozen::capture_task_output(
+            processor.crud_store.as_ref(),
+            task_response.task.workspace_id.as_str(),
+            &child_runtime.task_run_turn,
+        )
+        .await?;
         let agent_spec =
             select_agent_spec(&task_response, child_runtime.task_run_turn.run_id.as_str())
                 .ok_or_else(|| {
@@ -5257,9 +5256,11 @@ impl TaskAgentExecutor {
             text_elements: Vec::new(),
         }];
         if let Some((runtime_id, runtime_kind)) = turn_settings.cli_runtime.clone() {
-            let (_, conversation_history) = load_task_execution_conversation_scope(
+            // Preserve accepted-basis validation; primary CLI owns its history.
+            let _ = load_task_execution_conversation_scope(
                 processor,
                 task,
+                agent_spec,
                 &run,
                 &parent,
                 task_run_turn.kind,
@@ -5303,7 +5304,6 @@ impl TaskAgentExecutor {
                     parent.parent_thread_id.clone(),
                     run.id.clone(),
                     reviewer_execution_id.clone(),
-                    conversation_history,
                     action_author,
                     turn_response.clone(),
                 )
@@ -5578,6 +5578,7 @@ impl TaskAgentExecutor {
             load_task_execution_conversation_scope(
                 processor,
                 task,
+                agent_spec,
                 &run,
                 &parent,
                 task_run_turn.kind,
@@ -6467,13 +6468,14 @@ fn task_hook_runtime_context(
 async fn load_task_execution_conversation_scope(
     processor: &Arc<MessageProcessor>,
     task: &Task,
+    agent_spec: &TaskAgentSpec,
     run: &TaskRun,
     parent: &TaskParentRuntimeContext,
     task_run_turn_kind: TaskRunTurnKind,
     execution_thread_id: &str,
     execution_turn_id: &str,
-    fallback_model: &str,
-    fallback_model_provider: &str,
+    _fallback_model: &str,
+    _fallback_model_provider: &str,
 ) -> Result<(
     AgentTurnHookRuntimeContext,
     Vec<pioneer_provider::ChatMessage>,
@@ -6487,11 +6489,12 @@ async fn load_task_execution_conversation_scope(
         if snapshot.workspace_id != task.workspace_id || snapshot.thread_id != execution_thread_id {
             bail!("task child runtime snapshot identity mismatch for turn `{execution_turn_id}`");
         }
-        return crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&snapshot)
-            .context("failed to restore frozen Task conversation scope");
-    }
-    if task_attachment(task) != TaskAttachmentMode::Detached {
-        return Ok((expected_hook_context, Vec::new()));
+        return crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+            processor.crud_store.as_ref(),
+            &snapshot,
+        )
+        .await
+        .context("failed to restore frozen Task conversation scope");
     }
     let source_turn_id = task
         .metadata
@@ -6504,8 +6507,15 @@ async fn load_task_execution_conversation_scope(
         .get_task_run_conversation_snapshot(run.id.as_str())
         .await?
     {
-        let history =
-            restore_task_run_conversation_snapshot(&snapshot, task, parent, source_turn_id)?;
+        let history = restore_task_run_conversation_snapshot(
+            processor.crud_store.as_ref(),
+            &snapshot,
+            task,
+            parent,
+            source_turn_id,
+            execution_thread_id,
+        )
+        .await?;
         return Ok((expected_hook_context, history));
     }
     if let Some(retry_of_run_id) = run.retry_of_run_id.as_deref()
@@ -6514,8 +6524,15 @@ async fn load_task_execution_conversation_scope(
             .get_task_run_conversation_snapshot(retry_of_run_id)
             .await?
     {
-        let history =
-            restore_task_run_conversation_snapshot(&snapshot, task, parent, source_turn_id)?;
+        restore_task_run_conversation_snapshot(
+            processor.crud_store.as_ref(),
+            &snapshot,
+            task,
+            parent,
+            source_turn_id,
+            execution_thread_id,
+        )
+        .await?;
         let persisted = processor
             .crud_store
             .insert_task_run_conversation_snapshot_if_absent(
@@ -6525,27 +6542,71 @@ async fn load_task_execution_conversation_scope(
                     workspace_id: task.workspace_id.clone(),
                     conversation_thread_id: parent.parent_thread_id.clone(),
                     source_turn_id: source_turn_id.map(str::to_owned),
-                    history_json: serde_json::to_string(&history)
-                        .context("failed to serialize inherited Task conversation snapshot")?,
+                    // Retain the accepted snapshot descriptor verbatim across
+                    // retries; materialization must never create a new history.
+                    history_json: snapshot.history_json.clone(),
                     created_at: chrono::Utc::now().fixed_offset(),
                 },
             )
             .await?;
-        let history =
-            restore_task_run_conversation_snapshot(&persisted, task, parent, source_turn_id)?;
+        let history = restore_task_run_conversation_snapshot(
+            processor.crud_store.as_ref(),
+            &persisted,
+            task,
+            parent,
+            source_turn_id,
+            execution_thread_id,
+        )
+        .await?;
         return Ok((expected_hook_context, history));
     }
-    let history = processor
-        .load_conversation_history_for_workspace_in_execution_excluding_turn(
+    let composer = task
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.composer_work.as_ref());
+    let default_policy = crate::compaction::frozen::default_task_context_policy();
+    // Delayed/recurring runs freeze at execution admission. Resolve the current
+    // actor from the durable Task admission; a delivery receipt alone grants no
+    // access to the child originals. Accepted retry snapshots above stay fixed.
+    let admission = processor
+        .crud_store
+        .get_task_execution_admission(task.id.as_str())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Task has no execution admission for context capture"))?;
+    let authority = crate::authorization::ExecutionAuthorizationContext::load_for_task_admission(
+        processor.crud_store.as_ref(),
+        &admission,
+    )
+    .await?;
+    anyhow::ensure!(
+        authority.workspace_id() == task.workspace_id,
+        "Task context admission workspace mismatch"
+    );
+    let current = processor
+        .execution_leases
+        .revalidate_context(
+            processor.crud_store.as_ref(),
+            &authority,
+            crate::authorization::ResourceAction::TaskCreate,
+            processor.current_authorization_revision().await?,
+        )
+        .await?;
+    let history_json = processor
+        .capture_authorized_task_basis(
+            current.principal(),
             task.workspace_id.as_str(),
             parent.parent_thread_id.as_str(),
-            execution_thread_id,
-            execution_turn_id,
             source_turn_id,
-            Some(fallback_model),
-            Some(fallback_model_provider),
+            composer.map(|work| work.launch.turn_id.as_str()),
+            composer.is_none().then(|| {
+                agent_spec
+                    .context_policy
+                    .as_ref()
+                    .unwrap_or(&default_policy)
+            }),
         )
-        .await;
+        .await
+        .context("failed to freeze Task conversation sources")?;
     let persisted = processor
         .crud_store
         .insert_task_run_conversation_snapshot_if_absent(
@@ -6555,21 +6616,30 @@ async fn load_task_execution_conversation_scope(
                 workspace_id: task.workspace_id.clone(),
                 conversation_thread_id: parent.parent_thread_id.clone(),
                 source_turn_id: source_turn_id.map(str::to_owned),
-                history_json: serde_json::to_string(&history)
-                    .context("failed to serialize Task conversation snapshot")?,
+                history_json,
                 created_at: chrono::Utc::now().fixed_offset(),
             },
         )
         .await?;
-    let history = restore_task_run_conversation_snapshot(&persisted, task, parent, source_turn_id)?;
+    let history = restore_task_run_conversation_snapshot(
+        processor.crud_store.as_ref(),
+        &persisted,
+        task,
+        parent,
+        source_turn_id,
+        execution_thread_id,
+    )
+    .await?;
     Ok((expected_hook_context, history))
 }
 
-fn restore_task_run_conversation_snapshot(
+async fn restore_task_run_conversation_snapshot(
+    store: &pioneer_crud::CrudStore,
     snapshot: &pioneer_crud::TaskRunConversationSnapshotRecord,
     task: &Task,
     parent: &TaskParentRuntimeContext,
     source_turn_id: Option<&str>,
+    execution_thread_id: &str,
 ) -> Result<Vec<pioneer_provider::ChatMessage>> {
     if snapshot.task_id != task.id
         || snapshot.workspace_id != task.workspace_id
@@ -6581,8 +6651,31 @@ fn restore_task_run_conversation_snapshot(
             snapshot.run_id
         );
     }
-    serde_json::from_str(snapshot.history_json.as_str())
-        .context("failed to restore frozen Task conversation history")
+    let allowed = crate::compaction::frozen::accepted_history_scopes(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.conversation_thread_id,
+        &snapshot.history_json,
+    )
+    .await?;
+    let mut history = crate::turn_runtime_snapshot::restore_history_json(
+        store,
+        &snapshot.workspace_id,
+        &allowed,
+        &snapshot.history_json,
+    )
+    .await
+    .context("failed to restore frozen Task conversation history")?;
+    crate::compaction::frozen::hydrate_accepted_own(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.conversation_thread_id,
+        &snapshot.history_json,
+        execution_thread_id,
+        &mut history,
+    )
+    .await?;
+    Ok(history)
 }
 
 async fn ensure_task_run_occurrence_context(
@@ -8653,10 +8746,19 @@ async fn render_context_policy(
     parent: &TaskParentRuntimeContext,
     frozen_parent_history: Option<&[pioneer_provider::ChatMessage]>,
 ) -> Result<Option<String>> {
+    // Canonical frozen history is already delivered through the provider/CLI
+    // history channel. Repeating it in the Task input would persist a second
+    // transcript and make inherited work look like the child's new command.
+    // Previously accepted legacy arrays retain their explicit compatibility path.
+    let history_is_separate = frozen_parent_history
+        .is_some_and(|history| history.iter().all(|message| message.provenance.is_some()));
     let Some(policy) = agent_spec.context_policy.as_ref() else {
+        if history_is_separate {
+            return Ok(None);
+        }
         let rendered = match frozen_parent_history {
             Some(history) => render_frozen_parent_history(history, Some(6), true),
-            None => render_parent_history(processor, parent, Some(6), true).await?,
+            None => render_parent_history(processor, parent, Some(6)).await?,
         };
         return Ok(rendered.map(frame_background_context));
     };
@@ -8669,12 +8771,13 @@ async fn render_context_policy(
             .as_ref()
             .and_then(render_agent_context)
             .map(|value| format!("Context:\n{value}"))),
+        _ if history_is_separate => Ok(None),
         TaskAgentContextMode::SummaryOnly => match frozen_parent_history {
             Some(history) => Ok(render_frozen_parent_summary(
                 history,
                 policy.include_parent_summary,
             )),
-            None => render_parent_summary(processor, parent, policy.include_parent_summary).await,
+            None => Ok(None),
         },
         TaskAgentContextMode::LastNTurns => {
             let max_turns = policy.max_turns.map(|value| value as usize).or(Some(6));
@@ -8684,15 +8787,7 @@ async fn render_context_policy(
                     max_turns,
                     policy.include_parent_summary,
                 )),
-                None => {
-                    render_parent_history(
-                        processor,
-                        parent,
-                        max_turns,
-                        policy.include_parent_summary,
-                    )
-                    .await
-                }
+                None => render_parent_history(processor, parent, max_turns).await,
             }
         }
         TaskAgentContextMode::InheritParent => {
@@ -8703,15 +8798,7 @@ async fn render_context_policy(
                     max_turns,
                     policy.include_parent_summary,
                 )),
-                None => {
-                    render_parent_history(
-                        processor,
-                        parent,
-                        max_turns,
-                        policy.include_parent_summary,
-                    )
-                    .await
-                }
+                None => render_parent_history(processor, parent, max_turns).await,
             }
         }
     }? {
@@ -8792,34 +8879,12 @@ fn frame_background_context(context: String) -> String {
     )
 }
 
-async fn render_parent_summary(
-    processor: &Arc<MessageProcessor>,
-    parent: &TaskParentRuntimeContext,
-    include_parent_summary: bool,
-) -> Result<Option<String>> {
-    if !include_parent_summary {
-        return Ok(None);
-    }
-    let Some((summary, _)) = processor
-        .crud_store
-        .get_thread_summary(parent.parent_thread_id.as_str())
-        .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(format!("Parent thread summary:\n{summary}")))
-}
-
 async fn render_parent_history(
     processor: &Arc<MessageProcessor>,
     parent: &TaskParentRuntimeContext,
     max_turns: Option<usize>,
-    include_parent_summary: bool,
 ) -> Result<Option<String>> {
     let mut parts = Vec::new();
-    if let Some(summary) = render_parent_summary(processor, parent, include_parent_summary).await? {
-        parts.push(summary);
-    }
 
     let max_turns = max_turns.unwrap_or(6).max(1);
     let parent_workspace_id = processor
@@ -10101,10 +10166,6 @@ mod tests {
                 summary_model_provider: Some("echo".to_owned()),
                 title_model: Some("test-model".to_owned()),
                 title_model_provider: Some("echo".to_owned()),
-            },
-            ContextBudget {
-                max_context_tokens: 128_000,
-                response_reserve_tokens: 16_000,
             },
             test_tool_loop_config_for_task_artifacts(),
         ));

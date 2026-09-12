@@ -202,6 +202,8 @@ struct ApiUsage {
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
     #[serde(default)]
+    usage: Option<ApiUsage>,
+    #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
     error: Option<StreamError>,
@@ -662,10 +664,15 @@ impl crate::traits::Provider for GlmProvider {
         tokio::spawn(async move {
             let mut decoder = IncrementalLineDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
 
             tokio::pin!(byte_stream);
 
-            while let Some(result) = byte_stream.next().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -696,18 +703,36 @@ impl crate::traits::Provider for GlmProvider {
                     };
 
                     if data.trim() == "[DONE]" {
-                        if tx
-                            .send(Err(anyhow!("GLM stream ended without a finish_reason")))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                anyhow!("provider stream ended without a finish_reason")
+                            });
+                        let _ = tx.send(terminal).await;
                         return;
                     }
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
+                            if terminal_reason.is_some() && !resp.choices.is_empty() {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent choices after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if let Some(usage) = resp.usage {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(TokenUsage {
+                                        input_tokens: usage.prompt_tokens,
+                                        output_tokens: usage.completion_tokens,
+                                    })))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if let Some(error) = resp.error {
                                 if tx
                                     .send(Err(anyhow!("GLM stream error: {}", error.description())))
@@ -772,14 +797,7 @@ impl crate::traits::Provider for GlmProvider {
                                             return;
                                         }
                                     }
-                                    if tx
-                                        .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                    return;
+                                    terminal_reason = Some(termination);
                                 }
                             }
                         }
@@ -797,13 +815,13 @@ impl crate::traits::Provider for GlmProvider {
                 }
             }
 
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("GLM stream ended before a provider terminal marker"));
-            if tx.send(Err(error)).await.is_err() {
-                return;
-            }
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => terminal_reason
+                    .map(StreamChunk::final_chunk_with)
+                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
+            };
+            let _ = tx.send(terminal).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

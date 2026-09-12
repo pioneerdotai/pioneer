@@ -20,6 +20,7 @@ pub struct ProviderCatalogConfig {
     registrar: Arc<dyn ClientBindingRegistrar>,
     credential: Arc<dyn ProviderCredentialPort>,
     external: Arc<dyn ProviderExternalNavigationPort>,
+    model_picker: Arc<dyn ProviderModelPickerPort>,
 }
 impl ProviderCatalogConfig {
     pub fn new(
@@ -27,12 +28,14 @@ impl ProviderCatalogConfig {
         registrar: Arc<dyn ClientBindingRegistrar>,
         credential: Arc<dyn ProviderCredentialPort>,
         external: Arc<dyn ProviderExternalNavigationPort>,
+        model_picker: Arc<dyn ProviderModelPickerPort>,
     ) -> Self {
         Self {
             client,
             registrar,
             credential,
             external,
+            model_picker,
         }
     }
 }
@@ -60,6 +63,7 @@ pub struct ProviderCatalogView {
     pub(crate) refresh_button: Entity<crate::activity::RefreshButton>,
     pub(crate) credential: Arc<dyn ProviderCredentialPort>,
     pub(crate) external: Arc<dyn ProviderExternalNavigationPort>,
+    pub(crate) model_picker: Arc<dyn ProviderModelPickerPort>,
     pub(crate) dialogs: Vec<Entity<crate::dialog_lifetime::DialogLifetime>>,
     _release: Subscription,
     pub(crate) mount: u64,
@@ -117,6 +121,7 @@ impl ProviderCatalogView {
                 demanded: None,
                 credential: config.credential,
                 external: config.external,
+                model_picker: config.model_picker,
                 mount,
                 operation: None,
                 window_active: window.is_window_active(),
@@ -446,7 +451,7 @@ mod tests {
     use super::{ProviderCatalogConfig, ProviderCatalogView};
     use crate::ports::*;
     use gpui_kit::component::Root;
-    use gpui_kit::{App, AppContext, TestAppContext};
+    use gpui_kit::{App, TestAppContext, Window};
     use pioneer_client::{
         core::{ClientCore, ClientScope},
         navigation::{NavigationIntent, SemanticDestination},
@@ -479,6 +484,11 @@ mod tests {
             _: &mut App,
         ) -> ProviderEffectCompletion {
             panic!("unexpected platform effect")
+        }
+    }
+    impl ProviderModelPickerPort for Ports {
+        fn open(&self, _: ProviderModelPickerRequest, _: &mut Window, _: &mut App) {
+            panic!("model picker is outside this retained-publication fixture");
         }
     }
     impl ProviderExternalNavigationPort for Ports {
@@ -518,6 +528,7 @@ mod tests {
                     ProviderCatalogConfig::new(
                         core.clone(),
                         Arc::new(Registrar(scopes.clone())),
+                        Arc::new(Ports),
                         Arc::new(Ports),
                         Arc::new(Ports),
                     ),

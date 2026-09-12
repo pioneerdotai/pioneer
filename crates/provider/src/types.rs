@@ -405,8 +405,38 @@ impl ProviderReplayState {
     }
 }
 
+/// Runtime-only provenance. Provider wire serializers never emit this field,
+/// and deserializing a provider response cannot manufacture trusted sources.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageSourceRef {
+    pub scope: String,
+    pub id: String,
+    pub version: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageProvenance {
+    /// Exact Task command turn for a delivered outcome in the same source
+    /// thread. Set by trusted canonical projection, never inferred from text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_turn_id: Option<String>,
+    pub workspace_id: String,
+    /// Canonical storage scope. Adopting work never moves its source records.
+    pub thread_id: String,
+    /// Explicit execution-context ownership assigned only by the accepted
+    /// Gateway composition. None retains ownership in the canonical thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_thread: Option<String>,
+    pub unit_id: String,
+    pub sources: Vec<MessageSourceRef>,
+    pub complete: bool,
+    pub protected_input: bool,
+    pub inherited: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
+    #[serde(skip)]
+    pub provenance: Option<MessageProvenance>,
     pub role: Role,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,6 +456,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::System,
             content: content.into(),
             reasoning_content: None,
@@ -439,6 +470,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::User,
             content: content.into(),
             reasoning_content: None,
@@ -452,6 +484,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Assistant,
             content: content.into(),
             reasoning_content: None,
@@ -465,6 +498,7 @@ impl ChatMessage {
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Tool,
             content: content.into(),
             reasoning_content: None,
@@ -498,6 +532,7 @@ impl ChatMessage {
         provider_replay_state: Option<ProviderReplayState>,
     ) -> Self {
         Self {
+            provenance: None,
             role: Role::Assistant,
             content: content.map(Into::into).unwrap_or_default(),
             reasoning_content: reasoning_content.map(Into::into),
@@ -515,6 +550,7 @@ impl ChatMessage {
         content: impl Into<String>,
     ) -> Self {
         Self {
+            provenance: None,
             role: Role::Tool,
             content: content.into(),
             reasoning_content: None,
@@ -528,6 +564,7 @@ impl ChatMessage {
 
     pub fn user_parts(parts: Vec<MessageContentPart>) -> Self {
         Self {
+            provenance: None,
             role: Role::User,
             content: String::new(),
             reasoning_content: None,
@@ -876,8 +913,22 @@ impl ProviderTermination {
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    /// Full effective input, including cache reads/writes exactly once.
+    /// None means unreported, never zero by implication.
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Stream usage fields are cumulative snapshots, not increments.
+    pub fn update(&mut self, snapshot: &Self) {
+        if snapshot.input_tokens.is_some() {
+            self.input_tokens = snapshot.input_tokens;
+        }
+        if snapshot.output_tokens.is_some() {
+            self.output_tokens = snapshot.output_tokens;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -898,6 +949,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
+    pub usage: Option<TokenUsage>,
     pub delta: String,
     pub reasoning_delta: Option<String>,
     pub tool_calls: Vec<ProviderToolCall>,
@@ -909,8 +961,21 @@ pub struct StreamChunk {
 }
 
 impl StreamChunk {
+    pub fn usage(usage: TokenUsage) -> Self {
+        Self {
+            usage: Some(usage),
+            ..Self::delta("")
+        }
+    }
+
+    pub fn with_usage(mut self, usage: Option<TokenUsage>) -> Self {
+        self.usage = usage;
+        self
+    }
+
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
+            usage: None,
             delta: text.into(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
@@ -922,6 +987,7 @@ impl StreamChunk {
 
     pub fn reasoning(text: impl Into<String>) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: Some(text.into()),
             tool_calls: Vec::new(),
@@ -933,6 +999,7 @@ impl StreamChunk {
 
     pub fn tool_calls(tool_calls: Vec<ProviderToolCall>) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: None,
             tool_calls,
@@ -944,6 +1011,7 @@ impl StreamChunk {
 
     pub fn provider_replay_state(state: ProviderReplayState) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
@@ -955,6 +1023,7 @@ impl StreamChunk {
 
     pub fn final_chunk_with(termination: ProviderTermination) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
@@ -1475,5 +1544,36 @@ mod tests {
             "Stable\n<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->\nDynamic"
         );
         assert_eq!(rendered[1].role, Role::User);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    #[test]
+    fn runtime_provenance_survives_cloning_but_never_provider_serialization() {
+        let provenance = MessageProvenance {
+            logical_turn_id: Some("command-turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "round".into(),
+            sources: vec![MessageSourceRef {
+                scope: "input:turn".into(),
+                id: "source".into(),
+                version: "input-revision:1".into(),
+            }],
+            complete: true,
+            protected_input: true,
+            inherited: false,
+        };
+        let mut message = ChatMessage::user("text");
+        message.provenance = Some(provenance.clone());
+        assert_eq!(message.clone().provenance, Some(provenance.clone()));
+        let mut wire = serde_json::to_value(message).unwrap();
+        assert!(wire.get("provenance").is_none());
+        wire["provenance"] = serde_json::to_value(provenance).unwrap();
+        let received: ChatMessage = serde_json::from_value(wire).unwrap();
+        assert_eq!(received.provenance, None);
     }
 }

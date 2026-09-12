@@ -425,3 +425,18 @@ microphone_no_device_available = "Kein Eingabemikrofon verfügbar."
 microphone_sample_format_unsupported = "Desktop-Mikrofon-Sampleformat %{format} wird nicht unterstützt."
 microphone_no_input_stream = "Standardmikrofon kann keinen Eingabestream bereitstellen."
 microphone_capture_failed = "Mikrofonaufnahme fehlgeschlagen: %{error}"
+
+[settings.default_model]
+label = "Standardmodell des Arbeitsbereichs"
+
+[settings.compaction.model]
+label = "Modell zur Kontextkomprimierung"
+
+[settings.compaction.enabled]
+label = "Kontextkomprimierung"
+description = "Lange Gesprächsverläufe in diesem Arbeitsbereich komprimieren."
+
+[settings.model]
+inherit = "Modell des aktuellen Gesprächsschritts verwenden"
+choose = "Auswählen…"
+reset = "Zurücksetzen"

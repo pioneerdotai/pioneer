@@ -53,3 +53,63 @@ pub trait ProviderExternalNavigationPort {
         cx: &mut App,
     ) -> ProviderEffectCompletion;
 }
+
+/// Provider forms delegate the existing Desktop model dialog to shell composition.
+pub struct ProviderModelPickerRequest {
+    title: String,
+    workspace_id: String,
+    selection: pioneer_client::composer::model_selection::ModelSelectorSelection,
+    on_save: std::rc::Rc<
+        dyn Fn(pioneer_client::composer::model_selection::ModelSelectorSelection, &mut App) -> bool,
+    >,
+    on_refresh: std::rc::Rc<dyn Fn(&mut App)>,
+}
+impl ProviderModelPickerRequest {
+    pub fn new(
+        title: String,
+        workspace_id: String,
+        selection: pioneer_client::composer::model_selection::ModelSelectorSelection,
+        on_save: std::rc::Rc<
+            dyn Fn(
+                pioneer_client::composer::model_selection::ModelSelectorSelection,
+                &mut App,
+            ) -> bool,
+        >,
+        on_refresh: std::rc::Rc<dyn Fn(&mut App)>,
+    ) -> Self {
+        Self {
+            title,
+            workspace_id,
+            selection,
+            on_save,
+            on_refresh,
+        }
+    }
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn selection(&self) -> &pioneer_client::composer::model_selection::ModelSelectorSelection {
+        &self.selection
+    }
+    pub fn on_save(
+        &self,
+    ) -> std::rc::Rc<
+        dyn Fn(pioneer_client::composer::model_selection::ModelSelectorSelection, &mut App) -> bool,
+    > {
+        self.on_save.clone()
+    }
+    pub fn on_refresh(&self) -> std::rc::Rc<dyn Fn(&mut App)> {
+        self.on_refresh.clone()
+    }
+}
+pub trait ProviderModelPickerPort {
+    fn open(
+        &self,
+        request: ProviderModelPickerRequest,
+        window: &mut gpui_kit::Window,
+        cx: &mut App,
+    );
+}

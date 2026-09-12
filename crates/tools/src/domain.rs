@@ -24,17 +24,20 @@ pub const TASK_DOMAIN_TOOL_NAMES: &[&str] = &[
 ];
 pub const ARTIFACT_DOMAIN_TOOL_NAMES: &[&str] =
     &["artifact_prepare", "artifact_register", "artifact_read"];
+pub const THREADS_DOMAIN_TOOL_NAMES: &[&str] = &["threads_tools_result_read"];
 pub const COMPUTER_USE_DOMAIN_TOOL_NAMES: &[&str] = &["computer_use"];
 pub const REQUEST_TOOLS_REASON_MAX_CHARS: usize = 512;
 
 pub const REQUEST_TOOLS_DOMAIN_VALUES: &[&str] = &[
+    BuiltinToolDomain::Threads.as_str(),
     BuiltinToolDomain::Memory.as_str(),
     BuiltinToolDomain::Task.as_str(),
     BuiltinToolDomain::Artifact.as_str(),
     BuiltinToolDomain::ComputerUse.as_str(),
 ];
 
-pub const BUILTIN_TOOL_DOMAIN_MAP: [(BuiltinToolDomain, &'static [&'static str]); 4] = [
+pub const BUILTIN_TOOL_DOMAIN_MAP: [(BuiltinToolDomain, &'static [&'static str]); 5] = [
+    (BuiltinToolDomain::Threads, THREADS_DOMAIN_TOOL_NAMES),
     (BuiltinToolDomain::Memory, MEMORY_DOMAIN_TOOL_NAMES),
     (BuiltinToolDomain::Task, TASK_DOMAIN_TOOL_NAMES),
     (BuiltinToolDomain::Artifact, ARTIFACT_DOMAIN_TOOL_NAMES),
@@ -47,6 +50,7 @@ pub const BUILTIN_TOOL_DOMAIN_MAP: [(BuiltinToolDomain, &'static [&'static str])
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinToolDomain {
+    Threads,
     Memory,
     Task,
     Artifact,
@@ -54,10 +58,17 @@ pub enum BuiltinToolDomain {
 }
 
 impl BuiltinToolDomain {
-    pub const ALL: [Self; 4] = [Self::Memory, Self::Task, Self::Artifact, Self::ComputerUse];
+    pub const ALL: [Self; 5] = [
+        Self::Threads,
+        Self::Memory,
+        Self::Task,
+        Self::Artifact,
+        Self::ComputerUse,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Threads => "threads",
             Self::Memory => "memory",
             Self::Task => "task",
             Self::Artifact => "artifact",
@@ -67,6 +78,7 @@ impl BuiltinToolDomain {
 
     pub const fn tool_names(self) -> &'static [&'static str] {
         match self {
+            Self::Threads => THREADS_DOMAIN_TOOL_NAMES,
             Self::Memory => MEMORY_DOMAIN_TOOL_NAMES,
             Self::Task => TASK_DOMAIN_TOOL_NAMES,
             Self::Artifact => ARTIFACT_DOMAIN_TOOL_NAMES,
@@ -76,6 +88,7 @@ impl BuiltinToolDomain {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "threads" => Some(Self::Threads),
             "memory" => Some(Self::Memory),
             "task" => Some(Self::Task),
             "artifact" => Some(Self::Artifact),

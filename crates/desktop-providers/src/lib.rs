@@ -18,7 +18,7 @@ mod sidebar;
 mod view;
 pub use ports::{
     ProviderCredentialPort, ProviderEffectCompletion, ProviderEffectIdentity,
-    ProviderExternalNavigationPort,
+    ProviderExternalNavigationPort, ProviderModelPickerPort, ProviderModelPickerRequest,
 };
 pub use providers::{ProviderCatalogConfig, ProviderCatalogView};
 

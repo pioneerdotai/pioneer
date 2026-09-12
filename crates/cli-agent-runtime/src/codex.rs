@@ -1,5 +1,8 @@
 //! Codex app-server runtime implementation boundary.
 
+#[path = "codex_service.rs"]
+pub mod service;
+
 #[path = "codex_schema.rs"]
 mod schema;
 pub use schema::{
@@ -114,7 +117,64 @@ pub struct CodexJsonlRpcClient {
     diagnostic_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcClientDiagnostic>>>>,
 }
 
+/// Owns only this transport's reader, writer/dispatcher and ordered ingress.
+/// A service attempt joins these after terminating its own App Server process.
+/// Dropping the owner aborts every task even when client clones remain alive.
+pub struct CodexJsonlRpcOwner {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+impl CodexJsonlRpcOwner {
+    pub async fn shutdown(mut self) {
+        self.abort_and_join().await;
+    }
+
+    pub async fn abort_and_join(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        while let Some(task) = self.tasks.last_mut() {
+            let _ = task.await;
+            self.tasks.pop();
+        }
+    }
+
+    fn detach(mut self) {
+        // Preserve the existing persistent transport's lifecycle contract.
+        self.tasks.clear();
+    }
+}
+impl Drop for CodexJsonlRpcOwner {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 impl CodexJsonlRpcClient {
+    pub fn new_owned<R, W>(reader: R, writer: W) -> (Self, CodexJsonlRpcOwner)
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::new_owned_with_server_request_policy(
+            reader,
+            writer,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_COMMAND_QUEUE_CAPACITY,
+            DEFAULT_SERVER_REQUEST_TIMEOUT,
+            // Service responses are bounded in memory. Disabling the larger
+            // disk recovery path also prevents detached spawn_blocking spool
+            // decoders from surviving cancellation of this attempt's owner.
+            crate::NativeEventBudget {
+                max_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+                max_recovery_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+                ..crate::NativeEventBudget::default()
+            },
+        )
+    }
+
     pub fn new<R, W>(reader: R, writer: W) -> Self
     where
         R: AsyncBufRead + Send + Unpin + 'static,
@@ -186,6 +246,32 @@ impl CodexJsonlRpcClient {
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        let (client, owner) = Self::new_owned_with_server_request_policy(
+            reader,
+            writer,
+            notification_capacity,
+            server_request_capacity,
+            diagnostic_capacity,
+            server_request_timeout,
+            native_event_budget,
+        );
+        owner.detach();
+        client
+    }
+
+    fn new_owned_with_server_request_policy<R, W>(
+        reader: R,
+        writer: W,
+        notification_capacity: usize,
+        server_request_capacity: usize,
+        diagnostic_capacity: usize,
+        server_request_timeout: Duration,
+        native_event_budget: crate::NativeEventBudget,
+    ) -> (Self, CodexJsonlRpcOwner)
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         let server_request_capacity = server_request_capacity.max(1);
         let server_request_timeout = if server_request_timeout.is_zero() {
             Duration::from_millis(1)
@@ -197,7 +283,7 @@ impl CodexJsonlRpcClient {
         let (notification_tx, notification_rx) = mpsc::channel(notification_capacity.max(1));
         let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity);
         let (diagnostic_tx, diagnostic_rx) = mpsc::channel(diagnostic_capacity.max(1));
-        let notification_ingress = OrderedEventIngress::spawn(
+        let (notification_ingress, ingress_worker) = OrderedEventIngress::spawn_owned(
             notification_tx,
             OrderedIngressConfig {
                 flush_interval: CODEX_NOTIFICATION_PROGRESS_FLUSH_INTERVAL,
@@ -206,12 +292,12 @@ impl CodexJsonlRpcClient {
             },
         );
 
-        tokio::spawn(run_codex_jsonl_rpc_reader(
+        let reader_worker = tokio::spawn(run_codex_jsonl_rpc_reader(
             reader,
             incoming_tx,
             native_event_budget,
         ));
-        tokio::spawn(run_codex_jsonl_rpc_worker(
+        let rpc_worker = tokio::spawn(run_codex_jsonl_rpc_worker(
             writer,
             command_rx,
             incoming_rx,
@@ -224,13 +310,19 @@ impl CodexJsonlRpcClient {
             server_request_timeout,
         ));
 
-        Self {
+        let client = Self {
             command_tx,
             next_request_id: Arc::new(AtomicI64::new(0)),
             notification_rx: Arc::new(StdMutex::new(Some(notification_rx))),
             server_request_rx: Arc::new(StdMutex::new(Some(server_request_rx))),
             diagnostic_rx: Arc::new(StdMutex::new(Some(diagnostic_rx))),
-        }
+        };
+        (
+            client,
+            CodexJsonlRpcOwner {
+                tasks: vec![reader_worker, rpc_worker, ingress_worker],
+            },
+        )
     }
 
     pub async fn request<TResponse, TParams>(
@@ -8018,7 +8110,97 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
+
+    #[tokio::test]
+    async fn owned_codex_transport_joins_all_tasks_between_attempts() {
+        for _ in 0..3 {
+            let (client_io, mut server_io) = tokio::io::duplex(1024);
+            let (reader, writer) = split(client_io);
+            let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+            let mut notifications = client.take_notification_receiver().unwrap();
+            owner.shutdown().await;
+            let mut byte = [0_u8; 1];
+            assert_eq!(server_io.read(&mut byte).await.unwrap(), 0);
+            assert!(server_io.write_all(b"x").await.is_err());
+            assert!(notifications.recv().await.is_none());
+            assert!(
+                client
+                    .request_value("unused", None, Duration::from_secs(60))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_codex_transport_shutdown_releases_pending_request() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let pending = tokio::spawn(async move {
+            client
+                .request_value("fixture/pending", None, Duration::from_secs(60))
+                .await
+        });
+        let mut server = BufReader::new(server_io);
+        let mut line = String::new();
+        server.read_line(&mut line).await.unwrap();
+        assert!(line.contains("fixture/pending"));
+        owner.shutdown().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(server.read_line(&mut String::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn owned_codex_transport_rejects_oversized_frames_without_spool_recovery() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let oversized = vec![b'x'; CODEX_MAX_MATERIALIZED_FRAME_BYTES + 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), server_io.write_all(&oversized))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        owner.shutdown().await;
+        assert!(
+            client
+                .request_value("unused", None, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_codex_transport_drop_aborts_even_with_live_client_clone() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let clone = client.clone();
+        drop(owner);
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), server_io.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(
+            clone
+                .request_value("unused", None, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn codex_recovery_budget_is_disk_only_and_provider_specific() {

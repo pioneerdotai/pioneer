@@ -75,6 +75,46 @@ fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     )
 }
 
+/// Persist the provider accumulator, including opaque state absent from UI text.
+/// This acknowledged observation precedes failure/recovery and never becomes an
+/// executable assistant/tool round. Cancellation still drops this owned future.
+#[allow(clippy::too_many_arguments)]
+async fn persist_failed_provider_observation(
+    events: &AgentEventHub,
+    thread: &str,
+    turn: &str,
+    item: &str,
+    text: &str,
+    reasoning: &str,
+    calls: &[ProviderToolCall],
+    replay: Option<&pioneer_provider::ProviderReplayState>,
+    error: &ChatTurnError,
+) -> Result<(), ChatTurnError> {
+    if !matches!(error, ChatTurnError::ProviderFailure { .. })
+        || (text.is_empty() && reasoning.is_empty() && calls.is_empty() && replay.is_none())
+    {
+        return Ok(());
+    }
+    let mut message = pioneer_provider::ChatMessage::assistant(text);
+    message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.to_owned());
+    message.tool_calls = (!calls.is_empty()).then(|| calls.to_vec());
+    message.provider_replay_state = replay.cloned();
+    super::persist_provider_history_message(
+        events,
+        thread,
+        turn,
+        item,
+        &pioneer_provider::CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: item.into(),
+            termination: ProviderTermination::ProviderError,
+            message,
+            calls: Vec::new(),
+        },
+    )
+    .await
+}
+
 pub(super) async fn request_agent_round(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
@@ -109,116 +149,142 @@ pub(super) async fn request_agent_round(
         let mut tool_calls = Vec::new();
         let mut provider_replay_state = None;
         let mut termination = None;
+        let mut usage: Option<pioneer_provider::TokenUsage> = None;
         let mut seen_any_chunk = false;
         let response_limits = ProviderResponseLimits::default();
 
-        while let Some(chunk) = read_next_stream_chunk(
-            &mut stream,
-            &mut seen_any_chunk,
-            target,
-            provider,
-            model_name.as_str(),
-            provider_timeout_policy,
-        )
-        .await?
-        {
-            if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
-                return Err(provider_response_limit_error(
+        let received = async {
+            while let Some(mut chunk) = read_next_stream_chunk(
+                &mut stream,
+                &mut seen_any_chunk,
+                target,
+                provider,
+                model_name.as_str(),
+                provider_timeout_policy,
+            )
+            .await?
+            {
+                if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
+                    return Err(provider_response_limit_error(
+                        target,
+                        provider_name.as_str(),
+                        model_name.as_str(),
+                        ProviderTransportKind::Stream,
+                        error,
+                    ));
+                }
+                if let Some(snapshot) = &chunk.usage {
+                    usage.get_or_insert_with(Default::default).update(snapshot);
+                }
+                if chunk.provider_replay_state.is_some() {
+                    provider_replay_state = chunk.provider_replay_state.take();
+                }
+                if chunk.is_final {
+                    termination = chunk.termination;
+                    break;
+                }
+
+                validate_stream_append_limits(
+                    &response_limits,
+                    full_text.len(),
+                    full_reasoning.len(),
+                    chunk.delta.as_str(),
+                    chunk.reasoning_delta.as_deref(),
                     target,
                     provider_name.as_str(),
                     model_name.as_str(),
                     ProviderTransportKind::Stream,
-                    error,
-                ));
-            }
-            if chunk.is_final {
-                termination = chunk.termination;
-                break;
+                )?;
+
+                if let Some(reasoning_delta) = chunk.reasoning_delta
+                    && !reasoning_delta.is_empty()
+                {
+                    full_reasoning.push_str(reasoning_delta.as_str());
+                    super::emit_progress_event(
+                        event_tx,
+                        AgentProgressEvent::ItemDelta {
+                            notification: ItemDeltaNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item_id: thinking_item_id.to_owned(),
+                                delta: reasoning_delta,
+                                stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
+                                payload: None,
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        },
+                    )
+                    .await?;
+                }
+
+                if !chunk.delta.is_empty() {
+                    full_text.push_str(chunk.delta.as_str());
+                }
+
+                validate_provider_tool_calls(
+                    chunk.tool_calls.as_slice(),
+                    target,
+                    provider_name.as_str(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                )?;
+                for tool_call in chunk.tool_calls {
+                    upsert_tool_call(&mut tool_calls, tool_call);
+                }
+                if let Err(error) = response_limits.validate_accumulated(
+                    full_text.as_str(),
+                    full_reasoning.as_str(),
+                    tool_calls.as_slice(),
+                    provider_replay_state.as_ref(),
+                ) {
+                    return Err(provider_response_limit_error(
+                        target,
+                        provider_name.as_str(),
+                        model_name.as_str(),
+                        ProviderTransportKind::Stream,
+                        error,
+                    ));
+                }
             }
 
-            validate_stream_append_limits(
-                &response_limits,
-                full_text.len(),
-                full_reasoning.len(),
-                chunk.delta.as_str(),
-                chunk.reasoning_delta.as_deref(),
+            require_round_termination(
+                termination,
+                tool_calls.as_slice(),
                 target,
                 provider_name.as_str(),
                 model_name.as_str(),
                 ProviderTransportKind::Stream,
-            )?;
-
-            if let Some(reasoning_delta) = chunk.reasoning_delta
-                && !reasoning_delta.is_empty()
-            {
-                full_reasoning.push_str(reasoning_delta.as_str());
-                super::emit_progress_event(
+            )
+        }
+        .await;
+        let termination = match received {
+            Ok(termination) => termination,
+            Err(error) => {
+                persist_failed_provider_observation(
                     event_tx,
-                    AgentProgressEvent::ItemDelta {
-                        notification: ItemDeltaNotification {
-                            workspace_id: workspace_id.to_owned(),
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            item_id: thinking_item_id.to_owned(),
-                            delta: reasoning_delta,
-                            stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
-                            payload: None,
-                            markdown: None,
-                            markdown_version: None,
-                        },
-                    },
+                    thread_id,
+                    turn_id,
+                    thinking_item_id,
+                    &full_text,
+                    &full_reasoning,
+                    &tool_calls,
+                    provider_replay_state.as_ref(),
+                    &error,
                 )
                 .await?;
+                return Err(error);
             }
-
-            if !chunk.delta.is_empty() {
-                full_text.push_str(chunk.delta.as_str());
-            }
-
-            validate_provider_tool_calls(
-                chunk.tool_calls.as_slice(),
-                target,
-                provider_name.as_str(),
-                model_name.as_str(),
-                ProviderTransportKind::Stream,
-            )?;
-            for tool_call in chunk.tool_calls {
-                upsert_tool_call(&mut tool_calls, tool_call);
-            }
-            if chunk.provider_replay_state.is_some() {
-                provider_replay_state = chunk.provider_replay_state;
-            }
-            if let Err(error) = response_limits.validate_accumulated(
-                full_text.as_str(),
-                full_reasoning.as_str(),
-                tool_calls.as_slice(),
-                provider_replay_state.as_ref(),
-            ) {
-                return Err(provider_response_limit_error(
-                    target,
-                    provider_name.as_str(),
-                    model_name.as_str(),
-                    ProviderTransportKind::Stream,
-                    error,
-                ));
-            }
-        }
-
-        let termination = require_round_termination(
-            termination,
-            tool_calls.as_slice(),
-            target,
-            provider_name.as_str(),
-            model_name.as_str(),
-            ProviderTransportKind::Stream,
-        )?;
+        };
         lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
         return Ok(AgentRoundResponse {
             text: full_text,
             reasoning: full_reasoning,
             tool_calls,
             provider_replay_state,
-            provider_token_count: None,
+            provider_token_count: total_token_usage(usage.as_ref()),
+            usage,
             termination,
         });
     }
@@ -286,6 +352,7 @@ pub(super) async fn request_agent_round(
         tool_calls: response.tool_calls,
         provider_replay_state: response.provider_replay_state,
         provider_token_count,
+        usage: response.usage,
         termination,
     })
 }
@@ -300,7 +367,7 @@ pub(super) async fn stream_provider_response(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-) -> Result<String, ChatTurnError> {
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
@@ -323,180 +390,208 @@ pub(super) async fn stream_provider_response(
     let mut message_started = false;
     let mut stream_tool_calls = Vec::new();
     let mut termination = None;
+    let mut usage: Option<pioneer_provider::TokenUsage> = None;
     let mut seen_any_chunk = false;
     let response_limits = ProviderResponseLimits::default();
 
-    while let Some(chunk) = read_next_stream_chunk(
-        &mut stream,
-        &mut seen_any_chunk,
-        response_stream_target(message_started, thinking_item_id, message_item_id),
-        provider,
-        model_name.as_str(),
-        provider_timeout_policy,
-    )
-    .await?
-    {
-        if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
-            return Err(provider_response_limit_error(
-                response_stream_target(message_started, thinking_item_id, message_item_id),
+    let mut provider_replay_state = None;
+    let received: Result<(), ChatTurnError> = async {
+        while let Some(chunk) = read_next_stream_chunk(
+            &mut stream,
+            &mut seen_any_chunk,
+            response_stream_target(message_started, thinking_item_id, message_item_id),
+            provider,
+            model_name.as_str(),
+            provider_timeout_policy,
+        )
+        .await?
+        {
+            if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
+                return Err(provider_response_limit_error(
+                    response_stream_target(message_started, thinking_item_id, message_item_id),
+                    provider_name.as_str(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                    error,
+                ));
+            }
+            let StreamChunk {
+                usage: chunk_usage,
+                delta,
+                reasoning_delta,
+                tool_calls,
+                is_final,
+                provider_replay_state: chunk_replay,
+                termination: chunk_termination,
+            } = chunk;
+
+            if let Some(snapshot) = &chunk_usage {
+                usage.get_or_insert_with(Default::default).update(snapshot);
+            }
+            if chunk_replay.is_some() {
+                provider_replay_state = chunk_replay;
+            }
+            if is_final {
+                termination = chunk_termination;
+                break;
+            }
+
+            let target = response_stream_target(message_started, thinking_item_id, message_item_id);
+            validate_stream_append_limits(
+                &response_limits,
+                full_text.len(),
+                reasoning_parts.len(),
+                delta.as_str(),
+                reasoning_delta.as_deref(),
+                target,
                 provider_name.as_str(),
                 model_name.as_str(),
                 ProviderTransportKind::Stream,
-                error,
-            ));
-        }
-        let StreamChunk {
-            delta,
-            reasoning_delta,
-            tool_calls,
-            is_final,
-            provider_replay_state: _,
-            termination: chunk_termination,
-        } = chunk;
+            )?;
 
-        if is_final {
-            termination = chunk_termination;
-            break;
-        }
+            validate_provider_tool_calls(
+                tool_calls.as_slice(),
+                target,
+                provider_name.as_str(),
+                model_name.as_str(),
+                ProviderTransportKind::Stream,
+            )?;
+            for tool_call in tool_calls {
+                upsert_tool_call(&mut stream_tool_calls, tool_call);
+            }
 
-        let target = response_stream_target(message_started, thinking_item_id, message_item_id);
-        validate_stream_append_limits(
-            &response_limits,
-            full_text.len(),
-            reasoning_parts.len(),
-            delta.as_str(),
-            reasoning_delta.as_deref(),
-            target,
-            provider_name.as_str(),
-            model_name.as_str(),
-            ProviderTransportKind::Stream,
-        )?;
+            if let Some(reasoning) = reasoning_delta
+                && !reasoning.is_empty()
+            {
+                reasoning_parts.push_str(reasoning.as_str());
 
-        validate_provider_tool_calls(
-            tool_calls.as_slice(),
-            target,
-            provider_name.as_str(),
-            model_name.as_str(),
-            ProviderTransportKind::Stream,
-        )?;
-        for tool_call in tool_calls {
-            upsert_tool_call(&mut stream_tool_calls, tool_call);
-        }
-
-        if let Some(reasoning) = reasoning_delta
-            && !reasoning.is_empty()
-        {
-            reasoning_parts.push_str(reasoning.as_str());
-
-            super::emit_progress_event(
-                event_tx,
-                AgentProgressEvent::ItemDelta {
-                    notification: ItemDeltaNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item_id: thinking_item_id.to_owned(),
-                        delta: reasoning,
-                        stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
-                        payload: None,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                },
-            )
-            .await?;
-        }
-
-        if !delta.is_empty() {
-            if !message_started {
-                message_started = true;
-                let reasoning_text = reasoning_parts.clone();
-
-                super::emit_durable_event(
+                super::emit_progress_event(
                     event_tx,
-                    AgentDurableEvent::ItemCompleted {
-                        notification: ItemCompletedNotification {
+                    AgentProgressEvent::ItemDelta {
+                        notification: ItemDeltaNotification {
                             workspace_id: workspace_id.to_owned(),
                             thread_id: thread_id.to_owned(),
                             turn_id: turn_id.to_owned(),
-                            item: TurnItem::Reasoning {
-                                id: thinking_item_id.to_owned(),
-                                summary: Vec::new(),
-                                content: if reasoning_text.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    vec![reasoning_text]
-                                },
-                            },
-                        },
-                    },
-                )
-                .await?;
-
-                super::emit_durable_event(
-                    event_tx,
-                    AgentDurableEvent::ItemStarted {
-                        notification: ItemStartedNotification {
-                            workspace_id: workspace_id.to_owned(),
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            item: TurnItem::AgentMessage {
-                                id: message_item_id.to_owned(),
-                                text: String::new(),
-                                phase: Default::default(),
-                                markdown: None,
-                                markdown_version: None,
-                            },
+                            item_id: thinking_item_id.to_owned(),
+                            delta: reasoning,
+                            stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
+                            payload: None,
+                            markdown: None,
+                            markdown_version: None,
                         },
                     },
                 )
                 .await?;
             }
 
-            full_text.push_str(delta.as_str());
-            super::emit_progress_event(
-                event_tx,
-                AgentProgressEvent::ItemDelta {
-                    notification: ItemDeltaNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item_id: message_item_id.to_owned(),
-                        delta,
-                        stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
-                        payload: None,
-                        markdown: None,
-                        markdown_version: None,
+            if !delta.is_empty() {
+                if !message_started {
+                    message_started = true;
+                    let reasoning_text = reasoning_parts.clone();
+
+                    super::emit_durable_event(
+                        event_tx,
+                        AgentDurableEvent::ItemCompleted {
+                            notification: ItemCompletedNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item: TurnItem::Reasoning {
+                                    id: thinking_item_id.to_owned(),
+                                    summary: Vec::new(),
+                                    content: if reasoning_text.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        vec![reasoning_text]
+                                    },
+                                },
+                            },
+                        },
+                    )
+                    .await?;
+
+                    super::emit_durable_event(
+                        event_tx,
+                        AgentDurableEvent::ItemStarted {
+                            notification: ItemStartedNotification {
+                                workspace_id: workspace_id.to_owned(),
+                                thread_id: thread_id.to_owned(),
+                                turn_id: turn_id.to_owned(),
+                                item: TurnItem::AgentMessage {
+                                    id: message_item_id.to_owned(),
+                                    text: String::new(),
+                                    phase: Default::default(),
+                                    markdown: None,
+                                    markdown_version: None,
+                                },
+                            },
+                        },
+                    )
+                    .await?;
+                }
+
+                full_text.push_str(delta.as_str());
+                super::emit_progress_event(
+                    event_tx,
+                    AgentProgressEvent::ItemDelta {
+                        notification: ItemDeltaNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item_id: message_item_id.to_owned(),
+                            delta,
+                            stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                            payload: None,
+                            markdown: None,
+                            markdown_version: None,
+                        },
                     },
-                },
-            )
-            .await?;
+                )
+                .await?;
+            }
+
+            if let Err(error) = response_limits.validate_accumulated(
+                full_text.as_str(),
+                reasoning_parts.as_str(),
+                stream_tool_calls.as_slice(),
+                None,
+            ) {
+                return Err(provider_response_limit_error(
+                    response_stream_target(message_started, thinking_item_id, message_item_id),
+                    provider_name.as_str(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                    error,
+                ));
+            }
         }
 
-        if let Err(error) = response_limits.validate_accumulated(
-            full_text.as_str(),
-            reasoning_parts.as_str(),
+        require_round_termination(
+            termination,
             stream_tool_calls.as_slice(),
-            None,
-        ) {
-            return Err(provider_response_limit_error(
-                response_stream_target(message_started, thinking_item_id, message_item_id),
-                provider_name.as_str(),
-                model_name.as_str(),
-                ProviderTransportKind::Stream,
-                error,
-            ));
-        }
+            response_stream_target(message_started, thinking_item_id, message_item_id),
+            provider_name.as_str(),
+            model_name.as_str(),
+            ProviderTransportKind::Stream,
+        )?;
+        Ok(())
     }
-
-    require_round_termination(
-        termination,
-        stream_tool_calls.as_slice(),
-        response_stream_target(message_started, thinking_item_id, message_item_id),
-        provider_name.as_str(),
-        model_name.as_str(),
-        ProviderTransportKind::Stream,
-    )?;
+    .await;
+    if let Err(error) = received {
+        persist_failed_provider_observation(
+            event_tx,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            &full_text,
+            &reasoning_parts,
+            &stream_tool_calls,
+            provider_replay_state.as_ref(),
+            &error,
+        )
+        .await?;
+        return Err(error);
+    }
     for tool_call in stream_tool_calls {
         super::emit_durable_event(
             event_tx,
@@ -609,7 +704,7 @@ pub(super) async fn stream_provider_response(
     .await?;
 
     lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
-    Ok(assistant_text)
+    Ok((assistant_text, usage))
 }
 
 pub(super) async fn non_stream_provider_response(
@@ -621,7 +716,7 @@ pub(super) async fn non_stream_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
-) -> Result<String, ChatTurnError> {
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
@@ -741,7 +836,7 @@ pub(super) async fn non_stream_provider_response(
     .await?;
 
     lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
-    Ok(assistant_text)
+    Ok((assistant_text, response.usage))
 }
 
 fn response_stream_target<'a>(
@@ -1682,6 +1777,140 @@ mod tests {
                 failure.class,
                 ProviderFailureClass::MalformedProviderRequest
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod partial_observation_tests {
+    use super::*;
+    struct FailingStream;
+    #[async_trait::async_trait]
+    impl Provider for FailingStream {
+        fn name(&self) -> &str {
+            "partial-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected non-stream transport")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::reasoning("reasoning actually received")),
+                Ok(StreamChunk::delta("partial answer actually received")),
+                Ok(StreamChunk::provider_replay_state(
+                    pioneer_provider::ProviderReplayState::new(
+                        "partial-fixture",
+                        serde_json::json!({"opaque":"retained bytes"}),
+                    ),
+                )),
+                Ok(StreamChunk::tool_calls(vec![ProviderToolCall {
+                    id: "not-executed".into(),
+                    name: "tool".into(),
+                    arguments: "{}".into(),
+                }])),
+                Err(anyhow::anyhow!("connection reset mid-stream")),
+            ])
+            .boxed())
+        }
+    }
+    #[tokio::test]
+    async fn compaction_failed_partial_is_acknowledged_before_stream_failure_returns() {
+        for agent in [false, true] {
+            let provider: Arc<dyn Provider> = Arc::new(FailingStream);
+            let hub = AgentEventHub::new();
+            let mut events = hub.take_durable_receiver().await.unwrap();
+            let request = ChatRequest {
+                model: "fixture".into(),
+                messages: vec![pioneer_provider::ChatMessage::user("request")],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            };
+            let receive = async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    assert!(!matches!(
+                        event,
+                        AgentDurableEvent::TurnFinalizationPrepared { .. }
+                    ));
+                    let observation = match event {
+                        AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                            Some(payload)
+                        }
+                        _ => None,
+                    };
+                    events.acknowledge_last(Ok(()));
+                    if let Some(payload) = observation {
+                        break payload;
+                    }
+                }
+            };
+            let call = async {
+                if agent {
+                    request_agent_round(
+                        &provider,
+                        request,
+                        "ws",
+                        "thread",
+                        "turn",
+                        "thinking",
+                        false,
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    stream_provider_response(
+                        &provider,
+                        request,
+                        "ws",
+                        "thread",
+                        "turn",
+                        "thinking",
+                        "message",
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            };
+            let (result, payload) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(call, receive)
+                })
+                .await
+                .unwrap();
+            assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
+            let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(envelope.termination, ProviderTermination::ProviderError);
+            assert_eq!(envelope.message.content, "partial answer actually received");
+            assert_eq!(
+                envelope.message.reasoning_content.as_deref(),
+                Some("reasoning actually received")
+            );
+            assert_eq!(envelope.message.tool_calls.unwrap()[0].id, "not-executed");
+            assert_eq!(
+                envelope.message.provider_replay_state.unwrap().payload["opaque"],
+                "retained bytes"
+            );
+            assert!(envelope.calls.is_empty());
         }
     }
 }

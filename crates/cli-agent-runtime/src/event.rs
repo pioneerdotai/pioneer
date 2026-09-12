@@ -107,7 +107,7 @@ fn structured_retry_after_ms(native: &RuntimeNativeEvent) -> Option<u64> {
         .or_else(|| native.raw_redacted.as_ref().and_then(find_retry_after_ms))
 }
 
-fn find_retry_after_ms(value: &JsonValue) -> Option<u64> {
+pub(crate) fn find_retry_after_ms(value: &JsonValue) -> Option<u64> {
     match value {
         JsonValue::Object(map) => {
             for key in ["retry_after_ms", "retryAfterMs"] {

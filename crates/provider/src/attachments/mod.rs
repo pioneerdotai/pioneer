@@ -1,5 +1,6 @@
 mod budget;
 mod errors;
+pub(crate) mod input_estimate;
 mod normalize;
 mod observability;
 mod plan;
@@ -37,6 +38,7 @@ fn attachment_blocking_governor() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
+pub use input_estimate::{MediaInputEstimate, PreparedInputBudget};
 pub use normalize::infer_mime_from_reference;
 pub use registry::{
     ArtifactExternalRefCacheBackend, ArtifactExternalRefLookupRequest,
@@ -468,6 +470,7 @@ mod tests {
     #[test]
     fn prepares_text_and_attachment_context_without_inlining_binary() {
         let message = ChatMessage {
+            provenance: None,
             role: Role::User,
             content: "analyze".to_owned(),
             reasoning_content: None,

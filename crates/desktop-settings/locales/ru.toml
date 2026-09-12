@@ -425,3 +425,18 @@ microphone_no_device_available = "Доступный входной микроф
 microphone_sample_format_unsupported = "Формат сэмплов desktop-микрофона %{format} не поддерживается."
 microphone_no_input_stream = "Микрофон по умолчанию не может предоставить входной поток."
 microphone_capture_failed = "Ошибка записи с микрофона: %{error}"
+
+[settings.default_model]
+label = "Модель workspace по умолчанию"
+
+[settings.compaction.model]
+label = "Модель сжатия"
+
+[settings.compaction.enabled]
+label = "Сжатие контекста"
+description = "Сжимать длинную историю разговоров в этом workspace."
+
+[settings.model]
+inherit = "Использовать модель текущего терна"
+choose = "Выбрать…"
+reset = "Сбросить"

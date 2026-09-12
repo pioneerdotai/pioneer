@@ -425,3 +425,18 @@ microphone_no_device_available = "कोई input माइक्रोफ़ो
 microphone_sample_format_unsupported = "Desktop माइक्रोफ़ोन sample format %{format} समर्थित नहीं है।"
 microphone_no_input_stream = "Default माइक्रोफ़ोन input stream नहीं दे सकता।"
 microphone_capture_failed = "माइक्रोफ़ोन capture विफल हुआ: %{error}"
+
+[settings.default_model]
+label = "वर्कस्पेस का डिफ़ॉल्ट मॉडल"
+
+[settings.compaction.model]
+label = "संकुचन मॉडल"
+
+[settings.compaction.enabled]
+label = "संदर्भ संकुचन"
+description = "इस वर्कस्पेस में लंबे वार्तालाप इतिहास को संकुचित करें।"
+
+[settings.model]
+inherit = "मौजूदा टर्न का मॉडल इस्तेमाल करें"
+choose = "चुनें…"
+reset = "रीसेट करें"

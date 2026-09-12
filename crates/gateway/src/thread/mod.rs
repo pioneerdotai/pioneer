@@ -189,8 +189,18 @@ impl ThreadManager {
 
     pub fn from_app_config(config: &AppConfig) -> Self {
         Self::new(
-            config.gateway.thread.default_model.clone(),
-            config.gateway.thread.default_model_provider.clone(),
+            config
+                .gateway
+                .thread
+                .default_model
+                .clone()
+                .unwrap_or_default(),
+            config
+                .gateway
+                .thread
+                .default_model_provider
+                .clone()
+                .unwrap_or_default(),
         )
     }
 

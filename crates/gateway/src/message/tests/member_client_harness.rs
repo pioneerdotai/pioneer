@@ -233,7 +233,6 @@ async fn hermetic_member_shared_client_covers_policy_and_access_loss_without_log
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 

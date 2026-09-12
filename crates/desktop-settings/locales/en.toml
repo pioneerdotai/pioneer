@@ -425,3 +425,18 @@ microphone_no_device_available = "No input microphone is available."
 microphone_sample_format_unsupported = "Desktop microphone sample format %{format} is unsupported."
 microphone_no_input_stream = "Default microphone cannot provide an input stream."
 microphone_capture_failed = "Microphone capture failed: %{error}"
+
+[settings.default_model]
+label = "Default workspace model"
+
+[settings.compaction.model]
+label = "Compaction model"
+
+[settings.compaction.enabled]
+label = "Context compaction"
+description = "Compact long conversation history in this workspace."
+
+[settings.model]
+inherit = "Use the current turn model"
+choose = "Choose…"
+reset = "Reset"

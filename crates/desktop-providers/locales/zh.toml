@@ -339,3 +339,11 @@ cancel = "取消"
 save = "保存"
 dismiss = "关闭"
 
+
+[providers.cli.compaction]
+label = "上下文压缩模型"
+inherit = "使用常规设置"
+choose = "选择…"
+reset = "重置"
+save_first = "请先保存 CLI 提供商，再选择其模型。"
+invalid = "请选择此 CLI 提供商支持的模型和推理设置。"

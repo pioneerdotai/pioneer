@@ -4326,7 +4326,32 @@ pub enum TurnItem {
     },
 }
 
+/// Shared interpretation for typed items and bounded stored event metadata.
+pub fn context_compaction_status(
+    code: Option<&str>,
+    details: Option<&serde_json::Value>,
+) -> Option<crate::TurnWorkItemStatus> {
+    if code != Some("agent_context_compaction") {
+        return None;
+    }
+    Some(match details?.get("status")?.as_str()? {
+        "started" | "running" => crate::TurnWorkItemStatus::Running,
+        "completed" => crate::TurnWorkItemStatus::Completed,
+        "failed" => crate::TurnWorkItemStatus::Failed,
+        "cancelled" => crate::TurnWorkItemStatus::Cancelled,
+        _ => return None,
+    })
+}
+
 impl TurnItem {
+    /// Compaction lifecycle is independent of severity and the parent Turn status.
+    pub fn context_compaction_status(&self) -> Option<crate::TurnWorkItemStatus> {
+        let Self::SystemEvent { code, details, .. } = self else {
+            return None;
+        };
+        context_compaction_status(code.as_deref(), details.as_ref())
+    }
+
     pub fn item_id(&self) -> &str {
         match self {
             Self::UserMessage { id, .. }

@@ -1,3 +1,4 @@
+use crate::{ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse};
 use schemars::{Schema, schema_for};
 use std::fs;
 use std::path::Path;
@@ -97,7 +98,7 @@ use crate::{
     ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayNativeAgentConfig, GatewayNotification,
+    GatewayMemorySettings, GatewayModelSelection, GatewayNativeAgentConfig, GatewayNotification,
     GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate,
     GatewayRemoteAccessState, GatewayRemoteAccessStatusChangedNotification,
     GatewayRemoteAccessStatusSnapshot, GatewayRemoteAccessTransport,
@@ -150,13 +151,13 @@ use crate::{
     MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
     MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
-    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, NormalizedAgentAction,
-    PermissionBehavior, ProgressCoalescingKey, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
+    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, ModelSelectionTransport,
+    NormalizedAgentAction, PermissionBehavior, ProgressCoalescingKey, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderConfigureParams,
+    ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, ProviderTranscriptionModelMetadata, ProviderTransportKind,
     PublicError, PublicErrorCode, PublicErrorStage, PublicTask, PublicTaskAgendaItem,
@@ -1005,6 +1006,15 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "thread_participants_changed_notification.json",
             ThreadParticipantsChangedNotification
+        ),
+        schema_doc!("thread_tool_result_cursor.json", ThreadToolResultCursor),
+        schema_doc!(
+            "thread_tool_result_read_params.json",
+            ThreadToolResultReadParams
+        ),
+        schema_doc!(
+            "thread_tool_result_read_response.json",
+            ThreadToolResultReadResponse
         ),
         schema_doc!("thread_get_params.json", ThreadGetParams),
         schema_doc!("thread_get_response.json", ThreadGetResponse),
@@ -2069,6 +2079,8 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "gateway_memory_model_selection.json",
             GatewayMemoryModelSelection
         ),
+        schema_doc!("gateway_model_selection.json", GatewayModelSelection),
+        schema_doc!("model_selection_transport.json", ModelSelectionTransport),
         schema_doc!("gateway_memory_settings.json", GatewayMemorySettings),
         schema_doc!(
             "gateway_self_improvement_model_selection.json",

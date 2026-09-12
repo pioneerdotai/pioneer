@@ -28,7 +28,6 @@ fn capsule_step(
             store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         ));
         processor.bind_task_bridge().await;

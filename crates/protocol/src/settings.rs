@@ -96,6 +96,12 @@ pub struct GatewaySettingsUpdate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<crate::GatewayModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<crate::GatewayModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compaction_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_enabled: Option<bool>,
@@ -220,6 +226,12 @@ pub struct GatewayVoiceInputStatusChangedNotification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettings {
     #[serde(default)]
+    pub default_model: crate::GatewayModelSelection,
+    #[serde(default)]
+    pub compaction_model: crate::GatewayModelSelection,
+    #[serde(default = "default_context_compaction_enabled")]
+    pub context_compaction_enabled: bool,
+    #[serde(default)]
     pub keepawake: bool,
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
@@ -230,11 +242,18 @@ pub struct GatewayGeneralSettings {
 impl Default for GatewayGeneralSettings {
     fn default() -> Self {
         Self {
+            default_model: Default::default(),
+            compaction_model: Default::default(),
+            context_compaction_enabled: true,
             keepawake: false,
             telemetry_enabled: default_telemetry_enabled(),
             preflight_model: GatewayMemoryModelSelection::default(),
         }
     }
+}
+
+const fn default_context_compaction_enabled() -> bool {
+    true
 }
 
 const fn default_telemetry_enabled() -> bool {
@@ -519,6 +538,10 @@ impl Default for GatewayCliRuntimeSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayCliRuntimeInstanceSettings {
+    /// Workspace override. Omission in updates preserves the stored value;
+    /// an explicit Inherit removes it without affecting other workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<crate::GatewayModelSelection>,
     pub id: String,
     pub kind: CLIAgentRuntimeKind,
     pub display_name: String,
@@ -537,6 +560,7 @@ pub struct GatewayCliRuntimeInstanceSettings {
 impl GatewayCliRuntimeInstanceSettings {
     pub fn default_codex() -> Self {
         Self {
+            compaction_model: None,
             id: "codex".to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
             display_name: "Codex".to_owned(),
@@ -550,6 +574,7 @@ impl GatewayCliRuntimeInstanceSettings {
 
     pub fn default_claude() -> Self {
         Self {
+            compaction_model: None,
             id: "claude".to_owned(),
             kind: CLIAgentRuntimeKind::Claude,
             display_name: "Claude".to_owned(),
@@ -957,6 +982,9 @@ mod tests {
     #[test]
     fn settings_general_update_roundtrips_preflight_model() {
         let update = GatewayGeneralSettingsUpdate {
+            default_model: None,
+            compaction_model: None,
+            context_compaction_enabled: None,
             keepawake: Some(true),
             telemetry_enabled: Some(false),
             preflight_model: Some(GatewayMemoryModelSelection::custom(
@@ -1031,6 +1059,7 @@ mod tests {
             },
             cli_runtimes: GatewayCliRuntimeSettings {
                 instances: vec![GatewayCliRuntimeInstanceSettings {
+                    compaction_model: None,
                     id: "codex_work".to_owned(),
                     kind: CLIAgentRuntimeKind::Codex,
                     display_name: "Codex Work".to_owned(),
@@ -1066,6 +1095,7 @@ mod tests {
             }),
             cli_runtimes: Some(GatewayCliRuntimeSettings {
                 instances: vec![GatewayCliRuntimeInstanceSettings {
+                    compaction_model: None,
                     id: "codex_personal".to_owned(),
                     kind: CLIAgentRuntimeKind::Codex,
                     display_name: "Codex Personal".to_owned(),

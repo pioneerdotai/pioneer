@@ -44,7 +44,6 @@ use crate::{
 };
 use chrono::Local;
 use futures_util::{StreamExt, stream};
-use pioneer_config::AppConfig;
 use pioneer_hooks::{
     HookActorKind, HookPhase, HookRuntime, HookToolName, TurnPostPreflightPromptContextHookInput,
     TurnPostTurnDomain, TurnPostTurnDomainEventSummary, TurnPostTurnToolEventSummary,
@@ -211,6 +210,7 @@ struct TurnCapabilityResolutionSummary {
 
 #[derive(Debug)]
 struct AgentRoundResponse {
+    usage: Option<pioneer_provider::TokenUsage>,
     text: String,
     reasoning: String,
     tool_calls: Vec<ProviderToolCall>,
@@ -234,6 +234,8 @@ struct ExecutedToolResult {
     recovery_view: Option<ToolRecoveryView>,
     retained_llm_context: Option<(ToolResultView, pioneer_protocol::ToolOutputPolicySnapshot)>,
     request_tools_result: Option<RequestToolsResult>,
+    full_message: Option<ChatMessage>,
+    full_source_in_item: bool,
     message: ChatMessage,
 }
 
@@ -268,6 +270,8 @@ fn unknown_tool_task_result(
         outcome: outcome.clone(),
         recovery_view: None,
         retained_llm_context: None,
+        full_message: None,
+        full_source_in_item: false,
         request_tools_result: None,
         message: tooling::build_tool_error_message(provider_call_id, tool_name, message, outcome),
     }
@@ -1068,6 +1072,75 @@ async fn persist_provider_history_message(
         .map_err(agent_event_error)
 }
 
+pub(crate) fn bounded_tool_result_message(
+    source: &ChatMessage,
+    reference: &str,
+) -> Result<ChatMessage, ChatTurnError> {
+    bounded_tool_result_message_with_budget(source, reference, pioneer_compaction::RESULT_TOKENS)
+}
+
+pub(crate) fn bounded_tool_result_message_with_budget(
+    source: &ChatMessage,
+    reference: &str,
+    available_tokens: u64,
+) -> Result<ChatMessage, ChatTurnError> {
+    let token_limit = available_tokens.min(pioneer_compaction::RESULT_TOKENS);
+    let mut message = source.clone();
+    let mut text = message.content.clone();
+    message.content_parts = message.content_parts.into_iter().enumerate().filter_map(|(index, part)| {
+        if let pioneer_provider::MessageContentPart::Text { text: part } = &part {
+            if !text.is_empty() { text.push('\n'); }
+            text.push_str(part);
+            return None;
+        }
+        let attachment = match &part {
+            pioneer_provider::MessageContentPart::File { file } => file,
+            pioneer_provider::MessageContentPart::Image { image } => image,
+            pioneer_provider::MessageContentPart::Audio { audio } => audio,
+            pioneer_provider::MessageContentPart::Video { video } => video,
+            pioneer_provider::MessageContentPart::Text { .. } => unreachable!(),
+        };
+        if matches!(attachment.source, pioneer_provider::AttachmentDataSource::Bytes { .. }) {
+            // The source message is durably retained before this representation is published.
+            // Inline binary data stays there; the working message carries its exact part reference.
+            text.push('\n');
+            text.push_str(&serde_json::json!({"attachment": {
+                "mime_type": attachment.mime_type, "name": attachment.name, "size_bytes": attachment.size_bytes,
+                "sha256": attachment.sha256, "artifact": attachment.artifact,
+                "full_source": reference, "content_part": index,
+                "read_tool": "threads_tools_result_read",
+            }}).to_string());
+            None
+        } else { Some(part) }
+    }).collect();
+    message.content.clear();
+    let framing =
+        serde_json::to_string(&message).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+    if framing.len() > pioneer_compaction::RESULT_BYTES
+        || pioneer_compaction::text_tokens(&framing) > token_limit
+    {
+        return Err(ChatTurnError::Blocked(
+            "tool result attachment references exceed available context".into(),
+        ));
+    }
+    let mut tokens = token_limit.saturating_sub(pioneer_compaction::text_tokens(&framing));
+    let mut bytes = pioneer_compaction::RESULT_BYTES.saturating_sub(framing.len());
+    loop {
+        message.content =
+            pioneer_compaction::results::result_excerpt(&text, reference, tokens, bytes)
+                .map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+        let encoded =
+            serde_json::to_string(&message).map_err(|e| ChatTurnError::Blocked(e.to_string()))?;
+        if encoded.len() <= pioneer_compaction::RESULT_BYTES
+            && pioneer_compaction::text_tokens(&encoded) <= token_limit
+        {
+            return Ok(message);
+        }
+        tokens /= 2;
+        bytes /= 2;
+    }
+}
+
 async fn persist_retained_tool_result(
     event_tx: &AgentEventHub,
     thread_id: &str,
@@ -1083,11 +1156,12 @@ async fn persist_retained_tool_result(
             result.item_id
         )));
     }
-    let payload = serde_json::to_value(&result.message).map_err(|error| {
-        ChatTurnError::Terminal(format!(
-            "failed to serialize exact provider tool result: {error}"
-        ))
-    })?;
+    let payload = serde_json::to_value(result.full_message.as_ref().unwrap_or(&result.message))
+        .map_err(|error| {
+            ChatTurnError::Terminal(format!(
+                "failed to serialize exact provider tool result: {error}"
+            ))
+        })?;
     let output_policy_snapshot = result
         .retained_llm_context
         .as_ref()
@@ -2169,40 +2243,6 @@ fn preflight_active_recall_prompt_context_input(
     )
 }
 
-fn compile_agent_instruction_delivery_plan(
-    skills_prompt: Option<String>,
-    retry_instruction: Option<String>,
-    runtime_sections: &[PromptRuntimeSectionInput],
-    permission_profile: &TurnPermissionProfileSnapshot,
-    include_task_orchestration_policy: bool,
-    include_request_tools_catalog: bool,
-    continue_generation_hint: bool,
-    initiating_thread_id: Option<&str>,
-    thread_id: &str,
-    turn_id: &str,
-) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
-    let prompt_root = AppConfig::load()
-        .map_err(|error| ChatTurnError::Terminal(format!("failed to load app config: {error}")))?
-        .runtime_home_dir()
-        .map_err(|error| {
-            ChatTurnError::Terminal(format!("failed to resolve runtime home: {error:#}"))
-        })?;
-
-    compile_agent_instruction_delivery_plan_with_prompt_root(
-        prompt_root.as_path(),
-        skills_prompt,
-        retry_instruction,
-        runtime_sections,
-        permission_profile,
-        include_task_orchestration_policy,
-        include_request_tools_catalog,
-        continue_generation_hint,
-        initiating_thread_id,
-        thread_id,
-        turn_id,
-    )
-}
-
 fn compile_agent_instruction_delivery_plan_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
@@ -2592,6 +2632,7 @@ async fn start_reasoning_item(
 }
 
 pub(super) async fn execute_chat_turn_flow(
+    context_session: Option<Arc<crate::compaction::controller::NativeContextSession>>,
     thread_id: String,
     turn_id: String,
     workspace_id: String,
@@ -2636,7 +2677,15 @@ pub(super) async fn execute_chat_turn_flow(
         ));
     }
 
-    let user_message = build_user_message(input.as_slice(), resolved_artifacts.as_slice());
+    let mut user_message = build_user_message(input.as_slice(), resolved_artifacts.as_slice());
+    user_message.provenance = Some(crate::compaction::history::pending_origin(
+        &workspace_id,
+        &thread_id,
+        &turn_id,
+        "user-input",
+        crate::compaction::history::PendingOriginKind::Input,
+        &turn_id,
+    ));
 
     if execution_security_snapshot.is_none() {
         return Err(ChatTurnError::Terminal(
@@ -2645,7 +2694,18 @@ pub(super) async fn execute_chat_turn_flow(
     }
 
     let thinking_item_id = generate_id(TURN_ITEM_ID_LEN);
-    let message_item_id = deterministic_final_message_item_id(&turn_id);
+    let final_identity = if context_session
+        .as_ref()
+        .is_some_and(|s| s.context.overflow_recovery)
+    {
+        recovery
+            .as_ref()
+            .map(|r| format!("{turn_id}:context-recovery:{}", r.attempt_id))
+            .unwrap_or_else(|| turn_id.clone())
+    } else {
+        turn_id.clone()
+    };
+    let message_item_id = deterministic_final_message_item_id(&final_identity);
 
     emit_durable_event(
         event_tx.as_ref(),
@@ -2668,6 +2728,7 @@ pub(super) async fn execute_chat_turn_flow(
         ThreadMode::Message => unreachable!("message mode is rejected before provider execution"),
         ThreadMode::Agent => {
             execute_agent_provider_response(
+                context_session.as_deref(),
                 provider_registry,
                 &provider,
                 model,
@@ -2710,6 +2771,7 @@ pub(super) async fn execute_chat_turn_flow(
         }
         ThreadMode::Chat => {
             let result = execute_standard_provider_response(
+                context_session.as_deref(),
                 &provider,
                 model,
                 history,
@@ -2757,7 +2819,34 @@ pub(super) async fn execute_chat_turn_flow(
     }
 }
 
+async fn await_context_request<T>(
+    session: Option<&crate::compaction::controller::NativeContextSession>,
+    future: impl std::future::Future<Output = Result<T, ChatTurnError>>,
+) -> Result<T, ChatTurnError> {
+    let Some(session) = session else {
+        return future.await;
+    };
+    let work = async {
+        if let Some(deadline) = session.provider_deadline() {
+            tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| {
+                    ChatTurnError::Blocked(
+                        "context recovery deadline exceeded during provider retry".into(),
+                    )
+                })?
+        } else {
+            future.await
+        }
+    };
+    tokio::select! { biased;
+        _ = session.context.cancellation.cancelled() => Err(ChatTurnError::Blocked("native model request cancelled".into())),
+        result = work => result,
+    }
+}
+
 async fn execute_standard_provider_response(
+    context_session: Option<&crate::compaction::controller::NativeContextSession>,
     provider: &Arc<dyn Provider>,
     model: String,
     history: Vec<ChatMessage>,
@@ -2794,32 +2883,50 @@ async fn execute_standard_provider_response(
         compiled_prompt,
     };
 
-    if provider.capabilities().streaming && !force_non_stream {
-        provider::stream_provider_response(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            message_item_id,
-            provider_timeout_policy,
-            event_tx.as_ref(),
-        )
-        .await
+    let (request, receipt) = if let Some(session) = context_session {
+        let prepared = session
+            .prepare(request, false)
+            .await
+            .map_err(|e| ChatTurnError::Blocked(format!("context preparation failed: {e}")))?;
+        (prepared.request, Some(prepared.receipt))
     } else {
-        provider::non_stream_provider_response(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            message_item_id,
-            event_tx.as_ref(),
-        )
-        .await
+        (request, None)
+    };
+    let work = async {
+        if provider.capabilities().streaming && !force_non_stream {
+            provider::stream_provider_response(
+                provider,
+                request,
+                workspace_id,
+                thread_id,
+                turn_id,
+                thinking_item_id,
+                message_item_id,
+                provider_timeout_policy,
+                event_tx.as_ref(),
+            )
+            .await
+        } else {
+            provider::non_stream_provider_response(
+                provider,
+                request,
+                workspace_id,
+                thread_id,
+                turn_id,
+                thinking_item_id,
+                message_item_id,
+                event_tx.as_ref(),
+            )
+            .await
+        }
+    };
+    let (text, usage) = await_context_request(context_session, work).await?;
+    if let (Some(session), Some(receipt)) = (context_session, receipt) {
+        session
+            .record_usage(receipt, usage.as_ref())
+            .map_err(|e| ChatTurnError::Blocked(format!("context usage unavailable: {e}")))?;
     }
+    Ok(text)
 }
 
 async fn materialize_mcp_tooling(
@@ -3353,6 +3460,7 @@ fn workdir_from_execution_security_snapshot(
 }
 
 async fn execute_agent_provider_response(
+    context_session: Option<&crate::compaction::controller::NativeContextSession>,
     provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
     model: String,
@@ -3846,7 +3954,8 @@ async fn execute_agent_provider_response(
             filesystem_prompt_snapshot.as_ref(),
         )?;
 
-        let initial_instruction_plan = compile_agent_instruction_delivery_plan(
+        let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+            tool_loop_config.computer_use.runtime_home_dir.as_path(),
             skills_prompt.clone(),
             None,
             prompt_runtime_sections.as_slice(),
@@ -3886,6 +3995,7 @@ async fn execute_agent_provider_response(
         .await?;
 
         let result = execute_standard_provider_response(
+            context_session,
             provider,
             model,
             history,
@@ -4273,7 +4383,8 @@ async fn execute_agent_provider_response(
         filesystem_prompt_snapshot.as_ref(),
     )?;
 
-    let initial_instruction_plan = compile_agent_instruction_delivery_plan(
+    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+        tool_loop_config.computer_use.runtime_home_dir.as_path(),
         skills_prompt.clone(),
         None,
         prompt_runtime_sections.as_slice(),
@@ -4641,7 +4752,8 @@ async fn execute_agent_provider_response(
                 }
                 let next_retry_instruction = normalize_optional_prompt(Some(instruction));
                 if next_retry_instruction != applied_retry_instruction {
-                    let refreshed_instruction_plan = compile_agent_instruction_delivery_plan(
+                    let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+            tool_loop_config.computer_use.runtime_home_dir.as_path(),
                         skills_prompt.clone(),
                         next_retry_instruction.clone(),
                         prompt_runtime_sections.as_slice(),
@@ -4734,7 +4846,8 @@ async fn execute_agent_provider_response(
                     include_artifact_reference_policy,
                 )
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_instruction_plan = compile_agent_instruction_delivery_plan(
+                let no_tool_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+            tool_loop_config.computer_use.runtime_home_dir.as_path(),
                     skills_prompt.clone(),
                     applied_retry_instruction.clone(),
                     no_tool_runtime_sections.as_slice(),
@@ -4768,9 +4881,7 @@ async fn execute_agent_provider_response(
             };
 
             let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
-            let round = provider::request_agent_round(
-                provider,
-                ChatRequest {
+            let request = ChatRequest {
                     model: model.clone(),
                     messages: messages.clone(),
                     temperature: Some(0.7),
@@ -4780,7 +4891,18 @@ async fn execute_agent_provider_response(
                     parallel_tool_calls: round_plan.tools_enabled.then_some(true),
                     reasoning,
                     compiled_prompt: round_compiled_prompt,
-                },
+                            };
+            let (request, receipt) = if let Some(session) = context_session {
+                let prepared = session.prepare(request, false).await.map_err(|e| (
+                    ChatTurnError::Blocked(format!("context preparation failed: {e}")),
+                    current_thinking_id.clone(),
+                ))?;
+                (prepared.request, Some(prepared.receipt))
+            } else { (request, None) };
+            messages = request.messages.clone();
+            let round = await_context_request(context_session, provider::request_agent_round(
+                provider,
+                request,
                 workspace_id,
                 thread_id,
                 turn_id,
@@ -4788,9 +4910,16 @@ async fn execute_agent_provider_response(
                 force_non_stream,
                 tool_loop_config.provider,
                 event_tx.as_ref(),
-            )
+            ))
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
+
+            if let (Some(session), Some(receipt)) = (context_session, receipt) {
+                session.record_usage(receipt, round.usage.as_ref()).map_err(|e| (
+                    ChatTurnError::Blocked(format!("context usage unavailable: {e}")),
+                    current_thinking_id.clone(),
+                ))?;
+            }
 
             if !round.text.trim().is_empty() {
                 append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
@@ -5044,7 +5173,8 @@ async fn execute_agent_provider_response(
                     pending_retry_instruction =
                         normalize_optional_prompt(Some(instruction.clone()));
                     if pending_retry_instruction != applied_retry_instruction {
-                        let refreshed_instruction_plan = compile_agent_instruction_delivery_plan(
+                        let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+            tool_loop_config.computer_use.runtime_home_dir.as_path(),
                             skills_prompt.clone(),
                             pending_retry_instruction.clone(),
                             prompt_runtime_sections.as_slice(),
@@ -5555,7 +5685,7 @@ async fn execute_agent_provider_response(
             .await
             .map_err(|error| (error, current_thinking_id.clone()))?;
 
-            let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
+            let mut assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
                 (!round.text.is_empty()).then_some(round.text.clone()),
                 (!round.reasoning.is_empty()).then_some(round.reasoning.clone()),
                 round.tool_calls.clone(),
@@ -5606,6 +5736,9 @@ async fn execute_agent_provider_response(
             )
             .await
             .map_err(|error| (error, current_thinking_id.clone()))?;
+            assistant_round.provenance = Some(crate::compaction::history::pending_origin(
+                workspace_id,thread_id,turn_id,&round_id,crate::compaction::history::PendingOriginKind::Assistant,&round_id,
+            ));
             retain_provider_history_message(
                 &mut continuation_provider_history,
                 &mut next_provider_history_sequence,
@@ -5751,6 +5884,8 @@ async fn execute_agent_provider_response(
                                 outcome: outcome.clone(),
                                 recovery_view: None,
                                 retained_llm_context: None,
+            full_message: None,
+        full_source_in_item: false,
                                 request_tools_result: None,
                                 message: tooling::build_tool_error_message(
                                     provider_call_id,
@@ -5910,6 +6045,8 @@ async fn execute_agent_provider_response(
                                     outcome: outcome.clone(),
                                     recovery_view: None,
                                     retained_llm_context: None,
+            full_message: None,
+        full_source_in_item: false,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         provider_call_id,
@@ -5997,6 +6134,8 @@ async fn execute_agent_provider_response(
                                     outcome: outcome.clone(),
                                     recovery_view: None,
                                     retained_llm_context: None,
+            full_message: None,
+        full_source_in_item: false,
                                     request_tools_result: None,
                                     message: tooling::build_tool_error_message(
                                         provider_call_id,
@@ -6053,6 +6192,16 @@ async fn execute_agent_provider_response(
                             .complete_attempt(turn_id.as_str(), item_id.as_str())
                             .await;
 
+                        let full_source_in_item = dispatch_result.as_ref().ok().and_then(|r| r.projection()).is_some_and(|p| matches!(p.storage, pioneer_protocol::ToolStoragePayload::Shell { .. }) && matches!(p.output_policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. }));
+                        let full_message = dispatch_result.as_ref().ok().map(|result| {
+                            let mut message = result.to_model_input_item().into_chat_message();
+                            message.tool_call_id = Some(provider_call_id.clone());
+                            message.name = Some(tool_name.clone());
+                            let raw = result.raw_output_json();
+                            message.content = if let Some(text) = raw.as_str() { text.to_owned() } else if raw.is_null() { result.raw_output_text() } else { raw.to_string() };
+                            message
+                        });
+                        let full_source_in_item = full_source_in_item && full_message.as_ref().is_none_or(|message| message.content_parts.is_empty());
                         let (
                             tool_output,
                             success,
@@ -6131,6 +6280,8 @@ async fn execute_agent_provider_response(
                             recovery_view,
                             retained_llm_context,
                             request_tools_result,
+                            full_message,
+                            full_source_in_item,
                             message,
                         })
                     });
@@ -6183,7 +6334,7 @@ async fn execute_agent_provider_response(
                                 event_tx.as_ref(),
                                 AgentDurableEvent::ItemCompleted {
                                     notification: ItemCompletedNotification {
-                                        workspace_id,
+                                        workspace_id: workspace_id.clone(),
                                         thread_id: thread_id.clone(),
                                         turn_id: turn_id.clone(),
                                         item: tooling::build_failed_tool_turn_item(
@@ -6212,13 +6363,21 @@ async fn execute_agent_provider_response(
                             (result, Some(text))
                         }
                     };
-                    persist_retained_tool_result(
-                        event_tx.as_ref(),
-                        thread_id.as_str(),
-                        turn_id.as_str(),
-                        &result,
-                    )
-                    .await?;
+                    let mut result = result;
+                    let reference = serde_json::json!({"workspace_id": workspace_id, "thread_id": thread_id,
+                        "turn_id": turn_id, "item_id": result.item_id}).to_string();
+                    if !result.full_source_in_item {
+                        persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                    }
+                    result.message = bounded_tool_result_message(
+                        result.full_message.as_ref().unwrap_or(&result.message), &reference,
+                    )?;
+                    // The durable terminal item already owns full shell output. Retain only
+                    // its bounded provider representation in canonical replay history.
+                    if result.full_source_in_item {
+                        result.full_message = None;
+                        persist_retained_tool_result(event_tx.as_ref(), thread_id.as_str(), turn_id.as_str(), &result).await?;
+                    }
                     if let Some(error) = unknown_side_effect {
                         return Err(ChatTurnError::Terminal(error));
                     }
@@ -6364,7 +6523,8 @@ async fn execute_agent_provider_response(
                 normalize_optional_prompt(pending_retry_instruction.clone());
 
             if next_retry_instruction != applied_retry_instruction {
-                let refreshed_instruction_plan = compile_agent_instruction_delivery_plan(
+                let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+            tool_loop_config.computer_use.runtime_home_dir.as_path(),
                     skills_prompt.clone(),
                     next_retry_instruction.clone(),
                     prompt_runtime_sections.as_slice(),
@@ -6402,7 +6562,12 @@ async fn execute_agent_provider_response(
                 applied_retry_instruction = next_retry_instruction;
             }
 
-            for result in &executed_results {
+            for result in &mut executed_results {
+                result.message.provenance = Some(crate::compaction::history::pending_origin(
+                    workspace_id,thread_id,turn_id,&round_id,
+                    if result.full_source_in_item {crate::compaction::history::PendingOriginKind::ToolItem} else {crate::compaction::history::PendingOriginKind::ToolResult},
+                    &result.item_id,
+                ));
                 retain_provider_history_message(
                     &mut continuation_provider_history,
                     &mut next_provider_history_sequence,
@@ -7773,6 +7938,8 @@ mod tests {
             },
             recovery_view: None,
             retained_llm_context: None,
+            full_message: None,
+            full_source_in_item: false,
             request_tools_result: None,
             message: ChatMessage::tool_result("provider_call_1", tool_name, text),
         }
@@ -8998,6 +9165,7 @@ mod tests {
 
     fn computer_use_snapshot_message(call_id: &str, session_id: u64, path: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role: pioneer_provider::Role::Tool,
             content: serde_json::json!({
                 "action": "snapshot",
@@ -9295,6 +9463,7 @@ mod tests {
     fn agent_policy_keeps_latest_snapshot_per_session_and_preserves_user_files() {
         let mut messages = vec![
             ChatMessage {
+                provenance: None,
                 role: pioneer_provider::Role::User,
                 content: "Analyze this file".to_owned(),
                 reasoning_content: None,
@@ -9321,6 +9490,7 @@ mod tests {
     fn agent_policy_prunes_snapshots_before_pinned_files_when_budget_exceeded() {
         let mut messages = vec![
             ChatMessage {
+                provenance: None,
                 role: pioneer_provider::Role::User,
                 content: "Keep this PDF pinned".to_owned(),
                 reasoning_content: None,
@@ -9347,6 +9517,7 @@ mod tests {
     fn chat_policy_keeps_only_latest_user_attachment_message() {
         let mut messages = vec![
             ChatMessage {
+                provenance: None,
                 role: pioneer_provider::Role::User,
                 content: "old file".to_owned(),
                 reasoning_content: None,
@@ -9357,6 +9528,7 @@ mod tests {
                 provider_replay_state: None,
             },
             ChatMessage {
+                provenance: None,
                 role: pioneer_provider::Role::Tool,
                 content: "tool-1".to_owned(),
                 reasoning_content: None,
@@ -9367,6 +9539,7 @@ mod tests {
                 provider_replay_state: None,
             },
             ChatMessage {
+                provenance: None,
                 role: pioneer_provider::Role::User,
                 content: "new file".to_owned(),
                 reasoning_content: None,
@@ -9606,5 +9779,58 @@ mod tests {
 
         assert_eq!(message.content, "first\nsecond");
         assert!(message.content_parts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod compaction_result_budget_tests {
+    use super::*;
+    #[test]
+    fn inline_binary_result_uses_a_reference_to_the_retained_part() {
+        let mut source = ChatMessage::tool("binary result");
+        let mut attachment = pioneer_provider::MessageAttachment::from_path("fixture", "image/png");
+        attachment.source = pioneer_provider::AttachmentDataSource::Bytes {
+            base64_data: "A".repeat(300_000),
+        };
+        source
+            .content_parts
+            .push(pioneer_provider::MessageContentPart::image(attachment));
+        let bounded = bounded_tool_result_message(&source, "fixture-source").unwrap();
+        assert!(bounded.content_parts.is_empty());
+        assert!(
+            bounded.content.contains("fixture-source") && bounded.content.contains("content_part")
+        );
+        assert!(bounded.content.len() < 1000);
+        assert_eq!(source.content_parts.len(), 1);
+    }
+    #[test]
+    fn result_budget_rejects_oversized_non_text_framing_without_looping() {
+        let mut source = ChatMessage::tool("");
+        source
+            .content_parts
+            .push(pioneer_provider::MessageContentPart::file(
+                pioneer_provider::MessageAttachment::from_path(
+                    "x".repeat(70_000),
+                    "application/octet-stream",
+                ),
+            ));
+        assert!(bounded_tool_result_message(&source, "fixture-ref").is_err());
+    }
+    #[test]
+    fn result_budget_counts_serialized_framing_and_all_text_parts() {
+        let mut source = ChatMessage::tool("\"\\\n".repeat(30_000));
+        source.name = Some("fixture".into());
+        source
+            .content_parts
+            .push(pioneer_provider::MessageContentPart::text(
+                "🌍漢字".repeat(30_000),
+            ));
+        let page = bounded_tool_result_message(&source, "fixture-ref").unwrap();
+        let wire = serde_json::to_string(&page).unwrap();
+        assert!(wire.len() <= pioneer_compaction::RESULT_BYTES);
+        assert!(pioneer_compaction::text_tokens(&wire) <= pioneer_compaction::RESULT_TOKENS);
+        assert!(page.content_parts.is_empty());
+        assert!(page.content.contains("fixture-ref"));
+        assert!(source.content_parts.len() == 1);
     }
 }

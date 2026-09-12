@@ -1,0 +1,3771 @@
+use migration::{Migrator, MigratorTrait};
+use pioneer_compaction::*;
+use pioneer_crud::{CrudStore, compaction::*};
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+async fn store() -> CrudStore {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&db, None).await.unwrap();
+    let store = CrudStore::new(db).with_maintenance_access();
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    store
+}
+async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> SourceAssertion {
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",
+        [id.into(), sequence.into(), payload.into()])).await.unwrap();
+    SourceAssertion {
+        revision: None,
+        kind: CanonicalSource::Event,
+        turn_id: "turn".into(),
+        id: id.into(),
+        payload: payload.into(),
+    }
+}
+async fn candidate(
+    store: &CrudStore,
+    op: &str,
+    expected: Option<&str>,
+    assertion: &SourceAssertion,
+) -> Checkpoint {
+    candidate_with_epochs(
+        store,
+        op,
+        expected,
+        assertion,
+        std::collections::BTreeMap::new(),
+    )
+    .await
+}
+async fn candidate_with_epochs(
+    store: &CrudStore,
+    op: &str,
+    expected: Option<&str>,
+    assertion: &SourceAssertion,
+    source_epochs: std::collections::BTreeMap<String, u64>,
+) -> Checkpoint {
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "p".into(),
+        model: "m".into(),
+        effort: None,
+    };
+    let snapshot = OperationSnapshot {
+        id: op.into(),
+        owner: "owner".into(),
+        expected_checkpoint: expected.map(str::to_owned),
+        projection_version: 1,
+        source_epochs,
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 10)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![assertion.reference()],
+            fingerprint: op.into(),
+        },
+    };
+    store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: format!("cp-{op}"),
+        operation_id: op.into(),
+        format_version: 1,
+        owner: "owner".into(),
+        previous: expected.map(str::to_owned),
+        coverage: vec![assertion.reference()],
+        summary: "A saved summary".into(),
+        selection,
+        projection_version: 1,
+    };
+    store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    checkpoint
+}
+#[tokio::test]
+async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply() {
+    let store = store().await;
+    let first = source(&store, "source-a", 1, "original one").await;
+    let cp = candidate(&store, "op-a", None, &first).await;
+    source(&store, "source-b", 2, "appended after snapshot").await;
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[first.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let restarted = CrudStore::new(store.database_connection());
+    assert_eq!(
+        restarted.compaction_head("owner").await.unwrap().as_deref(),
+        Some(cp.id.as_str())
+    );
+    assert_eq!(
+        restarted
+            .compaction_apply(&cp, None, &[first])
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+    let page = restarted
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 2);
+    assert!(page.entries.iter().all(|s| !s.incomplete));
+    assert_eq!(
+        restarted
+            .compaction_checkpoint(&cp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage
+            .len(),
+        1
+    );
+}
+#[tokio::test]
+async fn edits_competing_head_and_stop_reject_candidates_without_losing_summaries() {
+    let store = store().await;
+    let s = source(&store, "source", 1, "original").await;
+    let a = candidate(&store, "a", None, &s).await;
+    let b = candidate(&store, "b", None, &s).await;
+    assert_eq!(
+        store
+            .compaction_apply(&a, None, &[s.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&b, None, &[s.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    let c = candidate(&store, "c", Some(&a.id), &s).await;
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='changed' WHERE id='source'")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply(&c, Some(&a.id), &[s.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    store
+        .compaction_finish("c", "cancelled", "user_stop")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.compaction_apply(&c, Some(&a.id), &[s]).await.unwrap(),
+        CommitOutcome::Cancelled
+    );
+    for cp in [&a, &b, &c] {
+        assert!(store.compaction_checkpoint(&cp.id).await.unwrap().is_some());
+    }
+    assert_eq!(
+        store.compaction_head("owner").await.unwrap().as_deref(),
+        Some(a.id.as_str())
+    );
+}
+#[tokio::test]
+async fn durable_retry_budget_and_exact_candidate_idempotency() {
+    let store = store().await;
+    let s = source(&store, "source", 1, "original").await;
+    let cp = candidate(&store, "op", None, &s).await;
+    store.compaction_save_candidate(&cp, 0).await.unwrap();
+    let mut forged = cp.clone();
+    forged.summary = "different result".into();
+    assert!(store.compaction_save_candidate(&forged, 0).await.is_err());
+    assert!(store.compaction_apply(&forged, None, &[s]).await.is_err());
+    assert!(
+        store
+            .compaction_claim_attempt("op", 0, 20, false, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .compaction_claim_attempt("op", 0, 20, false, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_claim_attempt("op", 1, 20, true, false)
+            .await
+            .unwrap()
+    );
+    let restarted = CrudStore::new(store.database_connection());
+    assert!(
+        restarted
+            .compaction_claim_attempt("op", 2, 20, true, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !restarted
+            .compaction_claim_attempt("op", 3, 20, true, false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !restarted
+            .compaction_claim_attempt("op", 3, 20, false, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !restarted
+            .compaction_claim_attempt("op", 3, 900_010, false, false)
+            .await
+            .unwrap()
+    );
+}
+#[tokio::test]
+async fn poison_source_progress_and_scope_are_bounded() {
+    let store = store().await;
+    source(&store, "huge", 1, &"x".repeat(SOURCE_PAGE_BYTES + 1)).await;
+    source(&store, "next", 2, "small").await;
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    assert!(page.entries[0].incomplete);
+    assert_eq!(page.entries[1].payload.as_deref(), Some("small"));
+    assert_eq!(page.next_sequence, 2);
+    assert!(
+        store
+            .compaction_source_page("other", "thread", "turn", CanonicalSource::Event, 0)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        store.database_connection().read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
+    assert_eq!(
+        store.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Maintenance
+    );
+}
+
+#[tokio::test]
+async fn cancellation_releases_writer_and_reader_is_physically_read_only() {
+    use sea_orm::{ConnectOptions, TransactionTrait};
+    use std::time::Duration;
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target/compaction-tests");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(1).min_connections(1);
+    let writer = Database::connect(options).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+    options.max_connections(1).min_connections(1);
+    let reader = Database::connect(options).await.unwrap();
+    reader
+        .execute_unprepared("PRAGMA query_only=ON")
+        .await
+        .unwrap();
+    let database = pioneer_sqlite::SqliteDatabase::new(reader, writer);
+    assert!(database.reader_query_only_enabled().await.unwrap());
+    let store = CrudStore::new(database.clone()).with_maintenance_access();
+    let hold = database.begin().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), store.compaction_head("none"))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    let waiting = tokio::spawn({
+        let store = store.clone();
+        async move { store.compaction_finish("none", "cancelled", "stop").await }
+    });
+    tokio::task::yield_now().await;
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    hold.rollback().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        store.compaction_finish("none", "failed", "done"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(database.reader_query_only_enabled().await.unwrap());
+    drop(store);
+    drop(database);
+    // This file belongs exclusively to this test. No application configuration is used.
+    std::fs::remove_file(&path).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn large_canonical_source_reads_are_version_bound_and_cleanup_preserves_original() {
+    let store = store().await;
+    let text = "🌍漢字abcdef".repeat(40_000);
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('large','turn',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)", [text.clone().into()])).await.unwrap();
+    let mut offset = 0;
+    let mut rebuilt = String::new();
+    let mut revision = None;
+    loop {
+        let fragment = store
+            .compaction_source_fragment(
+                "ws",
+                "thread",
+                "turn",
+                "large",
+                revision.as_deref(),
+                offset,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fragment.text.len() <= 64 * 1024);
+        revision = Some(fragment.reference.version);
+        rebuilt.push_str(&fragment.text);
+        let Some(next) = fragment.next_character else {
+            break;
+        };
+        offset = next;
+    }
+    assert_eq!(rebuilt, text);
+    assert_eq!(
+        store
+            .delete_turn_llm_context_for_terminal_turns()
+            .await
+            .unwrap(),
+        0
+    );
+    let source = SourceAssertion {
+        revision: Some(1),
+        kind: CanonicalSource::ProviderContext,
+        turn_id: "turn".into(),
+        id: "large".into(),
+        payload: String::new(),
+    };
+    let cp = candidate(&store, "large-op", None, &source).await;
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_llm_context SET payload='changed' WHERE id='large'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_source_fragment("ws", "thread", "turn", "large", revision.as_deref(), 0)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.compaction_apply(&cp, None, &[source]).await.unwrap(),
+        CommitOutcome::Stale
+    );
+}
+
+#[tokio::test]
+async fn tool_result_lookup_never_crosses_workspace_thread_or_turn() {
+    let store = store().await;
+    store.database_connection().execute_unprepared("INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('result','turn','call-item',1,'tool_result_v2','{}','{}',CURRENT_TIMESTAMP)").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_tool_result_id("ws", "thread", "turn", "call-item")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("result")
+    );
+    for (workspace, thread, turn) in [
+        ("other", "thread", "turn"),
+        ("ws", "other", "turn"),
+        ("ws", "thread", "other"),
+    ] {
+        assert!(
+            store
+                .compaction_tool_result_id(workspace, thread, turn, "call-item")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_shell_result_reuses_terminal_item_and_binds_revision() {
+    let store = store().await;
+    let payload = serde_json::json!({"storage":{"kind":"shell","stdout":"🌍漢字".repeat(20_000),"truncated":true}}).to_string();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,payload,created_at,updated_at) VALUES ('shell-row','turn','shell-item','command_execution',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
+    assert!(
+        store
+            .compaction_tool_result_id("ws", "thread", "turn", "shell-item")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let first = store
+        .compaction_tool_result_fragment("ws", "thread", "turn", "shell-item", None, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    let version = first.reference.version.clone();
+    assert!(version.starts_with("item-revision:"));
+    let mut restored = first.text;
+    let mut next = first.next_character;
+    while let Some(offset) = next {
+        let fragment = store
+            .compaction_tool_result_fragment(
+                "ws",
+                "thread",
+                "turn",
+                "shell-item",
+                Some(&version),
+                offset,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        restored.push_str(&fragment.text);
+        next = fragment.next_character;
+    }
+    assert_eq!(restored, payload);
+    assert!(
+        store
+            .compaction_tool_result_fragment("other", "thread", "turn", "shell-item", None, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let assertion = SourceAssertion {
+        kind: CanonicalSource::ToolItem,
+        turn_id: "turn".into(),
+        id: "shell-row".into(),
+        payload: String::new(),
+        revision: Some(
+            version
+                .strip_prefix("item-revision:")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ),
+    };
+    let checkpoint = candidate(&store, "shell-op", None, &assertion).await;
+    store.database_connection().execute_unprepared("UPDATE turn_item SET payload=json_set(payload,'$.storage.truncated',0) WHERE id='shell-row'").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_apply(&checkpoint, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    assert!(
+        store
+            .compaction_tool_result_fragment(
+                "ws",
+                "thread",
+                "turn",
+                "shell-item",
+                Some(&version),
+                0
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn durable_runner_manifest_candidate_and_state_commit_together() {
+    verify_runner_commit_dependency(false).await;
+}
+#[tokio::test]
+async fn foreign_dependency_edit_fences_runner_commit() {
+    verify_runner_commit_dependency(true).await;
+}
+async fn verify_runner_commit_dependency(edit_parent: bool) {
+    use pioneer_compaction::runner::{RunnerState, SourceCursor};
+    let store = store().await;
+    store.database_connection().execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('parent','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    store.database_connection().execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('parent-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    store.database_connection().execute_unprepared("INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('parent-source','parent','parent-turn',1,'fixture','reference fact',CURRENT_TIMESTAMP)").await.unwrap();
+    source(&store, "runner-source", 1, "original source").await;
+    // Simulate a source predating the migration: admission must seed revision
+    // metadata even if this source is never read by the service materializer.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM compaction_event_revision WHERE source_id='runner-source'")
+        .await
+        .unwrap();
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    let reference = page.entries[0].reference.clone();
+    assert_eq!(reference.version, "event-revision:1");
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        0
+    );
+    let snapshot = OperationSnapshot {
+        id: "runner".into(),
+        owner: "runner-owner".into(),
+        expected_checkpoint: None,
+        projection_version: 0,
+        source_epochs: std::collections::BTreeMap::from([("parent".into(), 0)]),
+        admission: CompactionSettings::default()
+            .admit(
+                &ModelSelection {
+                    transport: Transport::Api,
+                    instance: "p".into(),
+                    model: "m".into(),
+                    effort: None,
+                },
+                None,
+                0,
+            )
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            compact: vec![],
+            retain: vec![],
+            coverage: vec![],
+            fingerprint: "runner-plan".into(),
+        },
+    };
+    store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    let budget = ModelBudget::new(None, None, None);
+    store
+        .compaction_prepare_runner("runner", &budget, 1, 0)
+        .await
+        .unwrap();
+    let initial = RunnerState::new(snapshot.admission.deadline_ms, &budget, 1000, None).unwrap();
+    assert!(
+        store
+            .compaction_activate_runner("runner", &initial)
+            .await
+            .is_err()
+    );
+    let manifest = ManifestEntry {
+        ordinal: 0,
+        unit: 0,
+        reference_only: false,
+        thread_id: "thread".into(),
+        source: reference.clone(),
+    };
+    store
+        .compaction_append_manifest("runner", &[manifest.clone()])
+        .await
+        .unwrap();
+    store
+        .compaction_append_manifest("runner", &[manifest])
+        .await
+        .unwrap();
+    store
+        .compaction_activate_runner("runner", &initial)
+        .await
+        .unwrap();
+    let attempt = initial.claim(1).unwrap();
+    assert!(
+        store
+            .compaction_runner_transition("runner", initial.generation, &attempt, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .compaction_runner_transition("runner", initial.generation, &attempt, None)
+            .await
+            .unwrap()
+    );
+    let next = attempt
+        .candidate(
+            1,
+            "runner-candidate".into(),
+            SourceCursor {
+                unit: 1,
+                ..Default::default()
+            },
+            true,
+            2,
+        )
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: "runner-candidate".into(),
+        operation_id: "runner".into(),
+        format_version: 1,
+        owner: snapshot.owner.clone(),
+        previous: None,
+        coverage: vec![reference],
+        summary: "saved complete candidate".into(),
+        selection: snapshot.admission.selection.clone(),
+        projection_version: 0,
+    };
+    let mut wrong_selection = checkpoint.clone();
+    wrong_selection.selection.model = "changed-after-admission".into();
+    assert!(
+        store
+            .compaction_runner_transition(
+                "runner",
+                attempt.generation,
+                &next,
+                Some(&wrong_selection)
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .compaction_runner_state("runner")
+            .await
+            .unwrap()
+            .unwrap(),
+        attempt
+    );
+    let mut wrong_basis = checkpoint.clone();
+    wrong_basis.previous = Some("unrelated-checkpoint".into());
+    assert!(
+        !store
+            .compaction_runner_transition("runner", attempt.generation, &next, Some(&wrong_basis))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_checkpoint("runner-candidate")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_runner_transition("runner", attempt.generation, &next, Some(&checkpoint))
+            .await
+            .unwrap()
+    );
+    let restored = store
+        .compaction_runner_state("runner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored, next);
+    assert_eq!(
+        store
+            .compaction_checkpoint("runner-candidate")
+            .await
+            .unwrap()
+            .unwrap()
+            .summary,
+        "saved complete candidate"
+    );
+    let ready = restored.candidate_checked(true).unwrap();
+    store
+        .compaction_runner_transition("runner", restored.generation, &ready, None)
+        .await
+        .unwrap();
+    if edit_parent {
+        store
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE turn_event SET payload='edited reference fact' WHERE id='parent-source'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .compaction_apply_runner("runner", &ready, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Stale
+        );
+        assert!(
+            store
+                .compaction_head("runner-owner")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .compaction_checkpoint("runner-candidate")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .compaction_checkpoint_source("ws", "thread", "runner-candidate")
+                .await
+                .unwrap()
+                .is_none(),
+            "ancestry prepared before a failed CAS must not become a live checkpoint"
+        );
+        return;
+    }
+    // Appending new material leaves the old selected source and epoch intact.
+    source(&store, "runner-append", 2, "new unselected work").await;
+    assert_eq!(
+        store
+            .compaction_apply_runner("runner", &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner("runner", &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+    let derived = store
+        .compaction_checkpoint_source("ws", "thread", "runner-candidate")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_reference_fragment("ws", "thread", &derived, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        "saved complete candidate"
+    );
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='edited' WHERE id='runner-source'")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .compaction_checkpoint_source("ws", "thread", "runner-candidate")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Normal thread deletion must keep its existing cascade contract.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM thread WHERE id='thread'")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn projection_epoch_changes_for_history_edits_without_invalidating_active_parent_appends() {
+    let store = store().await;
+    let db = store.database_connection();
+    db.execute_unprepared("INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('live-row','turn','live-item','command_execution','in_progress','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared(
+        "UPDATE turn_item SET payload='{\"stdout\":\"progress\"}' WHERE id='live-row'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        0
+    );
+    db.execute_unprepared("UPDATE turn_item SET status='completed',payload='{\"stdout\":\"finished\"}' WHERE id='live-row'").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        0
+    );
+    source(&store, "appended-parent-event", 1, "completed new work").await;
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        0
+    );
+    db.execute_unprepared("UPDATE turn_item SET payload='{\"stdout\":\"edited historical result\"}' WHERE id='live-row'").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn user_input_revisions_bind_edits_and_deletes_without_invalidating_appends() {
+    let store = store().await;
+    let db = store.database_connection();
+    db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('original-input','turn',0,'text','original','{\"type\":\"text\",\"text\":\"original\"}',CURRENT_TIMESTAMP)").await.unwrap();
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Input, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    let original = page.entries[0].reference.clone();
+    assert_eq!(original.version, "input-revision:1");
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &original, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("original")
+    );
+    db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('new-input','turn',1,'text','new','{\"type\":\"text\",\"text\":\"new\"}',CURRENT_TIMESTAMP)").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        0
+    );
+    db.execute_unprepared("UPDATE turn_input SET text='edited',payload='{\"type\":\"text\",\"text\":\"edited\"}' WHERE id='original-input'").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &original, 0)
+            .await
+            .is_err()
+    );
+    let changed = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Input, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    assert_eq!(changed.version, "input-revision:2");
+    assert!(
+        store
+            .compaction_reference_fragment("other", "thread", &changed, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.execute_unprepared("DELETE FROM turn_input WHERE id='original-input'")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &changed, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn source_high_water_is_scoped_and_append_does_not_move_a_captured_boundary() {
+    let store = store().await;
+    source(&store, "first", 1, "first payload").await;
+    let high_water = store
+        .compaction_source_high_water("ws", "thread", "turn", CanonicalSource::Event)
+        .await
+        .unwrap();
+    assert_eq!(high_water, 1);
+    assert_eq!(
+        store
+            .compaction_source_high_water("other", "thread", "turn", CanonicalSource::Event)
+            .await
+            .unwrap(),
+        0
+    );
+    source(&store, "appended", 2, "later payload").await;
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    let pinned: Vec<_> = page
+        .entries
+        .into_iter()
+        .filter(|row| row.sequence <= high_water)
+        .collect();
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].reference.id, "first");
+    assert_eq!(pinned[0].payload.as_deref(), Some("first payload"));
+    assert_eq!(
+        store
+            .compaction_source_high_water("ws", "thread", "turn", CanonicalSource::Event)
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn history_fence_excludes_late_completion_and_reused_canonical_rowid() {
+    let store = store().await;
+    source(&store, "before", 1, "before snapshot").await;
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    source(&store, "late", 2, "completed after snapshot").await;
+    let page = store
+        .compaction_history_turn_page("ws", "thread", "", &fence)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].event_high_water, 1);
+    assert!(
+        store
+            .compaction_history_turn_page("other", "thread", "", &fence)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_history_turn_page("ws", "thread", &page[0].id, &fence)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let next = store.compaction_history_read_fence().await.unwrap();
+    assert_eq!(
+        store
+            .compaction_history_turn_page("ws", "thread", "", &next)
+            .await
+            .unwrap()[0]
+            .event_high_water,
+        2
+    );
+    // Deleting the largest canonical row permits SQLite to reuse its rowid.
+    // Retained revision metadata must still classify the replacement as new.
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='late'")
+        .await
+        .unwrap();
+    source(&store, "replacement", 3, "new after deletion").await;
+    assert_eq!(
+        store
+            .compaction_history_turn_page("ws", "thread", "", &next)
+            .await
+            .unwrap()[0]
+            .event_high_water,
+        1
+    );
+}
+
+#[tokio::test]
+async fn metadata_projection_keeps_exact_sources_without_loading_covered_payloads() {
+    let store = store().await;
+    source(&store, "small-metadata", 1, "small body").await;
+    source(
+        &store,
+        "large-metadata",
+        2,
+        &"x".repeat(SOURCE_PAGE_BYTES + 1),
+    )
+    .await;
+    let metadata = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    assert_eq!(metadata.entries.len(), 2);
+    assert_eq!(metadata.next_sequence, 2);
+    assert!(metadata.entries.iter().all(|row| row.payload.is_none()));
+    let materialized = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata.entries[0].reference,
+        materialized.entries[0].reference
+    );
+    assert_eq!(
+        metadata.entries[1].reference,
+        materialized.entries[1].reference
+    );
+    assert_eq!(
+        materialized.entries[0].payload.as_deref(),
+        Some("small body")
+    );
+    assert!(materialized.entries[1].payload.is_none());
+    assert!(
+        store
+            .compaction_source_metadata_page("other", "thread", "turn", CanonicalSource::Event, 0)
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn fitting_request_validation_rejects_edited_deleted_and_cross_scope_sources() {
+    let store = store().await;
+    source(&store, "current-source", 1, "original").await;
+    let reference = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    assert!(
+        store
+            .compaction_sources_current("ws", "thread", &[reference.clone()])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .compaction_sources_current("other", "thread", &[reference.clone()])
+            .await
+            .unwrap()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='edited' WHERE id='current-source'")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_sources_current("ws", "thread", &[reference])
+            .await
+            .unwrap()
+    );
+    let updated = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    assert!(
+        store
+            .compaction_sources_current("ws", "thread", &[updated.clone()])
+            .await
+            .unwrap()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='current-source'")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_sources_current("ws", "thread", &[updated])
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn canonical_event_metadata_uses_typed_identity_and_invalidates_on_edit() {
+    let store = store().await;
+    for item in [
+        pioneer_protocol::TurnItem::Reasoning {
+            id: "reasoning-source".into(),
+            summary: vec![],
+            content: vec!["equal text".into()],
+        },
+        pioneer_protocol::TurnItem::AgentMessage {
+            id: "answer-source".into(),
+            text: "equal text".into(),
+            phase: Default::default(),
+            markdown: None,
+            markdown_version: None,
+        },
+    ] {
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    let metadata = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    let reasoning = metadata
+        .entries
+        .iter()
+        .find(|row| row.item_id.as_deref() == Some("reasoning-source"))
+        .unwrap();
+    let answer = metadata
+        .entries
+        .iter()
+        .find(|row| row.item_id.as_deref() == Some("answer-source"))
+        .unwrap();
+    assert_eq!(reasoning.projection_kind.as_deref(), Some("reasoning"));
+    assert_eq!(answer.projection_kind.as_deref(), Some("assistant"));
+    assert_ne!(reasoning.reference, answer.reference);
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE turn_event SET payload=replace(payload,'equal text','edited content') WHERE id=?", [reasoning.reference.id.clone().into()])).await.unwrap();
+    let edited = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    let invalidated = edited
+        .entries
+        .iter()
+        .find(|row| row.reference.id == reasoning.reference.id)
+        .unwrap();
+    assert_eq!(invalidated.projection_kind, None);
+    assert_eq!(invalidated.item_id, None);
+    assert_ne!(invalidated.reference.version, reasoning.reference.version);
+}
+
+#[tokio::test]
+async fn input_projection_uses_accepted_input_order_instead_of_insertion_order() {
+    let store = store().await;
+    let mut insertion_fence = None;
+    for (id, index) in [("later-input", 1_i64), ("first-input", 0_i64)] {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES (?,'turn',?,'text','fixture','{}',CURRENT_TIMESTAMP)", [id.into(),index.into()])).await.unwrap();
+        if index == 1 {
+            insertion_fence = Some(store.compaction_history_read_fence().await.unwrap());
+        }
+    }
+    let frozen = store
+        .compaction_source_metadata_page_at_fence(
+            "ws",
+            "thread",
+            "turn",
+            CanonicalSource::Input,
+            0,
+            insertion_fence.unwrap().input_order,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        frozen.entries.len(),
+        1,
+        "a late lower input index must not enter the captured snapshot"
+    );
+    assert_eq!(frozen.entries[0].reference.id, "later-input");
+    let page = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Input, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|row| row.reference.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first-input", "later-input"]
+    );
+    let next = store
+        .compaction_source_metadata_page(
+            "ws",
+            "thread",
+            "turn",
+            CanonicalSource::Input,
+            page.entries[0].sequence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.entries.len(), 1);
+    assert_eq!(next.entries[0].reference.id, "later-input");
+}
+
+#[tokio::test]
+async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    let store = store().await;
+    let descriptor = FrozenHistoryRef {
+        format: 1,
+        manifest_id: "frozen-manifest".into(),
+        messages: 130,
+        identity_sha256: "a".repeat(64),
+    };
+    let messages = (0..130)
+        .map(|i| FrozenMessageRef {
+            logical_turn_id: Some("command-turn".into()),
+            context_thread: None,
+            source_thread: "thread".into(),
+            unit_id: format!("unit-{i}"),
+            sources: vec![SourceRef {
+                scope: "event:turn".into(),
+                id: format!("event-{i}"),
+                version: "event-revision:1".into(),
+            }],
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "b".repeat(64),
+            replay_source: None,
+            tool_call_id: None,
+            tool_name: None,
+        })
+        .collect::<Vec<_>>();
+    store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_finish_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap()
+    );
+    store
+        .compaction_append_frozen_history(
+            "ws",
+            "thread",
+            &descriptor.manifest_id,
+            0,
+            &messages[..128],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_frozen_history_owner("ws", &descriptor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Restart retries the same immutable metadata, then finishes the remaining quantum.
+    store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_history(
+            "ws",
+            "thread",
+            &descriptor.manifest_id,
+            0,
+            &messages[..128],
+        )
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_history(
+            "ws",
+            "thread",
+            &descriptor.manifest_id,
+            128,
+            &messages[128..],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap()
+    );
+    let page = store
+        .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(page, messages[..128]);
+    assert_eq!(
+        store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 128)
+            .await
+            .unwrap(),
+        messages[128..]
+    );
+    assert!(
+        store
+            .compaction_frozen_history_page("other", "thread", &descriptor.manifest_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_frozen_history_owner("other", &descriptor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut changed = messages[0].clone();
+    changed.wire_sha256 = "c".repeat(64);
+    assert!(
+        store
+            .compaction_append_frozen_history(
+                "ws",
+                "thread",
+                &descriptor.manifest_id,
+                0,
+                &[changed]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+            .await
+            .unwrap(),
+        page
+    );
+    let mut collision = descriptor.clone();
+    collision.messages = 1;
+    assert!(
+        store
+            .compaction_begin_frozen_history("ws", "thread", &collision)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_append_frozen_history(
+                "ws",
+                "thread",
+                &descriptor.manifest_id,
+                130,
+                &messages[..1]
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn exact_reference_scope_requires_workspace_and_current_revision() {
+    let store = store().await;
+    source(&store, "lookup-source", 1, "original").await;
+    let reference = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    assert_eq!(
+        store
+            .compaction_reference_thread("ws", &reference)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("thread")
+    );
+    assert!(
+        store
+            .compaction_reference_thread("other-workspace", &reference)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_event SET payload='edited' WHERE id='lookup-source'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_reference_thread("ws", &reference)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn inherited_source_epoch_fences_commit_but_parent_append_does_not() {
+    for edited in [false, true] {
+        let store = store().await;
+        let db = store.database_connection();
+        db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('parent','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('parent-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_unprepared("INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('parent-source','parent','parent-turn',1,'fixture','reference fact',CURRENT_TIMESTAMP)").await.unwrap();
+        let own = source(&store, "own", 1, "own completed work").await;
+        let parent_epoch = store
+            .compaction_projection_version("ws", "parent")
+            .await
+            .unwrap();
+        let cp = candidate_with_epochs(
+            &store,
+            "guarded",
+            None,
+            &own,
+            std::collections::BTreeMap::from([("parent".into(), parent_epoch)]),
+        )
+        .await;
+        if edited {
+            db.execute_unprepared(
+                "UPDATE turn_event SET payload='edited fact' WHERE id='parent-source'",
+            )
+            .await
+            .unwrap();
+        } else {
+            db.execute_unprepared("INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('parent-append','parent','parent-turn',2,'fixture','later work',CURRENT_TIMESTAMP)").await.unwrap();
+        }
+        let result = store.compaction_apply(&cp, None, &[own]).await.unwrap();
+        assert_eq!(
+            result,
+            if edited {
+                CommitOutcome::Stale
+            } else {
+                CommitOutcome::Applied
+            }
+        );
+        assert_eq!(
+            store.compaction_head("owner").await.unwrap().is_some(),
+            !edited
+        );
+        assert!(store.compaction_checkpoint(&cp.id).await.unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn source_epoch_admission_rejects_changed_missing_and_foreign_scope() {
+    let store = store().await;
+    let own = source(&store, "own", 1, "completed work").await;
+    candidate(&store, "original", None, &own).await;
+    store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('other','other',1,0)",
+        )
+        .await
+        .unwrap();
+    store.database_connection().execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('foreign','other','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    let original: OperationSnapshot = serde_json::from_str(
+        &store
+            .compaction_operation("original")
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot,
+    )
+    .unwrap();
+    for (index, (thread, epoch)) in [("missing", 0), ("thread", 99), ("foreign", 0)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut snapshot = original.clone();
+        snapshot.id = format!("invalid-{index}");
+        snapshot.plan.fingerprint = snapshot.id.clone();
+        snapshot.source_epochs = std::collections::BTreeMap::from([(thread.into(), epoch)]);
+        assert!(
+            store
+                .compaction_admit("ws", "thread", &snapshot)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .compaction_operation(&snapshot.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn causal_task_boundary_requires_identified_delivery_inside_capture_fence() {
+    let store = store().await;
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('run','thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('delivery','ws','task','run','key','thread','origin_thread','thread','delivered',1,1,'run')",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let empty = store.compaction_history_read_fence().await.unwrap();
+    let boundary = store
+        .compaction_history_causal_boundary("ws", "thread", "turn", &empty)
+        .await
+        .unwrap();
+    assert!(boundary.delegated_command);
+    assert!(
+        !boundary.delivered_outcome,
+        "delivery status without an acknowledged payload is not closure"
+    );
+    assert!(
+        store
+            .compaction_history_causal_boundary("ws", "thread", "run", &empty)
+            .await
+            .unwrap()
+            .task_transport
+    );
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "run".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "unrelated-response".into(),
+                    text: "not the Task result".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let unrelated = store.compaction_history_read_fence().await.unwrap();
+    assert!(
+        !store
+            .compaction_history_causal_boundary("ws", "thread", "turn", &unrelated)
+            .await
+            .unwrap()
+            .delivered_outcome
+    );
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "run".into(),
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: pioneer_protocol::task_delivery_result_item_id("delivery"),
+                    level: pioneer_protocol::SystemEventLevel::Error,
+                    message: "acknowledged failed outcome".into(),
+                    code: Some("unavailable".into()),
+                    details: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let completed = store.compaction_history_read_fence().await.unwrap();
+    assert!(
+        store
+            .compaction_history_causal_boundary("ws", "thread", "turn", &completed)
+            .await
+            .unwrap()
+            .delivered_outcome
+    );
+    assert!(
+        !store
+            .compaction_history_causal_boundary("ws", "thread", "turn", &unrelated)
+            .await
+            .unwrap()
+            .delivered_outcome,
+        "later delivery must not cross the accepted snapshot fence"
+    );
+    assert!(
+        store
+            .compaction_history_causal_boundary("other", "thread", "turn", &completed)
+            .await
+            .is_err()
+    );
+    let entries = store
+        .compaction_source_page("ws", "thread", "run", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries;
+    let result = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .payload
+                .as_deref()
+                .is_some_and(|p| p.contains("acknowledged failed outcome"))
+        })
+        .unwrap()
+        .reference
+        .clone();
+    assert_eq!(
+        store
+            .compaction_task_delivery_command("ws", "thread", &result)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("turn")
+    );
+    let unrelated_source = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .payload
+                .as_deref()
+                .is_some_and(|p| p.contains("unrelated-response"))
+        })
+        .unwrap()
+        .reference
+        .clone();
+    assert!(
+        store
+            .compaction_task_delivery_command("ws", "thread", &unrelated_source)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_task_delivery_command("other", "thread", &result)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut stale_result = result.clone();
+    stale_result.version = "event-revision:999".into();
+    assert!(
+        store
+            .compaction_task_delivery_command("ws", "thread", &stale_result)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(
+        entries
+            .iter()
+            .find(|entry| entry.reference == result)
+            .unwrap()
+            .payload
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_event_revision SET projection_revision=0 WHERE source_id=?",
+        [result.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    assert!(
+        store
+            .compaction_task_delivery_command("ws", "thread", &result)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !store
+            .compaction_record_event_projection("ws", "thread", &stale_result, &event)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_record_event_projection("other", "thread", &result, &event)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_record_event_projection("ws", "thread", &result, &event)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_task_delivery_command("ws", "thread", &result)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("turn")
+    );
+    db.execute_unprepared("UPDATE task_delivery SET status='delivering' WHERE id='delivery'")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_history_causal_boundary("ws", "thread", "turn", &completed)
+            .await
+            .unwrap()
+            .delivered_outcome
+    );
+    assert!(
+        store
+            .compaction_task_delivery_command("ws", "thread", &result)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn task_occurrence_failures_close_command_only_after_canonical_acknowledgement() {
+    for status in ["failed", "blocked", "cancelled"] {
+        let store = store().await;
+        let db = store.database_connection();
+        for sql in [
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('run','thread','in_progress','task_run','scheduled_task',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task_run SET status=? WHERE id='run'",
+            [status.into()],
+        ))
+        .await
+        .unwrap();
+        let before = store.compaction_history_read_fence().await.unwrap();
+        assert!(
+            !store
+                .compaction_history_causal_boundary("ws", "thread", "turn", &before)
+                .await
+                .unwrap()
+                .delivered_outcome,
+            "mutable {status} run without a canonical event is not closure"
+        );
+        assert_eq!(
+            store
+                .compare_and_materialize_task_run_occurrence_terminal(
+                    "run",
+                    chrono::Utc::now().timestamp()
+                )
+                .await
+                .unwrap(),
+            pioneer_crud::TaskRunOccurrenceTerminalizationOutcome::Changed
+        );
+        let after = store.compaction_history_read_fence().await.unwrap();
+        assert!(
+            store
+                .compaction_history_causal_boundary("ws", "thread", "turn", &after)
+                .await
+                .unwrap()
+                .delivered_outcome,
+            "{status}"
+        );
+        assert!(
+            !store
+                .compaction_history_causal_boundary("ws", "thread", "turn", &before)
+                .await
+                .unwrap()
+                .delivered_outcome
+        );
+        let entries = store
+            .compaction_source_page("ws", "thread", "run", CanonicalSource::Event, 0)
+            .await
+            .unwrap()
+            .entries;
+        assert_eq!(entries.len(), 1, "terminal occurrence has no result item");
+        let source = &entries[0].reference;
+        assert_eq!(
+            store
+                .compaction_task_delivery_command("ws", "thread", source)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("turn")
+        );
+        assert!(
+            store
+                .compaction_task_delivery_command("other", "thread", source)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut stale = source.clone();
+        stale.version = "event-revision:999".into();
+        assert!(
+            store
+                .compaction_task_delivery_command("ws", "thread", &stale)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.execute_unprepared("UPDATE turn SET turn_kind='conversation' WHERE id='run'")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .compaction_history_causal_boundary("ws", "thread", "turn", &after)
+                .await
+                .unwrap()
+                .delivered_outcome
+        );
+        assert!(
+            store
+                .compaction_task_delivery_command("ws", "thread", source)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn generic_failed_task_delivery_requires_exact_turn_identity_and_event_fence() {
+    let store = store().await;
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'failed','agent')",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts) VALUES ('delivery','ws','task','run','key','thread','origin_thread','thread','delivered',1,1)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let thread = store.get_thread_model("thread").await.unwrap().unwrap();
+    let template = store.get_turn("thread", "turn").await.unwrap().unwrap().1;
+    let before = store.compaction_history_read_fence().await.unwrap();
+    for (id, expected) in [
+        ("unrelated-failed-turn".to_owned(), false),
+        (
+            pioneer_crud::canonical_agent_id('T', "task-delivery-turn\0delivery"),
+            true,
+        ),
+    ] {
+        let mut started = template.clone();
+        started.id = id.clone();
+        started.status = pioneer_protocol::TurnStatus::InProgress;
+        started.mode = pioneer_protocol::ThreadMode::Chat;
+        started.origin = pioneer_protocol::TurnOrigin::TaskDelivery;
+        started.author = None;
+        let mut failed = started.clone();
+        failed.status = pioneer_protocol::TurnStatus::Failed;
+        failed.error = Some("fixture failure".into());
+        store
+            .materialize_failed_task_delivery_turn(pioneer_crud::FailedTaskDeliveryTurnWrite {
+                thread: &thread,
+                sandbox_mode: pioneer_protocol::SandboxMode::FullAccess,
+                started_turn: &started,
+                actor: pioneer_protocol::PersistedActorRef::System,
+                audit_event: pioneer_protocol::TurnPermissionAuditEvent {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: id.clone(),
+                    event_kind: pioneer_protocol::TurnPermissionAuditEventKind::ProfileSelected,
+                    profile_mode: pioneer_protocol::TurnPermissionMode::FullAccess,
+                    profile_source: pioneer_protocol::TurnPermissionProfileSource::System,
+                    security_snapshot_id: None,
+                    security_snapshot_version: None,
+                    security_reason_code: None,
+                    security_capability: None,
+                    item_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    action_kind: None,
+                    request_key: None,
+                    decision: None,
+                    reason: None,
+                    cached: false,
+                },
+                failed: pioneer_protocol::TurnFailedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn: failed,
+                },
+                agent_action: None,
+            })
+            .await
+            .unwrap();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task_delivery SET delivered_turn_id=? WHERE id='delivery'",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        let after = store.compaction_history_read_fence().await.unwrap();
+        assert_eq!(
+            store
+                .compaction_history_causal_boundary("ws", "thread", "turn", &after)
+                .await
+                .unwrap()
+                .delivered_outcome,
+            expected
+        );
+        assert!(
+            !store
+                .compaction_history_causal_boundary("ws", "thread", "turn", &before)
+                .await
+                .unwrap()
+                .delivered_outcome
+        );
+        let entries = store
+            .compaction_source_page("ws", "thread", &id, CanonicalSource::Event, 0)
+            .await
+            .unwrap()
+            .entries;
+        for entry in entries {
+            let is_failure = entry
+                .payload
+                .as_deref()
+                .is_some_and(|p| p.contains("fixture failure"));
+            assert_eq!(
+                store
+                    .compaction_task_delivery_command("ws", "thread", &entry.reference)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                (expected && is_failure).then_some("turn")
+            );
+            assert!(
+                store
+                    .compaction_task_delivery_command("other", "thread", &entry.reference)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
+    let store = store().await;
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt','task','run','child','child-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('child','thread','thread',1,CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .compaction_task_basis_thread("ws", "child", "child-turn")
+            .await
+            .unwrap(),
+        None
+    );
+    db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run','task','ws','thread','not read by metadata lookup',CURRENT_TIMESTAMP)").await.unwrap();
+    assert_eq!(
+        store
+            .compaction_task_basis_thread("ws", "child", "child-turn")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("thread")
+    );
+    let before_input = store.compaction_history_read_fence().await.unwrap();
+    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn','child','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('child-input','child-turn',0,'text','own','{}',CURRENT_TIMESTAMP)").await.unwrap();
+    let after_input = store.compaction_history_read_fence().await.unwrap();
+    assert!(
+        store
+            .compaction_latest_task_basis_turn("ws", "child", &before_input)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .compaction_latest_task_basis_turn("ws", "child", &after_input)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("child-turn")
+    );
+    assert!(
+        store
+            .compaction_latest_task_basis_turn("other", "child", &after_input)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let basis = store
+        .compaction_task_basis_snapshot("ws", "child", "child-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(basis.parent_thread, "thread");
+    assert_eq!(basis.run_id, "run");
+    assert_eq!(basis.history_json, "not read by metadata lookup");
+    // A UTF-8 scalar crosses the 256KiB fragment boundary; decode only after
+    // releasing the reader and joining complete bounded byte fragments.
+    let large = format!(
+        "{}🦀{}",
+        "x".repeat(SOURCE_PAGE_BYTES - 1),
+        "история".repeat(50_000)
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run'",
+        [large.clone().into()],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .compaction_task_basis_snapshot("ws", "child", "child-turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .history_json,
+        large
+    );
+    for (workspace, thread, turn) in [
+        ("other", "child", "child-turn"),
+        ("ws", "thread", "child-turn"),
+        ("ws", "child", "other-turn"),
+    ] {
+        assert!(
+            store
+                .compaction_task_basis_snapshot(workspace, thread, turn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .compaction_task_basis_thread(workspace, thread, turn)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    db.execute_unprepared(
+        "UPDATE thread_lineage SET parent_thread_id='child' WHERE child_thread_id='child'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .compaction_task_basis_thread("ws", "child", "child-turn")
+            .await
+            .unwrap(),
+        None
+    );
+    db.execute_unprepared(
+        "UPDATE thread_lineage SET parent_thread_id='thread' WHERE child_thread_id='child'",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "UPDATE task_run_conversation_snapshot SET task_id='unrelated' WHERE run_id='run'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .compaction_task_basis_thread("ws", "child", "child-turn")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() {
+    let store = store().await;
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt','task','run','thread','turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+        "UPDATE turn SET status='in_progress' WHERE id='turn'",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    assert_eq!(
+        store.get_task_run_turn("rt").await.unwrap().unwrap().kind,
+        pioneer_protocol::TaskRunTurnKind::Initial
+    );
+    let history = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: "output-history".into(),
+        messages: 0,
+        identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    };
+    store
+        .compaction_begin_frozen_history("ws", "thread", &history)
+        .await
+        .unwrap();
+    store
+        .compaction_finish_frozen_history("ws", "thread", &history)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_record_task_output("ws", "rt", &history)
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_record_task_output("other", "rt", &history)
+            .await
+            .is_err()
+    );
+    let output = store
+        .compaction_record_task_output("ws", "rt", &history)
+        .await
+        .unwrap();
+    assert_eq!(output.task_id, "task");
+    assert_eq!(output.run_id, "run");
+    assert_eq!(output.source_thread, "thread");
+    assert_eq!(output.source_turn, "turn");
+    assert_eq!(output.history, history);
+    let other = pioneer_compaction::frozen::FrozenHistoryRef {
+        manifest_id: "later-history".into(),
+        ..history.clone()
+    };
+    store
+        .compaction_begin_frozen_history("ws", "thread", &other)
+        .await
+        .unwrap();
+    store
+        .compaction_finish_frozen_history("ws", "thread", &other)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_record_task_output("ws", "rt", &other)
+            .await
+            .unwrap(),
+        output
+    );
+    assert!(
+        store
+            .compaction_task_output("other", "rt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.execute_unprepared("UPDATE task_run_turn SET turn_id='other-turn' WHERE id='rt'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_task_output("ws", "rt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn delivered_output_discovery_advances_empty_bounded_quanta() {
+    let store = store().await;
+    for n in 1..=260 {
+        source(&store, &format!("irrelevant-{n}"), n, "{}").await;
+    }
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let first = store
+        .compaction_delivered_output_page("ws", "thread", 0, &fence)
+        .await
+        .unwrap();
+    assert!(first.entries.is_empty());
+    assert_eq!(first.scanned_through, 128);
+    assert!(!first.done);
+    let second = store
+        .compaction_delivered_output_page("ws", "thread", first.scanned_through, &fence)
+        .await
+        .unwrap();
+    assert!(second.entries.is_empty());
+    assert_eq!(second.scanned_through, 256);
+    assert!(!second.done);
+    source(&store, "late", 261, "{}").await;
+    let last = store
+        .compaction_delivered_output_page("ws", "thread", second.scanned_through, &fence)
+        .await
+        .unwrap();
+    assert!(last.entries.is_empty());
+    assert_eq!(last.scanned_through, fence.event_order);
+    assert!(last.done);
+}
+
+#[tokio::test]
+async fn frozen_own_imports_require_exact_output_membership_and_atomic_publication() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    use sha2::{Digest, Sha256};
+    fn descriptor(id: &str, messages: &[FrozenMessageRef]) -> FrozenHistoryRef {
+        let mut digest = Sha256::new();
+        for message in messages {
+            let bytes = serde_json::to_vec(message).unwrap();
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        FrozenHistoryRef {
+            format: 1,
+            manifest_id: id.into(),
+            messages: messages.len() as u64,
+            identity_sha256: hex::encode(digest.finalize()),
+        }
+    }
+    let store = store().await;
+    let db = store.database_connection();
+    source(&store, "basis-source", 1, "{}").await;
+    let inherited = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn','child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('child-source','child','child-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'succeeded','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt','task','run','child','child-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('candidate','task','run','rt','child','child-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('delivery-turn','thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('delivery','ws','task','run','key','thread','origin_thread','thread','delivered',1,1,'delivery-turn')",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    let own_source = SourceRef {
+        scope: "event:child-turn".into(),
+        id: "child-source".into(),
+        version: "event-revision:1".into(),
+    };
+    let own = FrozenMessageRef {
+        logical_turn_id: None,
+        context_thread: None,
+        source_thread: "child".into(),
+        unit_id: "child-unit".into(),
+        sources: vec![own_source.clone()],
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: "a".repeat(64),
+        replay_source: None,
+        tool_call_id: None,
+        tool_name: None,
+    };
+    let basis = FrozenMessageRef {
+        source_thread: "thread".into(),
+        sources: vec![inherited.clone()],
+        inherited: true,
+        ..own.clone()
+    };
+    let output = descriptor("output-with-basis", &[own.clone(), basis.clone()]);
+    store
+        .compaction_begin_frozen_history("ws", "child", &output)
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_history(
+            "ws",
+            "child",
+            &output.manifest_id,
+            0,
+            &[own.clone(), basis],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "child", &output)
+            .await
+            .unwrap()
+    );
+    store
+        .compaction_record_task_output("ws", "rt", &output)
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('delivery','candidate','rt')").await.unwrap();
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "delivery-turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id("delivery"),
+                    text: "delivered".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let acknowledgement = store
+        .compaction_source_page("ws", "thread", "delivery-turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let prepared = store
+        .compaction_prepare_frozen_import(
+            "ws",
+            "thread",
+            "delivery",
+            &acknowledgement,
+            0,
+            "child",
+            &own_source,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "delivery",
+                &acknowledgement,
+                1,
+                "thread",
+                &inherited
+            )
+            .await
+            .is_err(),
+        "H cannot become own work"
+    );
+    assert!(
+        store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "delivery",
+                &acknowledgement,
+                0,
+                "thread",
+                &inherited
+            )
+            .await
+            .is_err(),
+        "an unrelated same-workspace source is not an output member"
+    );
+    assert!(
+        store
+            .compaction_prepare_frozen_import(
+                "other",
+                "thread",
+                "delivery",
+                &acknowledgement,
+                0,
+                "child",
+                &own_source
+            )
+            .await
+            .is_err()
+    );
+    let mut stale_ack = acknowledgement.clone();
+    stale_ack.version = "event-revision:999".into();
+    assert!(
+        store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "delivery",
+                &stale_ack,
+                0,
+                "child",
+                &own_source
+            )
+            .await
+            .is_err()
+    );
+    let target = FrozenMessageRef {
+        context_thread: Some("thread".into()),
+        ..own
+    };
+    let context = descriptor("assembled", std::slice::from_ref(&target));
+    let imports = vec![(0, prepared.clone())];
+    let import_digest = frozen_import_identity(&imports).unwrap();
+    store
+        .compaction_begin_frozen_history_with_imports("ws", "thread", &context, 1, &import_digest)
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_history(
+            "ws",
+            "thread",
+            &context.manifest_id,
+            0,
+            std::slice::from_ref(&target),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_finish_frozen_history("ws", "thread", &context)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_frozen_history_owner("ws", &context)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.execute_unprepared("DELETE FROM compaction_delivery_output WHERE delivery_id='delivery'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_append_frozen_imports("ws", "thread", &context.manifest_id, 0, &imports)
+            .await
+            .is_err(),
+        "binding is revalidated after preparation"
+    );
+    db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('delivery','candidate','rt')").await.unwrap();
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_frozen_import AFTER INSERT ON compaction_frozen_import BEGIN SELECT RAISE(ABORT,'fixture import rollback'); END").await.unwrap();
+    assert!(
+        store
+            .compaction_append_frozen_imports("ws", "thread", &context.manifest_id, 0, &imports)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .compaction_finish_frozen_history("ws", "thread", &context)
+            .await
+            .unwrap()
+    );
+    db.execute_unprepared("DROP TRIGGER abort_frozen_import")
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_imports("ws", "thread", &context.manifest_id, 0, &imports)
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_imports("ws", "thread", &context.manifest_id, 0, &imports)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &context)
+            .await
+            .unwrap()
+    );
+    store
+        .compaction_append_frozen_imports("ws", "thread", &context.manifest_id, 0, &imports)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_frozen_import_state("ws", "thread", &context.manifest_id)
+            .await
+            .unwrap(),
+        Some((1, import_digest.clone()))
+    );
+    let records = store
+        .compaction_frozen_import_page("ws", "thread", &context.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].source, own_source);
+    assert_eq!(records[0].delivery_id, "delivery");
+    assert!(
+        store
+            .compaction_frozen_import_page("other", "thread", &context.manifest_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A new execution can adopt this metadata only through its exact TaskRun
+    // snapshot; sharing a workspace or parent thread is insufficient.
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('context-c','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('context-c','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-c','context-c','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-c','task','run-c',1,2,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-c','task','run-c','context-c','turn-c','initial',0,1,'running',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    let operation = admit_import_operation(&store, "own-c", "context-c", "turn-c").await;
+    assert!(
+        store
+            .compaction_bind_source_projection(&operation.id, &context)
+            .await
+            .is_err(),
+        "an arbitrary parent manifest is not an accepted Task basis"
+    );
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run-c','task','ws','thread',?,CURRENT_TIMESTAMP)",
+        [serde_json::to_string(&context).unwrap().into()])).await.unwrap();
+    assert!(
+        store
+            .compaction_bind_source_projection(&operation.id, &output)
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_projection AFTER INSERT ON compaction_operation_projection BEGIN SELECT RAISE(ABORT,'fixture binding rollback'); END").await.unwrap();
+    assert!(
+        store
+            .compaction_bind_source_projection(&operation.id, &context)
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("DROP TRIGGER abort_projection")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&operation.id, &context)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&operation.id, &context)
+        .await
+        .unwrap();
+    let ready = ready_import_operation(&store, &operation, "child", &own_source).await;
+    store
+        .compaction_bind_source_projection(&operation.id, &context)
+        .await
+        .unwrap();
+    // Header identity is pinned with the operation, so mutation cannot widen
+    // its authority between admission and final publication.
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id='assembled'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply_runner(&operation.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id='assembled'",
+        [import_digest.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_import_commit AFTER UPDATE OF head ON compaction_context BEGIN SELECT RAISE(ABORT,'fixture imported commit rollback'); END").await.unwrap();
+    assert!(
+        store
+            .compaction_apply_runner(&operation.id, &ready, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(store.compaction_head(&operation.owner).await.unwrap(), None);
+    db.execute_unprepared("DROP TRIGGER abort_import_commit")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply_runner(&operation.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&operation.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+
+    let unbound = admit_import_operation(&store, "unbound-c", "context-c", "turn-c").await;
+    let unbound_ready = ready_import_operation(&store, &unbound, "child", &own_source).await;
+    assert_eq!(
+        store
+            .compaction_apply_runner(&unbound.id, &unbound_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    assert!(
+        store
+            .compaction_bind_source_projection(&unbound.id, &context)
+            .await
+            .is_err(),
+        "a ready runner cannot gain new ownership after provider execution"
+    );
+    let h_operation = admit_import_operation(&store, "h-c", "context-c", "turn-c").await;
+    store
+        .compaction_bind_source_projection(&h_operation.id, &context)
+        .await
+        .unwrap();
+    let h_ready = ready_import_operation(&store, &h_operation, "thread", &inherited).await;
+    assert_eq!(
+        store
+            .compaction_apply_runner(&h_operation.id, &h_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale,
+        "accepted H remains reference-only, even in the same accepted manifest"
+    );
+    let edited = admit_import_operation(&store, "edited-c", "context-c", "turn-c").await;
+    store
+        .compaction_bind_source_projection(&edited.id, &context)
+        .await
+        .unwrap();
+    let edited_ready = ready_import_operation(&store, &edited, "child", &own_source).await;
+    let stale = descriptor("stale-assembled", std::slice::from_ref(&target));
+    store
+        .compaction_begin_frozen_history_with_imports("ws", "thread", &stale, 1, &import_digest)
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_history("ws", "thread", &stale.manifest_id, 0, &[target])
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "UPDATE turn_event SET payload='{\"changed\":true}' WHERE id='child-source'",
+    )
+    .await
+    .unwrap();
+    assert!(
+        store
+            .compaction_append_frozen_imports("ws", "thread", &stale.manifest_id, 0, &imports)
+            .await
+            .is_err(),
+        "source revision is revalidated in the writer transaction"
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&edited.id, &edited_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+
+    assert!(
+        !store
+            .compaction_finish_frozen_history("ws", "thread", &stale)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_import_page("ws", "thread", &context.manifest_id, 0)
+            .await
+            .unwrap(),
+        records,
+        "accepted metadata is retained"
+    );
+}
+
+async fn admit_import_operation(
+    store: &CrudStore,
+    id: &str,
+    thread: &str,
+    turn: &str,
+) -> OperationSnapshot {
+    let snapshot = OperationSnapshot {
+        id: id.into(),
+        owner: format!("owner-{id}"),
+        expected_checkpoint: None,
+        projection_version: store
+            .compaction_projection_version("ws", thread)
+            .await
+            .unwrap(),
+        source_epochs: std::collections::BTreeMap::new(),
+        admission: CompactionSettings::default()
+            .admit(
+                &ModelSelection {
+                    transport: Transport::Api,
+                    instance: "p".into(),
+                    model: "m".into(),
+                    effort: None,
+                },
+                None,
+                0,
+            )
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            compact: vec![],
+            retain: vec![],
+            coverage: vec![],
+            fingerprint: id.into(),
+        },
+    };
+    store
+        .compaction_admit("ws", thread, &snapshot)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(id, turn)
+        .await
+        .unwrap();
+    snapshot
+}
+
+async fn ready_import_operation(
+    store: &CrudStore,
+    snapshot: &OperationSnapshot,
+    source_thread: &str,
+    source: &SourceRef,
+) -> pioneer_compaction::runner::RunnerState {
+    use pioneer_compaction::runner::{RunnerState, SourceCursor};
+    let op = &snapshot.id;
+    let budget = ModelBudget::new(None, None, None);
+    store
+        .compaction_prepare_runner(op, &budget, 1, 0)
+        .await
+        .unwrap();
+    store
+        .compaction_append_manifest(
+            op,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: source_thread.into(),
+                source: source.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let initial = RunnerState::new(snapshot.admission.deadline_ms, &budget, 1000, None).unwrap();
+    store
+        .compaction_activate_runner(op, &initial)
+        .await
+        .unwrap();
+    let attempt = initial.claim(1).unwrap();
+    assert!(
+        store
+            .compaction_runner_transition(op, initial.generation, &attempt, None)
+            .await
+            .unwrap()
+    );
+    let checkpoint = Checkpoint {
+        id: format!("checkpoint-{op}"),
+        operation_id: op.clone(),
+        format_version: 1,
+        owner: snapshot.owner.clone(),
+        previous: None,
+        coverage: vec![source.clone()],
+        summary: "fixture summary".into(),
+        selection: snapshot.admission.selection.clone(),
+        projection_version: snapshot.projection_version,
+    };
+    let next = attempt
+        .candidate(
+            1,
+            checkpoint.id.clone(),
+            SourceCursor {
+                unit: 1,
+                ..Default::default()
+            },
+            true,
+            2,
+        )
+        .unwrap();
+    assert!(
+        store
+            .compaction_runner_transition(op, attempt.generation, &next, Some(&checkpoint))
+            .await
+            .unwrap()
+    );
+    let ready = next.candidate_checked(true).unwrap();
+    assert!(
+        store
+            .compaction_runner_transition(op, next.generation, &ready, None)
+            .await
+            .unwrap()
+    );
+    ready
+}
+
+#[tokio::test]
+async fn compaction_lifecycle_after_terminal_turn_requires_exact_operation_and_generation() {
+    use pioneer_crud::CanonicalTurnEventPayload as Event;
+    let store = store().await;
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "lifecycle-source".into(),
+                    text: "original".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let reference = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let op = admit_import_operation(&store, "lifecycle", "thread", "turn").await;
+    let ready = ready_import_operation(&store, &op, "thread", &reference).await;
+    let item = pioneer_protocol::TurnItem::SystemEvent {
+        id: "compaction:lifecycle".into(),
+        level: pioneer_protocol::SystemEventLevel::Info,
+        message: "Context compaction started".into(),
+        code: Some("agent_context_compaction".into()),
+        details: None,
+    };
+    let started = pioneer_protocol::ItemStartedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item: item.clone(),
+    };
+    let completed = pioneer_protocol::ItemCompletedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item,
+    };
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                ready.generation + 1,
+                Event::ItemStarted(started.clone()),
+                1
+            )
+            .await
+            .is_err()
+    );
+    let mut wrong_scope = started.clone();
+    wrong_scope.workspace_id = "other".into();
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                ready.generation,
+                Event::ItemStarted(wrong_scope),
+                1
+            )
+            .await
+            .is_err()
+    );
+    let mut forged = started.clone();
+    forged.item = pioneer_protocol::TurnItem::AgentMessage {
+        id: "compaction:lifecycle".into(),
+        text: "not a service event".into(),
+        phase: Default::default(),
+        markdown: None,
+        markdown_version: None,
+    };
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                ready.generation,
+                Event::ItemStarted(forged),
+                1
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                ready.generation,
+                Event::ItemCompleted(completed.clone()),
+                1
+            )
+            .await
+            .is_err(),
+        "running operation cannot claim a terminal lifecycle"
+    );
+    let db = store.database_connection();
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_compaction_lifecycle BEFORE INSERT ON turn_event WHEN NEW.event_type='item/started' BEGIN SELECT RAISE(ABORT,'lifecycle append rollback'); END").await.unwrap();
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                ready.generation,
+                Event::ItemStarted(started.clone()),
+                1
+            )
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("DROP TRIGGER abort_compaction_lifecycle")
+        .await
+        .unwrap();
+    // The fixture Turn is already completed. Only the operation-owned service
+    // event, not an ordinary provider callback, is admitted by this API.
+    store
+        .compaction_materialize_lifecycle(
+            &op.id,
+            ready.generation,
+            Event::ItemStarted(started.clone()),
+            1,
+        )
+        .await
+        .unwrap();
+    store
+        .compaction_materialize_lifecycle(
+            &op.id,
+            ready.generation,
+            Event::ItemStarted(started.clone()),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply_runner(&op.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let applied = store
+        .compaction_runner_state(&op.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                applied.generation,
+                Event::ItemStarted(started),
+                3
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_materialize_lifecycle(
+                &op.id,
+                ready.generation,
+                Event::ItemCompleted(completed.clone()),
+                3
+            )
+            .await
+            .is_err()
+    );
+    store
+        .compaction_materialize_lifecycle(
+            &op.id,
+            applied.generation,
+            Event::ItemCompleted(completed.clone()),
+            3,
+        )
+        .await
+        .unwrap();
+    store
+        .compaction_materialize_lifecycle(
+            &op.id,
+            applied.generation,
+            Event::ItemCompleted(completed),
+            4,
+        )
+        .await
+        .unwrap();
+    let row = db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT count(*) AS n FROM turn_event WHERE turn_id='turn' AND event_type IN ('item/started','item/completed')".to_owned())).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        3,
+        "baseline plus exactly two lifecycle events; retries add no duplicates"
+    );
+}
+
+#[tokio::test]
+async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late_attempt() {
+    use pioneer_compaction::runner::{FailureKind, RunnerPhase};
+    let store = store().await;
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "terminal-source".into(),
+                    text: "original".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let reference = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    for (id, status, outcome, kind) in [
+        ("stop", "cancelled", "cancelled", FailureKind::Cancelled),
+        ("deadline", "failed", "deadline", FailureKind::Deadline),
+    ] {
+        let op = admit_import_operation(&store, id, "thread", "turn").await;
+        let initial = ready_import_operation(&store, &op, "thread", &reference).await;
+        store.compaction_finish(id, status, outcome).await.unwrap();
+        let db = store.database_connection();
+        db.execute_unprepared("CREATE TEMP TRIGGER abort_terminal_state BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'terminal state rollback'); END").await.unwrap();
+        assert!(store.compaction_reconcile_runner_state(id).await.is_err());
+        assert_eq!(
+            store
+                .compaction_runner_state(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            initial.generation
+        );
+        db.execute_unprepared("DROP TRIGGER abort_terminal_state")
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            store.compaction_reconcile_runner_state(id),
+            store.compaction_reconcile_runner_state(id)
+        );
+        for state in [a.unwrap().unwrap(), b.unwrap().unwrap()] {
+            assert_eq!(state.generation, initial.generation + 1);
+            assert_eq!(state.phase, RunnerPhase::Failed { kind: kind.clone() });
+        }
+        let again = store
+            .compaction_reconcile_runner_state(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.generation, initial.generation + 1);
+        assert!(
+            !store
+                .compaction_runner_transition(
+                    id,
+                    initial.generation,
+                    &initial.terminate(FailureKind::Permanent).unwrap(),
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: format!("compaction:{id}"),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Compaction finished".into(),
+                    code: Some("agent_context_compaction".into()),
+                    details: None,
+                },
+            },
+        );
+        assert!(
+            store
+                .compaction_materialize_lifecycle(id, initial.generation, event.clone(), 2)
+                .await
+                .is_err()
+        );
+        store
+            .compaction_materialize_lifecycle(id, again.generation, event.clone(), 2)
+            .await
+            .unwrap();
+        store
+            .compaction_materialize_lifecycle(id, again.generation, event, 3)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admission() {
+    let store = store().await;
+    source(&store, "stop-source", 1, "original source").await;
+    let reference = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let op = admit_import_operation(&store, "durable-stop", "thread", "turn").await;
+    let ready = ready_import_operation(&store, &op, "thread", &reference).await;
+    let db = store.database_connection();
+    assert!(
+        store
+            .compaction_stop_execution("wrong-workspace", "thread", &op.owner, "turn")
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_context_stop BEFORE INSERT ON compaction_execution_stop BEGIN SELECT RAISE(ABORT,'Stop rollback'); END").await.unwrap();
+    assert!(
+        store
+            .compaction_stop_execution("ws", "thread", &op.owner, "turn")
+            .await
+            .is_err()
+    );
+    assert!(!store.compaction_execution_cancelled(&op.id).await.unwrap());
+    db.execute_unprepared("DROP TRIGGER abort_context_stop")
+        .await
+        .unwrap();
+    store
+        .compaction_stop_execution("ws", "thread", &op.owner, "turn")
+        .await
+        .unwrap();
+    store
+        .compaction_stop_execution("ws", "thread", &op.owner, "turn")
+        .await
+        .unwrap();
+    // No service reconciliation runs: model a lost worker with a ready candidate.
+    assert!(store.compaction_execution_cancelled(&op.id).await.unwrap());
+    assert_eq!(
+        store
+            .compaction_operation(&op.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&op.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Cancelled
+    );
+    assert!(store.compaction_head(&op.owner).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .get_turn("thread", "turn")
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .status,
+        pioneer_protocol::TurnStatus::Completed
+    );
+    let mut replacement = op.clone();
+    replacement.id = "after-stop-new-fingerprint".into();
+    replacement.plan.fingerprint = replacement.id.clone();
+    assert!(
+        store
+            .compaction_admit_for_turn("ws", "thread", &replacement, Some("turn"))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_operation(&replacement.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('next-turn','thread','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    store
+        .compaction_admit_for_turn("ws", "thread", &replacement, Some("next-turn"))
+        .await
+        .unwrap();
+    store
+        .compaction_stop_execution("ws", "thread", &op.owner, "next-turn")
+        .await
+        .unwrap();
+    assert!(
+        store.compaction_execution_cancelled(&op.id).await.unwrap(),
+        "later Stop must not erase an earlier stopped execution"
+    );
+    assert!(
+        store
+            .compaction_execution_cancelled(&replacement.id)
+            .await
+            .unwrap()
+    );
+    // Stop before any admission is also durable and cannot leave a running row.
+    let mut unborn = replacement.clone();
+    unborn.id = "never-admitted".into();
+    unborn.owner = "never-admitted-owner".into();
+    unborn.plan.fingerprint = unborn.id.clone();
+    store
+        .compaction_stop_execution("ws", "thread", &unborn.owner, "turn")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_admit_for_turn("ws", "thread", &unborn, Some("turn"))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_operation(&unborn.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded() {
+    let store = store().await;
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let body = serde_json::to_string(&vec!["память🦀".repeat(9000)]).unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)", [body.clone().into()])).await.unwrap();
+    let source = store
+        .compaction_legacy_task_basis_source("ws", "thread", "run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .compaction_legacy_task_basis_source("other", "thread", "run")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "other", &source, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut restored = String::new();
+    let mut offset = 0;
+    loop {
+        let fragment = store
+            .compaction_reference_fragment("ws", "thread", &source, offset)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fragment.text.len() <= 64 * 1024);
+        restored.push_str(&fragment.text);
+        match fragment.next_character {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    assert_eq!(restored, body);
+    let epoch = store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE task_run_conversation_snapshot SET history_json=history_json||' ' WHERE run_id='run'").await.unwrap();
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &source, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap()
+            > epoch
+    );
+    let current = store
+        .compaction_legacy_task_basis_source("ws", "thread", "run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.version, source.version);
+    db.execute_unprepared("DELETE FROM task_run_conversation_snapshot WHERE run_id='run'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_reference_thread("ws", &current)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
+    let store = store().await;
+    let db = store.database_connection();
+    db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet')").await.unwrap();
+    assert!(
+        store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.execute_unprepared(
+        "UPDATE turn SET status='in_progress',reasoning_effort='high' WHERE id='turn'",
+    )
+    .await
+    .unwrap();
+    {
+        use sea_orm::TransactionTrait;
+        let tx = db.begin().await.unwrap();
+        tx.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+    }
+    assert!(
+        store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    let pending = store.compaction_pending_history_checks().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        store
+            .compaction_history_check_is_current("turn")
+            .await
+            .unwrap()
+    );
+    assert_eq!(pending[0].reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(pending[0].model.as_deref(), Some("sonnet"));
+    assert_eq!(
+        store
+            .compaction_capture_history_check("turn", "original selection and deadline")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("original selection and deadline")
+    );
+    assert_eq!(
+        store
+            .compaction_capture_history_check("turn", "changed settings after restart")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("original selection and deadline")
+    );
+    assert!(
+        store
+            .compaction_capture_history_check("turn", &"x".repeat(16385))
+            .await
+            .is_err()
+    );
+    store
+        .compaction_stop_execution("ws", "thread", "owner", "turn")
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_capture_history_check("turn", "restart")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn compaction_recovery_metadata_pages_do_not_starve_later_operations() {
+    let store = store().await;
+    let assertion = source(&store, "recovery-source", 1, "canonical source").await;
+    for index in 0..17 {
+        let id = format!("recovery-{index:02}");
+        candidate(&store, &id, None, &assertion).await;
+        store
+            .compaction_bind_execution_turn(&id, "turn")
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .compaction_lifecycle_recovery(11, "")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let first = store
+        .compaction_lifecycle_recovery(1_000_000, "")
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 16);
+    let last = first.last().unwrap().id.clone();
+    let second = store
+        .compaction_lifecycle_recovery(1_000_000, &last)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, "recovery-16");
+    assert!(
+        store
+            .compaction_lifecycle_recovery(1_000_000, &second[0].id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .compaction_stop_execution("ws", "thread", "owner", "turn")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_lifecycle_recovery(11, "")
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.cancelled)
+    );
+}
+
+#[tokio::test]
+async fn compaction_timeline_persists_explicit_terminal_status_with_one_item() {
+    let store = store().await;
+    for terminal in ["completed", "failed", "cancelled"] {
+        let id = format!("compaction:{terminal}");
+        let item = |status: &str| pioneer_protocol::TurnItem::SystemEvent {
+            id: id.clone(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: status.into(),
+            code: Some("agent_context_compaction".into()),
+            details: Some(serde_json::json!({"status":status})),
+        };
+        store
+            .materialize_item_started(
+                pioneer_protocol::ItemStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item("started"),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let query = || {
+            Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT status FROM turn_work_item_projection WHERE item_id=?",
+                vec![id.clone().into()],
+            )
+        };
+        let row = store
+            .database_connection()
+            .query_one_raw(query())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "status").unwrap(), "running");
+        for _ in 0..2 {
+            store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        item: item(terminal),
+                    },
+                    2,
+                )
+                .await
+                .unwrap();
+        }
+        let rows = store
+            .database_connection()
+            .query_all_raw(query())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].try_get::<String>("", "status").unwrap(), terminal);
+    }
+}
+
+#[tokio::test]
+async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_reapply() {
+    use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+    let connection = Database::connect("sqlite::memory:").await.unwrap();
+    let writer = SqliteWriteExecutor::new(connection.clone());
+    let migrations = Migrator::migrations();
+    let name = migrations.last().unwrap().name().to_owned();
+    assert_eq!(name, "m20260910_000001_context_compaction");
+    writer
+        .run_migrations::<Migrator>(
+            SqliteWriteClass::Maintenance,
+            Some((migrations.len() - 1) as u32),
+        )
+        .await
+        .unwrap();
+    let store = CrudStore::new(SqliteDatabase::from_executor(connection, writer.clone()))
+        .with_maintenance_access();
+    let db = store.database_connection();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        // Durable prefix of an interrupted metadata migration, before its marker.
+        "CREATE TABLE compaction_history_check (turn_id TEXT PRIMARY KEY NOT NULL REFERENCES turn(id) ON DELETE CASCADE, state TEXT NOT NULL DEFAULT 'pending', descriptor TEXT, outcome TEXT)",
+        "INSERT INTO compaction_history_check(turn_id,state,outcome) VALUES ('turn','done','retained-before-retry')",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    store
+        .update_thread_summary("thread", "retained old summary", 42)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_thread_summary("thread").await.unwrap(),
+            Some(("retained old summary".into(), 42))
+        );
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT state,outcome FROM compaction_history_check WHERE turn_id='turn'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "state").unwrap(), "done");
+        assert_eq!(
+            row.try_get::<String>("", "outcome").unwrap(),
+            "retained-before-retry"
+        );
+        // Re-execute the actual migration, not just Migrator's marker fast path.
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM seaql_migrations WHERE version=?",
+            [name.clone().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+    source(&store, "after-migration", 1, "retained original").await;
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+}
+
+#[tokio::test]
+async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
+    let store = store().await;
+    let db = store.database_connection();
+    db.execute_unprepared(
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count) VALUES ('manifest','ws','thread','fixture',1)",
+    ).await.unwrap();
+    // The CHECK measures UTF-8 bytes, not characters, and enforces the upper bound.
+    for (table, columns, values) in [
+        (
+            "compaction_frozen_message",
+            "manifest_id,ordinal,reference_json,bytes",
+            "'manifest',0,?,?",
+        ),
+        (
+            "compaction_frozen_import",
+            "manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes",
+            "'manifest',0,0,'scope','source','v1','thread',?,?",
+        ),
+    ] {
+        let insert = format!("INSERT INTO {table}({columns}) VALUES ({values})");
+        for (payload, bytes) in [
+            ("я".to_owned(), 1_i64),
+            ("".into(), -1),
+            ("x".repeat(262145), 262145),
+        ] {
+            assert!(
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    insert.clone(),
+                    [payload.into(), bytes.into()],
+                ))
+                .await
+                .is_err()
+            );
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            insert.clone(),
+            ["я".into(), 2_i64.into()],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                insert,
+                ["я".into(), 2_i64.into()],
+            ))
+            .await
+            .is_err(),
+            "composite primary key must reject duplicate ordinals"
+        );
+    }
+    assert!(db.execute_unprepared("INSERT INTO compaction_frozen_import(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('manifest',1,0,'scope','source','v1','thread','{}',2)").await.is_err(), "source identity must remain unique within the manifest message");
+    assert!(db.execute_unprepared("INSERT INTO compaction_frozen_message(manifest_id,ordinal,reference_json,bytes) VALUES ('missing',0,'{}',2)").await.is_err());
+    db.execute_unprepared("DELETE FROM compaction_frozen_history WHERE id='manifest'")
+        .await
+        .unwrap();
+    for table in ["compaction_frozen_message", "compaction_frozen_import"] {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("SELECT count(*) AS n FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "n").unwrap(),
+            0,
+            "manifest deletion must cascade"
+        );
+    }
+    let previous = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT sequence FROM compaction_turn_creation WHERE turn_id='turn'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "sequence")
+        .unwrap();
+    db.execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id='turn'")
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_turn_creation(turn_id) VALUES ('turn')")
+        .await
+        .unwrap();
+    let next = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT sequence FROM compaction_turn_creation WHERE turn_id='turn'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "sequence")
+        .unwrap();
+    assert!(
+        next > previous,
+        "AUTOINCREMENT must not reuse deleted creation ordinals"
+    );
+}
+
+#[tokio::test]
+async fn old_summary_is_not_a_canonical_source_or_projection_dependency() {
+    let store = store().await;
+    let epoch = store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    store
+        .update_thread_summary("thread", "obsolete text", 900)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        epoch
+    );
+    let row = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_live_sources WHERE source_scope LIKE 'legacy:%'",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+    let source = SourceRef {
+        scope: "legacy:thread".into(),
+        id: "thread".into(),
+        version: "legacy-revision:1".into(),
+    };
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &source, 0)
+            .await
+            .is_err()
+    );
+}

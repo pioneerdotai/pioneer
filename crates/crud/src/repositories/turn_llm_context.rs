@@ -182,6 +182,7 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
     turn_id: &str,
 ) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
+        .filter(turn_llm_context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
         .filter(turn_llm_context::Column::TurnId.eq(turn_id.to_owned()))
         .exec(db)
         .await
@@ -191,6 +192,7 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
 
 pub async fn delete_expired_turn_llm_context<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
+        .filter(turn_llm_context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
         .filter(turn_llm_context::Column::ExpiresAt.is_not_null())
         .filter(turn_llm_context::Column::ExpiresAt.lte(chrono::Utc::now().fixed_offset()))
         .exec(db)
@@ -221,6 +223,7 @@ pub async fn delete_turn_llm_context_for_terminal_turns<C: ConnectionTrait>(db: 
     }
 
     let deleted = turn_llm_context::Entity::delete_many()
+        .filter(turn_llm_context::Column::Source.is_not_in(["assistant_round", "tool_result_v2"]))
         .filter(turn_llm_context::Column::TurnId.is_in(terminal_turn_ids))
         .exec(db)
         .await

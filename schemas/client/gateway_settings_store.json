@@ -1,0 +1,1026 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewaySettingsStore",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "saving": {
+      "type": "boolean"
+    },
+    "settings": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySettingsSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vector_refill_refresh_requested": {
+      "type": "boolean"
+    },
+    "voice_input": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayVoiceInputSettings"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "workspace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "vector_refill_refresh_requested",
+    "loading",
+    "saving"
+  ],
+  "$defs": {
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "GatewayCliRuntimeInstanceSettings": {
+      "type": "object",
+      "properties": {
+        "binary_path": {
+          "type": "string"
+        },
+        "compaction_model": {
+          "description": "Workspace override. Omission in updates preserves the stored value;\nan explicit Inherit removes it without affecting other workspaces.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "home_path": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/CLIAgentRuntimeKind"
+        },
+        "nickname": {
+          "description": "Stable workspace nickname used by the direct AgentIdentity projection.\nThe default keeps old settings files readable; gateway validation owns\nuniqueness and rejects an empty/duplicate value before activation.",
+          "type": "string",
+          "default": ""
+        },
+        "shadow_home_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "display_name",
+        "enabled",
+        "binary_path",
+        "home_path"
+      ]
+    },
+    "GatewayCliRuntimeSettings": {
+      "type": "object",
+      "properties": {
+        "instances": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayCliRuntimeInstanceSettings"
+          }
+        }
+      }
+    },
+    "GatewayGeneralSettings": {
+      "type": "object",
+      "properties": {
+        "compaction_model": {
+          "$ref": "#/$defs/GatewayModelSelection",
+          "default": {
+            "source": "inherit"
+          }
+        },
+        "context_compaction_enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "default_model": {
+          "$ref": "#/$defs/GatewayModelSelection",
+          "default": {
+            "source": "inherit"
+          }
+        },
+        "keepawake": {
+          "type": "boolean",
+          "default": false
+        },
+        "preflight_model": {
+          "$ref": "#/$defs/GatewayMemoryModelSelection",
+          "default": {
+            "source": "thread"
+          }
+        },
+        "telemetry_enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "GatewayMemoryModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/GatewayMemoryModelSelectionSource",
+          "default": "thread"
+        }
+      }
+    },
+    "GatewayMemoryModelSelectionSource": {
+      "type": "string",
+      "enum": [
+        "thread",
+        "custom"
+      ]
+    },
+    "GatewayMemorySettings": {
+      "type": "object",
+      "properties": {
+        "active_recall_enabled": {
+          "type": "boolean"
+        },
+        "background_extraction_enabled": {
+          "type": "boolean"
+        },
+        "debug_trace_enabled": {
+          "type": "boolean"
+        },
+        "deterministic_recall_enabled": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "proactive_writes_enabled": {
+          "type": "boolean"
+        },
+        "proactive_writes_model": {
+          "$ref": "#/$defs/GatewayMemoryModelSelection",
+          "default": {
+            "source": "thread"
+          }
+        },
+        "strict_diagnostics_enabled": {
+          "type": "boolean"
+        },
+        "tools_enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "deterministic_recall_enabled",
+        "active_recall_enabled",
+        "tools_enabled",
+        "proactive_writes_enabled",
+        "background_extraction_enabled",
+        "debug_trace_enabled",
+        "strict_diagnostics_enabled"
+      ]
+    },
+    "GatewayModelSelection": {
+      "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "const": "inherit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "const": "explicit"
+            },
+            "transport": {
+              "$ref": "#/$defs/ModelSelectionTransport"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "transport",
+            "instance",
+            "model"
+          ]
+        }
+      ]
+    },
+    "GatewayRemoteAccessErrorKind": {
+      "type": "string",
+      "enum": [
+        "invalid_settings",
+        "missing_key",
+        "missing_binary",
+        "local_gateway_unavailable",
+        "relay_resolve_failed",
+        "relay_connect_failed",
+        "tunnel_auth_failed",
+        "process_exited",
+        "unsupported_transport",
+        "restart_limit_reached",
+        "io",
+        "unknown"
+      ]
+    },
+    "GatewayRemoteAccessSettings": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "has_key": {
+          "type": "boolean",
+          "default": false
+        },
+        "server": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/GatewayRemoteAccessStatusSnapshot",
+          "default": {
+            "state": "disabled"
+          }
+        },
+        "transport": {
+          "$ref": "#/$defs/GatewayRemoteAccessTransport",
+          "default": "tcp"
+        }
+      }
+    },
+    "GatewayRemoteAccessState": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "starting",
+        "connected",
+        "reconnecting",
+        "failed",
+        "stopped"
+      ]
+    },
+    "GatewayRemoteAccessStatusSnapshot": {
+      "type": "object",
+      "properties": {
+        "error_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayRemoteAccessErrorKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/GatewayRemoteAccessState",
+          "default": "disabled"
+        },
+        "updated_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "GatewayRemoteAccessTransport": {
+      "type": "string",
+      "enum": [
+        "tcp",
+        "tls",
+        "noise",
+        "websocket"
+      ]
+    },
+    "GatewaySelfImprovementModelSelection": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "description": "None delegates to the provider; `none` explicitly disables reasoning.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
+    "GatewaySelfImprovementSettings": {
+      "type": "object",
+      "properties": {
+        "default_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "reviewer_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GatewaySelfImprovementStatus": {
+      "description": "Bounded operational projection; contains no history, prompts, or provider error payloads.",
+      "type": "object",
+      "properties": {
+        "last_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelfImprovementStatusReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_run_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "next_retry_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "next_scheduled_at_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "observed_at_unix": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "phase": {
+          "$ref": "#/$defs/SelfImprovementPhase"
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelfImprovementProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/SelfImprovementStatusReason"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "phase",
+        "reason",
+        "observed_at_unix"
+      ]
+    },
+    "GatewaySettingsSnapshot": {
+      "type": "object",
+      "properties": {
+        "cli_runtimes": {
+          "$ref": "#/$defs/GatewayCliRuntimeSettings",
+          "default": {
+            "instances": [
+              {
+                "binary_path": "codex",
+                "display_name": "Codex",
+                "enabled": true,
+                "home_path": "~/.codex",
+                "id": "codex",
+                "kind": "codex",
+                "nickname": "codex"
+              },
+              {
+                "binary_path": "claude",
+                "display_name": "Claude",
+                "enabled": true,
+                "home_path": "~/.claude",
+                "id": "claude",
+                "kind": "claude",
+                "nickname": "claude"
+              }
+            ]
+          }
+        },
+        "general": {
+          "$ref": "#/$defs/GatewayGeneralSettings",
+          "default": {
+            "compaction_model": {
+              "source": "inherit"
+            },
+            "context_compaction_enabled": true,
+            "default_model": {
+              "source": "inherit"
+            },
+            "keepawake": false,
+            "preflight_model": {
+              "source": "thread"
+            },
+            "telemetry_enabled": true
+          }
+        },
+        "memory": {
+          "$ref": "#/$defs/GatewayMemorySettings"
+        },
+        "remote_access": {
+          "$ref": "#/$defs/GatewayRemoteAccessSettings",
+          "default": {
+            "enabled": false,
+            "has_key": false,
+            "status": {
+              "state": "disabled"
+            },
+            "transport": "tcp"
+          }
+        },
+        "self_improvement": {
+          "description": "Effective Self-improvement settings for the workspace bound to this RPC connection.",
+          "$ref": "#/$defs/GatewaySelfImprovementSettings",
+          "default": {
+            "enabled": false
+          }
+        },
+        "self_improvement_status": {
+          "description": "Read-only status of learning in the connection's workspace. Absent on older gateways.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySelfImprovementStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_episodic": {
+          "$ref": "#/$defs/GatewayThreadEpisodicSettings",
+          "default": {
+            "default_max_candidates": 32,
+            "default_prompt_chars": 2400,
+            "enabled": true,
+            "index_batch_limit": 16,
+            "indexing_enabled": true,
+            "max_attempts": 5,
+            "max_candidate_work": 128,
+            "max_hit_chars": 1200,
+            "max_prompt_chars": 12000,
+            "max_segments": 16,
+            "min_relevancy": 0.25,
+            "min_results": 1,
+            "near_capacity_percent": 85.0,
+            "recall_enabled": true,
+            "retry_base_delay_secs": 30,
+            "retry_max_delay_secs": 900,
+            "snippet_chars": 360,
+            "vector_search": {
+              "embedding_normalized": true,
+              "enabled": false,
+              "local_model_status": "not_selected",
+              "provider_key": {
+                "present": false,
+                "required": false
+              },
+              "refill_status": "disabled",
+              "use_search_instructions": false
+            }
+          }
+        },
+        "voice_input": {
+          "$ref": "#/$defs/GatewayVoiceInputSettings",
+          "default": {
+            "enabled": false,
+            "runtime": {
+              "effective_enabled": false,
+              "phase": "disabled"
+            }
+          }
+        }
+      },
+      "required": [
+        "memory"
+      ]
+    },
+    "GatewayThreadEpisodicSettings": {
+      "type": "object",
+      "properties": {
+        "default_max_candidates": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "default_prompt_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "index_batch_limit": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "indexing_enabled": {
+          "type": "boolean"
+        },
+        "max_attempts": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "max_candidate_work": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_hit_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_prompt_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_segments": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "min_relevancy": {
+          "type": "number",
+          "format": "float"
+        },
+        "min_results": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "near_capacity_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "recall_enabled": {
+          "type": "boolean"
+        },
+        "retry_base_delay_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "retry_max_delay_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "snippet_chars": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "vector_search": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorSearchSettings",
+          "default": {
+            "embedding_normalized": true,
+            "enabled": false,
+            "local_model_status": "not_selected",
+            "provider_key": {
+              "present": false,
+              "required": false
+            },
+            "refill_status": "disabled",
+            "use_search_instructions": false
+          }
+        }
+      },
+      "required": [
+        "enabled",
+        "indexing_enabled",
+        "recall_enabled",
+        "default_prompt_chars",
+        "max_prompt_chars",
+        "max_hit_chars",
+        "default_max_candidates",
+        "max_candidate_work",
+        "max_segments",
+        "min_relevancy",
+        "min_results",
+        "snippet_chars",
+        "index_batch_limit",
+        "retry_base_delay_secs",
+        "retry_max_delay_secs",
+        "max_attempts",
+        "near_capacity_percent"
+      ]
+    },
+    "GatewayThreadEpisodicVectorLocalModelStatus": {
+      "type": "string",
+      "enum": [
+        "not_selected",
+        "unknown",
+        "missing",
+        "downloading",
+        "installed",
+        "failed"
+      ]
+    },
+    "GatewayThreadEpisodicVectorProvider": {
+      "type": "string",
+      "enum": [
+        "openai",
+        "openrouter",
+        "local"
+      ]
+    },
+    "GatewayThreadEpisodicVectorProviderKeyStatus": {
+      "type": "object",
+      "properties": {
+        "present": {
+          "type": "boolean",
+          "default": false
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "GatewayThreadEpisodicVectorRefillStatus": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "unknown",
+        "required",
+        "running",
+        "complete",
+        "failed"
+      ]
+    },
+    "GatewayThreadEpisodicVectorSearchSettings": {
+      "type": "object",
+      "properties": {
+        "downloaded_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "embedding_dimension": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "embedding_normalized": {
+          "type": "boolean",
+          "default": true
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "local_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local_model_status": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorLocalModelStatus",
+          "default": "not_selected"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayThreadEpisodicVectorProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_key": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorProviderKeyStatus",
+          "default": {
+            "present": false,
+            "required": false
+          }
+        },
+        "refill_status": {
+          "$ref": "#/$defs/GatewayThreadEpisodicVectorRefillStatus",
+          "default": "disabled"
+        },
+        "total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "use_search_instructions": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "GatewayVoiceInputProvider": {
+      "type": "string",
+      "enum": [
+        "local"
+      ]
+    },
+    "GatewayVoiceInputRuntimePhase": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "model_not_selected",
+        "missing",
+        "downloading",
+        "installing",
+        "loading",
+        "ready",
+        "failed"
+      ]
+    },
+    "GatewayVoiceInputRuntimeSnapshot": {
+      "type": "object",
+      "properties": {
+        "downloaded_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "effective_enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "$ref": "#/$defs/GatewayVoiceInputRuntimePhase",
+          "default": "disabled"
+        },
+        "total_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "GatewayVoiceInputSettings": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayVoiceInputProvider"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime": {
+          "$ref": "#/$defs/GatewayVoiceInputRuntimeSnapshot",
+          "default": {
+            "effective_enabled": false,
+            "phase": "disabled"
+          }
+        }
+      }
+    },
+    "ModelSelectionTransport": {
+      "type": "string",
+      "enum": [
+        "api",
+        "codex",
+        "claude"
+      ]
+    },
+    "SelfImprovementPhase": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "unavailable",
+        "waiting",
+        "running",
+        "retrying",
+        "failed",
+        "no_change",
+        "completed",
+        "cancelled"
+      ]
+    },
+    "SelfImprovementProgress": {
+      "type": "object",
+      "properties": {
+        "processed_chunks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "total_chunks": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "processed_chunks",
+        "total_chunks"
+      ]
+    },
+    "SelfImprovementStatusReason": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "model_unavailable",
+        "worker_unavailable",
+        "preparing",
+        "no_new_sources",
+        "awaiting_schedule",
+        "analyzing",
+        "finalizing",
+        "pending",
+        "recovering",
+        "timeout",
+        "output_limit",
+        "invalid_response",
+        "provider_error",
+        "response_filtered",
+        "no_candidate",
+        "reviewer_rejected",
+        "validation_rejected",
+        "created",
+        "updated",
+        "rolled_back",
+        "cancelled",
+        "unknown"
+      ]
+    }
+  }
+}

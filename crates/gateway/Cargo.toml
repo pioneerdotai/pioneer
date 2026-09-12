@@ -10,6 +10,7 @@ default = []
 computer-use = ["pioneer-tools/computer-use"]
 
 [dependencies]
+pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

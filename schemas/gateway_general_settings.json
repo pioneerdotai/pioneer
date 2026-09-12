@@ -3,6 +3,22 @@
   "title": "GatewayGeneralSettings",
   "type": "object",
   "properties": {
+    "compaction_model": {
+      "$ref": "#/$defs/GatewayModelSelection",
+      "default": {
+        "source": "inherit"
+      }
+    },
+    "context_compaction_enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "default_model": {
+      "$ref": "#/$defs/GatewayModelSelection",
+      "default": {
+        "source": "inherit"
+      }
+    },
     "keepawake": {
       "type": "boolean",
       "default": false
@@ -45,6 +61,63 @@
       "enum": [
         "thread",
         "custom"
+      ]
+    },
+    "GatewayModelSelection": {
+      "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "const": "inherit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "const": "explicit"
+            },
+            "transport": {
+              "$ref": "#/$defs/ModelSelectionTransport"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "transport",
+            "instance",
+            "model"
+          ]
+        }
+      ]
+    },
+    "ModelSelectionTransport": {
+      "type": "string",
+      "enum": [
+        "api",
+        "codex",
+        "claude"
       ]
     }
   }

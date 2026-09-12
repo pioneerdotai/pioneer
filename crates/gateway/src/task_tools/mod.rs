@@ -1576,15 +1576,7 @@ impl TaskToolHandler {
         let execution_admission = authorization
             .authorize_execution_intent(self.processor.as_ref(), &params)
             .await?;
-        let mut create_context = self
-            .processor
-            .task_create_context_for_params(&params)
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "failed to freeze detached Task context: {error:#}"
-                ))
-            })?;
+        let mut create_context = pioneer_tasks::TaskCreateContext::default();
         // Agent-authored Task creation is bound to the exact execution that
         // owns this turn.  Do not reuse the initiating human principal as the
         // durable creator when the execution-bound action adapter is present.
@@ -1799,6 +1791,23 @@ impl TaskToolHandler {
                 create_context.delivery_route_expires_at_millis = return_route.expires_at;
             }
         }
+        // Freeze after the adapter resolves and authorizes the destination.
+        // A routed Task inherits that admitted parent, never the creator's
+        // unrelated capsule. The service commits the seed with the TaskRun.
+        create_context.conversation_snapshot = self
+            .processor
+            .task_create_context_for_destination(
+                &params,
+                create_context.execution_destination_thread_id.as_deref(),
+                Some(&authorization.principal),
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to freeze accepted Task context: {error:#}"
+                ))
+            })?
+            .conversation_snapshot;
         create_context.execution_admission = execution_admission;
         if let Some(seed) = create_context.execution_admission.as_ref() {
             self.processor

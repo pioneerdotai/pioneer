@@ -593,7 +593,6 @@ struct CliRuntimeAdmissionPhase {
     normalized_pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
     manager: std::sync::Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>,
     continuation_thread_id: String,
-    context_thread_id: String,
     session_key: crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
     session_turn_lease: tokio::sync::OwnedMutexGuard<()>,
     combined_preflight: crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan,
@@ -699,7 +698,6 @@ pub(super) enum TurnStartSuccessResponse {
         context_thread_id: String,
         task_run_id: String,
         execution_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: Option<pioneer_protocol::TurnAuthorSnapshot>,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
         completion: std::sync::Arc<
@@ -715,7 +713,6 @@ pub(super) enum TurnStartSuccessResponse {
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
         continuation_thread_id: String,
         context_thread_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         completion: std::sync::Arc<
             std::sync::Mutex<
@@ -816,20 +813,6 @@ impl TurnStartSuccessResponse {
             Self::TurnStart
             | Self::VoiceSessionFinalizeAccepted { .. }
             | Self::DurableAgent { .. } => None,
-        }
-    }
-
-    fn task_conversation_history(&self) -> Option<&[ChatMessage]> {
-        match self {
-            Self::Task {
-                conversation_history,
-                ..
-            }
-            | Self::DurableAgent {
-                conversation_history,
-                ..
-            } => Some(conversation_history.as_slice()),
-            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
         }
     }
 
@@ -2019,18 +2002,19 @@ impl MessageProcessor {
                 // Freeze the causally closed parent branch before the Task becomes
                 // visible to the scheduler. A later sibling message must not change
                 // the context of this run, even if execution starts later.
-                let frozen_history = self
-                    .load_conversation_history_for_workspace_in_execution_excluding_turn(
-                        thread.workspace_id.as_str(),
-                        thread.id.as_str(),
-                        thread.id.as_str(),
-                        launch.turn_id.as_str(),
-                        Some(launch.turn_id.as_str()),
-                        Some(outcome.materialization.thread.model.as_str()),
-                        Some(task_model_provider.as_str()),
-                    )
-                    .await;
-                let frozen_history_json = match serde_json::to_string(&frozen_history) {
+                let frozen_history_json = match async {
+                    let authority = self.load_turn_execution_authorization_context(launch.turn_id.as_str()).await?;
+                    let current = self.execution_leases.revalidate_context(
+                        self.crud_store.as_ref(), &authority,
+                        crate::authorization::ResourceAction::TaskCreate,
+                        self.current_authorization_revision().await?,
+                    ).await?;
+                    self.capture_authorized_task_basis(
+                        current.principal(), thread.workspace_id.as_str(), thread.id.as_str(),
+                        Some(launch.turn_id.as_str()), Some(launch.turn_id.as_str()), None,
+                    ).await
+                }.await
+                {
                     Ok(history_json) => history_json,
                     Err(error) => {
                         self.mark_turn_blocked(
@@ -2857,6 +2841,20 @@ impl MessageProcessor {
                 outcome.started_notification.turn.id.as_str(),
             )
             .await;
+        let history = match history {
+            Ok(history) => history,
+            Err(_) => {
+                let message =
+                    "Conversation history is unavailable; turn preparation paused".to_owned();
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    message.clone(),
+                )
+                .await;
+                return Err(TurnStartFailure::unavailable(message));
+            }
+        };
         let workspace_skill_policies = match self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3203,7 +3201,10 @@ impl MessageProcessor {
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
-            .await;
+            .await
+            .map_err(|_| {
+                "Conversation history is unavailable; turn preparation paused".to_owned()
+            })?;
         let workspace_skill_policies = self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3354,7 +3355,6 @@ impl MessageProcessor {
         context_thread_id: String,
         task_run_id: String,
         execution_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
@@ -3366,7 +3366,6 @@ impl MessageProcessor {
             context_thread_id,
             task_run_id,
             execution_id,
-            conversation_history,
             agent_author: Some(agent_author),
             agent_turn_response,
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
@@ -3401,7 +3400,6 @@ impl MessageProcessor {
         execution_authorization_context: crate::authorization::ExecutionAuthorizationContext,
         continuation_thread_id: String,
         context_thread_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
         let execution_authorization_revalidation = self
@@ -3426,7 +3424,6 @@ impl MessageProcessor {
             execution_security_snapshot,
             continuation_thread_id,
             context_thread_id,
-            conversation_history,
             agent_author,
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
@@ -4057,9 +4054,6 @@ impl MessageProcessor {
             let continuation_thread_id = success_response
                 .continuation_thread_id(thread.id.as_str())
                 .to_owned();
-            let context_thread_id = success_response
-                .context_thread_id(thread.id.as_str())
-                .to_owned();
             let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
                 thread.workspace_id.as_str(),
                 runtime_id.as_str(),
@@ -4217,7 +4211,6 @@ impl MessageProcessor {
                 normalized_pack_names,
                 manager,
                 continuation_thread_id,
-                context_thread_id,
                 session_key,
                 session_turn_lease,
                 combined_preflight,
@@ -4232,7 +4225,6 @@ impl MessageProcessor {
                 normalized_pack_names,
                 manager,
                 continuation_thread_id,
-                context_thread_id,
                 session_key,
                 session_turn_lease,
                 combined_preflight,
@@ -5063,14 +5055,12 @@ impl MessageProcessor {
                     runtime_kind,
                     &outcome,
                     continuation_thread_id.as_str(),
-                    context_thread_id.as_str(),
                     combined_preflight.mcp_projection.as_ref(),
                     match &execution_authority {
                         TurnExecutionAuthority::Fresh(admission) => admission.root_thread_id(),
                         TurnExecutionAuthority::Durable { context, .. } => context.root_thread_id(),
                     },
                     selected_skill_names.as_slice(),
-                    success_response.task_conversation_history(),
                 )
                 .await
             {
@@ -5601,6 +5591,11 @@ impl MessageProcessor {
             request_timeout_ms,
         } = prepared;
         let pioneer_turn_id = outcome.started_notification.turn.id.clone();
+        self.interrupt_completed_history_for_new_input(
+            &outcome.started_notification.workspace_id,
+            &outcome.started_notification.thread_id,
+        )
+        .await;
         let mcp_metadata = match cli_session
             .prepare_mcp_turn(
                 outcome.started_notification.thread_id.as_str(),
@@ -7330,28 +7325,15 @@ impl MessageProcessor {
         runtime_kind: CLIAgentRuntimeKind,
         outcome: &crate::thread::TurnStartOutcome,
         continuation_thread_id: &str,
-        context_thread_id: &str,
         mcp_projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
         initiating_thread_id: &str,
         selected_skill_names: &[String],
-        frozen_history: Option<&[ChatMessage]>,
     ) -> anyhow::Result<pioneer_promt::CompiledInstructionDeliveryPlan> {
         let native_cwd = self
             .crud_store
             .get_cli_runtime_thread_binding(continuation_thread_id)
             .await?
             .and_then(|binding| binding.native_cwd);
-        let history = match frozen_history {
-            Some(history) => history.to_vec(),
-            None => {
-                self.load_conversation_history_for_workspace(
-                    outcome.started_notification.workspace_id.as_str(),
-                    context_thread_id,
-                    outcome.started_notification.turn.id.as_str(),
-                )
-                .await
-            }
-        };
         let permission_profile =
             self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
         crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
@@ -7367,7 +7349,6 @@ impl MessageProcessor {
                 model: Some(outcome.materialization.thread.model.as_str()),
                 cwd: native_cwd.as_deref(),
                 permission_profile,
-                history: history.as_slice(),
                 selected_skill_names,
                 selected_capabilities:
                     crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(mcp_projection),
@@ -7661,6 +7642,54 @@ impl MessageProcessor {
             )
             .await;
             return;
+        }
+
+        if turn.status == TurnStatus::Completed && self.agent_manager.has_context_controller().await
+        {
+            // Completed user work remains completed. Stop applies to its owned
+            // context preparation, including an operation recovered after loss
+            // of the in-memory worker. Persist the fence before acknowledging.
+            let stopped = async {
+                self.crud_store
+                    .compaction_stop_execution(
+                        &workspace_id,
+                        &thread_id,
+                        &crate::compaction::native_owner(&workspace_id, &thread_id),
+                        &turn_id,
+                    )
+                    .await?;
+                self.stop_completed_history_check(&workspace_id, &thread_id, &turn_id)
+                    .await;
+                match self
+                    .agent_manager
+                    .cancel_turn(&thread_id, &turn_id, &reason)
+                    .await
+                {
+                    Ok(())
+                    | Err(
+                        pioneer_agent::AgentControlError::ThreadNotFound
+                        | pioneer_agent::AgentControlError::NoActiveTurn
+                        | pioneer_agent::AgentControlError::TurnMismatch,
+                    ) => Ok::<_, anyhow::Error>(()),
+                    Err(error) => Err(anyhow::anyhow!(
+                        "context cancellation was not acknowledged: {error:?}"
+                    )),
+                }
+            }
+            .await;
+            if stopped.is_err() {
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        "failed to stop completed-turn context preparation".to_owned(),
+                    ),
+                )
+                .await;
+                return;
+            }
         }
 
         if turn.status != TurnStatus::InProgress {
@@ -9212,7 +9241,7 @@ fn normalize_cli_runtime_sandbox_label(value: &str) -> String {
         .collect()
 }
 
-fn cli_runtime_provider_key(runtime_id: &str) -> String {
+pub(super) fn cli_runtime_provider_key(runtime_id: &str) -> String {
     format!("cli_runtime:{}", runtime_id.trim())
 }
 

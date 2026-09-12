@@ -219,6 +219,23 @@ struct BedrockUsage {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_write_input_tokens: Option<u64>,
+}
+
+impl BedrockUsage {
+    fn normalized(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input_tokens.and_then(|input| {
+                input
+                    .checked_add(self.cache_read_input_tokens?)?
+                    .checked_add(self.cache_write_input_tokens?)
+            }),
+            output_tokens: self.output_tokens,
+        }
+    }
 }
 
 // ── List models response types ─────────────────────────────────────────────
@@ -919,10 +936,7 @@ impl crate::traits::Provider for BedrockProvider {
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
 
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        });
+        let usage = api_response.usage.map(|u| u.normalized());
 
         let mut text_parts = Vec::new();
         let mut reasoning_parts = Vec::new();
@@ -1006,7 +1020,9 @@ impl crate::traits::Provider for BedrockProvider {
         if let Some(state) = response.provider_replay_state {
             chunks.push(Ok(StreamChunk::provider_replay_state(state)));
         }
-        chunks.push(Ok(StreamChunk::final_chunk_with(termination)));
+        chunks.push(Ok(
+            StreamChunk::final_chunk_with(termination).with_usage(response.usage)
+        ));
         Ok(Box::pin(futures_util::stream::iter(chunks)))
     }
 
@@ -1105,6 +1121,22 @@ fn provider_model_from_bedrock_model_summary(m: BedrockModelSummary) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_normalization_requires_complete_separate_cache_counters() {
+        let complete: super::BedrockUsage = serde_json::from_value(serde_json::json!({
+            "inputTokens":10,"cacheReadInputTokens":100,"cacheWriteInputTokens":20,"outputTokens":8
+        }))
+        .unwrap();
+        assert_eq!(complete.normalized().input_tokens, Some(130));
+        assert_eq!(complete.normalized().output_tokens, Some(8));
+        let missing: super::BedrockUsage = serde_json::from_value(serde_json::json!({
+            "inputTokens":10,"outputTokens":8
+        }))
+        .unwrap();
+        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().output_tokens, Some(8));
+    }
+
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;

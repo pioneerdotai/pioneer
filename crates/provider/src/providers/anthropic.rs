@@ -154,6 +154,23 @@ struct ApiUsage {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+impl ApiUsage {
+    fn normalized(&self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input_tokens.and_then(|input| {
+                input
+                    .checked_add(self.cache_creation_input_tokens?)?
+                    .checked_add(self.cache_read_input_tokens?)
+            }),
+            output_tokens: self.output_tokens,
+        }
+    }
 }
 
 // ── SSE streaming response types ────────────────────────────────────────────
@@ -162,6 +179,10 @@ struct ApiUsage {
 struct StreamEvent {
     #[serde(rename = "type")]
     event_type: String,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+    #[serde(default)]
+    message: Option<StreamMessage>,
     /// Content block index for block-level events.
     #[serde(default)]
     index: Option<usize>,
@@ -170,6 +191,12 @@ struct StreamEvent {
     /// Present on `content_block_start` events — carries the block type.
     #[serde(default)]
     content_block: Option<StreamContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamMessage {
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,10 +572,7 @@ impl crate::traits::Provider for AnthropicProvider {
             .as_deref()
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_stop_reason".to_owned()));
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-        });
+        let usage = api_response.usage.map(|u| u.normalized());
 
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -688,7 +712,11 @@ impl crate::traits::Provider for AnthropicProvider {
 
             tokio::pin!(byte_stream);
 
-            while let Some(result) = byte_stream.next().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -720,6 +748,21 @@ impl crate::traits::Provider for AnthropicProvider {
 
                     match serde_json::from_str::<StreamEvent>(data) {
                         Ok(event) => {
+                            for usage in event
+                                .message
+                                .as_ref()
+                                .and_then(|m| m.usage.as_ref())
+                                .into_iter()
+                                .chain(event.usage.as_ref())
+                            {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(usage.normalized())))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if event.event_type == "message_stop" {
                                 let remaining_calls = pending_tool_uses
                                     .drain()
@@ -1018,6 +1061,21 @@ fn provider_model_from_anthropic_model_entry(m: AnthropicModelEntry) -> Provider
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_normalization_requires_complete_separate_cache_counters() {
+        let complete: super::ApiUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":20,"output_tokens":8
+        })).unwrap();
+        assert_eq!(complete.normalized().input_tokens, Some(130));
+        assert_eq!(complete.normalized().output_tokens, Some(8));
+        let missing: super::ApiUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens":10,"output_tokens":8
+        }))
+        .unwrap();
+        assert_eq!(missing.normalized().input_tokens, None);
+        assert_eq!(missing.normalized().output_tokens, Some(8));
+    }
+
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;

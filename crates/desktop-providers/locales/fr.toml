@@ -339,3 +339,11 @@ cancel = "Annuler"
 save = "Enregistrer"
 dismiss = "Fermer"
 
+
+[providers.cli.compaction]
+label = "Modèle de compression"
+inherit = "Utiliser les réglages généraux"
+choose = "Choisir…"
+reset = "Réinitialiser"
+save_first = "Enregistrez le fournisseur CLI avant de choisir son modèle."
+invalid = "Choisissez un modèle et un niveau de raisonnement pris en charge par ce fournisseur CLI."

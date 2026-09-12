@@ -2167,7 +2167,9 @@ impl MessageProcessor {
             source_sequence: row.source_sequence,
             source_updated_at_unix_micros: row.updated_at.timestamp_micros(),
             item_type: item.item_type(),
-            status: parse_turn_work_item_status(row.status.as_str()),
+            status: item
+                .context_compaction_status()
+                .unwrap_or_else(|| parse_turn_work_item_status(row.status.as_str())),
             started_at_unix_ms: row.started_at.map(|value| value.timestamp_millis()),
             completed_at_unix_ms: row.completed_at.map(|value| value.timestamp_millis()),
             item,
@@ -2654,6 +2656,47 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
 #[cfg(test)]
 mod timeline_handler_unit_tests {
     use super::*;
+
+    #[test]
+    fn compaction_reconnect_uses_durable_lifecycle_even_with_legacy_projection_status() {
+        let now = chrono::DateTime::from_timestamp(1, 0)
+            .unwrap()
+            .fixed_offset();
+        let row = turn_work_item_projection::Model {
+            work_item_id: "work".into(),
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "compaction:one".into(),
+            source_event_id: None,
+            source_sequence: 2,
+            order_key: "2".into(),
+            item_type: "system_event".into(),
+            visibility: "visible".into(),
+            classification: "system_event".into(),
+            status: "completed".into(),
+            started_at: Some(now),
+            completed_at: Some(now),
+            metadata_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        for (status, expected) in [
+            ("cancelled", TurnWorkItemStatus::Cancelled),
+            ("failed", TurnWorkItemStatus::Failed),
+        ] {
+            let item = TurnItem::SystemEvent {
+                id: row.item_id.clone(),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "Context preparation ended".into(),
+                code: Some("agent_context_compaction".into()),
+                details: Some(serde_json::json!({"status":status})),
+            };
+            let projected = MessageProcessor::turn_work_item_from_row(&row, item).unwrap();
+            assert_eq!(projected.status, expected);
+            assert_eq!(projected.work_item_id, row.work_item_id);
+        }
+    }
 
     fn agent_authored_turn() -> Turn {
         let presentation = pioneer_protocol::AgentPresentationSnapshot {

@@ -6,6 +6,13 @@
     "binary_path": {
       "type": "string"
     },
+    "compaction_model": {
+      "description": "Whole override; Inherit explicitly clears it instead of persisting fallback.",
+      "$ref": "#/$defs/GatewayModelSelection",
+      "default": {
+        "source": "inherit"
+      }
+    },
     "display_name": {
       "type": "string"
     },
@@ -99,6 +106,63 @@
             "Duplicate"
           ]
         }
+      ]
+    },
+    "GatewayModelSelection": {
+      "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "const": "inherit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "const": "explicit"
+            },
+            "transport": {
+              "$ref": "#/$defs/ModelSelectionTransport"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "transport",
+            "instance",
+            "model"
+          ]
+        }
+      ]
+    },
+    "ModelSelectionTransport": {
+      "type": "string",
+      "enum": [
+        "api",
+        "codex",
+        "claude"
       ]
     }
   }

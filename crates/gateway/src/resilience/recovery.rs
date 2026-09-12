@@ -303,7 +303,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: CompactHistory,
                 max_attempts: 1,
                 base_backoff_secs: 1,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 900,
                 no_progress_limit: 1,
             },
         );
@@ -313,7 +313,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: CompactHistory,
                 max_attempts: 1,
                 base_backoff_secs: 1,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 900,
                 no_progress_limit: 1,
             },
         );
@@ -2474,6 +2474,12 @@ impl RecoveryCoordinator {
             disable_image_input: execution_plan.disable_image_input,
             refresh_provider_auth: execution_plan.refresh_provider_auth,
             compact_history: execution_plan.compact_history,
+            context_recovery_deadline_ms: execution_plan.compact_history.then(|| {
+                u64::try_from(job.scheduled_at_unix)
+                    .unwrap_or(0)
+                    .saturating_mul(1000)
+                    .saturating_add(pioneer_compaction::OPERATION_MILLIS)
+            }),
             continue_generation,
             model_override: execution_plan.model_override,
             retained_provider_history,
@@ -3031,6 +3037,7 @@ impl RecoveryCoordinator {
 
         let mut request =
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+                self.crud_store.as_ref(),
                 &snapshot,
                 turn.permission_profile,
                 match self
@@ -3053,7 +3060,9 @@ impl RecoveryCoordinator {
                     }
                 },
                 agent_skill_overlay,
-            ) {
+            )
+            .await
+            {
                 Ok(request) => request,
                 Err(error) => {
                     return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
@@ -3807,7 +3816,19 @@ impl RecoveryCoordinator {
             action: job.action,
             max_attempts: job.max_attempts,
             base_backoff_secs: policy_snapshot_u64(job, "base_backoff_secs").unwrap_or(1),
-            max_wall_clock_secs: policy_snapshot_u64(job, "max_wall_clock_secs").unwrap_or(60),
+            // Legacy snapshots predate the single 15-minute compaction/retry
+            // operation. Preserve their admission time, never restart the clock.
+            max_wall_clock_secs: if job.action == RecoveryAction::CompactHistory
+                && matches!(
+                    job.error_class,
+                    Some(
+                        ProviderFailureClass::ContextTooLarge | ProviderFailureClass::PromptTooLong
+                    )
+                ) {
+                pioneer_compaction::OPERATION_MILLIS / 1000
+            } else {
+                policy_snapshot_u64(job, "max_wall_clock_secs").unwrap_or(60)
+            },
             no_progress_limit: policy_snapshot_i64(job, "no_progress_limit")
                 .unwrap_or(job.max_attempts),
         })
@@ -3817,35 +3838,227 @@ impl RecoveryCoordinator {
         &self,
         turn_id: &str,
     ) -> Result<Vec<RetainedProviderHistoryMessage>> {
-        let rows = self
-            .crud_store
-            .list_turn_llm_context(turn_id)
+        use pioneer_crud::compaction::CanonicalSource;
+        let store = self.crud_store.with_maintenance_access();
+        let (thread, workspace) = store
+            .get_turn_location(turn_id)
             .await?
-            .into_iter()
-            .map(|row| RetainedProviderHistoryRow {
-                sequence: row.sequence,
-                source: row.source,
-                item_id: row.item_id,
-                tool_name: row.tool_name,
-                payload: row.payload,
-            })
-            .collect::<Vec<_>>();
-        let item_ids = retained_provider_history_item_ids(rows.as_slice());
-        let resumable_item_ids = self
-            .crud_store
-            .get_turn_items_by_ids(turn_id, item_ids.as_slice())
-            .await?
-            .into_iter()
-            .filter_map(|(item_id, item)| {
-                item.recovery_policy()
-                    .is_some_and(|policy| {
-                        policy.can_resume
-                            && policy.idempotency_mode == ToolRecoveryIdempotencyMode::Safe
-                    })
-                    .then_some(item_id)
-            })
+            .ok_or_else(|| anyhow::anyhow!("retained history scope is missing"))?;
+        let high_water = store
+            .compaction_source_high_water(
+                &workspace,
+                &thread,
+                turn_id,
+                CanonicalSource::ProviderContext,
+            )
+            .await?;
+        let mut after = 0;
+        let mut rows = Vec::new();
+        let mut sources = HashMap::new();
+        while after < high_water {
+            let page = store
+                .compaction_source_page(
+                    &workspace,
+                    &thread,
+                    turn_id,
+                    CanonicalSource::ProviderContext,
+                    after,
+                )
+                .await?;
+            anyhow::ensure!(
+                page.next_sequence > after,
+                "retained history source disappeared"
+            );
+            after = page.next_sequence;
+            for row in page
+                .entries
+                .into_iter()
+                .filter(|row| row.sequence <= high_water)
+            {
+                let payload = match row.payload {
+                    Some(payload) => payload,
+                    None => {
+                        let mut payload = String::new();
+                        let mut offset = 0;
+                        loop {
+                            let fragment = store
+                                .compaction_reference_fragment(
+                                    &workspace,
+                                    &thread,
+                                    &row.reference,
+                                    offset,
+                                )
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("retained source revision disappeared")
+                                })?;
+                            payload.push_str(&fragment.text);
+                            let Some(next) = fragment.next_character else {
+                                break;
+                            };
+                            anyhow::ensure!(
+                                next > offset,
+                                "retained history fragment made no progress"
+                            );
+                            offset = next;
+                        }
+                        payload
+                    }
+                };
+                sources.insert(row.sequence, row.reference);
+                rows.push(RetainedProviderHistoryRow {
+                    sequence: row.sequence,
+                    source: row.source_type,
+                    item_id: row.item_id,
+                    tool_name: row.tool_name,
+                    payload,
+                });
+            }
+        }
+        // Capture the exact round/item mapping before the existing recovery
+        // assembler orders results and synthesizes safe interrupted observations.
+        let origins = retained_history_origins(&workspace, &thread, turn_id, &rows, &sources)?;
+        // A terminal shell item is acknowledged before the replay row. Recover
+        // that known outcome if the process stopped between the two appends.
+        let recorded_items = rows
+            .iter()
+            .filter(|row| row.source == "tool_result_v2")
+            .filter_map(|row| row.item_id.as_deref())
             .collect::<HashSet<_>>();
-        assemble_retained_provider_history_with_recovery(turn_id, rows, &resumable_item_ids)
+        let mut recovered = HashMap::new();
+        let mut recovered_sources = HashMap::new();
+        for row in rows.iter().filter(|row| row.source == "assistant_round") {
+            let Ok(envelope) = serde_json::from_str::<
+                pioneer_provider::CanonicalProviderRoundEnvelope,
+            >(&row.payload) else {
+                continue;
+            };
+            for identity in &envelope.calls {
+                if recorded_items.contains(identity.turn_item_id.as_str()) {
+                    continue;
+                }
+                let call = envelope
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|calls| calls.get(identity.ordinal as usize))
+                    .ok_or_else(|| anyhow::anyhow!("canonical call ordinal is missing"))?;
+                anyhow::ensure!(
+                    call.id == identity.provider_call_id,
+                    "canonical call identity mismatch"
+                );
+                if let Some((source, message)) = crate::compaction::retained_shell_outcome(
+                    &store,
+                    &workspace,
+                    &thread,
+                    turn_id,
+                    &identity.turn_item_id,
+                    &identity.provider_call_id,
+                    &call.name,
+                )
+                .await?
+                {
+                    anyhow::ensure!(
+                        recovered
+                            .insert(identity.turn_item_id.clone(), message)
+                            .is_none(),
+                        "terminal item belongs to multiple rounds"
+                    );
+                    recovered_sources.insert(identity.turn_item_id.clone(), source);
+                }
+            }
+        }
+        let mut resumable_item_ids = HashSet::new();
+        for tool in origins.values().flat_map(|round| round.tools.values()) {
+            if tool.provenance.is_some() || recovered.contains_key(&tool.item_id) {
+                continue;
+            }
+            if crate::compaction::retained_tool_policy(
+                &store,
+                &workspace,
+                &thread,
+                turn_id,
+                &tool.item_id,
+            )
+            .await?
+            .is_some_and(|policy| {
+                policy.can_resume && policy.idempotency_mode == ToolRecoveryIdempotencyMode::Safe
+            }) {
+                resumable_item_ids.insert(tool.item_id.clone());
+            }
+        }
+        let mut retained = assemble_retained_provider_history_with_outcomes(
+            turn_id,
+            rows,
+            &resumable_item_ids,
+            &recovered,
+        )?;
+        let mut round = None;
+        for entry in &mut retained {
+            if entry.message.role == Role::Assistant {
+                round = origins.get(&entry.sequence);
+                if let Some(origin) = round {
+                    entry.message.provenance = Some(origin.assistant.clone());
+                }
+            } else if entry.message.role == Role::User {
+                if let Some(origin) = origins.get(&entry.sequence) {
+                    entry.message.provenance = Some(origin.assistant.clone());
+                }
+                round = None;
+            } else if entry.message.role == Role::Tool {
+                let origin = round.and_then(|round| {
+                    entry
+                        .message
+                        .tool_call_id
+                        .as_ref()
+                        .and_then(|id| round.tools.get(id))
+                });
+                let Some(origin) = origin else {
+                    if let Some(item) = entry.message.tool_call_id.as_ref() {
+                        let reference = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn_id, "item_id": item}).to_string();
+                        entry.message = pioneer_agent::compaction::restored_tool_result_message(
+                            &entry.message,
+                            &reference,
+                        )?;
+                    }
+                    continue;
+                };
+                // Synthetic interrupted observations have no retained outcome;
+                // leave them protected and do not fabricate a durable source.
+                let Some(mut provenance) = origin.provenance.clone().or_else(|| {
+                    recovered_sources.get(&origin.item_id).and_then(|source| {
+                        round.map(|round| {
+                            let mut provenance = round.assistant.clone();
+                            provenance.sources = vec![pioneer_provider::MessageSourceRef {
+                                scope: source.scope.clone(),
+                                id: source.id.clone(),
+                                version: source.version.clone(),
+                            }];
+                            provenance
+                        })
+                    })
+                }) else {
+                    continue;
+                };
+                if let Some(full) = store
+                    .compaction_tool_item_reference(&workspace, &thread, turn_id, &origin.item_id)
+                    .await?
+                {
+                    provenance.sources = vec![pioneer_provider::MessageSourceRef {
+                        scope: full.scope,
+                        id: full.id,
+                        version: full.version,
+                    }];
+                }
+                entry.message.provenance = Some(provenance);
+                let reference = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn_id, "item_id": origin.item_id}).to_string();
+                entry.message = pioneer_agent::compaction::restored_tool_result_message(
+                    &entry.message,
+                    &reference,
+                )?;
+            }
+        }
+        Ok(retained)
     }
 
     async fn cancel_other_open_jobs_after_terminal_recovery(
@@ -4027,23 +4240,126 @@ fn provider_snapshot_field<'a>(job: &'a RecoveryJobRecord, key: &str) -> Option<
     job.policy_snapshot.get(key)?.as_str()
 }
 
+struct RetainedRoundOrigins {
+    assistant: pioneer_provider::MessageProvenance,
+    tools: HashMap<String, RetainedToolOrigin>,
+}
+struct RetainedToolOrigin {
+    item_id: String,
+    provenance: Option<pioneer_provider::MessageProvenance>,
+}
+
+fn retained_history_origins(
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    rows: &[RetainedProviderHistoryRow],
+    sources: &HashMap<i64, pioneer_compaction::SourceRef>,
+) -> Result<HashMap<i64, RetainedRoundOrigins>> {
+    use pioneer_provider::{MessageProvenance, MessageSourceRef};
+    let provenance = |unit: &str, source: &pioneer_compaction::SourceRef| MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: workspace.into(),
+        thread_id: thread.into(),
+        context_thread: None,
+        unit_id: format!("{turn}:{unit}"),
+        sources: vec![MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        }],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    };
+    let mut result = HashMap::<i64, RetainedRoundOrigins>::new();
+    let mut current = None;
+    for row in rows {
+        if row.source == "provider_observation" {
+            let source = sources
+                .get(&row.sequence)
+                .ok_or_else(|| anyhow::anyhow!("failed observation source missing"))?;
+            result.insert(
+                row.sequence,
+                RetainedRoundOrigins {
+                    assistant: provenance(&source.id, source),
+                    tools: HashMap::new(),
+                },
+            );
+            current = None;
+        } else if row.source == "assistant_round" {
+            current = None;
+            if let Ok(envelope) = serde_json::from_str::<
+                pioneer_provider::CanonicalProviderRoundEnvelope,
+            >(&row.payload)
+            {
+                let source = sources
+                    .get(&row.sequence)
+                    .ok_or_else(|| anyhow::anyhow!("canonical round source missing"))?;
+                result.insert(
+                    row.sequence,
+                    RetainedRoundOrigins {
+                        assistant: provenance(&envelope.round_id, source),
+                        tools: envelope
+                            .calls
+                            .into_iter()
+                            .map(|call| {
+                                (
+                                    call.provider_call_id,
+                                    RetainedToolOrigin {
+                                        item_id: call.turn_item_id,
+                                        provenance: None,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                );
+                current = Some((row.sequence, envelope.round_id));
+            }
+        } else if row.source == "tool_result_v2"
+            && let Some((sequence, unit)) = &current
+        {
+            let source = sources
+                .get(&row.sequence)
+                .ok_or_else(|| anyhow::anyhow!("canonical result source missing"))?;
+            if let Some(tool) = result.get_mut(sequence).and_then(|round| {
+                round
+                    .tools
+                    .values_mut()
+                    .find(|tool| Some(&tool.item_id) == row.item_id.as_ref())
+            }) {
+                tool.provenance = Some(provenance(unit, source));
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 fn assemble_retained_provider_history(
     turn_id: &str,
     rows: Vec<RetainedProviderHistoryRow>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
-    assemble_retained_provider_history_with_recovery(turn_id, rows, &HashSet::new())
+    assemble_retained_provider_history_with_outcomes(
+        turn_id,
+        rows,
+        &HashSet::new(),
+        &HashMap::new(),
+    )
 }
 
-fn assemble_retained_provider_history_with_recovery(
+fn assemble_retained_provider_history_with_outcomes(
     turn_id: &str,
     mut rows: Vec<RetainedProviderHistoryRow>,
     resumable_item_ids: &HashSet<String>,
+    recovered: &HashMap<String, ChatMessage>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
     rows.sort_by_key(|row| row.sequence);
 
     let canonical_start = rows.iter().position(|row| {
         row.source == "tool_result_v2"
+            || row.source == "provider_observation"
             || (row.source == "assistant_round"
                 && serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
                     row.payload.as_str(),
@@ -4060,30 +4376,9 @@ fn assemble_retained_provider_history_with_recovery(
         turn_id,
         canonical_rows,
         resumable_item_ids,
+        recovered,
     )?);
     Ok(retained)
-}
-
-fn retained_provider_history_item_ids(rows: &[RetainedProviderHistoryRow]) -> Vec<String> {
-    let mut item_ids = HashSet::new();
-    for row in rows {
-        if let Some(item_id) = row.item_id.as_ref() {
-            item_ids.insert(item_id.clone());
-        }
-        if row.source == "assistant_round"
-            && let Ok(envelope) = serde_json::from_str::<
-                pioneer_provider::CanonicalProviderRoundEnvelope,
-            >(row.payload.as_str())
-        {
-            item_ids.extend(
-                envelope
-                    .calls
-                    .into_iter()
-                    .map(|identity| identity.turn_item_id),
-            );
-        }
-    }
-    item_ids.into_iter().collect()
 }
 
 fn assemble_legacy_provider_history(
@@ -4199,6 +4494,7 @@ fn assemble_canonical_provider_history(
     turn_id: &str,
     rows: Vec<RetainedProviderHistoryRow>,
     resumable_item_ids: &HashSet<String>,
+    recovered: &HashMap<String, ChatMessage>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
     use pioneer_provider::{CanonicalProviderRoundEnvelope, ProviderTermination};
 
@@ -4212,6 +4508,7 @@ fn assemble_canonical_provider_history(
         turn_id: &str,
         mut pending: PendingRound,
         resumable_item_ids: &HashSet<String>,
+        recovered: &HashMap<String, ChatMessage>,
         retained: &mut Vec<RetainedProviderHistoryMessage>,
     ) -> Result<()> {
         if pending.envelope.version != 1 {
@@ -4280,6 +4577,15 @@ fn assemble_canonical_provider_history(
             }
         }
 
+        for identity in &identities {
+            if !pending.results.contains_key(&identity.turn_item_id)
+                && let Some(message) = recovered.get(&identity.turn_item_id)
+            {
+                pending
+                    .results
+                    .insert(identity.turn_item_id.clone(), message.clone());
+            }
+        }
         let resumptions = identities
             .iter()
             .filter(|identity| {
@@ -4344,9 +4650,30 @@ fn assemble_canonical_provider_history(
     let mut pending: Option<PendingRound> = None;
     for row in rows {
         match row.source.as_str() {
+            "provider_observation" => {
+                if let Some(previous) = pending.take() {
+                    flush_round(
+                        turn_id,
+                        previous,
+                        resumable_item_ids,
+                        recovered,
+                        &mut retained,
+                    )?;
+                }
+                retained.push(RetainedProviderHistoryMessage {
+                    sequence: row.sequence,
+                    message: crate::compaction::provider_observation(&row.payload)?,
+                });
+            }
             "assistant_round" => {
                 if let Some(previous) = pending.take() {
-                    flush_round(turn_id, previous, resumable_item_ids, &mut retained)?;
+                    flush_round(
+                        turn_id,
+                        previous,
+                        resumable_item_ids,
+                        recovered,
+                        &mut retained,
+                    )?;
                 }
                 let envelope =
                     serde_json::from_str::<CanonicalProviderRoundEnvelope>(row.payload.as_str())
@@ -4397,7 +4724,13 @@ fn assemble_canonical_provider_history(
         }
     }
     if let Some(pending) = pending {
-        flush_round(turn_id, pending, resumable_item_ids, &mut retained)?;
+        flush_round(
+            turn_id,
+            pending,
+            resumable_item_ids,
+            recovered,
+            &mut retained,
+        )?;
     }
     Ok(retained)
 }
@@ -4931,6 +5264,276 @@ mod tests {
     }
 
     #[test]
+    fn compaction_failed_partial_recovery_is_data_and_never_replays_its_calls() {
+        let mut partial = ChatMessage::assistant("unfinished answer");
+        partial.tool_calls = Some(vec![ProviderToolCall {
+            id: "already-called".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]);
+        let observation = retained_history_row(
+            3,
+            "provider_observation",
+            Some("failed-round"),
+            None,
+            serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: "failed-round".into(),
+                termination: ProviderTermination::ProviderError,
+                message: partial,
+                calls: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let restored = assemble_retained_provider_history(
+            "turn",
+            vec![
+                canonical_round_row(1, "successful-round", "already-called", "item"),
+                exact_result_row(2, "item", "already-called", "completed outcome"),
+                observation,
+            ],
+        )
+        .unwrap();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[2].message.role, pioneer_provider::Role::User);
+        assert!(restored[2].message.tool_calls.is_none());
+        assert!(restored[2].message.content.contains("unfinished answer"));
+        assert!(restored[2].message.content.contains("already-called"));
+        assert!(!restored[2].message.content.contains("Reissue"));
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|entry| entry.message.tool_calls.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_restore_bounds_full_results_and_keeps_round_scoped_sources() {
+        let (store, _, coordinator) = setup_coordinator_with_agent().await;
+        let workspace = "ws_restore_bounded";
+        let thread = "thr_restore_bounded";
+        let turn = "turn_restore_bounded";
+        materialize_turn_with_tool_item(store.as_ref(), workspace, thread, turn, "item_one", None)
+            .await;
+        let rows = vec![
+            canonical_round_row(1, "round_one", "reused_call", "item_one"),
+            exact_result_row(
+                2,
+                "item_one",
+                "reused_call",
+                &"large retained result 🦀\n".repeat(20000),
+            ),
+            canonical_round_row(3, "round_two", "reused_call", "item_two"),
+            exact_result_row(4, "item_two", "reused_call", "second outcome"),
+        ];
+        for row in rows {
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: turn.into(),
+                    item_id: row.item_id,
+                    attempt_id: None,
+                    sequence: row.sequence,
+                    source: row.source,
+                    tool_name: row.tool_name,
+                    payload: row.payload,
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        let messages = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 4);
+        for pair in messages.chunks_exact(2) {
+            let assistant = pair[0].message.provenance.as_ref().unwrap();
+            let tool = pair[1].message.provenance.as_ref().unwrap();
+            assert_eq!(assistant.unit_id, tool.unit_id);
+            assert_eq!(tool.workspace_id, workspace);
+            assert_eq!(tool.thread_id, thread);
+            assert_ne!(assistant.sources, tool.sources);
+            let wire = serde_json::to_string(&pair[1].message).unwrap();
+            assert!(wire.len() <= pioneer_compaction::RESULT_BYTES);
+            assert!(pioneer_compaction::text_tokens(&wire) <= pioneer_compaction::RESULT_TOKENS);
+        }
+        assert_ne!(
+            messages[1].message.provenance.as_ref().unwrap().sources,
+            messages[3].message.provenance.as_ref().unwrap().sources
+        );
+        assert!(messages[1].message.content.contains("item_one"));
+        assert_eq!(messages[3].message.content, "second outcome");
+        // Restore is a projection: it cannot rewrite the retained original.
+        let full = store.list_turn_llm_context(turn).await.unwrap();
+        assert!(
+            full.iter()
+                .find(|row| row.sequence == 2)
+                .unwrap()
+                .payload
+                .len()
+                > 256 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_restore_uses_acknowledged_shell_outcome_without_replay_row() {
+        let (store, _, coordinator) = setup_coordinator_with_agent().await;
+        let (workspace, thread, turn, item) = (
+            "ws_terminal_restore",
+            "thr_terminal_restore",
+            "turn_terminal_restore",
+            "shell_terminal",
+        );
+        materialize_turn_with_tool_item(
+            store.as_ref(),
+            workspace,
+            thread,
+            turn,
+            "unrelated_item",
+            None,
+        )
+        .await;
+        let mut row = canonical_round_row(1, "shell_round", "provider_shell", item);
+        let mut envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+            serde_json::from_str(&row.payload).unwrap();
+        envelope.message.tool_calls.as_mut().unwrap()[0].name = "exec_command".into();
+        row.payload = serde_json::to_string(&envelope).unwrap();
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: row.item_id,
+                attempt_id: None,
+                sequence: row.sequence,
+                source: row.source,
+                tool_name: None,
+                payload: row.payload,
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let shell = TurnItem::CommandExecution {
+            id: item.into(),
+            tool_name: "exec_command".into(),
+            arguments: serde_json::json!({"command":"fixture-only"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::Shell {
+                stdout: Some("retained terminal output".into()),
+                stderr: None,
+                aggregated_output: None,
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                timed_out: Some(false),
+                truncated: false,
+            },
+            recovery: None,
+            command: vec!["fixture-only".into()],
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: shell.clone(),
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let restored = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored[1].message.tool_call_id.as_deref(),
+            Some("provider_shell")
+        );
+        assert!(
+            restored[1]
+                .message
+                .content
+                .contains("retained terminal output")
+        );
+        assert!(!restored[1].message.content.contains("Reissue"));
+        assert_eq!(
+            restored[1].message.provenance.as_ref().unwrap().sources[0].scope,
+            format!("item:{turn}")
+        );
+        assert_eq!(
+            store.list_turn_llm_context(turn).await.unwrap().len(),
+            1,
+            "reconciliation must not write a second result copy"
+        );
+        // Explicit failure is still a known outcome, never a reason to repeat.
+        let mut failed = shell;
+        if let TurnItem::CommandExecution {
+            status, success, ..
+        } = &mut failed
+        {
+            *status = ToolCallStatus::Failed;
+            *success = Some(false);
+        }
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: failed,
+                },
+                chrono::Utc::now().timestamp() + 1,
+            )
+            .await
+            .unwrap();
+        let restored = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert!(restored[1].message.content.contains("failed"));
+        assert!(
+            crate::compaction::retained_shell_outcome(
+                &store,
+                "foreign",
+                thread,
+                turn,
+                item,
+                "provider_shell",
+                "exec_command"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            crate::compaction::retained_shell_outcome(
+                &store,
+                workspace,
+                thread,
+                turn,
+                item,
+                "provider_shell",
+                "another_tool"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
     fn canonical_provider_history_replays_exact_result_by_provider_identity() {
         let retained = assemble_retained_provider_history(
             "turn_v2",
@@ -5055,6 +5658,41 @@ mod tests {
         assert_eq!(policy.max_wall_clock_secs, 900);
     }
 
+    #[tokio::test]
+    async fn compaction_legacy_recovery_policy_preserves_admission_and_one_retry() {
+        let (_store, coordinator) = setup_coordinator().await;
+        let mut job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_legacy_compaction_budget".into(),
+                    item_id: "reasoning_legacy".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::ContextTooLarge, "capacity"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        // A persisted pre-proposal job carries the old nested 120s policy.
+        job.policy_snapshot["max_wall_clock_secs"] = serde_json::json!(120);
+        let admission = job.scheduled_at_unix;
+        let policy = coordinator.policy_for_recovery_job(&job).await.unwrap();
+        assert_eq!(policy.max_wall_clock_secs, 900);
+        assert_eq!(policy.max_attempts, 1);
+        assert_eq!(job.scheduled_at_unix, admission);
+        job.action = RecoveryAction::DisableStreaming;
+        job.error_class = Some(ProviderFailureClass::UnsupportedStreaming);
+        assert_eq!(
+            coordinator
+                .policy_for_recovery_job(&job)
+                .await
+                .unwrap()
+                .max_wall_clock_secs,
+            120
+        );
+    }
+
     #[test]
     fn recoverable_provider_failures_use_fifteen_minute_job_budget() {
         let registry = RecoveryPolicyRegistry::default();
@@ -5063,6 +5701,8 @@ mod tests {
             ProviderFailureClass::NetworkTransient,
             ProviderFailureClass::RateLimit,
             ProviderFailureClass::Provider5xx,
+            ProviderFailureClass::ContextTooLarge,
+            ProviderFailureClass::PromptTooLong,
         ] {
             assert_eq!(
                 registry
@@ -5095,7 +5735,10 @@ mod tests {
                 ddg_instant_api_url: "https://api.duckduckgo.com/".to_owned(),
                 default_user_agent: "Mozilla/5.0".to_owned(),
             },
-            computer_use: ComputerUseToolsConfig::default(),
+            computer_use: ComputerUseToolsConfig {
+                runtime_home_dir: std::env::temp_dir().join("pioneer-recovery-tests"),
+                ..ComputerUseToolsConfig::default()
+            },
             skills: SkillsLoopConfig {
                 enabled: true,
                 max_skills_per_source: 256,

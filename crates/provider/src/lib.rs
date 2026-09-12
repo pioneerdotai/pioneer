@@ -6,6 +6,7 @@
 //! adapters.
 
 pub mod attachments;
+pub mod catalog;
 pub mod factory;
 pub mod file_tools;
 mod http;
@@ -43,10 +44,10 @@ pub use traits::{Provider, ProviderWarmupOutcome};
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,
-    InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, ModelInputItem,
-    ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
-    ProviderResponseLimits, ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
-    ToolDefinition,
+    InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, MessageProvenance,
+    MessageSourceRef, ModelInputItem, ProviderCallIdentity, ProviderCapabilities,
+    ProviderFailureClassification, ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities,
+    ProviderReplayState, ProviderResponseLimits, ProviderResponseTooLarge, ProviderTermination,
+    ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk,
+    TokenUsage, ToolChoice, ToolDefinition,
 };

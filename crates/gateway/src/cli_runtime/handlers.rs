@@ -10218,7 +10218,7 @@ impl MessageProcessor {
         result
     }
 
-    pub(super) async fn prepare_cli_runtime_proxy_url(
+    pub(crate) async fn prepare_cli_runtime_proxy_url(
         &self,
         workspace_id: &str,
         runtime_id: &str,

@@ -339,3 +339,11 @@ cancel = "Cancel"
 save = "Save"
 dismiss = "Dismiss"
 
+
+[providers.cli.compaction]
+label = "Compaction model"
+inherit = "Use General settings"
+choose = "Choose…"
+reset = "Reset"
+save_first = "Save the CLI provider before choosing its model."
+invalid = "Choose a model and reasoning setting supported by this CLI provider."

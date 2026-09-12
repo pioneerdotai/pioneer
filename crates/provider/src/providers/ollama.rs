@@ -149,6 +149,10 @@ struct OllamaStreamChunk {
     done: bool,
     #[serde(default)]
     done_reason: Option<String>,
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 // ── Implementation ─────────────────────────────────────────────────────────
@@ -465,7 +469,11 @@ impl crate::traits::Provider for OllamaProvider {
 
             tokio::pin!(byte_stream);
 
-            while let Some(result) = byte_stream.next().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -534,7 +542,11 @@ impl crate::traits::Provider for OllamaProvider {
                                         }
                                     });
                                 if tx
-                                    .send(Ok(StreamChunk::final_chunk_with(termination)))
+                                    .send(Ok(StreamChunk::final_chunk_with(termination)
+                                        .with_usage(Some(TokenUsage {
+                                            input_tokens: chunk.prompt_eval_count,
+                                            output_tokens: chunk.eval_count,
+                                        }))))
                                     .await
                                     .is_err()
                                 {

@@ -112,6 +112,7 @@ impl ToolResultEnvelope {
         if let Some(attachment_part) = attachment_part_from_llm_context(&payload) {
             let content = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
             return ModelInputItem::message(ChatMessage {
+                provenance: None,
                 role: Role::Tool,
                 content,
                 reasoning_content: None,

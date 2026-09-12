@@ -5111,6 +5111,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     disable_tool_calling: false,
                     disable_image_input: false,
                     refresh_provider_auth: false,
+                    context_recovery_deadline_ms: None,
                     compact_history: false,
                     continue_generation: true,
                     model_override: None,
@@ -12352,6 +12353,7 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
                 disable_tool_calling: false,
                 disable_image_input: false,
                 refresh_provider_auth: false,
+                context_recovery_deadline_ms: None,
                 compact_history: false,
                 continue_generation: true,
                 model_override: None,
@@ -13645,6 +13647,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
                 disable_tool_calling: false,
                 disable_image_input: false,
                 refresh_provider_auth: false,
+                context_recovery_deadline_ms: None,
                 compact_history: false,
                 continue_generation: false,
                 model_override: None,
@@ -13744,6 +13747,7 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
                 disable_tool_calling: false,
                 disable_image_input: false,
                 refresh_provider_auth: false,
+                context_recovery_deadline_ms: None,
                 compact_history: false,
                 continue_generation: true,
                 model_override: None,
@@ -13875,6 +13879,7 @@ async fn provider_recovery_success_boundary_clears_recovery_before_later_provide
                 disable_tool_calling: false,
                 disable_image_input: false,
                 refresh_provider_auth: false,
+                context_recovery_deadline_ms: None,
                 compact_history: false,
                 continue_generation: false,
                 model_override: None,
@@ -15146,6 +15151,7 @@ async fn tool_recovery_succeeds_at_tool_attempt_boundary() {
                         disable_tool_calling: false,
                         disable_image_input: false,
                         refresh_provider_auth: false,
+                        context_recovery_deadline_ms: None,
                         compact_history: false,
                         continue_generation: false,
                         model_override: None,
@@ -15803,4 +15809,416 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
     assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
+}
+
+#[derive(Default)]
+struct RecordingContextBoundary {
+    inputs: std::sync::Mutex<Vec<(ChatRequest, Option<u64>, bool)>>,
+    after_turns: std::sync::Mutex<Vec<String>>,
+    hold_after_turn: bool,
+    live_checks: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl crate::compaction::controller::NativeContextController for RecordingContextBoundary {
+    async fn stop(&self, _: &crate::compaction::controller::NativeContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn prepare(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        mut request: ChatRequest,
+        measurement: Option<crate::compaction::controller::NativeUsageMeasurement>,
+        recovery: bool,
+    ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+        self.inputs.lock().unwrap().push((
+            request.clone(),
+            measurement.map(|value| value.input_tokens),
+            recovery,
+        ));
+        request.max_tokens = Some(4321);
+        let receipt = crate::compaction::controller::NativeInputReceipt::for_request(
+            &request,
+            &context.provider_instance,
+            "fixture-api",
+            1,
+            None,
+        )?;
+        Ok(crate::compaction::controller::NativePreparedRequest { request, receipt })
+    }
+    async fn after_turn(
+        &self,
+        context: &crate::compaction::controller::NativeContext,
+        request: ChatRequest,
+        _: Option<crate::compaction::controller::NativeUsageMeasurement>,
+    ) -> anyhow::Result<()> {
+        assert_eq!(request.max_tokens, Some(4321));
+        self.after_turns
+            .lock()
+            .unwrap()
+            .push(context.turn_id.clone());
+        if self.hold_after_turn {
+            struct Live<'a>(&'a AtomicUsize);
+            impl Drop for Live<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            self.live_checks.fetch_add(1, Ordering::SeqCst);
+            let _live = Live(&self.live_checks);
+            context.cancellation.cancelled().await;
+        }
+        Ok(())
+    }
+}
+
+struct UsageToolProvider(SequencedToolProvider);
+#[async_trait::async_trait]
+impl Provider for UsageToolProvider {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.0.capabilities()
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let mut response = self.0.chat(request).await?;
+        response.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(12345),
+            output_tokens: Some(12),
+        });
+        Ok(response)
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        let response = self.chat(request).await?;
+        Ok(
+            futures_util::stream::iter(vec![Ok(StreamChunk::final_chunk_with(
+                response.termination,
+            )
+            .with_usage(response.usage))])
+            .boxed(),
+        )
+    }
+}
+
+#[tokio::test]
+async fn compaction_boundary_prepares_chat_and_agent_without_tools_before_provider() {
+    for (index, mode) in [ThreadMode::Chat, ThreadMode::Agent]
+        .into_iter()
+        .enumerate()
+    {
+        let provider = Arc::new(CaptureStandardProvider::default());
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "capture-standard",
+                provider.clone(),
+            )),
+            test_tool_loop_config(),
+        );
+        let controller = Arc::new(RecordingContextBoundary::default());
+        manager
+            .set_context_controller(Some(controller.clone()))
+            .await;
+        let thread = format!("thr_boundary_{index}");
+        manager.ensure_thread(&thread, "ws_boundary").await.unwrap();
+        let mut events = subscribe_agent_events(&manager, &thread).await;
+        manager
+            .start_test_turn_with_default_profile_and_capabilities(
+                &thread,
+                &format!("turn_boundary_{index}"),
+                mode,
+                "test-model",
+                "capture-standard",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "answer".into(),
+                    text_elements: Vec::new(),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_turn_completed(&recv_events_until_terminal(&mut events).await);
+        let requests = provider.snapshot_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_tokens, Some(4321));
+        let calls = controller.inputs.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, None);
+        assert!(!calls[0].2);
+        assert!(
+            calls[0]
+                .0
+                .messages
+                .iter()
+                .any(|message| message.content.contains("answer"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_boundary_rechecks_after_durable_tools_and_passes_measured_input() {
+    let directory = unique_temp_dir("compaction-boundary");
+    fs::create_dir_all(&directory).unwrap();
+    let provider = Arc::new(UsageToolProvider(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "call_boundary_list".into(),
+            name: "list_dir".into(),
+            arguments: serde_json::json!({"path": directory, "depth": 0, "limit": 1}).to_string(),
+        }],
+        "final after bounded result",
+    )));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    let controller = Arc::new(RecordingContextBoundary::default());
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
+    manager
+        .ensure_thread("thr_boundary_tools", "ws_boundary_tools")
+        .await
+        .unwrap();
+    let mut events = subscribe_agent_events(&manager, "thr_boundary_tools").await;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "thr_boundary_tools",
+            "turn_boundary_tools",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "list the fixture".into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_turn_completed(&recv_events_until_terminal(&mut events).await);
+    let requests = provider.0.snapshot_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.max_tokens == Some(4321))
+    );
+    let inputs = controller.inputs.lock().unwrap();
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0].1, None);
+    assert_eq!(inputs[1].1, Some(12345));
+    let result = inputs[1]
+        .0
+        .messages
+        .iter()
+        .find(|message| message.role == pioneer_provider::Role::Tool)
+        .unwrap();
+    assert_eq!(result.tool_call_id.as_deref(), Some("call_boundary_list"));
+    assert!(result.provenance.is_some());
+    assert!(serde_json::to_string(result).unwrap().len() <= pioneer_compaction::RESULT_BYTES);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+struct PendingContextBoundary(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl crate::compaction::controller::NativeContextController for PendingContextBoundary {
+    async fn stop(&self, _: &crate::compaction::controller::NativeContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn prepare(
+        &self,
+        _: &crate::compaction::controller::NativeContext,
+        _: ChatRequest,
+        _: Option<crate::compaction::controller::NativeUsageMeasurement>,
+        _: bool,
+    ) -> anyhow::Result<crate::compaction::controller::NativePreparedRequest> {
+        struct Live(Arc<AtomicUsize>);
+        impl Drop for Live {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let _live = Live(self.0.clone());
+        std::future::pending().await
+    }
+    async fn after_turn(
+        &self,
+        _: &crate::compaction::controller::NativeContext,
+        _: ChatRequest,
+        _: Option<crate::compaction::controller::NativeUsageMeasurement>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
+    use crate::compaction::controller::{NativeContext, NativeContextSession};
+    let request = || ChatRequest {
+        model: "fixture".into(),
+        messages: vec![ChatMessage::user("request")],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let context = || NativeContext {
+        overflow_recovery: true,
+        recovery_deadline_ms: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 1000,
+        ),
+        workspace_id: "ws_fixture".into(),
+        thread_id: "thr_fixture".into(),
+        turn_id: "turn_fixture".into(),
+        conversation_thread_id: None,
+        provider_instance: "fixture".into(),
+        provider: Arc::new(CaptureStandardProvider::default()),
+        events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+    };
+    let live = Arc::new(AtomicUsize::new(0));
+    let session =
+        NativeContextSession::new(context(), Arc::new(PendingContextBoundary(live.clone())));
+    let deadline = session.provider_deadline().unwrap();
+    let result = session.prepare(request(), false).await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("deadline exceeded")
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+    assert!(tokio::time::Instant::now() >= deadline);
+
+    let session =
+        NativeContextSession::new(context(), Arc::new(PendingContextBoundary(live.clone())));
+    let preparing = session.prepare(request(), false);
+    tokio::pin!(preparing);
+    tokio::select! { biased;
+        _ = &mut preparing => panic!("fixture preparation must wait"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    session.context.cancellation.cancel();
+    assert!(
+        preparing
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cancelled")
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn compaction_post_turn_check_is_owned_and_new_input_cancels_it() {
+    let provider = Arc::new(CaptureStandardProvider::default());
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "capture-standard",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    let controller = Arc::new(RecordingContextBoundary {
+        hold_after_turn: true,
+        ..Default::default()
+    });
+    manager
+        .set_context_controller(Some(controller.clone()))
+        .await;
+    manager.ensure_thread("post-turn", "ws").await.unwrap();
+    let mut events = manager.take_durable_receiver("post-turn").await.unwrap();
+    for index in 0..2 {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.start_test_turn_with_default_profile_and_capabilities(
+                "post-turn",
+                &format!("turn-{index}"),
+                ThreadMode::Chat,
+                "test-model",
+                "capture-standard",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: format!("input-{index}"),
+                    text_elements: vec![],
+                }],
+                vec![],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        loop {
+            let event = timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let terminal = matches!(event, AgentDurableEvent::TurnCompleted { .. });
+            if terminal {
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    controller.after_turns.lock().unwrap().len(),
+                    index,
+                    "post-turn preparation must wait for durable terminal acknowledgement"
+                );
+            }
+            events.acknowledge_last(Ok(()));
+            if terminal {
+                break;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if controller.after_turns.lock().unwrap().len() == index + 1
+                    && controller.live_checks.load(Ordering::SeqCst) == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        provider.snapshot_requests().len(),
+        2,
+        "new input reached the provider once"
+    );
+    manager
+        .cancel_turn("post-turn", "turn-1", "stop context preparation")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while controller.live_checks.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

@@ -85,6 +85,15 @@ pub enum SettingsIntent {
     PreflightModel {
         selection: GatewayMemoryModelSelection,
     },
+    DefaultModel {
+        selection: GatewayModelSelection,
+    },
+    CompactionModel {
+        selection: GatewayModelSelection,
+    },
+    ContextCompaction {
+        enabled: bool,
+    },
     RemoteAccess {
         enabled: bool,
         key: Option<String>,
@@ -143,9 +152,12 @@ impl SettingsIntent {
             | Self::Refresh
             | Self::RefreshSessions
             | Self::RevokeSession { .. } => return None,
-            Self::Keepawake { .. } | Self::Telemetry { .. } | Self::PreflightModel { .. } => {
-                SettingsPage::General
-            }
+            Self::Keepawake { .. }
+            | Self::Telemetry { .. }
+            | Self::PreflightModel { .. }
+            | Self::DefaultModel { .. }
+            | Self::CompactionModel { .. }
+            | Self::ContextCompaction { .. } => SettingsPage::General,
             Self::RemoteAccess { .. } => SettingsPage::RemoteAccess,
             Self::Memory { .. }
             | Self::MemoryToggle { .. }
@@ -179,6 +191,27 @@ impl SettingsIntent {
             Self::PreflightModel { selection } => {
                 g::preflight_model_update_plan(Some(snapshot), selection.clone()).map(|p| p.update)
             }
+            Self::DefaultModel { selection } => Some(GatewaySettingsUpdate {
+                general: Some(GatewayGeneralSettingsUpdate {
+                    default_model: Some(selection.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            Self::CompactionModel { selection } => Some(GatewaySettingsUpdate {
+                general: Some(GatewayGeneralSettingsUpdate {
+                    compaction_model: Some(selection.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            Self::ContextCompaction { enabled } => Some(GatewaySettingsUpdate {
+                general: Some(GatewayGeneralSettingsUpdate {
+                    context_compaction_enabled: Some(*enabled),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             Self::RemoteAccess {
                 enabled,
                 key,
@@ -437,7 +470,8 @@ impl ClientCore {
                 .settings
                 .as_ref()
                 .filter(|_| {
-                    page != SettingsPage::SelfImprovement || store.workspace_id == workspace
+                    !matches!(page, SettingsPage::General | SettingsPage::SelfImprovement)
+                        || store.workspace_id == workspace
                 })
                 .map(|s| match page {
                     SettingsPage::General => SettingsPageValue::General {
@@ -462,7 +496,10 @@ impl ClientCore {
             self.publish_settings_value(
                 ClientScope::SettingsPage { page },
                 SettingsPagePublication {
-                    workspace_id: if page == SettingsPage::SelfImprovement {
+                    workspace_id: if matches!(
+                        page,
+                        SettingsPage::General | SettingsPage::SelfImprovement
+                    ) {
                         store.workspace_id.clone()
                     } else {
                         None
@@ -638,7 +675,7 @@ impl ClientCore {
             .lock()
             .expect("settings owner poisoned");
         let changed = runtime.demands.insert(*page, active) != Some(active);
-        if changed && *page == SettingsPage::SelfImprovement {
+        if changed && matches!(page, SettingsPage::General | SettingsPage::SelfImprovement) {
             let combined = active
                 || runtime
                     .desktop_demands
@@ -1033,7 +1070,7 @@ impl ClientCore {
             *count == 0
         };
         let active = *count > 0 || runtime.demands.get(&page) == Some(&true);
-        if page == SettingsPage::SelfImprovement {
+        if matches!(page, SettingsPage::General | SettingsPage::SelfImprovement) {
             runtime.self_poll =
                 (active && allowed).then(|| (Instant::now() + Duration::from_secs(5), epoch));
         }

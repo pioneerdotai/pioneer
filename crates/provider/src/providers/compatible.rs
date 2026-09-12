@@ -243,6 +243,8 @@ struct ApiUsage {
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
     #[serde(default)]
+    usage: Option<ApiUsage>,
+    #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
     error: Option<StreamError>,
@@ -1169,12 +1171,17 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
         tokio::spawn(async move {
             let mut decoder = IncrementalLineDecoder::default();
             let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
             let mut response_content: Option<String> = None;
             let mut response_reasoning_content: Option<String> = None;
 
             tokio::pin!(byte_stream);
 
-            while let Some(result) = byte_stream.next().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -1205,21 +1212,36 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                     };
 
                     if data.trim() == "[DONE]" {
-                        if tx
-                            .send(Err(anyhow!(
-                                "{} stream ended without a finish_reason",
-                                provider_name
-                            )))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                anyhow!("provider stream ended without a finish_reason")
+                            });
+                        let _ = tx.send(terminal).await;
                         return;
                     }
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
+                            if terminal_reason.is_some() && !resp.choices.is_empty() {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent choices after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if let Some(usage) = resp.usage {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(TokenUsage {
+                                        input_tokens: usage.prompt_tokens,
+                                        output_tokens: usage.completion_tokens,
+                                    })))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if let Some(error) = resp.error {
                                 if tx
                                     .send(Err(anyhow!(
@@ -1274,8 +1296,8 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                         &mut tool_call_accumulator,
                                         provider_name.as_str(),
                                         replay_reasoning_content,
-                                        response_content,
-                                        response_reasoning_content,
+                                        response_content.take(),
+                                        response_reasoning_content.take(),
                                         ProviderTermination::from_openai_reason(&reason),
                                     ) {
                                         Ok(chunks) => chunks,
@@ -1287,11 +1309,12 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                         }
                                     };
                                     for chunk in chunks {
-                                        if tx.send(Ok(chunk)).await.is_err() {
+                                        if chunk.is_final {
+                                            terminal_reason = chunk.termination;
+                                        } else if tx.send(Ok(chunk)).await.is_err() {
                                             return;
                                         }
                                     }
-                                    return;
                                 }
                             }
                         }
@@ -1309,15 +1332,13 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                 }
             }
 
-            let error = decoder.finish().err().unwrap_or_else(|| {
-                anyhow!(
-                    "{} stream ended before a provider terminal marker",
-                    provider_name
-                )
-            });
-            if tx.send(Err(error)).await.is_err() {
-                return;
-            }
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => terminal_reason
+                    .map(StreamChunk::final_chunk_with)
+                    .ok_or_else(|| anyhow!("provider stream ended before a terminal marker")),
+            };
+            let _ = tx.send(terminal).await;
         });
 
         let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

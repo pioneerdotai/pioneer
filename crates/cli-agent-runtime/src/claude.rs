@@ -1,5 +1,8 @@
 //! Claude CLI streaming runtime primitives.
 
+#[path = "claude_service.rs"]
+pub mod service;
+
 use crate::codex::CodexMcpSchemaTransformer;
 use crate::instructions::CLIRuntimeElevatedInstructions;
 use crate::mcp::{

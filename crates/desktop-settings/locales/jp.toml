@@ -425,3 +425,18 @@ microphone_no_device_available = "利用可能な入力マイクがありませ�
 microphone_sample_format_unsupported = "デスクトップマイクのサンプル形式 %{format} はサポートされていません。"
 microphone_no_input_stream = "デフォルトのマイクは入力ストリームを提供できません。"
 microphone_capture_failed = "マイクのキャプチャに失敗しました: %{error}"
+
+[settings.default_model]
+label = "ワークスペースの既定モデル"
+
+[settings.compaction.model]
+label = "圧縮モデル"
+
+[settings.compaction.enabled]
+label = "コンテキストの圧縮"
+description = "このワークスペースの長い会話履歴を圧縮します。"
+
+[settings.model]
+inherit = "現在のターンのモデルを使用"
+choose = "選択…"
+reset = "リセット"

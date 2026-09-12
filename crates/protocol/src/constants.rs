@@ -45,6 +45,7 @@ pub mod methods {
     pub const THREAD_AGENTS_DOC_SAVE: &str = "thread/agents_doc/save";
     pub const THREAD_AGENTS_DOC_ARCHIVE: &str = "thread/agents_doc/archive";
     pub const THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD: &str = "thread/agents_doc/resolve_for_thread";
+    pub const THREADS_TOOLS_RESULT_READ: &str = "threads/tools/result/read";
     pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_TIMELINE_PAGE: &str = "thread/timeline/page";
     pub const THREAD_PATCH_STEPS_PAGE: &str = "thread/patch_steps/page";
@@ -203,6 +204,7 @@ pub mod methods {
         THREAD_AGENTS_DOC_ARCHIVE,
         THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
         THREAD_GET,
+        THREADS_TOOLS_RESULT_READ,
         THREAD_TIMELINE_PAGE,
         THREAD_FILE_VIEW_GRANT_CREATE,
         THREAD_PATCH_STEPS_PAGE,

@@ -16,6 +16,7 @@ pub mod claude_mcp_conformance;
 pub mod cli_mcp_client_validation;
 mod cli_runtime;
 pub mod codex_mcp_conformance;
+pub(crate) mod compaction;
 mod database;
 mod epic5_observability;
 mod helpers;
@@ -101,8 +102,8 @@ use crate::database::initialize_with_startup as initialize_database;
 use crate::identity::bootstrap_identity;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::memory_runtime::GatewayMemoryRuntime;
+use crate::message::SummaryConfig;
 use crate::message::now_timestamp_secs;
-use crate::message::{ContextBudget, SummaryConfig};
 use crate::message::{MessageProcessor, MessageProcessorResilienceConfig};
 use crate::secrets::GatewaySecrets;
 use crate::self_improvement::supervisor::SelfImprovementSupervisor;
@@ -481,11 +482,6 @@ async fn run_gateway_until_shutdown_inner(
         title_model_provider: config.gateway.thread.title_model_provider.clone(),
     };
 
-    let context_budget = ContextBudget {
-        max_context_tokens: config.gateway.thread.max_context_tokens,
-        response_reserve_tokens: config.gateway.thread.response_reserve_tokens,
-    };
-
     let web_cfg = &config.gateway.tools.web;
     let computer_use_cfg = &config.gateway.tools.computer_use;
     let tool_retry_cfg = &config.gateway.tools.retry;
@@ -768,7 +764,6 @@ async fn run_gateway_until_shutdown_inner(
         crud_store.clone(),
         gateway_secrets.clone(),
         summary_config,
-        context_budget,
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
@@ -785,6 +780,7 @@ async fn run_gateway_until_shutdown_inner(
     )
     .with_cli_mcp_limits(cli_mcp_limits)
     .with_invitation_gateway_base_url(invitation_gateway_base_url);
+    message_processor.apply_workspace_model_settings(&gateway_settings)?;
     let cli_runtime_manager = build_cli_runtime_manager(
         &runtime_home,
         &config,
@@ -806,6 +802,7 @@ async fn run_gateway_until_shutdown_inner(
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
+    message_processor.bind_context_compaction().await;
     message_processor
         .initialize_authorization_generation()
         .await
@@ -887,6 +884,15 @@ async fn run_gateway_until_shutdown_inner(
             post_startup = Some(post_startup::PostStartupSupervisor::start(
                 move |scope| async move {
                     let cancellation = scope.cancellation();
+                    let catalog_directory = post_runtime_home.join("providers").join("models");
+                    let catalog_cancellation = cancellation.clone();
+                    scope.spawn(async move {
+                        pioneer_provider::catalog::runtime::run_catalog_updates(
+                            catalog_directory,
+                            catalog_cancellation,
+                        )
+                        .await;
+                    });
                     // Resilience owns an independent, joined retry loop. A
                     // persistent repair/runtime failure must be visible in
                     // readiness, but must not head-of-line block unrelated
@@ -1972,4 +1978,13 @@ mod runtime_tests {
                 .contains("invalid trust level `supertrusted`")
         );
     }
+}
+
+/// Unit-test configuration is the embedded baseline only. The copied local.toml
+/// and the user's configuration/environment must not supply test credentials.
+#[cfg(test)]
+pub(crate) fn isolated_test_app_config() -> anyhow::Result<pioneer_config::AppConfig> {
+    Ok(toml::from_str(include_str!(
+        "../../../config/default.toml"
+    ))?)
 }

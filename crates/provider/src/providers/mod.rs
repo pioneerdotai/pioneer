@@ -31,3 +31,6 @@ pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;
 pub use telnyx::TelnyxProvider;
+
+#[cfg(test)]
+mod usage_tests;

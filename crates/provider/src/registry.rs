@@ -185,6 +185,18 @@ impl Provider for AuthorityBoundProvider {
         self.inner.classify_failure(error)
     }
 
+    async fn prepare_input_budget(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::attachments::PreparedInputBudget> {
+        self.ensure_not_revoked()?;
+        crate::attachments::runtime::with_async_authority_scope(
+            self.authority_fingerprint.as_str().to_owned(),
+            self.inner.prepare_input_budget(request),
+        )
+        .await
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
         crate::attachments::runtime::with_async_authority_scope(
@@ -208,7 +220,10 @@ impl Provider for AuthorityBoundProvider {
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
-        self.inner.list_models().await
+        let catalog = crate::catalog::model_catalog()?;
+        let mut models = self.inner.list_models().await?;
+        catalog.enrich(self.inner.name(), &mut models);
+        Ok(models)
     }
 
     async fn list_embedding_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -847,6 +862,15 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn discovery_requires_loaded_catalog_but_direct_chat_does_not() {
+        let registry = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
+        let provider = registry.get_or_create("echo").unwrap();
+        let error = provider.list_models().await.unwrap_err();
+        assert!(error.to_string().contains("Model catalog is not loaded"));
+        assert!(provider.chat(chat_request()).await.is_ok());
+    }
+
     #[test]
     fn registry_configuration_is_hard_bounded() {
         let limits = ProviderRegistryLimits {
@@ -1160,6 +1184,23 @@ mod tests {
             .expect_err("future calls through an explicitly revoked Arc must fail");
         assert!(revoked.downcast_ref::<ProviderAuthorityRevoked>().is_some());
         assert_eq!(revoked.to_string(), "provider authority has been revoked");
+        let mut media_request = chat_request();
+        media_request.messages[0]
+            .content_parts
+            .push(crate::MessageContentPart::image(
+                crate::MessageAttachment::from_path("/missing-revoked-media.png", "image/png"),
+            ));
+        let budget_error = workspace_a
+            .prepare_input_budget(media_request)
+            .await
+            .err()
+            .expect("revocation must precede materialization and filesystem access");
+        assert!(
+            budget_error
+                .downcast_ref::<ProviderAuthorityRevoked>()
+                .is_some()
+        );
+
         assert!(
             !revoked
                 .to_string()

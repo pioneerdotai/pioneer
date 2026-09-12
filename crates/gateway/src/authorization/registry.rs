@@ -397,6 +397,13 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Read,
     ),
     method_entry(THREAD_GET, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREADS_TOOLS_RESULT_READ,
+        ThreadRead,
+        Thread,
+        NotFound,
+        Read,
+    ),
     method_entry(THREAD_TIMELINE_PAGE, ThreadRead, Thread, NotFound, Read),
     method_entry(
         THREAD_FILE_VIEW_GRANT_CREATE,
@@ -1092,7 +1099,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 151);
+        assert_eq!(registry.len(), 152);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());

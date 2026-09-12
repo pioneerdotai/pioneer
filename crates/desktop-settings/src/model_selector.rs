@@ -53,16 +53,116 @@ pub(crate) struct ModelSelectorDialogOptions {
     pub(crate) on_save: ModelSelectorSaveCallback,
 }
 
+/// Existing model dialog shared through Desktop's composition ports.
+/// The caller owns persistence; this dialog owns only the catalog selection.
+pub struct SharedModelSelectorOptions {
+    title: String,
+    workspace_id: String,
+    client: std::sync::Arc<pioneer_client::core::ClientCore>,
+    bindings: std::sync::Arc<dyn pioneer_desktop_foundation::ClientBindingRegistrar>,
+    selection: ModelSelectorSelection,
+    mode: ProviderModelSelectorMode,
+    fixed_provider: bool,
+    on_save: Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>,
+    on_refresh: Rc<dyn Fn(&mut App)>,
+}
+impl SharedModelSelectorOptions {
+    pub fn new(
+        title: String,
+        workspace_id: String,
+        client: std::sync::Arc<pioneer_client::core::ClientCore>,
+        bindings: std::sync::Arc<dyn pioneer_desktop_foundation::ClientBindingRegistrar>,
+        on_save: Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>,
+    ) -> Self {
+        Self {
+            title,
+            workspace_id,
+            client,
+            bindings,
+            on_save,
+            selection: ModelSelectorSelection::default(),
+            mode: ProviderModelSelectorMode::Chat,
+            fixed_provider: false,
+            on_refresh: Rc::new(|_| {}),
+        }
+    }
+    pub fn selection(mut self, selection: ModelSelectorSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+    pub fn mode(mut self, mode: ProviderModelSelectorMode) -> Self {
+        self.mode = mode;
+        self
+    }
+    pub fn fixed_provider(mut self) -> Self {
+        self.fixed_provider = true;
+        self
+    }
+    pub fn on_refresh(mut self, callback: Rc<dyn Fn(&mut App)>) -> Self {
+        self.on_refresh = callback;
+        self
+    }
+}
+
+pub fn open_shared_model_selector(
+    options: SharedModelSelectorOptions,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    ModelSelectorDialog::open(options, window, cx);
+}
+
+impl SettingsScreenView {
+    pub(crate) fn open_model_selector_dialog(
+        &mut self,
+        options: ModelSelectorDialogOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let save_owner = cx.weak_entity();
+        let refresh_owner = save_owner.clone();
+        let on_save = options.on_save;
+        let shared = SharedModelSelectorOptions::new(
+            options.title,
+            options.workspace_id,
+            options.client,
+            self.config.bindings.clone(),
+            Rc::new(move |selection, cx| {
+                save_owner
+                    .update(cx, |view, cx| {
+                        let saved = on_save(view, selection, cx);
+                        cx.notify();
+                        saved
+                    })
+                    .unwrap_or(false)
+            }),
+        )
+        .selection(ModelSelectorSelection {
+            provider: options.selected_provider,
+            model: options.selected_model,
+            selected_reasoning_effort: options.selected_reasoning_effort,
+        })
+        .mode(options.mode)
+        .on_refresh(Rc::new(move |cx| {
+            let _ = refresh_owner.update(cx, |_, cx| cx.notify());
+        }));
+        open_shared_model_selector(shared, window, cx);
+    }
+}
+
+struct ModelSelectorDialog;
+
 #[derive(Clone)]
 struct ModelSelectorDialogState {
     title: String,
-    desktop_entity: WeakEntity<SettingsScreenView>,
+    on_refresh: Rc<dyn Fn(&mut App)>,
+    fixed_provider: Option<String>,
     owner: Entity<ModelSelectorOwner>,
     closed: Rc<Cell<bool>>,
     client: std::sync::Arc<pioneer_client::core::ClientCore>,
     picker_id: String,
     generation: u64,
-    on_save: ModelSelectorSaveCallback,
+    on_save: Rc<dyn Fn(ModelSelectorSelection, &mut App) -> bool>,
     value: Rc<RefCell<std::sync::Arc<SettingsModelPickerPublication>>>,
     mode: ProviderModelSelectorMode,
     provider_search_input: Entity<InputState>,
@@ -285,27 +385,24 @@ impl RenderOnce for SelectorPopoverTrigger {
     }
 }
 
-impl SettingsScreenView {
-    pub(crate) fn open_model_selector_dialog(
-        &mut self,
-        options: ModelSelectorDialogOptions,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let desktop_entity = cx.weak_entity();
-
-        let picker_id = format!("settings-model-selector:{}", cx.entity().entity_id());
+impl ModelSelectorDialog {
+    fn open(options: SharedModelSelectorOptions, window: &mut Window, cx: &mut App) {
+        static NEXT_PICKER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_PICKER
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .expect("model picker identity exhausted");
+        let picker_id = format!("model-selector:{id}");
         options
             .client
             .settings_model_picker_intent(SettingsModelPickerIntent::Open {
                 picker_id: picker_id.clone(),
                 workspace_id: options.workspace_id.clone(),
                 mode: options.mode,
-                selection: ModelSelectorSelection {
-                    provider: options.selected_provider.clone(),
-                    model: options.selected_model.clone(),
-                    selected_reasoning_effort: options.selected_reasoning_effort.clone(),
-                },
+                selection: options.selection.clone(),
             });
         let Some(publication) = options
             .client
@@ -318,7 +415,7 @@ impl SettingsScreenView {
         let value = Rc::new(RefCell::new(publication));
         let owner = ModelSelectorOwner::new(
             &options.client,
-            &self.config.bindings,
+            &options.bindings,
             value.clone(),
             window,
             cx,
@@ -342,7 +439,11 @@ impl SettingsScreenView {
             closed: owner.read(cx).closed.clone(),
             owner,
             title: options.title,
-            desktop_entity,
+            on_refresh: options.on_refresh,
+            fixed_provider: options
+                .fixed_provider
+                .then(|| options.selection.provider.clone())
+                .flatten(),
             client: options.client,
             picker_id,
             generation,
@@ -364,7 +465,7 @@ impl SettingsScreenView {
 
     fn show_model_selector_dialog(
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
         state: ModelSelectorDialogState,
     ) {
         window.open_dialog(cx, move |dialog, _window, _cx| {
@@ -421,16 +522,23 @@ impl SettingsScreenView {
                     ]
                 }))
                 .child(v_flex().w_full().pt_4().pb_5().child({
-                    let form = v_form()
-                        .child(Self::render_provider_selector_section(
+                    let form = if state.fixed_provider.is_some() {
+                        v_form().child(
+                            field()
+                                .label(t!("chat.composer.model.provider_label").to_string())
+                                .child(div().text_sm().child(provider_trigger_label)),
+                        )
+                    } else {
+                        v_form().child(Self::render_provider_selector_section(
                             state.clone(),
                             provider_trigger_label,
                         ))
-                        .child(Self::render_model_selector_section(
-                            state.clone(),
-                            model_trigger_label,
-                            model_trigger_loading,
-                        ));
+                    };
+                    let form = form.child(Self::render_model_selector_section(
+                        state.clone(),
+                        model_trigger_label,
+                        model_trigger_loading,
+                    ));
 
                     if let Some(reasoning_section) =
                         Self::render_reasoning_effort_selector_section(state.clone())
@@ -453,14 +561,14 @@ impl SettingsScreenView {
             else {
                 return false;
             };
-            state
-                .desktop_entity
-                .update(cx, |view, cx| {
-                    let saved = (state.on_save)(view, selection, cx);
-                    cx.notify();
-                    saved
-                })
-                .unwrap_or(false)
+            if state
+                .fixed_provider
+                .as_ref()
+                .is_some_and(|expected| selection.provider.as_ref() != Some(expected))
+            {
+                return false;
+            }
+            (state.on_save)(selection, cx)
         })
     }
 
@@ -537,7 +645,7 @@ impl SettingsScreenView {
         provider_trigger_label: String,
     ) -> Field {
         let provider_trigger_width_px = state.provider_trigger_width_px.clone();
-        let desktop_entity = state.desktop_entity.clone();
+        let refresh = state.on_refresh.clone();
         field()
             .label(t!("chat.composer.model.provider_label").to_string())
             .child(
@@ -564,9 +672,7 @@ impl SettingsScreenView {
                                 let mut cached_width = provider_trigger_width_px.borrow_mut();
                                 if (measured_width - *cached_width).abs() > 1.0 {
                                     *cached_width = measured_width;
-                                    let _ = desktop_entity.update(cx, |_view, cx| {
-                                        cx.notify();
-                                    });
+                                    refresh(cx);
                                 }
                             },
                             |_, _, _, _| {},
@@ -731,7 +837,7 @@ impl SettingsScreenView {
         model_trigger_loading: bool,
     ) -> Field {
         let model_trigger_width_px = state.model_trigger_width_px.clone();
-        let desktop_entity = state.desktop_entity.clone();
+        let refresh = state.on_refresh.clone();
         field()
             .label(t!("chat.composer.model.model_label").to_string())
             .child(
@@ -765,9 +871,7 @@ impl SettingsScreenView {
                                 let mut cached_width = model_trigger_width_px.borrow_mut();
                                 if (measured_width - *cached_width).abs() > 1.0 {
                                     *cached_width = measured_width;
-                                    let _ = desktop_entity.update(cx, |_view, cx| {
-                                        cx.notify();
-                                    });
+                                    refresh(cx);
                                 }
                             },
                             |_, _, _, _| {},
@@ -785,7 +889,7 @@ impl SettingsScreenView {
         }
 
         let reasoning_trigger_width_px = state.reasoning_trigger_width_px.clone();
-        let desktop_entity = state.desktop_entity.clone();
+        let refresh = state.on_refresh.clone();
         let trigger_label = Self::reasoning_effort_trigger_label(rows.as_slice());
 
         Some(
@@ -818,9 +922,7 @@ impl SettingsScreenView {
                                     let mut cached_width = reasoning_trigger_width_px.borrow_mut();
                                     if (measured_width - *cached_width).abs() > 1.0 {
                                         *cached_width = measured_width;
-                                        let _ = desktop_entity.update(cx, |_view, cx| {
-                                            cx.notify();
-                                        });
+                                        refresh(cx);
                                     }
                                 },
                                 |_, _, _, _| {},

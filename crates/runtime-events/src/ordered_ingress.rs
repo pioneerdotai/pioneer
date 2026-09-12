@@ -114,6 +114,15 @@ impl<T: OrderedIngressEvent> Clone for OrderedEventIngress<T> {
 
 impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
     pub fn spawn(output_tx: mpsc::Sender<T>, config: OrderedIngressConfig) -> Self {
+        Self::spawn_owned(output_tx, config).0
+    }
+
+    /// Return the worker to callers whose short-lived transport must join all
+    /// of its resources before starting another service attempt.
+    pub fn spawn_owned(
+        output_tx: mpsc::Sender<T>,
+        config: OrderedIngressConfig,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let ingress = Self {
             inner: Arc::new(OrderedIngressInner {
                 state: StdMutex::new(OrderedIngressState::default()),
@@ -124,8 +133,8 @@ impl<T: OrderedIngressEvent> OrderedEventIngress<T> {
                 config,
             }),
         };
-        tokio::spawn(run_ordered_ingress(ingress.clone(), output_tx));
-        ingress
+        let worker = tokio::spawn(run_ordered_ingress(ingress.clone(), output_tx));
+        (ingress, worker)
     }
 
     pub async fn offer(&self, event: T) -> OrderedIngressOffer<T> {

@@ -3,7 +3,7 @@
 use crate::settings::gateway::GatewaySettingsUpdatePlan;
 use pioneer_protocol::{
     CLIAgentRuntimeKind, GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings,
-    GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewayModelSelection, GatewaySettingsSnapshot, GatewaySettingsUpdate, ModelSelectionTransport,
 };
 use std::collections::HashSet;
 
@@ -40,6 +40,9 @@ pub struct CLIRuntimeProviderDraft {
     pub binary_path: String,
     pub home_path: String,
     pub shadow_home_path: String,
+    /// Whole override; Inherit explicitly clears it instead of persisting fallback.
+    #[serde(default)]
+    pub compaction_model: GatewayModelSelection,
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -55,6 +58,7 @@ pub enum CLIRuntimeProviderSettingsRejection {
     InvalidPath { field: String, message: String },
     ShadowHomeMatchesHome,
     UnsupportedKind { kind: CLIAgentRuntimeKind },
+    InvalidCompactionModel { message: String },
 }
 
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
@@ -81,6 +85,7 @@ impl CLIRuntimeProviderDraft {
             binary_path: defaults.binary_path.to_owned(),
             home_path: defaults.home_path.to_owned(),
             shadow_home_path: String::new(),
+            compaction_model: GatewayModelSelection::Inherit,
         }
     }
 
@@ -101,6 +106,7 @@ impl CLIRuntimeProviderDraft {
             binary_path: instance.binary_path.clone(),
             home_path: instance.home_path.clone(),
             shadow_home_path: instance.shadow_home_path.clone().unwrap_or_default(),
+            compaction_model: instance.compaction_model.clone().unwrap_or_default(),
         }
     }
 
@@ -129,6 +135,7 @@ impl CLIRuntimeProviderDraft {
             binary_path: instance.binary_path.clone(),
             home_path: instance.home_path.clone(),
             shadow_home_path: instance.shadow_home_path.clone().unwrap_or_default(),
+            compaction_model: instance.compaction_model.clone().unwrap_or_default(),
         }
     }
 
@@ -230,6 +237,7 @@ pub fn cli_runtime_provider_settings_rejection_message(
         CLIRuntimeProviderSettingsRejection::ShadowHomeMatchesHome => {
             "Shadow home must differ from home".to_owned()
         }
+        CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { message } => message.clone(),
         CLIRuntimeProviderSettingsRejection::UnsupportedKind { kind } => {
             format!("CLI provider kind cannot be changed from `{kind:?}` while editing")
         }
@@ -313,7 +321,42 @@ fn cli_runtime_provider_instance_from_draft(
         draft.nickname.trim().to_owned()
     };
 
+    let mut compaction_model = draft
+        .compaction_model
+        .clone()
+        .normalized()
+        .map_err(
+            |message| CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { message },
+        )?;
+    if let GatewayModelSelection::Explicit {
+        transport,
+        instance,
+        ..
+    } = &mut compaction_model
+    {
+        let expected_transport = match draft.kind {
+            CLIAgentRuntimeKind::Codex => ModelSelectionTransport::Codex,
+            CLIAgentRuntimeKind::Claude => ModelSelectionTransport::Claude,
+        };
+        let original = match &draft.mode {
+            CLIRuntimeProviderDraftMode::Edit { original_id } => original_id.as_str(),
+            CLIRuntimeProviderDraftMode::Duplicate { source_id } => source_id.as_str(),
+            CLIRuntimeProviderDraftMode::Create => id.as_str(),
+        };
+        if *transport != expected_transport || (instance != original && instance != &id) {
+            return Err(
+                CLIRuntimeProviderSettingsRejection::InvalidCompactionModel {
+                    message: "Compaction model must belong to this CLI provider".to_owned(),
+                },
+            );
+        }
+        // Editing an ID or duplicating its configuration carries the same model
+        // and effort into that instance; it never resolves a fallback model.
+        *instance = id.clone();
+    }
+
     Ok(GatewayCliRuntimeInstanceSettings {
+        compaction_model: Some(compaction_model),
         id,
         kind: draft.kind,
         display_name,
@@ -619,6 +662,7 @@ mod tests {
 
     fn codex_instance(id: &str, display_name: &str) -> GatewayCliRuntimeInstanceSettings {
         GatewayCliRuntimeInstanceSettings {
+            compaction_model: None,
             id: id.to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
             display_name: display_name.to_owned(),
@@ -627,6 +671,83 @@ mod tests {
             binary_path: "codex".to_owned(),
             home_path: "~/.codex".to_owned(),
             shadow_home_path: None,
+        }
+    }
+
+    #[test]
+    fn compaction_override_edit_duplicate_rename_and_reset_preserve_whole_selection() {
+        for (kind, transport) in [
+            (CLIAgentRuntimeKind::Codex, ModelSelectionTransport::Codex),
+            (CLIAgentRuntimeKind::Claude, ModelSelectionTransport::Claude),
+        ] {
+            let mut original = codex_instance("owned", "Owned CLI");
+            original.kind = kind;
+            original.compaction_model = Some(GatewayModelSelection::Explicit {
+                transport,
+                instance: original.id.clone(),
+                model: "chosen-model".into(),
+                reasoning_effort: Some("high".into()),
+            });
+            let current = snapshot(vec![original.clone()]);
+            let mut edited = CLIRuntimeProviderDraft::edit(&original);
+            assert_eq!(
+                cli_runtime_provider_instance_from_draft(&edited)
+                    .unwrap()
+                    .compaction_model,
+                original.compaction_model
+            );
+            let copied = CLIRuntimeProviderDraft::duplicate(Some(&current), &original);
+            for draft in [&copied, {
+                edited.id = "renamed".into();
+                &edited
+            }] {
+                let instance = cli_runtime_provider_instance_from_draft(draft).unwrap();
+                assert_eq!(
+                    instance.compaction_model,
+                    Some(GatewayModelSelection::Explicit {
+                        transport,
+                        instance: instance.id.clone(),
+                        model: "chosen-model".into(),
+                        reasoning_effort: Some("high".into()),
+                    })
+                );
+            }
+            edited.compaction_model = GatewayModelSelection::Inherit;
+            let CLIRuntimeProviderSettingsPlan::Send(plan) =
+                plan_cli_runtime_provider_draft_update(Some(&current), &edited)
+            else {
+                panic!("reset must produce an update")
+            };
+            let wire = serde_json::to_value(plan.update).unwrap();
+            assert_eq!(
+                wire["cli_runtimes"]["instances"][0]["compaction_model"]["source"],
+                "inherit"
+            );
+            assert_eq!(plan.snapshot.self_improvement, current.self_improvement);
+            assert_eq!(plan.snapshot.general, current.general);
+        }
+    }
+
+    #[test]
+    fn compaction_override_rejects_api_foreign_instance_and_invalid_effort() {
+        let original = codex_instance("owned", "Owned CLI");
+        for (transport, instance, effort) in [
+            (ModelSelectionTransport::Api, "owned", "high"),
+            (ModelSelectionTransport::Claude, "owned", "high"),
+            (ModelSelectionTransport::Codex, "other", "high"),
+            (ModelSelectionTransport::Codex, "owned", "invented"),
+        ] {
+            let mut draft = CLIRuntimeProviderDraft::edit(&original);
+            draft.compaction_model = GatewayModelSelection::Explicit {
+                transport,
+                instance: instance.into(),
+                model: "chosen-model".into(),
+                reasoning_effort: Some(effort.into()),
+            };
+            assert!(matches!(
+                cli_runtime_provider_instance_from_draft(&draft),
+                Err(CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { .. })
+            ));
         }
     }
 

@@ -1,3 +1,4 @@
+mod m20260910_000001_context_compaction;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -132,6 +133,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260906_000001_self_improvement_reasoning::Migration),
             Box::new(m20260906_000002_self_improvement_history_backfill::Migration),
             Box::new(m20260906_000003_projection_receipt_cleanup::Migration),
+            Box::new(m20260910_000001_context_compaction::Migration),
         ]
     }
 }

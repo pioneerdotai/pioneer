@@ -494,28 +494,24 @@ impl MessageProcessor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn task_create_context_for_params(
         &self,
         params: &TaskCreateParams,
     ) -> anyhow::Result<pioneer_tasks::TaskCreateContext> {
+        self.task_create_context_for_destination(params, None, None)
+            .await
+    }
+
+    pub(crate) async fn task_create_context_for_destination(
+        &self,
+        params: &TaskCreateParams,
+        accepted_destination: Option<&str>,
+        principal: Option<&crate::auth::AuthenticatedSessionPrincipal>,
+    ) -> anyhow::Result<pioneer_tasks::TaskCreateContext> {
         if params.trigger.spec.kind() != pioneer_protocol::TaskTriggerKind::Immediate {
             return Ok(pioneer_tasks::TaskCreateContext::default());
         }
-        let attachment = params
-            .lifecycle_policy
-            .as_ref()
-            .map(|policy| policy.attachment)
-            .unwrap_or_else(|| {
-                if params.created_by_turn_id.is_some() {
-                    pioneer_protocol::TaskAttachmentMode::Attached
-                } else {
-                    pioneer_protocol::TaskAttachmentMode::Detached
-                }
-            });
-        if attachment != pioneer_protocol::TaskAttachmentMode::Detached {
-            return Ok(pioneer_tasks::TaskCreateContext::default());
-        }
-
         // Keep snapshot identity identical to the executor's restoration rule:
         // Composer work is sourced by its replayed launch turn, while ordinary
         // Tasks fall back to the turn that created them.
@@ -525,25 +521,22 @@ impl MessageProcessor {
             .and_then(|metadata| metadata.composer_work.as_ref())
             .map(|composer_work| composer_work.launch.turn_id.as_str())
             .or(params.created_by_turn_id.as_deref());
-        let Some(source_turn_id) = source_turn_id else {
-            // An immediate detached Task without a creator turn is frozen by
-            // the executor at run admission, where the run identity exists.
-            return Ok(pioneer_tasks::TaskCreateContext::default());
-        };
-        let conversation_thread_id = params
-            .created_by_thread_id
-            .clone()
+        let conversation_thread_id = accepted_destination
+            .map(str::to_owned)
+            .or_else(|| params.created_by_thread_id.clone())
             .or_else(|| {
                 (params.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
                     .then(|| params.owner_id.clone())
                     .flatten()
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "immediate detached Task `{}` has no conversation thread to snapshot",
-                    params.title
-                )
-            })?;
+            });
+        let Some(conversation_thread_id) = conversation_thread_id else {
+            anyhow::ensure!(
+                source_turn_id.is_none(),
+                "Task creator turn has no conversation thread"
+            );
+            // Workspace-owned Tasks acquire their execution root at admission.
+            return Ok(pioneer_tasks::TaskCreateContext::default());
+        };
         let thread = self
             .crud_store
             .get_thread_by_id(conversation_thread_id.as_str())
@@ -558,34 +551,46 @@ impl MessageProcessor {
                 "Task conversation thread `{conversation_thread_id}` belongs to another workspace"
             );
         }
-        let fallback_model = params
+        let composer = params
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.composer_work.as_ref());
+        let default_policy = crate::compaction::frozen::default_task_context_policy();
+        let policy = params
             .agent_spec
             .as_ref()
-            .and_then(|spec| spec.model.as_deref())
-            .unwrap_or(thread.model.as_str());
-        let fallback_model_provider = params
-            .agent_spec
-            .as_ref()
-            .and_then(|spec| spec.model_provider.as_deref())
-            .unwrap_or(thread.model_provider.as_str());
-        let history = self
-            .load_conversation_history_for_workspace_in_execution_excluding_turn(
+            .and_then(|spec| spec.context_policy.as_ref())
+            .unwrap_or(&default_policy);
+        let history_json = if let Some(principal) = principal {
+            self.capture_authorized_task_basis(
+                principal,
                 params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),
+                source_turn_id,
+                composer.map(|work| work.launch.turn_id.as_str()),
+                composer.is_none().then_some(policy),
+            )
+            .await
+        } else {
+            // Unauthenticated fixture construction has no authority to adopt
+            // foreign Task output. Product callers supply their current actor.
+            crate::compaction::frozen::capture_execution_basis_json(
+                self.crud_store.as_ref(),
+                params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),
                 source_turn_id,
-                Some(source_turn_id),
-                Some(fallback_model),
-                Some(fallback_model_provider),
+                composer.map(|work| work.launch.turn_id.as_str()),
+                composer.is_none().then_some(policy),
             )
-            .await;
+            .await
+        }
+        .context("failed to freeze Task conversation sources")?;
 
         Ok(pioneer_tasks::TaskCreateContext {
             conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
                 conversation_thread_id,
-                source_turn_id: Some(source_turn_id.to_owned()),
-                history_json: serde_json::to_string(&history)
-                    .context("failed to serialize detached Task conversation snapshot")?,
+                source_turn_id: source_turn_id.map(str::to_owned),
+                history_json,
             }),
             ..Default::default()
         })
@@ -1040,7 +1045,10 @@ impl MessageProcessor {
                     .expect("admitted Task role must have a Task resource budget"),
             });
         }
-        let mut context = match self.task_create_context_for_params(&params).await {
+        let mut context = match self
+            .task_create_context_for_destination(&params, None, Some(request_context.principal()))
+            .await
+        {
             Ok(context) => context,
             Err(error) => {
                 self.send_error(

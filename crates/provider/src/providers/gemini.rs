@@ -788,7 +788,11 @@ impl crate::traits::Provider for GeminiProvider {
 
             tokio::pin!(byte_stream);
 
-            while let Some(result) = byte_stream.next().await {
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -820,6 +824,11 @@ impl crate::traits::Provider for GeminiProvider {
 
                     match serde_json::from_str::<ApiGenerateResponse>(data) {
                         Ok(resp) => {
+                            if let Some(usage) = Self::extract_usage(&resp) {
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                    return;
+                                }
+                            }
                             if let Some(state) = Self::extract_provider_replay_state(&resp) {
                                 provider_replay_state = Some(state);
                             }
@@ -1023,6 +1032,18 @@ fn canonical_gemini_thinking_level(level: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_prompt_includes_cached_content_once() {
+        let response: super::ApiGenerateResponse = serde_json::from_value(serde_json::json!({
+            "candidates":[], "usageMetadata": {"promptTokenCount":140,
+                "cachedContentTokenCount":100,"candidatesTokenCount":9}
+        }))
+        .unwrap();
+        let usage = super::GeminiProvider::extract_usage(&response).unwrap();
+        assert_eq!(usage.input_tokens, Some(140));
+        assert_eq!(usage.output_tokens, Some(9));
+    }
+
     use super::*;
     use crate::traits::Provider;
     use crate::types::{ChatMessage, CompiledPromptPayload, ReasoningConfig, ReasoningEffort};

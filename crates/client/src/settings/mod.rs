@@ -11,3 +11,5 @@ pub mod runtime;
 pub mod types;
 
 pub mod model_picker;
+
+pub mod models;

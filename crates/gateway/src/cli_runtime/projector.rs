@@ -625,7 +625,7 @@ fn completed_turn_item(completed: &RuntimeItemCompleted) -> TurnItem {
     )
 }
 
-fn context_compaction_item(
+pub(crate) fn context_compaction_item(
     item_id: &str,
     level: SystemEventLevel,
     message: &str,

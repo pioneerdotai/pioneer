@@ -828,6 +828,79 @@ fn agent_compaction_system_event_projects_to_completed_timeline_row() {
 }
 
 #[test]
+fn compaction_lifecycle_live_updates_and_reconnect_keep_one_terminal_row() {
+    for (terminal, expected) in [
+        ("completed", TimelineEntryStatus::Completed),
+        ("failed", TimelineEntryStatus::Failed),
+        ("cancelled", TimelineEntryStatus::Cancelled),
+    ] {
+        let item = |status: &str| TurnItem::SystemEvent {
+            id: "compaction:stable".into(),
+            level: SystemEventLevel::Info,
+            message: format!("Context {status}"),
+            code: Some("agent_context_compaction".into()),
+            details: Some(serde_json::json!({"status":status,"attempts":2})),
+        };
+        let mut live = Conversation::new(THREAD_ID);
+        live.apply(ConversationEvent::ItemStarted {
+            thread_id: THREAD_ID.into(),
+            turn_id: TURN_ID.into(),
+            item: item("started"),
+        });
+        live.apply(ConversationEvent::ItemUpdated {
+            thread_id: THREAD_ID.into(),
+            turn_id: TURN_ID.into(),
+            item: item("started"),
+        });
+        assert_eq!(
+            live.projection().items[0].status,
+            TimelineEntryStatus::Running
+        );
+        for _ in 0..2 {
+            live.apply(ConversationEvent::ItemCompleted {
+                thread_id: THREAD_ID.into(),
+                turn_id: TURN_ID.into(),
+                item: item(terminal),
+            });
+        }
+        assert_eq!(live.projection().timeline.len(), 1);
+        assert_eq!(live.projection().items[0].status, expected);
+        let history = [
+            ThreadHistoryEvent {
+                turn_id: TURN_ID.into(),
+                sequence: 1,
+                created_at: 1000,
+                payload: ThreadHistoryEventPayload::ItemStarted {
+                    workspace_id: WORKSPACE_ID.into(),
+                    thread_id: THREAD_ID.into(),
+                    turn_id: TURN_ID.into(),
+                    item: item("started"),
+                },
+            },
+            ThreadHistoryEvent {
+                turn_id: TURN_ID.into(),
+                sequence: 2,
+                created_at: 2000,
+                payload: ThreadHistoryEventPayload::ItemCompleted {
+                    workspace_id: WORKSPACE_ID.into(),
+                    thread_id: THREAD_ID.into(),
+                    turn_id: TURN_ID.into(),
+                    item: item(terminal),
+                },
+            },
+        ];
+        let mut restored = Conversation::new(THREAD_ID);
+        restored.hydrate_history(&history);
+        assert_eq!(restored.projection().timeline.len(), 1);
+        assert_eq!(restored.projection().items[0].status, expected);
+        assert_eq!(
+            restored.projection().items[0].item.item_id(),
+            "compaction:stable"
+        );
+    }
+}
+
+#[test]
 fn local_turn_start_projects_optimistic_user_message_with_artifacts() {
     let mut conversation = Conversation::new(THREAD_ID);
     let artifact = ArtifactRef {

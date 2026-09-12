@@ -1047,12 +1047,30 @@ impl TaskProjector {
                 handle_projection_outcome("depth_limit_task_failed", task_id, &outcome)?;
                 Ok(())
             }),
-            TaskEventPayload::DeliveryQueued { delivery } => project_future(project_task_delivery(
-                db,
-                delivery,
-                delivery_projection.context("queued delivery projection was not prepared")?,
-                delivery_authority.context("queued delivery authority was not prepared")?,
-            )),
+            TaskEventPayload::DeliveryQueued { delivery } => project_future(async move {
+                // This point read and the projection share the Task event writer
+                // transaction. Existing deliveries must retain their original
+                // output binding, including an explicitly unknown legacy basis.
+                let is_new = db
+                    .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DbBackend::Sqlite,
+                        "SELECT id FROM task_delivery WHERE id=?",
+                        [delivery.id.clone().into()],
+                    ))
+                    .await?
+                    .is_none();
+                project_task_delivery(
+                    db,
+                    delivery,
+                    delivery_projection.context("queued delivery projection was not prepared")?,
+                    delivery_authority.context("queued delivery authority was not prepared")?,
+                )
+                .await?;
+                if is_new {
+                    crate::compaction::bind_queued_task_output(db, delivery).await?;
+                }
+                Ok(())
+            }),
             TaskEventPayload::DeliveryCancelled {
                 delivery, attempt, ..
             } => project_future(async move {

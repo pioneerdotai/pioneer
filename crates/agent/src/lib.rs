@@ -6,6 +6,7 @@
 
 mod agent_loop;
 mod chat;
+pub mod compaction;
 mod hooks;
 mod manager_recovery;
 #[cfg(test)]
@@ -1162,6 +1163,7 @@ pub struct RecoveryAttemptRequest {
     pub disable_image_input: bool,
     pub refresh_provider_auth: bool,
     pub compact_history: bool,
+    pub context_recovery_deadline_ms: Option<u64>,
     pub continue_generation: bool,
     pub model_override: Option<String>,
     pub retained_provider_history: Vec<RetainedProviderHistoryMessage>,
@@ -1308,6 +1310,8 @@ pub struct RestoredRecoveryTurnRequest {
 
 #[derive(Debug, Clone, Default)]
 struct TurnExecutionOptions {
+    context_overflow_recovery: bool,
+    context_recovery_deadline_ms: Option<u64>,
     force_non_stream: bool,
     disable_tool_calling: bool,
     continue_generation_hint: bool,
@@ -1884,6 +1888,7 @@ enum AgentCommand {
         turn_id: String,
         run_id: u64,
         completion: TurnTaskCompletion,
+        context_session: Option<Arc<compaction::controller::NativeContextSession>>,
     },
     CancelAttempt {
         turn_id: String,
@@ -2470,6 +2475,7 @@ impl RetiredControlOperationRegistry {
 /// updates affect the next Turn without changing an already running one.
 #[derive(Clone)]
 pub(crate) struct NativeTurnRuntimeSnapshot {
+    pub(crate) context_controller: Option<Arc<dyn compaction::controller::NativeContextController>>,
     pub(crate) generation: u64,
     pub(crate) tool_loop_config: ToolLoopConfig,
     pub(crate) mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
@@ -2513,6 +2519,7 @@ struct NativeTerminalRuntimeSnapshot {
 }
 
 struct NativeRuntimeDependencyState {
+    context_controller: Option<Arc<dyn compaction::controller::NativeContextController>>,
     generation: u64,
     tool_loop_config: ToolLoopConfig,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
@@ -2557,6 +2564,7 @@ impl NativeRuntimeDependencies {
     ) -> Self {
         Self {
             state: RwLock::new(NativeRuntimeDependencyState {
+                context_controller: None,
                 generation: initial_native_runtime_generation(),
                 tool_loop_config,
                 mcp_tool_provider,
@@ -2633,6 +2641,7 @@ impl NativeRuntimeDependencies {
     pub(crate) async fn snapshot(&self) -> NativeTurnRuntimeSnapshot {
         let state = self.state.read().await;
         NativeTurnRuntimeSnapshot {
+            context_controller: state.context_controller.clone(),
             generation: state.generation,
             tool_loop_config: state.tool_loop_config.clone(),
             mcp_tool_provider: state.mcp_tool_provider.clone(),
@@ -2877,6 +2886,26 @@ impl AgentManager {
                     .map_err(AgentTerminalEffectExecutionError::CleanupFailed)
             }
         }
+    }
+
+    /// Whether the runtime composition supplies canonical context preparation.
+    /// The Gateway uses the same composition boundary for initial history loading.
+    pub async fn has_context_controller(&self) -> bool {
+        self.runtime_dependencies
+            .state
+            .read()
+            .await
+            .context_controller
+            .is_some()
+    }
+
+    pub async fn set_context_controller(
+        &self,
+        controller: Option<Arc<dyn compaction::controller::NativeContextController>>,
+    ) {
+        self.runtime_dependencies
+            .update(move |state| state.context_controller = controller)
+            .await;
     }
 
     pub async fn set_turn_tool_provider(&self, provider: Option<Arc<dyn TurnToolProvider>>) {

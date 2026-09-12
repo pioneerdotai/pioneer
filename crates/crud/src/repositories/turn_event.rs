@@ -20,6 +20,8 @@ pub struct PreparedTurnEvent {
     turn_id: String,
     event_type: String,
     payload_json: String,
+    context_item_id: Option<String>,
+    context_projection_kind: &'static str,
     idempotency_key: String,
     payload: TurnEventPayload,
     semantically_matching_existing_id: Option<String>,
@@ -35,7 +37,11 @@ impl PreparedTurnEvent {
         let idempotency_key = payload
             .idempotency_key()
             .context("failed to derive turn event idempotency key")?;
+        let (context_item_id, context_projection_kind) =
+            crate::compaction::history::event_projection_metadata(&payload);
         Ok(Self {
+            context_item_id,
+            context_projection_kind,
             id: generate_id(DB_ID_LEN),
             thread_id,
             turn_id,
@@ -186,6 +192,24 @@ pub async fn append_prepared_event<C: ConnectionTrait>(
     db.execute(&insert)
         .await
         .context("failed to append turn event")?;
+
+    // Prepared metadata reads only the immutable typed payload inserted above.
+    // Production callers hold the same serialized append transaction, so an
+    // event edit cannot intervene. Replays do not overwrite metadata; stale or
+    // legacy metadata is detected by its revision and reprojected by readers.
+    db.execute(
+        &Query::update()
+            .table(Alias::new("compaction_event_revision"))
+            .value("projection_revision", Expr::col("revision"))
+            .value("item_id", prepared.context_item_id)
+            .value("projection_kind", prepared.context_projection_kind)
+            .and_where(Expr::col("source_id").eq(prepared.id.clone()))
+            .and_where(Expr::col("turn_id").eq(prepared.turn_id.clone()))
+            .and_where(Expr::col("present").eq(1))
+            .to_owned(),
+    )
+    .await
+    .context("failed to record canonical event projection metadata")?;
 
     Ok(AppendedTurnEvent {
         id: prepared.id,

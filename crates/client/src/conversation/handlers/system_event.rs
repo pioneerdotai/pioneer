@@ -47,7 +47,7 @@ impl TurnItemHandler for SystemEventHandler {
     fn on_completed(
         &self,
         projector: &mut ConversationProjector,
-        _turn_id: &str,
+        turn_id: &str,
         item: &TurnItem,
         ts_unix_ms: i64,
     ) {
@@ -55,9 +55,19 @@ impl TurnItemHandler for SystemEventHandler {
             return;
         };
 
+        let status = match item.context_compaction_status() {
+            Some(pioneer_protocol::TurnWorkItemStatus::Running) => {
+                self.on_started(projector, turn_id, item, ts_unix_ms);
+                return;
+            }
+            Some(pioneer_protocol::TurnWorkItemStatus::Failed) => TimelineEntryStatus::Failed,
+            Some(pioneer_protocol::TurnWorkItemStatus::Cancelled) => TimelineEntryStatus::Cancelled,
+            Some(pioneer_protocol::TurnWorkItemStatus::Blocked) => TimelineEntryStatus::Blocked,
+            _ => TimelineEntryStatus::Completed,
+        };
         projector.complete_item_view(
             id,
-            TimelineEntryStatus::Completed,
+            status,
             Some(message.as_str()),
             None,
             item.clone(),

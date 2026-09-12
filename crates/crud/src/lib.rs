@@ -1,3 +1,4 @@
+pub mod compaction;
 mod convention;
 mod events;
 mod memory;
@@ -26171,6 +26172,24 @@ impl CrudStore {
         projection_context: TurnEventProjectionContext,
         execution_owner_id: Option<&str>,
     ) -> Result<()> {
+        self.materialize_turn_event_with_projection_context_and_guard(
+            event,
+            event_timestamp_secs,
+            projection_context,
+            execution_owner_id,
+            None,
+        )
+        .await
+    }
+
+    async fn materialize_turn_event_with_projection_context_and_guard(
+        &self,
+        event: TurnEventPayload,
+        event_timestamp_secs: i64,
+        projection_context: TurnEventProjectionContext,
+        execution_owner_id: Option<&str>,
+        operation_guard: Option<sea_orm::Statement>,
+    ) -> Result<()> {
         let claim_token = generate_id(DB_ID_LEN);
         let created_at = unix_to_datetime(event_timestamp_secs);
         let claim_expires_at =
@@ -26186,6 +26205,7 @@ impl CrudStore {
                 created_at,
                 claim_expires_at,
                 execution_owner_id.clone(),
+                operation_guard.clone(),
             )
         })
         .await
@@ -26200,6 +26220,7 @@ impl CrudStore {
         created_at: DateTimeWithTimeZone,
         claim_expires_at: DateTimeWithTimeZone,
         execution_owner_id: Option<String>,
+        operation_guard: Option<sea_orm::Statement>,
     ) -> Result<()> {
         let appended_event = self
             .append_claimed_turn_event_projection_once(
@@ -26209,6 +26230,7 @@ impl CrudStore {
                 claim_token.clone(),
                 claim_expires_at,
                 execution_owner_id.as_deref(),
+                operation_guard,
             )
             .await?;
 
@@ -26793,6 +26815,7 @@ impl CrudStore {
         claim_token: String,
         claim_expires_at: DateTimeWithTimeZone,
         execution_owner_id: Option<&str>,
+        operation_guard: Option<sea_orm::Statement>,
     ) -> Result<crate::events::AppendedTurnEvent> {
         let event = prepare_turn_event_for_permanent_storage(&self.connection, event).await?;
         let projection_context_json =
@@ -26806,6 +26829,13 @@ impl CrudStore {
         validate_turn_event_durable_owner(&transaction, event.payload()).await?;
         validate_turn_event_execution_owner(&transaction, event.payload(), execution_owner_id)
             .await?;
+
+        if let Some(guard) = operation_guard {
+            anyhow::ensure!(
+                transaction.query_one_raw(guard).await?.is_some(),
+                "compaction lifecycle owner or generation changed"
+            );
+        }
 
         let appended_event =
             match turn_event::append_prepared_event(&transaction, event, created_at).await {

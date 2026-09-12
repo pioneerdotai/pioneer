@@ -211,6 +211,7 @@ pub(super) async fn run_agent_loop(
     // unexpectedly, dropping a bare JoinHandle would detach provider/tool
     // work and leave it without a consumer for its terminal command.
     let mut active_turn_task: Option<ActiveTurnTask> = None;
+    let mut context_check: Option<OwnedContextCheck> = None;
     let mut active_turn_control: Option<TurnExecutionControl> = None;
     let mut active_turn_request: Option<ActiveTurnRequest> = None;
     let mut last_turn_request: Option<ActiveTurnRequest> = None;
@@ -304,6 +305,30 @@ pub(super) async fn run_agent_loop(
     }
 
     while let Some(command) = command_rx.recv().await {
+        // A single owned post-turn check never blocks receiving new input.
+        // Starting another execution cancels and joins its service boundary.
+        let stop_check = matches!(
+            &command,
+            AgentCommand::StartTurn { .. }
+                | AgentCommand::StartRecoveryAttempt { .. }
+                | AgentCommand::StartRestoredRecoveryTurn { .. }
+                | AgentCommand::Shutdown
+        ) || matches!(&command, AgentCommand::CancelTurn { turn_id, .. }
+                if context_check.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
+        let cancelled_context_check = matches!(&command, AgentCommand::CancelTurn { turn_id, .. }
+            if context_check.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
+        let context_stop_error = if stop_check && let Some(check) = context_check.take() {
+            check
+                .stop(!matches!(&command, AgentCommand::Shutdown))
+                .await
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
+        if context_stop_error.is_some() {
+            tracing::warn!("context Stop fence could not be persisted");
+        }
         match command {
             AgentCommand::StartTurn {
                 turn_id,
@@ -441,6 +466,7 @@ pub(super) async fn run_agent_loop(
                 turn_id,
                 run_id,
                 completion,
+                context_session,
             } => {
                 if active_turn_id.as_deref() != Some(turn_id.as_str()) {
                     continue;
@@ -494,6 +520,9 @@ pub(super) async fn run_agent_loop(
                         clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
+                        if let Some(session) = context_session {
+                            context_check = Some(OwnedContextCheck::start(session));
+                        }
                     }
                     Ok(TurnTaskSuccess::NeedsContinuation(continuation)) => {
                         debug!(
@@ -946,6 +975,13 @@ pub(super) async fn run_agent_loop(
             } => {
                 if let Some(outcome) = ack.completed() {
                     let _ = ack.send(outcome);
+                    continue;
+                }
+                if cancelled_context_check {
+                    let _ = ack.send(match context_stop_error {
+                        Some(error) => Err(super::AgentControlError::Internal(error)),
+                        None => Ok(()),
+                    });
                     continue;
                 }
                 if active_turn_id.is_none() {
@@ -1422,6 +1458,7 @@ fn spawn_turn_task(
 ) -> JoinHandle<()> {
     tokio::spawn(turn_flow_future(async move {
         let NativeTurnRuntimeSnapshot {
+            context_controller,
             generation: _,
             tool_loop_config,
             mcp_tool_provider,
@@ -1434,7 +1471,33 @@ fn spawn_turn_task(
             post_turn_hook_dispatch_policy: _,
             permission_approval_broker,
         } = runtime_snapshot;
+        let missing_context_recovery = turn_request.execution_options.context_overflow_recovery
+            && context_controller.is_none();
+        let context_session = context_controller.map(|controller| {
+            Arc::new(crate::compaction::controller::NativeContextSession::new(
+                crate::compaction::controller::NativeContext {
+                    overflow_recovery: turn_request.execution_options.context_overflow_recovery,
+                    recovery_deadline_ms: turn_request
+                        .execution_options
+                        .context_recovery_deadline_ms,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_request.turn_id.clone(),
+                    conversation_thread_id: turn_request
+                        .hook_runtime_context
+                        .conversation_thread_id
+                        .clone(),
+                    provider_instance: turn_request.provider_name.clone(),
+                    provider: provider.clone(),
+                    events: event_hub.clone(),
+                    cancellation: turn_control.cancellation_token(),
+                },
+                controller,
+            ))
+        });
         let result = AssertUnwindSafe(turn_flow_future(execute_turn_flow(
+            missing_context_recovery,
+            context_session.clone(),
             thread_id.clone(),
             turn_request.turn_id.clone(),
             workspace_id,
@@ -1495,9 +1558,50 @@ fn spawn_turn_task(
                 turn_id: turn_request.turn_id,
                 run_id,
                 completion: result,
+                context_session,
             })
             .await;
     }))
+}
+
+struct OwnedContextCheck {
+    session: Arc<crate::compaction::controller::NativeContextSession>,
+    task: Option<ActiveTurnTask>,
+}
+impl OwnedContextCheck {
+    fn start(session: Arc<crate::compaction::controller::NativeContextSession>) -> Self {
+        let worker = session.clone();
+        let task = tokio::spawn(async move {
+            if worker.after_turn().await.is_err() {
+                tracing::warn!("post-turn context preparation did not complete");
+            }
+        });
+        Self {
+            session,
+            task: Some(ActiveTurnTask::new(task)),
+        }
+    }
+    async fn stop(mut self, persist_stop: bool) -> anyhow::Result<()> {
+        // Registration may already have handed work to a durable background
+        // owner. User cancellation/new input still fences that work. Shutdown
+        // only joins this registration task; the Gateway suspends its workers.
+        let fence = if persist_stop {
+            self.session.stop().await
+        } else {
+            Ok(())
+        };
+        self.session.context.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            wait_for_turn_task_shutdown(task.into_join_handle()).await;
+        }
+        fence
+    }
+}
+impl Drop for OwnedContextCheck {
+    fn drop(&mut self) {
+        self.session.context.cancellation.cancel();
+        // ActiveTurnTask aborts on actor exit; no service future is detached.
+    }
 }
 
 struct ActiveTurnTask {
@@ -1574,6 +1678,8 @@ fn recovery_context(request: &super::RecoveryAttemptRequest) -> RecoveryAttemptC
 }
 
 async fn execute_turn_flow(
+    missing_context_recovery: bool,
+    context_session: Option<Arc<crate::compaction::controller::NativeContextSession>>,
     thread_id: String,
     turn_id: String,
     workspace_id: String,
@@ -1614,6 +1720,14 @@ async fn execute_turn_flow(
     recovery: Option<RecoveryAttemptContext>,
     event_hub: Arc<AgentEventHub>,
 ) -> TurnTaskCompletion {
+    if missing_context_recovery {
+        return TurnTaskCompletion {
+            result: Err(TurnTaskFailure::Blocked(
+                "context recovery runtime is unavailable".into(),
+            )),
+            post_turn_dispatch: None,
+        };
+    }
     match mode {
         ThreadMode::Message => TurnTaskCompletion {
             result: Err(TurnTaskFailure::Terminal(
@@ -1623,6 +1737,7 @@ async fn execute_turn_flow(
             post_turn_dispatch: None,
         },
         ThreadMode::Chat | ThreadMode::Agent => turn_flow_future(chat::execute_chat_turn_flow(
+            context_session,
             thread_id,
             turn_id,
             workspace_id,

@@ -323,6 +323,17 @@ impl ProviderCatalogView {
         let attach = lifetime.clone();
         let dialog_title = cli_runtime_provider_dialog_title(&draft.mode);
 
+        let compaction_field = CliCompactionField {
+            model: Rc::new(RefCell::new(draft.compaction_model.clone())),
+            owner: desktop_entity.clone(),
+            lifetime: lifetime.clone(),
+            picker: self.model_picker.clone(),
+            runtime_id: match &draft.mode {
+                CLIRuntimeProviderDraftMode::Edit { original_id } => Some(original_id.clone()),
+                _ => None,
+            },
+            workspace_id: self.active_workspace_id().map(str::to_owned),
+        };
         let save_cli_provider: Rc<dyn Fn(&mut App) -> bool> = Rc::new({
             let desktop_entity = desktop_entity.clone();
             let field_error = field_error.clone();
@@ -333,6 +344,7 @@ impl ProviderCatalogView {
             let shadow_home_input_state = shadow_home_input_state.clone();
             let enabled_state = enabled_state.clone();
             let draft_seed = draft.clone();
+            let compaction_model = compaction_field.model.clone();
             let lifetime = lifetime.clone();
             move |cx| {
                 if !lifetime.read(cx).valid() {
@@ -360,6 +372,7 @@ impl ProviderCatalogView {
                     shadow_home_input_state.read(cx).value().to_string(),
                 );
                 draft.enabled = enabled_state.get();
+                draft.compaction_model = compaction_model.borrow().clone();
 
                 let mut result = Err(CLIRuntimeProviderSettingsRejection::MissingSettings);
                 let _ = desktop_entity.update(cx, |view, cx| {
@@ -556,6 +569,7 @@ impl ProviderCatalogView {
                                     },
                                 ),
                         )
+                        .child(compaction_field.render(cx))
                         .child(
                             h_flex()
                                 .w_full()
@@ -633,12 +647,20 @@ fn cli_runtime_provider_dialog_field_error(
         }
         CLIRuntimeProviderSettingsRejection::MissingSettings
         | CLIRuntimeProviderSettingsRejection::MissingRuntime { .. }
-        | CLIRuntimeProviderSettingsRejection::UnsupportedKind { .. } => None,
+        | CLIRuntimeProviderSettingsRejection::UnsupportedKind { .. }
+        | CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { .. } => None,
     };
 
     CLIRuntimeProviderDialogFieldError {
         field,
-        message: cli_runtime_provider_settings_rejection_message(rejection),
+        message: if matches!(
+            rejection,
+            CLIRuntimeProviderSettingsRejection::InvalidCompactionModel { .. }
+        ) {
+            t!("providers.cli.compaction.invalid").to_string()
+        } else {
+            cli_runtime_provider_settings_rejection_message(rejection)
+        },
     }
 }
 
@@ -674,4 +696,108 @@ fn cli_runtime_provider_dialog_error_field(
             .whitespace_normal()
             .child(error),
     )
+}
+
+#[derive(Clone)]
+struct CliCompactionField {
+    model: Rc<RefCell<pioneer_client::settings::types::GatewayModelSelection>>,
+    owner: WeakEntity<ProviderCatalogView>,
+    lifetime: Entity<crate::dialog_lifetime::DialogLifetime>,
+    picker: std::sync::Arc<dyn crate::ports::ProviderModelPickerPort>,
+    runtime_id: Option<String>,
+    workspace_id: Option<String>,
+}
+impl CliCompactionField {
+    fn render(&self, cx: &App) -> AnyElement {
+        use pioneer_client::settings::types::GatewayModelSelection;
+        let selected = pioneer_client::settings::models::to_selector(&self.model.borrow());
+        let label = selected
+            .model
+            .map(|model| match selected.selected_reasoning_effort {
+                Some(effort) => format!("{model} · {effort}"),
+                None => model,
+            })
+            .unwrap_or_else(|| t!("providers.cli.compaction.inherit").to_string());
+        let explicit = !matches!(*self.model.borrow(), GatewayModelSelection::Inherit);
+        let field = self.clone();
+        let reset = self.clone();
+        v_flex()
+            .gap_2()
+            .w_full()
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .child(t!("providers.cli.compaction.label").to_string()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        default_outline_button("cli-compaction-choose")
+                            .label(t!("providers.cli.compaction.choose").to_string())
+                            .disabled(self.runtime_id.is_none() || self.workspace_id.is_none())
+                            .on_click(move |_, window, cx| field.open(window, cx)),
+                    )
+                    .when(explicit, |row| {
+                        row.child(
+                            default_outline_button("cli-compaction-reset")
+                                .label(t!("providers.cli.compaction.reset").to_string())
+                                .on_click(move |_, window, cx| {
+                                    if reset.lifetime.read(cx).valid() {
+                                        *reset.model.borrow_mut() = GatewayModelSelection::Inherit;
+                                        Root::update(window, cx, |_, _, cx| cx.notify());
+                                    }
+                                }),
+                        )
+                    }),
+            )
+            .when(self.runtime_id.is_none(), |column| {
+                column.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("providers.cli.compaction.save_first").to_string()),
+                )
+            })
+            .into_any_element()
+    }
+    fn open(&self, window: &mut Window, cx: &mut App) {
+        if !self.lifetime.read(cx).valid() {
+            return;
+        }
+        let (Some(runtime), Some(workspace)) = (self.runtime_id.clone(), self.workspace_id.clone())
+        else {
+            return;
+        };
+        let mut selected = pioneer_client::settings::models::to_selector(&self.model.borrow());
+        selected.provider = Some(pioneer_client::providers::list::cli_runtime_provider_key(
+            &runtime,
+        ));
+        let state = self.clone();
+        let refresh_owner = self.owner.clone();
+        self.picker.open(crate::ports::ProviderModelPickerRequest::new(
+            t!("providers.cli.compaction.label").to_string(), workspace.clone(), selected,
+            Rc::new(move |selection, cx| {
+                if !state.lifetime.read(cx).valid() { return false; }
+                state.owner.update(cx, |view, cx| {
+                    if view.active_workspace_id() != Some(workspace.as_str())
+                        || !view.principal_presentation_capabilities().can_manage_capabilities { return false; }
+                    let Some(settings) = view.gateway.settings.as_ref() else { return false; };
+                    let Some(selection) = pioneer_client::settings::models::from_selector(selection, &settings.cli_runtimes.instances)
+                    else { return false; };
+                    if !matches!(&selection, pioneer_client::settings::types::GatewayModelSelection::Explicit { instance, .. } if instance == &runtime) { return false; }
+                    *state.model.borrow_mut() = selection;
+                    cx.notify(); true
+                }).unwrap_or(false)
+            }),
+            Rc::new(move |cx| { let _ = refresh_owner.update(cx, |_, cx| cx.notify()); }),
+        ), window, cx);
+    }
 }

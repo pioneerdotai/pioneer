@@ -76,13 +76,10 @@ use pioneer_entity::{
     turn_work_projection,
 };
 use pioneer_hooks::{
-    HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookDiagnosticCode,
-    HookDiagnosticMessage, HookDomain, HookError, HookExecutionPolicy, HookFailurePolicy,
-    HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookInputPayload, HookKind,
-    HookPhase, HookPromptContent, HookRegistry, HookRuntime, HookRuntimeOptions, HookSectionId,
-    HookSubscription, HookSubscriptionId, HookSubscriptionRegistry, PromptSectionContribution,
-    TurnPreCompactionRawTurnRetention, TurnPreCompactionSummaryStorage,
-    TurnPreCompactionSummaryStrategy, TurnPreCompactionTrigger,
+    HookAwaitPolicy, HookCapabilities, HookCapability, HookContribution, HookExecutionPolicy,
+    HookFailurePolicy, HookHandler, HookHandlerRequest, HookHandlerResponse, HookId, HookKind,
+    HookPhase, HookRegistry, HookRuntime, HookRuntimeOptions, HookSubscription, HookSubscriptionId,
+    HookSubscriptionRegistry,
 };
 use pioneer_keystore::{MemorySecretStore, SecretFilter, SecretId, SecretKind, SecretStore};
 use pioneer_memory::hooks::{
@@ -960,7 +957,7 @@ fn with_enabled_test_cli_runtime_catalog(processor: MessageProcessor) -> Message
     ));
     std::fs::create_dir_all(runtime_home.as_path())
         .expect("test CLI runtime home should be created");
-    let app_config = pioneer_config::AppConfig::load().expect("test app config should load");
+    let app_config = crate::isolated_test_app_config().expect("test app config should load");
     let settings_name = crate::settings::normalize_settings_file_name(
         app_config.gateway.settings_file_name.as_str(),
     )
@@ -1072,7 +1069,6 @@ async fn setup_cli_runtime_security_harness_for_principal(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone())
@@ -1467,7 +1463,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
         std::fs::write(&native_home, b"not a directory").unwrap();
     }
 
-    let app_config = pioneer_config::AppConfig::load().unwrap();
+    let app_config = crate::isolated_test_app_config().unwrap();
     let settings_name = crate::settings::normalize_settings_file_name(
         app_config.gateway.settings_file_name.as_str(),
     )
@@ -1487,6 +1483,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     settings
         .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings {
             instances: vec![pioneer_protocol::GatewayCliRuntimeInstanceSettings {
+                compaction_model: None,
                 id: runtime_id.clone(),
                 kind: runtime_kind,
                 display_name: format!("Proposal 51 {runtime_id}"),
@@ -1521,7 +1518,6 @@ async fn setup_cli_runtime_skill_preflight_harness(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     )
     .with_runtime_home_for_tests(runtime_home.clone())
@@ -3080,6 +3076,7 @@ struct CountingDelayedProvider {
 }
 
 struct CaptureSummaryProvider {
+    pause_first: std::sync::atomic::AtomicBool,
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     calls: AtomicUsize,
@@ -3112,6 +3109,7 @@ struct ConcurrentComposerHistoryProvider {
     first_started: Notify,
     second_started: Notify,
     release_first: Notify,
+    release_third: Notify,
 }
 
 struct FlakyTitleProvider {
@@ -3403,6 +3401,7 @@ impl CountingDelayedProvider {
 impl CaptureSummaryProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
+            pause_first: std::sync::atomic::AtomicBool::new(false),
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
@@ -3478,6 +3477,7 @@ impl ConcurrentComposerHistoryProvider {
             first_started: Notify::new(),
             second_started: Notify::new(),
             release_first: Notify::new(),
+            release_third: Notify::new(),
         }
     }
 
@@ -3512,6 +3512,9 @@ impl Provider for CaptureSummaryProvider {
             .lock()
             .expect("capture summary requests lock")
             .push(request);
+        if self.pause_first.swap(false, Ordering::SeqCst) {
+            futures_util::future::pending::<()>().await;
+        }
         Ok(ChatResponse {
             text: self.text.clone(),
             usage: None,
@@ -3755,6 +3758,12 @@ impl Provider for ConcurrentComposerHistoryProvider {
                 self.second_started.notify_one();
                 Ok(text_response(
                     r#"<task_result>{"summary":"B complete","data":{"rawText":"B complete"}}</task_result>"#,
+                ))
+            }
+            Some("ASYNC_TASK_C") => {
+                self.release_third.notified().await;
+                Ok(text_response(
+                    r#"<task_result>{"summary":"C complete","data":{"rawText":"C complete"}}</task_result>"#,
                 ))
             }
             _ => Ok(text_response(r#"{"facts":[]}"#)),
@@ -4093,8 +4102,6 @@ enum Phase13HookBehavior {
     Succeed {
         contributions: Vec<HookContribution>,
     },
-    Fail,
-    Pending,
 }
 
 struct Phase13RecordingHookHandler {
@@ -4174,11 +4181,6 @@ impl HookHandler for Phase13RecordingHookHandler {
                 contributions: contributions.clone(),
                 ..HookHandlerResponse::default()
             }),
-            Phase13HookBehavior::Fail => Err(HookError::new(
-                HookDiagnosticCode::new("test.phase13_failed").expect("valid diagnostic code"),
-                HookDiagnosticMessage::new("phase 13 hook failed").expect("valid diagnostic"),
-            )),
-            Phase13HookBehavior::Pending => futures_util::future::pending().await,
         }
     }
 }
@@ -4524,7 +4526,6 @@ async fn self_improvement_settings_response_waits_for_durable_live_transition() 
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_runtime_home_for_tests(runtime_home.clone())
@@ -4693,7 +4694,6 @@ async fn self_improvement_settings_fail_closed_without_runtime_supervisor() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_runtime_home_for_tests(runtime_home.clone());
@@ -5983,7 +5983,6 @@ async fn setup_provider_api_key_processor(
         crud_store,
         gateway_secrets,
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     (
@@ -7317,7 +7316,6 @@ fn review_enabled_processor(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
         Arc::new(GatewayMemoryRuntime::disabled(crud_store)),
         runtime_home,
@@ -7380,13 +7378,6 @@ fn test_summary_config() -> super::summary::SummaryConfig {
         summary_model_provider: Some("echo".to_owned()),
         title_model: Some("test-model".to_owned()),
         title_model_provider: Some("echo".to_owned()),
-    }
-}
-
-fn test_context_budget() -> super::ContextBudget {
-    super::ContextBudget {
-        max_context_tokens: 128_000,
-        response_reserve_tokens: 16_000,
     }
 }
 
@@ -7925,7 +7916,6 @@ async fn setup_progress_delta_harness(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     ensure_test_superuser_execution_authority(crud_store.as_ref()).await;
@@ -8502,7 +8492,6 @@ async fn long_russian_first_message_generates_parent_title_successfully() {
         crud_store.clone(),
         test_gateway_secrets(),
         summary_config,
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -8589,7 +8578,6 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         crud_store.clone(),
         test_gateway_secrets(),
         summary_config,
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -8682,7 +8670,6 @@ async fn title_generation_retries_after_transient_failure() {
         crud_store.clone(),
         test_gateway_secrets(),
         summary_config,
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -8774,7 +8761,6 @@ async fn child_thread_scope_skips_auto_title_generation() {
         crud_store.clone(),
         test_gateway_secrets(),
         summary_config,
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -9104,7 +9090,6 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
     let parent_thread_id = "thr_collaborative_composer";
@@ -9330,9 +9315,14 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
 
@@ -9506,9 +9496,14 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .await
         .expect("Task B snapshot should load")
         .expect("Task B history must be frozen at admission");
-    let frozen_history: Vec<pioneer_provider::ChatMessage> =
-        serde_json::from_str(frozen.history_json.as_str())
-            .expect("Task B frozen history should decode");
+    let frozen_history = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &frozen.workspace_id,
+        &std::collections::BTreeSet::from([frozen.conversation_thread_id.clone()]),
+        &frozen.history_json,
+    )
+    .await
+    .expect("Task B frozen history should decode");
     assert!(
         frozen_history.iter().all(|message| {
             !message.content.contains("ASYNC_TASK_A") && !message.content.contains("ASYNC_TASK_B")
@@ -9518,13 +9513,26 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
 
     let task_a_id = task_a.id.clone();
     let task_b_id = task_b.id.clone();
+    let task_b_status = wait_for_task_status(
+        crud_store.clone(),
+        task_b_id.as_str(),
+        TaskStatus::Completed,
+    )
+    .await;
+    if task_b_status != TaskStatus::Completed {
+        // Surface the exact snapshot failure instead of hiding it behind the
+        // eventual Task-status timeout. This cannot satisfy the status oracle.
+        let source = crud_store
+            .get_latest_task_run_turn(&task_b_run.id)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::compaction::frozen::capture_task_output(crud_store.as_ref(), &workspace_id, &source)
+            .await
+            .expect("completed Task B output must have a reproducible canonical snapshot");
+    }
     assert_eq!(
-        wait_for_task_status(
-            crud_store.clone(),
-            task_b_id.as_str(),
-            TaskStatus::Completed
-        )
-        .await,
+        task_b_status,
         TaskStatus::Completed,
         "Task B must complete while the earlier Task A remains blocked"
     );
@@ -9602,6 +9610,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         "unfinished Task A must be excluded as a whole from Task B's frozen range"
     );
 
+    let output_fence_before_a = crud_store.compaction_history_read_fence().await.unwrap();
     provider.release_first.notify_one();
     assert_eq!(
         wait_for_task_status(
@@ -9693,6 +9702,756 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
                 .is_some_and(|text| text.contains("B complete"))),
         "each completed source command must be paired with its fully delivered result"
     );
+    let descriptor = crate::compaction::frozen::capture_line_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        None,
+    )
+    .await
+    .expect("later Task source projection should freeze");
+    let allowed = std::collections::BTreeSet::from([parent_thread_id.to_owned()]);
+    let later = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &allowed,
+        &descriptor,
+    )
+    .await
+    .expect("completed sources should restore by reference");
+    assert_eq!(
+        later
+            .iter()
+            .filter(|message| {
+                matches!(message.content.as_str(), "ASYNC_TASK_A" | "ASYNC_TASK_B")
+            })
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ASYNC_TASK_A", "ASYNC_TASK_B"]
+    );
+    for outcome in ["A complete", "B complete"] {
+        assert_eq!(
+            later
+                .iter()
+                .filter(|message| message.content.contains(outcome))
+                .count(),
+            1,
+            "a delivered result must appear once, without its Task card copy"
+        );
+    }
+    let last_policy = crate::compaction::frozen::capture_selected_line_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        None,
+        Some(&pioneer_protocol::TaskAgentContextPolicy {
+            max_turns: Some(1),
+            ..crate::compaction::frozen::default_task_context_policy()
+        }),
+    )
+    .await
+    .expect("one logical Task exchange should freeze");
+    let last = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &allowed,
+        &last_policy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        last.iter().filter(|m| m.content == "ASYNC_TASK_B").count(),
+        1
+    );
+    assert_eq!(
+        last.iter()
+            .filter(|m| m.content.contains("B complete"))
+            .count(),
+        1
+    );
+    assert!(
+        last.iter()
+            .all(|m| m.content != "ASYNC_TASK_A" && !m.content.contains("A complete"))
+    );
+    assert!(last.iter().any(
+        |m| m.provenance.as_ref().unwrap().logical_turn_id.as_deref()
+            == Some("turn_concurrent_task_b")
+    ));
+    let unchanged = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &allowed,
+        &frozen.history_json,
+    )
+    .await
+    .expect("already accepted Task B snapshot remains readable");
+    assert_eq!(
+        unchanged, frozen_history,
+        "later A/B deliveries cannot rewrite an accepted TaskRun"
+    );
+    async fn collect_delivered_outputs(
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        mut after: i64,
+        fence: &pioneer_crud::compaction::HistoryReadFence,
+    ) -> anyhow::Result<Vec<pioneer_crud::compaction::DeliveredTaskOutputRef>> {
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = store
+                .compaction_delivered_output_page(workspace, thread, after, fence)
+                .await?;
+            entries.extend(
+                page.entries
+                    .into_iter()
+                    .filter(|entry| seen.insert(entry.delivery_id.clone())),
+            );
+            if page.done {
+                break;
+            }
+            assert!(page.scanned_through > after);
+            after = page.scanned_through;
+        }
+        Ok(entries)
+    }
+    let output_fence = crud_store.compaction_history_read_fence().await.unwrap();
+    let acknowledged = collect_delivered_outputs(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        0,
+        &output_fence,
+    )
+    .await
+    .unwrap();
+    assert_eq!(acknowledged.len(), 2);
+    let first_only = collect_delivered_outputs(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        0,
+        &output_fence_before_a,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_only.len(), 1);
+    assert_eq!(first_only[0], acknowledged[0]);
+    let first_output = crud_store
+        .compaction_delivery_output(&workspace_id, &first_only[0].delivery_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_output.output.run_id, task_b_run.id);
+    assert_eq!(
+        collect_delivered_outputs(
+            crud_store.as_ref(),
+            &workspace_id,
+            parent_thread_id,
+            acknowledged[0].capture_order,
+            &output_fence
+        )
+        .await
+        .unwrap(),
+        acknowledged[1..]
+    );
+    assert!(
+        collect_delivered_outputs(
+            crud_store.as_ref(),
+            "other",
+            parent_thread_id,
+            0,
+            &output_fence
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    for reference in &acknowledged {
+        assert_eq!(
+            crud_store
+                .compaction_reference_thread(&workspace_id, &reference.acknowledgement)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(parent_thread_id)
+        );
+    }
+    // Simulate a cold/legacy projection cache without changing any source.
+    // The first capture must retain the command, not only its later outcome.
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=?)",
+        [parent_thread_id.into()],
+    )).await.unwrap();
+    let cold = crate::compaction::frozen::capture_selected_line_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        None,
+        Some(&pioneer_protocol::TaskAgentContextPolicy {
+            max_turns: Some(1),
+            ..crate::compaction::frozen::default_task_context_policy()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::turn_runtime_snapshot::restore_history_json(
+            crud_store.as_ref(),
+            &workspace_id,
+            &allowed,
+            &cold
+        )
+        .await
+        .unwrap(),
+        last
+    );
+    assert_eq!(
+        collect_delivered_outputs(
+            crud_store.as_ref(),
+            &workspace_id,
+            parent_thread_id,
+            0,
+            &output_fence
+        )
+        .await
+        .unwrap(),
+        acknowledged
+    );
+
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=?)",
+        [parent_thread_id.into()],
+    )).await.unwrap();
+    let replay = crud_store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT payload FROM turn_event WHERE id=?",
+            [acknowledged[0].acknowledgement.id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let event: pioneer_crud::CanonicalTurnEventPayload =
+        serde_json::from_str(&replay.try_get::<String>("", "payload").unwrap()).unwrap();
+    let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) = event else {
+        panic!("exact Task output acknowledgement")
+    };
+    crud_store
+        .materialize_item_completed(notification, chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert!(
+        processor
+            .capture_authorized_task_basis(
+                authenticated_test_member_collaborator().as_ref(),
+                &workspace_id,
+                parent_thread_id,
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+        "no destination Read grant means no original history is captured"
+    );
+    let assembled_json = processor
+        .capture_authorized_task_basis(
+            authenticated_test_superuser().as_ref(),
+            &workspace_id,
+            parent_thread_id,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("assemble C from currently authorized acknowledged A/B originals");
+    let assembled_scopes = crate::compaction::frozen::accepted_history_scopes(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        &assembled_json,
+    )
+    .await
+    .unwrap();
+    let assembled = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &assembled_scopes,
+        &assembled_json,
+    )
+    .await
+    .unwrap();
+    let mut child_history = assembled.clone();
+    crate::compaction::frozen::hydrate_accepted_own(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        &assembled_json,
+        "new-child-context",
+        &mut child_history,
+    )
+    .await
+    .unwrap();
+    let once = child_history.clone();
+    crate::compaction::frozen::hydrate_accepted_own(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        &assembled_json,
+        "new-child-context",
+        &mut child_history,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        child_history, once,
+        "ownership hydration is idempotent within the admitted execution"
+    );
+    for message in &child_history {
+        let origin = message.provenance.as_ref().unwrap();
+        if acknowledged
+            .iter()
+            .any(|reference| reference.source_thread == origin.thread_id)
+        {
+            assert_eq!(origin.context_thread.as_deref(), Some("new-child-context"));
+            assert!(!origin.inherited);
+        } else {
+            assert_ne!(
+                origin.context_thread.as_deref(),
+                Some("new-child-context"),
+                "H stays inherited by the new Task"
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&child_history).unwrap(),
+        serde_json::to_value(&assembled).unwrap(),
+        "own-role transfer changes metadata only"
+    );
+    assert_eq!(
+        crate::turn_runtime_snapshot::restore_history_json(
+            crud_store.as_ref(),
+            &workspace_id,
+            &assembled_scopes,
+            &assembled_json
+        )
+        .await
+        .unwrap(),
+        assembled
+    );
+    let assembled_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&assembled_json).unwrap();
+    let (import_count, import_digest) = crud_store
+        .compaction_frozen_import_state(
+            &workspace_id,
+            parent_thread_id,
+            &assembled_descriptor.manifest_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(import_count > 0);
+    crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+            [
+                "0".repeat(64).into(),
+                assembled_descriptor.manifest_id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        crate::turn_runtime_snapshot::restore_history_json(
+            crud_store.as_ref(),
+            &workspace_id,
+            &assembled_scopes,
+            &assembled_json
+        )
+        .await
+        .is_err(),
+        "own-import metadata corruption cannot silently change context ownership"
+    );
+    crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+            [
+                import_digest.into(),
+                assembled_descriptor.manifest_id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    for outcome in ["A complete", "B complete"] {
+        assert_eq!(
+            assembled
+                .iter()
+                .filter(|message| message.content.contains(outcome))
+                .count(),
+            1,
+            "accepted own output replaces its exact delivery transport copy"
+        );
+    }
+    for reference in &acknowledged {
+        assert!(
+            assembled
+                .iter()
+                .any(|message| message
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|origin| origin.thread_id == reference.source_thread
+                        && !origin.inherited
+                        && origin.context_thread.as_deref() == Some(parent_thread_id))),
+            "own A/B work belongs to C while retaining its physical source thread"
+        );
+    }
+
+    for (run_id, command, outcome) in [
+        (
+            task_a_state.runs.last().unwrap().id.as_str(),
+            "ASYNC_TASK_A",
+            "A complete",
+        ),
+        (task_b_run.id.as_str(), "ASYNC_TASK_B", "B complete"),
+    ] {
+        let candidate = crud_store
+            .get_accepted_task_result_candidate(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let output = crud_store
+            .compaction_task_output(&workspace_id, &candidate.task_run_turn_id)
+            .await
+            .unwrap()
+            .expect("candidate publication must follow its immutable output snapshot");
+        let deliveries = crud_store
+            .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                workspace_id: workspace_id.clone(),
+                task_id: Some(output.task_id.clone()),
+                run_id: Some(run_id.to_owned()),
+                statuses: vec![],
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(!deliveries.deliveries.is_empty());
+        for delivery in &deliveries.deliveries {
+            let accepted = crud_store
+                .compaction_delivery_output(&workspace_id, &delivery.id)
+                .await
+                .unwrap()
+                .expect("queue event must bind the exact candidate snapshot atomically");
+            assert_eq!(accepted.candidate_id, candidate.id);
+            assert_eq!(accepted.output, output);
+        }
+        let output_json = serde_json::to_string(&output.history).unwrap();
+        let source_scopes = crate::compaction::frozen::accepted_history_scopes(
+            crud_store.as_ref(),
+            &workspace_id,
+            &output.source_thread,
+            &output_json,
+        )
+        .await
+        .unwrap();
+        let output_messages = crate::compaction::frozen::restore(
+            crud_store.as_ref(),
+            &workspace_id,
+            &source_scopes,
+            &output.history,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            output_messages
+                .iter()
+                .filter(|m| m.content == command)
+                .count(),
+            1
+        );
+        assert_eq!(
+            output_messages
+                .iter()
+                .filter(|m| m.content.contains(outcome))
+                .count(),
+            1
+        );
+        crud_store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: output.source_thread.clone(),
+                    turn_id: output.source_turn.clone(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: format!("late-{}", output.task_run_turn_id),
+                        text: "LATER CHILD WORK MUST NOT JOIN DELIVERY".into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let source_turn = crud_store
+            .get_task_run_turn(&output.task_run_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let recovered = crate::compaction::frozen::capture_task_output(
+            crud_store.as_ref(),
+            &workspace_id,
+            &source_turn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered, output);
+        assert_eq!(
+            crate::compaction::frozen::restore(
+                crud_store.as_ref(),
+                &workspace_id,
+                &source_scopes,
+                &recovered.history
+            )
+            .await
+            .unwrap(),
+            output_messages
+        );
+    }
+    // Exercise actual Composer/Task admission and provider input for C, after
+    // later A/B work appeared. C must inherit only the accepted output snapshots.
+    let c_request_id = generate_test_request_id("frozen", "turn_concurrent_task_c");
+    Arc::clone(&processor)
+        .process_owned_request(
+            connection_context.clone(),
+            json!({
+                "jsonrpc":"2.0", "id":c_request_id, "method":"turn/start", "params": {
+                    "thread_id":parent_thread_id, "turn_id":"turn_concurrent_task_c",
+                    "input":[{"type":"text","text":"ASYNC_TASK_C"}],
+                    "model":"test-model", "model_provider":"openai", "mode":"Agent"
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let c_response = recv_response_by_id(&mut rx, c_request_id.as_str()).await;
+    let _: TurnStartResponse = serde_json::from_value(c_response.result).unwrap();
+    let c_request = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(request) = provider.snapshot_requests().into_iter().find(|r| {
+                r.messages
+                    .last()
+                    .is_some_and(|m| m.content == "ASYNC_TASK_C")
+            }) {
+                break request;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if c_request.is_err() {
+        let rows = crud_store
+            .database_connection()
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT status,error FROM turn WHERE id='turn_concurrent_task_c'".to_owned(),
+            ))
+            .await
+            .unwrap();
+        for row in rows {
+            eprintln!(
+                "C parent status={:?}, error={:?}",
+                row.try_get::<String>("", "status"),
+                row.try_get::<Option<String>>("", "error")
+            );
+        }
+        let rows = crud_store.database_connection().query_all_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT r.status,r.error_json FROM task_run r JOIN task t ON t.id=r.task_id WHERE t.created_by_turn_id='turn_concurrent_task_c' LIMIT 10".to_owned(),
+        )).await.unwrap();
+        for row in rows {
+            eprintln!(
+                "C run status={:?}, error={:?}",
+                row.try_get::<String>("", "status"),
+                row.try_get::<Option<String>>("", "error_json")
+            );
+        }
+    }
+    let c_request = c_request.expect("new Task C must reach its provider through normal runtime");
+    let mut c_context = None;
+    for reference in &acknowledged {
+        let own = c_request
+            .messages
+            .iter()
+            .filter_map(|m| m.provenance.as_ref())
+            .filter(|origin| origin.thread_id == reference.source_thread)
+            .collect::<Vec<_>>();
+        assert!(
+            !own.is_empty(),
+            "C needs accepted own work from both A and B"
+        );
+        for origin in own {
+            assert!(!origin.inherited);
+            let execution = origin
+                .context_thread
+                .as_ref()
+                .expect("own import carries C identity");
+            assert_ne!(execution, parent_thread_id);
+            assert_ne!(execution, &reference.source_thread);
+            if let Some(expected) = &c_context {
+                assert_eq!(execution, expected);
+            }
+            c_context = Some(execution.clone());
+        }
+    }
+    for outcome in ["A complete", "B complete"] {
+        assert_eq!(
+            c_request
+                .messages
+                .iter()
+                .filter(|m| m.content.contains(outcome))
+                .count(),
+            1
+        );
+    }
+    assert!(c_request.messages.iter().all(|m| {
+        !m.content
+            .contains("LATER CHILD WORK MUST NOT JOIN DELIVERY")
+    }));
+    let c_tasks = processor
+        .task_runtime
+        .service()
+        .list_tasks(TaskListParams {
+            workspace_id: workspace_id.clone(),
+            owner_kind: Some(TaskOwnerKind::Thread),
+            owner_id: Some(parent_thread_id.into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let c_task = c_tasks
+        .tasks
+        .iter()
+        .find(|task| {
+            task.metadata
+                .as_ref()
+                .and_then(|m| m.composer_work.as_ref())
+                .is_some_and(|w| w.launch.turn_id == "turn_concurrent_task_c")
+        })
+        .unwrap();
+    let c_state = crud_store.get_task(&c_task.id).await.unwrap().unwrap();
+    let c_turn = crud_store
+        .get_latest_task_run_turn(&c_state.runs.last().unwrap().id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(c_turn.thread_id.clone()), c_context);
+    let runtime = crud_store
+        .get_turn_runtime_snapshot(&c_turn.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !runtime.history_json.trim_start().starts_with('['),
+        "new runtime history is reference-only"
+    );
+    let (_, restored) = crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+        crud_store.as_ref(),
+        &runtime,
+    )
+    .await
+    .unwrap();
+    for reference in &acknowledged {
+        assert!(restored.iter().any(|m| m.provenance.as_ref().is_some_and(
+            |origin| origin.thread_id == reference.source_thread
+                && !origin.inherited
+                && origin.context_thread.as_ref() == c_context.as_ref()
+        )));
+    }
+    provider.release_third.notify_one();
+    assert_eq!(
+        wait_for_task_status(crud_store.clone(), &c_task.id, TaskStatus::Completed).await,
+        TaskStatus::Completed
+    );
+    // Access-denial mutations are isolated from C execution admission.
+    materialize_test_member_collaborator(crud_store.as_ref(), &workspace_id, parent_thread_id)
+        .await;
+    let hidden_child = &acknowledged[0].source_thread;
+    let hidden_lineage = crud_store
+        .get_task_thread_lineage(hidden_child)
+        .await
+        .unwrap()
+        .unwrap();
+    crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE thread_lineage SET created_by_turn_id=NULL WHERE child_thread_id=?",
+            [hidden_child.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let disclosed_only_json = processor
+        .capture_authorized_task_basis(
+            authenticated_test_member_collaborator().as_ref(),
+            &workspace_id,
+            parent_thread_id,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("root reader may use disclosed delivery without an original-child grant");
+    let disclosed_scopes = crate::compaction::frozen::accepted_history_scopes(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        &disclosed_only_json,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !disclosed_scopes.contains(hidden_child),
+        "a delivery cannot grant access to its original child"
+    );
+    let disclosed = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &disclosed_scopes,
+        &disclosed_only_json,
+    )
+    .await
+    .unwrap();
+    assert!(
+        disclosed.iter().any(
+            |message| message.provenance.as_ref().is_some_and(|origin| origin
+                .sources
+                .iter()
+                .any(|source| source.id == acknowledged[0].acknowledgement.id))
+        ),
+        "denied original leaves its exact already disclosed delivery in the root history"
+    );
+    crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE thread_lineage SET created_by_turn_id=? WHERE child_thread_id=?",
+            [
+                hidden_lineage.created_by_turn_id.into(),
+                hidden_child.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -9724,7 +10483,6 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -9931,6 +10689,51 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
             .is_none_or(|text| !text.contains("too late")),
         "partial or late provider output must not enter cancelled history"
     );
+
+    let frozen_cancelled = crate::compaction::frozen::capture_selected_line_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        None,
+        Some(&pioneer_protocol::TaskAgentContextPolicy {
+            max_turns: Some(1),
+            ..crate::compaction::frozen::default_task_context_policy()
+        }),
+    )
+    .await
+    .expect("cancelled logical exchange must freeze");
+    let cancelled_messages = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &std::collections::BTreeSet::from([parent_thread_id.to_owned()]),
+        &frozen_cancelled,
+    )
+    .await
+    .expect("cancelled exchange must restore by reference");
+    assert_eq!(
+        cancelled_messages
+            .iter()
+            .filter(|m| m.content == "keep working until stopped")
+            .count(),
+        1
+    );
+    assert_eq!(
+        cancelled_messages
+            .iter()
+            .filter(|m| m.content.contains("Historical turn Interrupted"))
+            .count(),
+        1
+    );
+    assert!(
+        !cancelled_messages
+            .iter()
+            .any(|m| m.content.contains("too late"))
+    );
+    assert!(cancelled_messages.iter().any(|m| {
+        m.provenance
+            .as_ref()
+            .is_some_and(|p| p.logical_turn_id.as_deref() == Some(message_turn_id))
+    }));
 
     let expected_parent_block_id = pioneer_crud::detached_task_run_block_id(
         occurrence_turn_id,
@@ -10315,7 +11118,6 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread = start_thread_for_artifact_test(
@@ -10445,7 +11247,6 @@ async fn followup_turn_history_includes_inline_artifact_ref_without_reattaching_
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread = start_thread_for_artifact_test(
@@ -10612,7 +11413,6 @@ async fn followup_turn_history_includes_inline_assistant_artifact_ref() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread = start_thread_for_artifact_test(
@@ -10851,7 +11651,6 @@ async fn turn_start_with_capabilities_materializes_user_message_attachments() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
     let thread = start_thread_for_artifact_test(
@@ -11262,7 +12061,6 @@ async fn first_voice_turn_materializes_runtime_draft() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_voice_input_supervisor(ready_gateway_voice_supervisor("first voice message")),
@@ -11357,7 +12155,6 @@ async fn voice_turn_start_replay_does_not_dispatch_provider_again_impl() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_voice_input_supervisor(ready_gateway_voice_supervisor("same durable voice request")),
@@ -11467,7 +12264,6 @@ async fn collaborative_voice_composer_admits_detached_task() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_voice_input_supervisor(ready_gateway_voice_supervisor(
@@ -11570,7 +12366,6 @@ async fn task_run_voice_composer_stays_foreground() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_voice_input_supervisor(ready_gateway_voice_supervisor("continue inside this child")),
@@ -11723,7 +12518,6 @@ async fn voice_session_transcript_starts_turn_and_preserves_authorized_context_a
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     )
     .with_voice_input_supervisor(ready_gateway_voice_supervisor(
@@ -11964,7 +12758,6 @@ async fn voice_session_cancel_drops_session_without_creating_turn() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_voice_input_supervisor(ready_gateway_voice_supervisor("ignored"));
@@ -12031,7 +12824,6 @@ async fn voice_session_finalize_without_speech_does_not_create_turn() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_voice_input_supervisor(ready_gateway_voice_supervisor("should not run"));
@@ -12133,7 +12925,6 @@ async fn voice_status_disabled_and_start_report_model_unavailable() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     materialize_artifact_api_thread(
@@ -12202,7 +12993,6 @@ async fn voice_session_requires_ready_for_every_non_ready_phase() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_voice_input_supervisor(supervisor.clone());
@@ -12364,7 +13154,6 @@ async fn voice_input_status_notification_reports_transitions_and_coalesces_progr
             crud_store,
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_voice_input_supervisor(supervisor.clone()),
@@ -12471,7 +13260,6 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_runtime_home_for_tests(runtime_home.clone());
@@ -12563,7 +13351,7 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
         .await;
     let _ = recv_response_by_id(&mut rx, unrelated_request_id.as_str()).await;
 
-    let config = pioneer_config::AppConfig::load().expect("app config");
+    let config = crate::isolated_test_app_config().expect("app config");
     let settings_path = runtime_home.join(config.gateway.settings_file_name.as_str());
     let settings = crate::settings::load_or_create_gateway_settings(
         settings_path.as_path(),
@@ -12618,7 +13406,7 @@ async fn voice_reconfiguration_busy_blocks_all_active_states_before_persistence(
 async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
     let runtime_home = unique_temp_dir("voice_settings_disable_cleanup");
     std::fs::create_dir_all(&runtime_home).expect("runtime home");
-    let config = pioneer_config::AppConfig::load().expect("app config");
+    let config = crate::isolated_test_app_config().expect("app config");
     let entry =
         crate::voice::model_catalog::voice_model_catalog_entry("small").expect("small voice model");
     let layout = crate::voice::model_catalog::voice_model_install_layout(
@@ -12704,7 +13492,6 @@ async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_runtime_home_for_tests(runtime_home.clone())
@@ -12757,7 +13544,7 @@ async fn voice_settings_disable_removes_model_files_and_preserves_selection() {
 async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
     let runtime_home = unique_temp_dir("voice_settings_two_client_race");
     std::fs::create_dir_all(&runtime_home).expect("runtime home");
-    let config = pioneer_config::AppConfig::load().expect("app config");
+    let config = crate::isolated_test_app_config().expect("app config");
     let settings_path = runtime_home.join(config.gateway.settings_file_name.as_str());
     let mut settings = crate::settings::load_or_create_gateway_settings(
         settings_path.as_path(),
@@ -12800,7 +13587,6 @@ async fn voice_settings_two_client_race_serializes_to_one_consistent_outcome() {
             crud_store,
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_runtime_home_for_tests(runtime_home.clone())
@@ -13008,7 +13794,6 @@ async fn setup_binary_ingress_processor() -> (
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(
             system_root.as_path(),
             user_root.as_path(),
@@ -13111,7 +13896,6 @@ async fn authorization_gate_allows_superuser_and_denies_user_text_and_binary_dis
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -13384,7 +14168,6 @@ async fn member_workspace_discovery_default_and_selection_are_membership_scoped(
         crud_store,
         gateway_secrets,
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -13780,7 +14563,6 @@ async fn workspace_notification_fanout_revalidates_membership_before_serializati
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -14135,7 +14917,6 @@ async fn task_user_notification_inbox_rpc_is_durable_exact_recipient_and_acknowl
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -14256,7 +15037,6 @@ async fn gateway_management_notifications_are_superuser_only() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor
@@ -14369,7 +15149,6 @@ async fn thread_subscriptions_bind_identity_and_revalidate_current_visibility() 
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -14929,7 +15708,6 @@ async fn committed_workspace_revoke_evicts_only_affected_live_state() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -15646,7 +16424,6 @@ async fn turn_start_rejects_artifact_from_another_workspace() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let artifact =
@@ -15708,7 +16485,6 @@ async fn artifact_list_get_delete_restore_bind_api_roundtrip() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     materialize_artifact_api_thread(
@@ -15917,7 +16693,6 @@ async fn artifact_list_for_thread_includes_child_thread_subtree() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -16099,7 +16874,6 @@ async fn artifact_get_rejects_cross_workspace_artifact() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     materialize_artifact_api_thread(
@@ -16220,7 +16994,6 @@ async fn review_disabled_immediate_task_agent_run_creates_child_thread_and_wait_
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -16860,11 +17633,34 @@ async fn review_enabled_window_continuation_does_not_create_revision_and_preserv
 fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery() {
     run_standard_stack_message_test(
         "Task review accept and delivery",
-        task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(),
+        task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(false),
     );
 }
 
-async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
+// Keep compaction integration fixtures on the public runtime policy instead
+// of depending on the private helper used by unrelated message tests.
+fn run_compaction_message_test<F>(name: &'static str, future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = crate::build_gateway_runtime()
+        .unwrap_or_else(|error| panic!("{name} runtime should build: {error}"));
+    let result = runtime.block_on(async move { tokio::spawn(future).await });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    result.unwrap_or_else(|error| panic!("{name} task should finish: {error}"));
+}
+
+#[test]
+fn compaction_task_output_queue_failure_rolls_back_run_and_delivery_then_recovers() {
+    run_compaction_message_test(
+        "Task output queue rollback",
+        task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(true),
+    );
+}
+
+async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
+    inject_queue_failure: bool,
+) {
     let provider = Arc::new(DelayedProvider {
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for user approval","data":{"answer":"ok"}}</task_result>"#
@@ -17006,6 +17802,11 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
         TaskResultCandidateStatus::PendingReview,
     )
     .await;
+    let output_before_accept = crud_store
+        .compaction_task_output(&workspace_id, &candidate.task_run_turn_id)
+        .await
+        .unwrap()
+        .expect("pending review candidate must already have a frozen source");
     let (_, occurrence_before_accept) = crud_store
         .get_turn(parent_thread_id, run.id.as_str())
         .await
@@ -17013,6 +17814,47 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
         .expect("occurrence turn should exist before accept");
     assert_eq!(occurrence_before_accept.turn_kind, TurnKind::TaskRun);
     assert_eq!(occurrence_before_accept.status, TurnStatus::InProgress);
+
+    if inject_queue_failure {
+        use sea_orm::ConnectionTrait;
+        crud_store.database_connection().execute_unprepared(
+            "CREATE TEMP TRIGGER compaction_test_queue_failure AFTER INSERT ON compaction_delivery_output BEGIN SELECT RAISE(ABORT,'injected output queue failure'); END"
+        ).await.expect("install temporary writer fault");
+        let failed_id = generate_test_request_id("taskaccept", "fault");
+        processor.process_request_for_connection(connection_id, &json!({
+            "jsonrpc":"2.0","id":failed_id,"method":pioneer_protocol::constants::methods::TASK_ACCEPT,
+            "params":{"taskId":response.task.id,"runId":run.id,"candidateId":candidate.id,"reason":"approved by user"}
+        }).to_string()).await;
+        let _ = recv_error_by_id(&mut rx, failed_id.as_str()).await;
+        let retained_run = crud_store.get_task_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(retained_run.status, TaskRunStatus::WaitingReview);
+        let rolled_back = crud_store
+            .list_task_deliveries(TaskDeliveriesParams {
+                workspace_id: workspace_id.clone(),
+                task_id: Some(response.task.id.clone()),
+                run_id: Some(run.id.clone()),
+                statuses: vec![],
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(
+            rolled_back.deliveries.is_empty(),
+            "failed source binding must roll back DeliveryQueued"
+        );
+        assert_eq!(
+            crud_store
+                .compaction_task_output(&workspace_id, &candidate.task_run_turn_id)
+                .await
+                .unwrap(),
+            Some(output_before_accept.clone())
+        );
+        crud_store
+            .database_connection()
+            .execute_unprepared("DROP TRIGGER compaction_test_queue_failure")
+            .await
+            .unwrap();
+    }
 
     let request_id = generate_test_request_id("taskaccept", "rpc");
     let request = json!({
@@ -17034,7 +17876,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
         serde_json::from_value(rpc_response.result).expect("task/accept response should decode");
 
     assert!(accepted.accepted);
-    assert!(!accepted.already_accepted);
+    assert_eq!(accepted.already_accepted, inject_queue_failure);
     assert_eq!(
         accepted.review_event.reviewer_kind,
         TaskResultReviewerKind::User
@@ -17072,6 +17914,14 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl() {
         .expect("task deliveries should list after accept");
     assert_eq!(deliveries.deliveries.len(), 1);
     assert_eq!(deliveries.deliveries[0].status, TaskDeliveryStatus::Pending);
+    let accepted_output = crud_store
+        .compaction_delivery_output(&workspace_id, &deliveries.deliveries[0].id)
+        .await
+        .unwrap()
+        .expect("accepted review must bind the original candidate source at queue commit");
+    assert_eq!(accepted_output.candidate_id, candidate.id);
+    assert_eq!(accepted_output.output, output_before_accept);
+
     assert_eq!(
         deliveries.deliveries[0]
             .result_snapshot
@@ -18332,7 +19182,6 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -18402,14 +19251,124 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
 }
 
 #[test]
+fn compaction_task_admission_freezes_the_accepted_destination() {
+    run_compaction_message_test("Task snapshot destination", async {
+        let (processor, _, _, _, _, workspace) = setup_workspace_message_processor().await;
+        let processor = Arc::new(processor);
+        let params = test_task_create_params(
+            &workspace,
+            "source-parent",
+            "source-turn",
+            "scope fixture",
+            3,
+        );
+        let destination = test_task_create_params(
+            &workspace,
+            "destination-parent",
+            "destination-turn",
+            "scope fixture",
+            3,
+        );
+        for (params, text) in [
+            (&params, "SOURCE PRIVATE HISTORY"),
+            (&destination, "DESTINATION ACCEPTED HISTORY"),
+        ] {
+            ensure_task_create_parent_turn_for_test(&processor, params)
+                .await
+                .unwrap();
+            processor
+                .crud_store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: workspace.clone(),
+                        thread_id: params.created_by_thread_id.clone().unwrap(),
+                        turn_id: params.created_by_turn_id.clone().unwrap(),
+                        item: TurnItem::AgentMessage {
+                            id: "completed-work".into(),
+                            text: text.into(),
+                            phase: Default::default(),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    super::now_timestamp_secs(),
+                )
+                .await
+                .unwrap();
+        }
+        let seed = processor
+            .task_create_context_for_destination(&params, Some("destination-parent"), None)
+            .await
+            .unwrap()
+            .conversation_snapshot
+            .unwrap();
+        assert_eq!(seed.conversation_thread_id, "destination-parent");
+        assert_eq!(seed.source_turn_id.as_deref(), Some("source-turn"));
+        let history = crate::turn_runtime_snapshot::restore_history_json(
+            processor.crud_store.as_ref(),
+            &workspace,
+            &std::collections::BTreeSet::from(["destination-parent".into()]),
+            &seed.history_json,
+        )
+        .await
+        .unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "DESTINATION ACCEPTED HISTORY")
+        );
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("SOURCE PRIVATE HISTORY"))
+        );
+        assert!(!seed.history_json.contains("DESTINATION ACCEPTED HISTORY"));
+        let mut without_creator = params.clone();
+        without_creator.created_by_turn_id = None;
+        let seed_without_turn = processor
+            .task_create_context_for_destination(&without_creator, Some("destination-parent"), None)
+            .await
+            .unwrap()
+            .conversation_snapshot
+            .unwrap();
+        assert!(seed_without_turn.source_turn_id.is_none());
+        assert_eq!(
+            crate::turn_runtime_snapshot::restore_history_json(
+                processor.crud_store.as_ref(),
+                &workspace,
+                &std::collections::BTreeSet::from(["destination-parent".into()]),
+                &seed_without_turn.history_json,
+            )
+            .await
+            .unwrap(),
+            history
+        );
+    });
+}
+
+#[test]
 fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile() {
     run_standard_stack_message_test(
         "recovered hidden Task preflight ordering",
-        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(),
+        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+            TaskAttachmentMode::Detached,
+        ),
     );
 }
 
-async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body() {
+#[test]
+fn compaction_attached_task_restores_its_frozen_basis_without_changing_hook_scope() {
+    run_compaction_message_test(
+        "attached Task frozen basis and recovery",
+        recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+            TaskAttachmentMode::Attached,
+        ),
+    );
+}
+
+async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_prompt_compile_body(
+    attachment: TaskAttachmentMode,
+) {
     let initial_provider = Arc::new(HangingChildProvider::new());
     let initial_provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
@@ -18426,7 +19385,6 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     initial_processor.bind_task_bridge().await;
@@ -18506,7 +19464,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         3,
     );
     task_params.lifecycle_policy = Some(TaskLifecyclePolicy {
-        attachment: TaskAttachmentMode::Detached,
+        attachment,
         on_parent_cancel: TaskParentTerminalAction::KeepRunning,
         on_parent_failure: TaskParentTerminalAction::KeepRunning,
         completion: TaskCompletionBehavior::CompleteOnTerminalRun,
@@ -18523,9 +19481,14 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .await
         .expect("recovery conversation snapshot should load")
         .expect("recovery conversation snapshot should be frozen at task creation");
-    let frozen_history: Vec<pioneer_provider::ChatMessage> =
-        serde_json::from_str(frozen_conversation.history_json.as_str())
-            .expect("recovery conversation snapshot should decode");
+    let frozen_history = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &frozen_conversation.workspace_id,
+        &std::collections::BTreeSet::from([frozen_conversation.conversation_thread_id.clone()]),
+        &frozen_conversation.history_json,
+    )
+    .await
+    .expect("recovery conversation snapshot should decode");
     assert!(
         frozen_history
             .iter()
@@ -18542,6 +19505,50 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     assert!(
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
+    );
+    let child_snapshot = crud_store
+        .get_turn_runtime_snapshot(&lineage.child_turn_id)
+        .await
+        .unwrap()
+        .expect("child runtime context must be frozen before its model call");
+    let saved_hook: pioneer_agent::AgentTurnHookRuntimeContext =
+        serde_json::from_str(&child_snapshot.hook_runtime_context_json).unwrap();
+    if attachment == TaskAttachmentMode::Attached {
+        assert!(
+            saved_hook.conversation_thread_id.is_none(),
+            "inheritance must not redirect attached hooks"
+        );
+        assert_eq!(
+            saved_hook.post_turn_dispatch_mode,
+            pioneer_agent::AgentTurnPostTurnDispatchMode::Immediate
+        );
+    }
+    assert!(
+        !child_snapshot
+            .input_json
+            .contains("RECOVERY SNAPSHOT HISTORY MARKER"),
+        "parent history must not be copied into the child's new input"
+    );
+    assert!(
+        !child_snapshot
+            .history_json
+            .contains("RECOVERY SNAPSHOT HISTORY MARKER"),
+        "runtime history stores references, not the parent transcript"
+    );
+    let (_, child_history) =
+        crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+            crud_store.as_ref(),
+            &child_snapshot,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        child_history
+            .iter()
+            .filter(|message| message.content.contains("RECOVERY SNAPSHOT HISTORY MARKER"))
+            .count(),
+        1,
+        "the original parent history remains available exactly once"
     );
 
     let late_parent_turn = Turn {
@@ -18736,7 +19743,6 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     recovery_processor.bind_task_bridge().await;
@@ -18853,7 +19859,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .messages
             .iter()
             .any(|message| message.content == "RECOVERY SNAPSHOT HISTORY MARKER"),
-        "recovery must reuse the parent history frozen when the Detached child started"
+        "recovery must reuse the parent history frozen when the child started"
     );
     assert!(
         recovered_main_request
@@ -18889,7 +19895,6 @@ async fn failed_child_task_run_opens_recovery_without_candidate_impl() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -18977,7 +19982,6 @@ fn detached_task_block_preserves_child_reason_in_parent_timeline() {
             store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         ));
         processor.bind_task_bridge().await;
@@ -19067,7 +20071,6 @@ async fn blocked_execution_window_recovery_blocks_child_task_run_without_failure
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -19251,7 +20254,6 @@ async fn execution_window_continuation_keeps_task_run_turn_in_progress_impl() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -19391,7 +20393,6 @@ async fn exhausted_window_does_not_create_candidate_until_child_turn_completes_i
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -19607,7 +20608,6 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -19941,7 +20941,6 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -20438,7 +21437,6 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     ));
     processor.bind_task_bridge().await;
@@ -21099,7 +22097,6 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
                 crud_store.clone(),
                 test_gateway_secrets(),
                 test_summary_config(),
-                test_context_budget(),
                 test_tool_loop_config(),
             )
             .with_cli_runtime_manager_for_tests(cli_manager.clone())
@@ -21342,9 +22339,16 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             conversation_snapshot.source_turn_id.as_deref(),
             Some(turn_id.as_str())
         );
-        let frozen_history: Vec<pioneer_provider::ChatMessage> =
-            serde_json::from_str(conversation_snapshot.history_json.as_str())
-                .expect("native Task conversation snapshot should decode");
+        let frozen_history = crate::turn_runtime_snapshot::restore_history_json(
+            crud_store.as_ref(),
+            &conversation_snapshot.workspace_id,
+            &std::collections::BTreeSet::from([conversation_snapshot
+                .conversation_thread_id
+                .clone()]),
+            &conversation_snapshot.history_json,
+        )
+        .await
+        .expect("native Task conversation snapshot should decode");
         assert!(
             frozen_history
                 .iter()
@@ -21628,7 +22632,6 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 crud_store.clone(),
                 test_gateway_secrets(),
                 test_summary_config(),
-                test_context_budget(),
                 test_tool_loop_config(),
             )
             .with_cli_runtime_manager_for_tests(cli_manager.clone())
@@ -21852,7 +22855,6 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -22020,7 +23022,6 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone())
@@ -22192,7 +23193,6 @@ async fn assert_detached_native_child_turn_cancellation() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager)
@@ -23233,7 +24233,6 @@ async fn task_event_listener_fans_out_notifications_from_committed_event_log() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.start_task_event_listener().await;
@@ -23296,7 +24295,6 @@ async fn task_event_fanout_cursor_survives_listener_restart_without_replaying_hi
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -23443,7 +24441,6 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -23504,7 +24501,6 @@ async fn task_depth_limit_rejects_subtask_creation() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -23599,9 +24595,14 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
     processor.bind_task_bridge().await;
 
     let root_thread_id = "thread_nested_permission_root";
@@ -23728,6 +24729,27 @@ async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissio
             Some(2)
         );
     }
+    let requests = provider.snapshot_requests();
+    assert!(
+        requests.len() >= 4,
+        "root tool round and both child executions must reach the provider"
+    );
+    assert!(
+        requests.iter().all(|request| request.max_tokens.is_some()),
+        "every main model call, including the round after tool outcomes, must pass the full budget"
+    );
+    for call in [
+        "call_create_nested_subagent",
+        "call_create_nested_background_task",
+    ] {
+        assert!(
+            requests.iter().any(|request| request
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some(call))),
+            "the original tool outcome must reach the resumed model round"
+        );
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -23804,7 +24826,6 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_agent_tool_bridges().await;
@@ -24125,7 +25146,6 @@ async fn supervised_native_task_apply_patch_creates_approved_missing_destination
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_agent_tool_bridges().await;
@@ -24363,7 +25383,6 @@ async fn supervised_direct_agent_grant_reaches_the_real_child_sandbox_side_effec
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_agent_tool_bridges().await;
@@ -24569,7 +25588,6 @@ async fn task_list_inside_child_turn_hides_its_execution_wrapper_impl() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -24644,7 +25662,6 @@ async fn task_detach_updates_lifecycle_policy_impl() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -24728,7 +25745,6 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -24831,7 +25847,6 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -24922,7 +25937,6 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_agent_tool_bridges().await;
@@ -25861,7 +26875,6 @@ async fn task_agenda_pause_resume_json_rpc_contracts() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -26082,7 +27095,6 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         ));
         processor.bind_task_bridge().await;
@@ -26202,7 +27214,6 @@ async fn task_progress_refreshes_parent_task_anchor_preview_impl() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -26300,7 +27311,6 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -26412,7 +27422,6 @@ async fn thread_start_returns_response_and_started_notification() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let request = json!({
@@ -26463,7 +27472,6 @@ async fn thread_started_notification_is_not_broadcast_to_foreign_connections() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let request = json!({
@@ -26507,7 +27515,6 @@ async fn thread_tree_hides_foreign_empty_draft_threads() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thr_000000000000000122";
@@ -26733,7 +27740,6 @@ async fn runtime_draft_accepts_completed_attachment_upload_without_thread_persis
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thr_runtime_draft_upload";
@@ -26841,7 +27847,6 @@ async fn connection_closed_deletes_completed_upload_for_abandoned_runtime_draft(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thr_abandoned_draft_upload";
@@ -26920,7 +27925,6 @@ async fn materialized_thread_accepts_attachment_for_not_yet_started_planned_turn
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = pioneer_protocol::generate_id(21);
@@ -27545,7 +28549,6 @@ async fn turn_start_persists_profile_selected_audit_with_default_full_access() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -29379,7 +30382,6 @@ async fn thread_unsubscribe_returns_status_and_closed_notification() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29490,7 +30492,6 @@ async fn thread_start_rejects_unknown_workspace_id() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let request = json!({
@@ -29534,7 +30535,6 @@ async fn thread_start_rejects_missing_thread_id() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29585,7 +30585,6 @@ async fn thread_start_rejects_missing_workspace_id() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29636,7 +30635,6 @@ async fn workspace_list_returns_existing_workspaces() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29675,7 +30673,6 @@ async fn workspace_default_returns_single_active_workspace() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29714,7 +30711,6 @@ async fn workspace_create_creates_new_workspace() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29758,7 +30754,6 @@ async fn workspace_create_rejects_missing_workspace_id() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -29928,7 +30923,6 @@ async fn workspace_create_broadcasts_changed_to_other_workspace_connections() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -30101,7 +31095,6 @@ async fn message_turn_start_is_immediately_completed_idempotent_and_never_dispat
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -30456,7 +31449,6 @@ async fn message_reply_and_mentions_are_same_thread_scoped_and_directory_scoped(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -30724,7 +31716,6 @@ async fn message_attachment_requires_exact_version_and_current_thread_scope() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -30999,7 +31990,6 @@ async fn message_mutation_rpcs_enforce_author_moderation_revision_and_tombstone_
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -31571,7 +32561,6 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -31677,7 +32666,6 @@ async fn concurrent_message_turn_starts_commit_once_and_keep_stable_timeline_ord
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor
@@ -31801,7 +32789,6 @@ async fn message_persistence_failure_rolls_back_and_emits_no_realtime() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor
@@ -31880,7 +32867,6 @@ async fn turn_start_without_execution_backend_uses_api_provider_path() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -31970,7 +32956,6 @@ async fn turn_start_security_snapshot_native_turn_is_persisted_before_dispatch()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -32097,7 +33082,6 @@ async fn native_turn_start_same_request_replays_durable_outcome_without_dispatch
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_native_admission_replay";
@@ -32228,7 +33212,6 @@ async fn turn_start_security_audit_events_include_snapshot_reference() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_security_audit_native";
@@ -32366,7 +33349,6 @@ async fn turn_start_cli_runtime_backend_disabled_errors_before_provider_dispatch
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -33753,7 +34735,6 @@ async fn codex_review_start_uncommitted_changes_is_rejected_without_runtime_call
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -33856,7 +34837,6 @@ async fn codex_review_start_custom_instructions_is_rejected_without_runtime_call
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -33953,7 +34933,6 @@ async fn codex_review_start_rejects_before_target_validation() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -34032,7 +35011,6 @@ async fn codex_compaction_start_is_rejected_without_runtime_call() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -34125,7 +35103,6 @@ async fn codex_compaction_start_rejects_wrong_backend() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -34219,7 +35196,6 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -34375,7 +35351,6 @@ async fn codex_thread_ops_fork_creates_pioneer_thread_and_native_binding() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -34553,7 +35528,6 @@ async fn member_codex_thread_fork_commits_private_creator_membership() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session));
@@ -34811,7 +35785,6 @@ async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -34880,7 +35853,6 @@ async fn cli_runtime_turn_start_blocker_rejects_db_only_active_cli_binding() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -34924,7 +35896,6 @@ async fn cli_runtime_turn_start_blocker_reconciles_db_only_terminal_binding() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -35044,7 +36015,6 @@ async fn cli_runtime_turn_start_blocker_rejects_unbound_server_request() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -35146,7 +36116,6 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -35251,7 +36220,6 @@ async fn codex_transport_observation_gap_enqueues_recovery_without_terminalizing
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -35462,7 +36430,6 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -35605,7 +36572,6 @@ async fn cli_runtime_reconciliation_uses_full_terminal_lifecycle_for_unloaded_th
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -35797,7 +36763,6 @@ async fn cli_runtime_projection_backlog_does_not_start_agent_recovery() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_cli_projection_backlog";
@@ -36001,7 +36966,6 @@ async fn cli_runtime_snapshot_materialization_failure_keeps_turn_running() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_cli_snapshot_failure";
@@ -36075,7 +37039,6 @@ async fn cli_runtime_legacy_storage_failure_routes_claude_through_native_recover
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_claude_storage_recovery";
@@ -36161,7 +37124,6 @@ async fn cli_runtime_failure_keeps_binding_active_while_pioneer_recovery_is_pend
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_cli_runtime_failure_recovery";
@@ -36308,7 +37270,6 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -36683,7 +37644,6 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -36864,7 +37824,6 @@ async fn closed_cli_runtime_durable_hub_is_replaced() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let key = CLIAgentRuntimeSessionKey::new(
@@ -36922,7 +37881,6 @@ async fn completed_cli_runtime_attempt_reconciles_running_pioneer_turn() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_cli_completed_attempt_reconciliation";
@@ -37037,7 +37995,6 @@ async fn cli_runtime_terminal_attempt_fences_late_native_events() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_cli_attempt_fencing";
@@ -37247,7 +38204,6 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -37953,7 +38909,6 @@ async fn cli_runtime_terminal_cleanup_keeps_session_open_for_other_active_turn()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -38061,7 +39016,6 @@ async fn cli_runtime_stale_db_only_running_binding_schedules_recovery() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -38200,7 +39154,6 @@ async fn cli_runtime_stale_scan_reconciles_db_only_terminal_binding() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -38320,7 +39273,6 @@ fn codex_steer_allows_another_current_collaborator_user() {
                 crud_store.clone(),
                 test_gateway_secrets(),
                 test_summary_config(),
-                test_context_budget(),
                 test_tool_loop_config(),
             )
             .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -38440,7 +39392,6 @@ async fn codex_steer_rejects_missing_active_runtime_session() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -38529,7 +39480,6 @@ async fn codex_steer_rejects_missing_active_turn_binding() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -38584,7 +39534,6 @@ async fn codex_steer_rejects_wrong_backend() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()));
@@ -38669,7 +39618,6 @@ async fn cli_runtime_request_respond_allows_another_current_collaborator_user() 
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -38846,7 +39794,6 @@ async fn cli_runtime_pending_request_replays_to_late_collaborator_thread_open() 
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -39023,7 +39970,6 @@ async fn cli_runtime_grandchild_request_replays_into_root_capsule_and_resolves_f
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -39292,7 +40238,6 @@ async fn cli_runtime_native_request_resolved_cancels_matching_pending_request() 
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -39404,7 +40349,6 @@ async fn turn_permission_request_respond_allows_another_current_collaborator_use
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     materialize_artifact_api_thread(
@@ -39616,7 +40560,6 @@ async fn native_permission_request_from_grandchild_is_visible_in_all_ancestor_sc
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let root_thread_id = "thread_native_permission_root";
@@ -39871,7 +40814,6 @@ async fn native_permission_request_cancellation_resolves_and_removes_pending_req
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     materialize_artifact_api_thread(
@@ -39972,7 +40914,6 @@ async fn native_permission_request_replays_and_accepts_durable_response_after_re
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_native_permission_restart";
@@ -40168,7 +41109,6 @@ async fn cli_runtime_request_respond_rejects_stale_request_ids() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -40214,7 +41154,6 @@ async fn cli_runtime_request_respond_rejects_pending_without_turn_binding() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -40864,7 +41803,6 @@ async fn cli_runtime_request_claude_approval_roundtrip_preserves_provider_payloa
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -41016,7 +41954,6 @@ async fn cli_runtime_request_claude_denial_blocks_provider_action() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -41755,7 +42692,6 @@ async fn cli_runtime_human_wait_without_turn_binding_does_not_defer_timeout() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -42671,7 +43607,6 @@ async fn cli_runtime_approval_processor() -> (
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -43118,7 +44053,6 @@ async fn turn_start_succeeds_when_skill_roots_are_missing() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -43260,7 +44194,6 @@ fn agents_doc_turn_without_doc_omits_agents_md_prompt_section() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         );
 
@@ -43351,7 +44284,6 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         );
 
@@ -43560,7 +44492,6 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     crud_store
@@ -43718,7 +44649,6 @@ async fn agent_skill_resolution_event_clears_pins_when_overlay_was_not_exposed()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_agent_overlay_not_exposed";
@@ -43768,7 +44698,6 @@ async fn agent_skill_resolution_event_rejects_exposure_that_does_not_match_pins(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_agent_overlay_pin_mismatch";
@@ -43857,7 +44786,6 @@ async fn agent_skill_resolution_event_persists_turn_skill_bindings() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -43949,7 +44877,6 @@ async fn agent_skill_binding_failure_fails_closed_before_execution() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     let thread_id = "thread_agent_binding_fail_soft";
@@ -44017,7 +44944,6 @@ async fn agent_skill_audit_event_persists_audit_rows() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -44113,7 +45039,6 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         );
 
@@ -44481,7 +45406,6 @@ async fn turn_get_returns_turn_snapshot() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -44572,7 +45496,6 @@ async fn assert_turn_cancel_interrupts_running_turn_and_is_idempotent() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -44741,7 +45664,6 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -44965,7 +45887,6 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -45043,7 +45964,6 @@ async fn task_cancel_allows_another_current_collaborator_user() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     ));
     processor.bind_task_bridge().await;
@@ -45118,7 +46038,6 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -45196,7 +46115,6 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -45309,7 +46227,6 @@ async fn folder_delete_promotes_nested_contents_to_parent() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -45484,7 +46401,6 @@ async fn thread_and_folder_move_support_root_target() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -45655,7 +46571,6 @@ async fn thread_tree_changed_is_broadcast_to_other_connections() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     session_manager
@@ -45715,7 +46630,6 @@ async fn thread_tree_includes_agents_doc_summaries_without_content() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -45909,7 +46823,6 @@ fn thread_agents_doc_rpc_saves_inherits_archives_and_resolves_for_thread() {
             crud_store,
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         );
 
@@ -46138,7 +47051,6 @@ fn thread_agents_doc_rpc_rejects_large_content_and_version_conflicts() {
             crud_store,
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         );
 
@@ -46217,7 +47129,6 @@ async fn thread_history_is_not_a_reachable_timeline_api() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -46818,7 +47729,6 @@ async fn turn_items_returns_stream_events_for_resume() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -48517,7 +49427,6 @@ async fn setup_semantic_timeline_query_harness_inner(
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -48652,7 +49561,6 @@ async fn setup_live_semantic_timeline_harness(case_id: &str) -> LiveSemanticTime
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -49706,7 +50614,6 @@ async fn recovery_lifecycle_notification_is_persisted_for_history_replay() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -50204,7 +51111,6 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone())),
@@ -50341,7 +51247,6 @@ async fn cli_runtime_request_respond_for_completed_turn_expires_all_pending_requ
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -50507,7 +51412,6 @@ async fn cli_runtime_request_respond_rejects_pending_without_active_runtime_sess
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(cli_manager.clone()),
@@ -50620,7 +51524,6 @@ async fn cli_runtime_request_respond_rejects_pending_with_mismatched_native_thre
             crud_store.clone(),
             test_gateway_secrets(),
             test_summary_config(),
-            test_context_budget(),
             test_tool_loop_config(),
         )
         .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone())),
@@ -50742,7 +51645,6 @@ async fn cli_runtime_server_request_without_turn_binding_is_cancelled_without_pe
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -50913,7 +51815,6 @@ async fn cli_runtime_server_request_waits_for_starting_turn_binding_native_id() 
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -51079,7 +51980,6 @@ async fn cli_runtime_generic_request_event_waits_for_starting_turn_binding_nativ
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -51233,7 +52133,6 @@ async fn cli_runtime_server_request_buffered_flush_preserves_order_before_termin
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -51408,7 +52307,6 @@ async fn cli_runtime_server_request_with_mismatched_starting_native_thread_is_ca
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -51521,7 +52419,6 @@ async fn cli_runtime_server_request_without_native_thread_does_not_buffer_on_sta
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -51634,7 +52531,6 @@ async fn cli_runtime_server_request_without_native_turn_does_not_close_starting_
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -51748,7 +52644,6 @@ async fn cli_runtime_server_request_with_bound_native_turn_but_mismatched_native
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -51838,7 +52733,6 @@ async fn cli_runtime_server_request_with_bound_native_turn_but_missing_native_th
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     )
     .with_cli_runtime_manager_for_tests(cli_manager.clone());
@@ -52436,7 +53330,6 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -52529,7 +53422,6 @@ async fn turn_start_emits_full_lifecycle_notifications_and_echoes_text() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -52772,7 +53664,6 @@ Gateway skill body"#,
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -52895,7 +53786,6 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config.clone(),
     );
     processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
@@ -53115,7 +54005,6 @@ Gateway HTTP skill body"#
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -53371,7 +54260,6 @@ async fn skills_list_returns_sorted_catalog_snapshot() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -53555,7 +54443,6 @@ async fn turn_skill_capability_validation_uses_only_exact_id() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -53713,7 +54600,6 @@ async fn skills_policy_set_mutates_policy_and_emits_changed() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -53825,7 +54711,6 @@ async fn skills_policy_set_can_disable_system_skill() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -53933,7 +54818,6 @@ async fn skills_policy_set_rejects_locked_system_implicit_disable() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -54063,7 +54947,6 @@ async fn skills_pack_install_persists_children_atomically_and_emits_one_change()
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -54282,7 +55165,6 @@ async fn concurrent_pack_install_consumes_one_upload_exactly_once() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
     let upload_id = create_finalized_archive_upload(
@@ -54416,7 +55298,6 @@ async fn pack_install_upload_races_and_existing_terminal_states_never_publish_tw
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
     let upload_id = create_finalized_archive_upload(
@@ -54715,7 +55596,6 @@ async fn upload_expiry_waits_for_the_shared_lifecycle_guard() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
     let upload_id = "expiryguardupload0001";
@@ -54818,7 +55698,6 @@ async fn pack_install_commit_failure_rolls_back_all_published_children() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
     let upload_id = create_finalized_archive_upload(
@@ -55049,7 +55928,6 @@ async fn skills_pack_update_preserves_retained_identity_policy_and_rolls_back_fa
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -55425,7 +56303,6 @@ async fn skills_pack_uninstall_is_ordered_atomic_and_supports_empty_parents() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     ));
 
@@ -55680,7 +56557,6 @@ async fn packed_skill_individual_update_and_uninstall_preserve_parent_contract()
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -55950,7 +56826,6 @@ async fn skills_install_update_uninstall_round_trip_persists_and_notifies() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -56322,7 +57197,6 @@ async fn skills_uninstall_removes_pending_identity_without_deleting_external_sou
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -56387,7 +57261,6 @@ async fn skills_lifecycle_rejects_system_install_and_unknown_mutation_id() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -56551,7 +57424,6 @@ async fn skills_health_returns_dependency_diagnostics() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -56661,7 +57533,6 @@ async fn skills_install_rejects_relative_path_with_structured_error_code() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -56743,7 +57614,6 @@ async fn skills_upload_abort_is_connection_bound() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -56857,7 +57727,6 @@ async fn skills_upload_chunk_digest_mismatch_aborts_session() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -56969,7 +57838,6 @@ async fn skills_install_with_user_target_persists_user_source_kind() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -57104,7 +57972,6 @@ async fn skills_install_defaults_to_user_source_and_isolates_workspaces() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
     );
 
@@ -57233,7 +58100,6 @@ async fn skills_install_blocks_dependency_failure_under_default_policy() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config_with_roots(&system_root, &user_root, &workspace_root, &registry_root),
     );
 
@@ -57449,7 +58315,6 @@ async fn mcp_list_empty_then_install_stdio_persists_redacts_and_notifies() {
         crud_store,
         gateway_secrets.clone(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
@@ -57720,7 +58585,6 @@ async fn mcp_install_http_disabled_persists_and_lists_disabled_state() {
         crud_store,
         gateway_secrets.clone(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
@@ -57838,7 +58702,6 @@ async fn mcp_update_deletes_stale_keystore_refs_after_success() {
         crud_store,
         gateway_secrets.clone(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
@@ -57984,7 +58847,6 @@ async fn mcp_details_and_uninstall_return_full_ui_state_and_remove_server() {
         crud_store,
         gateway_secrets.clone(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
@@ -58249,7 +59111,6 @@ async fn mcp_install_itemizes_valid_and_invalid_servers() {
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
     processor.set_mcp_runtime_connector_for_tests(Arc::new(FakeMcpRuntimeConnector));
@@ -58373,7 +59234,6 @@ async fn setup_workspace_message_processor() -> (
         crud_store,
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
     );
 
@@ -58407,7 +59267,6 @@ async fn setup_phase_13_compaction_harness(
         crud_store.clone(),
         test_gateway_secrets(),
         phase_13_summary_config(),
-        phase_13_context_budget(),
         test_tool_loop_config(),
     ));
 
@@ -58427,20 +59286,15 @@ fn phase_13_summary_config() -> super::summary::SummaryConfig {
     }
 }
 
-fn phase_13_context_budget() -> super::ContextBudget {
-    super::ContextBudget {
-        max_context_tokens: 1_000,
-        response_reserve_tokens: 200,
-    }
-}
-
 fn phase_13_provider_registry(
     provider: Arc<CaptureSummaryProvider>,
 ) -> Arc<pioneer_provider::ProviderRegistry> {
-    Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "summary-capture",
-        provider,
-    ))
+        provider.clone(),
+    ));
+    registry.insert("openai", provider).unwrap();
+    registry
 }
 
 fn phase_13_now_secs() -> i64 {
@@ -58563,6 +59417,11 @@ async fn seed_phase_13_compaction_thread(
 
 #[tokio::test]
 async fn detached_composer_history_orders_each_delivered_answer_after_its_user_message() {
+    check_detached_composer_history_order(false).await;
+    check_detached_composer_history_order(true).await;
+}
+
+async fn check_detached_composer_history_order(legacy: bool) {
     let provider = Arc::new(CaptureSummaryProvider::new("unused"));
     let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
     let thread_id = generate_test_request_id("history", "detached-order");
@@ -58689,12 +59548,36 @@ async fn detached_composer_history_orders_each_delivered_answer_after_its_user_m
             .expect("Task occurrence turn should complete");
     }
 
+    if legacy {
+        // Existing turns predate the new creation-order trigger. Their retained
+        // insertion order must still win over arbitrary IDs in the same second.
+        harness.crud_store.database_connection().execute_raw(
+            sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
+                "DELETE FROM compaction_turn_creation WHERE turn_id IN (SELECT id FROM turn WHERE thread_id=?)",
+                [thread_id.clone().into()]),
+        ).await.unwrap();
+    }
+    ensure_test_superuser_execution_turn(
+        &harness.processor,
+        &harness.workspace_id,
+        &thread_id,
+        "next_child_turn",
+    )
+    .await;
     let history = harness
         .processor
-        .load_conversation_history(thread_id.as_str(), "next_child_turn")
-        .await;
+        .load_conversation_history_for_workspace(
+            &harness.workspace_id,
+            thread_id.as_str(),
+            "next_child_turn",
+        )
+        .await
+        .unwrap();
     let roles_and_content = history
         .into_iter()
+        // Canonical history also retains terminal-state records. Compare the
+        // causal order of the actual user/answer payloads, not those markers.
+        .filter(|message| message.content != "Historical turn status: Completed")
         .map(|message| (message.role, message.content))
         .collect::<Vec<_>>();
 
@@ -58763,518 +59646,35 @@ async fn detached_composer_history_orders_each_delivered_answer_after_its_user_m
     );
 }
 
-fn phase_13_prompt_section_contribution() -> HookContribution {
-    HookContribution::PromptSection(PromptSectionContribution {
-        contribution_id: pioneer_hooks::HookContributionId::new("phase13.prompt_section")
-            .expect("valid contribution id"),
-        section_id: HookSectionId::new("phase13.prompt_section").expect("valid section id"),
-        title: None,
-        domain: HookDomain::new("test.phase13").expect("valid hook domain"),
-        priority: 100,
-        content: HookPromptContent::new("this must not enter the summary prompt")
-            .expect("valid prompt content"),
-        max_chars: None,
-        source_refs: Vec::new(),
-        diagnostics: Vec::new(),
-        truncated: false,
-    })
-}
-
-fn phase_13_history_value(messages: &[pioneer_provider::ChatMessage]) -> serde_json::Value {
-    serde_json::to_value(messages).expect("chat history should serialize")
-}
-
+// The former count-based loader's pre-compaction hook tests were retired with
+// that loader. Hook engine policies remain covered in pioneer-hooks; history
+// loading now neither invokes a provider nor grants hooks control over recovery.
 #[tokio::test]
-async fn phase_13_pre_compaction_hook_is_dispatched() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
-    let thread_id = generate_test_request_id("p13", "dispatch");
-    let turn_id = generate_test_request_id("turn", "dispatch");
-    seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "PHASE13_DISPATCH_RAW",
-    )
-    .await;
-
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &harness.processor,
-        phase_13_hook_runtime(
-            calls.clone(),
-            Phase13HookBehavior::Succeed {
-                contributions: Vec::new(),
-            },
-            HookAwaitPolicy::Blocking,
-            None,
-            HookFailurePolicy::BestEffort,
-        ),
-    )
-    .await;
-    assert!(harness.processor.agent_manager.has_hook_runtime().await);
-
-    let _history = harness
-        .processor
-        .load_conversation_history(thread_id.as_str(), turn_id.as_str())
-        .await;
-
-    let calls = calls.lock().expect("phase 13 calls lock");
-    assert_eq!(calls.len(), 1);
-    let request = &calls[0];
-    assert_eq!(request.phase, HookPhase::TurnPreCompaction);
-    assert_eq!(request.input.kind.as_str(), "turn.pre_compaction");
-    assert_eq!(
-        request
-            .context
-            .workspace_id
-            .as_ref()
-            .expect("context workspace")
-            .as_str(),
-        harness.workspace_id.as_str()
-    );
-    assert_eq!(
-        request
-            .context
-            .thread_id
-            .as_ref()
-            .expect("context thread")
-            .as_str(),
-        thread_id.as_str()
-    );
-    assert_eq!(
-        request
-            .context
-            .turn_id
-            .as_ref()
-            .expect("context turn")
-            .as_str(),
-        turn_id.as_str()
-    );
-    assert_eq!(
-        request.context.mode,
-        Some(pioneer_hooks::HookContextMode::System)
-    );
-    assert_eq!(
-        request.context.actor.as_ref().expect("context actor").kind,
-        pioneer_hooks::HookActorKind::Service
-    );
-
-    let HookInputPayload::TurnPreCompaction(payload) = &request.input.payload else {
-        panic!("pre-compaction payload should be typed");
-    };
-    assert_eq!(payload.workspace_id.as_str(), harness.workspace_id.as_str());
-    assert_eq!(payload.thread_id.as_str(), thread_id.as_str());
-    assert_eq!(
-        payload.turn_id.as_ref().expect("payload turn").as_str(),
-        turn_id.as_str()
-    );
-    assert!(payload.compaction_id.as_str().starts_with("cmp_"));
-    assert_eq!(
-        payload.trigger,
-        TurnPreCompactionTrigger::ContextBudgetThreshold
-    );
-    assert_eq!(
-        payload.source_range.source_kind,
-        pioneer_hooks::TurnPreCompactionSourceKind::ConversationHistory
-    );
-    assert_eq!(payload.source_range.loaded_completed_turn_count, 2);
-    assert_eq!(payload.source_range.source_entry_count, 2);
-    assert_eq!(
-        payload.summary_policy.strategy,
-        TurnPreCompactionSummaryStrategy::ProgressiveFullHistorySummary
-    );
-    assert_eq!(
-        payload.retention_policy.raw_turn_retention,
-        TurnPreCompactionRawTurnRetention::RetainOriginalTurns
-    );
-    assert_eq!(
-        payload.retention_policy.summary_storage,
-        TurnPreCompactionSummaryStorage::ThreadSummary
-    );
-}
-
-#[tokio::test]
-async fn phase_13_empty_hook_runtime_preserves_current_compaction_behavior() {
-    let no_runtime_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let no_runtime_harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(no_runtime_provider.clone()))
-            .await;
-    let no_runtime_thread_id = generate_test_request_id("p13", "noruntime");
-    seed_phase_13_compaction_thread(
-        no_runtime_harness.crud_store.as_ref(),
-        no_runtime_harness.workspace_id.as_str(),
-        no_runtime_thread_id.as_str(),
-        "PHASE13_EMPTY_RAW",
-    )
-    .await;
-    let no_runtime_history = no_runtime_harness
-        .processor
-        .load_conversation_history(no_runtime_thread_id.as_str(), "turn_no_runtime")
-        .await;
-    let no_runtime_summary = no_runtime_harness
-        .crud_store
-        .get_thread_summary(no_runtime_thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    let empty_runtime_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let empty_runtime_harness = setup_phase_13_compaction_harness(phase_13_provider_registry(
-        empty_runtime_provider.clone(),
-    ))
-    .await;
-    let empty_runtime_thread_id = generate_test_request_id("p13", "emptyruntime");
-    seed_phase_13_compaction_thread(
-        empty_runtime_harness.crud_store.as_ref(),
-        empty_runtime_harness.workspace_id.as_str(),
-        empty_runtime_thread_id.as_str(),
-        "PHASE13_EMPTY_RAW",
-    )
-    .await;
-    install_test_hook_runtime(
-        &empty_runtime_harness.processor,
-        phase_13_empty_hook_runtime(),
-    )
-    .await;
-    let empty_runtime_history = empty_runtime_harness
-        .processor
-        .load_conversation_history(empty_runtime_thread_id.as_str(), "turn_empty_runtime")
-        .await;
-    let empty_runtime_summary = empty_runtime_harness
-        .crud_store
-        .get_thread_summary(empty_runtime_thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    assert_eq!(
-        phase_13_history_value(no_runtime_history.as_slice()),
-        phase_13_history_value(empty_runtime_history.as_slice())
-    );
-    assert_eq!(no_runtime_summary, empty_runtime_summary);
-    assert_eq!(no_runtime_provider.call_count(), 1);
-    assert_eq!(empty_runtime_provider.call_count(), 1);
-}
-
-#[tokio::test]
-async fn phase_13_best_effort_hook_failure_keeps_compaction_behavior() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
+async fn compaction_history_loading_ignores_old_summary_without_llm() {
+    let provider = Arc::new(CaptureSummaryProvider::new("must not be called"));
     let harness =
         setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
-    let thread_id = generate_test_request_id("p13", "besteffort");
-    seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "PHASE13_BESTEFFORT_RAW",
-    )
-    .await;
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &harness.processor,
-        phase_13_hook_runtime(
-            calls.clone(),
-            Phase13HookBehavior::Fail,
-            HookAwaitPolicy::Blocking,
-            None,
-            HookFailurePolicy::BestEffort,
-        ),
-    )
-    .await;
-
-    let history = harness
-        .processor
-        .load_conversation_history(thread_id.as_str(), "turn_best_effort")
-        .await;
-    let summary = harness
-        .crud_store
-        .get_thread_summary(thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
-    assert_eq!(provider.call_count(), 1);
-    assert_eq!(
-        summary.as_ref().map(|(summary, _)| summary.as_str()),
-        Some("compressed summary")
-    );
-    assert_eq!(history.len(), 1);
-    assert!(history[0].content.contains("compressed summary"));
-}
-
-#[tokio::test]
-async fn phase_13_fallback_hook_failure_keeps_compaction_and_ignores_fallback_contribution() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
-    let thread_id = generate_test_request_id("p13", "fallback");
-    seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "PHASE13_FALLBACK_RAW",
-    )
-    .await;
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &harness.processor,
-        phase_13_hook_runtime_with_fallback(
-            calls.clone(),
-            Phase13HookBehavior::Fail,
-            HookAwaitPolicy::Blocking,
-            None,
-            HookFailurePolicy::Fallback,
-            vec![phase_13_prompt_section_contribution()],
-        ),
-    )
-    .await;
-
-    let history = harness
-        .processor
-        .load_conversation_history(thread_id.as_str(), "turn_fallback")
-        .await;
-    let summary = harness
-        .crud_store
-        .get_thread_summary(thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-    let summary_prompt = provider.snapshot_requests()[0].messages[0].content.clone();
-
-    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
-    assert_eq!(provider.call_count(), 1);
-    assert_eq!(
-        summary.as_ref().map(|(summary, _)| summary.as_str()),
-        Some("compressed summary")
-    );
-    assert_eq!(history.len(), 1);
-    assert!(!summary_prompt.contains("this must not enter the summary prompt"));
-}
-
-#[tokio::test]
-async fn phase_13_required_hook_failure_skips_summary_update_and_uses_fallback() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
-    let thread_id = generate_test_request_id("p13", "requiredfail");
-    seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "PHASE13_REQUIRED_RAW",
-    )
-    .await;
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &harness.processor,
-        phase_13_hook_runtime(
-            calls.clone(),
-            Phase13HookBehavior::Fail,
-            HookAwaitPolicy::Blocking,
-            None,
-            HookFailurePolicy::Required,
-        ),
-    )
-    .await;
-
-    let history = harness
-        .processor
-        .load_conversation_history(thread_id.as_str(), "turn_required_failure")
-        .await;
-    let summary = harness
-        .crud_store
-        .get_thread_summary(thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
-    assert_eq!(provider.call_count(), 0);
-    assert!(summary.is_none());
-    assert!(!history.is_empty());
+    harness.processor.bind_context_compaction().await;
     assert!(
-        history
-            .iter()
-            .any(|message| message.content.contains("PHASE13_REQUIRED_RAW"))
+        harness
+            .processor
+            .agent_manager
+            .has_context_controller()
+            .await
     );
-}
-
-#[tokio::test]
-async fn phase_13_fail_closed_hook_failure_skips_summary_update() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
-    let thread_id = generate_test_request_id("p13", "failclosed");
+    let thread_id = generate_test_request_id("history", "canonical-cutover");
     seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "PHASE13_FAILCLOSED_RAW",
+        &harness.crud_store,
+        &harness.workspace_id,
+        &thread_id,
+        "retained-original",
     )
     .await;
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &harness.processor,
-        phase_13_hook_runtime(
-            calls.clone(),
-            Phase13HookBehavior::Fail,
-            HookAwaitPolicy::Blocking,
-            None,
-            HookFailurePolicy::FailClosed,
-        ),
-    )
-    .await;
-
-    let history = harness
-        .processor
-        .load_conversation_history(thread_id.as_str(), "turn_fail_closed")
-        .await;
-    let summary = harness
-        .crud_store
-        .get_thread_summary(thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
-    assert_eq!(provider.call_count(), 0);
-    assert!(summary.is_none());
-    assert!(!history.is_empty());
-}
-
-#[tokio::test]
-async fn phase_13_deadline_required_timeout_skips_summary_update() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
-    let thread_id = generate_test_request_id("p13", "deadline");
-    seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "PHASE13_DEADLINE_RAW",
-    )
-    .await;
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &harness.processor,
-        phase_13_hook_runtime(
-            calls.clone(),
-            Phase13HookBehavior::Pending,
-            HookAwaitPolicy::Deadline,
-            Some(5),
-            HookFailurePolicy::Required,
-        ),
-    )
-    .await;
-
-    let history = harness
-        .processor
-        .load_conversation_history(thread_id.as_str(), "turn_deadline")
-        .await;
-    let summary = harness
-        .crud_store
-        .get_thread_summary(thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    assert_eq!(calls.lock().expect("phase 13 calls lock").len(), 1);
-    assert_eq!(provider.call_count(), 0);
-    assert!(summary.is_none());
-    assert!(!history.is_empty());
-}
-
-#[tokio::test]
-async fn phase_13_hook_contributions_do_not_mutate_summary() {
-    let baseline_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let baseline_harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(baseline_provider.clone()))
-            .await;
-    let baseline_thread_id = generate_test_request_id("p13", "baseline");
-    seed_phase_13_compaction_thread(
-        baseline_harness.crud_store.as_ref(),
-        baseline_harness.workspace_id.as_str(),
-        baseline_thread_id.as_str(),
-        "PHASE13_NONMUTATION_RAW",
-    )
-    .await;
-    let baseline_history = baseline_harness
-        .processor
-        .load_conversation_history(baseline_thread_id.as_str(), "turn_baseline")
-        .await;
-    let baseline_summary = baseline_harness
-        .crud_store
-        .get_thread_summary(baseline_thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    let hook_provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let hook_harness =
-        setup_phase_13_compaction_harness(phase_13_provider_registry(hook_provider.clone())).await;
-    let hook_thread_id = generate_test_request_id("p13", "withcontrib");
-    seed_phase_13_compaction_thread(
-        hook_harness.crud_store.as_ref(),
-        hook_harness.workspace_id.as_str(),
-        hook_thread_id.as_str(),
-        "PHASE13_NONMUTATION_RAW",
-    )
-    .await;
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    install_test_hook_runtime(
-        &hook_harness.processor,
-        phase_13_hook_runtime(
-            calls,
-            Phase13HookBehavior::Succeed {
-                contributions: vec![phase_13_prompt_section_contribution()],
-            },
-            HookAwaitPolicy::Blocking,
-            None,
-            HookFailurePolicy::BestEffort,
-        ),
-    )
-    .await;
-    let hook_history = hook_harness
-        .processor
-        .load_conversation_history(hook_thread_id.as_str(), "turn_hook_contrib")
-        .await;
-    let hook_summary = hook_harness
-        .crud_store
-        .get_thread_summary(hook_thread_id.as_str())
-        .await
-        .expect("summary lookup succeeds");
-
-    let baseline_prompt = baseline_provider.snapshot_requests()[0].messages[0]
-        .content
-        .clone();
-    let hook_prompt = hook_provider.snapshot_requests()[0].messages[0]
-        .content
-        .clone();
-
-    assert_eq!(baseline_prompt, hook_prompt);
-    assert_eq!(baseline_summary, hook_summary);
-    assert_eq!(
-        phase_13_history_value(baseline_history.as_slice()),
-        phase_13_history_value(hook_history.as_slice())
-    );
-    assert!(!hook_prompt.contains("this must not enter the summary prompt"));
-}
-
-#[tokio::test]
-async fn phase_13_pre_compaction_input_is_bounded() {
-    let provider = Arc::new(CaptureSummaryProvider::new("compressed summary"));
-    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
-    let thread_id = generate_test_request_id("p13", "bounded");
-    seed_phase_13_compaction_thread(
-        harness.crud_store.as_ref(),
-        harness.workspace_id.as_str(),
-        thread_id.as_str(),
-        "VERY_RAW_USER_TEXT_PHASE13",
-    )
-    .await;
-    let omitted_summary_tail = "OMITTED_SUMMARY_TAIL_PHASE13";
-    let long_summary = format!("{}{}", "s".repeat(2_100), omitted_summary_tail);
     harness
         .crud_store
-        .update_thread_summary(thread_id.as_str(), long_summary.as_str(), 1)
+        .update_thread_summary(&thread_id, "unknown legacy summary", 999)
         .await
-        .expect("existing summary should update");
-
+        .unwrap();
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     install_test_hook_runtime(
         &harness.processor,
@@ -59289,34 +59689,46 @@ async fn phase_13_pre_compaction_input_is_bounded() {
         ),
     )
     .await;
-    let _history = harness
+    ensure_test_superuser_execution_turn(
+        &harness.processor,
+        &harness.workspace_id,
+        &thread_id,
+        "next-turn",
+    )
+    .await;
+    let history = harness
         .processor
-        .load_conversation_history(thread_id.as_str(), "turn_bounded")
-        .await;
-
-    let calls = calls.lock().expect("phase 13 calls lock");
-    let request = calls.first().expect("pre-compaction hook should run");
-    let serialized_input =
-        serde_json::to_string(&request.input).expect("input should serialize safely");
-    assert!(!serialized_input.contains("VERY_RAW_USER_TEXT_PHASE13"));
-    assert!(!serialized_input.contains(omitted_summary_tail));
-
-    let HookInputPayload::TurnPreCompaction(payload) = &request.input.payload else {
-        panic!("pre-compaction payload should be typed");
-    };
-    let preview = payload
-        .existing_summary_preview
-        .as_ref()
-        .expect("existing summary preview should be present");
-    assert!(preview.truncated);
-    assert_eq!(preview.max_chars, 2_000);
-    assert_eq!(payload.source_range.existing_summary_turn_count, Some(1));
-    assert_eq!(payload.source_range.max_loaded_turns, 200);
-    assert_eq!(payload.source_range.source_entry_count, 2);
-    assert_eq!(payload.token_budget.max_context_tokens, 1_000);
-    assert_eq!(payload.token_budget.response_reserve_tokens, 200);
-    assert_eq!(payload.summary_policy.compression_threshold_bps, 8_000);
-    assert_eq!(payload.summary_policy.compression_target_bps, 1_000);
+        .load_conversation_history_for_workspace(&harness.workspace_id, &thread_id, "next-turn")
+        .await
+        .unwrap();
+    let text = history
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for index in 0..2 {
+        assert_eq!(
+            text.matches(&format!("retained-original_user_{index}"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.matches(&format!("retained-original_assistant_{index}"))
+                .count(),
+            1
+        );
+    }
+    assert!(!text.contains("unknown legacy summary"));
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(
+        harness
+            .crud_store
+            .get_thread_summary(&thread_id)
+            .await
+            .unwrap(),
+        Some(("unknown legacy summary".into(), 999))
+    );
 }
 
 struct MemoryGatewayHarness {
@@ -59389,7 +59801,6 @@ async fn setup_memory_gateway_harness(case_id: &str, enabled: bool) -> MemoryGat
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         test_tool_loop_config(),
         memory_runtime,
         runtime_home.clone(),
@@ -59458,7 +59869,6 @@ async fn setup_memory_agent_e2e_harness_with_tool_loop_config(
         crud_store.clone(),
         test_gateway_secrets(),
         test_summary_config(),
-        test_context_budget(),
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
@@ -62554,4 +62964,1338 @@ async fn recv_echo_turn_lifecycle_notifications(
     }
 
     panic!("timed out waiting for full turn lifecycle notifications");
+}
+
+#[tokio::test]
+async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
+    use pioneer_protocol::{ThreadToolResultReadParams, ThreadToolResultReadResponse};
+    let (workspace_manager, store, workspace_id) = setup_workspace_manager().await;
+    let (tx, mut rx) = mpsc::channel(32);
+    let sessions = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("fixture", "echo")),
+        test_provider(),
+        sessions,
+        workspace_manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    let db = store.database_connection();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('result-thread',?,'','agent','m','echo','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [workspace_id.clone().into()])).await.unwrap();
+    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('result-turn','result-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    let payload = serde_json::json!({"kind":"json","truncated":false,"value":{"role":"tool","name":"fixture","tool_call_id":"call","content":"🌍漢字\\\"\n".repeat(5000)}}).to_string();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('result-source','result-turn','result-item',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
+    let mut params = ThreadToolResultReadParams {
+        workspace_id,
+        thread_id: "result-thread".into(),
+        turn_id: "result-turn".into(),
+        item_id: "result-item".into(),
+        cursor: None,
+        max_tokens: Some(300),
+        max_bytes: Some(1500),
+    };
+    let request_id = generate_test_request_id("compaction-result", "authorized");
+    processor.process_request_for_connection(connection_id, &json!({"jsonrpc":"2.0", "id":request_id, "method":"threads/tools/result/read", "params":params}).to_string()).await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let first: ThreadToolResultReadResponse = serde_json::from_value(response.result).unwrap();
+    assert!(!first.text.is_empty());
+    let mut small = params.clone();
+    small.max_tokens = Some(100);
+    small.max_bytes = Some(200);
+    let small_page = processor.read_thread_tool_result(small).await.unwrap();
+    assert!(!small_page.text.is_empty());
+    assert!(serde_json::to_string(&small_page).unwrap().len() <= 200);
+    let mut restored = String::new();
+    loop {
+        let page: ThreadToolResultReadResponse = processor
+            .read_thread_tool_result(params.clone())
+            .await
+            .unwrap();
+        let wire = serde_json::to_string(&page).unwrap();
+        assert!(wire.len() <= 1500 && pioneer_compaction::text_tokens(&wire) <= 300);
+        restored.push_str(&page.text);
+        params.cursor = page.next;
+        if page.eof {
+            break;
+        }
+    }
+    assert_eq!(restored, payload);
+    params.workspace_id = "unrelated-workspace".into();
+    params.cursor = None;
+    let request_id = generate_test_request_id("compaction-result", "wrong-scope");
+    processor.process_request_for_connection(connection_id, &json!({"jsonrpc":"2.0", "id":request_id, "method":"threads/tools/result/read", "params":params}).to_string()).await;
+    let wire = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+    let response: JsonValue = serde_json::from_str(&wire).unwrap();
+    assert!(
+        response.get("error").is_some(),
+        "wrong scope must fail central admission"
+    );
+    assert!(processor.read_thread_tool_result(params).await.is_err());
+}
+
+#[tokio::test]
+async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_observation() {
+    let thread = "thr_failed_partial";
+    let turn = "turn_failed_partial";
+    let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    start_terminal_test_execution_window(
+        &processor,
+        &workspace,
+        thread,
+        turn,
+        "win_failed_partial",
+    )
+    .await;
+    let mut message = pioneer_provider::ChatMessage::assistant("partial answer, not completed");
+    message.reasoning_content = Some("received reasoning".into());
+    message.tool_calls = Some(vec![pioneer_provider::ProviderToolCall {
+        id: "not-executed".into(),
+        name: "tool".into(),
+        arguments: "{}".into(),
+    }]);
+    let payload = serde_json::to_value(pioneer_provider::CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "failed-thinking".into(),
+        termination: pioneer_provider::ProviderTermination::ProviderError,
+        message,
+        calls: Vec::new(),
+    })
+    .unwrap();
+    let event = AgentDurableEvent::TurnProviderHistoryAppended {
+        thread_id: thread.into(),
+        turn_id: turn.into(),
+        item_id: "failed-thinking".into(),
+        sequence: 0,
+        payload,
+    };
+    assert!(processor.handle_durable_agent_event(event.clone()).await);
+    assert!(processor.handle_durable_agent_event(event).await);
+    let page = store
+        .compaction_source_page(
+            &workspace,
+            thread,
+            turn,
+            pioneer_crud::compaction::CanonicalSource::ProviderContext,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].source_type, "provider_observation");
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let history = crate::compaction::load_line_history(&store, &workspace, thread, None, &fence)
+        .await
+        .unwrap();
+    let partial = history
+        .into_iter()
+        .filter(|message| message.content.contains("Unsuccessful provider response"))
+        .collect::<Vec<_>>();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].role, pioneer_provider::Role::User);
+    assert!(partial[0].tool_calls.is_none());
+    assert!(partial[0].content.contains("not-executed"));
+    assert!(partial[0].content.contains("received reasoning"));
+    let allowed = std::collections::BTreeSet::from([thread.to_owned()]);
+    let frozen = crate::compaction::frozen::capture(&store, &workspace, thread, &allowed, &partial)
+        .await
+        .unwrap();
+    let restored = crate::compaction::frozen::restore(&store, &workspace, &allowed, &frozen)
+        .await
+        .unwrap();
+    assert_eq!(restored, partial);
+    processor
+        .persist_turn_runtime_snapshot(
+            thread,
+            &workspace,
+            turn,
+            pioneer_protocol::ThreadMode::Agent,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            "fixture-model",
+            "fixture-provider",
+            None,
+            &std::collections::HashMap::new(),
+            &[],
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &partial,
+            &[],
+        )
+        .await
+        .unwrap();
+    let runtime = store
+        .get_turn_runtime_snapshot(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!runtime.history_json.contains("partial answer"));
+    assert!(!runtime.history_json.trim_start().starts_with('['));
+    let (_, runtime_history) =
+        crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&store, &runtime)
+            .await
+            .unwrap();
+    assert_eq!(runtime_history, partial);
+    assert!(
+        !serde_json::to_string(&frozen)
+            .unwrap()
+            .contains("partial answer")
+    );
+}
+
+#[tokio::test]
+async fn compaction_general_default_model_reaches_thread_start_as_one_selection() {
+    use pioneer_protocol::{GatewayModelSelection, ModelSelectionTransport};
+    let (tx, mut rx) = mpsc::channel(256);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("", "")),
+        test_provider(),
+        sessions.clone(),
+        workspaces,
+        store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    for (index, transport) in [
+        ModelSelectionTransport::Api,
+        ModelSelectionTransport::Codex,
+        ModelSelectionTransport::Claude,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        processor.workspace_model_settings.write().unwrap().insert(
+            workspace.clone(),
+            crate::settings::WorkspaceModelSettings {
+                default_model: GatewayModelSelection::Explicit {
+                    transport,
+                    instance: "selected-instance".into(),
+                    model: "selected-model".into(),
+                    reasoning_effort: Some("high".into()),
+                },
+                compaction_model: None,
+                enabled: true,
+                cli_overrides: Default::default(),
+            },
+        );
+        for explicit in [false, true] {
+            let request_id =
+                generate_test_request_id("default-model", &format!("{index}-{explicit}"));
+            let mut params = json!({"workspace_id":workspace,"thread_id":format!("default-model-{index}-{explicit}")});
+            if explicit {
+                params["model"] = json!("explicit-model");
+                params["model_provider"] = json!("explicit-api");
+            }
+            processor.clone().process_owned_request(sessions.connection_context(connection).await.unwrap(),
+                json!({"jsonrpc":"2.0","id":request_id,"method":"thread/start","params":params}).to_string()).await;
+            let response = recv_response_by_id(&mut rx, &request_id).await;
+            let response: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
+            assert_eq!(
+                response.thread.model,
+                if explicit {
+                    "explicit-model"
+                } else {
+                    "selected-model"
+                }
+            );
+            let expected_provider = if explicit {
+                "explicit-api".to_owned()
+            } else if transport == ModelSelectionTransport::Api {
+                "selected-instance".into()
+            } else {
+                super::turn_handlers::cli_runtime_provider_key("selected-instance")
+            };
+            assert_eq!(response.thread.model_provider, expected_provider);
+            assert_eq!(
+                response.thread.reasoning_effort.as_deref(),
+                (!explicit).then_some("high")
+            );
+        }
+    }
+    processor.workspace_model_settings.write().unwrap().clear();
+    let request_id = generate_test_request_id("default-model", "inherit");
+    processor
+        .clone()
+        .process_owned_request(
+            sessions.connection_context(connection).await.unwrap(),
+            json!({"jsonrpc":"2.0","id":request_id,"method":"thread/start",
+            "params":{"workspace_id":workspace,"thread_id":"default-model-inherit"}})
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let response: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
+    assert!(response.thread.model.is_empty());
+    assert!(response.thread.model_provider.is_empty());
+    assert!(response.thread.reasoning_effort.is_none());
+}
+
+#[tokio::test]
+async fn compaction_native_overflow_twice_retries_main_request_once() {
+    Box::pin(check_native_overflow_twice(false, false)).await;
+}
+
+#[tokio::test]
+async fn compaction_native_overflow_twice_never_reexecutes_completed_tool() {
+    Box::pin(check_native_overflow_twice(true, false)).await;
+}
+
+#[tokio::test]
+async fn compaction_native_overflow_uses_general_cli_model_and_owned_service() {
+    Box::pin(check_native_overflow_twice(false, true)).await;
+}
+
+// Keep large synchronous settings/configuration temporaries off the async
+// recovery fixture's poll frame. This does not change runtime stack limits.
+fn configure_native_cli_summary_fixture(
+    processor: &MessageProcessor,
+    fixture: &std::path::Path,
+    workspace: &str,
+    cli_called: &std::path::Path,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = fixture.join("mock-claude");
+    std::fs::create_dir_all(cli_called.parent().unwrap()).unwrap();
+    std::fs::write(&executable, r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+if sys.argv[1:] == ['--version']:
+    print('2.1.79 (Claude Code)'); sys.exit(0)
+a = sys.argv[1:]
+assert '--no-session-persistence' in a and '--resume' not in a
+assert a[a.index('--model')+1] == 'claude-sonnet-4-6'
+assert a[a.index('--effort')+1] == 'high'
+assert a[a.index('--tools')+1] == ''
+r = json.load(sys.stdin)
+assert r['compact_units']
+p = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'], 'called')
+p.write_text('called')
+h = ['Goal and constraints','Decisions and rationale','Completed work and results','Failed attempts and unknowns','Current work and next step','Source references']
+t = '\n\n'.join('## '+x+'\nПользователь ожидает ответ; продолжить текущую задачу.' for x in h)
+print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}, {'type':'result','subtype':'success','is_error':False,'stop_reason':'end_turn','result':t,'modelUsage':{'claude-sonnet-4-6':{}},'usage':{'input_tokens':32,'output_tokens':100}}]))
+"#).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = crate::isolated_test_app_config().unwrap();
+    let path = processor
+        .artifact_runtime_home
+        .join(&config.gateway.settings_file_name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut settings = crate::settings::load_or_create_gateway_settings(
+        &path,
+        config.gateway.settings_version,
+        &config.gateway.settings_file_name,
+    )
+    .unwrap();
+    let mut runtime = pioneer_protocol::GatewayCliRuntimeInstanceSettings::default_claude();
+    runtime.binary_path = executable.to_string_lossy().into_owned();
+    runtime.home_path = cli_called.parent().unwrap().to_string_lossy().into_owned();
+    settings
+        .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings {
+            instances: vec![runtime],
+        })
+        .unwrap();
+    crate::settings::save_gateway_settings(&path, &settings).unwrap();
+    processor.workspace_model_settings.write().unwrap().insert(
+        workspace.to_owned(),
+        crate::settings::WorkspaceModelSettings {
+            compaction_model: Some(pioneer_protocol::GatewayModelSelection::Explicit {
+                transport: pioneer_protocol::ModelSelectionTransport::Claude,
+                instance: "claude".into(),
+                model: "claude-sonnet-4-6".into(),
+                reasoning_effort: Some("high".into()),
+            }),
+            default_model: Default::default(),
+            enabled: true,
+            cli_overrides: Default::default(),
+        },
+    );
+}
+
+async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
+    let (tx, mut rx) = mpsc::channel(256);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let threads = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let tool_fixture = tempfile::tempdir().unwrap();
+    let executions = tool_fixture.path().join("executions");
+    struct OverflowProvider(std::sync::Mutex<Vec<ChatRequest>>, Vec<ProviderToolCall>);
+    #[async_trait::async_trait]
+    impl Provider for OverflowProvider {
+        fn name(&self) -> &str {
+            "overflow-fixture"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            let mut capabilities = CaptureSummaryProvider::new("").capabilities();
+            capabilities.tool_calling = !self.1.is_empty();
+            capabilities
+        }
+        async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+            if is_turn_preflight_request(&request) {
+                return Ok(sequenced_tool_provider_preflight_response(
+                    &request, &self.1,
+                ));
+            }
+            let first = {
+                let mut requests = self.0.lock().unwrap();
+                requests.push(request);
+                requests.len() == 1
+            };
+            if first && !self.1.is_empty() {
+                return Ok(ChatResponse {
+                    text: String::new(),
+                    usage: None,
+                    reasoning_content: None,
+                    provider_replay_state: None,
+                    termination: pioneer_provider::ProviderTermination::ToolCalls,
+                    tool_calls: self.1.clone(),
+                });
+            }
+            anyhow::bail!("provider error: maximum context length exceeded")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("non-stream fixture")
+        }
+    }
+    let calls = if with_tool {
+        vec![ProviderToolCall {
+        id: "overflow-completed-tool".into(), name: "exec_command".into(),
+        arguments: json!({
+            "command": ["/bin/sh", "-c", "printf x >> \"$1\"; printf retained-output", "fixture", executions.display().to_string()],
+            "workdir": tool_fixture.path().display().to_string(),
+            "timeout_ms": 10000, "max_output_tokens": 1000, "tty": false,
+        }).to_string(),
+    }]
+    } else {
+        Vec::new()
+    };
+    let provider = Arc::new(OverflowProvider(std::sync::Mutex::new(Vec::new()), calls));
+    let summary = Arc::new(CaptureSummaryProvider::new(
+        pioneer_compaction::summary::HEADINGS
+            .iter()
+            .map(|heading| {
+                format!("{heading}\nПользователь ожидает ответ; продолжить текущую задачу.")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ));
+    let registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        provider.clone(),
+    ));
+    registry.insert("summary-capture", summary.clone()).unwrap();
+    let mut processor = MessageProcessor::new(
+        threads.clone(),
+        registry,
+        sessions.clone(),
+        workspaces,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    if cli_summary {
+        processor.artifact_runtime_home = tool_fixture.path().join("runtime");
+    }
+    let processor = Arc::new(processor);
+    processor
+        .apply_compaction_settings(pioneer_compaction::CompactionSettings {
+            enabled: true,
+            selection: Some(pioneer_compaction::ModelSelection {
+                transport: pioneer_compaction::Transport::Api,
+                instance: "summary-capture".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    let cli_called = tool_fixture.path().join("cli-home/called");
+    if cli_summary {
+        configure_native_cli_summary_fixture(
+            &processor,
+            tool_fixture.path(),
+            &workspace,
+            &cli_called,
+        );
+    }
+    processor.bind_context_compaction().await;
+    let recovery_processor = Arc::downgrade(&processor);
+    processor
+        .recovery_coordinator
+        .set_listener_starter(Arc::new(move |thread_id| {
+            let recovery_processor = recovery_processor.clone();
+            Box::pin(async move {
+                recovery_processor
+                    .upgrade()
+                    .ok_or_else(|| "fixture processor stopped".to_owned())?
+                    .ensure_agent_listener_task(&thread_id)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        }))
+        .await;
+    let started = threads
+        .thread_start_seeded(
+            connection,
+            workspace.clone(),
+            ThreadStartParams {
+                thread_id: "native-controller".into(),
+                workspace_id: workspace.clone(),
+                name: Some("Native controller fixture".into()),
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(if with_tool {
+                    ThreadMode::Agent
+                } else {
+                    ThreadMode::Chat
+                }),
+                origin_kind: Some(ThreadOriginKind::User),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let connection_context = sessions.connection_context(connection).await.unwrap();
+    let request_id = generate_test_request_id("controller", "start");
+    processor
+        .clone()
+        .process_owned_request(
+            connection_context,
+            json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
+                "params": { "thread_id":"native-controller", "turn_id":"native-controller-turn",
+                    "input":[{"type":"text","text":"native controller current input"}],
+                    "model":"test-model", "model_provider":"openai", "mode": if with_tool { "Agent" } else { "Chat" } }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let events = processor
+                .recovery_coordinator
+                .run_ready_jobs(chrono::Utc::now().timestamp(), 8)
+                .await
+                .unwrap();
+            for event in events {
+                processor
+                    .handle_recovery_event(event, chrono::Utc::now().timestamp())
+                    .await;
+            }
+            let (_, turn) = store
+                .get_turn("native-controller", "native-controller-turn")
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(turn.status, TurnStatus::Failed | TurnStatus::Blocked) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("second overflow must terminate bounded recovery");
+    let requests = provider.0.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2 + usize::from(with_tool),
+        "one original request and exactly one main retry, plus the initial tool round"
+    );
+    assert!(requests.iter().all(|request| request.max_tokens.is_some()));
+    drop(requests);
+    if with_tool {
+        assert_eq!(
+            std::fs::read_to_string(&executions).unwrap(),
+            "x",
+            "a completed command must execute exactly once across overflow recovery"
+        );
+    }
+    if cli_summary {
+        assert!(
+            cli_called.exists(),
+            "native recovery must use the General CLI service"
+        );
+        assert_eq!(summary.call_count(), 0, "no hidden API fallback");
+    } else {
+        assert!(
+            summary.call_count() > 0,
+            "recovery must invoke the real compaction runner"
+        );
+    }
+    let row = store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_operation WHERE status='completed'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
+    let pending = store
+        .find_recovery_jobs_by_turn_and_status("native-controller-turn", RecoveryJobStatus::Pending)
+        .await
+        .unwrap();
+    assert!(
+        pending.is_empty(),
+        "second overflow must not schedule another main retry"
+    );
+}
+
+#[tokio::test]
+async fn compaction_native_controller_runs_on_real_turn_and_checks_short_completed_history() {
+    let (tx, mut rx) = mpsc::channel(256);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let threads = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let provider = Arc::new(CaptureSummaryProvider::new("controller answer"));
+    let processor = Arc::new(MessageProcessor::new(
+        threads.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        )),
+        sessions.clone(),
+        workspaces,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
+    let started = threads
+        .thread_start_seeded(
+            connection,
+            workspace.clone(),
+            ThreadStartParams {
+                thread_id: "native-controller".into(),
+                workspace_id: workspace.clone(),
+                name: Some("Native controller fixture".into()),
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Chat),
+                origin_kind: Some(ThreadOriginKind::User),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let connection_context = sessions.connection_context(connection).await.unwrap();
+    let request_id = generate_test_request_id("controller", "start");
+    processor
+        .clone()
+        .process_owned_request(
+            connection_context,
+            json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
+                "params": { "thread_id":"native-controller", "turn_id":"native-controller-turn",
+                    "input":[{"type":"text","text":"native controller current input"}],
+                    "model":"test-model", "model_provider":"openai", "mode":"Chat" }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, turn) = store
+                .get_turn("native-controller", "native-controller-turn")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                turn.status != TurnStatus::Failed && turn.status != TurnStatus::Blocked,
+                "native controller failed: {:?}",
+                turn.error
+            );
+            if turn.status == TurnStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            processor.poll_completed_history_checks().await.unwrap();
+            let row = store.database_connection().query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_frozen_history WHERE owner_thread='native-controller' AND ready=1 AND message_count>=2".to_owned(),
+            )).await.unwrap().unwrap();
+            if row.try_get::<i64>("", "n").unwrap() > 0 && store.compaction_pending_history_checks().await.unwrap().is_empty() { break }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("post-terminal controller must capture canonical completed history");
+    let requests = provider.snapshot_requests();
+    let request = requests
+        .iter()
+        .find(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.content == "native controller current input")
+        })
+        .unwrap();
+    assert!(
+        request.max_tokens.is_some(),
+        "complete request budget must set the provider reserve"
+    );
+    assert!(
+        request
+            .messages
+            .iter()
+            .find(|message| message.content == "native controller current input")
+            .unwrap()
+            .provenance
+            .as_ref()
+            .unwrap()
+            .protected_input
+    );
+    let row = store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        0,
+        "short history must not create a service generation"
+    );
+    let cancel_id = generate_test_request_id("controller", "cancel-completed");
+    processor
+        .clone()
+        .process_owned_request(
+            sessions.connection_context(connection).await.unwrap(),
+            json!({"jsonrpc":"2.0", "id":cancel_id, "method":"turn/cancel",
+            "params":{"thread_id":"native-controller","turn_id":"native-controller-turn"}})
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &cancel_id).await;
+    let response: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
+    assert_eq!(response.turn.status, TurnStatus::Completed);
+    let row = store.database_connection().query_one_raw(sea_orm::Statement::from_string(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT count(*) AS n FROM compaction_execution_stop WHERE turn_id='native-controller-turn'".to_owned(),
+    )).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        1,
+        "completed-turn RPC Stop must fence context preparation"
+    );
+}
+
+#[tokio::test]
+async fn compaction_history_load_rejects_missing_and_foreign_scope_before_provider_call() {
+    let provider = Arc::new(CaptureSummaryProvider::new("must not run"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    assert!(
+        harness
+            .processor
+            .load_conversation_history_for_workspace(
+                &harness.workspace_id,
+                "missing-history-thread",
+                "next-turn"
+            )
+            .await
+            .is_err()
+    );
+    seed_phase_13_compaction_thread(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "scoped-history-thread",
+        "private-history",
+    )
+    .await;
+    assert!(
+        harness
+            .processor
+            .load_conversation_history_for_workspace(
+                "different-workspace",
+                "scoped-history-thread",
+                "next-turn"
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[tokio::test]
+async fn completed_cli_history_uses_general_api_without_primary_cli_or_new_turns() {
+    check_completed_history(false, false, false, false, false).await;
+}
+#[tokio::test]
+async fn durable_completed_cli_owner_prepares_history_and_publishes_lifecycle() {
+    check_completed_history(true, false, false, false, false).await;
+}
+#[tokio::test]
+async fn durable_completed_cli_owner_resumes_same_operation_after_shutdown() {
+    check_completed_history(true, true, false, false, false).await;
+}
+#[tokio::test]
+async fn durable_completed_cli_owner_stop_joins_service_and_never_resumes() {
+    check_completed_history(true, false, true, false, false).await;
+}
+#[tokio::test]
+async fn durable_completed_cli_owner_recovers_lost_terminal_publication() {
+    check_completed_history(true, false, false, true, false).await;
+}
+#[tokio::test]
+async fn durable_completed_native_owner_preserves_fixed_budget_and_resumes() {
+    check_completed_history(true, true, false, false, true).await;
+}
+#[tokio::test]
+async fn durable_completed_native_owner_stop_joins_registered_background() {
+    check_completed_history(true, false, true, false, true).await;
+}
+async fn check_completed_history(
+    owned: bool,
+    restart: bool,
+    stop: bool,
+    lose_terminal: bool,
+    native: bool,
+) {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    struct SilentObserver;
+    #[async_trait::async_trait]
+    impl crate::compaction::CompactionObserver for SilentObserver {
+        async fn started(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn heartbeat(&self, _: &str) {}
+        async fn terminal(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    struct FailTerminal(crate::compaction::HubCompactionObserver);
+    #[async_trait::async_trait]
+    impl crate::compaction::CompactionObserver for FailTerminal {
+        async fn started(
+            &self,
+            id: &str,
+            state: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            crate::compaction::CompactionObserver::started(&self.0, id, state).await
+        }
+        fn heartbeat(&self, id: &str) {
+            crate::compaction::CompactionObserver::heartbeat(&self.0, id);
+        }
+        async fn terminal(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("fixture delivery failure after checkpoint commit")
+        }
+    }
+    let summary = [
+        "Goal and constraints",
+        "Decisions and rationale",
+        "Completed work and results",
+        "Failed attempts and unknowns",
+        "Current work and next step",
+        "Source references",
+    ]
+    .into_iter()
+    .map(|heading| format!("## {heading}\nfixture retained fact"))
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let provider = Arc::new(CaptureSummaryProvider::new(&summary));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread = "cli-history-preparation";
+    let turn = "cli-history-completed";
+    seed_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "fixture-cli",
+        "claude",
+        thread,
+        turn,
+        "primary-session",
+        &"completed CLI work ".repeat(40_000),
+    )
+    .await;
+    if native {
+        harness
+            .crud_store
+            .database_connection()
+            .execute_unprepared(
+                "DELETE FROM turn_cli_runtime_binding WHERE turn_id='cli-history-completed'",
+            )
+            .await
+            .unwrap();
+    }
+    let mut completed = harness
+        .crud_store
+        .get_turn(thread, turn)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    completed.status = TurnStatus::Completed;
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn: completed,
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    let current = ModelSelection {
+        transport: Transport::Claude,
+        instance: "fixture-cli".into(),
+        model: "unknown-cli-model".into(),
+        effort: Some("high".into()),
+    };
+    let general = CompactionSettings {
+        enabled: true,
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let run = |workspace: String,
+               settings: CompactionSettings,
+               override_model: Option<ModelSelection>| {
+        let processor = harness.processor.clone();
+        let current = current.clone();
+        async move {
+            let hub = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+            let observer: Arc<dyn crate::compaction::CompactionObserver> = if lose_terminal {
+                Arc::new(FailTerminal(crate::compaction::HubCompactionObserver {
+                    hub: hub.clone(),
+                    processor: Arc::downgrade(&processor),
+                    workspace: workspace.clone(),
+                    thread: thread.into(),
+                    turn: turn.into(),
+                }))
+            } else {
+                Arc::new(SilentObserver)
+            };
+            let result = crate::compaction::prepare_completed_history(
+                &processor,
+                &workspace,
+                thread,
+                turn,
+                &current,
+                &settings,
+                override_model.as_ref(),
+                observer,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+            hub.shutdown_progress().await;
+            result
+        }
+    };
+    assert!(
+        run(
+            harness.workspace_id.clone(),
+            CompactionSettings {
+                enabled: false,
+                ..general.clone()
+            },
+            None
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        run("foreign-workspace".into(), general.clone(), None)
+            .await
+            .is_err()
+    );
+    // An unavailable explicit override cannot fall back to the configured API.
+    assert!(
+        run(
+            harness.workspace_id.clone(),
+            general.clone(),
+            Some(current.clone())
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(provider.call_count(), 0);
+    let mut native_owner_context = None;
+    if owned {
+        harness
+            .processor
+            .apply_compaction_settings(general.clone())
+            .unwrap();
+        harness
+            .processor
+            .agent_manager
+            .set_context_controller(Some(Arc::new(
+                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                    &harness.processor,
+                )),
+            )))
+            .await;
+        if native {
+            let native_context = pioneer_agent::compaction::controller::NativeContext {
+                overflow_recovery: false,
+                recovery_deadline_ms: None,
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                conversation_thread_id: None,
+                provider_instance: "summary-capture".into(),
+                provider: provider.clone(),
+                events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            };
+            let request = ChatRequest {
+                model: "test-model".into(),
+                messages: vec![
+                    pioneer_provider::ChatMessage::system("fixed-native-instruction ".repeat(500)),
+                    pioneer_provider::ChatMessage::user("conversational-canary-must-not-be-copied"),
+                ],
+                temperature: None,
+                max_tokens: Some(16384),
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: Some(pioneer_provider::ReasoningConfig::effort(
+                    pioneer_provider::ReasoningEffort::High,
+                )),
+                compiled_prompt: None,
+            };
+            pioneer_agent::compaction::controller::NativeContextController::after_turn(
+                &crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                    &harness.processor,
+                )),
+                &native_context,
+                request,
+                None,
+            )
+            .await
+            .unwrap();
+            native_context.events.shutdown_progress().await;
+            native_owner_context = Some(native_context);
+            let pending = harness
+                .crud_store
+                .compaction_pending_history_checks()
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            let descriptor = pending[0].descriptor.as_ref().unwrap();
+            assert!(!descriptor.contains("conversational-canary"));
+            assert!(!descriptor.contains("fixed-native-instruction"));
+            let value: serde_json::Value = serde_json::from_str(descriptor).unwrap();
+            assert!(value["fixed_input_tokens"].as_u64().unwrap() > 500);
+            assert_eq!(value["target_output_cap"], 16384);
+            assert_eq!(value["current"]["effort"], "high");
+        }
+        if restart || stop {
+            provider.pause_first.store(true, Ordering::SeqCst);
+        }
+        let calls_before_recovery = if lose_terminal {
+            assert!(
+                run(harness.workspace_id.clone(), general.clone(), None)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let missing = harness
+                .crud_store
+                .compaction_lifecycle_recovery((phase_13_now_secs() as u64) * 1000, "")
+                .await
+                .unwrap();
+            assert_eq!(
+                missing.len(),
+                1,
+                "committed checkpoint is missing terminal publication"
+            );
+            assert_eq!(missing[0].status, "completed");
+            assert!(provider.call_count() > 0);
+            Some(provider.call_count())
+        } else {
+            None
+        };
+        harness
+            .processor
+            .poll_completed_history_checks()
+            .await
+            .unwrap();
+        if stop {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while provider.call_count() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if let Some(context) = &native_owner_context {
+                pioneer_agent::compaction::controller::NativeContextController::stop(
+                    &crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                        &harness.processor,
+                    )),
+                    context,
+                )
+                .await
+                .unwrap();
+            } else {
+                harness
+                    .crud_store
+                    .compaction_stop_execution(
+                        &harness.workspace_id,
+                        thread,
+                        &crate::compaction::native_owner(&harness.workspace_id, thread),
+                        turn,
+                    )
+                    .await
+                    .unwrap();
+                harness
+                    .processor
+                    .stop_completed_history_check(&harness.workspace_id, thread, turn)
+                    .await;
+            }
+            assert!(
+                harness
+                    .processor
+                    .completed_history_checks
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            harness
+                .processor
+                .poll_completed_history_checks()
+                .await
+                .unwrap();
+            assert!(
+                harness
+                    .crud_store
+                    .compaction_pending_history_checks()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(provider.call_count(), 1);
+            let row=harness.crud_store.database_connection().query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,"SELECT (SELECT count(*) FROM compaction_operation WHERE status='cancelled') AS cancelled,(SELECT count(*) FROM turn_item WHERE item_id LIKE 'compaction:%' AND json_extract(payload,'$.details.status')='cancelled') AS items,(SELECT count(*) FROM turn WHERE status='completed') AS turns".to_owned()
+            )).await.unwrap().unwrap();
+            assert_eq!(row.try_get::<i64>("", "cancelled").unwrap(), 1);
+            assert_eq!(row.try_get::<i64>("", "items").unwrap(), 1);
+            assert_eq!(row.try_get::<i64>("", "turns").unwrap(), 1);
+            return;
+        }
+        if restart {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while provider.call_count() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let before = harness
+                .crud_store
+                .database_connection()
+                .query_one_raw(sea_orm::Statement::from_string(
+                    sea_orm::DbBackend::Sqlite,
+                    "SELECT id,deadline_ms FROM compaction_operation WHERE status='running'"
+                        .to_owned(),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let operation: String = before.try_get("", "id").unwrap();
+            let deadline: i64 = before.try_get("", "deadline_ms").unwrap();
+            harness.processor.suspend_completed_history_checks().await;
+            assert!(
+                harness
+                    .processor
+                    .completed_history_checks
+                    .lock()
+                    .await
+                    .is_empty()
+            );
+            let pending = harness
+                .crud_store
+                .compaction_pending_history_checks()
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].descriptor.is_some());
+            // Restart must use the admitted whole selection, not later settings.
+            harness
+                .processor
+                .apply_compaction_settings(CompactionSettings {
+                    enabled: false,
+                    selection: None,
+                })
+                .unwrap();
+            harness
+                .processor
+                .poll_completed_history_checks()
+                .await
+                .unwrap();
+            let after = harness
+                .crud_store
+                .compaction_operation(&operation)
+                .await
+                .unwrap()
+                .unwrap();
+            let snapshot: pioneer_compaction::OperationSnapshot =
+                serde_json::from_str(&after.snapshot).unwrap();
+            assert_eq!(snapshot.admission.deadline_ms, deadline as u64);
+        }
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let jobs = harness.processor.completed_history_checks.lock().await;
+                let finished = jobs.values().all(|job| {
+                    job.handle
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                });
+                drop(jobs);
+                if finished {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        harness
+            .processor
+            .poll_completed_history_checks()
+            .await
+            .unwrap();
+        let row = harness.crud_store.database_connection().query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,"SELECT outcome FROM compaction_history_check WHERE turn_id='cli-history-completed'".to_owned()
+        )).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "completed");
+        let row = harness
+            .crud_store
+            .database_connection()
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_operation WHERE status='completed'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
+        let db = harness.crud_store.database_connection();
+        let row = db.query_one_raw(sea_orm::Statement::from_string(sea_orm::DbBackend::Sqlite,
+            "SELECT (SELECT count(*) FROM compaction_operation) AS operations,(SELECT count(*) FROM turn_item WHERE item_id LIKE 'compaction:%' AND json_extract(payload,'$.details.status')='completed') AS items".to_owned())).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "operations").unwrap(), 1);
+        assert_eq!(row.try_get::<i64>("", "items").unwrap(), 1);
+        if let Some(calls) = calls_before_recovery {
+            assert_eq!(provider.call_count(), calls);
+        }
+    } else {
+        let applied = run(harness.workspace_id.clone(), general.clone(), None)
+            .await
+            .unwrap();
+        assert!(applied.is_some());
+    }
+    let calls = provider.call_count();
+    assert!(calls > 0);
+    assert!(
+        provider
+            .snapshot_requests()
+            .iter()
+            .all(|request| request.model == "test-model")
+    );
+    assert!(
+        run(harness.workspace_id.clone(), general, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(provider.call_count(), calls);
+    let db = harness.crud_store.database_connection();
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT (SELECT count(*) FROM turn) AS turns,(SELECT count(*) FROM task_run) AS runs"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "turns").unwrap(), 1);
+    assert_eq!(row.try_get::<i64>("", "runs").unwrap(), 0);
 }

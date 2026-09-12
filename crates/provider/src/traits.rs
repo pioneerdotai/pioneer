@@ -54,6 +54,17 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Materialize and locally budget the media that this request will send.
+    /// The registry wrapper supplies and revalidates the same authority as chat.
+    /// This path performs no model request or provider upload.
+    async fn prepare_input_budget(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::attachments::PreparedInputBudget> {
+        crate::attachments::input_estimate::prepare(self.name(), &self.capabilities(), request)
+            .await
+    }
+
     /// Send a chat request and receive the complete response.
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
 

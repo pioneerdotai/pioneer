@@ -425,3 +425,18 @@ microphone_no_device_available = "No hay ningún micrófono de entrada disponibl
 microphone_sample_format_unsupported = "El formato de muestra del micrófono de escritorio %{format} no es compatible."
 microphone_no_input_stream = "El micrófono predeterminado no puede proporcionar un stream de entrada."
 microphone_capture_failed = "Error al capturar desde el micrófono: %{error}"
+
+[settings.default_model]
+label = "Modelo predeterminado del espacio de trabajo"
+
+[settings.compaction.model]
+label = "Modelo de compresión"
+
+[settings.compaction.enabled]
+label = "Compresión del contexto"
+description = "Comprimir el historial largo de conversaciones en este espacio de trabajo."
+
+[settings.model]
+inherit = "Usar el modelo del turno actual"
+choose = "Elegir…"
+reset = "Restablecer"

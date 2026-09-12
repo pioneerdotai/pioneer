@@ -157,6 +157,26 @@
       "required": [
         "UnsupportedKind"
       ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "InvalidCompactionModel": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "InvalidCompactionModel"
+      ]
     }
   ],
   "$defs": {

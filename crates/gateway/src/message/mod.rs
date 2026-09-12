@@ -11,8 +11,8 @@ mod binary;
 mod cli_post_turn;
 #[path = "../cli_runtime/handlers.rs"]
 mod cli_runtime;
+mod compaction_background;
 mod dispatch;
-mod hooks;
 mod invitation_handlers;
 mod invitation_lifecycle;
 mod markdown;
@@ -39,6 +39,7 @@ mod tests;
 mod thread_agents_doc_handlers;
 mod thread_file_handlers;
 mod thread_handlers;
+mod thread_tool_results;
 mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
@@ -137,7 +138,6 @@ use crate::thread_episodic_hooks::{
     ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
     thread_context_recall_hook_package,
 };
-use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -180,7 +180,6 @@ use pioneer_protocol::{
     CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    ContextCompressedNotification, ContextCompressingNotification,
     GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputSettings,
     GatewayVoiceInputStatusChangedNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
@@ -492,19 +491,6 @@ async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_faile
     true
 }
 
-#[derive(Clone, Copy)]
-pub struct ContextBudget {
-    pub max_context_tokens: usize,
-    pub response_reserve_tokens: usize,
-}
-
-impl ContextBudget {
-    fn history_budget(&self) -> usize {
-        self.max_context_tokens
-            .saturating_sub(self.response_reserve_tokens)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ThreadTitleJobState {
     Pending,
@@ -545,7 +531,11 @@ pub struct MessageProcessor {
     gateway_secrets: Arc<GatewaySecrets>,
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
-    context_budget: ContextBudget,
+    compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
+    compaction_recovery_cursor: Arc<StdRwLock<String>>,
+    completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
+    workspace_model_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceModelSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
@@ -934,7 +924,6 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
-        context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
@@ -950,7 +939,6 @@ impl MessageProcessor {
             crud_store,
             gateway_secrets,
             summary_config,
-            context_budget,
             tool_loop_config,
             memory_runtime,
             runtime_home,
@@ -970,7 +958,6 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
-        context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
@@ -1120,8 +1107,31 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
+            completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_coordinator: Arc::new(
+                crate::compaction::ContextCompactionCoordinator::default(),
+            ),
+            workspace_model_settings: Arc::new(StdRwLock::new(std::collections::BTreeMap::new())),
+            compaction_settings: Arc::new(StdRwLock::new(pioneer_compaction::CompactionSettings {
+                enabled: true,
+                selection: if summary_config.summary_model.is_some()
+                    || summary_config.summary_model_provider.is_some()
+                {
+                    Some(pioneer_compaction::ModelSelection {
+                        transport: pioneer_compaction::Transport::Api,
+                        instance: summary_config
+                            .summary_model_provider
+                            .clone()
+                            .unwrap_or_default(),
+                        model: summary_config.summary_model.clone().unwrap_or_default(),
+                        effort: None,
+                    })
+                } else {
+                    None
+                },
+            })),
             summary_config: Arc::new(summary_config),
-            context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
@@ -1662,6 +1672,14 @@ impl MessageProcessor {
         self.bind_artifact_tool_bridge().await;
     }
 
+    pub(crate) async fn bind_context_compaction(self: &Arc<Self>) {
+        self.agent_manager
+            .set_context_controller(Some(Arc::new(
+                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(self)),
+            )))
+            .await;
+    }
+
     /// Resolve the database-backed launch catalog on an isolated Tokio task.
     /// Task scheduling and turn admission compose large futures, so catalog
     /// projection must not inherit their worker stack.
@@ -2034,6 +2052,50 @@ impl MessageProcessor {
             .apply_workspace_configs(configs.clone());
         self.thread_episodic_recall_service
             .apply_workspace_vector_search_configs(configs);
+    }
+
+    pub(crate) fn compaction_settings(
+        &self,
+    ) -> anyhow::Result<pioneer_compaction::CompactionSettings> {
+        self.compaction_settings
+            .read()
+            .map(|value| value.clone())
+            .map_err(|_| anyhow::anyhow!("compaction settings unavailable"))
+    }
+    pub(crate) fn compaction_settings_for_workspace(
+        &self,
+        workspace: &str,
+    ) -> anyhow::Result<pioneer_compaction::CompactionSettings> {
+        let legacy = self.compaction_settings()?;
+        let settings = self
+            .workspace_model_settings
+            .read()
+            .map_err(|_| anyhow::anyhow!("workspace model settings unavailable"))?;
+        Ok(settings
+            .get(workspace)
+            .map_or(legacy.clone(), |value| value.compaction(&legacy)))
+    }
+    pub(crate) fn apply_workspace_model_settings(
+        &self,
+        settings: &crate::settings::GatewaySettings,
+    ) -> anyhow::Result<()> {
+        let prepared = settings.workspace_model_settings();
+        *self
+            .workspace_model_settings
+            .write()
+            .map_err(|_| anyhow::anyhow!("workspace model settings unavailable"))? = prepared;
+        Ok(())
+    }
+
+    pub(crate) fn apply_compaction_settings(
+        &self,
+        settings: pioneer_compaction::CompactionSettings,
+    ) -> anyhow::Result<()> {
+        *self
+            .compaction_settings
+            .write()
+            .map_err(|_| anyhow::anyhow!("compaction settings unavailable"))? = settings;
+        Ok(())
     }
 
     pub(crate) fn apply_keepawake_setting(&self, enabled: bool) -> anyhow::Result<()> {
@@ -2501,6 +2563,9 @@ impl MessageProcessor {
                 let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
+                if maintenance.poll_completed_history_checks().await.is_err() {
+                    warn!("failed to poll completed history checks");
+                }
                 if now >= next_skill_upload_cleanup {
                     crate::database::attribution::scope_database_workload(
                         pioneer_observability::DatabaseWorkload::ExecutionSupervision,
@@ -2836,6 +2901,7 @@ impl MessageProcessor {
                 let _ = handle.await;
             }
         }
+        self.suspend_completed_history_checks().await;
         self.task_runtime.shutdown().await;
     }
 
@@ -3802,7 +3868,8 @@ impl MessageProcessor {
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     ) -> anyhow::Result<()> {
-        let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+        let canonical = history.iter().all(|message| message.provenance.is_some());
+        let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
             thread_id,
             workspace_id,
             turn_id,
@@ -3816,9 +3883,31 @@ impl MessageProcessor {
             capabilities,
             resolved_artifacts,
             runtime_environment,
-            history,
+            if canonical { &[] } else { history },
             agent_skill_overlay,
         )?;
+        if canonical {
+            let allowed = crate::compaction::frozen::execution_history_scopes(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                hook_runtime_context.conversation_thread_id.as_deref(),
+            )
+            .await?;
+            let descriptor = crate::compaction::frozen::capture(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                &allowed,
+                history,
+            )
+            .await
+            .context("failed to freeze canonical runtime history")?;
+            snapshot.history_json = serde_json::to_string(&descriptor)?;
+        }
+        // Temporary compatibility for the ordinary legacy loader is removed
+        // when that loader is replaced. Canonical Task histories never enter it.
         self.crud_store
             .upsert_turn_runtime_snapshot(snapshot)
             .await
@@ -4124,7 +4213,6 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
-        context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
     ) -> Self {
         let memory_runtime = Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone()));
@@ -4141,7 +4229,6 @@ impl MessageProcessor {
             crud_store,
             gateway_secrets,
             summary_config,
-            context_budget,
             tool_loop_config,
             memory_runtime,
             runtime_home,
@@ -4368,16 +4455,21 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
+            completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_coordinator: Arc::new(
+                crate::compaction::ContextCompactionCoordinator::default(),
+            ),
+            workspace_model_settings: Arc::new(StdRwLock::new(std::collections::BTreeMap::new())),
+            compaction_settings: Arc::new(StdRwLock::new(
+                pioneer_compaction::CompactionSettings::default(),
+            )),
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
                 summary_model_provider: Some("echo".to_owned()),
                 title_model: Some("test-model".to_owned()),
                 title_model_provider: Some("echo".to_owned()),
             }),
-            context_budget: ContextBudget {
-                max_context_tokens: 128_000,
-                response_reserve_tokens: 16_000,
-            },
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),

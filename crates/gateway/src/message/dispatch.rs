@@ -1766,6 +1766,7 @@ impl MessageProcessor {
                 if matches!(
                     request.method.as_str(),
                     methods::THREAD_GET
+                        | methods::THREADS_TOOLS_RESULT_READ
                         | methods::THREAD_TIMELINE_PAGE
                         | methods::THREAD_PATCH_STEPS_PAGE
                         | methods::THREAD_FILE_PATCH_HISTORY_PAGE
@@ -6228,6 +6229,20 @@ impl MessageProcessor {
                         }
                     }
                 }
+                methods::THREADS_TOOLS_RESULT_READ => {
+                    let result = match serde_json::from_value::<pioneer_protocol::ThreadToolResultReadParams>(request.params.unwrap_or_else(empty_object_value)) {
+                        Ok(params) => self.read_thread_tool_result(params).await,
+                        Err(_) => Err(anyhow::anyhow!("invalid result/read parameters")),
+                    };
+                    match result {
+                        Ok(result) => {
+                            if let Ok(response) = JsonRpcResponse::from_result(request.id, &result) {
+                                let _ = self.send_json(connection_id, &response).await;
+                            }
+                        }
+                        Err(_) => self.send_error(connection_id, JsonRpcErrorResponse::new(Some(request.id), INVALID_PARAMS_CODE, "Result unavailable, cursor stale, or page budget too small")).await,
+                    }
+                }
                 methods::ARTIFACT_LIST_FOR_THREAD => {
                     let params_value = request.params.unwrap_or_else(empty_object_value);
                     match serde_json::from_value::<ArtifactListForThreadParams>(params_value) {
@@ -7306,8 +7321,11 @@ impl MessageProcessor {
         request_context: &RequestContext,
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let connection_id = request_context.connection_id();
+        #[cfg(not(test))]
         let config =
             pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
+        #[cfg(test)]
+        let config = crate::isolated_test_app_config()?;
         let settings_file_name = crate::settings::normalize_settings_file_name(
             config.gateway.settings_file_name.as_str(),
         )?;
@@ -7341,8 +7359,11 @@ impl MessageProcessor {
                 "self-improvement settings cannot be updated without the runtime supervisor"
             );
         }
+        #[cfg(not(test))]
         let config =
             pioneer_config::AppConfig::load().context("failed to load app config for settings")?;
+        #[cfg(test)]
+        let config = crate::isolated_test_app_config()?;
         let settings_file_name = crate::settings::normalize_settings_file_name(
             config.gateway.settings_file_name.as_str(),
         )?;
@@ -7530,6 +7551,8 @@ impl MessageProcessor {
                 ),
             };
         }
+
+        self.apply_workspace_model_settings(&settings)?;
 
         if let Some(telemetry_enabled) = changes.general.telemetry_enabled {
             pioneer_observability::set_telemetry_enabled(telemetry_enabled);

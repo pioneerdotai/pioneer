@@ -493,6 +493,14 @@ fn classify_system_event(
     details: Option<&JsonValue>,
     status: &'static str,
 ) -> TurnItemProjectionClassification {
+    let status = match pioneer_protocol::context_compaction_status(code, details) {
+        Some(pioneer_protocol::TurnWorkItemStatus::Running) => WORK_ITEM_STATUS_RUNNING,
+        Some(pioneer_protocol::TurnWorkItemStatus::Completed) => WORK_ITEM_STATUS_COMPLETED,
+        Some(pioneer_protocol::TurnWorkItemStatus::Failed) => WORK_ITEM_STATUS_FAILED,
+        Some(pioneer_protocol::TurnWorkItemStatus::Cancelled) => WORK_ITEM_STATUS_CANCELLED,
+        Some(pioneer_protocol::TurnWorkItemStatus::Blocked) => "blocked",
+        None => status,
+    };
     if matches!(level, SystemEventLevel::Error) {
         return visible_work(
             item_id,

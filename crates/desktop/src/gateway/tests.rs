@@ -326,8 +326,8 @@ pub(crate) fn test_config() -> AppConfig {
             preflight_model: Default::default(),
             telemetry: Default::default(),
             thread: GatewayThreadConfig {
-                default_model: "gpt-5.4".to_owned(),
-                default_model_provider: "openai".to_owned(),
+                default_model: Some("gpt-5.4".to_owned()),
+                default_model_provider: Some("openai".to_owned()),
                 summary_model: None,
                 summary_model_provider: None,
                 title_model: None,

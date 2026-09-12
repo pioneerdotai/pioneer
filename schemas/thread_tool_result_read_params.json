@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadToolResultReadParams",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadToolResultCursor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "item_id": {
+      "type": "string"
+    },
+    "max_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "max_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "turn_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "thread_id",
+    "turn_id",
+    "item_id"
+  ],
+  "$defs": {
+    "ThreadToolResultCursor": {
+      "type": "object",
+      "properties": {
+        "offset": {
+          "description": "Unicode scalar offset in the source, not a UTF-8 byte offset.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "offset"
+      ]
+    }
+  }
+}

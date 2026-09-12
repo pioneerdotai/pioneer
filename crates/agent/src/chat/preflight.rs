@@ -650,6 +650,23 @@ async fn request_turn_preflight_provider_json(
     request: ChatRequest,
     max_output_chars: usize,
 ) -> anyhow::Result<String> {
+    let model_limits =
+        pioneer_provider::catalog::model_catalog()?.limits(provider.name(), &request.model);
+    let evaluated = crate::compaction::request::NativeRequestProjection::full(
+        request,
+        vec![],
+        pioneer_compaction::ModelBudget::new(
+            Some(model_limits.context_window),
+            model_limits.max_input,
+            model_limits.max_output,
+        ),
+        false,
+    )?;
+    anyhow::ensure!(
+        evaluated.fits,
+        "preflight service request exceeds model input capacity"
+    );
+    let request = evaluated.request;
     let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
         let mut stream = provider.stream_chat(request).await?;
@@ -1817,6 +1834,7 @@ mod tests {
             streaming: bool,
             responses: impl IntoIterator<Item = FakePreflightResponse>,
         ) -> Self {
+            load_test_catalog();
             Self {
                 name: name.into(),
                 streaming,
@@ -4122,4 +4140,22 @@ mod tests {
         );
         assert!(plan.memory.active_recall.decision.provider_fallback_used);
     }
+}
+
+#[cfg(test)]
+fn load_test_catalog() {
+    static READY: std::sync::Once = std::sync::Once::new();
+    READY.call_once(|| {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = serde_json::json!({
+            "version": 1,
+            "updated_at": "2026-09-12T00:00:00Z",
+            "catalog": {
+                "models": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/models.json"))).unwrap(),
+                "provenance": serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../provider/tests/fixtures/catalog/provenance.json"))).unwrap(),
+            }
+        });
+        std::fs::write(directory.path().join("catalog.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+        pioneer_provider::catalog::runtime::restore_cached_catalog(directory.path()).unwrap();
+    });
 }

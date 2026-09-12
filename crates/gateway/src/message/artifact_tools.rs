@@ -91,6 +91,7 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .artifact_tool_state_for_turn(context.turn_id.as_str())
             .await;
         let agent_tool_context = context.clone();
+        let context_for_results = context.clone();
         let artifact_context = ArtifactToolContext {
             workspace_id: context.workspace_id,
             thread_id: context.thread_id,
@@ -133,6 +134,7 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .into_iter()
             .collect::<Vec<_>>();
         bundles.extend(agent_actions.bundles);
+        bundles.push(processor.thread_result_tools(context_for_results));
 
         Ok(TurnToolMaterialization {
             bundles,

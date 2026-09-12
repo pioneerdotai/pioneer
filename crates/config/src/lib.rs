@@ -975,8 +975,10 @@ impl Default for GatewayHookRecoveryConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayThreadConfig {
-    pub default_model: String,
-    pub default_model_provider: String,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub default_model_provider: Option<String>,
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default)]

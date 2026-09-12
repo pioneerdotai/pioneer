@@ -1096,6 +1096,73 @@ impl MessageProcessor {
         }
     }
 
+    /// Service compaction explicitly carries Maintenance access through both
+    /// lifecycle persistence and its reads. This path is chosen by its owning
+    /// runner, never inferred from an actor, item name or SQL statement.
+    pub(crate) async fn publish_compaction_lifecycle(
+        self: &Arc<Self>,
+        operation: &str,
+        generation: u64,
+        event: AgentDurableEvent,
+    ) -> Result<()> {
+        let canonical = match &event {
+            AgentDurableEvent::ItemStarted { notification } => {
+                pioneer_crud::CanonicalTurnEventPayload::ItemStarted(notification.clone())
+            }
+            AgentDurableEvent::ItemCompleted { notification } => {
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification.clone())
+            }
+            _ => anyhow::bail!("invalid service compaction lifecycle event"),
+        };
+        let thread = canonical.thread_id().to_owned();
+        self.crud_store
+            .compaction_materialize_lifecycle(
+                operation,
+                generation,
+                canonical,
+                chrono::Utc::now().timestamp(),
+            )
+            .await?;
+        self.kick_native_turn_event_deliveries();
+        self.agent_manager.publish_committed(&thread, event).await;
+        Ok(())
+    }
+
+    pub(crate) async fn capture_current_context_basis(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        excluded_turn: Option<&str>,
+    ) -> Result<String> {
+        let store = self.crud_store.with_maintenance_access();
+        let authority =
+            crate::authorization::ExecutionAuthorizationContext::load_for_turn(&store, turn)
+                .await?;
+        anyhow::ensure!(
+            authority.workspace_id() == workspace,
+            "context authority workspace changed"
+        );
+        let current = self
+            .execution_leases
+            .revalidate_context(
+                &store,
+                &authority,
+                authority.continuation_action(),
+                self.current_authorization_revision().await?,
+            )
+            .await?;
+        self.capture_authorized_task_basis(
+            current.principal(),
+            workspace,
+            thread,
+            Some(turn),
+            excluded_turn,
+            None,
+        )
+        .await
+    }
+
     pub(super) fn handle_durable_agent_event<'a>(
         &'a self,
         event: AgentDurableEvent,
@@ -3146,6 +3213,16 @@ impl MessageProcessor {
                 payload,
             } => message_future(async move {
                 let created_at = now_db_timestamp();
+                let source = if payload
+                    .get("termination")
+                    .and_then(|value| value.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("provider_error")
+                {
+                    "provider_observation"
+                } else {
+                    "assistant_round"
+                };
                 let payload = match serde_json::to_string(&payload) {
                     Ok(payload) => payload,
                     Err(error) => {
@@ -3158,14 +3235,13 @@ impl MessageProcessor {
                         return false;
                     }
                 };
-                let delivery_key =
-                    turn_llm_context_delivery_key(&["assistant_round", item_id.as_str()]);
+                let delivery_key = turn_llm_context_delivery_key(&[source, item_id.as_str()]);
                 let entry = pioneer_crud::NewTurnLlmContextEntry {
                     turn_id: turn_id.clone(),
                     item_id: Some(item_id),
                     attempt_id: None,
                     sequence,
-                    source: "assistant_round".to_owned(),
+                    source: source.to_owned(),
                     tool_name: None,
                     payload,
                     output_policy_snapshot: serde_json::json!({}).to_string(),

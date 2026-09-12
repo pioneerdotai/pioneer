@@ -1,3 +1,7 @@
+mod thread_tool_result;
+pub use thread_tool_result::{
+    ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse,
+};
 pub mod constants;
 
 mod access;
@@ -511,9 +515,10 @@ pub use turn::{
     WebSearchResultItem, build_execution_checkpoint_original_request_summary,
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
     build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
-    mcp_server_capability_key, mcp_tool_capability_key, normalize_metadata_reasoning_effort,
-    reasoning_effort_comparison_key, resolve_turn_permission_profile, skill_capability_key,
-    skill_pack_capability_key, validate_turn_execution_envelope, validate_turn_message_content,
+    context_compaction_status, mcp_server_capability_key, mcp_tool_capability_key,
+    normalize_metadata_reasoning_effort, reasoning_effort_comparison_key,
+    resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
+    validate_turn_execution_envelope, validate_turn_message_content,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,
@@ -546,3 +551,6 @@ pub use workspace::{
 };
 
 pub use schema::{protocol_schema_documents, write_protocol_schemas};
+
+mod model_selection;
+pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};

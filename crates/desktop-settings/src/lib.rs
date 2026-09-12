@@ -28,3 +28,5 @@ mod file_opener_types;
 mod preferences_types;
 pub use file_opener_types::FileOpenerId;
 pub use preferences_types::{AppLanguagePreference, WindowThemePreference};
+
+pub use model_selector::{SharedModelSelectorOptions, open_shared_model_selector};

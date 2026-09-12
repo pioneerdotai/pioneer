@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod process;
 pub mod registry;
 pub mod reserved_args;
+pub mod service;
 pub mod session;
 
 pub const CLI_AGENT_RUNTIME_BOUNDARY: &str = "cli-agent-runtime";

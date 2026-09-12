@@ -33,15 +33,43 @@ impl ProviderExternalNavigationPort for DesktopProviderPlatform {
         )
     }
 }
+struct DesktopProviderModelPicker {
+    client: Arc<ClientCore>,
+    registrar: Arc<dyn pioneer_desktop_foundation::ClientBindingRegistrar>,
+}
+impl ProviderModelPickerPort for DesktopProviderModelPicker {
+    fn open(
+        &self,
+        request: ProviderModelPickerRequest,
+        window: &mut gpui_kit::Window,
+        cx: &mut App,
+    ) {
+        pioneer_desktop_settings::open_shared_model_selector(
+            pioneer_desktop_settings::SharedModelSelectorOptions::new(
+                request.title().to_owned(),
+                request.workspace_id().to_owned(),
+                self.client.clone(),
+                self.registrar.clone(),
+                request.on_save(),
+            )
+            .selection(request.selection().clone())
+            .fixed_provider()
+            .on_refresh(request.on_refresh()),
+            window,
+            cx,
+        );
+    }
+}
 pub(crate) fn provider_config(client: Arc<ClientCore>, cx: &App) -> ProviderCatalogConfig {
     let platform = Arc::new(DesktopProviderPlatform);
-    ProviderCatalogConfig::new(
-        client,
-        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
-            .registrar(),
-        platform.clone(),
-        platform,
-    )
+    let registrar = cx
+        .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+        .registrar();
+    let picker = Arc::new(DesktopProviderModelPicker {
+        client: client.clone(),
+        registrar: registrar.clone(),
+    });
+    ProviderCatalogConfig::new(client, registrar, platform.clone(), platform, picker)
 }
 fn expand_cli_runtime_provider_path(raw: &str) -> anyhow::Result<PathBuf> {
     let trimmed = raw.trim();

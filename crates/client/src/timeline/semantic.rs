@@ -3391,6 +3391,9 @@ fn turn_status_to_work_state(status: TurnStatus) -> Option<TurnWorkState> {
 }
 
 fn completed_work_status_for_item(item: &TurnItem) -> TurnWorkItemStatus {
+    if let Some(status) = item.context_compaction_status() {
+        return status;
+    }
     match item {
         TurnItem::CommandExecution { status, .. }
         | TurnItem::FileChange { status, .. }
@@ -3835,6 +3838,51 @@ mod tests {
         TurnItem, TurnItemType, TurnMention, TurnWorkItemStatus, TurnWorkPresentation,
         TurnWorkState,
     };
+
+    #[test]
+    fn compaction_live_work_status_comes_from_lifecycle_not_severity() {
+        for (terminal, expected) in [
+            ("completed", TurnWorkItemStatus::Completed),
+            ("failed", TurnWorkItemStatus::Failed),
+            ("cancelled", TurnWorkItemStatus::Cancelled),
+        ] {
+            let mut state = SemanticTimelineState::default();
+            let item = |status: &str| TurnItem::SystemEvent {
+                id: "compaction:stable".into(),
+                level: SystemEventLevel::Info,
+                message: status.into(),
+                code: Some("agent_context_compaction".into()),
+                details: Some(serde_json::json!({"status":status})),
+            };
+            for event in [
+                ConversationEvent::ItemStarted {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item("started"),
+                },
+                ConversationEvent::ItemUpdated {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item("started"),
+                },
+                ConversationEvent::ItemCompleted {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item(terminal),
+                },
+            ] {
+                apply_conversation_event_to_semantic_timeline(&mut state, "ws", &event, 1000);
+            }
+            let range = state.thread("thread").unwrap().work_range("turn").unwrap();
+            let items = range
+                .items_by_id
+                .values()
+                .filter(|item| item.item.item_id() == "compaction:stable")
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].status, expected);
+        }
+    }
 
     #[test]
     fn agent_author_readiness_preserves_legacy_absence_and_rejects_contradictions() {

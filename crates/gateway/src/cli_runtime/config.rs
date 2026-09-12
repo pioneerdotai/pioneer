@@ -5,8 +5,10 @@ use pioneer_cli_agent_runtime::process::{SecretString, SensitiveEnvironment};
 use pioneer_cli_agent_runtime::reserved_args::{
     validate_claude_custom_args, validate_codex_custom_args,
 };
+#[cfg(not(test))]
+use pioneer_config::AppConfig;
 use pioneer_config::{
-    AppConfig, EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
+    EffectiveGatewayCliAgentRuntimeInstanceConfig, GatewayCliAgentRuntimeKindConfig,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +17,10 @@ use std::time::Duration;
 pub(crate) fn load_effective_cli_runtime_instances(
     runtime_home: &Path,
 ) -> Result<Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig>> {
+    #[cfg(not(test))]
     let config = AppConfig::load().context("failed to load app config for CLI runtime catalog")?;
+    #[cfg(test)]
+    let config = crate::isolated_test_app_config()?;
     let settings_file_name =
         crate::settings::normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
     let settings_path = runtime_home.join(settings_file_name.as_str());
@@ -45,8 +50,11 @@ pub(crate) fn load_effective_cli_runtime_instances(
 pub(crate) fn load_effective_cli_runtime_identity_settings(
     runtime_home: &Path,
 ) -> Result<pioneer_protocol::GatewayCliRuntimeSettings> {
+    #[cfg(not(test))]
     let config =
         AppConfig::load().context("failed to load app config for CLI identity settings")?;
+    #[cfg(test)]
+    let config = crate::isolated_test_app_config()?;
     let settings_file_name =
         crate::settings::normalize_settings_file_name(config.gateway.settings_file_name.as_str())?;
     let settings_path = runtime_home.join(settings_file_name.as_str());

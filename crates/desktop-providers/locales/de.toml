@@ -339,3 +339,11 @@ cancel = "Abbrechen"
 save = "Speichern"
 dismiss = "Schließen"
 
+
+[providers.cli.compaction]
+label = "Modell für Kontextkomprimierung"
+inherit = "Allgemeine Einstellungen verwenden"
+choose = "Auswählen…"
+reset = "Zurücksetzen"
+save_first = "Speichern Sie den CLI-Anbieter, bevor Sie sein Modell auswählen."
+invalid = "Wählen Sie ein Modell und eine Reasoning-Einstellung, die dieser CLI-Anbieter unterstützt."

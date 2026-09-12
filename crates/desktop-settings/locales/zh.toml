@@ -425,3 +425,18 @@ microphone_no_device_available = "没有可用的输入麦克风。"
 microphone_sample_format_unsupported = "不支持桌面麦克风采样格式 %{format}。"
 microphone_no_input_stream = "默认麦克风无法提供输入流。"
 microphone_capture_failed = "麦克风采集失败：%{error}"
+
+[settings.default_model]
+label = "工作区默认模型"
+
+[settings.compaction.model]
+label = "压缩模型"
+
+[settings.compaction.enabled]
+label = "上下文压缩"
+description = "压缩此工作区中的长对话历史。"
+
+[settings.model]
+inherit = "使用当前轮次的模型"
+choose = "选择…"
+reset = "重置"

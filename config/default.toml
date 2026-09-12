@@ -91,8 +91,7 @@ default_max_revision_rounds = 5
 auto_accept_after_seconds = 300
 
 [gateway.thread]
-default_model = "google/gemini-3-flash-preview"
-default_model_provider = "openrouter"
+# Workspace default model is optional; explicit launch/thread selection is retained.
 max_context_tokens = 128000
 response_reserve_tokens = 16000
 # summary_model = "gpt-5.4" — if omitted, uses thread's model

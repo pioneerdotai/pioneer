@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+pioneer-compaction.workspace = true
 anyhow.workspace = true
 pioneer-entity.workspace = true
 pioneer-hooks.workspace = true
