@@ -691,7 +691,8 @@ impl GatewaySettings {
         );
     }
 
-    fn set_cli_runtime_settings(
+    #[cfg(test)]
+    pub(crate) fn set_cli_runtime_settings_for_tests(
         &mut self,
         cli_runtimes: pioneer_protocol::GatewayCliRuntimeSettings,
     ) -> Result<()> {
@@ -699,14 +700,6 @@ impl GatewaySettings {
             cli_runtimes,
         )?);
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_cli_runtime_settings_for_tests(
-        &mut self,
-        cli_runtimes: pioneer_protocol::GatewayCliRuntimeSettings,
-    ) -> Result<()> {
-        self.set_cli_runtime_settings(cli_runtimes)
     }
 
     pub fn snapshot(&self, config: &GatewayConfig) -> pioneer_protocol::GatewaySettingsSnapshot {

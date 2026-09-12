@@ -181,13 +181,6 @@ pub struct Checkpoint {
     pub projection_version: u64,
 }
 
-impl Checkpoint {
-    pub fn compatible_with(&self, available: &BTreeSet<SourceRef>) -> bool {
-        self.format_version == crate::FORMAT_VERSION
-            && self.coverage.iter().all(|s| available.contains(s))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

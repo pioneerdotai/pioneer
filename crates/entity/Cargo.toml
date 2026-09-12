@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+path = "lib.rs"
+
 [dependencies]
 sea-orm = { workspace = true, features = ["macros"] }
 serde.workspace = true

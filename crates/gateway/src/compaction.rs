@@ -14,6 +14,8 @@ mod native;
 mod origins;
 mod result_budget;
 mod service;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod tool_outcomes;
 pub(crate) use admission::{PreparedOperation, admit_operation};
 #[cfg(test)]
@@ -286,18 +288,6 @@ impl CompactionRunner {
         self.summarizer.cleanup().await?;
         result
     }
-    /// Control-plane Stop serializes against checkpoint publication before the
-    /// service future is cancelled. The caller owns this future and its control
-    /// deadline; no detached write may race a later turn.
-    pub async fn stop(&self, service_cancel: &CancellationToken) -> Result<()> {
-        let result = self
-            .store
-            .compaction_finish(&self.snapshot.id, "cancelled", "cancelled")
-            .await;
-        service_cancel.cancel();
-        result
-    }
-
     /// Read durable truth after an interrupted service future. This is an owned
     /// control-plane reconciliation, never a new service attempt or deadline.
     /// Completed operations can therefore be recovered after their 15 minutes.

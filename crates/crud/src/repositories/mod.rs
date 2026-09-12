@@ -17,6 +17,15 @@ pub(crate) mod authorization_persistence;
 pub(crate) mod authorization_scope;
 pub(crate) mod canonical_turn_event;
 pub mod cli_runtime_binding;
+pub mod compaction;
+pub(crate) mod compaction_background;
+pub(crate) mod compaction_frozen;
+pub(crate) mod compaction_frozen_import;
+pub(crate) mod compaction_history;
+pub(crate) mod compaction_lifecycle;
+pub(crate) mod compaction_runner;
+pub(crate) mod compaction_source_projection;
+pub(crate) mod compaction_task_output;
 pub mod execution_admission_lease;
 pub mod hook_run;
 pub(crate) mod identity;
@@ -95,3 +104,5 @@ pub enum ProjectionWriteOutcome {
     NoopDuplicateTerminal,
     InvariantViolation { reason: String },
 }
+
+mod compaction_live_sources;

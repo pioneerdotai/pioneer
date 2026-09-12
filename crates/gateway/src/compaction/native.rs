@@ -26,26 +26,7 @@ pub(crate) fn native_owner(workspace: &str, thread: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn prepare_native_request(
-    store: &CrudStore,
-    providers: &ProviderRegistry,
-    settings: &CompactionSettings,
-    context: &NativeContext,
-    request: ChatRequest,
-    measured: Option<NativeUsageMeasurement>,
-    recovery: bool,
-    observer: Arc<dyn CompactionObserver>,
-    clock: Arc<dyn CompactionClock>,
-) -> Result<NativePreparedRequest> {
-    prepare_native_projection(
-        store, providers, settings, context, request, measured, recovery, observer, clock, None,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn prepare_native_projection(
+pub(super) async fn prepare_native_projection(
     store: &CrudStore,
     providers: &ProviderRegistry,
     settings: &CompactionSettings,

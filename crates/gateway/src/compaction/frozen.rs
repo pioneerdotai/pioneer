@@ -278,41 +278,6 @@ pub(crate) async fn capture_task_output(
         .await
 }
 
-/// Freeze one accepted parent line at admission. Source revisions are checked
-/// during rendering and restoration; the epoch check also detects edits to rows
-/// omitted by a concurrent edit/delete during discovery. Appends beyond the
-/// fence are intentionally excluded and do not invalidate the snapshot.
-pub(crate) async fn capture_line_json(
-    store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    excluded_turn: Option<&str>,
-) -> Result<String> {
-    capture_selected_line_json(store, workspace, thread, excluded_turn, None).await
-}
-
-/// Select the admitted Task basis before persisting its reference manifest.
-/// Composer passes no policy and retains its separately accepted launch scope.
-/// An ordinary Task passes its policy (or its explicit default); restoration
-/// never reevaluates that policy against a later parent history.
-pub(crate) async fn capture_selected_line_json(
-    store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    excluded_turn: Option<&str>,
-    policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
-) -> Result<String> {
-    capture_execution_basis_json(
-        store,
-        workspace,
-        thread,
-        excluded_turn,
-        excluded_turn,
-        policy,
-    )
-    .await
-}
-
 /// `basis_turn` identifies the accepted parent execution independently of the
 /// Composer-only exclusion. Ordinary Tasks include completed creator rounds.
 pub(crate) async fn capture_execution_basis_json(

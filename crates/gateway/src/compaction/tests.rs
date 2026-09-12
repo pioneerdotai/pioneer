@@ -657,7 +657,12 @@ async fn control_reconciliation_preserves_applied_result_after_deadline_and_stop
         applied
     );
     let cancel = CancellationToken::new();
-    f.runner.stop(&cancel).await.unwrap();
+    f.runner
+        .store
+        .compaction_finish(&f.runner.snapshot.id, "cancelled", "cancelled")
+        .await
+        .unwrap();
+    cancel.cancel();
     assert!(cancel.is_cancelled());
     assert_eq!(
         f.runner.reconcile(FailureKind::Cancelled).await.unwrap(),
@@ -1362,7 +1367,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         }),
     };
     let raw_request = request.clone();
-    let prepared = super::native::prepare_native_request(
+    let prepared = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -1428,7 +1433,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .all(|r| r.model == "summary-model" && r.tools.is_none() && r.reasoning.is_none())
     );
     settings.enabled = false;
-    let again = super::native::prepare_native_request(
+    let again = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -1446,7 +1451,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         prepared.receipt.identity.checkpoint
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
-    let restored = super::native::prepare_native_request(
+    let restored = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -1470,7 +1475,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     duplicated
         .messages
         .insert(1, raw_request.messages[0].clone());
-    let normalized = super::native::prepare_native_request(
+    let normalized = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -1488,7 +1493,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
 
     let mut earlier_boundary = raw_request.clone();
     earlier_boundary.messages.remove(0);
-    let incompatible = super::native::prepare_native_request(
+    let incompatible = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -1518,7 +1523,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         ))
         .await
         .unwrap();
-    let stale = super::native::prepare_native_request(
+    let stale = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -1557,7 +1562,7 @@ async fn compaction_empty_task_policy_never_reads_unselected_parent_payload() {
             mode,
             ..super::frozen::default_task_context_policy()
         };
-        let json = super::frozen::capture_selected_line_json(
+        let json = super::test_support::capture_selected_line_json(
             &f.store,
             "ws",
             "thread",
@@ -1577,7 +1582,7 @@ async fn compaction_empty_task_policy_never_reads_unselected_parent_payload() {
         assert!(history.is_empty());
     }
     assert!(
-        super::frozen::capture_line_json(&f.store, "ws", "thread", None)
+        super::test_support::capture_line_json(&f.store, "ws", "thread", None)
             .await
             .is_err()
     );
@@ -1838,7 +1843,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
     // New TaskRun writers use this entry point: no transcript in the descriptor,
     // exact current line on restoration, and the launch turn can be excluded.
-    let current_json = super::frozen::capture_line_json(&f.store, "ws", "thread", None)
+    let current_json = super::test_support::capture_line_json(&f.store, "ws", "thread", None)
         .await
         .unwrap();
     assert!(!current_json.contains("original request"));
@@ -1862,7 +1867,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             max_turns: Some(1),
             ..super::frozen::default_task_context_policy()
         };
-        let json = super::frozen::capture_selected_line_json(
+        let json = super::test_support::capture_selected_line_json(
             &f.store,
             "ws",
             "thread",
@@ -1884,7 +1889,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             _ => assert!(restored.is_empty()),
         }
     }
-    let excluded = super::frozen::capture_line_json(&f.store, "ws", "thread", Some("turn"))
+    let excluded = super::test_support::capture_line_json(&f.store, "ws", "thread", Some("turn"))
         .await
         .unwrap();
     assert!(
@@ -1894,7 +1899,7 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             .is_empty()
     );
     assert!(
-        super::frozen::capture_line_json(&f.store, "foreign-workspace", "thread", None)
+        super::test_support::capture_line_json(&f.store, "foreign-workspace", "thread", None)
             .await
             .is_err()
     );
@@ -2254,10 +2259,15 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         mode: pioneer_protocol::TaskAgentContextMode::SummaryOnly,
         ..super::frozen::default_task_context_policy()
     };
-    let summary_json =
-        super::frozen::capture_selected_line_json(&f.store, "ws", "thread", None, Some(&policy))
-            .await
-            .unwrap();
+    let summary_json = super::test_support::capture_selected_line_json(
+        &f.store,
+        "ws",
+        "thread",
+        None,
+        Some(&policy),
+    )
+    .await
+    .unwrap();
     let summary_history =
         crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &allowed, &summary_json)
             .await
@@ -2271,7 +2281,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         include_parent_summary: false,
         ..policy
     };
-    let json = super::frozen::capture_selected_line_json(
+    let json = super::test_support::capture_selected_line_json(
         &f.store,
         "ws",
         "thread",
@@ -2384,7 +2394,7 @@ async fn native_media_preparation_materializes_full_request_without_main_provide
         reasoning: None,
         compiled_prompt: None,
     };
-    let prepared = super::native::prepare_native_request(
+    let prepared = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &CompactionSettings::default(),
@@ -2464,7 +2474,7 @@ async fn check_nested_task_basis(legacy: bool) {
         ])
         .unwrap()
     } else {
-        super::frozen::capture_line_json(&f.store, "ws", "thread", None)
+        super::test_support::capture_line_json(&f.store, "ws", "thread", None)
             .await
             .unwrap()
     };

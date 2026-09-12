@@ -27,16 +27,6 @@ pub fn text_tokens(text: &str) -> u64 {
         .len() as u64
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationStatus {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    Stale,
-}
-
 /// Immutable input to one bounded operation; append-only history is not its basis.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OperationSnapshot {

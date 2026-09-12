@@ -9702,7 +9702,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
                 .is_some_and(|text| text.contains("B complete"))),
         "each completed source command must be paired with its fully delivered result"
     );
-    let descriptor = crate::compaction::frozen::capture_line_json(
+    let descriptor = crate::compaction::test_support::capture_line_json(
         crud_store.as_ref(),
         &workspace_id,
         parent_thread_id,
@@ -9739,7 +9739,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             "a delivered result must appear once, without its Task card copy"
         );
     }
-    let last_policy = crate::compaction::frozen::capture_selected_line_json(
+    let last_policy = crate::compaction::test_support::capture_selected_line_json(
         crud_store.as_ref(),
         &workspace_id,
         parent_thread_id,
@@ -9884,7 +9884,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id IN (SELECT id FROM turn_event WHERE thread_id=?)",
         [parent_thread_id.into()],
     )).await.unwrap();
-    let cold = crate::compaction::frozen::capture_selected_line_json(
+    let cold = crate::compaction::test_support::capture_selected_line_json(
         crud_store.as_ref(),
         &workspace_id,
         parent_thread_id,
@@ -10690,7 +10690,7 @@ async fn assert_collaborative_child_stop_cancels_task_and_survives_late_delivery
         "partial or late provider output must not enter cancelled history"
     );
 
-    let frozen_cancelled = crate::compaction::frozen::capture_selected_line_json(
+    let frozen_cancelled = crate::compaction::test_support::capture_selected_line_json(
         crud_store.as_ref(),
         &workspace_id,
         parent_thread_id,
@@ -64298,4 +64298,17 @@ async fn check_completed_history(
         .unwrap();
     assert_eq!(row.try_get::<i64>("", "turns").unwrap(), 1);
     assert_eq!(row.try_get::<i64>("", "runs").unwrap(), 0);
+}
+
+impl MessageProcessor {
+    pub(crate) fn apply_compaction_settings(
+        &self,
+        settings: pioneer_compaction::CompactionSettings,
+    ) -> anyhow::Result<()> {
+        *self
+            .compaction_settings
+            .write()
+            .map_err(|_| anyhow::anyhow!("compaction settings unavailable"))? = settings;
+        Ok(())
+    }
 }

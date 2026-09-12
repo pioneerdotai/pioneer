@@ -2087,17 +2087,6 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(crate) fn apply_compaction_settings(
-        &self,
-        settings: pioneer_compaction::CompactionSettings,
-    ) -> anyhow::Result<()> {
-        *self
-            .compaction_settings
-            .write()
-            .map_err(|_| anyhow::anyhow!("compaction settings unavailable"))? = settings;
-        Ok(())
-    }
-
     pub(crate) fn apply_keepawake_setting(&self, enabled: bool) -> anyhow::Result<()> {
         self.keepawake.set_enabled(enabled)
     }

@@ -1,4 +1,5 @@
-pub mod compaction;
+pub use repositories::compaction;
+mod compaction_store;
 mod convention;
 mod events;
 mod memory;
