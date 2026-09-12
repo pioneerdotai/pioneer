@@ -37,6 +37,8 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     pub thread_target: Option<String>,
     #[sea_orm(has_one)]
+    pub compaction_delivery_output: HasOne<super::compaction_delivery_output::Entity>,
+    #[sea_orm(has_one)]
     pub user_notification_outbox: HasOne<super::user_notification_outbox::Entity>,
 }
 

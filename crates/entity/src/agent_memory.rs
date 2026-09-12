@@ -58,6 +58,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub metadata_json: Option<String>,
     pub source_context_kind: Option<String>,
+    #[sea_orm(has_one)]
+    pub agent_memory_identity: HasOne<super::agent_memory_identity::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -24,7 +24,6 @@ pub struct Model {
     pub updated_at: DateTimeWithTimeZone,
     pub turn_kind: String,
     pub origin: String,
-    pub work_owner: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub reasoning_effort: Option<String>,
     pub permission_profile_mode: Option<String>,
@@ -52,10 +51,19 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub author_agent_snapshot_json: Option<String>,
     pub initiated_by_actor_kind: Option<String>,
+    pub work_owner: String,
     #[sea_orm(has_many)]
     pub agent_action_timeline_targets: HasMany<super::agent_action_timeline_target::Entity>,
     #[sea_orm(has_one)]
     pub agent_turn_response_execution: HasOne<super::agent_turn_response_execution::Entity>,
+    #[sea_orm(has_one)]
+    pub compaction_history_check: HasOne<super::compaction_history_check::Entity>,
+    #[sea_orm(has_many)]
+    pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
+    #[sea_orm(has_one)]
+    pub compaction_turn_creation: HasOne<super::compaction_turn_creation::Entity>,
+    #[sea_orm(has_many)]
+    pub native_terminal_effect_outboxes: HasMany<super::native_terminal_effect_outbox::Entity>,
     #[sea_orm(has_many)]
     pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
     #[sea_orm(
@@ -79,6 +87,8 @@ pub struct Model {
     pub turn_mcp_projection: HasOne<super::turn_mcp_projection::Entity>,
     #[sea_orm(has_many)]
     pub turn_message_revisions: HasMany<super::turn_message_revision::Entity>,
+    #[sea_orm(has_many, via = "compaction_execution_stop")]
+    pub compaction_contexts: HasMany<super::compaction_context::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

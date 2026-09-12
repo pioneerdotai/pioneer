@@ -32,6 +32,14 @@ pub struct Model {
     pub preview_author_json: Option<String>,
     pub created_by_actor_kind: Option<String>,
     #[sea_orm(has_many)]
+    pub compaction_contexts: HasMany<super::compaction_context::Entity>,
+    #[sea_orm(has_many)]
+    pub compaction_frozen_histories: HasMany<super::compaction_frozen_history::Entity>,
+    #[sea_orm(has_one)]
+    pub compaction_projection_epoch: HasOne<super::compaction_projection_epoch::Entity>,
+    #[sea_orm(has_many)]
+    pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
+    #[sea_orm(has_many)]
     pub thread_read_cursors: HasMany<super::thread_read_cursor::Entity>,
     #[sea_orm(has_many, via = "thread_membership")]
     pub gateway_principals: HasMany<super::gateway_principal::Entity>,

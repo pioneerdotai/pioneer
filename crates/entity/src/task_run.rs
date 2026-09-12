@@ -34,6 +34,8 @@ pub struct Model {
     pub error_json: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(has_many)]
+    pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

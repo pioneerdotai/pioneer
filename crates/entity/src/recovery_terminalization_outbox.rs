@@ -24,10 +24,10 @@ pub struct Model {
     pub claim_token: Option<String>,
     pub claim_expires_at: Option<DateTimeWithTimeZone>,
     pub delivered_at: Option<DateTimeWithTimeZone>,
-    pub quarantine_reason_code: Option<String>,
-    pub quarantined_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub quarantine_reason_code: Option<String>,
+    pub quarantined_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(
         belongs_to,
         from = "recovery_job_id",

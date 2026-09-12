@@ -28,6 +28,8 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub started_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(has_one)]
+    pub compaction_task_output: HasOne<super::compaction_task_output::Entity>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

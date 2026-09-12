@@ -12,10 +12,11 @@ pub struct Model {
     pub activation_epoch: i64,
     pub cursor_source_id: i64,
     pub effective_enabled_at: Option<DateTimeWithTimeZone>,
-    pub history_backfill_after_event_id: Option<String>,
-    pub history_backfill_complete: bool,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub history_backfill_after_event_id: Option<String>,
+    pub history_backfill_complete: bool,
     #[sea_orm(
         belongs_to,
         from = "workspace_id",
