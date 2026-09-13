@@ -8,7 +8,10 @@ use crate::apply_patch::{
 };
 use crate::context::ToolPayload;
 use crate::context::{ApplyPatchPreflight, ExecCommandArgs, ToolInvocation, WriteStdinArgs};
-use crate::domain::{ARTIFACT_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, TASK_DOMAIN_TOOL_NAMES};
+use crate::domain::{
+    ARTIFACT_DOMAIN_TOOL_NAMES, MEMORY_DOMAIN_TOOL_NAMES, TASK_DOMAIN_TOOL_NAMES,
+    THREADS_DOMAIN_TOOL_NAMES,
+};
 use crate::handlers::apply_patch::extract_patch_input;
 use crate::spec::DynamicSkillPermissionKind;
 use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation};
@@ -685,6 +688,9 @@ fn extract_internal_permission_intent(invocation: &ToolInvocation) -> Option<Per
         tool_name if ARTIFACT_DOMAIN_TOOL_NAMES.contains(&tool_name) => {
             Some("artifact bookkeeping")
         }
+        tool_name if THREADS_DOMAIN_TOOL_NAMES.contains(&tool_name) => {
+            Some("read thread tool result")
+        }
         _ => match &invocation.payload {
             ToolPayload::ToolSearch { .. } => Some("tool search"),
             _ => None,
@@ -718,6 +724,10 @@ fn extract_internal_permission_intent(invocation: &ToolInvocation) -> Option<Per
         scope
             .entries
             .insert("domain".to_owned(), "artifact".to_owned());
+    } else if THREADS_DOMAIN_TOOL_NAMES.contains(&tool_name) {
+        scope
+            .entries
+            .insert("domain".to_owned(), "threads".to_owned());
     }
 
     Some(PermissionIntent {
@@ -2335,7 +2345,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 37, "native tool inventory changed");
+        assert_eq!(registered.len(), 38, "native tool inventory changed");
         let unknown = registered
             .iter()
             .filter(|name| {
@@ -2390,6 +2400,7 @@ mod tests {
             ("artifact_prepare", PermissionActionKind::Internal),
             ("artifact_register", PermissionActionKind::Internal),
             ("artifact_read", PermissionActionKind::Internal),
+            ("threads_tools_result_read", PermissionActionKind::Internal),
             ("computer_use", PermissionActionKind::ComputerUse),
             ("read_skill", PermissionActionKind::Internal),
             ("agent_start_options", PermissionActionKind::Internal),
@@ -2416,7 +2427,7 @@ mod tests {
             .map(str::to_owned),
         );
 
-        assert_eq!(registered.len(), 37, "native tool inventory changed");
+        assert_eq!(registered.len(), 38, "native tool inventory changed");
         assert_eq!(
             registered,
             expected_actions

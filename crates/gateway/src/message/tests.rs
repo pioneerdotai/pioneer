@@ -5464,9 +5464,83 @@ fn canonical_execution_thread_for_parity(text: &str, expected_thread_id: &str) -
         .join("\n")
 }
 
+fn canonical_recorded_history_identity_for_parity(
+    message: &mut pioneer_provider::ChatMessage,
+    expected_thread: &str,
+    expected_turn: &str,
+) {
+    let Some((prefix, body)) = [
+        "Recorded historical status; not a successful model response:\n",
+        "Recorded historical event:\n",
+    ]
+    .into_iter()
+    .find_map(|prefix| {
+        message
+            .content
+            .strip_prefix(prefix)
+            .map(|body| (prefix, body))
+    }) else {
+        return;
+    };
+    let mut event: serde_json::Value =
+        serde_json::from_str(body).expect("recorded event must be typed JSON");
+    match event["kind"].as_str() {
+        Some("turn_permission_audit") => {
+            let payload = &mut event["payload"];
+            assert_eq!(payload["threadId"], expected_thread);
+            assert_eq!(payload["turnId"], expected_turn);
+            payload["threadId"] = json!("<verified history thread>");
+            payload["turnId"] = json!("<verified history turn>");
+            if payload.get("securitySnapshotId").is_some() {
+                assert_eq!(
+                    payload["securitySnapshotId"],
+                    format!("{expected_turn}:security:v1")
+                );
+                payload["securitySnapshotId"] = json!("<verified history turn>:security:v1");
+            }
+        }
+        Some("turn_execution_window_started") => {
+            let payload = &mut event["payload"];
+            assert_eq!(payload["thread_id"], expected_thread);
+            assert_eq!(payload["turn_id"], expected_turn);
+            let index = payload["window_index"].as_u64().unwrap();
+            assert_eq!(
+                payload["window_id"],
+                format!("{expected_turn}:window:{index}")
+            );
+            assert!(payload["started_at_unix_ms"].as_i64().unwrap() > 0);
+            payload["thread_id"] = json!("<verified history thread>");
+            payload["turn_id"] = json!("<verified history turn>");
+            payload["window_id"] = json!(format!("<verified history turn>:window:{index}"));
+            payload["started_at_unix_ms"] = json!(0);
+        }
+        _ if event["type"] == "systemEvent" && event["code"] == "task.finalization.snapshot" => {
+            // The two fixture seed turns create independent event IDs. Keep the
+            // complete message, level and snapshot details in the comparison.
+            assert!(!event["id"].as_str().unwrap().is_empty());
+            event["id"] = json!("<history event id>");
+        }
+        _ => return,
+    }
+    let origin = message
+        .provenance
+        .as_ref()
+        .expect("history must retain its source identity");
+    assert_eq!(origin.thread_id, expected_thread);
+    assert!(
+        origin
+            .sources
+            .iter()
+            .any(|source| source.scope == format!("event:{expected_turn}"))
+    );
+    message.content = format!("{prefix}{}", serde_json::to_string(&event).unwrap());
+}
+
 fn canonical_main_request_execution_thread_for_parity(
     request: &ChatRequest,
     expected_thread_id: &str,
+    history_thread_id: &str,
+    history_turn_id: &str,
 ) -> ChatRequest {
     // Independent executions must advertise their own thread, not the same ID.
     // Validate that identity against the fixture/lineage before comparing content.
@@ -5479,6 +5553,9 @@ fn canonical_main_request_execution_thread_for_parity(
         canonical_execution_thread_for_parity(&prompt.dynamic_system_text, expected_thread_id);
     prompt.full_system_text =
         canonical_execution_thread_for_parity(&prompt.full_system_text, expected_thread_id);
+    for message in &mut request.messages {
+        canonical_recorded_history_identity_for_parity(message, history_thread_id, history_turn_id);
+    }
     request
 }
 
@@ -5678,16 +5755,12 @@ fn sequenced_tool_provider_preflight_response(
 }
 
 fn is_turn_preflight_request(request: &ChatRequest) -> bool {
-    request.compiled_prompt.is_none()
-        && request.tools.is_none()
+    request.tools.is_none()
         && request.tool_choice.is_none()
-        && request.messages.len() == 1
-        && request.messages[0]
-            .content
-            .contains("internal turn preflight planner")
-        && request.messages[0]
-            .content
-            .contains("Structured input JSON")
+        && request.messages.iter().any(|message| {
+            message.content.contains("internal turn preflight planner")
+                && message.content.contains("Structured input JSON")
+        })
 }
 
 fn extract_task_id_from_messages(messages: &[pioneer_provider::ChatMessage]) -> Option<String> {
@@ -10152,12 +10225,12 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             assert_eq!(accepted.candidate_id, candidate.id);
             assert_eq!(accepted.output, output);
         }
-        let output_json = serde_json::to_string(&output.history).unwrap();
+        let serialized_history = serde_json::to_string(&output.history).unwrap();
         let source_scopes = crate::compaction::frozen::accepted_history_scopes(
             crud_store.as_ref(),
             &workspace_id,
             &output.source_thread,
-            &output_json,
+            &serialized_history,
         )
         .await
         .unwrap();
@@ -11228,7 +11301,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn followup_turn_history_includes_inline_artifact_ref_without_reattaching_content() {
+async fn followup_history_preserves_recorded_artifact_metadata_without_live_reattachment() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -11323,36 +11396,37 @@ async fn followup_turn_history_includes_inline_artifact_ref_without_reattaching_
         .find(|message| {
             message
                 .content
-                .contains("Available artifacts from this user message:")
+                .starts_with("Historical attachment references")
         })
-        .expect("second provider request should include previous user artifact ref");
-    assert!(
-        artifact_history_message
-            .content
-            .starts_with("Что за машина?")
+        .expect("the recorded attachment metadata must survive in canonical history");
+    let input_reference = second_request
+        .messages
+        .iter()
+        .find_map(|message| {
+            message
+                .content
+                .strip_prefix("Что за машина?\nHistorical input reference: ")
+        })
+        .expect("the original question and typed artifact input must remain together");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(input_reference).unwrap(),
+        json!({
+            "type": "artifact", "artifactId": artifact.artifact_id, "versionId": artifact.version_id,
+        })
     );
     assert!(
         artifact_history_message
             .content
-            .contains(format!("artifactId={}", artifact.artifact_id).as_str())
-    );
-    let artifact_version_id = artifact
-        .version_id
-        .as_deref()
-        .expect("test artifact version id");
-    assert!(
-        artifact_history_message
-            .content
-            .contains(format!("versionId={artifact_version_id}").as_str())
+            .contains(&artifact.artifact_id)
     );
     assert!(
         artifact_history_message
             .content
-            .contains("name=\"car.jpg\"")
+            .contains(artifact.version_id.as_deref().unwrap())
     );
-    assert!(artifact_history_message.content.contains("mime=text/plain"));
+    assert!(artifact_history_message.content.contains("car.jpg"));
+    assert!(artifact_history_message.content.contains("text/plain"));
     assert!(!artifact_history_message.content.contains("hello artifact"));
-    assert!(!artifact_history_message.content.contains("artifact_read"));
     assert!(artifact_history_message.content_parts.is_empty());
 
     processor
@@ -11386,15 +11460,23 @@ async fn followup_turn_history_includes_inline_artifact_ref_without_reattaching_
     assert_eq!(requests.len(), 3);
     let third_request = &requests[2];
     assert!(
-        third_request.messages.iter().all(|message| !message
-            .content
-            .contains("Available artifacts from this user message:")),
-        "deleted artifacts must not be rendered back into retained history"
+        third_request
+            .messages
+            .iter()
+            .any(|message| message.content == artifact_history_message.content),
+        "deleting the live artifact must not rewrite its recorded historical metadata"
+    );
+    assert!(
+        third_request
+            .messages
+            .iter()
+            .all(|message| message.content_parts.is_empty()),
+        "historical metadata must not reattach deleted content"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn followup_turn_history_includes_inline_assistant_artifact_ref() {
+async fn followup_history_does_not_inject_late_assistant_artifact_registration() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -11499,38 +11581,25 @@ async fn followup_turn_history_includes_inline_assistant_artifact_ref() {
 
     let requests = capture_provider.snapshot_requests();
     assert_eq!(requests.len(), 2);
-    let assistant_history_message = requests[1]
-        .messages
-        .iter()
-        .find(|message| {
-            message
-                .content
-                .contains("Available artifacts from this assistant message:")
-        })
-        .expect("second provider request should include previous assistant artifact ref");
     assert!(
-        assistant_history_message
-            .content
-            .starts_with("Я подготовил файл.")
+        requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content == "Я подготовил файл.")
     );
     assert!(
-        assistant_history_message
-            .content
-            .contains(format!("artifactId={}", artifact.artifact_id).as_str())
+        requests[1]
+            .messages
+            .iter()
+            .all(|message| !message.content.contains(&artifact.artifact_id)),
+        "a later mutable artifact association is not an original provider history source"
     );
     assert!(
-        assistant_history_message
-            .content
-            .contains("name=\"analysis.xlsx\"")
+        requests[1]
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("assistant artifact bytes"))
     );
-    assert!(assistant_history_message.content.contains("role=assistant"));
-    assert!(
-        !assistant_history_message
-            .content
-            .contains("assistant artifact bytes")
-    );
-    assert!(!assistant_history_message.content.contains("artifact_read"));
-    assert!(assistant_history_message.content_parts.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22713,11 +22782,11 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "{runtime_id} must receive the exact composer input"
         );
         assert!(
-            native_start
+            !native_start
                 .input
                 .to_string()
                 .contains(history_marker.as_str()),
-            "{runtime_id} must receive the parent conversation context"
+            "{runtime_id} primary CLI must not receive Pioneer history or summaries"
         );
 
         let native_child_actor = turn::Entity::find_by_id(lineage.child_turn_id.as_str())
@@ -23598,10 +23667,18 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
             .as_str(),
     )
     .await;
-    let direct_main =
-        canonical_main_request_execution_thread_for_parity(direct_main, direct_parent_thread_id);
-    let child_main =
-        canonical_main_request_execution_thread_for_parity(child_main, &lineage.child_thread_id);
+    let direct_main = canonical_main_request_execution_thread_for_parity(
+        direct_main,
+        direct_parent_thread_id,
+        direct_parent_thread_id,
+        direct_seed_turn_id,
+    );
+    let child_main = canonical_main_request_execution_thread_for_parity(
+        child_main,
+        &lineage.child_thread_id,
+        task_parent_thread_id,
+        task_seed_turn_id,
+    );
     assert_exact_chat_request_parity("main turn", &direct_main, &child_main);
 
     let direct_post =
@@ -23622,6 +23699,7 @@ fn detached_composer_work_matches_full_parent_llm_request_end_to_end() {
 }
 
 async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl() {
+    crate::compaction::load_test_catalog();
     let base_dir = unique_temp_dir("detached_full_prompt_parity");
     let system_root = base_dir.join("system");
     let user_root = base_dir.join("user");
@@ -24090,10 +24168,18 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
 
     let direct_main = single_prompt_parity_request(&direct_requests, PromptParityRequestKind::Main);
     let child_main = single_prompt_parity_request(&child_requests, PromptParityRequestKind::Main);
-    let direct_main =
-        canonical_main_request_execution_thread_for_parity(direct_main, direct_parent_thread_id);
-    let child_main =
-        canonical_main_request_execution_thread_for_parity(child_main, &lineage.child_thread_id);
+    let direct_main = canonical_main_request_execution_thread_for_parity(
+        direct_main,
+        direct_parent_thread_id,
+        direct_parent_thread_id,
+        direct_seed_turn_id,
+    );
+    let child_main = canonical_main_request_execution_thread_for_parity(
+        child_main,
+        &lineage.child_thread_id,
+        task_parent_thread_id,
+        task_seed_turn_id,
+    );
     assert_exact_chat_request_parity_with_turn_private_paths(
         "full main turn",
         &direct_main,
@@ -24902,7 +24988,7 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
     let task = create_task_for_test(&processor, params)
         .await
         .expect("supervised native Task should start");
-    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let opened = recv_native_task_permission_opened(&mut rx).await;
     let opened_request = opened
         .params
         .as_ref()
@@ -25222,7 +25308,7 @@ async fn supervised_native_task_apply_patch_creates_approved_missing_destination
     let task = create_task_for_test(&processor, params)
         .await
         .expect("supervised native patch Task should start");
-    let opened = recv_notification_by_method(&mut rx, events::TURN_PERMISSION_REQUEST_OPENED).await;
+    let opened = recv_native_task_permission_opened(&mut rx).await;
     let opened_request = opened
         .params
         .as_ref()
@@ -44506,6 +44592,13 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         .expect("conditional Agent pin failure trigger must install");
 
     let turn_id = "turn_agent_pin_fail_soft";
+    ensure_test_superuser_execution_turn(
+        &processor,
+        workspace_id.as_str(),
+        "thread_agent_pin_fail_soft",
+        turn_id,
+    )
+    .await;
     let mut overlay = vec![AgentSkillRuntimeEntry {
         skill_id: pioneer_protocol::SkillId::new("P".repeat(21)).expect("valid Agent SkillId"),
         slug: "verify-release".to_owned(),
@@ -53906,7 +53999,7 @@ async fn turn_start_materializes_mcp_tool_bindings_and_executes_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dynamic_http_body_is_model_visible_but_not_persisted_or_broadcast() {
+async fn dynamic_http_body_is_retained_for_context_without_timeline_or_broadcast_leak() {
     const SECRET: &str = "SECRET_DYNAMIC_HTTP_BODY_SENTINEL";
 
     let (tx, mut rx) = mpsc::channel(64);
@@ -54103,9 +54196,37 @@ Gateway HTTP skill body"#
         .await
         .expect("turn llm context should load");
     assert!(
-        retained_context.is_empty(),
-        "terminal turn cleanup should remove dynamic HTTP llm_view"
+        retained_context
+            .iter()
+            .all(|entry| matches!(entry.source.as_str(), "assistant_round" | "tool_result_v2")),
+        "terminal cleanup should retain only canonical provider context"
     );
+    assert!(
+        retained_context
+            .iter()
+            .filter(|entry| entry.source == "tool_result_v2" && entry.payload.contains(SECRET))
+            .count()
+            == 1,
+        "canonical full result must survive terminal cleanup exactly once for history and result_read"
+    );
+
+    let canonical_result = retained_context
+        .iter()
+        .find(|entry| entry.source == "tool_result_v2" && entry.payload.contains(SECRET))
+        .unwrap();
+    let saved_result = processor
+        .read_thread_tool_result(pioneer_protocol::ThreadToolResultReadParams {
+            workspace_id: workspace_id.clone(),
+            thread_id: "thr_000000000000000131".into(),
+            turn_id: "turn_000000000000000131".into(),
+            item_id: canonical_result.item_id.clone().unwrap(),
+            cursor: None,
+            max_tokens: None,
+            max_bytes: None,
+        })
+        .await
+        .expect("the result reader must retain access after terminal cleanup");
+    assert!(saved_result.text.contains(SECRET));
 
     let turn_items = crud_store_for_assert
         .get_turn_item_events("thr_000000000000000131", "turn_000000000000000131")
@@ -59182,6 +59303,7 @@ async fn setup_workspace_manager() -> (Arc<WorkspaceManager>, Arc<CrudStore>, St
 async fn setup_workspace_manager_with_connection(
     connection: sea_orm::DatabaseConnection,
 ) -> (Arc<WorkspaceManager>, Arc<CrudStore>, String) {
+    crate::compaction::load_test_catalog();
     Migrator::up(&connection, None)
         .await
         .expect("migrations must succeed");
@@ -60011,7 +60133,12 @@ async fn run_memory_e2e_turn(
     text: &str,
 ) {
     start_memory_e2e_turn(harness, thread_id, turn_id, mode, model_provider, text).await;
-    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method_timeout(
+        &mut harness.rx,
+        events::TURN_COMPLETED,
+        Duration::from_secs(30),
+    )
+    .await;
 }
 
 async fn run_memory_e2e_turn_with_params(
@@ -60035,7 +60162,12 @@ async fn run_memory_e2e_turn_with_params(
         events::TURN_STARTED,
     )
     .await;
-    let _ = recv_notification_by_method(&mut harness.rx, events::TURN_COMPLETED).await;
+    let _ = recv_notification_by_method_timeout(
+        &mut harness.rx,
+        events::TURN_COMPLETED,
+        Duration::from_secs(30),
+    )
+    .await;
 }
 
 async fn run_memory_e2e_thread_turn(
@@ -62802,6 +62934,23 @@ async fn recv_notification_by_method(
     method: &str,
 ) -> JsonRpcNotification {
     recv_notification_by_method_timeout(rx, method, Duration::from_secs(2)).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn recv_native_task_permission_opened(
+    rx: &mut mpsc::Receiver<Message>,
+) -> JsonRpcNotification {
+    // Task creation acknowledges enqueueing, not child readiness. The child must
+    // pass scheduler dispatch, preflight and tool admission before this event.
+    // These functional sandbox tests do not assert a two-second launch SLA.
+    // Bound the whole wait so unrelated progress cannot keep extending it.
+    let budget = Duration::from_secs(30);
+    timeout(
+        budget,
+        recv_notification_by_method_timeout(rx, events::TURN_PERMISSION_REQUEST_OPENED, budget),
+    )
+    .await
+    .expect("native Task must reach its permission request within the launch budget")
 }
 
 async fn recv_next_notification(rx: &mut mpsc::Receiver<Message>) -> JsonRpcNotification {

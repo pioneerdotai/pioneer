@@ -1,7 +1,7 @@
 use crate::output_policy::ToolResultEnvelope;
 use crate::spec::{ToolPermissionMetadata, ToolRecoveryMetadata};
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
-use pioneer_provider::ModelInputItem;
+use pioneer_provider::{ChatMessage, ModelInputItem};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -431,6 +431,19 @@ impl AnyToolResult {
         self.outcome = outcome;
     }
 
+    /// Complete result for durable conversation history and compaction source reads.
+    /// Timeline storage/display policies and bounded model views do not truncate this
+    /// source. Preserve the projected attachments and keep raw serialization here.
+    pub fn to_history_message(&self) -> ChatMessage {
+        let mut message = self.to_model_input_item().into_chat_message();
+        message.content = match self.output.raw_json() {
+            JsonValue::String(text) => text,
+            JsonValue::Null => self.output.raw_text(),
+            value => value.to_string(),
+        };
+        message
+    }
+
     pub fn to_model_input_item(&self) -> ModelInputItem {
         if let Some(projection) = self.projection.as_ref() {
             return projection.to_model_input_item(self.call_id.as_str(), self.tool_name.as_str());
@@ -518,6 +531,47 @@ mod tests {
     }
 
     #[test]
+    fn history_preserves_complete_result_independently_of_bounded_views() {
+        let body = "full result\n".repeat(10_000);
+        for payload in [
+            serde_json::json!({ "body": body, "status": 200 }),
+            JsonValue::String(body.clone()),
+            JsonValue::Null,
+        ] {
+            let expected = if payload.is_object() {
+                payload.to_string()
+            } else {
+                body.clone()
+            };
+            let outcome = ToolOutcome::ok();
+            let result = AnyToolResult {
+                call_id: "call_full".to_owned(),
+                tool_name: "dynamic_http".to_owned(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({}),
+                },
+                output: Box::new(FunctionToolOutput::with_payload(&body, true, payload)),
+                outcome: outcome.clone(),
+                projection: Some(test_projection(
+                    "dynamic_http",
+                    serde_json::json!({ "summary": "bounded view" }),
+                    outcome,
+                )),
+            };
+            let history = result.to_history_message();
+            assert_eq!(history.content, expected);
+            assert_eq!(history.role, Role::Tool);
+            assert_eq!(history.tool_call_id.as_deref(), Some("call_full"));
+            assert_eq!(history.name.as_deref(), Some("dynamic_http"));
+            assert!(result.model_visible_text().contains("bounded view"));
+            assert!(!result.model_visible_text().contains(&body));
+            let projection = result.projection().unwrap();
+            assert!(matches!(projection.storage, ToolStoragePayload::None));
+            assert!(matches!(projection.display, ToolDisplayPayload::Hidden));
+        }
+    }
+
+    #[test]
     fn llm_context_attachment_becomes_structured_tool_message() {
         let outcome = ToolOutcome::ok();
         let model_payload = serde_json::json!({
@@ -552,6 +606,7 @@ mod tests {
             projection: Some(test_projection("computer_use", model_payload, outcome)),
         };
 
+        let history = result.to_history_message();
         let item = result.to_model_input_item();
         let message = match item {
             ModelInputItem::Message { message } => message,
@@ -567,6 +622,10 @@ mod tests {
         assert!(message.content.contains("\"accessibility_tree\""));
         assert!(message.content.contains("\"partial_output\""));
         assert_eq!(message.content_parts.len(), 1);
+        assert_eq!(history.content_parts, message.content_parts);
+        assert_eq!(history.tool_call_id, message.tool_call_id);
+        assert_eq!(history.name, message.name);
+        assert!(history.content.contains("\"accessibility_tree\""));
 
         match &message.content_parts[0] {
             MessageContentPart::Image { image } => {

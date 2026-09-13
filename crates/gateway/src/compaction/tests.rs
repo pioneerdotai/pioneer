@@ -2671,6 +2671,37 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
         .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
         .await
         .unwrap();
+    for (id, code, message) in [
+        (
+            "source-blocker",
+            "permission_denied",
+            "recorded permission blocker",
+        ),
+        (
+            "compaction-progress",
+            "agent_context_compaction",
+            "technical summary progress",
+        ),
+    ] {
+        f.store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::SystemEvent {
+                        id: id.into(),
+                        level: SystemEventLevel::Info,
+                        message: message.into(),
+                        code: Some(code.into()),
+                        details: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
     let mut turn = f.store.get_turn("thread", "turn").await.unwrap().unwrap().1;
     turn.status = pioneer_protocol::TurnStatus::Interrupted;
     turn.error = None;
@@ -2685,6 +2716,25 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
         )
         .await
         .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|message| message.content.contains("recorded permission blocker"))
+    );
+    assert!(
+        history
+            .iter()
+            .any(|message| message.content == "Historical turn Interrupted: None")
+    );
+    assert!(
+        history
+            .iter()
+            .all(|message| !message.content.contains("technical summary progress"))
+    );
     let reference = f
         .store
         .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)

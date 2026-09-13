@@ -366,6 +366,7 @@ Prior visible assistant text: I drafted the outline and verified two files.
 Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
 
 Domains:
+- threads: threads_tools_result_read.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
@@ -415,6 +416,7 @@ Prior visible assistant text: I drafted the outline and verified two files.
 Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
 
 Domains:
+- threads: threads_tools_result_read.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
 - task: task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.

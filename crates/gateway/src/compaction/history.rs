@@ -662,7 +662,6 @@ async fn load_line_history_inner(
             {
                 continue;
             }
-            let is_original_work = kind != "status";
             let payload = source_payload(&store, workspace, thread, &mut row).await?;
             let event: Event = serde_json::from_str(&payload)?;
             ensure!(
@@ -681,7 +680,6 @@ async fn load_line_history_inner(
                 &row.reference.id,
                 vec![row.reference.clone()],
             ));
-            if is_original_work {}
             ordered.push((row.sequence, vec![message]));
         }
         if causal_task_context {

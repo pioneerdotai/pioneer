@@ -6194,11 +6194,9 @@ async fn execute_agent_provider_response(
 
                         let full_source_in_item = dispatch_result.as_ref().ok().and_then(|r| r.projection()).is_some_and(|p| matches!(p.storage, pioneer_protocol::ToolStoragePayload::Shell { .. }) && matches!(p.output_policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. }));
                         let full_message = dispatch_result.as_ref().ok().map(|result| {
-                            let mut message = result.to_model_input_item().into_chat_message();
+                            let mut message = result.to_history_message();
                             message.tool_call_id = Some(provider_call_id.clone());
                             message.name = Some(tool_name.clone());
-                            let raw = result.raw_output_json();
-                            message.content = if let Some(text) = raw.as_str() { text.to_owned() } else if raw.is_null() { result.raw_output_text() } else { raw.to_string() };
                             message
                         });
                         let full_source_in_item = full_source_in_item && full_message.as_ref().is_none_or(|message| message.content_parts.is_empty());

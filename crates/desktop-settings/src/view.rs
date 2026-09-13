@@ -2459,7 +2459,7 @@ mod tests {
             .split("fn render_settings_self_improvement")
             .nth(1)
             .expect("Self-improvement screen exists")
-            .split("fn render_locale_setting")
+            .split("fn render_workspace_model_settings")
             .next()
             .expect("Self-improvement screen boundary exists");
 

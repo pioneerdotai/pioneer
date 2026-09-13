@@ -910,7 +910,7 @@ impl CompactionRunner {
 mod tests;
 
 #[cfg(test)]
-fn load_test_catalog() {
+pub(crate) fn load_test_catalog() {
     static READY: std::sync::Once = std::sync::Once::new();
     READY.call_once(|| {
         let directory = tempfile::tempdir().unwrap();
