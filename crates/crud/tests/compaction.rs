@@ -17,6 +17,204 @@ async fn store() -> CrudStore {
     }
     store
 }
+
+#[tokio::test]
+async fn history_capture_is_identical_before_and_after_transparent_compression() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let store = store().await;
+    let db = store.database_connection();
+    source(&store, "first", 1, "retained original").await;
+    let first = store
+        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .remove(0)
+        .reference;
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let before = store
+        .compaction_history_turn_page("ws", "thread", "", &fence)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    for table in ["turn_item", "turn_event"] {
+        let config = serde_json::json!({
+            "table": table, "column": "payload", "compression_level": 3,
+            "dict_chooser": "'[nodict]'"
+        });
+        db.query_one_write_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT zstd_enable_transparent(?)",
+            [config.to_string().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    source(&store, "later", 2, "after the captured fence").await;
+    let after = store
+        .compaction_history_turn_page("ws", "thread", "", &fence)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), before.len());
+    let (before, after) = (&before[0], &after[0]);
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.created_at, before.created_at);
+    assert_eq!(after.creation_order, before.creation_order);
+    assert_eq!(after.legacy_creation_order, before.legacy_creation_order);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.turn_kind, before.turn_kind);
+    assert_eq!(after.send_mode, before.send_mode);
+    assert_eq!(after.input_high_water, before.input_high_water);
+    assert_eq!(after.event_high_water, before.event_high_water);
+    assert_eq!(after.context_high_water, before.context_high_water);
+    assert_eq!(after.event_high_water, 1);
+    let next_fence = store.compaction_history_read_fence().await.unwrap();
+    assert_eq!(
+        store
+            .compaction_history_turn_page("ws", "thread", "", &next_fence)
+            .await
+            .unwrap()[0]
+            .event_high_water,
+        2
+    );
+    assert!(
+        store
+            .compaction_history_turn_page("other", "thread", "", &fence)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_history_turn_page("ws", "thread", &after.id, &fence)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .compaction_reference_fragment("ws", "thread", &first, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+        "retained original"
+    );
+}
+
+#[tokio::test]
+async fn tool_item_paging_preserves_untracked_and_zero_order_legacy_rows() {
+    let store = store().await;
+    let db = store.database_connection();
+    for id in ["z-untracked", "a-seeded"] {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES (?,'turn',?,'command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [id.into(), id.into()])).await.unwrap();
+    }
+    // Reproduce both supported pre-migration states: no revision row and a
+    // lazily seeded revision whose capture_order is zero.
+    db.execute_unprepared("DELETE FROM compaction_item_revision")
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_item_revision(source_id,turn_id,revision,present,capture_order) VALUES ('a-seeded','turn',1,1,0)").await.unwrap();
+    let high_water = store
+        .compaction_source_high_water("ws", "thread", "turn", CanonicalSource::ToolItem)
+        .await
+        .unwrap();
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", CanonicalSource::ToolItem, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|row| row.reference.id.as_str())
+            .collect::<Vec<_>>(),
+        ["z-untracked", "a-seeded"]
+    );
+    assert_eq!(page.next_sequence, high_water);
+    let next = store
+        .compaction_source_metadata_page_at_fence(
+            "ws",
+            "thread",
+            "turn",
+            CanonicalSource::ToolItem,
+            page.entries[0].sequence,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.entries.len(), 1);
+    assert_eq!(next.entries[0].reference.id, "a-seeded");
+}
+
+#[tokio::test]
+async fn history_capture_after_upgrading_an_already_compressed_database() {
+    use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let connection = Database::connect("sqlite::memory:").await.unwrap();
+    let writer = SqliteWriteExecutor::new(connection.clone());
+    let before_compaction = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == "m20260910_000001_context_compaction")
+        .unwrap();
+    writer
+        .run_migrations::<Migrator>(
+            SqliteWriteClass::Maintenance,
+            Some(before_compaction as u32),
+        )
+        .await
+        .unwrap();
+    let store = CrudStore::new(SqliteDatabase::from_executor(connection, writer.clone()))
+        .with_maintenance_access();
+    let db = store.database_connection();
+    let config = serde_json::json!({"table":"turn_item", "column":"payload", "compression_level":3, "dict_chooser":"'[nodict]'"});
+    db.query_one_write_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT zstd_enable_transparent(?)",
+        [config.to_string().into()],
+    ))
+    .await
+    .unwrap();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        r#"INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES ('legacy','turn','legacy','command_execution','completed',0,'{"storage":{"kind":"shell"},"output":"retained old result"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"#,
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES ('item','turn','item','command_execution','completed',0,'{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    // History admission must work on an upgraded compressed database, and
+    // pre-migration payloads must remain readable by their exact references.
+    let legacy = store
+        .compaction_tool_result_fragment("ws", "thread", "turn", "legacy", None, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(legacy.text.contains("retained old result"));
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    assert!(fence.item_order > 0);
+    for _ in 0..2 {
+        let history = store
+            .compaction_history_turn_page("ws", "thread", "", &fence)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "turn");
+        assert_eq!(history[0].event_high_water, 0);
+        assert_eq!(history[0].context_high_water, 0);
+        assert_eq!(history[0].input_high_water, 0);
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+    }
+}
 async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> SourceAssertion {
     store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",

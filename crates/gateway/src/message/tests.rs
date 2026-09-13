@@ -9085,6 +9085,26 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .expect("materialized test thread should become durable in memory");
 }
 
+// Production canonical payloads are exposed through sqlite-zstd views. Keep
+// both Composer ingress tests on that schema so hidden-rowid regressions fail
+// at the same admission boundary as installed databases.
+async fn enable_composer_history_compression(store: &CrudStore) {
+    let db = store.with_maintenance_access().database_connection();
+    for table in ["turn_item", "turn_event"] {
+        let config = serde_json::json!({
+            "table": table, "column": "payload", "compression_level": 3,
+            "dict_chooser": "'[nodict]'"
+        });
+        db.query_one_write_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT zstd_enable_transparent(?)",
+            [config.to_string().into()],
+        ))
+        .await
+        .expect("enable canonical history compression");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collaborative_composer_admits_message_and_detached_task_while_task_child_stays_foreground()
 {
@@ -9103,7 +9123,9 @@ async fn collaborative_composer_admits_message_and_detached_task_while_task_chil
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    enable_composer_history_compression(crud_store.as_ref()).await;
     let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("valid pack id");
     let first_skill_id = pioneer_protocol::SkillId::new("A".repeat(21)).expect("first skill id");
     let second_skill_id = pioneer_protocol::SkillId::new("B".repeat(21)).expect("second skill id");
@@ -12319,7 +12341,9 @@ async fn collaborative_voice_composer_admits_detached_task() {
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    enable_composer_history_compression(crud_store.as_ref()).await;
     let provider = Arc::new(CaptureSummaryProvider::new("must run in child"));
     let processor = Arc::new(
         MessageProcessor::new(

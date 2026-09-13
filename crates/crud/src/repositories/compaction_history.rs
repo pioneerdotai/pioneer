@@ -8,7 +8,7 @@ use pioneer_entity::{
     compaction_event_revision, compaction_input_revision, compaction_item_revision,
     compaction_source_revision, compaction_turn_creation, task, task_delivery, task_run,
     task_run_conversation_snapshot, task_run_turn, thread, thread_lineage, turn, turn_event,
-    turn_input, turn_item, turn_llm_context,
+    turn_input, turn_llm_context,
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, JoinType, Order, Query};
 use sea_orm::{ConnectionTrait, FromQueryResult};
@@ -23,6 +23,9 @@ pub struct HistoryReadFence {
     pub context_order: i64,
     pub item_order: i64,
 }
+/// Tool items are resolved by exact source references, not enumerated by the
+/// history assembler. A physical turn_item rowid boundary is neither used nor
+/// available when transparent compression exposes the source through a view.
 #[derive(Clone, Debug, FromQueryResult)]
 pub struct HistoryTurnBoundary {
     pub creation_order: i64,
@@ -37,7 +40,6 @@ pub struct HistoryTurnBoundary {
     pub input_high_water: i64,
     pub event_high_water: i64,
     pub context_high_water: i64,
-    pub item_high_water: i64,
 }
 #[derive(Clone, Debug, FromQueryResult)]
 pub struct HistoryCausalBoundary {
@@ -1807,53 +1809,6 @@ pub(crate) async fn compaction_history_turn_page<C: ConnectionTrait>(
                 ),
             ),
             "context_high_water",
-        )
-        .expr_as(
-            Expr::SubQuery(
-                None,
-                Box::new(
-                    Query::select()
-                        .expr(Expr::expr(
-                            Func::cust(Alias::new("coalesce")).args([
-                                Expr::expr(
-                                    Func::cust(Alias::new("max"))
-                                        .args([Expr::col(("s", Alias::new("rowid")))]),
-                                ),
-                                Expr::val(0_i64),
-                            ]),
-                        ))
-                        .from_as(turn_item::Entity, "s")
-                        .join_as(
-                            JoinType::InnerJoin,
-                            compaction_item_revision::Entity,
-                            "r",
-                            Expr::col(("r", compaction_item_revision::Column::SourceId))
-                                .eq(Expr::col(("s", turn_item::Column::Id)))
-                                .and(
-                                    Expr::col(("r", compaction_item_revision::Column::TurnId))
-                                        .eq(Expr::col(("s", turn_item::Column::TurnId))),
-                                )
-                                .and(
-                                    Expr::col(("r", compaction_item_revision::Column::Present))
-                                        .eq(Expr::val(1_i64)),
-                                ),
-                        )
-                        .and_where(
-                            Expr::col(("s", turn_item::Column::TurnId))
-                                .eq(Expr::col((turn::Entity, turn::Column::Id)))
-                                .and(
-                                    Expr::col((
-                                        "r",
-                                        compaction_item_revision::Column::CaptureOrder,
-                                    ))
-                                    .lte(Expr::Value(fence.item_order.into())),
-                                ),
-                        )
-                        .to_owned()
-                        .into(),
-                ),
-            ),
-            "item_high_water",
         )
         .filter(
             Expr::col((thread::Entity, thread::Column::WorkspaceId))
