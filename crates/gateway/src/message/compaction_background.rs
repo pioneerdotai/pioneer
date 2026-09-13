@@ -39,9 +39,6 @@ impl MessageProcessor {
         mut request: pioneer_provider::ChatRequest,
     ) -> anyhow::Result<()> {
         let settings = self.compaction_settings_for_workspace(&context.workspace_id)?;
-        if !settings.enabled {
-            return Ok(());
-        }
         let clock = SystemCompactionClock::default();
         let deadline = clock
             .now_ms()
@@ -264,7 +261,7 @@ impl MessageProcessor {
             let (settings, cli_override) = {
                 let legacy = self.compaction_settings()?;
                 let workspace = self
-                    .workspace_model_settings
+                    .workspace_compaction_settings
                     .read()
                     .map_err(|_| anyhow::anyhow!("workspace settings unavailable"))?;
                 match workspace.get(&row.workspace_id) {
@@ -275,12 +272,6 @@ impl MessageProcessor {
                     None => (legacy, None),
                 }
             };
-            if !settings.enabled {
-                self.crud_store
-                    .compaction_finish_history_check(&row.turn_id, "disabled")
-                    .await?;
-                return Ok(());
-            }
             let current = ModelSelection {
                 transport: match row.runtime_kind.as_str() {
                     "codex" => Transport::Codex,

@@ -364,9 +364,7 @@ mod tests {
         GatewaySettingsSnapshot {
             self_improvement_status: None,
             general: pioneer_protocol::GatewayGeneralSettings {
-                default_model: Default::default(),
                 compaction_model: Default::default(),
-                context_compaction_enabled: true,
                 keepawake,
                 ..Default::default()
             },

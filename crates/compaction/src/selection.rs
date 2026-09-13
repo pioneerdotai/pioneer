@@ -15,23 +15,10 @@ pub struct ModelSelection {
     pub effort: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CompactionSettings {
-    #[serde(default = "enabled")]
-    pub enabled: bool,
     #[serde(default)]
     pub selection: Option<ModelSelection>,
-}
-fn enabled() -> bool {
-    true
-}
-impl Default for CompactionSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            selection: None,
-        }
-    }
 }
 
 /// Resolve the entire selection; never borrow the effort or instance of a fallback.
@@ -60,7 +47,6 @@ impl CompactionSettings {
         cli_override: Option<&ModelSelection>,
         now_ms: u64,
     ) -> anyhow::Result<OperationAdmission> {
-        anyhow::ensure!(self.enabled, "context compaction is disabled");
         let selection = effective_selection(current, self.selection.as_ref(), cli_override).clone();
         anyhow::ensure!(
             !selection.instance.is_empty() && !selection.model.is_empty(),
@@ -102,14 +88,15 @@ mod tests {
         assert_eq!(effective_selection(&cli, None, None), &cli);
     }
     #[test]
-    fn gate_blocks_next_operation_without_mutating_admission() {
-        let current = model(Transport::Api, "api");
-        let mut settings: CompactionSettings = serde_json::from_str("{}").unwrap();
-        let started = settings.admit(&current, None, 100).unwrap();
-        settings.enabled = false;
-        assert!(settings.admit(&current, None, 200).is_err());
-        assert_eq!(started.deadline_ms, 900_100);
-        assert_eq!(started.selection, current);
-        assert!(settings.selection.is_none());
+    fn admission_uses_current_selection_and_keeps_existing_snapshot() {
+        let current = model(Transport::Api, "current");
+        let mut settings = CompactionSettings::default();
+        let admitted = settings.admit(&current, None, 100).unwrap();
+        settings.selection = Some(model(Transport::Claude, "summary"));
+        let next = settings.admit(&current, None, 200).unwrap();
+        assert_eq!(admitted.selection, current);
+        assert_eq!(next.selection, settings.selection.clone().unwrap());
+        assert_eq!(admitted.deadline_ms, 100 + crate::OPERATION_MILLIS);
+        assert_eq!(next.deadline_ms, 200 + crate::OPERATION_MILLIS);
     }
 }

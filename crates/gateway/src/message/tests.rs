@@ -63297,100 +63297,6 @@ async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_obse
 }
 
 #[tokio::test]
-async fn compaction_general_default_model_reaches_thread_start_as_one_selection() {
-    use pioneer_protocol::{GatewayModelSelection, ModelSelectionTransport};
-    let (tx, mut rx) = mpsc::channel(256);
-    let sessions = Arc::new(SessionManager::new());
-    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
-    let (workspaces, store, workspace) = setup_workspace_manager().await;
-    sessions
-        .set_connection_workspace(connection, Some(workspace.clone()))
-        .await;
-    let processor = Arc::new(MessageProcessor::new(
-        Arc::new(ThreadManager::new("", "")),
-        test_provider(),
-        sessions.clone(),
-        workspaces,
-        store,
-        test_gateway_secrets(),
-        test_summary_config(),
-        test_tool_loop_config(),
-    ));
-    for (index, transport) in [
-        ModelSelectionTransport::Api,
-        ModelSelectionTransport::Codex,
-        ModelSelectionTransport::Claude,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        processor.workspace_model_settings.write().unwrap().insert(
-            workspace.clone(),
-            crate::settings::WorkspaceModelSettings {
-                default_model: GatewayModelSelection::Explicit {
-                    transport,
-                    instance: "selected-instance".into(),
-                    model: "selected-model".into(),
-                    reasoning_effort: Some("high".into()),
-                },
-                compaction_model: None,
-                enabled: true,
-                cli_overrides: Default::default(),
-            },
-        );
-        for explicit in [false, true] {
-            let request_id =
-                generate_test_request_id("default-model", &format!("{index}-{explicit}"));
-            let mut params = json!({"workspace_id":workspace,"thread_id":format!("default-model-{index}-{explicit}")});
-            if explicit {
-                params["model"] = json!("explicit-model");
-                params["model_provider"] = json!("explicit-api");
-            }
-            processor.clone().process_owned_request(sessions.connection_context(connection).await.unwrap(),
-                json!({"jsonrpc":"2.0","id":request_id,"method":"thread/start","params":params}).to_string()).await;
-            let response = recv_response_by_id(&mut rx, &request_id).await;
-            let response: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
-            assert_eq!(
-                response.thread.model,
-                if explicit {
-                    "explicit-model"
-                } else {
-                    "selected-model"
-                }
-            );
-            let expected_provider = if explicit {
-                "explicit-api".to_owned()
-            } else if transport == ModelSelectionTransport::Api {
-                "selected-instance".into()
-            } else {
-                super::turn_handlers::cli_runtime_provider_key("selected-instance")
-            };
-            assert_eq!(response.thread.model_provider, expected_provider);
-            assert_eq!(
-                response.thread.reasoning_effort.as_deref(),
-                (!explicit).then_some("high")
-            );
-        }
-    }
-    processor.workspace_model_settings.write().unwrap().clear();
-    let request_id = generate_test_request_id("default-model", "inherit");
-    processor
-        .clone()
-        .process_owned_request(
-            sessions.connection_context(connection).await.unwrap(),
-            json!({"jsonrpc":"2.0","id":request_id,"method":"thread/start",
-            "params":{"workspace_id":workspace,"thread_id":"default-model-inherit"}})
-            .to_string(),
-        )
-        .await;
-    let response = recv_response_by_id(&mut rx, &request_id).await;
-    let response: ThreadStartResponse = serde_json::from_value(response.result).unwrap();
-    assert!(response.thread.model.is_empty());
-    assert!(response.thread.model_provider.is_empty());
-    assert!(response.thread.reasoning_effort.is_none());
-}
-
-#[tokio::test]
 async fn compaction_native_overflow_twice_retries_main_request_once() {
     Box::pin(check_native_overflow_twice(false, false)).await;
 }
@@ -63454,20 +63360,23 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
         })
         .unwrap();
     crate::settings::save_gateway_settings(&path, &settings).unwrap();
-    processor.workspace_model_settings.write().unwrap().insert(
-        workspace.to_owned(),
-        crate::settings::WorkspaceModelSettings {
-            compaction_model: Some(pioneer_protocol::GatewayModelSelection::Explicit {
-                transport: pioneer_protocol::ModelSelectionTransport::Claude,
-                instance: "claude".into(),
-                model: "claude-sonnet-4-6".into(),
-                reasoning_effort: Some("high".into()),
-            }),
-            default_model: Default::default(),
-            enabled: true,
-            cli_overrides: Default::default(),
-        },
-    );
+    processor
+        .workspace_compaction_settings
+        .write()
+        .unwrap()
+        .insert(
+            workspace.to_owned(),
+            crate::settings::WorkspaceCompactionSettings {
+                compaction_model: Some(pioneer_protocol::GatewayModelSelection::Explicit {
+                    transport: pioneer_protocol::ModelSelectionTransport::Claude,
+                    instance: "claude".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    reasoning_effort: Some("high".into()),
+                }),
+
+                cli_overrides: Default::default(),
+            },
+        );
 }
 
 async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
@@ -63566,7 +63475,6 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     let processor = Arc::new(processor);
     processor
         .apply_compaction_settings(pioneer_compaction::CompactionSettings {
-            enabled: true,
             selection: Some(pioneer_compaction::ModelSelection {
                 transport: pioneer_compaction::Transport::Api,
                 instance: "summary-capture".into(),
@@ -64072,7 +63980,6 @@ async fn check_completed_history(
         effort: Some("high".into()),
     };
     let general = CompactionSettings {
-        enabled: true,
         selection: Some(ModelSelection {
             transport: Transport::Api,
             instance: "summary-capture".into(),
@@ -64114,19 +64021,6 @@ async fn check_completed_history(
             result
         }
     };
-    assert!(
-        run(
-            harness.workspace_id.clone(),
-            CompactionSettings {
-                enabled: false,
-                ..general.clone()
-            },
-            None
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
     assert!(
         run("foreign-workspace".into(), general.clone(), None)
             .await
@@ -64347,10 +64241,7 @@ async fn check_completed_history(
             // Restart must use the admitted whole selection, not later settings.
             harness
                 .processor
-                .apply_compaction_settings(CompactionSettings {
-                    enabled: false,
-                    selection: None,
-                })
+                .apply_compaction_settings(CompactionSettings { selection: None })
                 .unwrap();
             harness
                 .processor

@@ -132,16 +132,6 @@
             "source": "inherit"
           }
         },
-        "context_compaction_enabled": {
-          "type": "boolean",
-          "default": true
-        },
-        "default_model": {
-          "$ref": "#/$defs/GatewayModelSelection",
-          "default": {
-            "source": "inherit"
-          }
-        },
         "keepawake": {
           "type": "boolean",
           "default": false
@@ -535,10 +525,6 @@
           "$ref": "#/$defs/GatewayGeneralSettings",
           "default": {
             "compaction_model": {
-              "source": "inherit"
-            },
-            "context_compaction_enabled": true,
-            "default_model": {
               "source": "inherit"
             },
             "keepawake": false,

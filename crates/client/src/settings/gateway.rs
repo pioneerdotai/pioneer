@@ -205,9 +205,7 @@ pub fn keepawake_update_plan(
         snapshot,
         update: GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
-                default_model: None,
                 compaction_model: None,
-                context_compaction_enabled: None,
                 keepawake: Some(enabled),
                 telemetry_enabled: None,
                 preflight_model: None,
@@ -233,9 +231,7 @@ pub fn telemetry_enabled_update_plan(
         snapshot,
         update: GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
-                default_model: None,
                 compaction_model: None,
-                context_compaction_enabled: None,
                 keepawake: None,
                 telemetry_enabled: Some(enabled),
                 preflight_model: None,
@@ -261,9 +257,7 @@ pub fn preflight_model_update_plan(
         snapshot,
         update: GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
-                default_model: None,
                 compaction_model: None,
-                context_compaction_enabled: None,
                 keepawake: None,
                 telemetry_enabled: None,
                 preflight_model: Some(model_selection),
@@ -479,9 +473,7 @@ mod tests {
         GatewaySettingsSnapshot {
             self_improvement_status: None,
             general: GatewayGeneralSettings {
-                default_model: Default::default(),
                 compaction_model: Default::default(),
-                context_compaction_enabled: true,
                 keepawake,
                 ..Default::default()
             },

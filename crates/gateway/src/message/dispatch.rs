@@ -7552,7 +7552,7 @@ impl MessageProcessor {
             };
         }
 
-        self.apply_workspace_model_settings(&settings)?;
+        self.apply_workspace_compaction_settings(&settings)?;
 
         if let Some(telemetry_enabled) = changes.general.telemetry_enabled {
             pioneer_observability::set_telemetry_enabled(telemetry_enabled);

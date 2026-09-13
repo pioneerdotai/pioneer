@@ -289,16 +289,6 @@
             "source": "inherit"
           }
         },
-        "context_compaction_enabled": {
-          "type": "boolean",
-          "default": true
-        },
-        "default_model": {
-          "$ref": "#/$defs/GatewayModelSelection",
-          "default": {
-            "source": "inherit"
-          }
-        },
         "keepawake": {
           "type": "boolean",
           "default": false
@@ -319,22 +309,6 @@
       "type": "object",
       "properties": {
         "compaction_model": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayModelSelection"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "context_compaction_enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "default_model": {
           "anyOf": [
             {
               "$ref": "#/$defs/GatewayModelSelection"
@@ -774,10 +748,6 @@
           "$ref": "#/$defs/GatewayGeneralSettings",
           "default": {
             "compaction_model": {
-              "source": "inherit"
-            },
-            "context_compaction_enabled": true,
-            "default_model": {
               "source": "inherit"
             },
             "keepawake": false,

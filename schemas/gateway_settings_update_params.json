@@ -96,22 +96,6 @@
             }
           ]
         },
-        "context_compaction_enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "default_model": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GatewayModelSelection"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "keepawake": {
           "type": [
             "boolean",

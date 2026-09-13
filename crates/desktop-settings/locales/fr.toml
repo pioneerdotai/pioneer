@@ -426,17 +426,13 @@ microphone_sample_format_unsupported = "Le format d'échantillon du microphone d
 microphone_no_input_stream = "Le microphone par défaut ne peut pas fournir de flux d'entrée."
 microphone_capture_failed = "Échec de la capture du microphone : %{error}"
 
-[settings.default_model]
-label = "Modèle par défaut de l’espace de travail"
 
 [settings.compaction.model]
+description = "Modèle utilisé pour résumer automatiquement l’historique des conversations."
 label = "Modèle de compression"
 
-[settings.compaction.enabled]
-label = "Compression du contexte"
-description = "Compresser les longs historiques de conversation dans cet espace de travail."
 
 [settings.model]
-inherit = "Utiliser le modèle du tour actuel"
+not_selected = "Non sélectionné"
 choose = "Choisir…"
 reset = "Réinitialiser"

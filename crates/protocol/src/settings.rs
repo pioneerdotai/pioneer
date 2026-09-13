@@ -96,11 +96,7 @@ pub struct GatewaySettingsUpdate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_model: Option<crate::GatewayModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model: Option<crate::GatewayModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_compaction_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,11 +222,7 @@ pub struct GatewayVoiceInputStatusChangedNotification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettings {
     #[serde(default)]
-    pub default_model: crate::GatewayModelSelection,
-    #[serde(default)]
     pub compaction_model: crate::GatewayModelSelection,
-    #[serde(default = "default_context_compaction_enabled")]
-    pub context_compaction_enabled: bool,
     #[serde(default)]
     pub keepawake: bool,
     #[serde(default = "default_telemetry_enabled")]
@@ -242,18 +234,12 @@ pub struct GatewayGeneralSettings {
 impl Default for GatewayGeneralSettings {
     fn default() -> Self {
         Self {
-            default_model: Default::default(),
             compaction_model: Default::default(),
-            context_compaction_enabled: true,
             keepawake: false,
             telemetry_enabled: default_telemetry_enabled(),
             preflight_model: GatewayMemoryModelSelection::default(),
         }
     }
-}
-
-const fn default_context_compaction_enabled() -> bool {
-    true
 }
 
 const fn default_telemetry_enabled() -> bool {
@@ -880,6 +866,31 @@ mod tests {
     use crate::turn::CLIAgentRuntimeKind;
 
     #[test]
+    fn general_settings_publish_only_supported_controls() {
+        let value = serde_json::to_value(GatewayGeneralSettings::default()).unwrap();
+        let keys: std::collections::BTreeSet<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "compaction_model",
+                "keepawake",
+                "telemetry_enabled",
+                "preflight_model"
+            ])
+        );
+        let update: GatewayGeneralSettingsUpdate = serde_json::from_value(
+            serde_json::json!({"compaction_model": crate::GatewayModelSelection::Inherit}),
+        )
+        .unwrap();
+        assert!(update.compaction_model.is_some());
+    }
+
+    #[test]
     fn settings_general_defaults_to_thread_preflight_model() {
         let settings = GatewayGeneralSettings::default();
 
@@ -982,9 +993,7 @@ mod tests {
     #[test]
     fn settings_general_update_roundtrips_preflight_model() {
         let update = GatewayGeneralSettingsUpdate {
-            default_model: None,
             compaction_model: None,
-            context_compaction_enabled: None,
             keepawake: Some(true),
             telemetry_enabled: Some(false),
             preflight_model: Some(GatewayMemoryModelSelection::custom(

@@ -188,15 +188,10 @@ impl GatewayGeneralSettings {
 
     fn effective(&self, config: &GatewayConfig) -> pioneer_protocol::GatewayGeneralSettings {
         pioneer_protocol::GatewayGeneralSettings {
-            default_model: legacy_model_selection(
-                config.thread.default_model_provider.as_deref(),
-                config.thread.default_model.as_deref(),
-            ),
             compaction_model: legacy_model_selection(
                 config.thread.summary_model_provider.as_deref(),
                 config.thread.summary_model.as_deref(),
             ),
-            context_compaction_enabled: true,
             keepawake: self.keepawake.unwrap_or(config.keepawake),
             telemetry_enabled: self.telemetry_enabled.unwrap_or(config.telemetry.enabled),
             preflight_model: model_selection_to_protocol(
@@ -359,11 +354,7 @@ struct GatewayThreadEpisodicSettingsOverride {
 #[serde(deny_unknown_fields)]
 struct GatewayWorkspaceSettingsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    default_model: Option<pioneer_protocol::GatewayModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_model: Option<pioneer_protocol::GatewayModelSelection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    context_compaction_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     cli_compaction_models: BTreeMap<String, pioneer_protocol::GatewayModelSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -770,33 +761,15 @@ impl GatewaySettings {
         let mut changes = GatewaySettingsChangeSet::default();
         let normalized_workspace_id = normalize_workspace_settings_key(workspace_id);
         if let Some(mut general) = update.general {
-            if general.default_model.is_some()
-                || general.compaction_model.is_some()
-                || general.context_compaction_enabled.is_some()
-            {
-                let workspace_id = normalized_workspace_id.as_deref().context(
-                    "workspace context is required to update model or compaction settings",
-                )?;
-                let default_model = general
-                    .default_model
-                    .take()
-                    .map(|value| value.normalized().map_err(anyhow::Error::msg))
-                    .transpose()?;
-                let compaction_model = general
-                    .compaction_model
-                    .take()
-                    .map(|value| value.normalized().map_err(anyhow::Error::msg))
-                    .transpose()?;
-                let workspace = self.workspaces.entry(workspace_id.into()).or_default();
-                if let Some(value) = default_model {
-                    workspace.default_model = Some(value);
-                }
-                if let Some(value) = compaction_model {
-                    workspace.compaction_model = Some(value);
-                }
-                if let Some(value) = general.context_compaction_enabled.take() {
-                    workspace.context_compaction_enabled = Some(value);
-                }
+            if let Some(selection) = general.compaction_model.take() {
+                let workspace_id = normalized_workspace_id
+                    .as_deref()
+                    .context("workspace context is required to update compaction settings")?;
+                let selection = selection.normalized().map_err(anyhow::Error::msg)?;
+                self.workspaces
+                    .entry(workspace_id.into())
+                    .or_default()
+                    .compaction_model = Some(selection);
             }
             changes.general = self.general.apply_protocol_update(general);
         }
@@ -983,14 +956,9 @@ impl GatewaySettings {
     ) -> pioneer_protocol::GatewayGeneralSettings {
         let mut general = self.effective_general_settings(config);
         if let Some(workspace) = workspace_id.and_then(|id| self.workspaces.get(id)) {
-            if let Some(selection) = &workspace.default_model {
-                general.default_model = selection.clone();
-            }
             if let Some(selection) = &workspace.compaction_model {
                 general.compaction_model = selection.clone();
             }
-            general.context_compaction_enabled =
-                workspace.context_compaction_enabled.unwrap_or(true);
         }
         general
     }
@@ -1013,16 +981,16 @@ impl GatewaySettings {
         settings
     }
 
-    pub(crate) fn workspace_model_settings(&self) -> BTreeMap<String, WorkspaceModelSettings> {
+    pub(crate) fn workspace_compaction_settings(
+        &self,
+    ) -> BTreeMap<String, WorkspaceCompactionSettings> {
         self.workspaces
             .iter()
             .map(|(id, value)| {
                 (
                     id.clone(),
-                    WorkspaceModelSettings {
-                        default_model: value.default_model.clone().unwrap_or_default(),
+                    WorkspaceCompactionSettings {
                         compaction_model: value.compaction_model.clone(),
-                        enabled: value.context_compaction_enabled.unwrap_or(true),
                         cli_overrides: value
                             .cli_compaction_models
                             .iter()
@@ -2983,9 +2951,7 @@ backend = "keystore"
         settings
             .apply_protocol_update(pioneer_protocol::GatewaySettingsUpdate {
                 general: Some(pioneer_protocol::GatewayGeneralSettingsUpdate {
-                    default_model: None,
                     compaction_model: None,
-                    context_compaction_enabled: None,
                     keepawake: Some(true),
                     telemetry_enabled: Some(false),
                     preflight_model: Some(pioneer_protocol::GatewayMemoryModelSelection::custom(
@@ -4910,9 +4876,7 @@ model = "legacy-model"
         };
         let update = GatewaySettingsUpdate {
             general: Some(GatewayGeneralSettingsUpdate {
-                default_model: Some(selected.clone()),
                 compaction_model: Some(selected.clone()),
-                context_compaction_enabled: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4925,18 +4889,17 @@ model = "legacy-model"
         let mut settings = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
         let a = settings.effective_general_settings_for_workspace(&config, Some("a"));
         let b = settings.effective_general_settings_for_workspace(&config, Some("b"));
-        assert_eq!(a.default_model, selected);
         assert_eq!(a.compaction_model, selected);
-        assert!(!a.context_compaction_enabled);
-        assert!(b.context_compaction_enabled);
         assert_eq!(b.compaction_model, Selection::Inherit);
-        let admitted = settings.workspace_model_settings().remove("a").unwrap();
+        let admitted = settings
+            .workspace_compaction_settings()
+            .remove("a")
+            .unwrap();
         settings
             .apply_protocol_update_for_workspace(
                 GatewaySettingsUpdate {
                     general: Some(GatewayGeneralSettingsUpdate {
                         compaction_model: Some(Selection::Inherit),
-                        context_compaction_enabled: Some(true),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -4945,16 +4908,14 @@ model = "legacy-model"
             )
             .unwrap();
         // Already captured operation settings do not change with the admission gate.
-        assert!(!admitted.enabled);
+        assert_eq!(admitted.compaction_model, Some(selected.clone()));
         assert_eq!(admitted.compaction_model, Some(selected.clone()));
         let reset = settings.effective_general_settings_for_workspace(&config, Some("a"));
-        assert_eq!(reset.default_model, selected);
         assert_eq!(reset.compaction_model, Selection::Inherit);
-        assert!(reset.context_compaction_enabled);
         save_gateway_settings(&path, &settings).unwrap();
         let reloaded = load_or_create_gateway_settings(&path, 1, "settings.toml").unwrap();
         assert_eq!(
-            reloaded.workspace_model_settings()["a"].compaction_model,
+            reloaded.workspace_compaction_settings()["a"].compaction_model,
             Some(Selection::Inherit)
         );
     }
@@ -5027,7 +4988,7 @@ model = "legacy-model"
         assert_eq!(codex_a.compaction_model, Some(selected));
         assert_eq!(codex_b.compaction_model, Some(Selection::Inherit));
         assert_eq!(
-            settings.workspace_model_settings()["a"].cli_overrides["codex"].model,
+            settings.workspace_compaction_settings()["a"].cli_overrides["codex"].model,
             "codex-selected"
         );
     }
@@ -5121,19 +5082,16 @@ fn compaction_selection(
 }
 
 #[derive(Clone)]
-pub(crate) struct WorkspaceModelSettings {
-    pub default_model: pioneer_protocol::GatewayModelSelection,
+pub(crate) struct WorkspaceCompactionSettings {
     pub compaction_model: Option<pioneer_protocol::GatewayModelSelection>,
-    pub enabled: bool,
     pub cli_overrides: BTreeMap<String, pioneer_compaction::ModelSelection>,
 }
-impl WorkspaceModelSettings {
+impl WorkspaceCompactionSettings {
     pub fn compaction(
         &self,
         legacy: &pioneer_compaction::CompactionSettings,
     ) -> pioneer_compaction::CompactionSettings {
         pioneer_compaction::CompactionSettings {
-            enabled: self.enabled,
             selection: match &self.compaction_model {
                 Some(value) => compaction_selection(value),
                 None => legacy.selection.clone(),

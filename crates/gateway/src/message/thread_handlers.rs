@@ -180,40 +180,9 @@ impl MessageProcessor {
         };
 
         let workspace_id = authorization.workspace_id().to_owned();
-        let prepared = (|| -> anyhow::Result<_> {
-            let mut selected_params = params.clone();
-            let mut effort = None;
-            if selected_params.model.is_none() && selected_params.model_provider.is_none() {
-                let settings = self
-                    .workspace_model_settings
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("workspace model settings unavailable"))?;
-                if let Some(pioneer_protocol::GatewayModelSelection::Explicit {
-                    transport,
-                    instance,
-                    model,
-                    reasoning_effort,
-                }) = settings
-                    .get(&workspace_id)
-                    .map(|value| &value.default_model)
-                {
-                    selected_params.model = Some(model.clone());
-                    selected_params.model_provider = Some(
-                        if *transport == pioneer_protocol::ModelSelectionTransport::Api {
-                            instance.clone()
-                        } else {
-                            super::turn_handlers::cli_runtime_provider_key(instance)
-                        },
-                    );
-                    effort = reasoning_effort.clone();
-                }
-            }
-            let (mut thread, sandbox) = self
-                .thread_manager
-                .prepare_new_user_thread(workspace_id.clone(), &selected_params)?;
-            thread.reasoning_effort = effort;
-            Ok((thread, sandbox))
-        })();
+        let prepared = self
+            .thread_manager
+            .prepare_new_user_thread(workspace_id.clone(), &params);
         let (mut thread, sandbox_mode) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {

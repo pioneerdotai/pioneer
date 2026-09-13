@@ -530,7 +530,7 @@ async fn compaction_runner_corrects_once_and_failed_fingerprint_does_not_regener
 }
 
 #[tokio::test]
-async fn admission_gate_resumes_exact_plan_without_resetting_deadline() {
+async fn admission_resumes_exact_plan_without_resetting_deadline() {
     let f = fixture("source", vec![], true, false).await;
     let entries = f
         .store
@@ -555,7 +555,7 @@ async fn admission_gate_resumes_exact_plan_without_resetting_deadline() {
         target_identity: "complete-target-identity".into(),
         target_tokens: 500,
     };
-    let mut settings = CompactionSettings::default();
+    let settings = CompactionSettings::default();
     let selection = &f.runner.snapshot.admission.selection;
     let first = admit_operation(
         &f.store,
@@ -570,7 +570,6 @@ async fn admission_gate_resumes_exact_plan_without_resetting_deadline() {
     )
     .await
     .unwrap();
-    settings.enabled = false;
     let recaptured = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[])
         .await
         .unwrap();
@@ -614,7 +613,6 @@ async fn admission_gate_resumes_exact_plan_without_resetting_deadline() {
         .compaction_finish(&first.id, "failed", "ineffective")
         .await
         .unwrap();
-    settings.enabled = true;
     prepared.operation_deadline_ms = Some(901000);
     prepared.source_projection = Some(
         super::frozen::capture(&f.store, "ws", "thread", &allowed, &[])
@@ -1357,8 +1355,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         reasoning: None,
         compiled_prompt: None,
     };
-    let mut settings = CompactionSettings {
-        enabled: true,
+    let settings = CompactionSettings {
         selection: Some(ModelSelection {
             transport: Transport::Api,
             instance: "summary-fixture".into(),
@@ -1432,7 +1429,6 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .iter()
             .all(|r| r.model == "summary-model" && r.tools.is_none() && r.reasoning.is_none())
     );
-    settings.enabled = false;
     let again = super::test_support::prepare_native_request(
         &f.store,
         &providers,

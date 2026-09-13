@@ -535,7 +535,7 @@ pub struct MessageProcessor {
     compaction_recovery_cursor: Arc<StdRwLock<String>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
-    workspace_model_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceModelSettings>>>,
+    workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
     agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
@@ -1112,9 +1112,10 @@ impl MessageProcessor {
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
-            workspace_model_settings: Arc::new(StdRwLock::new(std::collections::BTreeMap::new())),
+            workspace_compaction_settings: Arc::new(StdRwLock::new(
+                std::collections::BTreeMap::new(),
+            )),
             compaction_settings: Arc::new(StdRwLock::new(pioneer_compaction::CompactionSettings {
-                enabled: true,
                 selection: if summary_config.summary_model.is_some()
                     || summary_config.summary_model_provider.is_some()
                 {
@@ -2068,22 +2069,22 @@ impl MessageProcessor {
     ) -> anyhow::Result<pioneer_compaction::CompactionSettings> {
         let legacy = self.compaction_settings()?;
         let settings = self
-            .workspace_model_settings
+            .workspace_compaction_settings
             .read()
-            .map_err(|_| anyhow::anyhow!("workspace model settings unavailable"))?;
+            .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))?;
         Ok(settings
             .get(workspace)
             .map_or(legacy.clone(), |value| value.compaction(&legacy)))
     }
-    pub(crate) fn apply_workspace_model_settings(
+    pub(crate) fn apply_workspace_compaction_settings(
         &self,
         settings: &crate::settings::GatewaySettings,
     ) -> anyhow::Result<()> {
-        let prepared = settings.workspace_model_settings();
+        let prepared = settings.workspace_compaction_settings();
         *self
-            .workspace_model_settings
+            .workspace_compaction_settings
             .write()
-            .map_err(|_| anyhow::anyhow!("workspace model settings unavailable"))? = prepared;
+            .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))? = prepared;
         Ok(())
     }
 
@@ -4449,7 +4450,9 @@ impl MessageProcessor {
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
-            workspace_model_settings: Arc::new(StdRwLock::new(std::collections::BTreeMap::new())),
+            workspace_compaction_settings: Arc::new(StdRwLock::new(
+                std::collections::BTreeMap::new(),
+            )),
             compaction_settings: Arc::new(StdRwLock::new(
                 pioneer_compaction::CompactionSettings::default(),
             )),

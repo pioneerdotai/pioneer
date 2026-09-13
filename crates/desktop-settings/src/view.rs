@@ -118,7 +118,7 @@ impl SettingsScreenView {
                         cx,
                     ))
                     .child(Self::render_settings_divider(cx))
-                    .child(self.render_workspace_model_settings(&settings.general, cx))
+                    .child(self.render_compaction_model_setting(&settings.general, cx))
                     .child(Self::render_settings_divider(cx))
                     .child(self.voice.clone().expect("general voice surface"))
                     .child(Self::render_settings_divider(cx))
@@ -548,46 +548,12 @@ impl SettingsScreenView {
         );
     }
 
-    fn render_workspace_model_settings(
+    fn render_compaction_model_setting(
         &self,
         settings: &pioneer_client::settings::types::GatewayGeneralSettings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        v_flex().w_full()
-            .child(self.render_workspace_model_row(false, &settings.default_model, cx))
-            .child(Self::render_settings_divider(cx))
-            .child(self.render_workspace_model_row(true, &settings.compaction_model, cx))
-            .child(Self::render_settings_divider(cx))
-            .child(h_flex().w_full().justify_between().gap_4().py_3()
-                .child(v_flex().flex_1().min_w_0()
-                    .child(t!("settings.compaction.enabled.label").to_string())
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child(t!("settings.compaction.enabled.description").to_string())))
-                .child(Switch::new("settings-context-compaction")
-                    .checked(settings.context_compaction_enabled)
-                    .on_click(cx.listener(|view, enabled, _, _| {
-                        view.config.client.settings_intent(pioneer_client::settings::runtime::SettingsIntent::ContextCompaction {enabled:*enabled});
-                    }))))
-            .into_any_element()
-    }
-
-    fn render_workspace_model_row(
-        &self,
-        compaction: bool,
-        selection: &pioneer_client::settings::types::GatewayModelSelection,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = if compaction {
-            "settings-compaction-model"
-        } else {
-            "settings-default-model"
-        };
-        let title = if compaction {
-            t!("settings.compaction.model.label")
-        } else {
-            t!("settings.default_model.label")
-        }
-        .to_string();
+        let selection = &settings.compaction_model;
         let selected = pioneer_client::settings::models::to_selector(selection);
         let value = selected
             .model
@@ -596,44 +562,46 @@ impl SettingsScreenView {
                 Some(effort) => format!("{model} · {effort}"),
                 None => model.clone(),
             })
-            .unwrap_or_else(|| t!("settings.model.inherit").to_string());
+            .unwrap_or_else(|| t!("settings.model.not_selected").to_string());
         let explicit = !matches!(
             selection,
             pioneer_client::settings::types::GatewayModelSelection::Inherit
         );
-        h_flex().w_full().justify_between().gap_4().py_3()
-            .child(v_flex().flex_1().min_w_0().child(title)
-                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(value)))
-            .child(h_flex().gap_2()
-                .child(small_outline_button((id,0usize))
+        v_flex().w_full().gap_3().py_3().justify_between().items_start()
+            .child(v_flex().min_w_0().flex_1()
+                .child(div().text_sm().font_semibold().child(t!("settings.compaction.model.label").to_string()))
+                .child(div().text_xs().opacity(0.6).child(t!("settings.compaction.model.description").to_string())))
+            .child(h_flex().w_full().gap_6().items_center().justify_between().mt_0p5()
+                .child(div().min_w_0().flex_1().text_sm().font_medium().overflow_hidden().text_ellipsis().child(value))
+                .child(h_flex().flex_none().gap_1()
+                .child(small_outline_button("settings-compaction-model")
                     .label(t!("settings.model.choose").to_string())
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        let current = view.gateway.settings.as_ref().map(|settings| if compaction {&settings.general.compaction_model} else {&settings.general.default_model}).cloned().unwrap_or_default();
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        let current = view.gateway.settings.as_ref().map(|settings| settings.general.compaction_model.clone()).unwrap_or_default();
                         let selected = pioneer_client::settings::models::to_selector(&current);
                         view.open_model_selector_dialog(ModelSelectorDialogOptions {
-                            title:if compaction {t!("settings.compaction.model.label")} else {t!("settings.default_model.label")}.to_string(),
-                            selected_provider:selected.provider, selected_model:selected.model,
-                            selected_reasoning_effort:selected.selected_reasoning_effort,
-                            mode:ProviderModelSelectorMode::Chat,
-                            workspace_id:view.model_selector_workspace_id(), client:view.config.client.clone(),
-                            on_save:Rc::new(move |view, selection, _| {
-                                let Some(settings)=view.gateway.settings.as_ref() else {return false;};
-                                let Some(selection)=pioneer_client::settings::models::from_selector(selection,&settings.cli_runtimes.instances) else {return false;};
-                                view.config.client.settings_intent(if compaction {
-                                    pioneer_client::settings::runtime::SettingsIntent::CompactionModel {selection}
-                                } else {pioneer_client::settings::runtime::SettingsIntent::DefaultModel {selection}});
+                            title: t!("settings.compaction.model.label").to_string(),
+                            selected_provider: selected.provider,
+                            selected_model: selected.model,
+                            selected_reasoning_effort: selected.selected_reasoning_effort,
+                            mode: ProviderModelSelectorMode::Chat,
+                            workspace_id: view.model_selector_workspace_id(),
+                            client: view.config.client.clone(),
+                            on_save: Rc::new(|view, selection, _| {
+                                let Some(settings) = view.gateway.settings.as_ref() else { return false; };
+                                let Some(selection) = pioneer_client::settings::models::from_selector(selection, &settings.cli_runtimes.instances) else { return false; };
+                                view.config.client.settings_intent(pioneer_client::settings::runtime::SettingsIntent::CompactionModel { selection });
                                 true
                             }),
-                        },window,cx);
+                        }, window, cx);
                     })))
-                .when(explicit, |row| row.child(small_outline_button((id,1usize))
+                .when(explicit, |row| row.child(div().flex_none().child(small_outline_button("settings-compaction-model-reset")
                     .label(t!("settings.model.reset").to_string())
-                    .on_click(cx.listener(move |view, _, _, _| {
-                        let selection=pioneer_client::settings::types::GatewayModelSelection::Inherit;
-                        view.config.client.settings_intent(if compaction {
-                            pioneer_client::settings::runtime::SettingsIntent::CompactionModel {selection}
-                        } else {pioneer_client::settings::runtime::SettingsIntent::DefaultModel {selection}});
-                    })))))
+                    .on_click(cx.listener(|view, _, _, _| {
+                        view.config.client.settings_intent(pioneer_client::settings::runtime::SettingsIntent::CompactionModel {
+                            selection: pioneer_client::settings::types::GatewayModelSelection::Inherit,
+                        });
+                    })))))))
             .into_any_element()
     }
 
@@ -2459,7 +2427,7 @@ mod tests {
             .split("fn render_settings_self_improvement")
             .nth(1)
             .expect("Self-improvement screen exists")
-            .split("fn render_workspace_model_settings")
+            .split("fn render_compaction_model_setting")
             .next()
             .expect("Self-improvement screen boundary exists");
 

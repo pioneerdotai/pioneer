@@ -506,7 +506,7 @@ pub(crate) async fn compaction_finish_history_check<C: ConnectionTrait>(
     use pioneer_entity::compaction_history_check as check;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
     ensure!(
-        matches!(outcome, "completed" | "cancelled" | "failed" | "disabled"),
+        matches!(outcome, "completed" | "cancelled" | "failed"),
         "invalid CLI history outcome"
     );
     check::Entity::update_many()

@@ -61,9 +61,6 @@ pub(crate) async fn prepare_completed_history_owned(
     fixed_input_tokens: u64,
     suspending: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<String>> {
-    if !settings.enabled {
-        return Ok(None);
-    }
     let store = processor.crud_store.with_maintenance_access();
     let clock: Arc<dyn CompactionClock> = Arc::new(SystemCompactionClock::default());
     let deadline = clock

@@ -85,14 +85,8 @@ pub enum SettingsIntent {
     PreflightModel {
         selection: GatewayMemoryModelSelection,
     },
-    DefaultModel {
-        selection: GatewayModelSelection,
-    },
     CompactionModel {
         selection: GatewayModelSelection,
-    },
-    ContextCompaction {
-        enabled: bool,
     },
     RemoteAccess {
         enabled: bool,
@@ -155,9 +149,7 @@ impl SettingsIntent {
             Self::Keepawake { .. }
             | Self::Telemetry { .. }
             | Self::PreflightModel { .. }
-            | Self::DefaultModel { .. }
-            | Self::CompactionModel { .. }
-            | Self::ContextCompaction { .. } => SettingsPage::General,
+            | Self::CompactionModel { .. } => SettingsPage::General,
             Self::RemoteAccess { .. } => SettingsPage::RemoteAccess,
             Self::Memory { .. }
             | Self::MemoryToggle { .. }
@@ -191,23 +183,9 @@ impl SettingsIntent {
             Self::PreflightModel { selection } => {
                 g::preflight_model_update_plan(Some(snapshot), selection.clone()).map(|p| p.update)
             }
-            Self::DefaultModel { selection } => Some(GatewaySettingsUpdate {
-                general: Some(GatewayGeneralSettingsUpdate {
-                    default_model: Some(selection.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
             Self::CompactionModel { selection } => Some(GatewaySettingsUpdate {
                 general: Some(GatewayGeneralSettingsUpdate {
                     compaction_model: Some(selection.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            Self::ContextCompaction { enabled } => Some(GatewaySettingsUpdate {
-                general: Some(GatewayGeneralSettingsUpdate {
-                    context_compaction_enabled: Some(*enabled),
                     ..Default::default()
                 }),
                 ..Default::default()

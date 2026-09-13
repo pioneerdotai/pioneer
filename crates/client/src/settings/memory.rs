@@ -143,9 +143,7 @@ mod tests {
         GatewaySettingsSnapshot {
             self_improvement_status: None,
             general: GatewayGeneralSettings {
-                default_model: Default::default(),
                 compaction_model: Default::default(),
-                context_compaction_enabled: true,
                 keepawake: true,
                 ..Default::default()
             },

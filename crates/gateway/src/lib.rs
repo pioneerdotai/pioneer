@@ -779,7 +779,7 @@ async fn run_gateway_until_shutdown_inner(
     )
     .with_cli_mcp_limits(cli_mcp_limits)
     .with_invitation_gateway_base_url(invitation_gateway_base_url);
-    message_processor.apply_workspace_model_settings(&gateway_settings)?;
+    message_processor.apply_workspace_compaction_settings(&gateway_settings)?;
     let cli_runtime_manager = build_cli_runtime_manager(
         &runtime_home,
         &config,
