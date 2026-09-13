@@ -594,21 +594,25 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     assert_eq!(resumed.admission.deadline_ms, 900010);
     let mut changed = prepared.clone();
     changed.target_identity = "changed-target".into();
-    assert!(
-        admit_operation(
-            &f.store,
-            "ws",
-            "thread",
-            &settings,
-            selection,
-            None,
-            f.runner.summarizer.as_ref(),
-            changed,
-            100
-        )
+    let changed = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &settings,
+        selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        changed,
+        100,
+    )
+    .await
+    .unwrap();
+    assert_ne!(first.id, changed.id);
+    assert_eq!(changed.admission.deadline_ms, 900100);
+    f.store
+        .compaction_finish(&changed.id, "failed", "test_cleanup")
         .await
-        .is_err()
-    );
+        .unwrap();
     f.store
         .compaction_finish(&first.id, "failed", "ineffective")
         .await
