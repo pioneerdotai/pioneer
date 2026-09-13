@@ -1,6 +1,6 @@
 //! Resolve only trusted runtime locators into versioned canonical references.
 use anyhow::{Result, ensure};
-use pioneer_crud::{CrudStore, compaction::CanonicalSource};
+use pioneer_crud::{CrudStore, compaction::PagedSource};
 use pioneer_provider::{ChatMessage, MessageSourceRef};
 use std::collections::BTreeSet;
 
@@ -44,7 +44,7 @@ pub(crate) async fn resolve_message_origins(
                             workspace,
                             &origin.thread_id,
                             turn,
-                            CanonicalSource::Input,
+                            PagedSource::Input,
                             after,
                         )
                         .await?;

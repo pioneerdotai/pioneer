@@ -3838,7 +3838,7 @@ impl RecoveryCoordinator {
         &self,
         turn_id: &str,
     ) -> Result<Vec<RetainedProviderHistoryMessage>> {
-        use pioneer_crud::compaction::CanonicalSource;
+        use pioneer_crud::compaction::PagedSource;
         let store = self.crud_store.with_maintenance_access();
         let (thread, workspace) = store
             .get_turn_location(turn_id)
@@ -3849,7 +3849,7 @@ impl RecoveryCoordinator {
                 &workspace,
                 &thread,
                 turn_id,
-                CanonicalSource::ProviderContext,
+                PagedSource::ProviderContext,
             )
             .await?;
         let mut after = 0;
@@ -3861,7 +3861,7 @@ impl RecoveryCoordinator {
                     &workspace,
                     &thread,
                     turn_id,
-                    CanonicalSource::ProviderContext,
+                    PagedSource::ProviderContext,
                     after,
                 )
                 .await?;

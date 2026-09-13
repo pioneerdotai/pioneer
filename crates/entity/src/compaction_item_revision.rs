@@ -13,7 +13,6 @@ pub struct Model {
     pub turn_id: String,
     pub revision: i64,
     pub present: i64,
-    pub capture_order: i64,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

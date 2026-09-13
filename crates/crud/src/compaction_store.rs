@@ -3,8 +3,8 @@ use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CommitOutcome,
     CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
     FrozenImportRecord, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
-    ManifestEntry, OperationRecord, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion,
-    SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
+    ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport, RunnerPlanRecord,
+    SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -20,7 +20,7 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
         turn: &str,
-        kind: CanonicalSource,
+        kind: PagedSource,
     ) -> Result<i64> {
         repositories::compaction::compaction_source_high_water(
             &self.connection,
@@ -38,7 +38,7 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
         turn: &str,
-        kind: CanonicalSource,
+        kind: PagedSource,
         after: i64,
     ) -> Result<SourcePage> {
         repositories::compaction::compaction_source_page(self, workspace, thread, turn, kind, after)
@@ -51,7 +51,7 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
         turn: &str,
-        kind: CanonicalSource,
+        kind: PagedSource,
         after: i64,
     ) -> Result<SourcePage> {
         repositories::compaction::compaction_source_metadata_page(
@@ -64,7 +64,7 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
         turn: &str,
-        kind: CanonicalSource,
+        kind: PagedSource,
         after: i64,
         capture_order: i64,
     ) -> Result<SourcePage> {
@@ -84,7 +84,7 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
         turn: &str,
-        kind: CanonicalSource,
+        kind: PagedSource,
         after: i64,
         include_payload: bool,
         capture_order: i64,

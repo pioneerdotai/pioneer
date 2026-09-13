@@ -25,7 +25,7 @@ async fn history_capture_is_identical_before_and_after_transparent_compression()
     let db = store.database_connection();
     source(&store, "first", 1, "retained original").await;
     let first = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries
@@ -103,49 +103,109 @@ async fn history_capture_is_identical_before_and_after_transparent_compression()
 }
 
 #[tokio::test]
-async fn tool_item_paging_preserves_untracked_and_zero_order_legacy_rows() {
-    let store = store().await;
-    let db = store.database_connection();
-    for id in ["z-untracked", "a-seeded"] {
-        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES (?,'turn',?,'command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            [id.into(), id.into()])).await.unwrap();
+async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compression() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        let store = store().await;
+        let db = store.database_connection();
+        for id in ["untracked", "seeded"] {
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                r#"INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES (?,'turn',?,'command_execution','completed','{"storage":{"kind":"shell"},"output":"retained result"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"#,
+                [id.into(), id.into()])).await.unwrap();
+        }
+        // Both pre-migration states must remain readable by exact reference:
+        // missing revision metadata and a lazily seeded revision.
+        db.execute_unprepared("DELETE FROM compaction_item_revision")
+            .await
+            .unwrap();
+        db.execute_unprepared("INSERT INTO compaction_item_revision(source_id,turn_id,revision,present) VALUES ('seeded','turn',1,1)").await.unwrap();
+        if compressed {
+            let config = serde_json::json!({"table":"turn_item", "column":"payload", "compression_level":3, "dict_chooser":"'[nodict]'"});
+            db.query_one_write_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT zstd_enable_transparent(?)",
+                [config.to_string().into()],
+            ))
+            .await
+            .unwrap();
+        }
+        for id in ["untracked", "seeded"] {
+            let reference = store
+                .compaction_tool_item_reference("ws", "thread", "turn", id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reference.version, "item-revision:1");
+            let fragment = store
+                .compaction_reference_fragment("ws", "thread", &reference, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(fragment.text.contains("retained result"));
+            assert_eq!(fragment.reference, reference);
+            assert_eq!(
+                store
+                    .compaction_replay_item_id("ws", "thread", &reference)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(id)
+            );
+            for (workspace, thread) in [("other", "thread"), ("ws", "other")] {
+                assert!(
+                    store
+                        .compaction_reference_fragment(workspace, thread, &reference, 0)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    store
+                        .compaction_replay_item_id(workspace, thread, &reference)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE turn_item SET payload=json_set(payload,'$.output','changed result') WHERE id=?", [id.into()]
+            )).await.unwrap();
+            assert!(
+                store
+                    .compaction_reference_fragment("ws", "thread", &reference, 0)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                store
+                    .compaction_replay_item_id("ws", "thread", &reference)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let current = store
+                .compaction_tool_result_fragment("ws", "thread", "turn", id, None, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(current.text.contains("changed result"));
+            assert_ne!(current.reference.version, reference.version);
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM turn_item WHERE id=?",
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .compaction_reference_fragment("ws", "thread", &current.reference, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
-    // Reproduce both supported pre-migration states: no revision row and a
-    // lazily seeded revision whose capture_order is zero.
-    db.execute_unprepared("DELETE FROM compaction_item_revision")
-        .await
-        .unwrap();
-    db.execute_unprepared("INSERT INTO compaction_item_revision(source_id,turn_id,revision,present,capture_order) VALUES ('a-seeded','turn',1,1,0)").await.unwrap();
-    let high_water = store
-        .compaction_source_high_water("ws", "thread", "turn", CanonicalSource::ToolItem)
-        .await
-        .unwrap();
-    let page = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::ToolItem, 0)
-        .await
-        .unwrap();
-    assert_eq!(
-        page.entries
-            .iter()
-            .map(|row| row.reference.id.as_str())
-            .collect::<Vec<_>>(),
-        ["z-untracked", "a-seeded"]
-    );
-    assert_eq!(page.next_sequence, high_water);
-    let next = store
-        .compaction_source_metadata_page_at_fence(
-            "ws",
-            "thread",
-            "turn",
-            CanonicalSource::ToolItem,
-            page.entries[0].sequence,
-            0,
-        )
-        .await
-        .unwrap();
-    assert_eq!(next.entries.len(), 1);
-    assert_eq!(next.entries[0].reference.id, "a-seeded");
 }
 
 #[tokio::test]
@@ -198,7 +258,6 @@ async fn history_capture_after_upgrading_an_already_compressed_database() {
         .unwrap();
     assert!(legacy.text.contains("retained old result"));
     let fence = store.compaction_history_read_fence().await.unwrap();
-    assert!(fence.item_order > 0);
     for _ in 0..2 {
         let history = store
             .compaction_history_turn_page("ws", "thread", "", &fence)
@@ -319,7 +378,7 @@ async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply
         CommitOutcome::AlreadyApplied
     );
     let page = restarted
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     assert_eq!(page.entries.len(), 2);
@@ -444,7 +503,7 @@ async fn poison_source_progress_and_scope_are_bounded() {
     source(&store, "huge", 1, &"x".repeat(SOURCE_PAGE_BYTES + 1)).await;
     source(&store, "next", 2, "small").await;
     let page = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     assert!(page.entries[0].incomplete);
@@ -452,7 +511,7 @@ async fn poison_source_progress_and_scope_are_bounded() {
     assert_eq!(page.next_sequence, 2);
     assert!(
         store
-            .compaction_source_page("other", "thread", "turn", CanonicalSource::Event, 0)
+            .compaction_source_page("other", "thread", "turn", PagedSource::Event, 0)
             .await
             .unwrap()
             .entries
@@ -725,7 +784,7 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         .await
         .unwrap();
     let page = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     let reference = page.entries[0].reference.clone();
@@ -1041,7 +1100,7 @@ async fn user_input_revisions_bind_edits_and_deletes_without_invalidating_append
     let db = store.database_connection();
     db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('original-input','turn',0,'text','original','{\"type\":\"text\",\"text\":\"original\"}',CURRENT_TIMESTAMP)").await.unwrap();
     let page = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Input, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Input, 0)
         .await
         .unwrap();
     assert_eq!(page.entries.len(), 1);
@@ -1079,7 +1138,7 @@ async fn user_input_revisions_bind_edits_and_deletes_without_invalidating_append
             .is_err()
     );
     let changed = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Input, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Input, 0)
         .await
         .unwrap()
         .entries[0]
@@ -1117,20 +1176,20 @@ async fn source_high_water_is_scoped_and_append_does_not_move_a_captured_boundar
     let store = store().await;
     source(&store, "first", 1, "first payload").await;
     let high_water = store
-        .compaction_source_high_water("ws", "thread", "turn", CanonicalSource::Event)
+        .compaction_source_high_water("ws", "thread", "turn", PagedSource::Event)
         .await
         .unwrap();
     assert_eq!(high_water, 1);
     assert_eq!(
         store
-            .compaction_source_high_water("other", "thread", "turn", CanonicalSource::Event)
+            .compaction_source_high_water("other", "thread", "turn", PagedSource::Event)
             .await
             .unwrap(),
         0
     );
     source(&store, "appended", 2, "later payload").await;
     let page = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     let pinned: Vec<_> = page
@@ -1143,7 +1202,7 @@ async fn source_high_water_is_scoped_and_append_does_not_move_a_captured_boundar
     assert_eq!(pinned[0].payload.as_deref(), Some("first payload"));
     assert_eq!(
         store
-            .compaction_source_high_water("ws", "thread", "turn", CanonicalSource::Event)
+            .compaction_source_high_water("ws", "thread", "turn", PagedSource::Event)
             .await
             .unwrap(),
         2
@@ -1215,14 +1274,14 @@ async fn metadata_projection_keeps_exact_sources_without_loading_covered_payload
     )
     .await;
     let metadata = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     assert_eq!(metadata.entries.len(), 2);
     assert_eq!(metadata.next_sequence, 2);
     assert!(metadata.entries.iter().all(|row| row.payload.is_none()));
     let materialized = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -1240,7 +1299,7 @@ async fn metadata_projection_keeps_exact_sources_without_loading_covered_payload
     assert!(materialized.entries[1].payload.is_none());
     assert!(
         store
-            .compaction_source_metadata_page("other", "thread", "turn", CanonicalSource::Event, 0)
+            .compaction_source_metadata_page("other", "thread", "turn", PagedSource::Event, 0)
             .await
             .unwrap()
             .entries
@@ -1253,7 +1312,7 @@ async fn fitting_request_validation_rejects_edited_deleted_and_cross_scope_sourc
     let store = store().await;
     source(&store, "current-source", 1, "original").await;
     let reference = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -1283,7 +1342,7 @@ async fn fitting_request_validation_rejects_edited_deleted_and_cross_scope_sourc
             .unwrap()
     );
     let updated = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -1339,7 +1398,7 @@ async fn canonical_event_metadata_uses_typed_identity_and_invalidates_on_edit() 
             .unwrap();
     }
     let metadata = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     let reasoning = metadata
@@ -1358,7 +1417,7 @@ async fn canonical_event_metadata_uses_typed_identity_and_invalidates_on_edit() 
     store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "UPDATE turn_event SET payload=replace(payload,'equal text','edited content') WHERE id=?", [reasoning.reference.id.clone().into()])).await.unwrap();
     let edited = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     let invalidated = edited
@@ -1387,7 +1446,7 @@ async fn input_projection_uses_accepted_input_order_instead_of_insertion_order()
             "ws",
             "thread",
             "turn",
-            CanonicalSource::Input,
+            PagedSource::Input,
             0,
             insertion_fence.unwrap().input_order,
         )
@@ -1400,7 +1459,7 @@ async fn input_projection_uses_accepted_input_order_instead_of_insertion_order()
     );
     assert_eq!(frozen.entries[0].reference.id, "later-input");
     let page = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Input, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Input, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -1415,7 +1474,7 @@ async fn input_projection_uses_accepted_input_order_instead_of_insertion_order()
             "ws",
             "thread",
             "turn",
-            CanonicalSource::Input,
+            PagedSource::Input,
             page.entries[0].sequence,
         )
         .await
@@ -1599,7 +1658,7 @@ async fn exact_reference_scope_requires_workspace_and_current_revision() {
     let store = store().await;
     source(&store, "lookup-source", 1, "original").await;
     let reference = store
-        .compaction_source_metadata_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_metadata_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -1823,7 +1882,7 @@ async fn causal_task_boundary_requires_identified_delivery_inside_capture_fence(
             .is_err()
     );
     let entries = store
-        .compaction_source_page("ws", "thread", "run", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "run", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries;
@@ -2004,7 +2063,7 @@ async fn task_occurrence_failures_close_command_only_after_canonical_acknowledge
                 .delivered_outcome
         );
         let entries = store
-            .compaction_source_page("ws", "thread", "run", CanonicalSource::Event, 0)
+            .compaction_source_page("ws", "thread", "run", PagedSource::Event, 0)
             .await
             .unwrap()
             .entries;
@@ -2143,7 +2202,7 @@ async fn generic_failed_task_delivery_requires_exact_turn_identity_and_event_fen
                 .delivered_outcome
         );
         let entries = store
-            .compaction_source_page("ws", "thread", &id, CanonicalSource::Event, 0)
+            .compaction_source_page("ws", "thread", &id, PagedSource::Event, 0)
             .await
             .unwrap()
             .entries;
@@ -2453,7 +2512,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     let db = store.database_connection();
     source(&store, "basis-source", 1, "{}").await;
     let inherited = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -2542,7 +2601,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .await
         .unwrap();
     let acknowledgement = store
-        .compaction_source_page("ws", "thread", "delivery-turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "delivery-turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -3045,7 +3104,7 @@ async fn compaction_lifecycle_after_terminal_turn_requires_exact_operation_and_g
         .await
         .unwrap();
     let reference = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -3246,7 +3305,7 @@ async fn compaction_terminal_fence_reconciliation_persists_once_and_rejects_late
         .await
         .unwrap();
     let reference = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -3335,7 +3394,7 @@ async fn compaction_post_terminal_stop_survives_worker_loss_and_fences_new_admis
     let store = store().await;
     source(&store, "stop-source", 1, "original source").await;
     let reference = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -3752,13 +3811,10 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
     let connection = Database::connect("sqlite::memory:").await.unwrap();
     let writer = SqliteWriteExecutor::new(connection.clone());
     let migrations = Migrator::migrations();
-    let name = migrations.last().unwrap().name().to_owned();
-    assert_eq!(name, "m20260910_000001_context_compaction");
+    let name = "m20260910_000001_context_compaction";
+    let before = migrations.iter().position(|m| m.name() == name).unwrap();
     writer
-        .run_migrations::<Migrator>(
-            SqliteWriteClass::Maintenance,
-            Some((migrations.len() - 1) as u32),
-        )
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(before as u32))
         .await
         .unwrap();
     let store = CrudStore::new(SqliteDatabase::from_executor(connection, writer.clone()))
@@ -3780,7 +3836,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         .unwrap();
     for _ in 0..2 {
         writer
-            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(1))
             .await
             .unwrap();
         assert_eq!(
@@ -3804,7 +3860,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM seaql_migrations WHERE version=?",
-            [name.clone().into()],
+            [name.into()],
         ))
         .await
         .unwrap();
@@ -3815,7 +3871,7 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
         .unwrap();
     source(&store, "after-migration", 1, "retained original").await;
     let page = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap();
     assert_eq!(page.entries.len(), 1);

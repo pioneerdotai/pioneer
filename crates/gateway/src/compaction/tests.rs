@@ -4,7 +4,7 @@ use pioneer_compaction::summary::{HEADINGS, SummaryInput};
 use pioneer_compaction::{
     CompactionMode, CompactionPlan, CompactionSettings, ModelBudget, ModelSelection, Transport,
 };
-use pioneer_crud::compaction::{CanonicalSource, ManifestEntry};
+use pioneer_crud::compaction::{CanonicalSource, ManifestEntry, PagedSource};
 use pioneer_protocol::ProviderFailureClass;
 use pioneer_provider::{
     ChatRequest, ChatResponse, Provider, ProviderFailureClassification, ProviderTermination,
@@ -196,7 +196,7 @@ async fn fixture(
     let payload = serde_json::json!({"text":text}).to_string();
     store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('source','thread','turn',1,'fixture',?,CURRENT_TIMESTAMP)",[payload.clone().into()])).await.unwrap();
     let source = store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -1179,7 +1179,7 @@ async fn stale_head_is_cas_guard_but_not_summary_basis_during_rebuild() {
         .unwrap();
     prepared.manifest[0].source = f
         .store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -1288,7 +1288,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     let f = fixture(&old, vec![], true, false).await;
     let source = f
         .store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries[0]
@@ -2013,7 +2013,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         start: usize,
     ) -> String {
         let page = store
-            .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+            .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
             .await
             .unwrap();
         let assertions = page.entries[start..end]
@@ -2737,7 +2737,7 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
     );
     let reference = f
         .store
-        .compaction_source_page("ws", "thread", "turn", CanonicalSource::Event, 0)
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
         .entries

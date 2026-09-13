@@ -60,6 +60,25 @@ pub(super) fn sqlite_specific_sql(
     Statement::from_sql_and_values(DbBackend::Sqlite, statement, values)
 }
 
+/// Sources with a stable sequence used for bounded discovery. Tool items are
+/// resolved by exact references and deliberately have no paging API.
+#[derive(Clone, Copy, Debug)]
+pub enum PagedSource {
+    Input,
+    Event,
+    ProviderContext,
+}
+
+impl From<PagedSource> for CanonicalSource {
+    fn from(source: PagedSource) -> Self {
+        match source {
+            PagedSource::Input => Self::Input,
+            PagedSource::Event => Self::Event,
+            PagedSource::ProviderContext => Self::ProviderContext,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum CanonicalSource {
     Input,
@@ -182,11 +201,11 @@ pub(crate) async fn compaction_source_high_water<C: ConnectionTrait>(
     workspace: &str,
     thread: &str,
     turn: &str,
-    kind: CanonicalSource,
+    kind: PagedSource,
 ) -> Result<i64> {
-    use pioneer_entity::{turn_event, turn_input, turn_item, turn_llm_context};
+    use pioneer_entity::{turn_event, turn_input, turn_llm_context};
     match kind {
-        CanonicalSource::Input => {
+        PagedSource::Input => {
             source_high_water::<C, turn_input::Entity>(
                 db,
                 workspace,
@@ -197,18 +216,7 @@ pub(crate) async fn compaction_source_high_water<C: ConnectionTrait>(
             )
             .await
         }
-        CanonicalSource::ToolItem => {
-            source_high_water::<C, turn_item::Entity>(
-                db,
-                workspace,
-                thread,
-                turn,
-                turn_item::Column::TurnId,
-                Expr::col((turn_item::Entity, Alias::new("rowid"))),
-            )
-            .await
-        }
-        CanonicalSource::ProviderContext => {
+        PagedSource::ProviderContext => {
             source_high_water::<C, turn_llm_context::Entity>(
                 db,
                 workspace,
@@ -219,7 +227,7 @@ pub(crate) async fn compaction_source_high_water<C: ConnectionTrait>(
             )
             .await
         }
-        CanonicalSource::Event => {
+        PagedSource::Event => {
             source_high_water::<C, turn_event::Entity>(
                 db,
                 workspace,
@@ -277,7 +285,7 @@ pub(crate) async fn compaction_source_page(
     workspace: &str,
     thread: &str,
     turn: &str,
-    kind: CanonicalSource,
+    kind: PagedSource,
     after: i64,
 ) -> Result<SourcePage> {
     store
@@ -292,7 +300,7 @@ pub(crate) async fn compaction_source_metadata_page(
     workspace: &str,
     thread: &str,
     turn: &str,
-    kind: CanonicalSource,
+    kind: PagedSource,
     after: i64,
 ) -> Result<SourcePage> {
     store
@@ -305,7 +313,7 @@ pub(crate) async fn compaction_source_metadata_page_at_fence(
     workspace: &str,
     thread: &str,
     turn: &str,
-    kind: CanonicalSource,
+    kind: PagedSource,
     after: i64,
     capture_order: i64,
 ) -> Result<SourcePage> {
@@ -320,13 +328,13 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
     workspace: &str,
     thread: &str,
     turn: &str,
-    kind: CanonicalSource,
+    kind: PagedSource,
     after: i64,
     include_payload: bool,
     capture_order: i64,
 ) -> Result<SourcePage> {
     match kind {
-        CanonicalSource::Input => {
+        PagedSource::Input => {
             read_source_page(
                 db,
                 turn_input_projection(workspace, thread, turn),
@@ -338,7 +346,7 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
             )
             .await
         }
-        CanonicalSource::Event => {
+        PagedSource::Event => {
             read_source_page(
                 db,
                 turn_event_projection(workspace, thread, turn),
@@ -350,7 +358,7 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
             )
             .await
         }
-        CanonicalSource::ProviderContext => {
+        PagedSource::ProviderContext => {
             read_source_page(
                 db,
                 turn_llm_context_projection(workspace, thread, turn),
@@ -362,36 +370,27 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
             )
             .await
         }
-        CanonicalSource::ToolItem => {
-            read_source_page(
-                db,
-                turn_item_projection(workspace, thread, turn),
-                kind,
-                turn,
-                after,
-                include_payload,
-                capture_order,
-            )
-            .await
-        }
     }
 }
 
-// Canonical source tables share paging semantics, but all table/column access
-// remains Entity-typed. The projection contains no payload until its byte
-// allowance and current revision have been checked.
-struct CanonicalProjection<E: EntityTrait> {
+// Exact reads share scoped identity/revision metadata. Only sequenced sources
+// carry discovery fields; tool items cannot acquire a physical rowid dependency.
+struct CanonicalProjection<E: EntityTrait, P = SourcePaging> {
     query: sea_orm::Select<E>,
     id: E::Column,
     payload: E::Column,
+    revision: Expr,
+    present: Expr,
+    paging: P,
+}
+
+struct SourcePaging {
     sequence: Expr,
     source_type: Expr,
     item_id: Expr,
     tool_name: Expr,
     projection_kind: Expr,
-    revision: Expr,
     capture_order: Expr,
-    present: Expr,
 }
 
 #[derive(FromQueryResult)]
@@ -410,12 +409,13 @@ struct CanonicalSourceMetadata {
 async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
     db: &C,
     projection: CanonicalProjection<E>,
-    kind: CanonicalSource,
+    kind: PagedSource,
     turn: &str,
     after: i64,
     include_payload: bool,
     capture_order: i64,
 ) -> Result<SourcePage> {
+    let kind = CanonicalSource::from(kind);
     let payload_bytes: Expr = Func::char_length(
         Expr::col((E::default(), projection.payload)).cast_as(Alias::new("BLOB")),
     )
@@ -425,11 +425,11 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         .clone()
         .select_only()
         .column(projection.id)
-        .expr_as(projection.sequence.clone(), "sequence")
-        .expr_as(projection.source_type, "source_type")
-        .expr_as(projection.item_id, "item_id")
-        .expr_as(projection.tool_name, "tool_name")
-        .expr_as(projection.projection_kind, "projection_kind")
+        .expr_as(projection.paging.sequence.clone(), "sequence")
+        .expr_as(projection.paging.source_type, "source_type")
+        .expr_as(projection.paging.item_id, "item_id")
+        .expr_as(projection.paging.tool_name, "tool_name")
+        .expr_as(projection.paging.projection_kind, "projection_kind")
         .expr_as(projection.revision.clone(), "revision")
         .expr_as(
             if include_payload {
@@ -439,9 +439,9 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
             },
             "bytes",
         )
-        .filter(projection.sequence.clone().gt(after))
-        .filter(projection.capture_order.lte(capture_order))
-        .order_by(projection.sequence, Order::Asc)
+        .filter(projection.paging.sequence.clone().gt(after))
+        .filter(projection.paging.capture_order.lte(capture_order))
+        .order_by(projection.paging.sequence, Order::Asc)
         .limit(SOURCE_PAGE_ROWS)
         .into_model::<CanonicalSourceMetadata>()
         .all(db)
@@ -543,11 +543,6 @@ fn turn_input_projection(
             .filter(turn_input::Column::TurnId.eq(turn_id)),
         id: turn_input::Column::Id,
         payload: turn_input::Column::Payload,
-        sequence: Expr::col((turn_input::Entity, turn_input::Column::InputIndex)).add(1),
-        source_type: Expr::col((turn_input::Entity, turn_input::Column::InputType)),
-        item_id: null.clone(),
-        tool_name: null.clone(),
-        projection_kind: null.clone(),
         revision: Func::coalesce([
             Expr::col((
                 compaction_input_revision::Entity,
@@ -560,14 +555,21 @@ fn turn_input_projection(
             compaction_input_revision::Entity,
             compaction_input_revision::Column::Present,
         )),
-        capture_order: Func::coalesce([
-            Expr::col((
-                compaction_input_revision::Entity,
-                compaction_input_revision::Column::CaptureOrder,
-            )),
-            Expr::val(0_i64),
-        ])
-        .into(),
+        paging: SourcePaging {
+            sequence: Expr::col((turn_input::Entity, turn_input::Column::InputIndex)).add(1),
+            source_type: Expr::col((turn_input::Entity, turn_input::Column::InputType)),
+            item_id: null.clone(),
+            tool_name: null.clone(),
+            projection_kind: null.clone(),
+            capture_order: Func::coalesce([
+                Expr::col((
+                    compaction_input_revision::Entity,
+                    compaction_input_revision::Column::CaptureOrder,
+                )),
+                Expr::val(0_i64),
+            ])
+            .into(),
+        },
     }
 }
 fn turn_event_projection(
@@ -628,11 +630,6 @@ fn turn_event_projection(
             .filter(turn_event::Column::TurnId.eq(turn_id)),
         id: turn_event::Column::Id,
         payload: turn_event::Column::Payload,
-        sequence: Expr::col((turn_event::Entity, turn_event::Column::Sequence)),
-        source_type: Expr::col((turn_event::Entity, turn_event::Column::EventType)),
-        item_id: current_projection(compaction_event_revision::Column::ItemId),
-        tool_name: null.clone(),
-        projection_kind: current_projection(compaction_event_revision::Column::ProjectionKind),
         revision: Func::coalesce([
             Expr::col((
                 compaction_event_revision::Entity,
@@ -645,14 +642,21 @@ fn turn_event_projection(
             compaction_event_revision::Entity,
             compaction_event_revision::Column::Present,
         )),
-        capture_order: Func::coalesce([
-            Expr::col((
-                compaction_event_revision::Entity,
-                compaction_event_revision::Column::CaptureOrder,
-            )),
-            Expr::val(0_i64),
-        ])
-        .into(),
+        paging: SourcePaging {
+            sequence: Expr::col((turn_event::Entity, turn_event::Column::Sequence)),
+            source_type: Expr::col((turn_event::Entity, turn_event::Column::EventType)),
+            item_id: current_projection(compaction_event_revision::Column::ItemId),
+            tool_name: null.clone(),
+            projection_kind: current_projection(compaction_event_revision::Column::ProjectionKind),
+            capture_order: Func::coalesce([
+                Expr::col((
+                    compaction_event_revision::Entity,
+                    compaction_event_revision::Column::CaptureOrder,
+                )),
+                Expr::val(0_i64),
+            ])
+            .into(),
+        },
     }
 }
 fn turn_llm_context_projection(
@@ -702,11 +706,6 @@ fn turn_llm_context_projection(
             .filter(turn_llm_context::Column::TurnId.eq(turn_id)),
         id: turn_llm_context::Column::Id,
         payload: turn_llm_context::Column::Payload,
-        sequence: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::Sequence)),
-        source_type: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::Source)),
-        item_id: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::ItemId)),
-        tool_name: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::ToolName)),
-        projection_kind: null.clone(),
         revision: Func::coalesce([
             Expr::col((
                 compaction_source_revision::Entity,
@@ -719,23 +718,28 @@ fn turn_llm_context_projection(
             compaction_source_revision::Entity,
             compaction_source_revision::Column::Present,
         )),
-        capture_order: Func::coalesce([
-            Expr::col((
-                compaction_source_revision::Entity,
-                compaction_source_revision::Column::CaptureOrder,
-            )),
-            Expr::val(0_i64),
-        ])
-        .into(),
+        paging: SourcePaging {
+            sequence: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::Sequence)),
+            source_type: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::Source)),
+            item_id: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::ItemId)),
+            tool_name: Expr::col((turn_llm_context::Entity, turn_llm_context::Column::ToolName)),
+            projection_kind: null.clone(),
+            capture_order: Func::coalesce([
+                Expr::col((
+                    compaction_source_revision::Entity,
+                    compaction_source_revision::Column::CaptureOrder,
+                )),
+                Expr::val(0_i64),
+            ])
+            .into(),
+        },
     }
 }
 fn turn_item_projection(
     workspace: &str,
     thread_id: &str,
     turn_id: &str,
-) -> CanonicalProjection<turn_item::Entity> {
-    let null = Expr::val(Option::<String>::None);
-
+) -> CanonicalProjection<turn_item::Entity, ()> {
     CanonicalProjection {
         query: turn_item::Entity::find()
             .join(
@@ -773,11 +777,6 @@ fn turn_item_projection(
             .filter(turn_item::Column::TurnId.eq(turn_id)),
         id: turn_item::Column::Id,
         payload: turn_item::Column::Payload,
-        sequence: Expr::col((turn_item::Entity, Alias::new("rowid"))),
-        source_type: Expr::col((turn_item::Entity, turn_item::Column::ItemType)),
-        item_id: Expr::col((turn_item::Entity, turn_item::Column::ItemId)),
-        tool_name: null.clone(),
-        projection_kind: null.clone(),
         revision: Func::coalesce([
             Expr::col((
                 compaction_item_revision::Entity,
@@ -790,14 +789,7 @@ fn turn_item_projection(
             compaction_item_revision::Entity,
             compaction_item_revision::Column::Present,
         )),
-        capture_order: Func::coalesce([
-            Expr::col((
-                compaction_item_revision::Entity,
-                compaction_item_revision::Column::CaptureOrder,
-            )),
-            Expr::val(0_i64),
-        ])
-        .into(),
+        paging: (),
     }
 }
 
@@ -2357,9 +2349,9 @@ struct SourceFragmentRow {
     characters: i64,
 }
 
-async fn read_source_fragment<C: ConnectionTrait, E: EntityTrait>(
+async fn read_source_fragment<C: ConnectionTrait, E: EntityTrait, P>(
     db: &C,
-    projection: CanonicalProjection<E>,
+    projection: CanonicalProjection<E, P>,
     id: &str,
     offset: i64,
 ) -> Result<Option<SourceFragmentRow>> {
@@ -2387,9 +2379,9 @@ async fn read_source_fragment<C: ConnectionTrait, E: EntityTrait>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn replay_item_id<C: ConnectionTrait, E: EntityTrait>(
+async fn replay_item_id<C: ConnectionTrait, E: EntityTrait, P>(
     db: &C,
-    projection: CanonicalProjection<E>,
+    projection: CanonicalProjection<E, P>,
     item: E::Column,
     kind: Expr,
     workspace: &str,

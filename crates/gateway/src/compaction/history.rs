@@ -3,7 +3,7 @@
 use super::*;
 use pioneer_crud::{
     CanonicalTurnEventPayload as Event,
-    compaction::{CanonicalSource, HistoryReadFence, SourceRecord},
+    compaction::{HistoryReadFence, PagedSource, SourceRecord},
 };
 use pioneer_provider::{
     CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef, Role,
@@ -49,15 +49,14 @@ async fn metadata(
     workspace: &str,
     thread: &str,
     turn: &str,
-    kind: CanonicalSource,
+    kind: PagedSource,
     high_water: i64,
     fence: &HistoryReadFence,
 ) -> Result<Vec<SourceRecord>> {
     let capture_order = match kind {
-        CanonicalSource::Input => fence.input_order,
-        CanonicalSource::Event => fence.event_order,
-        CanonicalSource::ProviderContext => fence.context_order,
-        CanonicalSource::ToolItem => fence.item_order,
+        PagedSource::Input => fence.input_order,
+        PagedSource::Event => fence.event_order,
+        PagedSource::ProviderContext => fence.context_order,
     };
     let mut records = Vec::new();
     let mut after = 0;
@@ -339,7 +338,7 @@ async fn load_line_history_inner(
             workspace,
             thread,
             &turn.id,
-            CanonicalSource::Event,
+            PagedSource::Event,
             turn.event_high_water,
             fence,
         )
@@ -423,7 +422,7 @@ async fn load_line_history_inner(
             workspace,
             thread,
             &turn.id,
-            CanonicalSource::ProviderContext,
+            PagedSource::ProviderContext,
             turn.context_high_water,
             fence,
         )
@@ -476,7 +475,7 @@ async fn load_line_history_inner(
                 workspace,
                 thread,
                 &turn.id,
-                CanonicalSource::Input,
+                PagedSource::Input,
                 turn.input_high_water,
                 fence,
             )

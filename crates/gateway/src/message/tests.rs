@@ -63253,7 +63253,7 @@ async fn compaction_failed_partial_writer_loader_and_frozen_reader_preserve_obse
             &workspace,
             thread,
             turn,
-            pioneer_crud::compaction::CanonicalSource::ProviderContext,
+            pioneer_crud::compaction::PagedSource::ProviderContext,
             0,
         )
         .await
