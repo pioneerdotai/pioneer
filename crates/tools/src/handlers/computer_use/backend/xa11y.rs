@@ -919,6 +919,7 @@ fn xa11y_failure_class(error: &xa11y::Error) -> &'static str {
             "accessibility_unavailable"
         }
         xa11y::Error::Platform { .. } => "runtime_action_error",
+        _ => "runtime_action_error",
     }
 }
 
@@ -963,12 +964,10 @@ fn execute_input_action(
             };
             input.mouse().click_with(
                 ClickTarget::Point(point),
-                ClickOptions {
-                    button,
-                    count,
-                    held: Vec::new(),
-                    anchor: Anchor::Center,
-                },
+                ClickOptions::new()
+                    .button(button)
+                    .count(count)
+                    .anchor(Anchor::Center),
             )?;
         }
         InputActionKind::InputMove => {
@@ -981,11 +980,13 @@ fn execute_input_action(
             input.mouse().drag_with(
                 from,
                 to,
-                DragOptions {
-                    button: to_xa11y_mouse_button(action.button.unwrap_or(MouseButtonKind::Left)),
-                    held: Vec::new(),
-                    duration: Duration::from_millis(action.wait_ms.unwrap_or(150).clamp(1, 10_000)),
-                },
+                DragOptions::new()
+                    .button(to_xa11y_mouse_button(
+                        action.button.unwrap_or(MouseButtonKind::Left),
+                    ))
+                    .duration(Duration::from_millis(
+                        action.wait_ms.unwrap_or(150).clamp(1, 10_000),
+                    )),
             )?;
         }
         InputActionKind::InputScroll => {
