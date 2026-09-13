@@ -179,6 +179,7 @@ async fn fixture(
     observer_fails: bool,
 ) -> Fixture {
     super::load_test_catalog();
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
     let store = CrudStore::new(db);
@@ -1954,6 +1955,26 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     assert!(
         legacy[0].provenance.is_none(),
         "legacy text must not acquire invented source coverage"
+    );
+    // A view-only fixture misses the production failure: the background worker
+    // physically compresses sources AFTER the immutable snapshot was captured.
+    let epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    assert!(
+        crate::database::compress_history_payloads_for_test(&f.store)
+            .await
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        f.store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        epoch
     );
     let restored = super::frozen::restore(&f.store, "ws", &allowed, &snapshot)
         .await

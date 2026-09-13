@@ -9606,6 +9606,15 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         "the immutable branch contains only causally closed prior exchanges; B is supplied separately"
     );
 
+    // Compress while A still runs and B has completed in its child. Both
+    // terminal reconciliation and the next Composer admission must retain the
+    // exact frozen basis across physical maintenance.
+    assert!(
+        crate::database::compress_history_payloads_for_test(crud_store.as_ref())
+            .await
+            .unwrap()
+            > 0
+    );
     let task_a_id = task_a.id.clone();
     let task_b_id = task_b.id.clone();
     let task_b_status = wait_for_task_status(
@@ -10321,6 +10330,12 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             output_messages
         );
     }
+    assert!(
+        crate::database::compress_history_payloads_for_test(crud_store.as_ref())
+            .await
+            .unwrap()
+            > 0
+    );
     // Exercise actual Composer/Task admission and provider input for C, after
     // later A/B work appeared. C must inherit only the accepted output snapshots.
     let c_request_id = generate_test_request_id("frozen", "turn_concurrent_task_c");

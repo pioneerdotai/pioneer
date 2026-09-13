@@ -908,6 +908,39 @@ async fn apply_prepared_payload_rows(
     Ok((applied, stale))
 }
 
+/// Exercise the real bounded compression prepare/CAS path between history
+/// capture and replay, including tiny fixtures below dictionary-training size.
+#[cfg(test)]
+pub(crate) async fn compress_history_payloads_for_test(store: &CrudStore) -> Result<u64> {
+    let db = store.with_maintenance_access().database_connection();
+    let mut total = 0;
+    for &config in ZSTD_PAYLOAD_COLUMNS {
+        if !compression_is_enabled(&db, config).await? {
+            enable_transparent_compression(&db, config).await?;
+        }
+        for _ in 0..32 {
+            let rows = load_pending_payload_rows(
+                &db,
+                config,
+                COMPRESSION_BATCH_MAX_ROWS,
+                COMPRESSION_BATCH_MAX_SOURCE_BYTES,
+            )
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let prepared = prepare_payload_rows(rows, 3, None)?;
+            let (applied, _) = apply_prepared_payload_rows(&db, config, -1, &prepared).await?;
+            total += applied;
+        }
+        anyhow::ensure!(
+            !has_pending_uncompressed_rows(&db, config).await?,
+            "test compression exceeded its bounded fixture size"
+        );
+    }
+    Ok(total)
+}
+
 async fn has_pending_uncompressed_rows(
     db: &SqliteDatabase,
     config: ZstdColumnConfig,
