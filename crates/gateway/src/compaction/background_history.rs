@@ -425,13 +425,23 @@ pub(crate) async fn prepare_completed_history_owned(
         CompactionExit::Failed(reason) | CompactionExit::Reconcile(reason) => {
             diagnostic.code = match reason {
                 FailureKind::Transient => "provider_retries_exhausted",
-                FailureKind::Permanent => "provider_permanent_failure",
+                FailureKind::Permanent => "compaction_permanent_failure",
                 FailureKind::InvalidCompletion => "invalid_completion",
                 FailureKind::InsufficientEffect => "insufficient_effect",
                 FailureKind::Deadline => "operation_deadline",
                 FailureKind::Cancelled => "cancelled",
             }
             .into();
+            if let Some(state) = runner
+                .store
+                .compaction_runner_state(&runner.snapshot.id)
+                .await?
+                && let Some(failure) = state.diagnostic
+            {
+                diagnostic.stage = failure.stage;
+                diagnostic.code = failure.code;
+                diagnostic.explanation = failure.explanation;
+            }
             Ok(if reason == FailureKind::Cancelled {
                 HistoryCheckOutcome::Cancelled
             } else {

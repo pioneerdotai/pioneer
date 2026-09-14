@@ -192,6 +192,17 @@ pub(crate) async fn admit_operation(
             .await?;
         start = end;
     }
+    if !store
+        .compaction_manifest_sources_current(&snapshot.id)
+        .await?
+    {
+        store
+            .compaction_finish(&snapshot.id, "failed", "invalid_source_manifest")
+            .await?;
+        anyhow::bail!(
+            "compaction source revisions or accepted imports do not match the admitted manifest"
+        );
+    }
     let initial = RunnerState::new(
         snapshot.admission.deadline_ms,
         &budget,

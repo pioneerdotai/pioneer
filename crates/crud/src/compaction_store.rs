@@ -622,6 +622,22 @@ impl CrudStore {
         )
         .await
     }
+    pub async fn compaction_prepare_accepted_import(
+        &self,
+        workspace: &str,
+        destination: &str,
+        turn: &str,
+        ordinal: u64,
+    ) -> Result<PreparedFrozenImport> {
+        repositories::compaction::frozen_import::compaction_prepare_accepted_import(
+            self,
+            workspace,
+            destination,
+            turn,
+            ordinal,
+        )
+        .await
+    }
     pub async fn compaction_append_frozen_imports(
         &self,
         workspace: &str,
@@ -919,6 +935,13 @@ impl CrudStore {
         entries: &[ManifestEntry],
     ) -> Result<()> {
         repositories::compaction::runner::compaction_append_manifest(self, operation, entries).await
+    }
+    pub async fn compaction_manifest_sources_current(&self, operation: &str) -> Result<bool> {
+        repositories::compaction::runner::compaction_manifest_sources_current(
+            &self.connection,
+            operation,
+        )
+        .await
     }
     pub async fn compaction_activate_runner(
         &self,

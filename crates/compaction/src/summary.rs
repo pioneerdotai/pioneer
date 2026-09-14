@@ -168,6 +168,7 @@ pub struct SummaryFailure {
     pub retry_after_ms: Option<u64>,
     /// A bounded classification, never a source payload or provider response body.
     pub code: &'static str,
+    pub diagnostic: Option<crate::runner::FailureDiagnostic>,
 }
 impl std::fmt::Display for SummaryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -10273,6 +10273,84 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .unwrap()
         .unwrap();
     assert!(import_count > 0);
+    // Re-capture a real admitted child basis, as native/background compaction
+    // does after execution. The source bodies and their own-import grants must
+    // survive together, including repeated captures and the latest-basis path.
+    let db = crud_store.database_connection();
+    for (sql, values) in [
+        (
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('new-child-context',?,'','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![workspace_id.clone().into()],
+        ),
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('recapture-turn','new-child-context','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('recapture-input','recapture-turn',0,'text','child command','{\"type\":\"text\",\"text\":\"child command\"}',CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('recapture-task',?,'thread',?,'agent','running','Recapture','fixture')",
+            vec![workspace_id.clone().into(), parent_thread_id.into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('recapture-run','recapture-task','recapture-run',1,1,'running','agent')",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('recapture-rt','recapture-task','recapture-run','new-child-context','recapture-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('new-child-context',?,?,1,CURRENT_TIMESTAMP)",
+            vec![parent_thread_id.into(), parent_thread_id.into()],
+        ),
+        (
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)",
+            vec![
+                workspace_id.clone().into(),
+                parent_thread_id.into(),
+                assembled_json.clone().into(),
+            ],
+        ),
+    ] {
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+    }
+    for basis_turn in [Some("recapture-turn"), None] {
+        let recaptured = crate::compaction::frozen::capture_execution_basis_json(
+            crud_store.as_ref(),
+            &workspace_id,
+            "new-child-context",
+            basis_turn,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+            serde_json::from_str(&recaptured).unwrap();
+        let (forwarded, _) = crud_store
+            .compaction_frozen_import_state(
+                &workspace_id,
+                "new-child-context",
+                &descriptor.manifest_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            forwarded, import_count,
+            "recapture must preserve every accepted own source grant (basis turn: {basis_turn:?})"
+        );
+    }
+
     crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(

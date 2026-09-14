@@ -1495,180 +1495,438 @@ pub(crate) async fn compaction_apply_runner(
     store
         .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
         .await?;
-    store.run_serialized_write(|| async {
+    store
+        .run_serialized_write(|| async {
             let txn = store.connection.begin().await?;
             let row = compaction_operation::Entity::find()
-            .select_only()
-            .join(JoinType::InnerJoin, compaction_operation::Entity::belongs_to(compaction_checkpoint::Entity)
-                .from(compaction_operation::Column::Id)
-                .to(compaction_checkpoint::Column::OperationId)
-                .on_condition(|_,_| sea_orm::Condition::all()
-                    .add(Expr::col((compaction_checkpoint::Entity, compaction_checkpoint::Column::Owner))
-                        .eq(Expr::col((compaction_operation::Entity, compaction_operation::Column::Owner)))))
-                .into())
-            .expr(Expr::col((compaction_operation::Entity, compaction_operation::Column::Status)))
-            .filter(Expr::col((compaction_operation::Entity, compaction_operation::Column::Id))
-                .eq(Expr::Value(operation.into()))
-                .and(Expr::col((compaction_checkpoint::Entity, compaction_checkpoint::Column::Id))
-                    .eq(Expr::Value(checkpoint.clone()
-                            .into())))
-                .and(Expr::col((compaction_operation::Entity, compaction_operation::Column::ExpectedHead))
-                    .binary(BinOper::Is, Expr::Value(expected_head.map(str::to_owned)
-                            .into()))))
-            .into_tuple::<String>()
-            .one(&txn)
-            .await?;
-            let Some(row) = row else { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Stale) };
+                .select_only()
+                .join(
+                    JoinType::InnerJoin,
+                    compaction_operation::Entity::belongs_to(compaction_checkpoint::Entity)
+                        .from(compaction_operation::Column::Id)
+                        .to(compaction_checkpoint::Column::OperationId)
+                        .on_condition(|_, _| {
+                            sea_orm::Condition::all().add(
+                                Expr::col((
+                                    compaction_checkpoint::Entity,
+                                    compaction_checkpoint::Column::Owner,
+                                ))
+                                .eq(Expr::col((
+                                    compaction_operation::Entity,
+                                    compaction_operation::Column::Owner,
+                                ))),
+                            )
+                        })
+                        .into(),
+                )
+                .expr(Expr::col((
+                    compaction_operation::Entity,
+                    compaction_operation::Column::Status,
+                )))
+                .filter(
+                    Expr::col((
+                        compaction_operation::Entity,
+                        compaction_operation::Column::Id,
+                    ))
+                    .eq(Expr::Value(operation.into()))
+                    .and(
+                        Expr::col((
+                            compaction_checkpoint::Entity,
+                            compaction_checkpoint::Column::Id,
+                        ))
+                        .eq(Expr::Value(checkpoint.clone().into())),
+                    )
+                    .and(
+                        Expr::col((
+                            compaction_operation::Entity,
+                            compaction_operation::Column::ExpectedHead,
+                        ))
+                        .binary(
+                            BinOper::Is,
+                            Expr::Value(expected_head.map(str::to_owned).into()),
+                        ),
+                    ),
+                )
+                .into_tuple::<String>()
+                .one(&txn)
+                .await?;
+            let Some(row) = row else {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            };
             let status = row;
             if status == "completed" {
-                let exact = compaction_checkpoint::Entity::find().select_only().expr(Expr::col(compaction_checkpoint::Column::Id)).filter(Expr::col(compaction_checkpoint::Column::Id).eq(Expr::Value(checkpoint.clone().into())).and(Expr::col(compaction_checkpoint::Column::Status).eq(Expr::val("applied")))).into_tuple::<String>().one(&txn).await?;
+                let exact = compaction_checkpoint::Entity::find()
+                    .select_only()
+                    .expr(Expr::col(compaction_checkpoint::Column::Id))
+                    .filter(
+                        Expr::col(compaction_checkpoint::Column::Id)
+                            .eq(Expr::Value(checkpoint.clone().into()))
+                            .and(
+                                Expr::col(compaction_checkpoint::Column::Status)
+                                    .eq(Expr::val("applied")),
+                            ),
+                    )
+                    .into_tuple::<String>()
+                    .one(&txn)
+                    .await?;
                 txn.rollback().await?;
-                return Ok(if exact.is_some() { super::compaction::CommitOutcome::AlreadyApplied } else { super::compaction::CommitOutcome::Stale });
+                return Ok(if exact.is_some() {
+                    super::compaction::CommitOutcome::AlreadyApplied
+                } else {
+                    super::compaction::CommitOutcome::Stale
+                });
             }
-            if status != "running" { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Cancelled) }
+            if status != "running" {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Cancelled);
+            }
             let interrupted = compaction_operation::Entity::find()
-            .select_only()
-            .join(JoinType::InnerJoin, compaction_operation::Entity::belongs_to(compaction_context::Entity)
-                .from(compaction_operation::Column::Owner)
-                .to(compaction_context::Column::Owner)
-                .into())
-            .expr(Expr::col((compaction_operation::Entity, compaction_operation::Column::Id)))
-            .filter(Expr::col((compaction_operation::Entity, compaction_operation::Column::Id))
-                .eq(Expr::Value(operation.into()))
-                .and(Expr::col((compaction_operation::Entity, compaction_operation::Column::ExecutionTurn))
-                    .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                    .not())
-                .and(Expr::exists(Query::select()
-                        .expr(Expr::val(1_i64))
-                        .from_as(compaction_execution_stop::Entity, "stop")
-                        .and_where(Expr::col(("stop", compaction_execution_stop::Column::Owner))
-                            .eq(Expr::col((compaction_context::Entity, compaction_context::Column::Owner)))
-                            .and(Expr::col(("stop", compaction_execution_stop::Column::TurnId))
-                                .eq(Expr::col((compaction_operation::Entity, compaction_operation::Column::ExecutionTurn)))))
-                        .to_owned())
-                    .or(Expr::exists(Query::select()
-                            .expr(Expr::val(1_i64))
-                            .from_as(turn::Entity, "t")
-                            .and_where(Expr::col(("t", turn::Column::Id))
-                                .eq(Expr::col((compaction_operation::Entity, compaction_operation::Column::ExecutionTurn)))
-                                .and(Expr::col(("t", turn::Column::Status))
-                                    .is_in(["interrupted", "cancelled"])
-                                    .not()))
-                            .to_owned())
-                        .not())))
-            .into_tuple::<String>()
-            .one(&txn)
-            .await?;
-            if interrupted.is_some() { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Cancelled) }
+                .select_only()
+                .join(
+                    JoinType::InnerJoin,
+                    compaction_operation::Entity::belongs_to(compaction_context::Entity)
+                        .from(compaction_operation::Column::Owner)
+                        .to(compaction_context::Column::Owner)
+                        .into(),
+                )
+                .expr(Expr::col((
+                    compaction_operation::Entity,
+                    compaction_operation::Column::Id,
+                )))
+                .filter(
+                    Expr::col((
+                        compaction_operation::Entity,
+                        compaction_operation::Column::Id,
+                    ))
+                    .eq(Expr::Value(operation.into()))
+                    .and(
+                        Expr::col((
+                            compaction_operation::Entity,
+                            compaction_operation::Column::ExecutionTurn,
+                        ))
+                        .binary(BinOper::Is, Expr::val(Option::<String>::None))
+                        .not(),
+                    )
+                    .and(
+                        Expr::exists(
+                            Query::select()
+                                .expr(Expr::val(1_i64))
+                                .from_as(compaction_execution_stop::Entity, "stop")
+                                .and_where(
+                                    Expr::col(("stop", compaction_execution_stop::Column::Owner))
+                                        .eq(Expr::col((
+                                            compaction_context::Entity,
+                                            compaction_context::Column::Owner,
+                                        )))
+                                        .and(
+                                            Expr::col((
+                                                "stop",
+                                                compaction_execution_stop::Column::TurnId,
+                                            ))
+                                            .eq(
+                                                Expr::col((
+                                                    compaction_operation::Entity,
+                                                    compaction_operation::Column::ExecutionTurn,
+                                                )),
+                                            ),
+                                        ),
+                                )
+                                .to_owned(),
+                        )
+                        .or(Expr::exists(
+                            Query::select()
+                                .expr(Expr::val(1_i64))
+                                .from_as(turn::Entity, "t")
+                                .and_where(
+                                    Expr::col(("t", turn::Column::Id))
+                                        .eq(Expr::col((
+                                            compaction_operation::Entity,
+                                            compaction_operation::Column::ExecutionTurn,
+                                        )))
+                                        .and(
+                                            Expr::col(("t", turn::Column::Status))
+                                                .is_in(["interrupted", "cancelled"])
+                                                .not(),
+                                        ),
+                                )
+                                .to_owned(),
+                        )
+                        .not()),
+                    ),
+                )
+                .into_tuple::<String>()
+                .one(&txn)
+                .await?;
+            if interrupted.is_some() {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Cancelled);
+            }
 
             let generation = compaction_runner_state::Entity::find()
-            .select_only()
-            .expr(Expr::col(compaction_runner_state::Column::OperationId))
-            .filter(Expr::col(compaction_runner_state::Column::OperationId)
-                .eq(Expr::Value(operation.into()))
-                .and(Expr::col(compaction_runner_state::Column::Generation)
-                    .eq(Expr::Value(i64::try_from(state.generation)?.into())))
-                .and(Expr::expr(Func::cust(Alias::new("json_extract"))
-                        .args([Expr::col(compaction_runner_state::Column::State), Expr::val("$.phase.Commit.checkpoint")]))
-                    .eq(Expr::Value(checkpoint.clone()
-                            .into()))))
-            .into_tuple::<String>()
-            .one(&txn)
-            .await?;
-            if generation.is_none() { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Stale) }
+                .select_only()
+                .expr(Expr::col(compaction_runner_state::Column::OperationId))
+                .filter(
+                    Expr::col(compaction_runner_state::Column::OperationId)
+                        .eq(Expr::Value(operation.into()))
+                        .and(
+                            Expr::col(compaction_runner_state::Column::Generation)
+                                .eq(Expr::Value(i64::try_from(state.generation)?.into())),
+                        )
+                        .and(
+                            Expr::expr(Func::cust(Alias::new("json_extract")).args([
+                                Expr::col(compaction_runner_state::Column::State),
+                                Expr::val("$.phase.Commit.checkpoint"),
+                            ]))
+                            .eq(Expr::Value(checkpoint.clone().into())),
+                        ),
+                )
+                .into_tuple::<String>()
+                .one(&txn)
+                .await?;
+            if generation.is_none() {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            }
             // Exact coverage: every selected record has a fully read version,
             // and no reference-only or unselected source has acquired coverage.
             let missing = compaction_manifest::Entity::find()
-            .select_only()
-            .expr(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::Ordinal)))
-            .filter(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::OperationId))
-                .eq(Expr::Value(operation.into()))
-                .and(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::ReferenceOnly))
-                    .eq(Expr::val(0_i64)))
-                .and(Expr::exists(Query::select()
-                        .expr(Expr::val(1_i64))
-                        .from_as(compaction_coverage::Entity, "c")
-                        .join_as(JoinType::InnerJoin, compaction_checkpoint::Entity, "p", Expr::col(("p", compaction_checkpoint::Column::Id))
-                            .eq(Expr::col(("c", compaction_coverage::Column::CheckpointId))))
-                        .and_where(Expr::col(("p", compaction_checkpoint::Column::OperationId))
-                            .eq(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::OperationId)))
-                            .and(Expr::col(("c", compaction_coverage::Column::SourceScope))
-                                .eq(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::SourceScope))))
-                            .and(Expr::col(("c", compaction_coverage::Column::SourceId))
-                                .eq(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::SourceId))))
-                            .and(Expr::col(("c", compaction_coverage::Column::SourceVersion))
-                                .eq(Expr::col((compaction_manifest::Entity, compaction_manifest::Column::SourceVersion)))))
-                        .to_owned())
-                    .not()))
-            .limit(1)
-            .into_tuple::<i64>()
-            .one(&txn)
-            .await?;
-            let extra = compaction_coverage::Entity::find()
-            .select_only()
-            .join(JoinType::InnerJoin, compaction_coverage::Entity::belongs_to(compaction_checkpoint::Entity)
-                .from(compaction_coverage::Column::CheckpointId)
-                .to(compaction_checkpoint::Column::Id)
-                .into())
-            .expr(Expr::col((compaction_coverage::Entity, compaction_coverage::Column::SourceId)))
-            .filter(Expr::col((compaction_checkpoint::Entity, compaction_checkpoint::Column::OperationId))
-                .eq(Expr::Value(operation.into()))
-                .and(Expr::exists(Query::select()
-                        .expr(Expr::val(1_i64))
-                        .from_as(compaction_manifest::Entity, "m")
-                        .and_where(Expr::col(("m", compaction_manifest::Column::OperationId))
-                            .eq(Expr::col((compaction_checkpoint::Entity, compaction_checkpoint::Column::OperationId)))
-                            .and(Expr::col(("m", compaction_manifest::Column::ReferenceOnly))
-                                .eq(Expr::val(0_i64)))
-                            .and(Expr::col((compaction_coverage::Entity, compaction_coverage::Column::SourceScope))
-                                .eq(Expr::col(("m", compaction_manifest::Column::SourceScope))))
-                            .and(Expr::col((compaction_coverage::Entity, compaction_coverage::Column::SourceId))
-                                .eq(Expr::col(("m", compaction_manifest::Column::SourceId))))
-                            .and(Expr::col((compaction_coverage::Entity, compaction_coverage::Column::SourceVersion))
-                                .eq(Expr::col(("m", compaction_manifest::Column::SourceVersion)))))
-                        .to_owned())
-                    .not()))
-            .limit(1)
-            .into_tuple::<String>()
-            .one(&txn)
-            .await?;
-            let stale = txn.query_one_raw(sqlite_specific_sql("SELECT m.ordinal FROM compaction_manifest m JOIN compaction_operation o ON o.id=m.operation_id JOIN compaction_context owner ON owner.owner=o.owner WHERE m.operation_id=? AND (EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value OR NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=wanted.key AND t.workspace_id=owner.workspace_id)) OR COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=owner.thread_id),0)<>json_extract(o.snapshot,'$.projection_version') OR NOT EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.source_scope=m.source_scope AND s.source_id=m.source_id AND s.source_version=m.source_version AND s.thread_id=m.source_thread AND (m.reference_only=1 OR s.thread_id=owner.thread_id OR EXISTS (SELECT 1 FROM compaction_operation_projection accepted JOIN compaction_frozen_history h ON h.id=accepted.manifest_id AND h.workspace_id=owner.workspace_id AND h.ready=1 AND h.identity_sha256=accepted.identity_sha256 AND h.imports_sha256=accepted.imports_sha256 AND h.import_count=accepted.import_count AND h.next_import=accepted.import_count JOIN compaction_frozen_import imported ON imported.manifest_id=h.id WHERE accepted.operation_id=o.id AND imported.source_scope=s.source_scope AND imported.source_id=s.source_id AND imported.source_version=s.source_version AND imported.source_thread=s.thread_id)) AND s.workspace_id=owner.workspace_id)) LIMIT 1",[operation.into()]))
-            .await?;
-            if missing.is_some() || extra.is_some() || stale.is_some() { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Stale) }
+                .select_only()
+                .expr(Expr::col((
+                    compaction_manifest::Entity,
+                    compaction_manifest::Column::Ordinal,
+                )))
+                .filter(
+                    Expr::col((
+                        compaction_manifest::Entity,
+                        compaction_manifest::Column::OperationId,
+                    ))
+                    .eq(Expr::Value(operation.into()))
+                    .and(
+                        Expr::col((
+                            compaction_manifest::Entity,
+                            compaction_manifest::Column::ReferenceOnly,
+                        ))
+                        .eq(Expr::val(0_i64)),
+                    )
+                    .and(
+                        Expr::exists(
+                            Query::select()
+                                .expr(Expr::val(1_i64))
+                                .from_as(compaction_coverage::Entity, "c")
+                                .join_as(
+                                    JoinType::InnerJoin,
+                                    compaction_checkpoint::Entity,
+                                    "p",
+                                    Expr::col(("p", compaction_checkpoint::Column::Id)).eq(
+                                        Expr::col(("c", compaction_coverage::Column::CheckpointId)),
+                                    ),
+                                )
+                                .and_where(
+                                    Expr::col(("p", compaction_checkpoint::Column::OperationId))
+                                        .eq(Expr::col((
+                                            compaction_manifest::Entity,
+                                            compaction_manifest::Column::OperationId,
+                                        )))
+                                        .and(
+                                            Expr::col((
+                                                "c",
+                                                compaction_coverage::Column::SourceScope,
+                                            ))
+                                            .eq(
+                                                Expr::col((
+                                                    compaction_manifest::Entity,
+                                                    compaction_manifest::Column::SourceScope,
+                                                )),
+                                            ),
+                                        )
+                                        .and(
+                                            Expr::col(("c", compaction_coverage::Column::SourceId))
+                                                .eq(Expr::col((
+                                                    compaction_manifest::Entity,
+                                                    compaction_manifest::Column::SourceId,
+                                                ))),
+                                        )
+                                        .and(
+                                            Expr::col((
+                                                "c",
+                                                compaction_coverage::Column::SourceVersion,
+                                            ))
+                                            .eq(
+                                                Expr::col((
+                                                    compaction_manifest::Entity,
+                                                    compaction_manifest::Column::SourceVersion,
+                                                )),
+                                            ),
+                                        ),
+                                )
+                                .to_owned(),
+                        )
+                        .not(),
+                    ),
+                )
+                .limit(1)
+                .into_tuple::<i64>()
+                .one(&txn)
+                .await?;
+            let extra =
+                compaction_coverage::Entity::find()
+                    .select_only()
+                    .join(
+                        JoinType::InnerJoin,
+                        compaction_coverage::Entity::belongs_to(compaction_checkpoint::Entity)
+                            .from(compaction_coverage::Column::CheckpointId)
+                            .to(compaction_checkpoint::Column::Id)
+                            .into(),
+                    )
+                    .expr(Expr::col((
+                        compaction_coverage::Entity,
+                        compaction_coverage::Column::SourceId,
+                    )))
+                    .filter(
+                        Expr::col((
+                            compaction_checkpoint::Entity,
+                            compaction_checkpoint::Column::OperationId,
+                        ))
+                        .eq(Expr::Value(operation.into()))
+                        .and(
+                            Expr::exists(
+                                Query::select()
+                                    .expr(Expr::val(1_i64))
+                                    .from_as(compaction_manifest::Entity, "m")
+                                    .and_where(
+                                        Expr::col(("m", compaction_manifest::Column::OperationId))
+                                            .eq(Expr::col((
+                                                compaction_checkpoint::Entity,
+                                                compaction_checkpoint::Column::OperationId,
+                                            )))
+                                            .and(
+                                                Expr::col((
+                                                    "m",
+                                                    compaction_manifest::Column::ReferenceOnly,
+                                                ))
+                                                .eq(Expr::val(0_i64)),
+                                            )
+                                            .and(
+                                                Expr::col((
+                                                    compaction_coverage::Entity,
+                                                    compaction_coverage::Column::SourceScope,
+                                                ))
+                                                .eq(Expr::col((
+                                                    "m",
+                                                    compaction_manifest::Column::SourceScope,
+                                                ))),
+                                            )
+                                            .and(
+                                                Expr::col((
+                                                    compaction_coverage::Entity,
+                                                    compaction_coverage::Column::SourceId,
+                                                ))
+                                                .eq(Expr::col((
+                                                    "m",
+                                                    compaction_manifest::Column::SourceId,
+                                                ))),
+                                            )
+                                            .and(
+                                                Expr::col((
+                                                    compaction_coverage::Entity,
+                                                    compaction_coverage::Column::SourceVersion,
+                                                ))
+                                                .eq(Expr::col((
+                                                    "m",
+                                                    compaction_manifest::Column::SourceVersion,
+                                                ))),
+                                            ),
+                                    )
+                                    .to_owned(),
+                            )
+                            .not(),
+                        ),
+                    )
+                    .limit(1)
+                    .into_tuple::<String>()
+                    .one(&txn)
+                    .await?;
+            let sources_current = compaction_manifest_sources_current(&txn, operation).await?;
+            if missing.is_some() || extra.is_some() || !sources_current {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            }
             let changed = compaction_context::Entity::update_many()
-            .col_expr(compaction_context::Column::Head, Expr::Value(checkpoint.clone()
-                    .into()))
-            .filter(Expr::col(compaction_context::Column::Owner)
-                .eq(Expr::SubQuery(None, Box::new(Query::select()
-                            .expr(Expr::col(compaction_operation::Column::Owner))
-                            .from(compaction_operation::Entity)
-                            .and_where(Expr::col(compaction_operation::Column::Id)
-                                .eq(Expr::Value(operation.into())))
-                            .to_owned()
-                            .into())))
-                .and(Expr::col(compaction_context::Column::Head)
-                    .binary(BinOper::Is, Expr::Value(expected_head.map(str::to_owned)
-                            .into())))
-                .and(Expr::col(compaction_context::Column::FormatVersion)
-                    .eq(Expr::val(1_i64))))
-            .exec(&txn)
-            .await?;
-            if changed.rows_affected != 1 { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Stale) }
-            compaction_checkpoint::Entity::update_many().col_expr(compaction_checkpoint::Column::Status, Expr::val("applied")).filter(Expr::col(compaction_checkpoint::Column::Id).eq(Expr::Value(checkpoint.clone().into()))).exec(&txn).await?;
-            compaction_operation::Entity::update_many().col_expr(compaction_operation::Column::Status, Expr::val("completed")).col_expr(compaction_operation::Column::Outcome, Expr::val("applied")).filter(Expr::col(compaction_operation::Column::Id).eq(Expr::Value(operation.into()))).exec(&txn).await?;
+                .col_expr(
+                    compaction_context::Column::Head,
+                    Expr::Value(checkpoint.clone().into()),
+                )
+                .filter(
+                    Expr::col(compaction_context::Column::Owner)
+                        .eq(Expr::SubQuery(
+                            None,
+                            Box::new(
+                                Query::select()
+                                    .expr(Expr::col(compaction_operation::Column::Owner))
+                                    .from(compaction_operation::Entity)
+                                    .and_where(
+                                        Expr::col(compaction_operation::Column::Id)
+                                            .eq(Expr::Value(operation.into())),
+                                    )
+                                    .to_owned()
+                                    .into(),
+                            ),
+                        ))
+                        .and(Expr::col(compaction_context::Column::Head).binary(
+                            BinOper::Is,
+                            Expr::Value(expected_head.map(str::to_owned).into()),
+                        ))
+                        .and(
+                            Expr::col(compaction_context::Column::FormatVersion)
+                                .eq(Expr::val(1_i64)),
+                        ),
+                )
+                .exec(&txn)
+                .await?;
+            if changed.rows_affected != 1 {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            }
+            compaction_checkpoint::Entity::update_many()
+                .col_expr(compaction_checkpoint::Column::Status, Expr::val("applied"))
+                .filter(
+                    Expr::col(compaction_checkpoint::Column::Id)
+                        .eq(Expr::Value(checkpoint.clone().into())),
+                )
+                .exec(&txn)
+                .await?;
+            compaction_operation::Entity::update_many()
+                .col_expr(compaction_operation::Column::Status, Expr::val("completed"))
+                .col_expr(compaction_operation::Column::Outcome, Expr::val("applied"))
+                .filter(
+                    Expr::col(compaction_operation::Column::Id).eq(Expr::Value(operation.into())),
+                )
+                .exec(&txn)
+                .await?;
             compaction_runner_state::Entity::update_many()
-            .col_expr(compaction_runner_state::Column::Generation, Expr::Value(i64::try_from(applied.generation)?.into()))
-            .col_expr(compaction_runner_state::Column::State, Expr::Value(encoded.clone()
-                    .into()))
-            .filter(Expr::col(compaction_runner_state::Column::OperationId)
-                .eq(Expr::Value(operation.into()))
-                .and(Expr::col(compaction_runner_state::Column::Generation)
-                    .eq(Expr::Value(i64::try_from(state.generation)?.into()))))
-            .exec(&txn)
-            .await?;
+                .col_expr(
+                    compaction_runner_state::Column::Generation,
+                    Expr::Value(i64::try_from(applied.generation)?.into()),
+                )
+                .col_expr(
+                    compaction_runner_state::Column::State,
+                    Expr::Value(encoded.clone().into()),
+                )
+                .filter(
+                    Expr::col(compaction_runner_state::Column::OperationId)
+                        .eq(Expr::Value(operation.into()))
+                        .and(
+                            Expr::col(compaction_runner_state::Column::Generation)
+                                .eq(Expr::Value(i64::try_from(state.generation)?.into())),
+                        ),
+                )
+                .exec(&txn)
+                .await?;
             txn.commit().await?;
             Ok(super::compaction::CommitOutcome::Applied)
-        }).await
+        })
+        .await
 }
 
 use sea_orm::QuerySelect;
@@ -1724,3 +1982,14 @@ async fn manifest_source_exists<C: ConnectionTrait, E: EntityTrait>(
 }
 
 use sea_orm::QueryTrait;
+
+/// Shared admission/commit predicate. Read-only preflight avoids provider work
+/// for an invalid grant; commit repeats it under the atomic writer boundary.
+pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+) -> Result<bool> {
+    let stale = db.query_one_raw(sqlite_specific_sql("SELECT m.ordinal FROM compaction_manifest m JOIN compaction_operation o ON o.id=m.operation_id JOIN compaction_context owner ON owner.owner=o.owner WHERE m.operation_id=? AND (EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value OR NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=wanted.key AND t.workspace_id=owner.workspace_id)) OR COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=owner.thread_id),0)<>json_extract(o.snapshot,'$.projection_version') OR NOT EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.source_scope=m.source_scope AND s.source_id=m.source_id AND s.source_version=m.source_version AND s.thread_id=m.source_thread AND (m.reference_only=1 OR s.thread_id=owner.thread_id OR EXISTS (SELECT 1 FROM compaction_operation_projection accepted JOIN compaction_frozen_history h ON h.id=accepted.manifest_id AND h.workspace_id=owner.workspace_id AND h.ready=1 AND h.identity_sha256=accepted.identity_sha256 AND h.imports_sha256=accepted.imports_sha256 AND h.import_count=accepted.import_count AND h.next_import=accepted.import_count JOIN compaction_frozen_import imported ON imported.manifest_id=h.id WHERE accepted.operation_id=o.id AND imported.source_scope=s.source_scope AND imported.source_id=s.source_id AND imported.source_version=s.source_version AND imported.source_thread=s.thread_id)) AND s.workspace_id=owner.workspace_id)) LIMIT 1",[operation.into()]))
+            .await?;
+    Ok(stale.is_none())
+}

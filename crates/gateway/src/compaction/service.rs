@@ -131,6 +131,104 @@ impl CliSummarizer {
         request.data_json()
     }
 }
+fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::FailureDiagnostic {
+    use pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientError;
+    use pioneer_cli_agent_runtime::service::ServiceStage;
+    use pioneer_compaction::runner::FailureDiagnostic;
+    let stage = error
+        .downcast_ref::<ServiceStage>()
+        .map(|s| s.0)
+        .unwrap_or("cli_service");
+    // Only known fixed messages may become stored explanations. Unknown errors
+    // retain the stage and typed transport classification, never their text.
+    let known = error
+        .chain()
+        .find_map(|cause| match cause.to_string().as_str() {
+            "unsupported Codex service capability version" => Some((
+                "cli_version_unsupported",
+                "Installed Codex version does not match the supported service protocol",
+            )),
+            "Codex service isolation was not applied" => Some((
+                "cli_isolation_rejected",
+                "Codex config/read did not confirm the required isolated service profile",
+            )),
+            "Codex service model changed" => Some((
+                "cli_model_changed",
+                "Codex opened a different model than requested",
+            )),
+            "Codex service opened a persistent thread" => Some((
+                "cli_thread_persistent",
+                "Codex did not confirm an ephemeral service thread",
+            )),
+            "service input exceeds transport capacity" | "service input exceeds capacity" => {
+                Some((
+                    "cli_input_capacity",
+                    "Service input exceeds transport capacity",
+                ))
+            }
+            "Codex service ended without completion" => Some((
+                "cli_completion_missing",
+                "Codex transport closed before a completion",
+            )),
+            "Codex service requested interaction or transport closed" => Some((
+                "cli_interaction_requested",
+                "Isolated service requested an interaction",
+            )),
+            "Codex service transport lost alignment" => Some((
+                "cli_transport_alignment",
+                "Codex transport lost protocol alignment",
+            )),
+            "codex service deadline exceeded" | "Claude service deadline exceeded" => {
+                Some(("cli_deadline", "CLI service exceeded the attempt deadline"))
+            }
+            "unsupported Claude service capability version" => Some((
+                "cli_version_unsupported",
+                "Installed Claude version does not match the supported service protocol",
+            )),
+            _ => None,
+        });
+    let mut diagnostic = if let Some((code, explanation)) = known {
+        FailureDiagnostic::new(stage, code, explanation)
+    } else if let Some(failure) = error.downcast_ref::<ServiceFailure>() {
+        FailureDiagnostic::new(
+            stage,
+            "cli_provider_failure",
+            &format!("Provider failure class: {:?}", failure.class),
+        )
+    } else if let Some(rpc) = error.downcast_ref::<CodexJsonlRpcClientError>() {
+        let code = match rpc {
+            CodexJsonlRpcClientError::Native(_) => "cli_rpc_rejected",
+            CodexJsonlRpcClientError::RequestTimeout { .. } => "cli_rpc_timeout",
+            CodexJsonlRpcClientError::TransportClosed { .. } => "cli_transport_closed",
+            CodexJsonlRpcClientError::Decode { .. } => "cli_response_invalid",
+            CodexJsonlRpcClientError::Encode { .. } => "cli_request_invalid",
+            _ => "cli_rpc_state_invalid",
+        };
+        FailureDiagnostic::new(
+            stage,
+            code,
+            "CLI protocol operation failed at the recorded stage",
+        )
+    } else if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        FailureDiagnostic::new(
+            stage,
+            "cli_io_failure",
+            &format!("Operating system failure: {:?}", io.kind()),
+        )
+    } else {
+        FailureDiagnostic::new(
+            stage,
+            "cli_service_rejected",
+            "Unclassified CLI service failure; raw error omitted",
+        )
+    };
+    if let Some(CodexJsonlRpcClientError::Native(rpc)) =
+        error.downcast_ref::<CodexJsonlRpcClientError>()
+    {
+        diagnostic.rpc_code = Some(rpc.code);
+    }
+    diagnostic
+}
 fn failure(error: anyhow::Error) -> SummaryFailure {
     let typed = error.downcast_ref::<ServiceFailure>();
     let transient = typed.is_some_and(|failure| {
@@ -142,6 +240,7 @@ fn failure(error: anyhow::Error) -> SummaryFailure {
         )
     });
     SummaryFailure {
+        diagnostic: Some(service_diagnostic(&error)),
         kind: if transient {
             FailureKind::Transient
         } else {
@@ -173,6 +272,7 @@ impl Summarizer for CliSummarizer {
         let input_tokens = self.input_tokens(&request).map_err(failure)?;
         if !self.budget.fits(input_tokens, request.output_cap, false) {
             return Err(SummaryFailure {
+                diagnostic: None,
                 kind: FailureKind::Permanent,
                 retry_after_ms: None,
                 code: "summary_cli_input_overflow",
@@ -240,6 +340,36 @@ mod tests {
         summary::{HEADINGS, SummaryInput, validate_summary},
     };
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cli_failure_diagnostic_preserves_stage_and_rpc_code_without_raw_payloads() {
+        use pioneer_cli_agent_runtime::codex::{
+            CodexJsonlRpcClientError, CodexJsonlRpcNativeError,
+        };
+        use pioneer_cli_agent_runtime::service::ServiceStage;
+        let error =
+            anyhow::Error::new(CodexJsonlRpcClientError::Native(CodexJsonlRpcNativeError {
+                id: None,
+                code: -32602,
+                message: "secret request payload /private/path token=credential".into(),
+                data: None,
+            }))
+            .context(ServiceStage("cli_thread_start"));
+        let failure = failure(error);
+        let diagnostic = failure.diagnostic.unwrap();
+        assert_eq!(diagnostic.stage, "cli_thread_start");
+        assert_eq!(diagnostic.code, "cli_rpc_rejected");
+        assert_eq!(diagnostic.rpc_code, Some(-32602));
+        let stored = serde_json::to_string(&diagnostic).unwrap();
+        assert!(
+            !stored.contains("credential")
+                && !stored.contains("private/path")
+                && !stored.contains("secret")
+        );
+        let profile =
+            service_diagnostic(&anyhow::anyhow!("Codex service isolation was not applied"));
+        assert_eq!(profile.code, "cli_isolation_rejected");
+    }
 
     #[tokio::test]
     async fn selected_cli_factory_passes_summary_contract_to_owned_print_adapter() {

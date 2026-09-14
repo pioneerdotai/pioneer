@@ -116,6 +116,7 @@ impl Summarizer for NativeSummarizer {
         request: SummaryRequest,
     ) -> Result<SummaryCompletion, SummaryFailure> {
         let invalid = || SummaryFailure {
+            diagnostic: None,
             kind: FailureKind::Permanent,
             retry_after_ms: None,
             code: "invalid_summary_request",
@@ -123,6 +124,7 @@ impl Summarizer for NativeSummarizer {
         let input = self.input_tokens(&request).map_err(|_| invalid())?;
         if !self.budget.fits(input, request.output_cap, false) {
             return Err(SummaryFailure {
+                diagnostic: None,
                 kind: FailureKind::Permanent,
                 retry_after_ms: None,
                 code: "summary_input_overflow",
@@ -144,6 +146,11 @@ impl Summarizer for NativeSummarizer {
                     | ProviderFailureClass::Provider5xx
             );
             SummaryFailure {
+                diagnostic: Some(pioneer_compaction::runner::FailureDiagnostic::new(
+                    "provider_request",
+                    "summary_provider_failure",
+                    &format!("Provider failure class: {:?}", class),
+                )),
                 kind: if transient {
                     FailureKind::Transient
                 } else {

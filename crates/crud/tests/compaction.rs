@@ -2880,6 +2880,140 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&operation.id, &context)
         .await
         .unwrap();
+    // Production path: the accepted parent basis is recaptured by the child.
+    // Ownership evidence must survive that capture and authorize final commit.
+    let maintenance = store.with_maintenance_access();
+    let forwarded = maintenance
+        .compaction_prepare_accepted_import("ws", "context-c", "turn-c", 0)
+        .await
+        .unwrap();
+    assert!(
+        maintenance
+            .compaction_prepare_accepted_import("ws", "child", "turn-c", 0)
+            .await
+            .is_err()
+    );
+    let child_target = FrozenMessageRef {
+        context_thread: Some("context-c".into()),
+        ..target.clone()
+    };
+    let child_context = descriptor("recaptured-c", std::slice::from_ref(&child_target));
+    let forwarded_imports = vec![(0, forwarded)];
+    let forwarded_digest =
+        pioneer_crud::compaction::frozen_import_identity(&forwarded_imports).unwrap();
+    maintenance
+        .compaction_begin_frozen_history_with_imports(
+            "ws",
+            "context-c",
+            &child_context,
+            1,
+            &forwarded_digest,
+        )
+        .await
+        .unwrap();
+    maintenance
+        .compaction_append_frozen_history(
+            "ws",
+            "context-c",
+            &child_context.manifest_id,
+            0,
+            std::slice::from_ref(&child_target),
+        )
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "UPDATE task_run_conversation_snapshot SET history_json='[]' WHERE run_id='run-c'",
+    )
+    .await
+    .unwrap();
+    assert!(
+        maintenance
+            .compaction_append_frozen_imports(
+                "ws",
+                "context-c",
+                &child_context.manifest_id,
+                0,
+                &forwarded_imports
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &child_context)
+            .await
+            .unwrap()
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run-c'",
+        [serde_json::to_string(&context).unwrap().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_forwarded_import AFTER INSERT ON compaction_frozen_import_data BEGIN SELECT RAISE(ABORT,'fixture forward rollback'); END").await.unwrap();
+    assert!(
+        maintenance
+            .compaction_append_frozen_imports(
+                "ws",
+                "context-c",
+                &child_context.manifest_id,
+                0,
+                &forwarded_imports
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &child_context)
+            .await
+            .unwrap()
+    );
+    db.execute_unprepared("DROP TRIGGER abort_forwarded_import")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        maintenance
+            .compaction_append_frozen_imports(
+                "ws",
+                "context-c",
+                &child_context.manifest_id,
+                0,
+                &forwarded_imports,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &child_context)
+            .await
+            .unwrap()
+    );
+    let recaptured_operation =
+        admit_import_operation(&maintenance, "recaptured-operation", "context-c", "turn-c").await;
+    maintenance
+        .compaction_bind_source_projection(&recaptured_operation.id, &child_context)
+        .await
+        .unwrap();
+    let recaptured_ready =
+        ready_import_operation(&maintenance, &recaptured_operation, "child", &own_source).await;
+    assert_eq!(
+        maintenance
+            .compaction_apply_runner(&recaptured_operation.id, &recaptured_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        maintenance
+            .compaction_apply_runner(&recaptured_operation.id, &recaptured_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+
     let ready = ready_import_operation(&store, &operation, "child", &own_source).await;
     store
         .compaction_bind_source_projection(&operation.id, &context)

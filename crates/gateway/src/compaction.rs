@@ -30,7 +30,8 @@ pub(crate) use tool_outcomes::{retained_shell_outcome, retained_tool_policy};
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use pioneer_compaction::runner::{
-    AttemptPurpose, FailureKind, RunnerAction, RunnerPhase, RunnerState, SourceCursor,
+    AttemptPurpose, FailureDiagnostic, FailureKind, RunnerAction, RunnerPhase, RunnerState,
+    SourceCursor,
 };
 use pioneer_compaction::summary::{
     ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest, validate_summary,
@@ -161,7 +162,7 @@ impl HubCompactionObserver {
             message,
             status,
             Some(
-                &serde_json::json!({"operationId":operation,"attempts":state.attempts,"retries":state.retries,"corrections":state.corrections}),
+                &serde_json::json!({"operationId":operation,"attempts":state.attempts,"retries":state.retries,"corrections":state.corrections,"diagnostic":state.diagnostic}),
             ),
         )
     }
@@ -427,7 +428,18 @@ impl CompactionRunner {
                 != self.snapshot.projection_version
             {
                 state = self
-                    .persist(&state, state.terminate(FailureKind::Permanent)?, None)
+                    .persist(
+                        &state,
+                        Self::diagnose(
+                            state.terminate(FailureKind::Permanent)?,
+                            FailureDiagnostic::new(
+                                "source_validation",
+                                "source_revision_changed",
+                                "History projection changed after admission",
+                            ),
+                        ),
+                        None,
+                    )
                     .await?;
             }
             match state.action(self.clock.now_ms()) {
@@ -456,7 +468,8 @@ impl CompactionRunner {
                         Ok(portion) => portion,
                         Err(_) => {
                             state = self
-                                .persist(&state, state.terminate(FailureKind::Permanent)?, None)
+                                .persist(&state, Self::diagnose(state.terminate(FailureKind::Permanent)?,
+                                    FailureDiagnostic::new("portion_preparation", "source_preparation_failed", "Could not prepare the next portion from admitted source revisions")), None)
                                 .await?;
                             continue;
                         }
@@ -472,24 +485,37 @@ impl CompactionRunner {
                         output_tokens: None,
                         completion: None,
                         failure: None,
+                        diagnostic: None,
                     });
                     state = self.persist(&state, claimed, None).await?;
                     let RunnerPhase::Attempt { deadline_ms, .. } = state.phase else {
                         unreachable!()
                     };
-                    let result = tokio::select! { biased;
+                    let mut result = tokio::select! { biased;
                         _=self.clock.sleep_until(deadline_ms)=>None,
                         result=self.summarizer.summarize(portion.request.clone())=>Some(result),
                     };
                     // No validation/publication/retry can get ahead of the
                     // previous service process and transport being released.
-                    self.summarizer.cleanup().await?;
+                    if let Err(failure) = self.summarizer.cleanup().await {
+                        // Preserve the original failure when cleanup also fails.
+                        if !matches!(result, Some(Err(_))) {
+                            result = Some(Err(failure));
+                        }
+                    }
                     match result {
                         None => {
                             state = self
                                 .persist(
                                     &state,
-                                    self.attempt_failed(&state, FailureKind::Transient, None)?,
+                                    Self::diagnose(
+                                        self.attempt_failed(&state, FailureKind::Transient, None)?,
+                                        FailureDiagnostic::new(
+                                            "summarization",
+                                            "attempt_deadline",
+                                            "Summary attempt exceeded its deadline",
+                                        ),
+                                    ),
                                     None,
                                 )
                                 .await?;
@@ -498,11 +524,20 @@ impl CompactionRunner {
                             state = self
                                 .persist(
                                     &state,
-                                    self.attempt_failed(
-                                        &state,
-                                        failure.kind,
-                                        failure.retry_after_ms,
-                                    )?,
+                                    Self::diagnose(
+                                        self.attempt_failed(
+                                            &state,
+                                            failure.kind,
+                                            failure.retry_after_ms,
+                                        )?,
+                                        failure.diagnostic.unwrap_or_else(|| {
+                                            FailureDiagnostic::new(
+                                                "summarization",
+                                                failure.code,
+                                                "Summarizer rejected the request",
+                                            )
+                                        }),
+                                    ),
                                     None,
                                 )
                                 .await?;
@@ -514,24 +549,26 @@ impl CompactionRunner {
                                 observation.input_tokens = completion.input_tokens;
                                 observation.output_tokens = completion.output_tokens;
                             }
-                            let summary =
-                                match validate_summary(&completion, portion.request.output_cap) {
-                                    Ok(text) => text,
-                                    Err(_) => {
-                                        state = self
+                            let summary = match validate_summary(
+                                &completion,
+                                portion.request.output_cap,
+                            ) {
+                                Ok(text) => text,
+                                Err(_) => {
+                                    state = self
                                             .persist(
                                                 &state,
-                                                state.attempt_failed(
+                                                Self::diagnose(state.attempt_failed(
                                                     FailureKind::InvalidCompletion,
                                                     self.clock.now_ms(),
                                                     None,
-                                                )?,
+                                                )?, FailureDiagnostic::new("summary_validation", "invalid_completion", "Summary completion did not satisfy the required format or output budget")),
                                                 None,
                                             )
                                             .await?;
-                                        continue;
-                                    }
-                                };
+                                    continue;
+                                }
+                            };
                             let checkpoint = Checkpoint {
                                 id: format!("{}:summary:{}", operation, state.attempts),
                                 operation_id: operation.clone(),
@@ -591,7 +628,8 @@ impl CompactionRunner {
                         }
                         CommitOutcome::Stale => {
                             state = self
-                                .persist(&state, state.terminate(FailureKind::Permanent)?, None)
+                                .persist(&state, Self::diagnose(state.terminate(FailureKind::Permanent)?,
+                                    FailureDiagnostic::new("checkpoint_commit", "checkpoint_stale", "Checkpoint was not applied: source revision, accepted import, coverage or context head no longer matches admission")), None)
                                 .await?;
                         }
                     }
@@ -622,6 +660,18 @@ impl CompactionRunner {
             retry_after_ms
         };
         state.attempt_failed(kind, self.clock.now_ms(), delay)
+    }
+
+    fn diagnose(mut state: RunnerState, diagnostic: FailureDiagnostic) -> RunnerState {
+        // Post-summary validation failures belong to the operation, not to the
+        // successful provider attempt. Failed calls retain their own diagnostic.
+        if let Some(observation) = &mut state.observation
+            && observation.failure.is_some()
+        {
+            observation.diagnostic = Some(diagnostic.clone());
+        }
+        state.diagnostic = Some(diagnostic);
+        state
     }
 
     async fn persist(

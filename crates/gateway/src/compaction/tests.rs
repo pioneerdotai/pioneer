@@ -3436,3 +3436,109 @@ async fn legacy_history_is_prepared_before_freezing_a_new_execution_basis() {
             .is_err()
     );
 }
+
+struct RejectedService(Arc<dyn Summarizer>);
+#[async_trait]
+impl Summarizer for RejectedService {
+    fn model_budget(&self) -> ModelBudget {
+        self.0.model_budget()
+    }
+    fn input_tokens(&self, request: &SummaryRequest) -> Result<u64> {
+        self.0.input_tokens(request)
+    }
+    async fn summarize(
+        &self,
+        _: SummaryRequest,
+    ) -> std::result::Result<
+        pioneer_compaction::summary::SummaryCompletion,
+        pioneer_compaction::summary::SummaryFailure,
+    > {
+        Err(pioneer_compaction::summary::SummaryFailure {
+            kind: FailureKind::Permanent,
+            retry_after_ms: None,
+            code: "cli_isolation_rejected",
+            diagnostic: Some(FailureDiagnostic::new(
+                "cli_config_read",
+                "cli_isolation_rejected",
+                "Codex did not confirm the isolated profile",
+            )),
+        })
+    }
+}
+#[tokio::test]
+async fn compaction_failed_attempt_retains_diagnostic_across_restart_and_lifecycle() {
+    let mut f = fixture("history", vec![], true, false).await;
+    let rejected = Arc::new(RejectedService(f.runner.summarizer.clone()));
+    Arc::get_mut(&mut f.runner).unwrap().summarizer = rejected;
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Failed(FailureKind::Permanent)
+    ));
+    let state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let diagnostic = state.diagnostic.as_ref().unwrap();
+    assert_eq!(diagnostic.code, "cli_isolation_rejected");
+    assert_eq!(
+        state.observation.as_ref().unwrap().diagnostic.as_ref(),
+        Some(diagnostic)
+    );
+    let row = f.store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT observation FROM compaction_attempt_observation WHERE operation_id=? AND attempt=1", ["operation".into()])).await.unwrap().unwrap();
+    let observation: pioneer_compaction::runner::AttemptObservation =
+        serde_json::from_str(&row.try_get::<String>("", "observation").unwrap()).unwrap();
+    assert_eq!(observation.diagnostic.as_ref(), Some(diagnostic));
+    let restored: RunnerState =
+        serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(restored, state);
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Failed(FailureKind::Permanent)
+    ));
+    assert_eq!(
+        f.store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap(),
+        state
+    );
+}
+
+struct StaleCommitTarget(CrudStore);
+#[async_trait]
+impl CompactionTarget for StaleCommitTarget {
+    async fn fits(&self, _: &str) -> Result<bool> {
+        // Provider succeeded; invalidate only the selected revision before commit.
+        self.0.database_connection().execute_unprepared(
+            "UPDATE compaction_manifest SET source_version='stale' WHERE operation_id='operation'"
+        ).await?;
+        Ok(true)
+    }
+}
+#[tokio::test]
+async fn compaction_commit_failure_does_not_mislabel_successful_provider_attempt() {
+    let mut f = fixture("completed history", vec![Reply::Success], true, false).await;
+    Arc::get_mut(&mut f.runner).unwrap().target = Arc::new(StaleCommitTarget(f.store.clone()));
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Failed(FailureKind::Permanent)
+    ));
+    let state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let diagnostic = state.diagnostic.as_ref().unwrap();
+    assert_eq!(diagnostic.stage, "checkpoint_commit");
+    assert_eq!(diagnostic.code, "checkpoint_stale");
+    let observation = state.observation.unwrap();
+    assert!(observation.completion.is_some());
+    assert_eq!(observation.failure, None);
+    assert_eq!(observation.diagnostic, None);
+    assert_eq!(f.store.compaction_head("owner").await.unwrap(), None);
+}

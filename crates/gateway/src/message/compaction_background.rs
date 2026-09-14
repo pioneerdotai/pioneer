@@ -576,6 +576,12 @@ fn classify_check_result(
             // exact known strings are accepted; arbitrary text is never copied.
             for cause in error.chain().take(8) {
                 let known = match cause.to_string().as_str() {
+                    "compaction source revisions or accepted imports do not match the admitted manifest" => {
+                        Some((
+                            "invalid_source_manifest",
+                            "Source revisions or accepted import evidence do not match the selected history; no provider call was made",
+                        ))
+                    }
                     "selected CLI service instance is unavailable" => Some((
                         "summary_instance_missing",
                         "Selected CLI summary instance is not configured",

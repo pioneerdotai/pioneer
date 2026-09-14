@@ -52,6 +52,26 @@ pub enum RunnerPhase {
         kind: FailureKind,
     },
 }
+/// Durable operational diagnostics contain only classified metadata, never raw
+/// provider/transport errors, request bodies, paths or credentials.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureDiagnostic {
+    pub stage: String,
+    pub code: String,
+    pub explanation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_code: Option<i64>,
+}
+impl FailureDiagnostic {
+    pub fn new(stage: &str, code: &str, explanation: &str) -> Self {
+        Self {
+            stage: stage.into(),
+            code: code.into(),
+            explanation: explanation.into(),
+            rpc_code: None,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttemptObservation {
     pub number: u64,
@@ -63,6 +83,8 @@ pub struct AttemptObservation {
     pub output_tokens: Option<u64>,
     pub completion: Option<crate::summary::CompletionKind>,
     pub failure: Option<FailureKind>,
+    #[serde(default)]
+    pub diagnostic: Option<FailureDiagnostic>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerState {
@@ -77,6 +99,8 @@ pub struct RunnerState {
     pub phase: RunnerPhase,
     #[serde(default)]
     pub observation: Option<AttemptObservation>,
+    #[serde(default)]
+    pub diagnostic: Option<FailureDiagnostic>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunnerAction {
@@ -103,6 +127,7 @@ impl RunnerState {
         anyhow::ensure!(target_tokens > 0, "summarizer has no output capacity");
         Ok(Self {
             observation: None,
+            diagnostic: None,
             generation: 0,
             deadline_ms,
             attempts: 0,
@@ -157,6 +182,7 @@ impl RunnerState {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("attempt counter overflow"))?;
         next.observation = None;
+        next.diagnostic = None;
         next.phase = RunnerPhase::Attempt {
             number: next.attempts,
             purpose,
@@ -307,6 +333,15 @@ impl RunnerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_runner_json_defaults_missing_diagnostics() {
+        let state = state();
+        let mut json = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("diagnostic");
+        let restored: RunnerState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, state);
+    }
+
     fn state() -> RunnerState {
         RunnerState::new(
             900_000,

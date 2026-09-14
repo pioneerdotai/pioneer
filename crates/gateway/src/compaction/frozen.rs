@@ -352,6 +352,8 @@ pub(super) async fn capture_execution_basis_with_outputs(
     let mut epochs = outputs
         .map(|outputs| outputs.source_epochs.clone())
         .unwrap_or_else(|| BTreeMap::from([(thread.to_owned(), epoch)]));
+    let mut accepted_turn = basis_turn.map(str::to_owned);
+    let mut imports = BTreeMap::new();
     let basis = if omits_history {
         None
     } else {
@@ -368,6 +370,7 @@ pub(super) async fn capture_execution_basis_with_outputs(
             .compaction_latest_task_basis_turn(workspace, thread, &fence)
             .await?
         {
+            accepted_turn = Some(turn.clone());
             store
                 .compaction_task_basis_snapshot(workspace, thread, &turn)
                 .await?
@@ -442,6 +445,34 @@ pub(super) async fn capture_execution_basis_with_outputs(
             &mut inherited,
         )
         .await?;
+        // Hydration promotes only explicitly accepted own imports. Preserve
+        // that evidence when recapturing the child; provenance alone is not a grant.
+        if !basis.history_json.trim_start().starts_with('[') {
+            let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
+            let (count, _) = store
+                .compaction_frozen_import_state(
+                    workspace,
+                    &basis.parent_thread,
+                    &descriptor.manifest_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("accepted import state disappeared"))?;
+            let turn = accepted_turn
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("accepted execution turn missing"))?;
+            for ordinal in 0..count {
+                let prepared = store
+                    .compaction_prepare_accepted_import(workspace, thread, turn, ordinal)
+                    .await?;
+                imports.insert(
+                    ScopedHistorySource {
+                        thread: prepared.source_thread().into(),
+                        source: prepared.source().clone(),
+                    },
+                    prepared,
+                );
+            }
+        }
         messages = compose_frozen_basis(&store, workspace, thread, &allowed, &inherited, &messages)
             .await?;
     }
@@ -551,7 +582,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
     if let Some(policy) = policy {
         select_task_history(&mut messages, policy)?;
     }
-    let mut imports = BTreeMap::new();
     if let Some(outputs) = outputs {
         for message in &messages {
             let origin = message

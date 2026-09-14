@@ -8,7 +8,8 @@ use crate::event::{
 };
 use crate::process::{CLIAgentProcess, SensitiveEnvironment};
 use crate::service::ServiceFailure;
-use anyhow::{Result, bail, ensure};
+use crate::service::ServiceStage;
+use anyhow::{Context, Result, bail, ensure};
 use pioneer_protocol::ProviderFailureClass;
 use tokio::sync::Mutex;
 
@@ -106,10 +107,12 @@ impl CodexService {
             let mut attempt = self.attempt.lock().await;
             ensure!(attempt.is_none(), "previous service attempt needs cleanup");
             ensure!(Instant::now() < deadline, "service deadline exceeded");
-            let directory = tempfile::tempdir()?;
-            let config = process_config(&self.config, directory.path())?;
-            let mut process = spawn_cli_agent_process(&config)?;
-            let (stdout, stdin) = process.take_stdio()?;
+            let directory = tempfile::tempdir().context(ServiceStage("cli_directory"))?;
+            let config = process_config(&self.config, directory.path())
+                .context(ServiceStage("cli_configuration"))?;
+            let mut process =
+                spawn_cli_agent_process(&config).context(ServiceStage("cli_spawn"))?;
+            let (stdout, stdin) = process.take_stdio().context(ServiceStage("cli_stdio"))?;
             let (rpc, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(stdout), stdin);
             *attempt = Some(ServiceAttempt {
                 client: CodexAppServerClient::new(rpc),
@@ -162,8 +165,7 @@ fn profile() -> JsonValue {
         "apps":{}, "projects":{}, "agents":{"enabled":false},
         "web_search":"disabled", "project_doc_max_bytes":0,
         "include_environment_context":false, "include_collaboration_mode_instructions":false,
-        "history":{"persistence":"none"},
-        "tools":{"update_plan":{"enabled":false},"experimental_request_user_input":{"enabled":false}}
+        "history":{"persistence":"none"}
     })
 }
 fn process_config(config: &CodexServiceConfig, cwd: &Path) -> Result<CLIAgentProcessSpawnConfig> {
@@ -191,6 +193,11 @@ fn verify_profile(actual: &JsonValue, expected: &JsonValue) -> bool {
                 })
             })
         }
+        // config/read uses typed maps: e.g. an empty apps table is returned
+        // as {"_default":null}. Null defaults do not enable an integration.
+        JsonValue::Object(expected) if expected.is_empty() => actual
+            .as_object()
+            .is_some_and(|actual| actual.values().all(JsonValue::is_null)),
         _ => actual == expected,
     }
 }
@@ -228,7 +235,10 @@ async fn exchange(
         .rpc
         .take_diagnostic_receiver()
         .ok_or_else(|| anyhow::anyhow!("service diagnostic receiver already used"))?;
-    let initialize = client.initialize(remaining(deadline)?).await?;
+    let initialize = client
+        .initialize(remaining(deadline)?)
+        .await
+        .context(ServiceStage("cli_initialize"))?;
     ensure!(
         supports_release(&initialize),
         "unsupported Codex service capability version"
@@ -240,7 +250,8 @@ async fn exchange(
             Some(json!({"cwd":cwd,"includeLayers":false})),
             remaining(deadline)?,
         )
-        .await?;
+        .await
+        .context(ServiceStage("cli_config_read"))?;
     ensure!(
         verify_profile(&config["config"], &profile()),
         "Codex service isolation was not applied"
@@ -250,8 +261,9 @@ async fn exchange(
         "ephemeral":true, "environments":[], "dynamicTools":[], "selectedCapabilityRoots":[],
         "allowProviderModelFallback":false, "baseInstructions":request.instructions,
         "developerInstructions":"", "personality":"none"
-    })), remaining(deadline)?).await?;
-    let opened = decode_codex_thread_open_response("thread/start", opened)?;
+    })), remaining(deadline)?).await.context(ServiceStage("cli_thread_start"))?;
+    let opened = decode_codex_thread_open_response("thread/start", opened)
+        .context(ServiceStage("cli_thread_decode"))?;
     ensure!(
         opened.model.as_deref() == Some(request.model.as_str()),
         "Codex service model changed"
@@ -273,9 +285,10 @@ async fn exchange(
             })),
             remaining(deadline)?,
         )
-        .await?;
-    let started =
-        decode_codex_turn_start_response("turn/start", &opened.native_thread_id, started)?;
+        .await
+        .context(ServiceStage("cli_turn_start"))?;
+    let started = decode_codex_turn_start_response("turn/start", &opened.native_thread_id, started)
+        .context(ServiceStage("cli_turn_decode"))?;
     let mut completion = CodexServiceCompletion {
         text: String::new(),
         input_tokens: None,
@@ -513,6 +526,28 @@ mod tests {
         assert!(verify_profile(&actual, &profile()));
     }
 
+    #[test]
+    fn service_profile_accepts_normalized_0154_config_and_rejects_enabled_integrations() {
+        // Shape observed from the supported executable's real config/read.
+        // tools.update_plan/experimental_request_user_input are not serialized
+        // config fields in this version; working actions are isolated by the
+        // feature gates plus empty environments in thread/start and turn/start.
+        let mut actual = profile();
+        actual["apps"] = json!({"_default":null});
+        actual["agents"]["max_depth"] = JsonValue::Null;
+        actual["history"]["max_bytes"] = JsonValue::Null;
+        actual["tools"] = json!({"web_search":null});
+        assert!(verify_profile(&actual, &profile()));
+        actual["apps"]["_default"] = json!({"enabled":true});
+        assert!(!verify_profile(&actual, &profile()));
+        actual["apps"] = json!({"_default":null});
+        actual["mcp_servers"] = json!({"unexpected":{"command":"tool"}});
+        assert!(!verify_profile(&actual, &profile()));
+        actual["mcp_servers"] = json!({});
+        actual["features"]["shell_tool"] = json!(true);
+        assert!(!verify_profile(&actual, &profile()));
+    }
+
     #[tokio::test]
     async fn service_wire_is_ephemeral_for_each_fresh_attempt_and_rejects_unknown_version() {
         for attempt in 0..3 {
@@ -540,7 +575,12 @@ mod tests {
                     let result = match method {
                         "initialize" => json!({"version":version}),
                         "initialized" => continue,
-                        "config/read" => json!({"config":profile()}),
+                        "config/read" => {
+                            let mut config = profile();
+                            config["apps"] = json!({"_default":null});
+                            config["tools"] = json!({"web_search":null});
+                            json!({"config":config})
+                        }
                         "thread/start" => {
                             let p = &value["params"];
                             assert_eq!(p["ephemeral"], true);

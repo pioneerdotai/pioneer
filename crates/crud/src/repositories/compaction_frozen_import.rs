@@ -43,6 +43,19 @@ pub struct PreparedFrozenImport {
     output_digest: String,
     original_json: String,
     record: FrozenImportRecord,
+    accepted_basis: Option<AcceptedImportBasis>,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptedImportBasis {
+    turn: String,
+    history_json: String,
+    manifest: String,
+    digest: String,
+    imports_digest: String,
+    import_count: u64,
+    ordinal: i64,
+    proof_json: String,
 }
 impl PreparedFrozenImport {
     pub fn source(&self) -> &SourceRef {
@@ -53,6 +66,10 @@ impl PreparedFrozenImport {
     }
     pub fn estimated_write_bytes(&self, target: &FrozenMessageRef) -> Result<usize> {
         Ok(self.original_json.len()
+            + self
+                .accepted_basis
+                .as_ref()
+                .map_or(0, |b| b.history_json.len() + b.proof_json.len())
             + serde_json::to_vec(&self.record)?.len()
             + serde_json::to_vec(target)?.len()
             + 64)
@@ -250,6 +267,7 @@ pub(crate) async fn compaction_prepare_frozen_import(
     Ok(PreparedFrozenImport {
         workspace: workspace.into(),
         destination: destination.into(),
+        accepted_basis: None,
         output_digest: snapshot.output.history.identity_sha256,
         original_json,
         record: FrozenImportRecord {
@@ -263,6 +281,90 @@ pub(crate) async fn compaction_prepare_frozen_import(
             acknowledgement: acknowledgement.clone(),
         },
     })
+}
+
+/// Forward only evidence from the exact TaskRun basis accepted by this child.
+/// Preparation reads immutable reference/import metadata outside the writer.
+/// Publication revalidates the TaskRun binding, ready digest, exact proof, target
+/// reference and live source in the same transaction as the bounded import batch.
+pub(crate) async fn compaction_prepare_accepted_import(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    turn: &str,
+    ordinal: u64,
+) -> Result<PreparedFrozenImport> {
+    let basis = store
+        .compaction_task_basis_snapshot(workspace, destination, turn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("accepted Task basis is unavailable"))?;
+    let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&basis.history_json)?;
+    let (import_count, imports_digest) = store
+        .compaction_frozen_import_state(workspace, &basis.parent_thread, &descriptor.manifest_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("accepted import manifest is not ready"))?;
+    ensure!(
+        ordinal < import_count,
+        "accepted import ordinal is outside the manifest"
+    );
+    let ordinal = i64::try_from(ordinal)?;
+    let proof_json =
+        compaction_frozen_import::Entity::find_by_id((descriptor.manifest_id.clone(), ordinal))
+            .select_only()
+            .column(compaction_frozen_import::Column::ProofJson)
+            .filter(compaction_frozen_import::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
+            .into_tuple::<String>()
+            .one(&store.connection)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
+    let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
+    let prepared = PreparedFrozenImport {
+        workspace: workspace.into(),
+        destination: destination.into(),
+        output_digest: String::new(),
+        original_json: String::new(),
+        record,
+        accepted_basis: Some(AcceptedImportBasis {
+            turn: turn.into(),
+            history_json: basis.history_json,
+            manifest: descriptor.manifest_id,
+            digest: descriptor.identity_sha256,
+            imports_digest,
+            import_count,
+            ordinal,
+            proof_json,
+        }),
+    };
+    ensure!(
+        accepted_import_current(&store.connection, &prepared).await?,
+        "accepted import binding changed"
+    );
+    Ok(prepared)
+}
+
+async fn accepted_import_current<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedFrozenImport,
+) -> Result<bool> {
+    let basis = prepared
+        .accepted_basis
+        .as_ref()
+        .expect("accepted import proof");
+    Ok(db.query_one_raw(sqlite_specific_sql(
+        "SELECT 1 FROM task_run_turn execution \
+         JOIN task_run_conversation_snapshot snapshot ON snapshot.run_id=execution.run_id AND snapshot.task_id=execution.task_id \
+         JOIN thread_lineage lineage ON lineage.child_thread_id=execution.thread_id AND lineage.parent_thread_id=snapshot.conversation_thread_id \
+         JOIN thread child ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id \
+         JOIN compaction_frozen_history h ON h.id=? AND h.owner_thread=snapshot.conversation_thread_id AND h.workspace_id=snapshot.workspace_id \
+         JOIN compaction_frozen_import i ON i.manifest_id=h.id AND i.ordinal=? \
+         JOIN compaction_live_sources s ON s.workspace_id=h.workspace_id AND s.thread_id=i.source_thread AND s.source_scope=i.source_scope AND s.source_id=i.source_id AND s.source_version=i.source_version \
+         WHERE execution.thread_id=? AND execution.turn_id=? AND snapshot.workspace_id=? AND snapshot.history_json=? \
+         AND h.ready=1 AND h.identity_sha256=? AND h.next_import=h.import_count AND i.proof_json=? AND h.imports_sha256=? AND h.import_count=? LIMIT 1",
+        [basis.manifest.clone().into(), basis.ordinal.into(), prepared.destination.clone().into(),
+         basis.turn.clone().into(), prepared.workspace.clone().into(), basis.history_json.clone().into(),
+         basis.digest.clone().into(), basis.proof_json.clone().into(), basis.imports_digest.clone().into(), i64::try_from(basis.import_count)?.into()],
+    )).await?.is_some())
 }
 
 pub(crate) async fn compaction_append_frozen_imports(
@@ -314,7 +416,7 @@ pub(crate) async fn compaction_append_frozen_imports(
         );
         let record = prepared.record_at(*message);
         let json = serde_json::to_string(&record)?;
-        bytes += target_json.len() + prepared.original_json.len() + json.len();
+        bytes += prepared.estimated_write_bytes(&target)?;
         ensure!(
             bytes <= FROZEN_IMPORT_PAGE_BYTES && json.len() <= SOURCE_PAGE_BYTES,
             "import batch byte limit"
@@ -353,300 +455,329 @@ pub(crate) async fn compaction_append_frozen_imports(
         if !ready && *ordinal >= next {
             // The existing transaction holds the validated dependency snapshot
             // through insertion; exact retries below retain their prior behavior.
-            if compaction_frozen_history::Entity::find()
-                .select_only()
-                .join_as(
-                    JoinType::InnerJoin,
-                    compaction_frozen_history::Entity::belongs_to(
-                        compaction_frozen_message::Entity,
+            let forwarded = if prepared.accepted_basis.is_some() {
+                accepted_import_current(&tx, prepared).await?
+                    && compaction_frozen_message::Entity::find_by_id((
+                        manifest.to_owned(),
+                        i64::try_from(record.message_ordinal)?,
+                    ))
+                    .filter(
+                        compaction_frozen_message::Column::ReferenceJson.eq(target_json.clone()),
                     )
-                    .from(compaction_frozen_history::Column::Id)
-                    .to(compaction_frozen_message::Column::ManifestId)
-                    .into(),
-                    Alias::new("target"),
-                )
-                .join(
-                    JoinType::InnerJoin,
-                    compaction_frozen_history::Entity::belongs_to(task_delivery::Entity)
-                        .from(compaction_frozen_history::Column::WorkspaceId)
-                        .to(task_delivery::Column::WorkspaceId)
-                        .into(),
-                )
-                .join(
-                    JoinType::InnerJoin,
-                    task_delivery::Entity::belongs_to(compaction_delivery_output::Entity)
-                        .from(task_delivery::Column::Id)
-                        .to(compaction_delivery_output::Column::DeliveryId)
-                        .into(),
-                )
-                .join(
-                    JoinType::InnerJoin,
-                    compaction_delivery_output::Entity::belongs_to(compaction_task_output::Entity)
-                        .from(compaction_delivery_output::Column::TaskRunTurnId)
-                        .to(compaction_task_output::Column::TaskRunTurnId)
-                        .into(),
-                )
-                .join_as(
-                    JoinType::InnerJoin,
-                    compaction_task_output::Entity::belongs_to(compaction_frozen_history::Entity)
-                        .from(compaction_task_output::Column::ManifestId)
-                        .to(compaction_frozen_history::Column::Id)
-                        .into(),
-                    Alias::new("original"),
-                )
-                .join_as(
-                    JoinType::InnerJoin,
-                    sea_orm::RelationDef::from(
-                        compaction_frozen_history::Entity::belongs_to(
-                            compaction_frozen_message::Entity,
-                        )
-                        .from(compaction_frozen_history::Column::Id)
-                        .to(compaction_frozen_message::Column::ManifestId),
-                    )
-                    .from_alias(Alias::new("original")),
-                    Alias::new("origin"),
-                )
-                .join(
-                    JoinType::InnerJoin,
-                    task_delivery::Entity::belongs_to(turn_event::Entity)
-                        .from(task_delivery::Column::TargetThreadId)
-                        .to(turn_event::Column::ThreadId)
-                        .into(),
-                )
-                .join(
-                    JoinType::InnerJoin,
-                    turn_event::Entity::belongs_to(compaction_event_revision::Entity)
-                        .from(turn_event::Column::Id)
-                        .to(compaction_event_revision::Column::SourceId)
-                        .into(),
-                )
-                .join(
-                    JoinType::InnerJoin,
-                    compaction_live_sources::join(
-                        compaction_frozen_history::Entity,
-                        compaction_frozen_history::Column::WorkspaceId,
-                        compaction_live_sources::Column::WorkspaceId,
-                    ),
-                )
-                .filter(
-                    Expr::col(("target", compaction_frozen_message::Column::Ordinal))
-                        .eq(Expr::Value(i64::try_from(record.message_ordinal)?.into())),
-                )
-                .filter(
-                    Expr::col(("target", compaction_frozen_message::Column::ReferenceJson))
-                        .eq(Expr::Value(target_json.clone().into())),
-                )
-                .filter(
-                    Expr::col((task_delivery::Entity, task_delivery::Column::Id))
-                        .eq(Expr::Value(record.delivery_id.clone().into())),
-                )
-                .filter(
-                    Expr::col((task_delivery::Entity, task_delivery::Column::TargetThreadId)).eq(
-                        Expr::col((
-                            compaction_frozen_history::Entity,
-                            compaction_frozen_history::Column::OwnerThread,
-                        )),
-                    ),
-                )
-                .filter(
-                    Expr::col((task_delivery::Entity, task_delivery::Column::Status))
-                        .eq(Expr::val("delivered")),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_delivery_output::Entity,
-                        compaction_delivery_output::Column::CandidateId,
-                    ))
-                    .eq(Expr::Value(record.candidate_id.clone().into())),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_task_output::Entity,
-                        compaction_task_output::Column::TaskId,
-                    ))
-                    .eq(Expr::col((
-                        task_delivery::Entity,
-                        task_delivery::Column::TaskId,
-                    ))),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_task_output::Entity,
-                        compaction_task_output::Column::RunId,
-                    ))
-                    .eq(Expr::col((
-                        task_delivery::Entity,
-                        task_delivery::Column::RunId,
-                    ))),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_task_output::Entity,
-                        compaction_task_output::Column::WorkspaceId,
-                    ))
-                    .eq(Expr::col((
-                        task_delivery::Entity,
-                        task_delivery::Column::WorkspaceId,
-                    ))),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_task_output::Entity,
-                        compaction_task_output::Column::ManifestId,
-                    ))
-                    .eq(Expr::Value(record.output_manifest.clone().into())),
-                )
-                .filter(
-                    Expr::col(("original", compaction_frozen_history::Column::Ready))
-                        .eq(Expr::val(1_i64)),
-                )
-                .filter(
-                    Expr::col((
-                        "original",
-                        compaction_frozen_history::Column::IdentitySha256,
-                    ))
-                    .eq(Expr::Value(prepared.output_digest.clone().into())),
-                )
-                .filter(
-                    Expr::col(("origin", compaction_frozen_message::Column::Ordinal))
-                        .eq(Expr::Value(i64::try_from(record.output_ordinal)?.into())),
-                )
-                .filter(
-                    Expr::col(("origin", compaction_frozen_message::Column::ReferenceJson))
-                        .eq(Expr::Value(prepared.original_json.clone().into())),
-                )
-                .filter(
-                    Expr::col((turn_event::Entity, turn_event::Column::Id))
-                        .eq(Expr::Value(record.acknowledgement.id.clone().into())),
-                )
-                .filter(
-                    Expr::col((turn_event::Entity, turn_event::Column::TurnId)).eq(Expr::col((
-                        task_delivery::Entity,
-                        task_delivery::Column::DeliveredTurnId,
-                    ))),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_event_revision::Entity,
-                        compaction_event_revision::Column::TurnId,
-                    ))
-                    .eq(Expr::col((turn_event::Entity, turn_event::Column::TurnId))),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_event_revision::Entity,
-                        compaction_event_revision::Column::Present,
-                    ))
-                    .eq(Expr::val(1_i64)),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_event_revision::Entity,
-                        compaction_event_revision::Column::ProjectionRevision,
-                    ))
-                    .eq(Expr::col((
-                        compaction_event_revision::Entity,
-                        compaction_event_revision::Column::Revision,
-                    ))),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceScope,
-                    ))
-                    .eq(Expr::Value(record.source.scope.clone().into())),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceId,
-                    ))
-                    .eq(Expr::Value(record.source.id.clone().into())),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceVersion,
-                    ))
-                    .eq(Expr::Value(record.source.version.clone().into())),
-                )
-                .filter(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::ThreadId,
-                    ))
-                    .eq(Expr::Value(record.source_thread.clone().into())),
-                )
-                .expr(Expr::col((
-                    compaction_frozen_history::Entity,
-                    compaction_frozen_history::Column::Id,
-                )))
-                .filter(
-                    Expr::col((
-                        compaction_frozen_history::Entity,
-                        compaction_frozen_history::Column::Id,
-                    ))
-                    .eq(Expr::Value(manifest.into()))
-                    .and(
-                        Expr::col((
-                            compaction_frozen_history::Entity,
-                            compaction_frozen_history::Column::WorkspaceId,
-                        ))
-                        .eq(Expr::Value(workspace.into())),
-                    )
-                    .and(
-                        Expr::col((
-                            compaction_frozen_history::Entity,
-                            compaction_frozen_history::Column::OwnerThread,
-                        ))
-                        .eq(Expr::Value(owner.into())),
-                    )
-                    .and(
-                        Expr::col((
-                            compaction_frozen_history::Entity,
-                            compaction_frozen_history::Column::Ready,
-                        ))
-                        .eq(Expr::val(0_i64)),
-                    )
-                    .and(
-                        Expr::val("event:")
-                            .binary(
-                                BinOper::Custom("||"),
-                                Expr::col((turn_event::Entity, turn_event::Column::TurnId)),
+                    .one(&tx)
+                    .await?
+                    .is_some()
+            } else {
+                false
+            };
+            if forwarded
+                || (prepared.accepted_basis.is_none()
+                    && compaction_frozen_history::Entity::find()
+                        .select_only()
+                        .join_as(
+                            JoinType::InnerJoin,
+                            compaction_frozen_history::Entity::belongs_to(
+                                compaction_frozen_message::Entity,
                             )
-                            .eq(Expr::Value(record.acknowledgement.scope.clone().into())),
-                    )
-                    .and(
-                        Expr::val("event-revision:")
-                            .binary(
-                                BinOper::Custom("||"),
+                            .from(compaction_frozen_history::Column::Id)
+                            .to(compaction_frozen_message::Column::ManifestId)
+                            .into(),
+                            Alias::new("target"),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            compaction_frozen_history::Entity::belongs_to(task_delivery::Entity)
+                                .from(compaction_frozen_history::Column::WorkspaceId)
+                                .to(task_delivery::Column::WorkspaceId)
+                                .into(),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            task_delivery::Entity::belongs_to(compaction_delivery_output::Entity)
+                                .from(task_delivery::Column::Id)
+                                .to(compaction_delivery_output::Column::DeliveryId)
+                                .into(),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            compaction_delivery_output::Entity::belongs_to(
+                                compaction_task_output::Entity,
+                            )
+                            .from(compaction_delivery_output::Column::TaskRunTurnId)
+                            .to(compaction_task_output::Column::TaskRunTurnId)
+                            .into(),
+                        )
+                        .join_as(
+                            JoinType::InnerJoin,
+                            compaction_task_output::Entity::belongs_to(
+                                compaction_frozen_history::Entity,
+                            )
+                            .from(compaction_task_output::Column::ManifestId)
+                            .to(compaction_frozen_history::Column::Id)
+                            .into(),
+                            Alias::new("original"),
+                        )
+                        .join_as(
+                            JoinType::InnerJoin,
+                            sea_orm::RelationDef::from(
+                                compaction_frozen_history::Entity::belongs_to(
+                                    compaction_frozen_message::Entity,
+                                )
+                                .from(compaction_frozen_history::Column::Id)
+                                .to(compaction_frozen_message::Column::ManifestId),
+                            )
+                            .from_alias(Alias::new("original")),
+                            Alias::new("origin"),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            task_delivery::Entity::belongs_to(turn_event::Entity)
+                                .from(task_delivery::Column::TargetThreadId)
+                                .to(turn_event::Column::ThreadId)
+                                .into(),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            turn_event::Entity::belongs_to(compaction_event_revision::Entity)
+                                .from(turn_event::Column::Id)
+                                .to(compaction_event_revision::Column::SourceId)
+                                .into(),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            compaction_live_sources::join(
+                                compaction_frozen_history::Entity,
+                                compaction_frozen_history::Column::WorkspaceId,
+                                compaction_live_sources::Column::WorkspaceId,
+                            ),
+                        )
+                        .filter(
+                            Expr::col(("target", compaction_frozen_message::Column::Ordinal))
+                                .eq(Expr::Value(i64::try_from(record.message_ordinal)?.into())),
+                        )
+                        .filter(
+                            Expr::col(("target", compaction_frozen_message::Column::ReferenceJson))
+                                .eq(Expr::Value(target_json.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((task_delivery::Entity, task_delivery::Column::Id))
+                                .eq(Expr::Value(record.delivery_id.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((
+                                task_delivery::Entity,
+                                task_delivery::Column::TargetThreadId,
+                            ))
+                            .eq(Expr::col((
+                                compaction_frozen_history::Entity,
+                                compaction_frozen_history::Column::OwnerThread,
+                            ))),
+                        )
+                        .filter(
+                            Expr::col((task_delivery::Entity, task_delivery::Column::Status))
+                                .eq(Expr::val("delivered")),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_delivery_output::Entity,
+                                compaction_delivery_output::Column::CandidateId,
+                            ))
+                            .eq(Expr::Value(record.candidate_id.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_task_output::Entity,
+                                compaction_task_output::Column::TaskId,
+                            ))
+                            .eq(Expr::col((
+                                task_delivery::Entity,
+                                task_delivery::Column::TaskId,
+                            ))),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_task_output::Entity,
+                                compaction_task_output::Column::RunId,
+                            ))
+                            .eq(Expr::col((
+                                task_delivery::Entity,
+                                task_delivery::Column::RunId,
+                            ))),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_task_output::Entity,
+                                compaction_task_output::Column::WorkspaceId,
+                            ))
+                            .eq(Expr::col((
+                                task_delivery::Entity,
+                                task_delivery::Column::WorkspaceId,
+                            ))),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_task_output::Entity,
+                                compaction_task_output::Column::ManifestId,
+                            ))
+                            .eq(Expr::Value(record.output_manifest.clone().into())),
+                        )
+                        .filter(
+                            Expr::col(("original", compaction_frozen_history::Column::Ready))
+                                .eq(Expr::val(1_i64)),
+                        )
+                        .filter(
+                            Expr::col((
+                                "original",
+                                compaction_frozen_history::Column::IdentitySha256,
+                            ))
+                            .eq(Expr::Value(prepared.output_digest.clone().into())),
+                        )
+                        .filter(
+                            Expr::col(("origin", compaction_frozen_message::Column::Ordinal))
+                                .eq(Expr::Value(i64::try_from(record.output_ordinal)?.into())),
+                        )
+                        .filter(
+                            Expr::col(("origin", compaction_frozen_message::Column::ReferenceJson))
+                                .eq(Expr::Value(prepared.original_json.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((turn_event::Entity, turn_event::Column::Id))
+                                .eq(Expr::Value(record.acknowledgement.id.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((turn_event::Entity, turn_event::Column::TurnId)).eq(
+                                Expr::col((
+                                    task_delivery::Entity,
+                                    task_delivery::Column::DeliveredTurnId,
+                                )),
+                            ),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_event_revision::Entity,
+                                compaction_event_revision::Column::TurnId,
+                            ))
+                            .eq(Expr::col((turn_event::Entity, turn_event::Column::TurnId))),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_event_revision::Entity,
+                                compaction_event_revision::Column::Present,
+                            ))
+                            .eq(Expr::val(1_i64)),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_event_revision::Entity,
+                                compaction_event_revision::Column::ProjectionRevision,
+                            ))
+                            .eq(Expr::col((
+                                compaction_event_revision::Entity,
+                                compaction_event_revision::Column::Revision,
+                            ))),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_live_sources::Column::Table,
+                                compaction_live_sources::Column::SourceScope,
+                            ))
+                            .eq(Expr::Value(record.source.scope.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_live_sources::Column::Table,
+                                compaction_live_sources::Column::SourceId,
+                            ))
+                            .eq(Expr::Value(record.source.id.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_live_sources::Column::Table,
+                                compaction_live_sources::Column::SourceVersion,
+                            ))
+                            .eq(Expr::Value(record.source.version.clone().into())),
+                        )
+                        .filter(
+                            Expr::col((
+                                compaction_live_sources::Column::Table,
+                                compaction_live_sources::Column::ThreadId,
+                            ))
+                            .eq(Expr::Value(record.source_thread.clone().into())),
+                        )
+                        .expr(Expr::col((
+                            compaction_frozen_history::Entity,
+                            compaction_frozen_history::Column::Id,
+                        )))
+                        .filter(
+                            Expr::col((
+                                compaction_frozen_history::Entity,
+                                compaction_frozen_history::Column::Id,
+                            ))
+                            .eq(Expr::Value(manifest.into()))
+                            .and(
+                                Expr::col((
+                                    compaction_frozen_history::Entity,
+                                    compaction_frozen_history::Column::WorkspaceId,
+                                ))
+                                .eq(Expr::Value(workspace.into())),
+                            )
+                            .and(
+                                Expr::col((
+                                    compaction_frozen_history::Entity,
+                                    compaction_frozen_history::Column::OwnerThread,
+                                ))
+                                .eq(Expr::Value(owner.into())),
+                            )
+                            .and(
+                                Expr::col((
+                                    compaction_frozen_history::Entity,
+                                    compaction_frozen_history::Column::Ready,
+                                ))
+                                .eq(Expr::val(0_i64)),
+                            )
+                            .and(
+                                Expr::val("event:")
+                                    .binary(
+                                        BinOper::Custom("||"),
+                                        Expr::col((turn_event::Entity, turn_event::Column::TurnId)),
+                                    )
+                                    .eq(Expr::Value(record.acknowledgement.scope.clone().into())),
+                            )
+                            .and(
+                                Expr::val("event-revision:")
+                                    .binary(
+                                        BinOper::Custom("||"),
+                                        Expr::col((
+                                            compaction_event_revision::Entity,
+                                            compaction_event_revision::Column::Revision,
+                                        )),
+                                    )
+                                    .eq(Expr::Value(record.acknowledgement.version.clone().into())),
+                            )
+                            .and(
+                                Expr::col((turn_event::Entity, turn_event::Column::EventType)).eq(
+                                    Expr::Value(
+                                        pioneer_protocol::constants::events::ITEM_COMPLETED.into(),
+                                    ),
+                                ),
+                            )
+                            .and(
                                 Expr::col((
                                     compaction_event_revision::Entity,
-                                    compaction_event_revision::Column::Revision,
+                                    compaction_event_revision::Column::ItemId,
+                                ))
+                                .eq(Expr::Value(
+                                    pioneer_protocol::task_delivery_result_item_id(
+                                        &record.delivery_id,
+                                    )
+                                    .into(),
                                 )),
-                            )
-                            .eq(Expr::Value(record.acknowledgement.version.clone().into())),
-                    )
-                    .and(
-                        Expr::col((turn_event::Entity, turn_event::Column::EventType)).eq(
-                            Expr::Value(pioneer_protocol::constants::events::ITEM_COMPLETED.into()),
-                        ),
-                    )
-                    .and(
-                        Expr::col((
-                            compaction_event_revision::Entity,
-                            compaction_event_revision::Column::ItemId,
-                        ))
-                        .eq(Expr::Value(
-                            pioneer_protocol::task_delivery_result_item_id(&record.delivery_id)
-                                .into(),
-                        )),
-                    ),
-                )
-                .into_tuple::<String>()
-                .one(&tx)
-                .await?
-                .is_some()
+                            ),
+                        )
+                        .into_tuple::<String>()
+                        .one(&tx)
+                        .await?
+                        .is_some())
             {
                 let source =
                     super::compaction_frozen_storage::append_source(&tx, manifest, 1, *ordinal)
