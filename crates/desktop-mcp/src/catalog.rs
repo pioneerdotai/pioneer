@@ -224,13 +224,6 @@ impl McpCatalogView {
     pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.window_active != active {
             self.window_active = active;
-            if !active {
-                self.parent_generation = self
-                    .parent_generation
-                    .checked_add(1)
-                    .expect("catalog lifetime exhausted");
-                self.native_task = None;
-            }
             self.sync_demand();
             cx.notify();
         }
@@ -513,7 +506,7 @@ mod tests {
         drop(subscriptions);
     }
     #[gpui_kit::test]
-    fn two_windows_aggregate_demand_and_warm_roots_release_it(cx: &mut TestAppContext) {
+    fn two_windows_aggregate_demand_without_cancelling_native_work(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let client = pioneer_client::catalog_test_support::client();
         client.navigate(
@@ -559,8 +552,19 @@ mod tests {
             }
         });
         assert_eq!(client.mcp_demand_count_for_test("workspace"), 2);
-        cx.update(|_, cx| first.update(cx, |view, cx| view.set_window_active(false, cx)));
+        let generation = first.read_with(cx, |view, _| view.parent_generation);
+        cx.update(|_, cx| {
+            first.update(cx, |view, cx| {
+                view.native_task = Some(gpui_kit::Task::ready(()));
+                view.set_window_active(false, cx);
+            })
+        });
         assert_eq!(client.mcp_demand_count_for_test("workspace"), 1);
+        assert_eq!(
+            first.read_with(cx, |view, _| view.parent_generation),
+            generation
+        );
+        assert!(first.read_with(cx, |view, _| view.native_task.is_some()));
         cx.update(|_, cx| second.update(cx, |view, cx| view.set_window_active(false, cx)));
         assert_eq!(client.mcp_demand_count_for_test("workspace"), 0);
         cx.update(|_, cx| first.update(cx, |view, cx| view.set_window_active(true, cx)));
@@ -574,6 +578,8 @@ mod tests {
         cx.update(|window, cx| first.update(cx, |view, cx| view.sync_publications(window, cx)));
         assert_eq!(client.mcp_demand_count_for_test("workspace"), 0);
         assert_eq!(first.read_with(cx, |view, _| view.demand.is_none()), true);
+        assert!(first.read_with(cx, |view, _| view.native_task.is_none()));
+        assert!(first.read_with(cx, |view, _| view.parent_generation) > generation);
     }
     #[gpui_kit::test]
     fn cached_detail_failure_notifies_the_visible_detail(cx: &mut TestAppContext) {
