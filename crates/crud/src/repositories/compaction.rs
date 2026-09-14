@@ -11,8 +11,8 @@ use crate::CrudStore;
 use anyhow::{Result, ensure};
 pub use background::{CompactionLifecycleRecovery, CompletedHistoryCheck};
 pub use frozen_import::{
-    EMPTY_FROZEN_IMPORT_SHA256, FROZEN_IMPORT_PAGE_BYTES, FrozenImportRecord, PreparedFrozenImport,
-    frozen_import_identity,
+    EMPTY_FROZEN_IMPORT_SHA256, FROZEN_IMPORT_PAGE_BYTES, FrozenImportRecord,
+    PreparedAcceptedImports, PreparedFrozenImport, frozen_import_identity,
 };
 pub use history::{
     AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
@@ -50,9 +50,9 @@ pub const SOURCE_PAGE_ROWS: u64 = 128;
 pub const SOURCE_PAGE_BYTES: usize = 256 * 1024;
 pub const CHECKPOINT_SOURCE_LIMIT: usize = 256;
 
-// Kept only for correlated SQLite json_each snapshot validation and the two
-// MATERIALIZED event quanta. These queries preserve one atomic validation or a
-// physical scan boundary; ordinary reads/writes use Entity/ActiveModel.
+// SQLite-specific correlated snapshot validation and bounded source quanta.
+// These queries preserve one atomic validation or an indexed scan boundary;
+// ordinary reads/writes use Entity/ActiveModel.
 pub(super) fn sqlite_specific_sql(
     statement: &str,
     values: impl IntoIterator<Item = Value>,
@@ -2556,3 +2556,12 @@ struct MatchedSourceCount {
 }
 
 pub use super::compaction_check_result::{HistoryCheckDiagnostic, HistoryCheckOutcome};
+
+/// Bounded metadata validation used when a request reuses a rendered projection.
+pub(crate) async fn compaction_references_current<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    references: &[(String, SourceRef)],
+) -> Result<bool> {
+    super::compaction_live_sources::references_current(db, workspace, references).await
+}

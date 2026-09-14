@@ -2883,10 +2883,30 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     // Production path: the accepted parent basis is recaptured by the child.
     // Ownership evidence must survive that capture and authorize final commit.
     let maintenance = store.with_maintenance_access();
-    let forwarded = maintenance
-        .compaction_prepare_accepted_import("ws", "context-c", "turn-c", 0)
+    let prepared_basis = maintenance
+        .compaction_prepare_accepted_imports("ws", "context-c", "turn-c")
         .await
         .unwrap();
+    assert_eq!(prepared_basis.len(), 1);
+    let mut page = maintenance
+        .compaction_prepare_accepted_import_page(&prepared_basis, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert!(
+        maintenance
+            .compaction_prepare_accepted_import_page(&prepared_basis, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        maintenance
+            .compaction_prepare_accepted_import_page(&prepared_basis, 2)
+            .await
+            .is_err()
+    );
+    let forwarded = page.remove(0);
     assert!(
         maintenance
             .compaction_prepare_accepted_import("ws", "child", "turn-c", 0)
@@ -2921,6 +2941,64 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         )
         .await
         .unwrap();
+    // Cross the production page boundary with real immutable import records.
+    let many_refs = vec![child_target.clone(); 129];
+    let many = descriptor("recaptured-many", &many_refs);
+    let many_imports = (0..129)
+        .map(|ordinal| (ordinal, forwarded_imports[0].1.clone()))
+        .collect::<Vec<_>>();
+    let many_digest = pioneer_crud::compaction::frozen_import_identity(&many_imports).unwrap();
+    maintenance
+        .compaction_begin_frozen_history_with_imports("ws", "context-c", &many, 129, &many_digest)
+        .await
+        .unwrap();
+    for start in [0, 128] {
+        let end = (start + 128).min(129);
+        maintenance
+            .compaction_append_frozen_history(
+                "ws",
+                "context-c",
+                &many.manifest_id,
+                start as u64,
+                &many_refs[start..end],
+            )
+            .await
+            .unwrap();
+        maintenance
+            .compaction_append_frozen_imports(
+                "ws",
+                "context-c",
+                &many.manifest_id,
+                start as u64,
+                &many_imports[start..end],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &many)
+            .await
+            .unwrap()
+    );
+    // This fixture's receiver is context-c, whose accepted parent remains thread.
+    // Verify page boundaries through the public immutable metadata reader.
+    assert_eq!(
+        maintenance
+            .compaction_frozen_import_page("ws", "context-c", &many.manifest_id, 0)
+            .await
+            .unwrap()
+            .len(),
+        128
+    );
+    assert_eq!(
+        maintenance
+            .compaction_frozen_import_page("ws", "context-c", &many.manifest_id, 128)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     db.execute_unprepared(
         "UPDATE task_run_conversation_snapshot SET history_json='[]' WHERE run_id='run-c'",
     )
@@ -2949,6 +3027,41 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run-c'",
         [serde_json::to_string(&context).unwrap().into()],
     ))
+    .await
+    .unwrap();
+    // Fault injection after preparation: the grant cannot cache source liveness.
+    db.execute_unprepared(
+        "UPDATE compaction_event_revision SET present=0 WHERE source_id='child-source'",
+    )
+    .await
+    .unwrap();
+    assert!(
+        maintenance
+            .compaction_prepare_accepted_import_page(&prepared_basis, 0)
+            .await
+            .is_err()
+    );
+    assert!(
+        maintenance
+            .compaction_append_frozen_imports(
+                "ws",
+                "context-c",
+                &child_context.manifest_id,
+                0,
+                &forwarded_imports
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &child_context)
+            .await
+            .unwrap()
+    );
+    db.execute_unprepared(
+        "UPDATE compaction_event_revision SET present=1 WHERE source_id='child-source'",
+    )
     .await
     .unwrap();
     db.execute_unprepared("CREATE TEMP TRIGGER abort_forwarded_import AFTER INSERT ON compaction_frozen_import_data BEGIN SELECT RAISE(ABORT,'fixture forward rollback'); END").await.unwrap();
@@ -4873,5 +4986,112 @@ async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress()
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn batched_source_validation_matches_live_view_and_rejects_stale_scopes() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let store = store().await;
+    let db = store.database_connection();
+    source(&store, "event", 1, "original").await;
+    for sql in [
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('input','turn',0,'text','original','{}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('item','turn','item','command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('context','turn',1,'tool_result_v2','{}','{}',CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run','task','ws','thread','[]',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let rows = db.query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT source_scope,source_id,source_version,thread_id FROM compaction_live_sources WHERE workspace_id='ws' LIMIT 128")).await.unwrap();
+    let references = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "thread_id").unwrap(),
+                SourceRef {
+                    scope: row.try_get("", "source_scope").unwrap(),
+                    id: row.try_get("", "source_id").unwrap(),
+                    version: row.try_get("", "source_version").unwrap(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(references.len(), 5);
+    for compressed in [false, true] {
+        if compressed {
+            for table in ["turn_input", "turn_item", "turn_event", "turn_llm_context"] {
+                let config = serde_json::json!({"table":table,"column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"});
+                db.query_one_write_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT zstd_enable_transparent(?)",
+                    [config.to_string().into()],
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        assert!(
+            store
+                .compaction_references_current("ws", &references)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compaction_references_current("other", &references)
+                .await
+                .unwrap()
+        );
+        for index in 0..references.len() {
+            for field in 0..4 {
+                let mut invalid = references.clone();
+                match field {
+                    0 => invalid[index].0 = "foreign".into(),
+                    1 => invalid[index].1.scope.push_str("-invalid"),
+                    2 => invalid[index].1.id.push_str("-missing"),
+                    _ => invalid[index].1.version.push_str("-stale"),
+                }
+                assert!(
+                    !store
+                        .compaction_references_current("ws", &invalid)
+                        .await
+                        .unwrap(),
+                    "one invalid source must reject the entire page"
+                );
+            }
+        }
+    }
+    assert!(
+        store
+            .compaction_references_current("ws", &vec![references[0].clone(); 128])
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_references_current("ws", &vec![references[0].clone(); 129])
+            .await
+            .is_err()
+    );
+    let mut oversized = references[0].clone();
+    oversized.1.id = "x".repeat(SOURCE_PAGE_BYTES);
+    assert!(
+        store
+            .compaction_references_current("ws", &[oversized])
+            .await
+            .is_err()
+    );
+    db.execute_unprepared("UPDATE turn_input SET payload='changed' WHERE id='input'")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_references_current("ws", &references)
+            .await
+            .unwrap()
     );
 }

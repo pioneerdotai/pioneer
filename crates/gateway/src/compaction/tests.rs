@@ -319,6 +319,20 @@ async fn compaction_runner_portions_cover_huge_source_once_and_reuse_committed_r
         .await
         .unwrap()
         .unwrap();
+    assert!(
+        f.store
+            .compaction_references_current("ws", &[("thread".into(), reference.clone())])
+            .await
+            .unwrap()
+    );
+    let mut stale_reference = reference.clone();
+    stale_reference.version.push_str("-stale");
+    assert!(
+        !f.store
+            .compaction_references_current("ws", &[("thread".into(), stale_reference)])
+            .await
+            .unwrap()
+    );
     let leaves = super::coverage::checkpoint_leaves(
         &f.store,
         "ws",

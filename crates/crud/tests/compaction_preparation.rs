@@ -388,6 +388,30 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         );
     }
     let held = database.begin().await.unwrap();
+    // The new metadata-only batch must use the scoped physical reader, even
+    // while the serialized writer is occupied by unrelated work. Only the
+    // first input page is prepared here; legacy event revisions are not yet live.
+    for scoped in [store.clone(), CrudStore::new(database.clone())] {
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                scoped.compaction_references_current(
+                    "ws",
+                    &[(
+                        "thread".into(),
+                        pioneer_compaction::SourceRef {
+                            scope: "input:turn".into(),
+                            id: "input-0".into(),
+                            version: "input-revision:1".into()
+                        }
+                    )]
+                )
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        );
+    }
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),

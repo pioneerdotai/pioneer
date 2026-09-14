@@ -16,6 +16,7 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub const EMPTY_FROZEN_IMPORT_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -46,14 +47,31 @@ pub struct PreparedFrozenImport {
     accepted_basis: Option<AcceptedImportBasis>,
 }
 
-#[derive(Clone, Debug)]
-struct AcceptedImportBasis {
+/// Request-local accepted snapshot metadata. Private fields bind every page to
+/// the same TaskRun; publication revalidates it in the writer transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedAcceptedImports {
+    workspace: String,
+    destination: String,
+    parent: String,
     turn: String,
     history_json: String,
     manifest: String,
     digest: String,
     imports_digest: String,
     import_count: u64,
+}
+impl PreparedAcceptedImports {
+    pub fn len(&self) -> u64 {
+        self.import_count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.import_count == 0
+    }
+}
+#[derive(Clone, Debug)]
+struct AcceptedImportBasis {
+    snapshot: Arc<PreparedAcceptedImports>,
     ordinal: i64,
     proof_json: String,
 }
@@ -69,7 +87,7 @@ impl PreparedFrozenImport {
             + self
                 .accepted_basis
                 .as_ref()
-                .map_or(0, |b| b.history_json.len() + b.proof_json.len())
+                .map_or(0, |b| b.snapshot.history_json.len() + b.proof_json.len())
             + serde_json::to_vec(&self.record)?.len()
             + serde_json::to_vec(target)?.len()
             + 64)
@@ -287,13 +305,12 @@ pub(crate) async fn compaction_prepare_frozen_import(
 /// Preparation reads immutable reference/import metadata outside the writer.
 /// Publication revalidates the TaskRun binding, ready digest, exact proof, target
 /// reference and live source in the same transaction as the bounded import batch.
-pub(crate) async fn compaction_prepare_accepted_import(
+pub(crate) async fn compaction_prepare_accepted_imports(
     store: &CrudStore,
     workspace: &str,
     destination: &str,
     turn: &str,
-    ordinal: u64,
-) -> Result<PreparedFrozenImport> {
+) -> Result<Arc<PreparedAcceptedImports>> {
     let basis = store
         .compaction_task_basis_snapshot(workspace, destination, turn)
         .await?
@@ -304,67 +321,141 @@ pub(crate) async fn compaction_prepare_accepted_import(
         .compaction_frozen_import_state(workspace, &basis.parent_thread, &descriptor.manifest_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("accepted import manifest is not ready"))?;
-    ensure!(
-        ordinal < import_count,
-        "accepted import ordinal is outside the manifest"
-    );
-    let ordinal = i64::try_from(ordinal)?;
-    let proof_json =
-        compaction_frozen_import::Entity::find_by_id((descriptor.manifest_id.clone(), ordinal))
-            .select_only()
-            .column(compaction_frozen_import::Column::ProofJson)
-            .filter(compaction_frozen_import::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
-            .into_tuple::<String>()
-            .one(&store.connection)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
-    let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
-    let prepared = PreparedFrozenImport {
+    Ok(Arc::new(PreparedAcceptedImports {
         workspace: workspace.into(),
         destination: destination.into(),
-        output_digest: String::new(),
-        original_json: String::new(),
-        record,
-        accepted_basis: Some(AcceptedImportBasis {
-            turn: turn.into(),
-            history_json: basis.history_json,
-            manifest: descriptor.manifest_id,
-            digest: descriptor.identity_sha256,
-            imports_digest,
-            import_count,
-            ordinal,
-            proof_json,
-        }),
-    };
+        parent: basis.parent_thread,
+        turn: turn.into(),
+        history_json: basis.history_json,
+        manifest: descriptor.manifest_id,
+        digest: descriptor.identity_sha256,
+        imports_digest,
+        import_count,
+    }))
+}
+
+pub(crate) async fn compaction_prepare_accepted_import_page(
+    store: &CrudStore,
+    snapshot: &Arc<PreparedAcceptedImports>,
+    start: u64,
+) -> Result<Vec<PreparedFrozenImport>> {
     ensure!(
-        accepted_import_current(&store.connection, &prepared).await?,
+        start <= snapshot.import_count,
+        "accepted import ordinal is outside the manifest"
+    );
+    if start == snapshot.import_count {
+        return Ok(Vec::new());
+    }
+    let rows = frozen_import_json_page(
+        &store.connection,
+        &snapshot.workspace,
+        &snapshot.parent,
+        &snapshot.manifest,
+        start,
+    )
+    .await?;
+    ensure!(
+        !rows.is_empty() && start + rows.len() as u64 <= snapshot.import_count,
+        "accepted import page is incomplete"
+    );
+    let prepared = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, proof_json)| {
+            Ok(PreparedFrozenImport {
+                workspace: snapshot.workspace.clone(),
+                destination: snapshot.destination.clone(),
+                output_digest: String::new(),
+                original_json: String::new(),
+                record: serde_json::from_str(&proof_json)?,
+                accepted_basis: Some(AcceptedImportBasis {
+                    snapshot: Arc::clone(snapshot),
+                    ordinal: i64::try_from(start + index as u64)?,
+                    proof_json,
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let proofs = prepared
+        .iter()
+        .map(|p| p.accepted_basis.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    ensure!(
+        accepted_imports_current(
+            &store.connection,
+            accepted_import_statement(snapshot, &proofs)?
+        )
+        .await?,
         "accepted import binding changed"
     );
     Ok(prepared)
 }
 
-async fn accepted_import_current<C: ConnectionTrait>(
-    db: &C,
-    prepared: &PreparedFrozenImport,
-) -> Result<bool> {
-    let basis = prepared
-        .accepted_basis
-        .as_ref()
-        .expect("accepted import proof");
-    Ok(db.query_one_raw(sqlite_specific_sql(
-        "SELECT 1 FROM task_run_turn execution \
+pub(crate) async fn compaction_prepare_accepted_import(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    turn: &str,
+    ordinal: u64,
+) -> Result<PreparedFrozenImport> {
+    let snapshot = compaction_prepare_accepted_imports(store, workspace, destination, turn).await?;
+    compaction_prepare_accepted_import_page(store, &snapshot, ordinal)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("accepted import ordinal is outside the manifest"))
+}
+
+// Construct bounded SQL and proof parameters before acquiring writer capacity.
+// Each predicate is the original exact TaskRun/lineage/header/proof binding.
+fn accepted_import_statement(
+    snapshot: &PreparedAcceptedImports,
+    proofs: &[&AcceptedImportBasis],
+) -> Result<sea_orm::Statement> {
+    ensure!(
+        !proofs.is_empty() && proofs.len() as u64 <= SOURCE_PAGE_ROWS,
+        "accepted import validation row limit"
+    );
+    let mut values = Vec::<sea_orm::Value>::new();
+    for proof in proofs {
+        values.extend([proof.ordinal.into(), proof.proof_json.clone().into()]);
+    }
+    values.extend([
+        snapshot.manifest.clone().into(),
+        snapshot.destination.clone().into(),
+        snapshot.turn.clone().into(),
+        snapshot.workspace.clone().into(),
+        snapshot.history_json.clone().into(),
+        snapshot.digest.clone().into(),
+        snapshot.imports_digest.clone().into(),
+        i64::try_from(snapshot.import_count)?.into(),
+    ]);
+    let sql = format!(
+        "WITH wanted(ordinal,proof_json) AS (VALUES {}) \
+         SELECT NOT EXISTS (SELECT 1 FROM wanted WHERE NOT EXISTS (\
+         SELECT 1 FROM task_run_turn execution \
          JOIN task_run_conversation_snapshot snapshot ON snapshot.run_id=execution.run_id AND snapshot.task_id=execution.task_id \
          JOIN thread_lineage lineage ON lineage.child_thread_id=execution.thread_id AND lineage.parent_thread_id=snapshot.conversation_thread_id \
          JOIN thread child ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id \
          JOIN compaction_frozen_history h ON h.id=? AND h.owner_thread=snapshot.conversation_thread_id AND h.workspace_id=snapshot.workspace_id \
-         JOIN compaction_frozen_import i ON i.manifest_id=h.id AND i.ordinal=? \
-         JOIN compaction_live_sources s ON s.workspace_id=h.workspace_id AND s.thread_id=i.source_thread AND s.source_scope=i.source_scope AND s.source_id=i.source_id AND s.source_version=i.source_version \
+         JOIN compaction_frozen_import i ON i.manifest_id=h.id AND i.ordinal=wanted.ordinal AND i.proof_json=wanted.proof_json \
          WHERE execution.thread_id=? AND execution.turn_id=? AND snapshot.workspace_id=? AND snapshot.history_json=? \
-         AND h.ready=1 AND h.identity_sha256=? AND h.next_import=h.import_count AND i.proof_json=? AND h.imports_sha256=? AND h.import_count=? LIMIT 1",
-        [basis.manifest.clone().into(), basis.ordinal.into(), prepared.destination.clone().into(),
-         basis.turn.clone().into(), prepared.workspace.clone().into(), basis.history_json.clone().into(),
-         basis.digest.clone().into(), basis.proof_json.clone().into(), basis.imports_digest.clone().into(), i64::try_from(basis.import_count)?.into()],
-    )).await?.is_some())
+         AND h.ready=1 AND h.identity_sha256=? AND h.next_import=h.import_count \
+         AND h.imports_sha256=? AND h.import_count=? AND {})) AS valid",
+        vec!["(?,?)"; proofs.len()].join(","),
+        compaction_live_sources::current_source_predicate("i", "h.workspace_id")
+    );
+    Ok(sqlite_specific_sql(&sql, values))
+}
+async fn accepted_imports_current<C: ConnectionTrait>(
+    db: &C,
+    statement: sea_orm::Statement,
+) -> Result<bool> {
+    let row = db
+        .query_one_raw(statement)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("accepted import validation result missing"))?;
+    Ok(row.try_get::<i64>("", "valid")? != 0)
 }
 
 pub(crate) async fn compaction_append_frozen_imports(
@@ -433,6 +524,23 @@ pub(crate) async fn compaction_append_frozen_imports(
             json,
         ));
     }
+    let mut groups: Vec<(&PreparedAcceptedImports, Vec<&AcceptedImportBasis>)> = Vec::new();
+    for (_, _, prepared, _, _) in &batch {
+        if let Some(proof) = &prepared.accepted_basis {
+            if let Some((_, proofs)) = groups
+                .iter_mut()
+                .find(|(snapshot, _)| *snapshot == proof.snapshot.as_ref())
+            {
+                proofs.push(proof);
+            } else {
+                groups.push((&proof.snapshot, vec![proof]));
+            }
+        }
+    }
+    let validations = groups
+        .into_iter()
+        .map(|(snapshot, proofs)| accepted_import_statement(snapshot, &proofs))
+        .collect::<Result<Vec<_>>>()?;
     let tx = store.connection.begin().await?;
     let row = compaction_frozen_history::Entity::find_by_id(manifest)
         .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
@@ -451,22 +559,31 @@ pub(crate) async fn compaction_append_frozen_imports(
         start <= next && end <= count && (start == next || end <= next),
         "imports are not a sequential batch or exact retry"
     );
+    // Preparation reads immutable proof metadata, but TaskRun bindings and
+    // canonical source revisions may change. Revalidate the entire bounded
+    // batch under the same transaction as insertion. Inserts below only change
+    // the destination manifest, never these source/basis dependencies.
+    if !ready && end > next {
+        for validation in validations {
+            ensure!(
+                accepted_imports_current(&tx, validation).await?,
+                "accepted import binding changed"
+            );
+        }
+    }
     for (ordinal, record, prepared, target_json, json) in &batch {
         if !ready && *ordinal >= next {
             // The existing transaction holds the validated dependency snapshot
             // through insertion; exact retries below retain their prior behavior.
             let forwarded = if prepared.accepted_basis.is_some() {
-                accepted_import_current(&tx, prepared).await?
-                    && compaction_frozen_message::Entity::find_by_id((
-                        manifest.to_owned(),
-                        i64::try_from(record.message_ordinal)?,
-                    ))
-                    .filter(
-                        compaction_frozen_message::Column::ReferenceJson.eq(target_json.clone()),
-                    )
-                    .one(&tx)
-                    .await?
-                    .is_some()
+                compaction_frozen_message::Entity::find_by_id((
+                    manifest.to_owned(),
+                    i64::try_from(record.message_ordinal)?,
+                ))
+                .filter(compaction_frozen_message::Column::ReferenceJson.eq(target_json.clone()))
+                .one(&tx)
+                .await?
+                .is_some()
             } else {
                 false
             };
@@ -880,6 +997,20 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
     manifest: &str,
     start: u64,
 ) -> Result<Vec<FrozenImportRecord>> {
+    frozen_import_json_page(db, workspace, owner, manifest, start)
+        .await?
+        .into_iter()
+        .map(|json| Ok(serde_json::from_str(&json)?))
+        .collect()
+}
+
+async fn frozen_import_json_page<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    owner: &str,
+    manifest: &str,
+    start: u64,
+) -> Result<Vec<String>> {
     let scoped = compaction_frozen_import::Entity::find()
         .inner_join(compaction_frozen_history::Entity)
         .filter(compaction_frozen_history::Column::Id.eq(manifest))
@@ -917,9 +1048,7 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
         .into_tuple::<String>()
         .all(db)
         .await?;
-    rows.into_iter()
-        .map(|json| Ok(serde_json::from_str(&json)?))
-        .collect()
+    Ok(rows)
 }
 
 use super::compaction_live_sources;
