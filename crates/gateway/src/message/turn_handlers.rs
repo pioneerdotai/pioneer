@@ -1397,6 +1397,10 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            pioneer_observability::turn_startup::thread_role(
+                &params.turn_id,
+                thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
+            );
             if thread.origin_kind.composer_execution_mode()
                 == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
             {
@@ -1582,6 +1586,11 @@ impl MessageProcessor {
             let admission_entry_point =
                 crate::authorization::ExecutionAdmissionEntryPoint::DetachedTask;
             let turn_id = params.turn_id.clone();
+            pioneer_observability::turn_startup::delegated(&turn_id);
+            let _startup_create = pioneer_observability::turn_startup::stage(
+                &turn_id,
+                pioneer_observability::turn_startup::Stage::DelegationCreate,
+            );
             // Keep Composer admission, durable materialization, detached Task
             // creation, and finalization in separate heap-backed futures. Polling
             // the complete lifecycle as one state machine stacks its large frame
@@ -2383,6 +2392,14 @@ impl MessageProcessor {
         entry_point: crate::authorization::ExecutionAdmissionEntryPoint,
         mut execution_admission: ExecutionAuthorizationAdmission,
     ) -> Result<ApiProviderTurnAdmission, TurnStartFailure> {
+        pioneer_observability::turn_startup::set_runtime(
+            &params.turn_id,
+            pioneer_observability::turn_startup::Runtime::Native,
+        );
+        let _startup_stage = pioneer_observability::turn_startup::stage(
+            &params.turn_id,
+            pioneer_observability::turn_startup::Stage::NativePrepare,
+        );
         let allow_agent_skill_overlay =
             execution_backend_allows_agent_skill_overlay(params.execution_backend.as_ref());
         let thread = self
@@ -2395,12 +2412,17 @@ impl MessageProcessor {
                     params.thread_id.trim()
                 ))
             })?;
-        let normalized_capabilities = self
-            .normalize_turn_skill_capabilities(
+        let normalized_capabilities = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &params.turn_id,
+                pioneer_observability::turn_startup::Stage::Skills,
+            );
+            self.normalize_turn_skill_capabilities(
                 thread.workspace_id.as_str(),
                 params.capabilities.as_slice(),
             )
-            .await?;
+            .await?
+        };
         if execution_admission.uses_scoped_collaboration_policy() {
             self.enforce_scoped_skill_capability_projection(
                 thread.workspace_id.as_str(),
@@ -2506,6 +2528,9 @@ impl MessageProcessor {
         .map_err(|error| {
             TurnStartFailure::invalid_input(format!("invalid Turn collaboration metadata: {error}"))
         })?;
+        let startup_persist = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::Persist,
+        );
         let outcome_result = match resolved_permission_profile {
             Some(profile) => {
                 self.thread_manager
@@ -2524,6 +2549,7 @@ impl MessageProcessor {
                     .await
             }
         };
+        drop(startup_persist);
         let outcome = outcome_result.map_err(|error| {
             TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
         })?;
@@ -2546,19 +2572,25 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::invalid_input(message));
             }
         };
-        let skill_catalog = match self
-            .validate_turn_skill_capabilities(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-        {
-            Ok(catalog) => catalog,
-            Err(message) => {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                return Err(message);
+        let skill_catalog = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Skills,
+            );
+            match self
+                .validate_turn_skill_capabilities(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.capabilities.as_slice(),
+                )
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(message) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    return Err(message);
+                }
             }
         };
         let mut agent_skill_overlay = if allow_agent_skill_overlay
@@ -2654,21 +2686,27 @@ impl MessageProcessor {
                 )));
             }
         };
-        let execution_security_snapshot = match self
-            .resolve_turn_execution_security_snapshot(
-                &security_params,
-                &outcome,
-                None,
-                ExecutionEnvelopeSource::Fresh(&execution_admission),
-            )
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(failure) => {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                return Err(failure);
+        let execution_security_snapshot = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Security,
+            );
+            match self
+                .resolve_turn_execution_security_snapshot(
+                    &security_params,
+                    &outcome,
+                    None,
+                    ExecutionEnvelopeSource::Fresh(&execution_admission),
+                )
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(failure) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    return Err(failure);
+                }
             }
         };
         let security_audit_events = self.turn_security_audit_events_for_turn(
@@ -2834,13 +2872,18 @@ impl MessageProcessor {
             .await;
             return Err(TurnStartFailure::unavailable(message));
         }
-        let history = self
-            .load_conversation_history_for_workspace(
+        let history = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::History,
+            );
+            self.load_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
-            .await;
+            .await
+        };
         let history = match history {
             Ok(history) => history,
             Err(_) => {
@@ -2892,45 +2935,59 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::unavailable(message));
             }
         };
-        let resolved_artifacts = match self
-            .resolve_provider_artifact_inputs(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.input.as_slice(),
-            )
-            .await
-        {
-            Ok(resolved_artifacts) => resolved_artifacts,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to resolve artifact input for provider: {error:#}"),
+        let resolved_artifacts = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Artifacts,
+            );
+            match self
+                .resolve_provider_artifact_inputs(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.input.as_slice(),
                 )
-                .await;
-                return Err(TurnStartFailure::unavailable(format!(
-                    "failed to resolve artifact input for provider: {error:#}"
-                )));
+                .await
+            {
+                Ok(resolved_artifacts) => resolved_artifacts,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to resolve artifact input for provider: {error:#}"),
+                    )
+                    .await;
+                    return Err(TurnStartFailure::unavailable(format!(
+                        "failed to resolve artifact input for provider: {error:#}"
+                    )));
+                }
             }
         };
-        let runtime_environment = match self
-            .create_artifact_output_environment(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-            )
-            .await
-        {
-            Ok(runtime_environment) => runtime_environment.into_iter().collect::<HashMap<_, _>>(),
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to prepare artifact output directory: {error:#}"),
+        let runtime_environment = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Environment,
+            );
+            match self
+                .create_artifact_output_environment(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
                 )
-                .await;
-                return Err(TurnStartFailure::unavailable(format!(
-                    "failed to prepare artifact output directory: {error:#}"
-                )));
+                .await
+            {
+                Ok(runtime_environment) => {
+                    runtime_environment.into_iter().collect::<HashMap<_, _>>()
+                }
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to prepare artifact output directory: {error:#}"),
+                    )
+                    .await;
+                    return Err(TurnStartFailure::unavailable(format!(
+                        "failed to prepare artifact output directory: {error:#}"
+                    )));
+                }
             }
         };
         let hook_runtime_context = scoped_principal_id.map_or_else(
@@ -3534,19 +3591,24 @@ impl MessageProcessor {
         provider_claim_matches: bool,
     ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, TurnStartFailure>> {
         message_future(async move {
-            let readiness_snapshot = self
-                .cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
-                .await
-                .map_err(|error| {
-                    TurnStartFailure::internal(format!(
-                        "failed to load CLI runtime readiness snapshot: {error:#}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    TurnStartFailure::internal(format!(
-                        "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
-                    ))
-                })?;
+            let readiness_snapshot = {
+                let _startup_part = pioneer_observability::turn_startup::stage(
+                    &params.turn_id,
+                    pioneer_observability::turn_startup::Stage::ReadinessWait,
+                );
+                self.cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
+                    .await
+                    .map_err(|error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to load CLI runtime readiness snapshot: {error:#}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        TurnStartFailure::internal(format!(
+                            "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
+                        ))
+                    })?
+            };
             let readiness_summary = readiness_snapshot.summary;
             let cached_mcp_readiness = readiness_snapshot.mcp_readiness;
             if !matches!(readiness_summary.status, RuntimeStatus::Ready) {
@@ -3874,6 +3936,15 @@ impl MessageProcessor {
                 }
             };
             let response_turn_id = params.turn_id.clone();
+            pioneer_observability::turn_startup::set_runtime(
+                &response_turn_id,
+                match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => {
+                        pioneer_observability::turn_startup::Runtime::Codex
+                    }
+                    _ => pioneer_observability::turn_startup::Runtime::Claude,
+                },
+            );
             let response_thread_id = params.thread_id.clone();
             let submitted_model_provider = params.model_provider.clone();
             macro_rules! send_turn_start_failure {
@@ -4066,7 +4137,7 @@ impl MessageProcessor {
                 }
             };
             let session_turn_mutex = self.cli_runtime_session_turn_mutex(&session_key).await;
-            let session_turn_lease = if success_response.is_task() {
+            let session_turn_lease = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliSessionWait); if success_response.is_task() {
                 let lock = session_turn_mutex.lock_owned();
                 tokio::pin!(lock);
                 let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -4112,7 +4183,7 @@ impl MessageProcessor {
                         return None;
                     }
                 }
-            };
+            } };
             let mut blocker_poll_count = 0_u32;
             loop {
                 match self
@@ -4269,7 +4340,7 @@ impl MessageProcessor {
                 ));
                 return None;
             }
-            let resolved_artifacts = match self
+            let resolved_artifacts = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::Artifacts); match self
                 .resolve_provider_artifact_inputs(
                     thread.workspace_id.as_str(),
                     params.input.as_slice(),
@@ -4283,7 +4354,7 @@ impl MessageProcessor {
                     ));
                     return None;
                 }
-            };
+            } };
             let input_mapping = match match runtime_kind {
                 CLIAgentRuntimeKind::Codex => {
                     crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
@@ -5184,7 +5255,7 @@ impl MessageProcessor {
                     .then_some(elevated_instructions.clone()),
                 ..Default::default()
             };
-            let session_result = if runtime_kind == CLIAgentRuntimeKind::Codex {
+            let session_result = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliAcquire); if runtime_kind == CLIAgentRuntimeKind::Codex {
                 let persisted_binding = match self
                     .crud_store
                     .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
@@ -5308,7 +5379,7 @@ impl MessageProcessor {
                 manager
                     .get_or_start_with_launch_spec(session_key.clone(), launch_spec)
                     .await
-            };
+            } };
             let session_handle = match session_result {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -5335,7 +5406,7 @@ impl MessageProcessor {
                 serde_json::json!(cli_runtime_thread_sandbox_label(sandbox_policy))
             });
             let native_thread =
-                match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
+                { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliThread); match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
                     self.crud_store.as_ref(),
                     &cli_session,
                     crate::cli_runtime::thread_binding::CLIAgentRuntimeThreadBindingOpenRequest {
@@ -5371,7 +5442,7 @@ impl MessageProcessor {
                         ));
                         return;
                     }
-                };
+                } };
             let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
             {
                 Ok(input_mapping_json) => input_mapping_json,
@@ -5570,11 +5641,15 @@ impl MessageProcessor {
         prepared: PreparedCliRuntimeNativeTurnStart,
     ) {
         let processor = self.clone();
-        let _handle = tokio::spawn(async move {
-            processor
-                .start_prepared_cli_runtime_native_turn(prepared)
-                .await;
-        });
+        let startup_key = Some(prepared.outcome.started_notification.turn.id.clone());
+        let _handle = tokio::spawn(pioneer_observability::turn_startup::scope(
+            startup_key,
+            async move {
+                processor
+                    .start_prepared_cli_runtime_native_turn(prepared)
+                    .await;
+            },
+        ));
     }
 
     async fn start_prepared_cli_runtime_native_turn(
@@ -5596,22 +5671,28 @@ impl MessageProcessor {
             &outcome.started_notification.thread_id,
         )
         .await;
-        let mcp_metadata = match cli_session
-            .prepare_mcp_turn(
-                outcome.started_notification.thread_id.as_str(),
-                pioneer_turn_id.as_str(),
-            )
-            .await
-        {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    pioneer_turn_id,
-                    format!("failed to reserve CLI MCP turn lease: {error:#}"),
+        let mcp_metadata = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &pioneer_turn_id,
+                pioneer_observability::turn_startup::Stage::CliMcp,
+            );
+            match cli_session
+                .prepare_mcp_turn(
+                    outcome.started_notification.thread_id.as_str(),
+                    pioneer_turn_id.as_str(),
                 )
-                .await;
-                return;
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        pioneer_turn_id,
+                        format!("failed to reserve CLI MCP turn lease: {error:#}"),
+                    )
+                    .await;
+                    return;
+                }
             }
         };
         if let Some(metadata) = mcp_metadata {
@@ -5674,13 +5755,19 @@ impl MessageProcessor {
                 return;
             }
         }
-        let native_turn = match cli_session
+        pioneer_observability::turn_startup::dispatched(&pioneer_turn_id);
+        let _startup_dispatch = pioneer_observability::turn_startup::stage(
+            &pioneer_turn_id,
+            pioneer_observability::turn_startup::Stage::CliDispatch,
+        );
+        let native_turn_result = cli_session
             .start_turn(
                 turn_start_params,
                 std::time::Duration::from_millis(request_timeout_ms),
             )
-            .await
-        {
+            .await;
+        drop(_startup_dispatch);
+        let native_turn = match native_turn_result {
             Ok(native_turn) => native_turn,
             Err(error) => {
                 let _ = cli_session

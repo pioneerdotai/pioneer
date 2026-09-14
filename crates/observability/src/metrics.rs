@@ -1167,6 +1167,7 @@ impl DatabasePoolContext {
 }
 
 fn record_database_pool_acquire(context: DatabasePoolContext, elapsed: Duration) {
+    crate::turn_startup::record_current_duration(crate::turn_startup::Stage::DbAcquire, elapsed);
     if !super::telemetry_enabled() {
         return;
     }

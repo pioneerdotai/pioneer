@@ -152,6 +152,27 @@ impl MessageProcessor {
         let Some(task_response) = self.crud_store.get_task(task_id.as_str()).await? else {
             return Ok(());
         };
+        if let Some(work) = task_response
+            .task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.composer_work.as_ref())
+        {
+            let outcome = match &event.payload {
+                TaskEventPayload::TaskCancelled { .. } => Some("cancelled"),
+                TaskEventPayload::TaskFailed { .. } => Some("failed"),
+                TaskEventPayload::TaskBlocked { .. } => Some("blocked"),
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                self.send_delegated_startup_outcome(
+                    &work.launch.thread_id,
+                    &work.launch.turn_id,
+                    outcome,
+                )
+                .await;
+            }
+        }
         let context = pioneer_protocol::TaskNotificationContext {
             workspace_id: task_response.task.workspace_id.clone(),
             task_id: task_response.task.id.clone(),

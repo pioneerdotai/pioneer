@@ -419,6 +419,10 @@ impl ClientCore {
         request: ComposerVoiceFinalizeRequest,
         sender: &impl JsonRpcRequestTransport,
     ) -> anyhow::Result<VoiceSessionFinalizeResponse> {
+        let _startup_stage = pioneer_observability::turn_startup::stage(
+            &request.operation.startup_observation_key(),
+            pioneer_observability::turn_startup::Stage::VoiceFinalize,
+        );
         let identity = request.operation;
         let publication = self
             .composer_snapshot(&identity.thread_id)

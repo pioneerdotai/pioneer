@@ -126,23 +126,30 @@ pub(super) async fn request_agent_round(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
+    pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     if provider.capabilities().streaming && !force_non_stream {
         let provider_name = provider.name().to_owned();
         let model_name = request.model.clone();
 
         let target = FailureTarget::new(thinking_item_id, TurnItemType::Reasoning);
-        let mut stream = provider.stream_chat(request).await.map_err(|error| {
-            adapter_error_for_target(
-                target,
-                provider.as_ref(),
-                model_name.as_str(),
-                ProviderTransportKind::Stream,
-                ProviderFailureStage::Connect,
-                "provider stream error",
-                &error,
-            )
-        })?;
+        let mut stream = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                turn_id,
+                pioneer_observability::turn_startup::Stage::ProviderConnect,
+            );
+            provider.stream_chat(request).await.map_err(|error| {
+                adapter_error_for_target(
+                    target,
+                    provider.as_ref(),
+                    model_name.as_str(),
+                    ProviderTransportKind::Stream,
+                    ProviderFailureStage::Connect,
+                    "provider stream error",
+                    &error,
+                )
+            })?
+        };
 
         let mut full_text = String::new();
         let mut full_reasoning = String::new();
@@ -164,6 +171,7 @@ pub(super) async fn request_agent_round(
             )
             .await?
             {
+                observe_startup_chunk(turn_id, &chunk);
                 if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
                     return Err(provider_response_limit_error(
                         target,
@@ -210,7 +218,9 @@ pub(super) async fn request_agent_round(
                                 item_id: thinking_item_id.to_owned(),
                                 delta: reasoning_delta,
                                 stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
-                                payload: None,
+                                payload: Some(
+                                    serde_json::json!({"startup_output_kind":"reasoning"}),
+                                ),
                                 markdown: None,
                                 markdown_version: None,
                             },
@@ -303,6 +313,23 @@ pub(super) async fn request_agent_round(
         )
     })?;
 
+    let startup_output = if !response.text.is_empty() {
+        Some(pioneer_observability::turn_startup::Output::BufferedText)
+    } else if response
+        .reasoning_content
+        .as_ref()
+        .is_some_and(|s| !s.is_empty())
+    {
+        Some(pioneer_observability::turn_startup::Output::BufferedReasoning)
+    } else if !response.tool_calls.is_empty() {
+        Some(pioneer_observability::turn_startup::Output::ToolCall)
+    } else {
+        None
+    };
+    if let Some(output) = startup_output {
+        pioneer_observability::turn_startup::runtime_output(turn_id, output);
+    }
+
     let response_limits = ProviderResponseLimits::default();
     if let Err(error) = response_limits.validate_chat_response(&response) {
         return Err(provider_response_limit_error(
@@ -328,7 +355,7 @@ pub(super) async fn request_agent_round(
                     item_id: thinking_item_id.to_owned(),
                     delta: reasoning.clone(),
                     stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
-                    payload: None,
+                    payload: Some(serde_json::json!({"startup_output_kind":"buffered_reasoning"})),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -368,22 +395,29 @@ pub(super) async fn stream_provider_response(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let provider_name = provider.name().to_owned();
     let model_name = request.model.clone();
 
     let connect_target = FailureTarget::new(thinking_item_id, TurnItemType::Reasoning);
-    let mut stream = provider.stream_chat(request).await.map_err(|error| {
-        adapter_error_for_target(
-            connect_target,
-            provider.as_ref(),
-            model_name.as_str(),
-            ProviderTransportKind::Stream,
-            ProviderFailureStage::Connect,
-            "provider stream error",
-            &error,
-        )
-    })?;
+    let mut stream = {
+        let _startup_part = pioneer_observability::turn_startup::stage(
+            turn_id,
+            pioneer_observability::turn_startup::Stage::ProviderConnect,
+        );
+        provider.stream_chat(request).await.map_err(|error| {
+            adapter_error_for_target(
+                connect_target,
+                provider.as_ref(),
+                model_name.as_str(),
+                ProviderTransportKind::Stream,
+                ProviderFailureStage::Connect,
+                "provider stream error",
+                &error,
+            )
+        })?
+    };
 
     let mut full_text = String::new();
     let mut reasoning_parts = String::new();
@@ -406,6 +440,7 @@ pub(super) async fn stream_provider_response(
         )
         .await?
         {
+            observe_startup_chunk(turn_id, &chunk);
             if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
                 return Err(provider_response_limit_error(
                     response_stream_target(message_started, thinking_item_id, message_item_id),
@@ -475,7 +510,7 @@ pub(super) async fn stream_provider_response(
                             item_id: thinking_item_id.to_owned(),
                             delta: reasoning,
                             stream: Some(pioneer_protocol::ItemDeltaStream::Generic),
-                            payload: None,
+                            payload: Some(serde_json::json!({"startup_output_kind":"reasoning"})),
                             markdown: None,
                             markdown_version: None,
                         },
@@ -717,6 +752,7 @@ pub(super) async fn non_stream_provider_response(
     message_item_id: &str,
     event_tx: &AgentEventHub,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
@@ -732,6 +768,21 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    if !response.text.is_empty() {
+        pioneer_observability::turn_startup::runtime_output(
+            turn_id,
+            pioneer_observability::turn_startup::Output::BufferedText,
+        );
+    } else if response
+        .reasoning_content
+        .as_ref()
+        .is_some_and(|s| !s.is_empty())
+    {
+        pioneer_observability::turn_startup::runtime_output(
+            turn_id,
+            pioneer_observability::turn_startup::Output::BufferedReasoning,
+        );
+    }
     let response_limits = ProviderResponseLimits::default();
     if let Err(error) = response_limits.validate_chat_response(&response) {
         return Err(provider_response_limit_error(
@@ -805,7 +856,7 @@ pub(super) async fn non_stream_provider_response(
                     item_id: message_item_id.to_owned(),
                     delta: assistant_text.clone(),
                     stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
-                    payload: None,
+                    payload: Some(serde_json::json!({"startup_output_kind":"buffered_text"})),
                     markdown: None,
                     markdown_version: None,
                 },
@@ -1912,5 +1963,25 @@ mod partial_observation_tests {
             );
             assert!(envelope.calls.is_empty());
         }
+    }
+}
+
+fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
+    use pioneer_observability::turn_startup::{self, Output};
+    let output = if !chunk.delta.is_empty() {
+        Some(Output::Text)
+    } else if chunk
+        .reasoning_delta
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
+        Some(Output::Reasoning)
+    } else if !chunk.tool_calls.is_empty() {
+        Some(Output::ToolCall)
+    } else {
+        None
+    };
+    if let Some(output) = output {
+        turn_startup::runtime_output(turn_id, output);
     }
 }

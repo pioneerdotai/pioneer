@@ -1173,7 +1173,8 @@ impl MessageProcessor {
         &'a self,
         event: AgentDurableEvent,
     ) -> MessageFuture<'a, bool> {
-        match event {
+        let startup_key = durable_event_turn_id(&event).map(str::to_owned);
+        let future = match event {
             AgentDurableEvent::TurnSkillsResolved {
                 thread_id,
                 turn_id,
@@ -1250,7 +1251,12 @@ impl MessageProcessor {
                 }
                 committed
             }),
-        }
+        };
+        message_future(pioneer_observability::turn_startup::scope_stage(
+            startup_key,
+            pioneer_observability::turn_startup::Stage::Projection,
+            future,
+        ))
     }
 
     fn handle_turn_skills_resolved_event<'a>(
@@ -4056,7 +4062,16 @@ impl MessageProcessor {
     pub(super) async fn handle_progress_agent_event(&self, event: AgentProgressEvent) {
         crate::database::attribution::scope_database_workload(
             pioneer_observability::DatabaseWorkload::AgentProgress,
-            self.handle_progress_agent_event_inner(event),
+            pioneer_observability::turn_startup::scope_stage(
+                Some(match &event {
+                    AgentProgressEvent::ItemDelta { notification } => notification.turn_id.clone(),
+                    AgentProgressEvent::ItemHeartbeat { turn_id, .. }
+                    | AgentProgressEvent::ToolOutputDelta { turn_id, .. }
+                    | AgentProgressEvent::TaskProgress { turn_id, .. } => turn_id.clone(),
+                }),
+                pioneer_observability::turn_startup::Stage::Projection,
+                self.handle_progress_agent_event_inner(event),
+            ),
         )
         .await;
     }

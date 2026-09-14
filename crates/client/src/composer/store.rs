@@ -39,6 +39,16 @@ pub struct ComposerOperationIdentity {
     pub generation: u64,
 }
 
+impl ComposerOperationIdentity {
+    /// Local correlation only; this identifier is never exported.
+    pub fn startup_observation_key(&self) -> String {
+        format!(
+            "composer:{}:{}:{}",
+            self.thread_id, self.draft_id.0, self.generation
+        )
+    }
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ComposerOperationPlan {
@@ -1314,6 +1324,17 @@ impl ClientCore {
                         }) else {
                             return self.transition(&authority, vec![], vec![]);
                         };
+                        pioneer_observability::turn_startup::begin(
+                            &identity.startup_observation_key(),
+                            pioneer_observability::turn_startup::Input::Voice,
+                            pioneer_observability::turn_startup::Runtime::Unknown,
+                        );
+                        if let Some(turn) = operation.voice_turn_id.as_deref() {
+                            pioneer_observability::turn_startup::bind(
+                                &identity.startup_observation_key(),
+                                turn,
+                            );
+                        }
                         operation.voice_committing = true;
                     }
                     ComposerIntent::VoiceFinalized { identity, response } => {
@@ -1470,6 +1491,15 @@ impl ClientCore {
                             draft: next.draft.clone(),
                         };
                         if operation == ComposerOperationKind::Send {
+                            if next.draft.domain.selected_mode
+                                != pioneer_protocol::ThreadMode::Message
+                            {
+                                pioneer_observability::turn_startup::begin(
+                                    &identity.startup_observation_key(),
+                                    pioneer_observability::turn_startup::Input::Text,
+                                    pioneer_observability::turn_startup::Runtime::Unknown,
+                                );
+                            }
                             super::turn_prepare::mark_pending_composer_attachments_uploading(
                                 &mut next.draft.domain.attachments,
                             );
@@ -1632,6 +1662,10 @@ impl ClientCore {
                                 ComposerOperationStatus::Completed
                             }
                             ComposerOperationCompletion::Failed { message } => {
+                                pioneer_observability::turn_startup::finish(
+                                    &identity.startup_observation_key(),
+                                    pioneer_observability::turn_startup::Outcome::Failed,
+                                );
                                 super::turn_prepare::mark_uploading_composer_attachments_failed(
                                     &mut next.draft.domain.attachments,
                                     &message,
@@ -1639,6 +1673,10 @@ impl ClientCore {
                                 ComposerOperationStatus::Failed { message }
                             }
                             ComposerOperationCompletion::Cancelled => {
+                                pioneer_observability::turn_startup::finish(
+                                    &identity.startup_observation_key(),
+                                    pioneer_observability::turn_startup::Outcome::Cancelled,
+                                );
                                 cancel_operation(&mut next);
                                 ComposerOperationStatus::Cancelled
                             }

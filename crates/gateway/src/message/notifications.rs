@@ -1137,6 +1137,65 @@ impl MessageProcessor {
         recipients
     }
 
+    pub(super) async fn send_delegated_startup_outcome(
+        &self,
+        thread: &str,
+        parent: &str,
+        outcome: &str,
+    ) {
+        use pioneer_observability::turn_startup;
+        let Some(owner) = turn_startup::delegated_owner(parent) else {
+            return;
+        };
+        let params = serde_json::json!({"turn_id": parent, "outcome": outcome});
+        let Some(result) = turn_startup::notification_outcome("turn/startup/outcome", &params)
+        else {
+            return;
+        };
+        self.send_execution_scoped_notification(
+            thread,
+            crate::authorization::ResourceAction::ThreadRead,
+            "turn/startup/outcome",
+            &params,
+            vec![owner],
+        )
+        .await;
+        turn_startup::finish(parent, result);
+    }
+
+    // Send only the first model event and first text (or a terminal without
+    // output) to the startup owner even while their UI stays in the parent.
+    // This does not create a subscription or grant access to the child.
+    async fn send_delegated_startup_notification<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        subscribers: &[crate::thread::ThreadSubscriber],
+    ) {
+        use pioneer_observability::turn_startup;
+        if !turn_startup::current_is_delegated() {
+            return;
+        }
+        let Ok(params) = serde_json::to_value(payload) else {
+            return;
+        };
+        let Some(owner) = turn_startup::delegated_delivery_candidate(method, &params) else {
+            return;
+        };
+        if subscribers.iter().any(|s| s.connection_id == owner) {
+            return;
+        }
+        self.send_execution_scoped_notification(
+            thread_id,
+            crate::authorization::ResourceAction::ChildObserve,
+            method,
+            payload,
+            vec![owner],
+        )
+        .await;
+    }
+
     pub(crate) async fn send_notification_to_thread_subscribers<T: Serialize>(
         &self,
         thread_id: &str,
@@ -1144,6 +1203,8 @@ impl MessageProcessor {
         payload: &T,
     ) {
         let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+        self.send_delegated_startup_notification(thread_id, method, payload, &subscribers)
+            .await;
         self.send_notification_to_authorized_thread_subscribers(
             thread_id,
             method,
@@ -1164,7 +1225,12 @@ impl MessageProcessor {
         method: &str,
         payload: &T,
     ) {
+        let _startup_fanout = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::Fanout,
+        );
         let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+        self.send_delegated_startup_notification(thread_id, method, payload, &subscribers)
+            .await;
         if subscribers.is_empty() {
             return;
         }
@@ -1808,7 +1874,7 @@ impl MessageProcessor {
     fn serialize_notification<T: Serialize>(&self, method: &str, payload: &T) -> Option<String> {
         let markdown_stream = markdown_notification_stream(method);
         let encode_started = markdown_stream.map(|_| Instant::now());
-        let notification = match JsonRpcNotification::from_params(method, payload) {
+        let mut notification = match JsonRpcNotification::from_params(method, payload) {
             Ok(notification) => {
                 if let (Some(stream), Some(started)) = (markdown_stream, encode_started.as_ref()) {
                     record_markdown_notification_stage(
@@ -1840,6 +1906,9 @@ impl MessageProcessor {
             }
         };
 
+        if let Some(params) = notification.params.as_mut() {
+            pioneer_observability::turn_startup::decorate_notification(params);
+        }
         let serialize_started = markdown_stream.map(|_| Instant::now());
         match serde_json::to_string(&notification) {
             Ok(payload) => {
@@ -1882,8 +1951,15 @@ impl MessageProcessor {
         serialized: &str,
         connection_ids: Vec<ConnectionId>,
     ) -> usize {
+        let startup_key = pioneer_observability::turn_startup::outgoing_key(serialized);
         let mut accepted = 0usize;
         for target_connection_id in connection_ids {
+            if let Some(key) = startup_key.as_deref() {
+                pioneer_observability::turn_startup::queued_on_connection(
+                    key,
+                    target_connection_id,
+                );
+            }
             if let Err(error) = self
                 .session_manager
                 .try_send_notification_text(target_connection_id, serialized.to_owned())
@@ -1911,6 +1987,12 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         response: JsonRpcErrorResponse,
     ) {
+        if let Some(key) = pioneer_observability::turn_startup::current_key() {
+            pioneer_observability::turn_startup::finish(
+                &key,
+                pioneer_observability::turn_startup::Outcome::Rejected,
+            );
+        }
         if let Err(error) = self.send_json(connection_id, &response).await {
             warn!(
                 connection_id,

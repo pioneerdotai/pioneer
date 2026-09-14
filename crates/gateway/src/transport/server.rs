@@ -249,11 +249,59 @@ async fn run_normal_connection(
 
     let mut writer_task = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
+            let startup_output = if let Message::Text(text) = &message {
+                if !pioneer_observability::turn_startup::active() {
+                    None
+                } else {
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| {
+                            let params = v.get("params")?;
+                            let method = v.get("method")?.as_str()?;
+                            let output = pioneer_observability::turn_startup::notification_output(
+                                method, params,
+                            );
+                            let outcome = pioneer_observability::turn_startup::notification_outcome(
+                                method, params,
+                            );
+                            if output.is_none() && outcome.is_none() {
+                                return None;
+                            }
+                            Some((
+                                pioneer_observability::turn_startup::request_key(params)?,
+                                output,
+                                outcome,
+                            ))
+                        })
+                }
+            } else {
+                None
+            };
+            let startup_write = startup_output.as_ref().map(|(key, _, _)| {
+                pioneer_observability::turn_startup::socket_write_started(key, connection_id);
+                pioneer_observability::turn_startup::stage(
+                    key,
+                    pioneer_observability::turn_startup::Stage::SocketWrite,
+                )
+            });
             let terminal = matches!(message, Message::Close(_));
             ws_writer
                 .send(message)
                 .await
                 .context("websocket write failed")?;
+            drop(startup_write);
+            if let Some((key, output, outcome)) = startup_output {
+                if output.is_some() {
+                    pioneer_observability::turn_startup::sent_on_connection(&key, connection_id);
+                }
+                if let Some(outcome) = outcome {
+                    pioneer_observability::turn_startup::finish_on_connection(
+                        &key,
+                        connection_id,
+                        outcome,
+                    );
+                }
+            }
             if terminal {
                 return Ok::<(), anyhow::Error>(());
             }
@@ -369,6 +417,7 @@ async fn run_normal_connection(
     let _ = lease_cancel_tx.send(true);
     session_manager.unregister_connection(connection_id).await;
     message_processor.connection_closed(connection_id).await;
+    pioneer_observability::turn_startup::connection_lost(connection_id);
     drop(outbound_tx);
     match writer_completion {
         Some(result) => result.context("writer task join failed")??,

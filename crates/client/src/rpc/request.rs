@@ -172,6 +172,8 @@ pub fn build_json_rpc_request_payload(
     method: &str,
     params: JsonValue,
 ) -> Result<JsonRpcRequestPayload> {
+    let mut params = params;
+    pioneer_observability::turn_startup::inject_params(method, &mut params);
     let request_id = new_request_id();
     let request = JsonRpcRequest {
         jsonrpc: JSONRPC_VERSION.to_owned(),
@@ -265,16 +267,37 @@ pub fn send_json_rpc_request_value<TTransport>(
 where
     TTransport: JsonRpcRequestTransport + ?Sized,
 {
+    let startup_key = if matches!(method, "turn/start" | "voice/session/finalize") {
+        pioneer_observability::turn_startup::request_key(&params)
+    } else {
+        None
+    };
     let request = build_json_rpc_request_payload(method, params)?;
     let (response_tx, response_rx) = std::sync::mpsc::channel();
 
     transport
         .send_json_rpc_request(request.request_id, request.payload, response_tx)
-        .map_err(anyhow::Error::msg)?;
+        .map_err(|error| {
+            if let Some(key) = startup_key.as_deref() {
+                pioneer_observability::turn_startup::finish(
+                    key,
+                    pioneer_observability::turn_startup::Outcome::ObservationLost,
+                );
+            }
+            anyhow::Error::msg(error)
+        })?;
 
-    let response = response_rx
-        .recv_timeout(timeout)
-        .map_err(|_| anyhow!("{}", request_timeout_message(method)))?;
+    let response = response_rx.recv_timeout(timeout).map_err(|error| {
+        if let Some(key) = startup_key.as_deref() {
+            let outcome = if matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout) {
+                pioneer_observability::turn_startup::Outcome::DeadlineExceeded
+            } else {
+                pioneer_observability::turn_startup::Outcome::ObservationLost
+            };
+            pioneer_observability::turn_startup::finish(key, outcome);
+        }
+        anyhow!("{}", request_timeout_message(method))
+    })?;
 
     response.map_err(anyhow::Error::new)
 }

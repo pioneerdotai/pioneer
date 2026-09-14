@@ -666,6 +666,9 @@ impl CodexAppServerClient {
         &self,
         timeout: Duration,
     ) -> Result<CodexInitializeSnapshot, CodexJsonlRpcClientError> {
+        let _startup_stage = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliHandshake,
+        );
         let params = CodexInitializeParams::pioneer_desktop();
         let params_value =
             serde_json::to_value(&params).map_err(|error| CodexJsonlRpcClientError::Encode {

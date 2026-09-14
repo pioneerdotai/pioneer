@@ -461,7 +461,10 @@ async fn monitor_connection(
                 match command {
                     Some(ConnectionRpcCommand::Request { request_id, payload, response_tx }) => {
                         pending_requests.insert(request_id.clone(), response_tx);
-                        if let Err(error) = writer.send(Message::Text(payload.into())).await {
+                        let startup_write = pioneer_observability::turn_startup::client_write(&payload, connection_id);
+                        let write_result = writer.send(Message::Text(payload.into())).await;
+                        drop(startup_write);
+                        if let Err(error) = write_result {
                             let message = websocket_write_failed_message(error);
                             if let Some(response_tx) = pending_requests.remove(request_id.as_str()) {
                                 let _ = response_tx.send(Err(
@@ -549,6 +552,7 @@ async fn monitor_connection(
             }
         }
     };
+    pioneer_observability::turn_startup::connection_lost(connection_id);
 
     fail_pending_requests(&mut pending_requests, disconnect_reason.as_str());
     fail_pending_upload_chunks(&mut pending_upload_chunks, disconnect_reason.as_str());

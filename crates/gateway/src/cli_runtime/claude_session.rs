@@ -2112,6 +2112,9 @@ impl ClaudeStreamClient {
     }
 
     async fn initialize(&self, timeout: Duration) -> Result<()> {
+        let _startup_stage = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliHandshake,
+        );
         self.send_control_request(json!({ "subtype": "initialize", "hooks": null }), timeout)
             .await?;
         Ok(())

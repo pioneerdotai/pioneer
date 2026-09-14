@@ -180,6 +180,9 @@ impl NativeContextSession {
         request: ChatRequest,
         recovery: bool,
     ) -> Result<NativePreparedRequest> {
+        let _startup_context = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::ContextPrepare,
+        );
         let pending = self
             .recovery_pending
             .swap(false, std::sync::atomic::Ordering::SeqCst);

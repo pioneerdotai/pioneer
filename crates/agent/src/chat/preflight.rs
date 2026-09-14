@@ -286,6 +286,9 @@ pub(crate) struct TurnPreflightOrchestratorResult {
 pub(crate) async fn run_turn_preflight_orchestrator(
     input: TurnPreflightOrchestratorInput,
 ) -> TurnPreflightOrchestratorResult {
+    let _startup_preflight = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::Preflight,
+    );
     let local_modules = build_local_preflight_module_plans(
         input.tool_index,
         input.deterministic_summary,

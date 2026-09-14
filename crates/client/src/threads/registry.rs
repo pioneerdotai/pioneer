@@ -1889,6 +1889,48 @@ impl ClientCore {
         &self,
         notification: pioneer_protocol::GatewayNotification,
     ) -> bool {
+        let startup_key = match &notification {
+            pioneer_protocol::GatewayNotification::ItemDelta(n)
+                if !n.delta.is_empty()
+                    && (n.stream == Some(pioneer_protocol::ItemDeltaStream::AgentMessage)
+                        || (n.stream == Some(pioneer_protocol::ItemDeltaStream::Generic)
+                            && n.payload.as_ref().is_some_and(|p| {
+                                matches!(
+                                    p.get("startup_output_kind")
+                                        .or_else(|| p.get("runtimeDeltaKind"))
+                                        .and_then(|v| v.as_str()),
+                                    Some(
+                                        "reasoning"
+                                            | "buffered_reasoning"
+                                            | "reasoning_text"
+                                            | "reasoning_summary"
+                                    )
+                                )
+                            }))) =>
+            {
+                Some(n.turn_id.as_str())
+            }
+            pioneer_protocol::GatewayNotification::ItemStarted(n)
+                if matches!(
+                    &n.item,
+                    pioneer_protocol::TurnItem::CommandExecution { .. }
+                        | pioneer_protocol::TurnItem::FileChange { .. }
+                        | pioneer_protocol::TurnItem::DynamicToolCall { .. }
+                        | pioneer_protocol::TurnItem::WebSearch { .. }
+                ) =>
+            {
+                Some(n.turn_id.as_str())
+            }
+            pioneer_protocol::GatewayNotification::ItemCompleted(n) if matches!(&n.item, pioneer_protocol::TurnItem::AgentMessage { text, .. } if !text.is_empty()) => {
+                Some(n.turn_id.as_str())
+            }
+            pioneer_protocol::GatewayNotification::ItemCompleted(n) if matches!(&n.item, pioneer_protocol::TurnItem::Reasoning { summary, content, .. } if summary.iter().chain(content).any(|s| !s.is_empty())) => {
+                Some(n.turn_id.as_str())
+            }
+            _ => None,
+        };
+        let _startup_apply =
+            startup_key.and_then(pioneer_observability::turn_startup::client_apply);
         if self.is_stopped() {
             return true;
         }

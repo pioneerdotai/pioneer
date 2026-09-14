@@ -1364,82 +1364,140 @@ impl TaskAgentExecutor {
         let Some(task_response) = processor.crud_store.get_task(run.task_id.as_str()).await? else {
             bail!("task `{}` not found", run.task_id);
         };
-        if !Self::root_collaboration_still_has_task_authority(&processor, &task_response).await? {
-            return Ok(TaskExecutorStartOutcome::Rejected);
-        }
-        if task_response.task.status.is_terminal() || run.status.is_terminal() {
-            return Ok(TaskExecutorStartOutcome::Queued);
-        }
-        let agent_spec = select_agent_spec(&task_response, run.id.as_str())
-            .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", run.task_id))?;
-        if run.status == TaskRunStatus::WaitingReview {
-            return self
-                .recover_waiting_review_run(&processor, &task_response, &run, &agent_spec)
-                .await;
-        }
-        // A disabled native runtime must not consume a new task execution
-        // reservation.  Keep the run queued so enabling the same configured
-        // runtime can resume it without rewriting its history.  The session
-        // factory repeats this check at process start to cover a config change
-        // racing this preflight.
-        if !cli_runtime_backend_enabled(&processor, &task_response.task)? {
-            return Ok(TaskExecutorStartOutcome::Queued);
-        }
-        let Some(execution) = self
-            .load_or_reserve_execution(&processor, &context, &run)
-            .await?
-        else {
-            return Ok(TaskExecutorStartOutcome::Queued);
-        };
+        let startup_key = task_response
+            .task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.composer_work.as_ref())
+            .map(|w| w.launch.turn_id.clone());
+        pioneer_observability::turn_startup::scope(startup_key.clone(), async {
+            if let Some(key) = startup_key.as_deref() {
+                pioneer_observability::turn_startup::delegation_picked_up(key);
+            }
+            let result = pioneer_observability::turn_startup::scope_stage(
+                startup_key.clone(),
+                pioneer_observability::turn_startup::Stage::ChildPrepare,
+                async {
+                    if !Self::root_collaboration_still_has_task_authority(
+                        &processor,
+                        &task_response,
+                    )
+                    .await?
+                    {
+                        return Ok(TaskExecutorStartOutcome::Rejected);
+                    }
+                    if task_response.task.status.is_terminal() || run.status.is_terminal() {
+                        return Ok(TaskExecutorStartOutcome::Queued);
+                    }
+                    let agent_spec = select_agent_spec(&task_response, run.id.as_str())
+                        .ok_or_else(|| anyhow!("agent task `{}` has no agent spec", run.task_id))?;
+                    if run.status == TaskRunStatus::WaitingReview {
+                        return self
+                            .recover_waiting_review_run(
+                                &processor,
+                                &task_response,
+                                &run,
+                                &agent_spec,
+                            )
+                            .await;
+                    }
+                    // A disabled native runtime must not consume a new task execution
+                    // reservation.  Keep the run queued so enabling the same configured
+                    // runtime can resume it without rewriting its history.  The session
+                    // factory repeats this check at process start to cover a config change
+                    // racing this preflight.
+                    if !cli_runtime_backend_enabled(&processor, &task_response.task)? {
+                        return Ok(TaskExecutorStartOutcome::Queued);
+                    }
+                    let Some(execution) = self
+                        .load_or_reserve_execution(&processor, &context, &run)
+                        .await?
+                    else {
+                        return Ok(TaskExecutorStartOutcome::Queued);
+                    };
 
-        if let Some(child_runtime) = load_child_runtime_for_run(&processor, run.id.as_str()).await?
-        {
-            return self
-                .recover_existing_child_turn(
-                    &processor,
-                    &task_response,
-                    &run,
-                    &agent_spec,
-                    &execution,
-                    child_runtime,
-                    handle,
-                )
-                .await;
-        }
+                    if let Some(child_runtime) =
+                        load_child_runtime_for_run(&processor, run.id.as_str()).await?
+                    {
+                        return self
+                            .recover_existing_child_turn(
+                                &processor,
+                                &task_response,
+                                &run,
+                                &agent_spec,
+                                &execution,
+                                child_runtime,
+                                handle,
+                            )
+                            .await;
+                    }
 
-        let parent = resolve_parent_context(&processor, &task_response.task).await?;
-        match self
-            .acquire_write_locks(&processor, &task_response.task, &run, handle.clone())
-            .await?
-        {
-            TaskExecutorStartOutcome::Started => {}
-            outcome => return Ok(outcome),
-        }
-        // The occurrence turn is the durable security parent for this run, so it
-        // carries the Task's maximum cap. The composer selection is applied to
-        // the actual hidden child below and may safely narrow that cap.
-        let occurrence_permission_profile =
-            effective_task_child_permission_profile(&agent_spec, None)?;
-        let parent = ensure_task_run_occurrence_context(
-            &processor,
-            &task_response,
-            &run,
-            &execution,
-            &agent_spec,
-            parent,
-            &occurrence_permission_profile,
-        )
-        .await?;
-        self.start_new_child_turn(
-            &processor,
-            &context,
-            &task_response,
-            &run,
-            &agent_spec,
-            &parent,
-            execution,
-            handle,
-        )
+                    let parent = resolve_parent_context(&processor, &task_response.task).await?;
+                    match self
+                        .acquire_write_locks(&processor, &task_response.task, &run, handle.clone())
+                        .await?
+                    {
+                        TaskExecutorStartOutcome::Started => {}
+                        outcome => return Ok(outcome),
+                    }
+                    // The occurrence turn is the durable security parent for this run, so it
+                    // carries the Task's maximum cap. The composer selection is applied to
+                    // the actual hidden child below and may safely narrow that cap.
+                    let occurrence_permission_profile =
+                        effective_task_child_permission_profile(&agent_spec, None)?;
+                    let parent = ensure_task_run_occurrence_context(
+                        &processor,
+                        &task_response,
+                        &run,
+                        &execution,
+                        &agent_spec,
+                        parent,
+                        &occurrence_permission_profile,
+                    )
+                    .await?;
+                    self.start_new_child_turn(
+                        &processor,
+                        &context,
+                        &task_response,
+                        &run,
+                        &agent_spec,
+                        &parent,
+                        execution,
+                        handle,
+                    )
+                    .await
+                },
+            )
+            .await;
+            if let Some(work) = task_response
+                .task
+                .metadata
+                .as_ref()
+                .and_then(|m| m.composer_work.as_ref())
+            {
+                let outcome = match &result {
+                    Err(_) => Some("failed"),
+                    Ok(TaskExecutorStartOutcome::Rejected) => Some("rejected"),
+                    Ok(TaskExecutorStartOutcome::Queued) => {
+                        pioneer_observability::turn_startup::delegation_requeued(
+                            &work.launch.turn_id,
+                        );
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    processor
+                        .send_delegated_startup_outcome(
+                            &work.launch.thread_id,
+                            &work.launch.turn_id,
+                            outcome,
+                        )
+                        .await;
+                }
+            }
+            result
+        })
         .await
     }
 
@@ -1545,6 +1603,16 @@ impl TaskAgentExecutor {
         };
         let child_thread_id = child_runtime.task_run_turn.thread_id.clone();
         let child_turn_id = child_runtime.task_run_turn.turn_id.clone();
+        if let Some(work) = task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.composer_work.as_ref())
+        {
+            pioneer_observability::turn_startup::delegated_child(
+                &work.launch.turn_id,
+                &child_turn_id,
+            );
+        }
         let mut composer_launch =
             rebound_composer_work_launch(task, child_thread_id.as_str(), child_turn_id.as_str())?;
         if let Some(launch) = composer_launch.as_ref() {

@@ -31,6 +31,7 @@ mod performance;
 mod qualification_diagnostics;
 mod startup;
 mod telemetry;
+pub mod turn_startup;
 
 pub use database_workload::{
     DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext, DatabaseWorkloadOutcome,
@@ -345,6 +346,9 @@ fn set_telemetry_gate(enabled: bool) {
     let generation = (current >> 1).wrapping_add(1);
     let next = (generation << 1) | u64::from(enabled);
     TELEMETRY_CONSENT.store(next, Ordering::Release);
+    if !enabled {
+        turn_startup::discard_on_opt_out();
+    }
 }
 
 pub fn telemetry_enabled() -> bool {

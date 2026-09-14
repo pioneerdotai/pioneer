@@ -506,6 +506,10 @@ impl MessageProcessor {
                     .await;
                     return;
                 }
+                pioneer_observability::turn_startup::thread_role(
+                    &turn_params.turn_id,
+                    thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
+                );
                 if thread.origin_kind.composer_execution_mode()
                     == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
                 {
@@ -1031,10 +1035,19 @@ impl MessageProcessor {
         &self,
         session: &GatewayVoiceSession,
     ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
-        let audio = self
-            .voice_session_buffers
-            .take_session_audio(session.session_id.as_str())
-            .map_err(|error| error.into_voice_error())?;
+        let _startup_stage = pioneer_observability::turn_startup::stage(
+            &session.turn_id,
+            pioneer_observability::turn_startup::Stage::VoiceFinalize,
+        );
+        let audio = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &session.turn_id,
+                pioneer_observability::turn_startup::Stage::VoiceFinish,
+            );
+            self.voice_session_buffers
+                .take_session_audio(session.session_id.as_str())
+                .map_err(|error| error.into_voice_error())?
+        };
         let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
         debug!(
             session_id = %session.session_id,
@@ -1049,35 +1062,44 @@ impl MessageProcessor {
             non_zero_samples = signal_stats.non_zero_samples,
             "voice session audio signal stats"
         );
-        let speech_outcome = if audio.normalized_samples.is_empty() {
-            VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
-                reason: crate::voice::transcription::VoiceTranscriptionNoSpeechReason::EmptyBuffer,
-                total_samples: 0,
-            })
-        } else {
-            let detector =
-                EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
+        let speech_outcome = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &session.turn_id,
+                pioneer_observability::turn_startup::Stage::VoiceVad,
+            );
+            if audio.normalized_samples.is_empty() {
+                VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
+                    reason:
+                        crate::voice::transcription::VoiceTranscriptionNoSpeechReason::EmptyBuffer,
+                    total_samples: 0,
+                })
+            } else {
+                let detector =
+                    EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
+                        .map_err(|error| VoiceError {
+                            kind: VoiceErrorKind::TranscriptionFailed,
+                            message: format!("failed to initialize gateway voice VAD: {error:#}"),
+                            public_error: None,
+                        })?;
+                let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default()).map_err(
+                    |error| VoiceError {
+                        kind: VoiceErrorKind::TranscriptionFailed,
+                        message: format!("failed to initialize gateway voice VAD: {error:#}"),
+                        public_error: None,
+                    },
+                )?;
+                let vad_outcome = vad
+                    .segment_samples(audio.normalized_samples.as_slice())
                     .map_err(|error| VoiceError {
                         kind: VoiceErrorKind::TranscriptionFailed,
-                        message: format!("failed to initialize gateway voice VAD: {error:#}"),
+                        message: format!("failed to segment voice audio: {error:#}"),
                         public_error: None,
                     })?;
-            let mut vad =
-                SmoothedVoiceVad::new(detector, VoiceVadConfig::default()).map_err(|error| {
-                    VoiceError {
-                        kind: VoiceErrorKind::TranscriptionFailed,
-                        message: format!("failed to initialize gateway voice VAD: {error:#}"),
-                        public_error: None,
-                    }
-                })?;
-            let vad_outcome = vad
-                .segment_samples(audio.normalized_samples.as_slice())
-                .map_err(|error| VoiceError {
-                    kind: VoiceErrorKind::TranscriptionFailed,
-                    message: format!("failed to segment voice audio: {error:#}"),
-                    public_error: None,
-                })?;
-            PreparedSpeechBuffer::from_vad_outcome(audio.audio_format.sample_rate_hz, vad_outcome)
+                PreparedSpeechBuffer::from_vad_outcome(
+                    audio.audio_format.sample_rate_hz,
+                    vad_outcome,
+                )
+            }
         };
 
         let buffer = match speech_outcome {
@@ -1153,6 +1175,23 @@ impl MessageProcessor {
         thread_id: &str,
         mut notification: VoiceSessionResultNotification,
     ) {
+        if let Some(key) = notification.turn_id.as_deref() {
+            let outcome = match notification.outcome {
+                VoiceSessionOutcome::Cancelled => {
+                    Some(pioneer_observability::turn_startup::Outcome::Cancelled)
+                }
+                VoiceSessionOutcome::NoSpeech => {
+                    Some(pioneer_observability::turn_startup::Outcome::NoSpeech)
+                }
+                VoiceSessionOutcome::Failed => {
+                    Some(pioneer_observability::turn_startup::Outcome::Failed)
+                }
+                VoiceSessionOutcome::TurnStarted => None,
+            };
+            if let Some(outcome) = outcome {
+                pioneer_observability::turn_startup::finish(key, outcome);
+            }
+        }
         if let Some(error) = notification.error.take() {
             notification.error = Some(voice_error_at_public_boundary(
                 error,
@@ -1288,6 +1327,9 @@ fn voice_turn_start_params_from_transcript(
     context: &pioneer_protocol::VoiceTurnContext,
     transcript: VoiceTranscript,
 ) -> Result<TurnStartParams, VoiceTranscriptionNoSpeech> {
+    let _startup_input = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::VoiceInput,
+    );
     let transcript_text = transcript.text.trim();
     if transcript_text.is_empty() {
         return Err(VoiceTranscriptionNoSpeech {

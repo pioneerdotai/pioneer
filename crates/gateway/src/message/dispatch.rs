@@ -272,7 +272,7 @@ impl MessageProcessor {
         connection: &'a crate::request_context::ConnectionContext,
         payload: &'a str,
     ) -> MessageFuture<'a, ()> {
-        let request_value = match serde_json::from_str::<JsonValue>(payload) {
+        let mut request_value = match serde_json::from_str::<JsonValue>(payload) {
             Ok(value) => value,
             Err(_) => {
                 let canonical_method =
@@ -300,6 +300,20 @@ impl MessageProcessor {
             }
         };
 
+        let telemetry_method = request_value
+            .get("method")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if let Some(params) = request_value.get_mut("params") {
+            pioneer_observability::turn_startup::accept_params(&telemetry_method, params);
+            if let Some(key) = pioneer_observability::turn_startup::request_key(params) {
+                pioneer_observability::turn_startup::connection_owner(
+                    &key,
+                    connection.connection_id(),
+                );
+            }
+        }
         let request_id = parse_request_id(&request_value);
         let canonical_method = request_value
             .get("method")
@@ -362,28 +376,48 @@ impl MessageProcessor {
             );
         }
 
-        let dispatched = message_future(async move {
-            let admission = match self.authorize_normal_request(&context, &request).await {
-                Ok(admission) => admission,
-                Err(response) => {
-                    self.send_error(context.connection_id(), response).await;
-                    return;
-                }
-            };
+        // An unrelated RPC about the same turn must not join or terminate its startup.
+        let startup_key = if matches!(
+            request.method.as_str(),
+            "turn/start" | "voice/session/finalize"
+        ) {
+            request
+                .params
+                .as_ref()
+                .and_then(pioneer_observability::turn_startup::request_key)
+        } else {
+            None
+        };
+        let dispatched = message_future(pioneer_observability::turn_startup::scope_stage(
+            startup_key,
+            pioneer_observability::turn_startup::Stage::GatewayDispatch,
+            async move {
+                let admission_span = pioneer_observability::turn_startup::current_stage(
+                    pioneer_observability::turn_startup::Stage::Admission,
+                );
+                let admission = match self.authorize_normal_request(&context, &request).await {
+                    Ok(admission) => admission,
+                    Err(response) => {
+                        self.send_error(context.connection_id(), response).await;
+                        return;
+                    }
+                };
 
-            // Large start workflows expose dedicated erased futures so constructing them does
-            // not share one native stack frame with every branch in the dispatch match.
-            let handler = if request.method == methods::TURN_START {
-                self.dispatch_turn_start(context, request, admission)
-            } else if request.method == methods::THREAD_START {
-                self.dispatch_thread_start(context, request, admission)
-            } else if request.method == methods::SETTINGS_UPDATE {
-                self.dispatch_settings_update(context, request)
-            } else {
-                self.process_request_inner(context, request, admission)
-            };
-            handler.await;
-        });
+                drop(admission_span);
+                // Large start workflows expose dedicated erased futures so constructing them does
+                // not share one native stack frame with every branch in the dispatch match.
+                let handler = if request.method == methods::TURN_START {
+                    self.dispatch_turn_start(context, request, admission)
+                } else if request.method == methods::THREAD_START {
+                    self.dispatch_thread_start(context, request, admission)
+                } else if request.method == methods::SETTINGS_UPDATE {
+                    self.dispatch_settings_update(context, request)
+                } else {
+                    self.process_request_inner(context, request, admission)
+                };
+                handler.await;
+            },
+        ));
 
         instrument_message_future(dispatched, span)
     }

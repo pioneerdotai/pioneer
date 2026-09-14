@@ -169,6 +169,9 @@ pub fn resolve_selected_execution_target(
         });
     };
 
+    let _startup_readiness = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::ReadinessWait,
+    );
     let runtimes = core.read_provider_runtimes(workspace_id, true)?.runtimes;
 
     selected_execution_target_from_runtimes(Some(provider_key), runtimes.as_slice())
@@ -293,6 +296,10 @@ impl ClientCore {
         &self,
         identity: &ComposerOperationIdentity,
     ) -> anyhow::Result<()> {
+        let _startup_wait = pioneer_observability::turn_startup::stage(
+            &identity.startup_observation_key(),
+            pioneer_observability::turn_startup::Stage::ClientSessionWait,
+        );
         while self.gateway_refresh_in_flight() {
             anyhow::ensure!(
                 self.composer_operation_plan(identity).is_some(),
@@ -321,10 +328,24 @@ impl ClientCore {
                 == ClientTransitionOutcome::Changed,
             "Composer send cancelled or already submitted"
         );
-        let result = self
-            .wait_composer_session_refresh(&identity)
-            .and_then(|_| self.prepare_and_send_composer(identity.clone(), file_system, context));
+        pioneer_observability::turn_startup::client_preparing(&identity.startup_observation_key());
+        let _startup_prepare = pioneer_observability::turn_startup::stage(
+            &identity.startup_observation_key(),
+            pioneer_observability::turn_startup::Stage::ClientPrepare,
+        );
+        let result = pioneer_observability::turn_startup::scope_sync(
+            Some(identity.startup_observation_key()),
+            || {
+                self.wait_composer_session_refresh(&identity).and_then(|_| {
+                    self.prepare_and_send_composer(identity.clone(), file_system, context)
+                })
+            },
+        );
         if let Err(error) = &result {
+            pioneer_observability::turn_startup::finish(
+                &identity.startup_observation_key(),
+                pioneer_observability::turn_startup::Outcome::Failed,
+            );
             self.complete_composer_operation(
                 identity,
                 ComposerOperationCompletion::Failed {
@@ -396,6 +417,7 @@ impl ClientCore {
             .map_err(anyhow::Error::msg)?;
         let ids = plan_turn_start_ids();
         let turn_id = ids.turn_id;
+        pioneer_observability::turn_startup::bind(&operation.startup_observation_key(), &turn_id);
         let pending_request_id = ids.pending_request_id;
         let (workspace_id, composer_execution_mode) = {
             let inner = self;
@@ -412,6 +434,17 @@ impl ClientCore {
                     .unwrap_or(ThreadComposerExecutionMode::ForegroundTurn),
             )
         };
+        if let Some(coordinator) = self.thread_coordinator_snapshot(thread_id.as_str()) {
+            if let Some(thread) = coordinator.thread() {
+                pioneer_observability::turn_startup::thread_role(
+                    &turn_id,
+                    thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
+                );
+            }
+        }
+        if composer_execution_mode == ThreadComposerExecutionMode::DetachedTask {
+            pioneer_observability::turn_startup::delegated(&turn_id);
+        }
         if let Some(requested_workspace_id) = requested_workspace_id.as_deref() {
             if requested_workspace_id != workspace_id {
                 return Err(anyhow::anyhow!(
@@ -829,6 +862,10 @@ impl ClientCore {
             identity,
             transport,
         };
+        let _startup_upload = pioneer_observability::turn_startup::stage(
+            &identity.startup_observation_key(),
+            pioneer_observability::turn_startup::Stage::ClientUpload,
+        );
         let result = prepare_composer_turn(
             &transport,
             file_system,

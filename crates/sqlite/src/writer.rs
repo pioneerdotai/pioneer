@@ -589,6 +589,9 @@ impl SqliteWriteExecutor {
     }
 
     async fn acquire(&self, class: SqliteWriteClass) -> SqliteWritePermit {
+        let _startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbAdmission,
+        );
         let (receiver, mut registration) = self.admission.enqueue(class);
         let reservation = receiver
             .await
@@ -614,6 +617,9 @@ impl ConnectionTrait for SqliteWriteConnection {
 
     async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         self.executor
             .connection
             .execute_raw(statement)
@@ -623,6 +629,9 @@ impl ConnectionTrait for SqliteWriteConnection {
 
     async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         self.executor
             .connection
             .execute_unprepared(sql)
@@ -632,6 +641,9 @@ impl ConnectionTrait for SqliteWriteConnection {
 
     async fn query_one_raw(&self, statement: Statement) -> Result<Option<QueryResult>, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         self.executor
             .connection
             .query_one_raw(statement)
@@ -641,6 +653,9 @@ impl ConnectionTrait for SqliteWriteConnection {
 
     async fn query_all_raw(&self, statement: Statement) -> Result<Vec<QueryResult>, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         self.executor
             .connection
             .query_all_raw(statement)
@@ -730,6 +745,9 @@ impl StreamTrait for SqliteWriteConnection {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
         Box::pin(async move {
             let permit = self.executor.acquire(self.class).await;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
             let effective_class = permit.class();
             let stream = self
                 .executor
@@ -777,6 +795,9 @@ impl SqliteTransaction {
     }
 
     pub async fn commit(mut self) -> Result<(), DbErr> {
+        let _startup_commit = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbCommit,
+        );
         self.inner
             .take()
             .expect("SQLite transaction was already completed")
@@ -889,6 +910,9 @@ impl TransactionTrait for SqliteWriteConnection {
 
     async fn begin(&self) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         let effective_class = permit.class();
         let transaction = self
             .executor
@@ -905,6 +929,9 @@ impl TransactionTrait for SqliteWriteConnection {
         access_mode: Option<AccessMode>,
     ) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         let effective_class = permit.class();
         let transaction = self
             .executor
@@ -920,6 +947,9 @@ impl TransactionTrait for SqliteWriteConnection {
         options: TransactionOptions,
     ) -> Result<Self::Transaction, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        let _startup_execute = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbExecute,
+        );
         let effective_class = permit.class();
         let transaction = self
             .executor

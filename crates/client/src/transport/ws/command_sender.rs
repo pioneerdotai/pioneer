@@ -923,7 +923,27 @@ where
     require_non_empty_field(params.thread_id.as_str(), "thread_id", methods::TURN_START)?;
     require_non_empty_field(params.turn_id.as_str(), "turn_id", methods::TURN_START)?;
 
-    send_json_rpc_request_typed(transport, methods::TURN_START, &params, RPC_REQUEST_TIMEOUT)
+    let runtime = match params.execution_backend.as_ref() {
+        Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { runtime_kind, .. }) => {
+            match runtime_kind {
+                pioneer_protocol::CLIAgentRuntimeKind::Codex => {
+                    pioneer_observability::turn_startup::Runtime::Codex
+                }
+                _ => pioneer_observability::turn_startup::Runtime::Claude,
+            }
+        }
+        _ => pioneer_observability::turn_startup::Runtime::Native,
+    };
+    pioneer_observability::turn_startup::set_runtime(&params.turn_id, runtime);
+    let result =
+        send_json_rpc_request_typed(transport, methods::TURN_START, &params, RPC_REQUEST_TIMEOUT);
+    if result.is_err() {
+        pioneer_observability::turn_startup::finish(
+            &params.turn_id,
+            pioneer_observability::turn_startup::Outcome::Rejected,
+        );
+    }
+    result
 }
 
 pub fn turn_message_edit<TTransport>(

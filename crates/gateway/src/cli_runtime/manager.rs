@@ -615,15 +615,28 @@ impl CLIAgentRuntimeManager {
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
         let start_lock = self.start_lock_for_key(&key).await;
+        let startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliSessionWait,
+        );
         let _guard = start_lock.lock().await;
+        drop(startup_wait);
 
         if let Some(handle) = self
             .touch_reusable_session(&key, &launch_spec, now_ms)
             .await
         {
+            pioneer_observability::turn_startup::session_state(
+                pioneer_observability::turn_startup::SessionState::Reused,
+            );
             return Ok(handle);
         }
+        pioneer_observability::turn_startup::session_state(
+            pioneer_observability::turn_startup::SessionState::New,
+        );
         if let Some(stale) = self.session_requiring_restart(&key, &launch_spec).await {
+            pioneer_observability::turn_startup::session_state(
+                pioneer_observability::turn_startup::SessionState::Replaced,
+            );
             validate_replacement_continuation(&stale.launch_spec, &launch_spec)?;
             stale
                 .session
@@ -703,6 +716,9 @@ impl CLIAgentRuntimeManager {
         launch_spec: CliSessionLaunchSpec,
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
+        let _startup_initialize = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliInitialize,
+        );
         let instance = self.generations.allocate(key.clone())?;
         let session = match self
             .factory

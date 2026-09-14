@@ -186,6 +186,9 @@ pub(super) async fn prepare_native_projection(
         if !recovery && budget.fits(input, full.output_reserve, false) {
             return Ok::<_, anyhow::Error>((full.request, receipt, None));
         }
+        let _startup_compaction = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CompactionWork,
+        );
         let effort = match full.request.reasoning {
             Some(pioneer_provider::ReasoningConfig::Effort(effort)) => {
                 Some(effort.as_str().to_owned())
@@ -467,6 +470,10 @@ impl pioneer_agent::compaction::controller::NativeContextController
             .now_ms()
             .saturating_add(pioneer_compaction::OPERATION_MILLIS)
             .min(context.recovery_deadline_ms.unwrap_or(u64::MAX));
+        let startup_wait = pioneer_observability::turn_startup::stage(
+            &context.turn_id,
+            pioneer_observability::turn_startup::Stage::CompactionWait,
+        );
         let lease = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
@@ -475,6 +482,7 @@ impl pioneer_agent::compaction::controller::NativeContextController
                 super::ContextWorkPriority::Foreground, &context.cancellation,
             ) => result?.ok_or_else(|| anyhow::anyhow!("native context owner unavailable"))?,
         };
+        drop(startup_wait);
         let refresh = refresh_native_history(&processor, context, request);
         let (request, projection) = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),

@@ -351,6 +351,21 @@ impl Render for TimelineRowView {
         {
             self.renders += 1;
         }
+        if let Some(item) = self.presentation.snapshot.item() {
+            use pioneer_client::timeline::types::TurnItem;
+            let content = match &item.item {
+                TurnItem::AgentMessage { text, .. } => !text.is_empty(),
+                TurnItem::Reasoning {
+                    summary, content, ..
+                } => {
+                    self.presentation.is_expanded() && (!summary.is_empty() || !content.is_empty())
+                }
+                _ => false,
+            };
+            if content {
+                pioneer_observability::turn_startup::presented(&item.turn_id);
+            }
+        }
         self.presentation.render(cx)
     }
 }

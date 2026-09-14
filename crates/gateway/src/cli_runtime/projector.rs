@@ -159,6 +159,21 @@ fn project_item_started(
         started.metadata.as_ref(),
     );
 
+    if context.recovery.is_none()
+        && matches!(
+            &item,
+            TurnItem::CommandExecution { .. }
+                | TurnItem::FileChange { .. }
+                | TurnItem::DynamicToolCall { .. }
+                | TurnItem::WebSearch { .. }
+        )
+    {
+        pioneer_observability::turn_startup::runtime_output(
+            &context.turn_id,
+            pioneer_observability::turn_startup::Output::ToolCall,
+        );
+    }
+
     CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemStarted {
         notification: ItemStartedNotification {
             workspace_id: context.workspace_id.clone(),
@@ -199,6 +214,19 @@ fn project_item_delta(
     context: &CLIRuntimeProjectorContext,
     delta: &RuntimeItemDelta,
 ) -> CLIRuntimeProjectedEvents {
+    if !delta.delta.is_empty() && context.recovery.is_none() {
+        use pioneer_observability::turn_startup::{self, Output};
+        let output = match delta.delta_kind {
+            RuntimeItemDeltaKind::AgentMessage => Some(Output::Text),
+            RuntimeItemDeltaKind::ReasoningText | RuntimeItemDeltaKind::ReasoningSummary => {
+                Some(Output::Reasoning)
+            }
+            _ => None,
+        };
+        if let Some(output) = output {
+            turn_startup::runtime_output(&context.turn_id, output);
+        }
+    }
     let (stream, runtime_delta_kind) = match delta.delta_kind {
         RuntimeItemDeltaKind::AgentMessage => (ItemDeltaStream::AgentMessage, "agent_message"),
         RuntimeItemDeltaKind::ReasoningText => (ItemDeltaStream::Generic, "reasoning_text"),
@@ -275,6 +303,31 @@ fn project_item_completed(
     }
 
     let item = completed_turn_item(completed);
+
+    if context.recovery.is_none() {
+        if let TurnItem::AgentMessage { text, .. } = &item {
+            if !text.is_empty() {
+                pioneer_observability::turn_startup::runtime_output(
+                    &context.turn_id,
+                    pioneer_observability::turn_startup::Output::BufferedText,
+                );
+            }
+        }
+    }
+
+    if context.recovery.is_none() {
+        if let TurnItem::Reasoning {
+            summary, content, ..
+        } = &item
+        {
+            if summary.iter().chain(content).any(|s| !s.is_empty()) {
+                pioneer_observability::turn_startup::runtime_output(
+                    &context.turn_id,
+                    pioneer_observability::turn_startup::Output::BufferedReasoning,
+                );
+            }
+        }
+    }
 
     CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
         notification: ItemCompletedNotification {

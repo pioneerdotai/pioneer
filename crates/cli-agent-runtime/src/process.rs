@@ -466,6 +466,9 @@ pub fn spawn_cli_agent_process(config: &CLIAgentProcessSpawnConfig) -> Result<CL
 pub fn spawn_prepared_cli_agent_process(
     prepared: &PreparedCLIAgentCommand,
 ) -> Result<CLIAgentProcess> {
+    let _startup_stage = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::CliSpawn,
+    );
     let mut command = Command::new(prepared.executable.as_str());
     scrub_inherited_cli_environment(&mut command);
     command.args(prepared.args.iter().map(String::as_str));

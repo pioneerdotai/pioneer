@@ -39,16 +39,64 @@ struct ClientMobileStartupStageTiming {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct ClientMobileStartupRecordResult {
     pub recorded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 pub(crate) fn record_mobile_startup(
     input_json: &str,
 ) -> Result<ClientMobileStartupRecordResult, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(input_json).map_err(|_| "invalid telemetry report".to_owned())?;
+    if value.get("kind").and_then(|v| v.as_str()) == Some("turn_startup") {
+        #[derive(Deserialize)]
+        struct Report {
+            key: String,
+            duration_ms: Option<f64>,
+            text: Option<bool>,
+            loss: Option<String>,
+            receive: Option<bool>,
+            bridge_ms: Option<f64>,
+        }
+        let report: Report =
+            serde_json::from_value(value).map_err(|_| "invalid turn startup report".to_owned())?;
+        if report.key.len() > 512 {
+            return Err("invalid startup key".to_owned());
+        }
+        let turn_id = pioneer_observability::turn_startup::canonical_key(&report.key);
+        let lost = report.loss.as_deref().is_some_and(|reason| {
+            pioneer_observability::turn_startup::mobile_lost(&report.key, reason)
+        });
+        let bridge = report
+            .bridge_ms
+            .is_some_and(|ms| pioneer_observability::turn_startup::mobile_bridge(&report.key, ms));
+        let recorded = lost
+            || bridge
+            || report.duration_ms.is_some_and(|ms| {
+                if report.receive.unwrap_or(false) {
+                    pioneer_observability::turn_startup::mobile_received(
+                        &report.key,
+                        ms,
+                        report.text.unwrap_or(false),
+                    )
+                } else {
+                    pioneer_observability::turn_startup::mobile_presented(
+                        &report.key,
+                        ms,
+                        report.text.unwrap_or(false),
+                    )
+                }
+            });
+        return Ok(ClientMobileStartupRecordResult { recorded, turn_id });
+    }
     let request = serde_json::from_str::<ClientMobileStartupRecordRequest>(input_json)
         .map_err(|error| format!("invalid mobile startup report: {error}"))?;
     if !request.enabled {
         pioneer_observability::set_telemetry_enabled(false);
-        return Ok(ClientMobileStartupRecordResult { recorded: false });
+        return Ok(ClientMobileStartupRecordResult {
+            recorded: false,
+            turn_id: None,
+        });
     }
 
     let duration = duration_from_millis(request.duration_ms, "duration_ms")?;
@@ -109,7 +157,10 @@ pub(crate) fn record_mobile_startup(
     // interval elapses. Flush this single lifecycle sample immediately, but
     // never block the JavaScript/UI thread on telemetry network I/O.
     pioneer_observability::schedule_observability_flush();
-    Ok(ClientMobileStartupRecordResult { recorded: true })
+    Ok(ClientMobileStartupRecordResult {
+        recorded: true,
+        turn_id: None,
+    })
 }
 
 fn validate_stage_outcome(failed: bool, cancelled: bool) -> Result<(), String> {
@@ -129,6 +180,24 @@ fn duration_from_millis(value: f64, field: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::{duration_from_millis, validate_stage_outcome};
+
+    #[test]
+    fn turn_reports_are_bounded_and_do_not_require_a_mobile_startup_payload() {
+        for extra in [
+            "\"receive\":true",
+            "\"loss\":\"background\"",
+            "\"text\":true",
+        ] {
+            let json = format!(
+                "{{\"kind\":\"turn_startup\",\"key\":\"missing-turn\",\"duration_ms\":1,{extra}}}"
+            );
+            let result = super::record_mobile_startup(&json).unwrap();
+            assert!(!result.recorded);
+            assert!(result.turn_id.is_none());
+        }
+        let json = serde_json::json!({"kind":"turn_startup","key":"x".repeat(513)}).to_string();
+        assert!(super::record_mobile_startup(&json).is_err());
+    }
 
     #[test]
     fn startup_durations_are_finite_and_bounded() {

@@ -466,7 +466,11 @@ impl VoiceInputSupervisor {
         &self,
         buffer: &super::transcription::PreparedSpeechBuffer,
     ) -> std::result::Result<String, VoiceTranscriptionError> {
+        let startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::VoiceTranscriberWait,
+        );
         let mut inner = self.lock_inner();
+        drop(startup_wait);
         let desired = inner.state.desired.selected_identity();
         if inner.state.runtime.phase != GatewayVoiceInputRuntimePhase::Ready
             || !inner.state.runtime.effective_enabled
@@ -483,7 +487,11 @@ impl VoiceInputSupervisor {
                 "Voice Input reported Ready without a loaded engine",
             ));
         };
+        let startup_transcribe = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::VoiceTranscribe,
+        );
         let result = catch_unwind(AssertUnwindSafe(|| engine.transcribe(buffer)));
+        drop(startup_transcribe);
         match result {
             Ok(Ok(transcript)) => Ok(transcript),
             Ok(Err(error)) => {

@@ -164,6 +164,7 @@ pub fn init_otlp_observability_for(
         })
         .build();
     let meter = meter_provider.meter(target.instrumentation_name());
+    crate::turn_startup::init(&meter);
     let startup_metrics = StartupMetrics::new(
         &meter,
         target.startup_duration_name(),
@@ -403,10 +404,12 @@ impl<E> SdkSpanExporter for ConsentGatedSpanExporter<E>
 where
     E: SdkSpanExporter,
 {
-    async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+    async fn export(&self, mut batch: Vec<SpanData>) -> OTelSdkResult {
         if !super::telemetry_enabled() {
             return Ok(());
         }
+        let epoch = super::telemetry_consent_snapshot().1 as i64;
+        batch.retain_mut(|span| startup_span_attributes_allowed(&mut span.attributes, epoch));
         self.inner.export(batch).await
     }
 
@@ -628,5 +631,39 @@ mod tests {
         await_ready(trace_exporter.export(Vec::new())).expect("enabled trace export succeeds");
         assert_eq!(metric_exports.load(Ordering::Relaxed), 1);
         assert_eq!(trace_exports.load(Ordering::Relaxed), 1);
+    }
+}
+
+// The marker is process-local bookkeeping, never an exported dimension.
+fn startup_span_attributes_allowed(
+    attributes: &mut Vec<opentelemetry::KeyValue>,
+    epoch: i64,
+) -> bool {
+    let allowed = attributes
+        .iter()
+        .find(|a| a.key.as_str() == crate::turn_startup::CONSENT_EPOCH_ATTRIBUTE)
+        .is_none_or(|a| a.value == opentelemetry::Value::I64(epoch));
+    attributes.retain(|a| a.key.as_str() != crate::turn_startup::CONSENT_EPOCH_ATTRIBUTE);
+    allowed
+}
+#[cfg(test)]
+mod startup_consent_tests {
+    #[test]
+    fn late_startup_spans_cannot_cross_opt_out_and_opt_in() {
+        use opentelemetry::KeyValue;
+        let marker = crate::turn_startup::CONSENT_EPOCH_ATTRIBUTE;
+        let mut old = vec![
+            KeyValue::new(marker, 1_i64),
+            KeyValue::new("stage", "cli.initialize"),
+        ];
+        assert!(!super::startup_span_attributes_allowed(&mut old, 3));
+        let mut current = vec![
+            KeyValue::new(marker, 3_i64),
+            KeyValue::new("stage", "cli.initialize"),
+        ];
+        assert!(super::startup_span_attributes_allowed(&mut current, 3));
+        assert_eq!(current, vec![KeyValue::new("stage", "cli.initialize")]);
+        let mut unrelated = vec![KeyValue::new("stage", "unrelated")];
+        assert!(super::startup_span_attributes_allowed(&mut unrelated, 3));
     }
 }

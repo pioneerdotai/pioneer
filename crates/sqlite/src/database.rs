@@ -78,6 +78,9 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
             let row = self
                 .connection
                 .query_one_raw(Statement::from_string(
@@ -102,6 +105,9 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
             self.connection
                 .ping()
                 .instrument(reader_pool_span(class))
@@ -120,6 +126,9 @@ impl SqliteReadPool {
         &self,
         class: SqliteReadClass,
     ) -> Result<Option<SqliteMaintenanceReadPermit>, DbErr> {
+        let _startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::DbAdmission,
+        );
         match class {
             SqliteReadClass::Interactive => Ok(None),
             SqliteReadClass::Maintenance => self.maintenance.acquire().await.map(Some),
@@ -135,6 +144,9 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
             self.connection
                 .query_one_raw(statement)
                 .instrument(reader_pool_span(class))
@@ -158,6 +170,9 @@ impl SqliteReadPool {
         let mut operation = SqliteReadOperation::start(self.observer.clone(), class);
         let result = async {
             let _permit = self.acquire(class).await?;
+            let _startup_execute = pioneer_observability::turn_startup::current_stage(
+                pioneer_observability::turn_startup::Stage::DbExecute,
+            );
             self.connection
                 .query_all_raw(statement)
                 .instrument(reader_pool_span(class))

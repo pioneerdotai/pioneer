@@ -384,6 +384,10 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    let future = pioneer_observability::turn_startup::scope(
+        pioneer_observability::turn_startup::current_key(),
+        future,
+    );
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await

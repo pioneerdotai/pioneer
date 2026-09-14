@@ -792,6 +792,9 @@ pub(super) async fn run_agent_turn_policy_hook_phase(
     context: &AgentTurnHookContext,
     input: TurnPrePolicyHookInput,
 ) -> Result<EffectiveTurnPolicySet, AgentTurnHookError> {
+    let _startup_hooks = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::HookPolicy,
+    );
     let Some(runtime) = runtime else {
         return Ok(EffectiveTurnPolicySet::empty());
     };
@@ -831,6 +834,9 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
     policy_set: &EffectiveTurnPolicySet,
     input: TurnPrePromptContextHookInput,
 ) -> EffectiveTurnPromptContextSet {
+    let _startup_hooks = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::HookContext,
+    );
     let Some(runtime) = runtime else {
         return EffectiveTurnPromptContextSet::empty();
     };
@@ -891,6 +897,9 @@ pub(super) async fn run_agent_turn_post_preflight_prompt_context_hook_phase(
     prompt_context_set: &EffectiveTurnPromptContextSet,
     input: TurnPostPreflightPromptContextHookInput,
 ) -> EffectiveTurnPromptContextSet {
+    let _startup_hooks = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::HookPostPreflight,
+    );
     let Some(runtime) = runtime else {
         return prompt_context_set.clone();
     };
@@ -954,6 +963,9 @@ pub(super) async fn run_agent_turn_prompt_compile_hook_phase(
     base_contributions: Vec<HookContribution>,
     input: TurnPrePromptCompileHookInput,
 ) -> Result<EffectiveTurnPromptSectionSet, AgentTurnHookError> {
+    let _startup_hooks = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::HookCompile,
+    );
     let Some(runtime) = runtime else {
         let prompt_section_set = prompt_section_set_from_contributions(base_contributions);
         return Ok(
@@ -1015,6 +1027,9 @@ pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
     artifact_store: Option<&Arc<AgentToolBundleArtifactStore>>,
     provider_tool_calling: bool,
 ) -> Result<EffectiveTurnToolBundleSet, AgentTurnHookError> {
+    let _startup_hooks = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::HookTools,
+    );
     let Some(runtime) = runtime else {
         return Ok(EffectiveTurnToolBundleSet::from_local(local_contributions));
     };

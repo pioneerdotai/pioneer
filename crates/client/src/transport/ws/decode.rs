@@ -42,10 +42,15 @@ pub fn process_text_payload(
         return None;
     }
 
-    let notification = match serde_json::from_value::<JsonRpcNotification>(value) {
+    let mut notification = match serde_json::from_value::<JsonRpcNotification>(value) {
         Ok(notification) => notification,
         Err(_) => return None,
     };
+
+    if let Some(params) = notification.params.as_mut() {
+        pioneer_observability::turn_startup::observe_notification(&notification.method, params);
+        pioneer_observability::turn_startup::strip_notification_metadata(params);
+    }
 
     if notification.method == events::SKILLS_UPLOAD_CHUNK_ACK
         && let Some(params) = notification.params.clone()
