@@ -80,13 +80,8 @@ impl MessageProcessor {
     ) -> Result<AuthorizedOutputSet> {
         let store = self.crud_store.with_maintenance_access();
         let authorization_revision = self.current_authorization_revision().await?;
-        let epoch = store
-            .compaction_projection_version(workspace, destination)
-            .await?;
-        let fence = store.compaction_history_read_fence().await?;
         let resolver = AuthorizationResolver::new(store.clone());
         let mut access = BTreeMap::new();
-        let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
         let mut branches: Vec<AuthorizedOutputBranch> = Vec::new();
         let mut seen = BTreeMap::<String, Option<usize>>::new();
         let mut after = 0;
@@ -96,6 +91,12 @@ impl MessageProcessor {
             destination_read,
             "destination history is unavailable or access is denied"
         );
+        super::history::prepare_history(&store, workspace, destination).await?;
+        let epoch = store
+            .compaction_projection_version(workspace, destination)
+            .await?;
+        let fence = store.compaction_history_read_fence().await?;
+        let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
         access.insert(destination.to_owned(), true);
         loop {
             let mut page = store

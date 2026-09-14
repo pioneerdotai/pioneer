@@ -60,6 +60,7 @@ pub mod compaction_frozen_history;
 pub mod compaction_frozen_import;
 pub mod compaction_frozen_message;
 pub mod compaction_history_check;
+pub mod compaction_history_preparation;
 pub mod compaction_input_revision;
 pub mod compaction_item_revision;
 pub mod compaction_manifest;

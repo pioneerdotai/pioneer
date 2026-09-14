@@ -23,6 +23,7 @@ pub(crate) mod compaction_frozen;
 pub(crate) mod compaction_frozen_import;
 pub(crate) mod compaction_history;
 pub(crate) mod compaction_lifecycle;
+pub(crate) mod compaction_preparation;
 pub(crate) mod compaction_runner;
 pub(crate) mod compaction_source_projection;
 pub(crate) mod compaction_task_output;

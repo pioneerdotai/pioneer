@@ -13,6 +13,30 @@ use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
 
 impl CrudStore {
+    /// One restart-safe, payload-free page of legacy history preparation.
+    /// Dropping the caller cancels work; a later caller resumes its durable cursor.
+    pub async fn compaction_prepare_history_quantum(
+        &self,
+        workspace: &str,
+        thread: &str,
+    ) -> Result<bool> {
+        let store = self.with_maintenance_access();
+        store
+            .run_background_database_quantum(|| {
+                repositories::compaction_preparation::quantum(&store, workspace, thread)
+            })
+            .await
+    }
+
+    pub async fn compaction_history_prepared(&self, workspace: &str, thread: &str) -> Result<bool> {
+        repositories::compaction_preparation::ready(
+            &self.with_maintenance_access(),
+            workspace,
+            thread,
+        )
+        .await
+    }
+
     /// Pin append-only discovery to a bounded high water mark. Edits remain
     /// governed by each source revision, not by this sequence boundary.
     pub async fn compaction_source_high_water(

@@ -1,6 +1,7 @@
 //! Source-aware canonical line loading. All database reads release Maintenance
 //! capacity before decoding. A shared fence can freeze several related lines.
 use super::*;
+
 use pioneer_crud::{
     CanonicalTurnEventPayload as Event,
     compaction::{HistoryReadFence, PagedSource, SourceRecord},
@@ -9,6 +10,23 @@ use pioneer_provider::{
     CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef, Role,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Preparation belongs to the requesting operation, never a detached startup
+/// scan. Each quantum releases SQLite capacity; cancellation leaves a durable
+/// cursor for the next request. Capture the history fence only after this returns.
+pub(crate) async fn prepare_history(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+) -> Result<()> {
+    while !store
+        .compaction_prepare_history_quantum(workspace, thread)
+        .await?
+    {
+        tokio::task::yield_now().await;
+    }
+    Ok(())
+}
 
 pub(crate) async fn source_payload(
     store: &CrudStore,

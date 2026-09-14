@@ -10,8 +10,8 @@ use pioneer_entity::{
     task_run_turn, thread, thread_lineage, turn, turn_event, turn_input, turn_llm_context,
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, Func, JoinType, Order, Query};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm::{ConnectionTrait, FromQueryResult};
-use sea_orm::{EntityTrait, QueryFilter};
 
 #[derive(Clone, Debug, FromQueryResult)]
 pub struct HistoryReadFence {
@@ -1602,6 +1602,31 @@ pub(crate) async fn compaction_history_turn_page<C: ConnectionTrait>(
     after: &str,
     fence: &HistoryReadFence,
 ) -> Result<Vec<HistoryTurnBoundary>> {
+    // Preserve the scoped-reader contract: an unavailable/foreign thread has
+    // no rows. Only an accessible, incompletely prepared history is an error.
+    if thread::Entity::find_by_id(thread)
+        .filter(thread::Column::WorkspaceId.eq(workspace))
+        .select_only()
+        .column(thread::Column::Id)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+    use pioneer_entity::compaction_history_preparation as preparation;
+    anyhow::ensure!(
+        preparation::Entity::find_by_id(thread)
+            .filter(preparation::Column::Ready.eq(1))
+            .filter(preparation::Column::InputOrder.lte(fence.input_order))
+            .filter(preparation::Column::EventOrder.lte(fence.event_order))
+            .filter(preparation::Column::ContextOrder.lte(fence.context_order))
+            .one(db)
+            .await?
+            .is_some(),
+        "compaction history preparation is required before capturing a read fence"
+    );
     Ok(turn::Entity::find()
         .select_only()
         .join(

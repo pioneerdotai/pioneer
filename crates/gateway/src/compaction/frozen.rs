@@ -316,6 +316,17 @@ pub(super) async fn capture_execution_basis_with_outputs(
             "accepted outputs belong to another context"
         );
     }
+    let omits_history = policy.is_some_and(|policy| {
+        matches!(
+            policy.mode,
+            pioneer_protocol::TaskAgentContextMode::Empty
+                | pioneer_protocol::TaskAgentContextMode::Custom
+        ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
+            && !policy.include_parent_summary)
+    });
+    if !omits_history && outputs.is_none() {
+        super::history::prepare_history(&store, workspace, thread).await?;
+    }
     let epoch = match outputs {
         Some(outputs) => *outputs
             .source_epochs
@@ -331,14 +342,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
         Some(outputs) => outputs.fence.clone(),
         None => store.compaction_history_read_fence().await?,
     };
-    let omits_history = policy.is_some_and(|policy| {
-        matches!(
-            policy.mode,
-            pioneer_protocol::TaskAgentContextMode::Empty
-                | pioneer_protocol::TaskAgentContextMode::Custom
-        ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
-            && !policy.include_parent_summary)
-    });
     let mut messages = if omits_history {
         Vec::new()
     } else {

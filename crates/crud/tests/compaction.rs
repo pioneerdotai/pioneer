@@ -257,6 +257,18 @@ async fn history_capture_after_upgrading_an_already_compressed_database() {
         .unwrap()
         .unwrap();
     assert!(legacy.text.contains("retained old result"));
+    let old_fence = store.compaction_history_read_fence().await.unwrap();
+    assert!(
+        store
+            .compaction_history_turn_page("ws", "thread", "", &old_fence)
+            .await
+            .is_err()
+    );
+    while !store
+        .compaction_prepare_history_quantum("ws", "thread")
+        .await
+        .unwrap()
+    {}
     let fence = store.compaction_history_read_fence().await.unwrap();
     for _ in 0..2 {
         let history = store

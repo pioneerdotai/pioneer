@@ -58,6 +58,7 @@ pub use super::compaction_frozen_history::Entity as CompactionFrozenHistory;
 pub use super::compaction_frozen_import::Entity as CompactionFrozenImport;
 pub use super::compaction_frozen_message::Entity as CompactionFrozenMessage;
 pub use super::compaction_history_check::Entity as CompactionHistoryCheck;
+pub use super::compaction_history_preparation::Entity as CompactionHistoryPreparation;
 pub use super::compaction_input_revision::Entity as CompactionInputRevision;
 pub use super::compaction_item_revision::Entity as CompactionItemRevision;
 pub use super::compaction_manifest::Entity as CompactionManifest;

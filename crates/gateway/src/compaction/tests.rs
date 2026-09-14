@@ -3341,3 +3341,78 @@ fn stopped_compaction_item_is_cancelled_with_the_same_lifecycle_identity() {
         assert_eq!(level, SystemEventLevel::Info);
     }
 }
+
+#[tokio::test]
+async fn legacy_history_is_prepared_before_freezing_a_new_execution_basis() {
+    use pioneer_protocol::TurnItem;
+    let f = fixture("unused", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('old-input','turn',0,'text','old request','{\"type\":\"text\",\"text\":\"old request\"}',CURRENT_TIMESTAMP)").await.unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: TurnItem::AgentMessage {
+                    id: "old-answer".into(),
+                    text: "old answer must survive upgrade".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    // Reproduce the installed legacy database: canonical data exists, but
+    // pre-upgrade rows were never entered in the compaction revision journals.
+    for sql in [
+        "DELETE FROM compaction_input_revision WHERE turn_id='turn'",
+        "DELETE FROM compaction_event_revision WHERE turn_id='turn'",
+        "DELETE FROM compaction_history_preparation WHERE thread_id='thread'",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let stale = f.store.compaction_history_read_fence().await.unwrap();
+    assert!(
+        f.store
+            .compaction_history_turn_page("ws", "thread", "", &stale)
+            .await
+            .is_err()
+    );
+    let json =
+        super::frozen::capture_execution_basis_json(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    assert!(
+        f.store
+            .compaction_history_prepared("ws", "thread")
+            .await
+            .unwrap()
+    );
+    let restored = crate::turn_runtime_snapshot::restore_history_json(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &json,
+    )
+    .await
+    .unwrap();
+    let text = serde_json::to_string(&restored).unwrap();
+    assert!(text.contains("old request"));
+    assert!(text.contains("old answer must survive upgrade"));
+    assert!(
+        f.store
+            .compaction_history_turn_page("ws", "thread", "", &stale)
+            .await
+            .is_err()
+    );
+}

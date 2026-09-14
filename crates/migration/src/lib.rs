@@ -1,6 +1,7 @@
 mod m20260910_000001_context_compaction;
 mod m20260913_000001_remove_compaction_item_capture_order;
 mod m20260913_000002_compaction_logical_payload_updates;
+mod m20260914_000001_compaction_history_preparation;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -138,6 +139,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000001_context_compaction::Migration),
             Box::new(m20260913_000001_remove_compaction_item_capture_order::Migration),
             Box::new(m20260913_000002_compaction_logical_payload_updates::Migration),
+            Box::new(m20260914_000001_compaction_history_preparation::Migration),
         ]
     }
 }

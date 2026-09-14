@@ -52,6 +52,17 @@ pub(crate) async fn rematerialize_overlap(
     affected: &BTreeSet<ScopedHistorySource>,
 ) -> Result<Vec<ChatMessage>> {
     let store = store.with_maintenance_access();
+    for thread in affected
+        .iter()
+        .map(|source| &source.thread)
+        .collect::<BTreeSet<_>>()
+    {
+        ensure!(
+            allowed.contains(thread),
+            "overlap history is outside accepted scope"
+        );
+        super::history::prepare_history(&store, workspace, thread).await?;
+    }
     let fence = store.compaction_history_read_fence().await?;
     let mut originals = BTreeMap::<String, Vec<ChatMessage>>::new();
     let mut result = Vec::new();
