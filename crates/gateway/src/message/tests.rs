@@ -9195,6 +9195,9 @@ async fn materialize_loaded_test_thread_for_durable_operation(
         .expect("materialized test thread should become durable in memory");
 }
 
+#[path = "tests/composer_history.rs"]
+mod composer_history;
+
 // Production canonical payloads are exposed through sqlite-zstd views. Keep
 // both Composer ingress tests on that schema so hidden-rowid regressions fail
 // at the same admission boundary as installed databases.
@@ -9500,6 +9503,7 @@ fn concurrent_collaborative_tasks_receive_independent_frozen_commands() {
 }
 
 async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_commands() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let (tx, mut rx) = mpsc::channel(256);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -9700,7 +9704,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .get_task_run_conversation_snapshot(task_b_run.id.as_str())
         .await
         .expect("Task B snapshot should load")
-        .expect("Task B history must be frozen at admission");
+        .expect("Task B history must be frozen before provider dispatch");
     let frozen_history = crate::turn_runtime_snapshot::restore_history_json(
         crud_store.as_ref(),
         &frozen.workspace_id,
@@ -22548,11 +22552,13 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             .first()
             .cloned()
             .expect("immediate dynamic Composer task should have a run");
+        // Message acceptance no longer waits for child context preparation.
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
         let conversation_snapshot = crud_store
             .get_task_run_conversation_snapshot(run.id.as_str())
             .await
             .expect("native Task conversation snapshot should load")
-            .expect("native Task conversation snapshot must be frozen at admission");
+            .expect("native Task conversation snapshot must be frozen before CLI activation");
         assert_eq!(
             conversation_snapshot.source_turn_id.as_deref(),
             Some(turn_id.as_str())
@@ -22666,7 +22672,6 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
             reprojected_task_card.sort_key.starts_with(source_sort_base),
             "projection rebuild must recover the source sort base from the durable Task row"
         );
-        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
         let child_turn_after_dispatch = crud_store
             .get_turn(
                 lineage.child_thread_id.as_str(),

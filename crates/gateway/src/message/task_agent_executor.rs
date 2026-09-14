@@ -1841,25 +1841,32 @@ impl TaskAgentExecutor {
             .system_thread_start_seeded(context.workspace_id.clone(), thread_params, None, None)
             .await
             .context("failed to create hidden task thread")?;
-        let frozen_conversation_scope = Some(
-            load_task_execution_conversation_scope(
-                processor,
-                task,
-                agent_spec,
-                run,
-                parent,
-                child_runtime.task_run_turn.kind,
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-                thread_outcome.started_notification.thread.model.as_str(),
-                thread_outcome
-                    .started_notification
-                    .thread
-                    .model_provider
-                    .as_str(),
+        // Composer already carries its complete input. Prepare its history only
+        // after the child Turn exists, so failures and cancellation belong to it.
+        // Other Task policies may need history to construct their synthetic input.
+        let frozen_conversation_scope = if composer_launch.is_some() {
+            None
+        } else {
+            Some(
+                load_task_execution_conversation_scope(
+                    processor,
+                    task,
+                    agent_spec,
+                    run,
+                    parent,
+                    child_runtime.task_run_turn.kind,
+                    child_thread_id.as_str(),
+                    child_turn_id.as_str(),
+                    thread_outcome.started_notification.thread.model.as_str(),
+                    thread_outcome
+                        .started_notification
+                        .thread
+                        .model_provider
+                        .as_str(),
+                )
+                .await?,
             )
-            .await?,
-        );
+        };
         let frozen_parent_history = frozen_conversation_scope
             .as_ref()
             .map(|(_, history)| history.as_slice());
@@ -2021,8 +2028,15 @@ impl TaskAgentExecutor {
                 let continuation_thread_id = parent.parent_thread_id.clone();
                 let task_run_id = run.id.clone();
                 let execution_id = execution.id.clone();
+                let prepare_composer_history = frozen_conversation_scope.is_none();
+                let history_task = (*task).clone();
+                let history_agent_spec = agent_spec.clone();
+                let history_run = (*run).clone();
+                let history_parent = (*parent).clone();
+                let history_turn = child_runtime.task_run_turn.clone();
+                let history_thread = thread_outcome.started_notification.thread.clone();
                 let prepared = message_fresh_task(async move {
-                    prepare_processor
+                    let prepared = prepare_processor
                         .prepare_task_cli_runtime_turn(
                             TurnStartParams {
                                 input: child_input,
@@ -2044,7 +2058,33 @@ impl TaskAgentExecutor {
                             action_author,
                             turn_response,
                         )
+                        .await?;
+                    // Keep context preparation on the same fresh-task boundary.
+                    // The child is durable; activation has not sent its command.
+                    if prepare_composer_history
+                        && let Err(error) = load_task_execution_conversation_scope(
+                            &prepare_processor,
+                            &history_task,
+                            &history_agent_spec,
+                            &history_run,
+                            &history_parent,
+                            history_turn.kind,
+                            history_turn.thread_id.as_str(),
+                            history_turn.turn_id.as_str(),
+                            history_thread.model.as_str(),
+                            history_thread.model_provider.as_str(),
+                        )
                         .await
+                    {
+                        prepare_processor
+                            .abort_prepared_task_cli_runtime_turn(
+                                prepared,
+                                format!("failed to prepare Task conversation history: {error:#}"),
+                            )
+                            .await;
+                        return Err(error).context("failed to prepare Task conversation history");
+                    }
+                    Ok(prepared)
                 })
                 .await
                 .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))?;
@@ -6633,9 +6673,9 @@ async fn load_task_execution_conversation_scope(
         .as_ref()
         .and_then(|metadata| metadata.composer_work.as_ref());
     let default_policy = crate::compaction::frozen::default_task_context_policy();
-    // Delayed/recurring runs freeze at execution admission. Resolve the current
-    // actor from the durable Task admission; a delivery receipt alone grants no
-    // access to the child originals. Accepted retry snapshots above stay fixed.
+    // First execution prepares the context, including Composer launches. Resolve
+    // the current actor from durable Task admission; a delivery receipt alone
+    // grants no access to child originals. Accepted retry snapshots above stay fixed.
     let admission = processor
         .crud_store
         .get_task_execution_admission(task.id.as_str())

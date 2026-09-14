@@ -2008,42 +2008,8 @@ impl MessageProcessor {
                 let title = goal.chars().take(96).collect::<String>();
                 let permission_profile = outcome.materialization.turn.permission_profile.clone();
                 let task_model_provider = outcome.materialization.thread.model_provider.clone();
-                // Freeze the causally closed parent branch before the Task becomes
-                // visible to the scheduler. A later sibling message must not change
-                // the context of this run, even if execution starts later.
-                let frozen_history_json = match async {
-                    let authority = self.load_turn_execution_authorization_context(launch.turn_id.as_str()).await?;
-                    let current = self.execution_leases.revalidate_context(
-                        self.crud_store.as_ref(), &authority,
-                        crate::authorization::ResourceAction::TaskCreate,
-                        self.current_authorization_revision().await?,
-                    ).await?;
-                    self.capture_authorized_task_basis(
-                        current.principal(), thread.workspace_id.as_str(), thread.id.as_str(),
-                        Some(launch.turn_id.as_str()), Some(launch.turn_id.as_str()), None,
-                    ).await
-                }.await
-                {
-                    Ok(history_json) => history_json,
-                    Err(error) => {
-                        self.mark_turn_blocked(
-                            thread.id.clone(),
-                            launch.turn_id.clone(),
-                            format!("failed to freeze Composer task history: {error:#}"),
-                        )
-                        .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to freeze Composer task history: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
+                // Persist the Composer launch here; context preparation belongs to
+                // the durable child execution, not the connection-owned request.
                 let mut task_params = pioneer_protocol::TaskCreateParams {
                     workspace_id: thread.workspace_id.clone(),
                     owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
@@ -2267,11 +2233,6 @@ impl MessageProcessor {
                         .map(|(identity, _)| identity.clone()),
                     resolved_launch_profile: resolved_launch.map(|(_, profile)| profile),
                     agent_authorization_grant,
-                    conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
-                        conversation_thread_id: thread.id.clone(),
-                        source_turn_id: Some(launch.turn_id.clone()),
-                        history_json: frozen_history_json,
-                    }),
                     execution_admission: Some(pioneer_tasks::TaskExecutionAdmissionSeed {
                         workspace_id: task_execution_context.workspace_id().to_owned(),
                         root_thread_id: task_execution_context.root_thread_id().to_owned(),
