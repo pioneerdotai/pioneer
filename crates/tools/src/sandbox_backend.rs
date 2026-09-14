@@ -481,6 +481,7 @@ fn platform_runtime_read_paths() -> &'static [&'static str] {
         "/lib64",
         "/usr/lib",
         "/usr/lib64",
+        "/usr/libexec",
         "/usr/local/lib",
         "/usr/share",
         "/etc/alternatives",
