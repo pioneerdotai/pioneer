@@ -22,6 +22,13 @@ pub struct CompletedHistoryCheck {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub descriptor: Option<String>,
+    pub revision: i64,
+    pub failures: i64,
+    pub attempt_deadline_ms: Option<i64>,
+    pub diagnostic: Option<String>,
+    pub config_hash: Option<String>,
+    pub outcome: Option<String>,
+    pub managed: i64,
 }
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct CompactionLifecycleRecovery {
@@ -377,6 +384,16 @@ pub(crate) async fn compaction_history_check_is_current<C: ConnectionTrait>(
 pub(crate) async fn compaction_pending_history_checks<C: ConnectionTrait>(
     db: &C,
 ) -> Result<Vec<CompletedHistoryCheck>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    compaction_due_history_checks(db, now).await
+}
+pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
+    db: &C,
+    now: i64,
+) -> Result<Vec<CompletedHistoryCheck>> {
     compaction_history_check::Entity::find()
         .select_only()
         .join(
@@ -452,13 +469,27 @@ pub(crate) async fn compaction_pending_history_checks<C: ConnectionTrait>(
             compaction_history_check::Entity,
             compaction_history_check::Column::Descriptor,
         )))
+        .columns([
+            compaction_history_check::Column::Revision,
+            compaction_history_check::Column::Failures,
+            compaction_history_check::Column::AttemptDeadlineMs,
+            compaction_history_check::Column::Diagnostic,
+            compaction_history_check::Column::ConfigHash,
+            compaction_history_check::Column::Outcome,
+            compaction_history_check::Column::Managed,
+        ])
+        .filter(compaction_history_check::Column::NextAttemptMs.lte(now))
         .filter(
-            Expr::col((
-                compaction_history_check::Entity,
-                compaction_history_check::Column::State,
-            ))
-            .eq(Expr::val("pending")),
+            sea_orm::Condition::any()
+                .add(compaction_history_check::Column::State.eq("pending"))
+                .add(
+                    sea_orm::Condition::all()
+                        .add(compaction_history_check::Column::State.eq("finished"))
+                        .add(compaction_history_check::Column::Outcome.eq("failed"))
+                        .add(compaction_history_check::Column::Managed.eq(0)),
+                ),
         )
+        .order_by_asc(compaction_history_check::Column::NextAttemptMs)
         .order_by(
             Expr::col((
                 compaction_history_check::Entity,
@@ -523,3 +554,136 @@ pub(crate) async fn compaction_finish_history_check<C: ConnectionTrait>(
 }
 
 use sea_orm::QueryTrait;
+
+/// CAS admission. Revalidate currency within the writer transaction: neither a
+/// stale discovery page nor Stop/new input can resurrect a completed check.
+pub(crate) async fn claim_history_check(
+    store: &crate::CrudStore,
+    id: &str,
+    revision: i64,
+    now: i64,
+) -> Result<Option<compaction_history_check::Model>> {
+    use compaction_history_check::{ActiveModel as A, Column as C, Entity as E};
+    use sea_orm::{Set, TransactionTrait};
+    store.run_serialized_write(|| async {
+        let tx = store.connection.begin().await?;
+        let row = E::find_by_id(id).one(&tx).await?;
+        let Some(row) = row.filter(|r| r.revision == revision && r.next_attempt_ms <= now
+            && (r.state == "pending" || (r.state == "finished" && r.outcome.as_deref() == Some("failed") && r.managed == 0))) else {
+            tx.rollback().await?; return Ok(None);
+        };
+        E::update_many().set(A { state: Set("pending".into()), managed: Set(1),
+            revision: Set(revision + 1), ..Default::default() })
+            .filter(C::TurnId.eq(id)).exec(&tx).await?;
+        if !compaction_history_check_is_current(&tx, id).await? {
+            compaction_finish_history_check(&tx, id, "cancelled").await?;
+            tx.commit().await?; return Ok(None);
+        }
+        // Legacy failure reasons were discarded; mark that fact once. Do not
+        // silently create a new runner after a previously admitted operation.
+        if row.managed == 0 && row.outcome.as_deref() == Some("failed") {
+            E::update_many().set(A {
+                diagnostic: Set(Some(r#"{"stage":"legacy","code":"legacy_recheck","explanation":"Previous failure reason was not stored","legacy_reason_unknown":true}"#.into())),
+                ..Default::default()
+            }).filter(C::TurnId.eq(id)).exec(&tx).await?;
+            let admitted = compaction_operation::Entity::find().select_only().column(compaction_operation::Column::Id)
+                .filter(compaction_operation::Column::ExecutionTurn.eq(id)).limit(1).into_tuple::<String>().one(&tx).await?;
+            if admitted.is_some() {
+                E::update_many().set(A { state: Set("finished".into()),
+                    diagnostic: Set(Some(r#"{"stage":"legacy","code":"legacy_operation_requires_review","explanation":"Previous reason unavailable; an admitted operation already owns the retry budget","legacy_reason_unknown":true}"#.into())),
+                    ..Default::default() }).filter(C::TurnId.eq(id)).exec(&tx).await?;
+                tx.commit().await?; return Ok(None);
+            }
+        }
+        let claimed = E::find_by_id(id).one(&tx).await?;
+        tx.commit().await?;
+        Ok(claimed)
+    }).await
+}
+/// Captured input was prepared without holding database capacity. CAS prevents
+/// a cancelled or replaced job from installing it. Deadlines survive restart.
+pub(crate) async fn begin_history_attempt<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    revision: i64,
+    descriptor: &str,
+    hash: &str,
+    now: i64,
+) -> Result<Option<i64>> {
+    use compaction_history_check::{ActiveModel as A, Column as C, Entity as E};
+    use sea_orm::Set;
+    ensure!(
+        descriptor.len() <= 16384 && hash.len() <= 128,
+        "history check metadata exceeds bound"
+    );
+    let rows = E::update_many()
+        .set(A {
+            descriptor: Set(Some(descriptor.into())),
+            config_hash: Set(Some(hash.into())),
+            ..Default::default()
+        })
+        .col_expr(
+            C::AttemptDeadlineMs,
+            Func::coalesce([
+                Expr::col(C::AttemptDeadlineMs),
+                Expr::val(now.saturating_add(pioneer_compaction::OPERATION_MILLIS as i64)),
+            ])
+            .into(),
+        )
+        .filter(C::TurnId.eq(id))
+        .filter(C::Revision.eq(revision))
+        .filter(C::State.eq("pending"))
+        .exec_with_returning(db)
+        .await?;
+    Ok(rows.first().and_then(|r| r.attempt_deadline_ms))
+}
+pub(crate) async fn record_history_result(
+    store: &crate::CrudStore,
+    id: &str,
+    revision: i64,
+    failures: i64,
+    outcome: super::compaction_check_result::HistoryCheckOutcome,
+    diagnostic: &str,
+    now: i64,
+) -> Result<bool> {
+    use compaction_history_check::{ActiveModel as A, Column as C, Entity as E};
+    use sea_orm::Set;
+    ensure!(diagnostic.len() <= 4096, "history diagnostic exceeds bound");
+    use sea_orm::TransactionTrait;
+    store
+        .run_serialized_write(|| async {
+            let tx = store.connection.begin().await?;
+            let outcome = if compaction_history_check_is_current(&tx, id).await? {
+                outcome
+            } else {
+                super::compaction_check_result::HistoryCheckOutcome::Cancelled
+            };
+            let (state, failures, due) = outcome.schedule(failures, now);
+            let label = if state == "finished"
+                && outcome == super::compaction_check_result::HistoryCheckOutcome::Retryable
+            {
+                "failed"
+            } else {
+                outcome.as_str()
+            };
+            let result = E::update_many()
+                .set(A {
+                    state: Set(state.into()),
+                    outcome: Set(Some(label.into())),
+                    failures: Set(failures),
+                    next_attempt_ms: Set(due),
+                    diagnostic: Set(Some(diagnostic.into())),
+                    attempt_deadline_ms: Set(None),
+                    revision: Set(revision + 1),
+                    ..Default::default()
+                })
+                .filter(C::TurnId.eq(id))
+                .filter(C::Revision.eq(revision))
+                .filter(C::State.eq("pending"))
+                .exec(&tx)
+                .await?;
+            tx.commit().await?;
+            Ok(result.rows_affected == 1)
+        })
+        .await
+}

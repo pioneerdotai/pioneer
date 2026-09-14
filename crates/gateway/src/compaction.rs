@@ -20,7 +20,7 @@ mod tool_outcomes;
 pub(crate) use admission::{PreparedOperation, admit_operation};
 #[cfg(test)]
 pub(crate) use background_history::prepare_completed_history;
-pub(crate) use background_history::prepare_completed_history_owned;
+pub(crate) use background_history::{HistoryCheckDeadline, prepare_completed_history_owned};
 #[cfg(test)]
 pub(crate) use history::load_line_history;
 pub(crate) use history::provider_observation;

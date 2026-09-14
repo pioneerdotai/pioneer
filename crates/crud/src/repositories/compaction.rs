@@ -2554,3 +2554,5 @@ async fn seed_canonical_revision<C: ConnectionTrait, E: EntityTrait, R: EntityTr
 struct MatchedSourceCount {
     matched: i64,
 }
+
+pub use super::compaction_check_result::{HistoryCheckDiagnostic, HistoryCheckOutcome};

@@ -4403,3 +4403,341 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
         39
     );
 }
+
+#[tokio::test]
+async fn history_check_retries_are_durable_bounded_and_cas_protected() {
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
+    let store = store().await.with_maintenance_access();
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    store
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    let mut now = 1000;
+    for (failure, delay) in [60_000, 300_000, 900_000, 0].into_iter().enumerate() {
+        let page = store.compaction_due_history_checks(now).await.unwrap();
+        assert_eq!(page.len(), 1);
+        let claim = store
+            .compaction_claim_history_check("turn", page[0].revision, now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .compaction_claim_history_check("turn", page[0].revision, now)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let deadline = store
+            .compaction_begin_history_attempt("turn", claim.revision, "{}", "hash", now)
+            .await
+            .unwrap()
+            .unwrap();
+        // A new worker after shutdown inherits the exact attempt deadline.
+        let restarted = store
+            .compaction_claim_history_check("turn", claim.revision, now + 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .compaction_begin_history_attempt(
+                    "turn",
+                    restarted.revision,
+                    "{}",
+                    "hash",
+                    now + 10
+                )
+                .await
+                .unwrap(),
+            Some(deadline)
+        );
+        let mut d = D::new(
+            "history_capture",
+            "database_error",
+            "Temporary database failure",
+        );
+        d.observed_ms = now as u64;
+        assert!(
+            !store
+                .compaction_record_history_result(
+                    "turn",
+                    claim.revision,
+                    failure as i64,
+                    O::Retryable,
+                    &d,
+                    now
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .compaction_record_history_result(
+                    "turn",
+                    restarted.revision,
+                    failure as i64,
+                    O::Retryable,
+                    &d,
+                    now
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compaction_record_history_result(
+                    "turn",
+                    restarted.revision,
+                    failure as i64,
+                    O::Retryable,
+                    &d,
+                    now
+                )
+                .await
+                .unwrap()
+        );
+        let saved = check::Entity::find_by_id("turn")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.failures, failure as i64 + 1);
+        assert_eq!(
+            serde_json::from_str::<D>(saved.diagnostic.as_ref().unwrap()).unwrap(),
+            d
+        );
+        assert!(saved.attempt_deadline_ms.is_none());
+        if delay == 0 {
+            assert_eq!(saved.state, "finished");
+            assert_eq!(saved.outcome.as_deref(), Some("failed"));
+            assert!(
+                store
+                    .compaction_due_history_checks(i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert_eq!(saved.next_attempt_ms, now + delay);
+            assert!(
+                store
+                    .compaction_due_history_checks(now + delay - 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            now += delay;
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_results() {
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::EntityTrait;
+    let store = store().await.with_maintenance_access();
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    store
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    let mut now = 0;
+    for outcome in [
+        O::Preparing,
+        O::WaitingCatalog,
+        O::WaitingExecutor,
+        O::WaitingSettings,
+    ] {
+        let row = store
+            .compaction_due_history_checks(now)
+            .await
+            .unwrap()
+            .remove(0);
+        let claim = store
+            .compaction_claim_history_check("turn", row.revision, now)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .compaction_begin_history_attempt("turn", claim.revision, "{}", "original", now)
+            .await
+            .unwrap();
+        let d = D::new("preparation", outcome.as_str(), "Waiting for readiness");
+        store
+            .compaction_record_history_result("turn", claim.revision, 0, outcome, &d, now)
+            .await
+            .unwrap();
+        let row = check::Entity::find_by_id("turn")
+            .one(&store.database_connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.failures, 0);
+        assert_eq!(row.config_hash.as_deref(), Some("original"));
+        assert!(
+            store
+                .compaction_due_history_checks(now + 59_999)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        now += 60_000;
+    }
+    let row = store
+        .compaction_due_history_checks(now)
+        .await
+        .unwrap()
+        .remove(0);
+    let claim = store
+        .compaction_claim_history_check("turn", row.revision, now)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .compaction_stop_execution("ws", "thread", "owner", "turn")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_record_history_result(
+                "turn",
+                claim.revision,
+                0,
+                O::Retryable,
+                &D::default(),
+                now
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_due_history_checks(i64::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let row = check::Entity::find_by_id("turn")
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.outcome.as_deref(), Some("cancelled"));
+}
+
+#[tokio::test]
+async fn history_check_legacy_failures_are_reconciled_once_without_reviving_cancelled_jobs() {
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+    let store = store().await.with_maintenance_access();
+    let db = store.database_connection();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .await
+        .unwrap();
+    store
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE compaction_history_check SET state='finished',outcome='failed' WHERE turn_id='turn'").await.unwrap();
+    let row = store
+        .compaction_due_history_checks(0)
+        .await
+        .unwrap()
+        .remove(0);
+    let claim = store
+        .compaction_claim_history_check("turn", row.revision, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        serde_json::from_str::<D>(claim.diagnostic.as_ref().unwrap())
+            .unwrap()
+            .legacy_reason_unknown,
+        "legacy marker must survive a crash before the result is recorded"
+    );
+    let d = D {
+        legacy_reason_unknown: true,
+        ..D::new("budget", "history_fits", "No summary needed")
+    };
+    store
+        .compaction_record_history_result("turn", claim.revision, 0, O::Fits, &d, 0)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_due_history_checks(i64::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.execute_unprepared("UPDATE compaction_history_check SET managed=0,state='finished',outcome='cancelled' WHERE turn_id='turn'").await.unwrap();
+    assert!(
+        store
+            .compaction_due_history_checks(i64::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress() {
+    let store = store().await.with_maintenance_access();
+    let db = store.database_connection();
+    for n in 0..33 {
+        db.execute_unprepared(&format!("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('legacy-{n:02}','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")).await.unwrap();
+        db.execute_unprepared(&format!("INSERT INTO compaction_history_check(turn_id,state,outcome) VALUES ('legacy-{n:02}','finished','failed')")).await.unwrap();
+    }
+    for expected in [16, 16, 1] {
+        let page = store.compaction_due_history_checks(0).await.unwrap();
+        assert_eq!(page.len(), expected);
+        for row in page {
+            let claim = store
+                .compaction_claim_history_check(&row.turn_id, row.revision, 0)
+                .await
+                .unwrap();
+            if row.turn_id == "legacy-32" {
+                let claim = claim.unwrap();
+                store
+                    .compaction_record_history_result(
+                        &row.turn_id,
+                        claim.revision,
+                        0,
+                        HistoryCheckOutcome::Failed,
+                        &HistoryCheckDiagnostic::new(
+                            "descriptor",
+                            "invalid_descriptor",
+                            "Malformed metadata quarantined",
+                        ),
+                        0,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                assert!(
+                    claim.is_none(),
+                    "newer turn must invalidate an old failed check"
+                );
+            }
+        }
+    }
+    assert!(
+        store
+            .compaction_due_history_checks(i64::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

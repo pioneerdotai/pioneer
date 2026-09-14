@@ -1151,3 +1151,55 @@ impl CrudStore {
         repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access()).await
     }
 }
+
+impl CrudStore {
+    pub async fn compaction_due_history_checks(
+        &self,
+        now: i64,
+    ) -> Result<Vec<CompletedHistoryCheck>> {
+        repositories::compaction::background::compaction_due_history_checks(&self.connection, now)
+            .await
+    }
+    pub async fn compaction_claim_history_check(
+        &self,
+        id: &str,
+        revision: i64,
+        now: i64,
+    ) -> Result<Option<pioneer_entity::compaction_history_check::Model>> {
+        repositories::compaction::background::claim_history_check(self, id, revision, now).await
+    }
+    pub async fn compaction_begin_history_attempt(
+        &self,
+        id: &str,
+        revision: i64,
+        descriptor: &str,
+        hash: &str,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        repositories::compaction::background::begin_history_attempt(
+            &self.connection,
+            id,
+            revision,
+            descriptor,
+            hash,
+            now,
+        )
+        .await
+    }
+    pub async fn compaction_record_history_result(
+        &self,
+        id: &str,
+        revision: i64,
+        failures: i64,
+        outcome: crate::compaction::HistoryCheckOutcome,
+        diagnostic: &crate::compaction::HistoryCheckDiagnostic,
+        now: i64,
+    ) -> Result<bool> {
+        // Serialize before database admission. No history, output or raw error.
+        let json = serde_json::to_string(diagnostic)?;
+        repositories::compaction::background::record_history_result(
+            self, id, revision, failures, outcome, &json, now,
+        )
+        .await
+    }
+}

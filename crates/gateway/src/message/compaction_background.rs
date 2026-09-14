@@ -3,7 +3,9 @@
 use super::*;
 use crate::compaction::{CompactionClock, SystemCompactionClock};
 use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
 
@@ -126,7 +128,10 @@ impl MessageProcessor {
                 let _ = handle.await;
             }
         }
-        for row in store.compaction_pending_history_checks().await? {
+        for mut row in store
+            .compaction_due_history_checks(SystemCompactionClock::default().now_ms() as i64)
+            .await?
+        {
             let key = (row.workspace_id.clone(), row.thread_id.clone());
             let mut jobs = self.completed_history_checks.lock().await;
             if jobs.contains_key(&key) {
@@ -144,22 +149,63 @@ impl MessageProcessor {
             let task_suspending = suspending.clone();
             let turn = row.turn_id.clone();
             let handle = tokio::spawn(async move {
+                let now = SystemCompactionClock::default().now_ms();
+                let claimed = tokio::select! { biased;
+                    _ = task_cancel.cancelled() => return,
+                    result = processor.crud_store.compaction_claim_history_check(&row.turn_id, row.revision, now as i64) => result,
+                };
+                let claimed = match claimed {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return,
+                    Err(_) => {
+                        warn!("failed to claim history check");
+                        return;
+                    }
+                };
+                let mut diagnostic = claimed
+                    .diagnostic
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<HistoryCheckDiagnostic>(value).ok())
+                    .unwrap_or_default();
+                diagnostic.legacy_reason_unknown |=
+                    row.managed == 0 && row.outcome.as_deref() == Some("failed");
+                row.revision = claimed.revision;
+                row.attempt_deadline_ms = claimed.attempt_deadline_ms;
+                row.descriptor = claimed.descriptor;
+                row.config_hash = claimed.config_hash;
+                row.failures = claimed.failures;
+                row.outcome = claimed.outcome;
                 let result = processor
-                    .run_completed_history_check(&row, task_cancel, task_suspending.clone())
+                    .run_completed_history_check(
+                        &row,
+                        task_cancel.clone(),
+                        task_suspending.clone(),
+                        &mut diagnostic,
+                    )
                     .await;
                 if !task_suspending.load(Ordering::Acquire) {
-                    let outcome = if result.is_ok() {
-                        "completed"
-                    } else {
-                        "failed"
-                    };
+                    let outcome =
+                        classify_check_result(result, &mut diagnostic, task_cancel.is_cancelled());
+                    if outcome == HistoryCheckOutcome::Retryable && row.failures >= 3 {
+                        diagnostic
+                            .explanation
+                            .push_str("; automatic preparation retry limit reached");
+                    }
+                    diagnostic.observed_ms = SystemCompactionClock::default().now_ms();
                     if processor
                         .crud_store
-                        .compaction_finish_history_check(&row.turn_id, outcome)
+                        .compaction_record_history_result(
+                            &row.turn_id,
+                            row.revision,
+                            row.failures,
+                            outcome,
+                            &diagnostic,
+                            diagnostic.observed_ms as i64,
+                        )
                         .await
                         .is_err()
                     {
-                        warn!("failed to persist CLI history check outcome");
+                        warn!("failed to persist history check result");
                     }
                 }
             });
@@ -244,69 +290,122 @@ impl MessageProcessor {
         row: &pioneer_crud::compaction::CompletedHistoryCheck,
         cancel: CancellationToken,
         suspending: Arc<AtomicBool>,
-    ) -> anyhow::Result<()> {
-        if !self
-            .crud_store
-            .compaction_history_check_is_current(&row.turn_id)
-            .await?
-        {
-            self.crud_store
-                .compaction_finish_history_check(&row.turn_id, "cancelled")
-                .await?;
-            return Ok(());
+        diagnostic: &mut HistoryCheckDiagnostic,
+    ) -> anyhow::Result<HistoryCheckOutcome> {
+        let previous_diagnostic = diagnostic.clone();
+        diagnostic.stage = "currency".into();
+        let current = tokio::select! { biased;
+            _ = cancel.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            result = self.crud_store.compaction_history_check_is_current(&row.turn_id) => result?,
+        };
+        if !current {
+            return Ok(HistoryCheckOutcome::Cancelled);
         }
-        let descriptor = if let Some(descriptor) = &row.descriptor {
-            descriptor.clone()
+        diagnostic.stage = "configuration".into();
+        let legacy = self.compaction_settings()?;
+        let (settings, cli_override) = {
+            let workspace = self
+                .workspace_compaction_settings
+                .read()
+                .map_err(|_| anyhow::anyhow!("workspace settings unavailable"))?;
+            match workspace.get(&row.workspace_id) {
+                Some(value) => (
+                    value.compaction(&legacy),
+                    value.cli_overrides.get(&row.runtime_id).cloned(),
+                ),
+                None => (legacy, None),
+            }
+        };
+        diagnostic.stage = "descriptor".into();
+        let mut captured: CapturedCheck = if let Some(descriptor) = &row.descriptor {
+            serde_json::from_str(descriptor)?
         } else {
-            let (settings, cli_override) = {
-                let legacy = self.compaction_settings()?;
-                let workspace = self
-                    .workspace_compaction_settings
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("workspace settings unavailable"))?;
-                match workspace.get(&row.workspace_id) {
-                    Some(value) => (
-                        value.compaction(&legacy),
-                        value.cli_overrides.get(&row.runtime_id).cloned(),
-                    ),
-                    None => (legacy, None),
+            let transport = match row.runtime_kind.as_str() {
+                "codex" => Transport::Codex,
+                "claude" => Transport::Claude,
+                _ => {
+                    diagnostic.code = "unknown_transport".into();
+                    return Ok(HistoryCheckOutcome::Failed);
                 }
             };
-            let current = ModelSelection {
-                transport: match row.runtime_kind.as_str() {
-                    "codex" => Transport::Codex,
-                    "claude" => Transport::Claude,
-                    _ => anyhow::bail!("unknown CLI history transport"),
-                },
-                instance: row.runtime_id.clone(),
-                model: row
-                    .model
-                    .clone()
-                    .filter(|model| !model.trim().is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("completed CLI model is unavailable"))?,
-                effort: row.reasoning_effort.clone(),
+            let Some(model) = row.model.clone().filter(|model| !model.trim().is_empty()) else {
+                diagnostic.code = "missing_turn_model".into();
+                return Ok(HistoryCheckOutcome::Failed);
             };
-            let captured = CapturedCheck {
+            CapturedCheck {
+                current: ModelSelection {
+                    transport,
+                    instance: row.runtime_id.clone(),
+                    model,
+                    effort: row.reasoning_effort.clone(),
+                },
+                settings: settings.clone(),
+                cli_override: cli_override.clone(),
+                deadline_ms: 0,
                 target_output_cap: None,
                 fixed_input_tokens: 0,
-                current,
-                settings,
-                cli_override,
-                deadline_ms: SystemCompactionClock::default()
-                    .now_ms()
-                    .saturating_add(pioneer_compaction::OPERATION_MILLIS),
-            };
-            let descriptor = serde_json::to_string(&captured)?;
-            let Some(descriptor) = self
-                .crud_store
-                .compaction_capture_history_check(&row.turn_id, &descriptor)
-                .await?
-            else {
-                return Ok(());
-            };
-            descriptor
+            }
         };
-        let captured: CapturedCheck = serde_json::from_str(&descriptor)?;
+        diagnostic.stage = "configuration".into();
+        // Compare only relevant settings/authorities. No secrets or paths are
+        // persisted; the fingerprint is a one-way digest. Waiting never calls a model.
+        let waiting_settings = row.outcome.as_deref() == Some("waiting_settings");
+        let (hash_settings, hash_override) = if waiting_settings {
+            (&settings, &cli_override)
+        } else {
+            (&captured.settings, &captured.cli_override)
+        };
+        let candidate = pioneer_compaction::effective_selection(
+            &captured.current,
+            hash_settings.selection.as_ref(),
+            hash_override.as_ref(),
+        );
+        let registry = self.provider_registry();
+        let authority = |selection: &ModelSelection| -> anyhow::Result<String> {
+            Ok(match selection.transport {
+                Transport::Api => registry
+                    .authority_fingerprint_for_workspace(&row.workspace_id, &selection.instance)
+                    .map(|v| v.as_str().to_owned())
+                    .unwrap_or_else(|_| "unavailable".into()),
+                _ => serde_json::to_string(
+                    &self
+                        .load_cli_runtime_instances()?
+                        .into_iter()
+                        .find(|instance| instance.id == selection.instance),
+                )?,
+            })
+        };
+        let hash = hex::encode(Sha256::digest(serde_json::to_vec(&(
+            candidate,
+            &captured.current,
+            authority(candidate)?,
+            authority(&captured.current)?,
+        ))?));
+        if row.outcome.as_deref() == Some("waiting_settings") {
+            if row.config_hash.as_deref() == Some(&hash) {
+                *diagnostic = previous_diagnostic;
+                return Ok(HistoryCheckOutcome::WaitingSettings);
+            }
+            captured.settings = settings;
+            captured.cli_override = cli_override;
+        }
+        // A resumed attempt retains its deadline and captured settings. Only a
+        // scheduled pre-admission retry/readiness wakeup receives a fresh deadline.
+        let now = SystemCompactionClock::default().now_ms();
+        let descriptor = serde_json::to_string(&captured)?;
+        let deadline = tokio::select! { biased;
+            _ = cancel.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            result = self.crud_store.compaction_begin_history_attempt(&row.turn_id, row.revision, &descriptor, &hash, now as i64) => result?,
+        };
+        let Some(deadline) = deadline else {
+            return Ok(HistoryCheckOutcome::Cancelled);
+        };
+        captured.deadline_ms = deadline as u64;
+        *diagnostic = HistoryCheckDiagnostic {
+            attempt: row.failures.saturating_add(1).max(1) as u64,
+            legacy_reason_unknown: diagnostic.legacy_reason_unknown,
+            ..HistoryCheckDiagnostic::default()
+        };
         let hub = Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
         let mut progress = hub.subscribe_live();
         let observer = Arc::new(crate::compaction::HubCompactionObserver {
@@ -326,11 +425,12 @@ impl MessageProcessor {
                 &captured.settings,
                 captured.cli_override.as_ref(),
                 observer,
-                cancel,
+                cancel.clone(),
                 Some(captured.deadline_ms),
                 captured.target_output_cap,
                 captured.fixed_input_tokens,
                 suspending,
+                diagnostic,
             );
             tokio::pin!(work);
             loop {
@@ -341,7 +441,7 @@ impl MessageProcessor {
             }
         };
         hub.shutdown_progress().await;
-        result.map(|_| ())
+        result
     }
     pub(crate) async fn interrupt_completed_history_for_new_input(
         &self,
@@ -386,5 +486,193 @@ impl MessageProcessor {
                 let _ = handle.await;
             }
         }
+    }
+}
+
+/// Never persist arbitrary provider/SQL errors: fixed codes and explanations
+/// identify the failing boundary without retaining payloads or credentials.
+fn classify_check_result(
+    result: anyhow::Result<HistoryCheckOutcome>,
+    diagnostic: &mut HistoryCheckDiagnostic,
+    cancelled: bool,
+) -> HistoryCheckOutcome {
+    if cancelled && !matches!(&result, Ok(HistoryCheckOutcome::Compacted)) {
+        diagnostic.code = "cancelled".into();
+        diagnostic.explanation = "Check cancelled by Stop, newer input or foreground work".into();
+        return HistoryCheckOutcome::Cancelled;
+    }
+    match result {
+        Ok(outcome) => {
+            if diagnostic.code.is_empty() {
+                diagnostic.code = outcome.as_str().into();
+            }
+            if diagnostic.explanation.is_empty() {
+                diagnostic.explanation = match outcome {
+                HistoryCheckOutcome::Fits => "Complete retained history fits the measured budget; no summary generated",
+                HistoryCheckOutcome::Compacted => "Summary applied to the context head",
+                HistoryCheckOutcome::Preparing => "History registration is incomplete; persisted cursor will resume",
+                HistoryCheckOutcome::WaitingCatalog => "Model catalog has not loaded",
+                HistoryCheckOutcome::WaitingExecutor => "Context executor is occupied",
+                HistoryCheckOutcome::WaitingSettings => "Waiting for a relevant model or provider configuration change",
+                HistoryCheckOutcome::Failed => "Compaction operation finished unsuccessfully; its retry budget is not reset",
+                HistoryCheckOutcome::Cancelled => "Check is no longer current",
+                HistoryCheckOutcome::Retryable => "Temporary preparation failure; bounded retry scheduled",
+            }.into();
+            }
+            outcome
+        }
+        Err(error) => {
+            // A database error is typed; payload text is deliberately discarded.
+            let database = error.downcast_ref::<sea_orm::DbErr>().is_some();
+            if error
+                .downcast_ref::<crate::compaction::HistoryCheckDeadline>()
+                .is_some()
+                && matches!(
+                    diagnostic.stage.as_str(),
+                    "history_capture" | "history_preparation"
+                )
+            {
+                diagnostic.code = "history_preparation_incomplete".into();
+                diagnostic.explanation =
+                    "Preparation time quantum ended; no incomplete history was budgeted".into();
+                return HistoryCheckOutcome::Preparing;
+            }
+            let outcome = if diagnostic.operation.is_some()
+                || matches!(diagnostic.stage.as_str(), "admission" | "summarization")
+            {
+                HistoryCheckOutcome::Failed
+            } else if database {
+                HistoryCheckOutcome::Retryable
+            } else {
+                match diagnostic.stage.as_str() {
+                    "target_configuration" | "summary_configuration" => {
+                        HistoryCheckOutcome::WaitingSettings
+                    }
+                    "descriptor" | "planning" | "budget" => HistoryCheckOutcome::Failed,
+                    _ => HistoryCheckOutcome::Retryable,
+                }
+            };
+            diagnostic.code = if database {
+                "database_error"
+            } else {
+                match diagnostic.stage.as_str() {
+                    "descriptor" => "invalid_descriptor",
+                    "planning" => "no_fitting_plan",
+                    "budget" => "invalid_budget",
+                    "target_configuration" | "summary_configuration" => "model_configuration_error",
+                    "history_capture" => "history_capture_error",
+                    "history_preparation" => "history_preparation_error",
+                    "admission" => "operation_admission_error",
+                    "summarization" => "operation_execution_error",
+                    _ => "check_preparation_error",
+                }
+            }
+            .into();
+            diagnostic.explanation = format!(
+                "Check stopped during {}. Raw error payload omitted",
+                diagnostic.stage
+            );
+            // Recognized validation errors have fixed public explanations. Only
+            // exact known strings are accepted; arbitrary text is never copied.
+            for cause in error.chain().take(8) {
+                let known = match cause.to_string().as_str() {
+                    "selected CLI service instance is unavailable" => Some((
+                        "summary_instance_missing",
+                        "Selected CLI summary instance is not configured",
+                    )),
+                    "selected CLI service instance is disabled" => Some((
+                        "summary_instance_disabled",
+                        "Selected CLI summary instance is disabled",
+                    )),
+                    "selected CLI service instance changed kind" => Some((
+                        "summary_transport_changed",
+                        "Configured CLI kind does not match the selected transport",
+                    )),
+                    "explicit output limit is not supported by the selected model" => Some((
+                        "output_limit_unsupported",
+                        "Requested output limit exceeds model capabilities",
+                    )),
+                    "selected history source disappeared" => Some((
+                        "history_source_missing",
+                        "A referenced canonical history source is missing",
+                    )),
+                    "context authority workspace changed" => Some((
+                        "history_scope_changed",
+                        "History authorization no longer matches the workspace",
+                    )),
+                    _ => None,
+                };
+                if let Some((code, explanation)) = known {
+                    diagnostic.code = code.into();
+                    diagnostic.explanation = explanation.into();
+                    break;
+                }
+            }
+            outcome
+        }
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+    #[test]
+    fn history_check_failure_policy_never_restarts_a_provider_budget() {
+        for stage in ["admission", "summarization"] {
+            let mut d = HistoryCheckDiagnostic::new(stage, "", "");
+            let result = Err(anyhow::Error::new(sea_orm::DbErr::Custom(
+                "private SQL and credentials".into(),
+            )));
+            assert_eq!(
+                classify_check_result(result, &mut d, false),
+                HistoryCheckOutcome::Failed
+            );
+            assert!(!serde_json::to_string(&d).unwrap().contains("private SQL"));
+        }
+        let mut d = HistoryCheckDiagnostic::new("history_capture", "", "");
+        assert_eq!(
+            classify_check_result(
+                Err(anyhow::Error::new(sea_orm::DbErr::Custom("private".into()))),
+                &mut d,
+                false
+            ),
+            HistoryCheckOutcome::Retryable
+        );
+        assert_eq!(d.code, "database_error");
+        let mut d = HistoryCheckDiagnostic::new("summary_configuration", "", "");
+        assert_eq!(
+            classify_check_result(
+                Err(anyhow::anyhow!("selected CLI service instance is disabled")),
+                &mut d,
+                false
+            ),
+            HistoryCheckOutcome::WaitingSettings
+        );
+    }
+    #[test]
+    fn history_check_wait_cancel_and_fit_remain_distinct() {
+        let mut d = HistoryCheckDiagnostic::new("history_capture", "", "");
+        assert_eq!(
+            classify_check_result(
+                Err(crate::compaction::HistoryCheckDeadline.into()),
+                &mut d,
+                false
+            ),
+            HistoryCheckOutcome::Preparing
+        );
+        assert_eq!(
+            classify_check_result(Ok(HistoryCheckOutcome::Fits), &mut d, true),
+            HistoryCheckOutcome::Cancelled
+        );
+        let mut d = HistoryCheckDiagnostic::new("budget", "", "");
+        d.estimated_input_tokens = Some(1000);
+        d.context_tokens = Some(272000);
+        assert_eq!(
+            classify_check_result(Ok(HistoryCheckOutcome::Fits), &mut d, false),
+            HistoryCheckOutcome::Fits
+        );
+        assert_eq!(d.code, "fits");
+        assert_eq!(d.estimated_input_tokens, Some(1000));
+        assert!(d.checkpoint.is_none());
     }
 }

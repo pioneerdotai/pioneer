@@ -6,10 +6,18 @@ use pioneer_compaction::{
     CompactionMode, CompactionSettings, ModelBudget, ModelSelection, SourceRole, Transport,
     effective_selection, plan_compaction,
 };
-use pioneer_crud::compaction::ManifestEntry;
+use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome, ManifestEntry};
 use pioneer_provider::ChatRequest;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+#[derive(Debug)]
+pub(crate) struct HistoryCheckDeadline;
+impl std::fmt::Display for HistoryCheckDeadline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("history check preparation deadline")
+    }
+}
+impl std::error::Error for HistoryCheckDeadline {}
 
 /// The completed-turn owner supplies a captured whole selection. Changes to
 /// General/instance settings apply only to later jobs. The owner must retain
@@ -27,7 +35,14 @@ pub(crate) async fn prepare_completed_history(
     observer: Arc<dyn CompactionObserver>,
     cancellation: CancellationToken,
 ) -> Result<Option<String>> {
-    prepare_completed_history_owned(
+    super::history::prepare_history(
+        &processor.crud_store.with_maintenance_access(),
+        workspace,
+        thread,
+    )
+    .await?;
+    let mut diagnostic = HistoryCheckDiagnostic::default();
+    let result = prepare_completed_history_owned(
         processor,
         workspace,
         thread,
@@ -41,8 +56,14 @@ pub(crate) async fn prepare_completed_history(
         None,
         0,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        &mut diagnostic,
     )
-    .await
+    .await?;
+    Ok(if result == HistoryCheckOutcome::Compacted {
+        diagnostic.checkpoint
+    } else {
+        None
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,13 +81,15 @@ pub(crate) async fn prepare_completed_history_owned(
     target_output_cap: Option<u32>,
     fixed_input_tokens: u64,
     suspending: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<Option<String>> {
+    diagnostic: &mut HistoryCheckDiagnostic,
+) -> Result<HistoryCheckOutcome> {
     let store = processor.crud_store.with_maintenance_access();
     let clock: Arc<dyn CompactionClock> = Arc::new(SystemCompactionClock::default());
     let deadline = clock
         .now_ms()
         .saturating_add(pioneer_compaction::OPERATION_MILLIS)
         .min(original_deadline.unwrap_or(u64::MAX));
+    diagnostic.stage = "executor".into();
     let Some(lease) = processor
         .compaction_coordinator
         .acquire(
@@ -77,9 +100,33 @@ pub(crate) async fn prepare_completed_history_owned(
         )
         .await?
     else {
-        return Ok(None);
+        diagnostic.code = "executor_busy".into();
+        return Ok(HistoryCheckOutcome::WaitingExecutor);
     };
     let cancellation = lease.cancellation();
+    diagnostic.stage = "catalog".into();
+    if pioneer_provider::catalog::model_catalog().is_err() {
+        diagnostic.code = "catalog_unavailable".into();
+        return Ok(HistoryCheckOutcome::WaitingCatalog);
+    }
+    diagnostic.stage = "history_preparation".into();
+    // One resumable registration quantum. No incomplete projection is budgeted.
+    let mut ready = false;
+    for _ in 0..16 {
+        ready = tokio::select! { biased;
+            _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+            _ = clock.sleep_until(deadline) => return Ok(HistoryCheckOutcome::Preparing),
+            result = store.compaction_prepare_history_quantum(workspace, thread) => result?,
+        };
+        if ready {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if !ready {
+        diagnostic.code = "history_preparation_incomplete".into();
+        return Ok(HistoryCheckOutcome::Preparing);
+    }
     let prepare = async {
         ensure!(
             store
@@ -87,6 +134,7 @@ pub(crate) async fn prepare_completed_history_owned(
                 .await?,
             "completed history preparation requires a completed scoped turn"
         );
+        diagnostic.stage = "history_capture".into();
         let owner = super::native::native_owner(workspace, thread);
         let version = store
             .compaction_projection_version(workspace, thread)
@@ -130,6 +178,7 @@ pub(crate) async fn prepare_completed_history_owned(
             )
             .await?;
         }
+        diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),
             Transport::Claude => "anthropic".to_owned(),
@@ -159,17 +208,30 @@ pub(crate) async fn prepare_completed_history_owned(
             reasoning: None,
             compiled_prompt: None,
         };
+        diagnostic.stage = "budget".into();
         let full = NativeRequestProjection::full(request, vec![], budget.clone(), false)?;
+        diagnostic.estimated_input_tokens = Some(
+            full.estimated_input_tokens
+                .saturating_add(fixed_input_tokens),
+        );
+        diagnostic.padded_input_tokens = diagnostic
+            .estimated_input_tokens
+            .map(pioneer_compaction::padded_input);
+        diagnostic.context_tokens = Some(budget.context);
+        diagnostic.input_limit = budget.input_limit;
+        diagnostic.output_reserve = Some(full.output_reserve);
         if budget.fits(
             full.estimated_input_tokens
                 .saturating_add(fixed_input_tokens),
             full.output_reserve,
             false,
         ) {
+            diagnostic.code = "history_fits".into();
             return Ok(None);
         }
         let selection =
             effective_selection(current, settings.selection.as_ref(), cli_override).clone();
+        diagnostic.stage = "summary_configuration".into();
         let summarizer = super::service::make_summarizer(
             processor.provider_registry().as_ref(),
             Some(processor),
@@ -177,6 +239,7 @@ pub(crate) async fn prepare_completed_history_owned(
             selection,
         )
         .await?;
+        diagnostic.stage = "planning".into();
         let layout = NativeHistoryLayout::from_messages(
             workspace,
             thread,
@@ -289,6 +352,7 @@ pub(crate) async fn prepare_completed_history_owned(
                 }
             }
         }
+        diagnostic.stage = "admission".into();
         let snapshot = admit_operation(
             &store,
             workspace,
@@ -317,13 +381,15 @@ pub(crate) async fn prepare_completed_history_owned(
         Ok::<_, anyhow::Error>(Some((snapshot, summarizer, projection)))
     };
     let operation = tokio::select! { biased;
-        _ = cancellation.cancelled() => anyhow::bail!("completed history preparation cancelled"),
-        _ = clock.sleep_until(deadline) => anyhow::bail!("completed history preparation deadline exceeded"),
+        _ = cancellation.cancelled() => return Ok(HistoryCheckOutcome::Cancelled),
+        _ = clock.sleep_until(deadline) => return Err(HistoryCheckDeadline.into()),
         result = prepare => result?,
     };
     let Some((snapshot, summarizer, projection)) = operation else {
-        return Ok(None);
+        return Ok(HistoryCheckOutcome::Fits);
     };
+    diagnostic.stage = "summarization".into();
+    diagnostic.operation = Some(snapshot.id.clone());
     let operation_deadline = deadline.min(snapshot.admission.deadline_ms);
     let runner = CompactionRunner::new(
         store,
@@ -351,8 +417,27 @@ pub(crate) async fn prepare_completed_history_owned(
         exit => exit,
     };
     match exit {
-        CompactionExit::Applied(checkpoint) => Ok(Some(checkpoint)),
-        exit => anyhow::bail!("completed history preparation did not apply: {exit:?}"),
+        CompactionExit::Applied(checkpoint) => {
+            diagnostic.code = "summary_applied".into();
+            diagnostic.checkpoint = Some(checkpoint);
+            Ok(HistoryCheckOutcome::Compacted)
+        }
+        CompactionExit::Failed(reason) | CompactionExit::Reconcile(reason) => {
+            diagnostic.code = match reason {
+                FailureKind::Transient => "provider_retries_exhausted",
+                FailureKind::Permanent => "provider_permanent_failure",
+                FailureKind::InvalidCompletion => "invalid_completion",
+                FailureKind::InsufficientEffect => "insufficient_effect",
+                FailureKind::Deadline => "operation_deadline",
+                FailureKind::Cancelled => "cancelled",
+            }
+            .into();
+            Ok(if reason == FailureKind::Cancelled {
+                HistoryCheckOutcome::Cancelled
+            } else {
+                HistoryCheckOutcome::Failed
+            })
+        }
     }
 }
 

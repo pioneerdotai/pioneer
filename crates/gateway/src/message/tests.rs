@@ -64435,7 +64435,10 @@ async fn check_completed_history(
         let row = harness.crud_store.database_connection().query_one_raw(sea_orm::Statement::from_string(
             sea_orm::DbBackend::Sqlite,"SELECT outcome FROM compaction_history_check WHERE turn_id='cli-history-completed'".to_owned()
         )).await.unwrap().unwrap();
-        assert_eq!(row.try_get::<String>("", "outcome").unwrap(), "completed");
+        assert_eq!(
+            row.try_get::<String>("", "outcome").unwrap(),
+            if lose_terminal { "fits" } else { "compacted" }
+        );
         let row = harness
             .crud_store
             .database_connection()
@@ -64502,4 +64505,172 @@ impl MessageProcessor {
             .map_err(|_| anyhow::anyhow!("compaction settings unavailable"))? = settings;
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn compaction_history_waits_for_changed_settings_without_spending_provider_attempts() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    use pioneer_entity::compaction_history_check as check;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+    let summary = [
+        "Goal and constraints",
+        "Decisions and rationale",
+        "Completed work and results",
+        "Failed attempts and unknowns",
+        "Current work and next step",
+        "Source references",
+    ]
+    .map(|heading| format!("## {heading}\nfixture retained fact"))
+    .join("\n\n");
+    let provider = Arc::new(CaptureSummaryProvider::new(&summary));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread = "settings-check";
+    let turn = "settings-check-turn";
+    seed_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "fixture-cli",
+        "claude",
+        thread,
+        turn,
+        "primary-session",
+        &"completed work ".repeat(80_000),
+    )
+    .await;
+    let mut completed = harness
+        .crud_store
+        .get_turn(thread, turn)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    completed.status = TurnStatus::Completed;
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn: completed,
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    harness
+        .processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                &harness.processor,
+            )),
+        )))
+        .await;
+    harness
+        .processor
+        .apply_compaction_settings(CompactionSettings {
+            selection: Some(ModelSelection {
+                transport: Transport::Claude,
+                instance: "missing-summary-instance".into(),
+                model: "sonnet".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    async fn poll_and_join(processor: &MessageProcessor) {
+        processor.poll_completed_history_checks().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if processor
+                    .completed_history_checks
+                    .lock()
+                    .await
+                    .values()
+                    .all(|job| {
+                        job.handle
+                            .as_ref()
+                            .is_none_or(tokio::task::JoinHandle::is_finished)
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    poll_and_join(&harness.processor).await;
+    let db = harness.crud_store.database_connection();
+    let first = check::Entity::find_by_id(turn)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.outcome.as_deref(), Some("waiting_settings"));
+    assert_eq!(first.failures, 0);
+    assert!(
+        first
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("summary_configuration")
+    );
+    assert_eq!(provider.call_count(), 0);
+    // Wake the metadata poll without sleeping a minute. An unchanged config
+    // must not re-enter preparation, create an operation or call the provider.
+    check::Entity::update_many()
+        .set(check::ActiveModel {
+            next_attempt_ms: Set(0),
+            ..Default::default()
+        })
+        .filter(check::Column::TurnId.eq(turn))
+        .exec(&db)
+        .await
+        .unwrap();
+    poll_and_join(&harness.processor).await;
+    let unchanged = check::Entity::find_by_id(turn)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.config_hash, first.config_hash);
+    assert_eq!(unchanged.outcome.as_deref(), Some("waiting_settings"));
+    assert_eq!(unchanged.failures, 0);
+    assert_eq!(provider.call_count(), 0);
+    harness
+        .processor
+        .apply_compaction_settings(CompactionSettings {
+            selection: Some(ModelSelection {
+                transport: Transport::Api,
+                instance: "summary-capture".into(),
+                model: "test-model".into(),
+                effort: None,
+            }),
+        })
+        .unwrap();
+    check::Entity::update_many()
+        .set(check::ActiveModel {
+            next_attempt_ms: Set(0),
+            ..Default::default()
+        })
+        .filter(check::Column::TurnId.eq(turn))
+        .exec(&db)
+        .await
+        .unwrap();
+    poll_and_join(&harness.processor).await;
+    let final_row = check::Entity::find_by_id(turn)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_row.outcome.as_deref(), Some("compacted"));
+    assert_ne!(final_row.config_hash, first.config_hash);
+    assert!(provider.call_count() > 0);
+    let diagnostic: pioneer_crud::compaction::HistoryCheckDiagnostic =
+        serde_json::from_str(final_row.diagnostic.as_ref().unwrap()).unwrap();
+    assert!(diagnostic.estimated_input_tokens.unwrap() > 0);
+    assert!(diagnostic.context_tokens.unwrap() > 0);
+    assert!(diagnostic.operation.is_some() && diagnostic.checkpoint.is_some());
 }

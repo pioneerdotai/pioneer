@@ -593,3 +593,106 @@ async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies(
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission() {
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
+    use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
+    use sea_orm::{ConnectOptions, EntityTrait, TransactionTrait};
+    let path = std::env::temp_dir().join(format!(
+        "pioneer-check-retry-{}.db",
+        pioneer_protocol::generate_id(21)
+    ));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut options = ConnectOptions::new(url.clone());
+    options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(options).await.unwrap();
+    let setup = fixture_on(writer.clone(), false).await;
+    let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path));
+    options
+        .max_connections(1)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|o| {
+            o.read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+    let reader = Database::connect(options).await.unwrap();
+    let database = SqliteDatabase::new(reader, writer);
+    let store = CrudStore::new(database.clone()).with_maintenance_access();
+    store
+        .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    let page = store.compaction_due_history_checks(1000).await.unwrap();
+    assert_eq!(page.len(), 1);
+    let held = database.begin().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.compaction_claim_history_check("turn", page[0].revision, 1000)
+        )
+        .await
+        .is_err()
+    );
+    // Interactive readers still run while the maintenance write is queued.
+    assert_eq!(
+        scalar(
+            &CrudStore::new(database.clone()),
+            "SELECT count(*) AS n FROM turn"
+        )
+        .await,
+        2
+    );
+    held.rollback().await.unwrap();
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT revision AS n FROM compaction_history_check WHERE turn_id='turn'"
+        )
+        .await,
+        0
+    );
+    let claim = store
+        .compaction_claim_history_check("turn", 0, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .compaction_begin_history_attempt("turn", claim.revision, "{}", "safe-digest", 1000)
+        .await
+        .unwrap();
+    store
+        .compaction_record_history_result(
+            "turn",
+            claim.revision,
+            0,
+            O::Retryable,
+            &D::new("history_capture", "database_error", "Temporary failure"),
+            1000,
+        )
+        .await
+        .unwrap();
+    drop(store);
+    drop(database);
+    drop(setup);
+    let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
+    assert!(
+        reopened
+            .compaction_due_history_checks(60999)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let page = reopened.compaction_due_history_checks(61000).await.unwrap();
+    assert_eq!(page[0].failures, 1);
+    assert_eq!(page[0].config_hash.as_deref(), Some("safe-digest"));
+    let row = pioneer_entity::compaction_history_check::Entity::find_by_id("turn")
+        .one(&reopened.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.diagnostic.unwrap().contains("database_error"));
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}

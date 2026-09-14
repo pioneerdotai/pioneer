@@ -15,6 +15,13 @@ pub struct Model {
     pub descriptor: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub outcome: Option<String>,
+    pub revision: i64,
+    pub failures: i64,
+    pub next_attempt_ms: i64,
+    pub attempt_deadline_ms: Option<i64>,
+    pub diagnostic: Option<String>,
+    pub config_hash: Option<String>,
+    pub managed: i64,
     #[sea_orm(
         belongs_to,
         from = "turn_id",
