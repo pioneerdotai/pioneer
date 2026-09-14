@@ -3,6 +3,7 @@ mod m20260913_000001_remove_compaction_item_capture_order;
 mod m20260913_000002_compaction_logical_payload_updates;
 mod m20260914_000001_compaction_history_preparation;
 mod m20260914_000002_tool_output_chunk;
+mod m20260914_000003_shared_frozen_ranges;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -142,6 +143,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260913_000002_compaction_logical_payload_updates::Migration),
             Box::new(m20260914_000001_compaction_history_preparation::Migration),
             Box::new(m20260914_000002_tool_output_chunk::Migration),
+            Box::new(m20260914_000003_shared_frozen_ranges::Migration),
         ]
     }
 }

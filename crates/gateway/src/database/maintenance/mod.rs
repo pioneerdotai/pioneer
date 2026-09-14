@@ -1,3 +1,4 @@
+mod frozen_storage;
 mod native_event_cleanup;
 mod projection_receipt_cleanup;
 mod zstd_payload_compression;
@@ -13,6 +14,7 @@ pub(crate) async fn run(
     tokio::join!(
         zstd_payload_compression::run(crud_store.clone(), cancellation.clone()),
         projection_receipt_cleanup::run(crud_store.clone(), cancellation.clone()),
+        frozen_storage::run(crud_store.clone(), cancellation.clone()),
         native_event_cleanup::run(crud_store, cancellation),
     );
 }

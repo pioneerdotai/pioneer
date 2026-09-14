@@ -943,12 +943,34 @@ async fn capture_with_imports(
         }
     }
     let import_digest = pioneer_crud::compaction::frozen_import_identity(&accepted)?;
+    let identity_sha256 = hex::encode(digest.finalize());
+    let capture_key = serde_json::to_vec(&(
+        1_u32,
+        workspace,
+        owner_thread,
+        &identity_sha256,
+        references.len(),
+        &import_digest,
+        accepted.len(),
+    ))?;
     let descriptor = FrozenHistoryRef {
         format: 1,
-        manifest_id: format!("fh_{}", pioneer_protocol::generate_id(21)),
+        manifest_id: format!("fh_{}", hex::encode(Sha256::digest(&capture_key))),
         messages: references.len() as u64,
-        identity_sha256: hex::encode(digest.finalize()),
+        identity_sha256,
     };
+    if let Some(existing) = store
+        .compaction_equivalent_frozen_history(
+            workspace,
+            owner_thread,
+            &descriptor,
+            accepted.len() as u64,
+            &import_digest,
+        )
+        .await?
+    {
+        return Ok(existing);
+    }
     store
         .compaction_begin_frozen_history_with_imports(
             workspace,
@@ -958,7 +980,16 @@ async fn capture_with_imports(
             &import_digest,
         )
         .await?;
-    let mut start = 0;
+    let (message_prefix, import_prefix) = store
+        .compaction_share_frozen_prefix(
+            workspace,
+            owner_thread,
+            &descriptor.manifest_id,
+            &references,
+            &accepted,
+        )
+        .await?;
+    let mut start = usize::try_from(message_prefix)?;
     while start < references.len() {
         let mut end = start;
         let mut bytes = 0;
@@ -987,7 +1018,7 @@ async fn capture_with_imports(
             .await?;
         start = end;
     }
-    let mut start = 0;
+    let mut start = usize::try_from(import_prefix)?;
     while start < accepted.len() {
         let mut end = start;
         let mut bytes = 0;

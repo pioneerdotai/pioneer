@@ -179,3 +179,11 @@ pub mod workspace;
 pub mod workspace_membership;
 
 pub mod tool_output_chunk;
+
+pub mod compaction_frozen_message_data;
+
+pub mod compaction_frozen_import_data;
+
+pub mod compaction_frozen_layout;
+
+pub mod compaction_frozen_span;

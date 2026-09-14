@@ -177,3 +177,11 @@ pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
 
 pub use super::tool_output_chunk::Entity as ToolOutputChunk;
+
+pub use super::compaction_frozen_message_data::Entity as CompactionFrozenMessageData;
+
+pub use super::compaction_frozen_import_data::Entity as CompactionFrozenImportData;
+
+pub use super::compaction_frozen_layout::Entity as CompactionFrozenLayout;
+
+pub use super::compaction_frozen_span::Entity as CompactionFrozenSpan;

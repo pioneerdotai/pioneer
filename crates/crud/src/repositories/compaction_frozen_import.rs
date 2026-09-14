@@ -57,7 +57,7 @@ impl PreparedFrozenImport {
             + serde_json::to_vec(target)?.len()
             + 64)
     }
-    fn record_at(&self, message: u64) -> FrozenImportRecord {
+    pub(crate) fn record_at(&self, message: u64) -> FrozenImportRecord {
         let mut record = self.record.clone();
         record.message_ordinal = message;
         record
@@ -350,7 +350,7 @@ pub(crate) async fn compaction_append_frozen_imports(
         "imports are not a sequential batch or exact retry"
     );
     for (ordinal, record, prepared, target_json, json) in &batch {
-        if !ready {
+        if !ready && *ordinal >= next {
             // The existing transaction holds the validated dependency snapshot
             // through insertion; exact retries below retain their prior behavior.
             if compaction_frozen_history::Entity::find()
@@ -648,17 +648,22 @@ pub(crate) async fn compaction_append_frozen_imports(
                 .await?
                 .is_some()
             {
-                compaction_frozen_import::Entity::insert(compaction_frozen_import::ActiveModel {
-                    manifest_id: sea_orm::Set(manifest.to_owned()),
-                    ordinal: sea_orm::Set(*ordinal),
-                    message_ordinal: sea_orm::Set(i64::try_from(record.message_ordinal)?),
-                    source_scope: sea_orm::Set(record.source.scope.clone()),
-                    source_id: sea_orm::Set(record.source.id.clone()),
-                    source_version: sea_orm::Set(record.source.version.clone()),
-                    source_thread: sea_orm::Set(record.source_thread.clone()),
-                    proof_json: sea_orm::Set(json.clone()),
-                    bytes: sea_orm::Set(i64::try_from(json.len())?),
-                })
+                let source =
+                    super::compaction_frozen_storage::append_source(&tx, manifest, 1, *ordinal)
+                        .await?;
+                pioneer_entity::compaction_frozen_import_data::Entity::insert(
+                    pioneer_entity::compaction_frozen_import_data::ActiveModel {
+                        manifest_id: sea_orm::Set(source),
+                        ordinal: sea_orm::Set(*ordinal),
+                        message_ordinal: sea_orm::Set(i64::try_from(record.message_ordinal)?),
+                        source_scope: sea_orm::Set(record.source.scope.clone()),
+                        source_id: sea_orm::Set(record.source.id.clone()),
+                        source_version: sea_orm::Set(record.source.version.clone()),
+                        source_thread: sea_orm::Set(record.source_thread.clone()),
+                        proof_json: sea_orm::Set(json.clone()),
+                        bytes: sea_orm::Set(i64::try_from(json.len())?),
+                    },
+                )
                 .on_conflict(
                     OnConflict::columns([
                         compaction_frozen_import::Column::ManifestId,

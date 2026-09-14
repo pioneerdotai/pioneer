@@ -574,9 +574,25 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     let recaptured = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[])
         .await
         .unwrap();
-    assert_ne!(projection.manifest_id, recaptured.manifest_id);
+    assert_eq!(projection.manifest_id, recaptured.manifest_id);
     assert_eq!(projection.identity_sha256, recaptured.identity_sha256);
-    prepared.source_projection = Some(recaptured);
+    // Old releases could store equivalent snapshots under different IDs.
+    // Preserve the admission/recovery coverage for those existing aliases.
+    let legacy_alias = pioneer_compaction::frozen::FrozenHistoryRef {
+        manifest_id: "legacy-recaptured-projection".into(),
+        ..recaptured
+    };
+    f.store
+        .compaction_begin_frozen_history("ws", "thread", &legacy_alias)
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_finish_frozen_history("ws", "thread", &legacy_alias)
+            .await
+            .unwrap()
+    );
+    prepared.source_projection = Some(legacy_alias);
     prepared.operation_deadline_ms = Some(900100);
     let resumed = admit_operation(
         &f.store,
@@ -1907,6 +1923,10 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
     let snapshot = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
         .await
         .unwrap();
+    let reused = super::frozen::capture(&f.store, "ws", "thread", &allowed, &frozen)
+        .await
+        .unwrap();
+    assert_eq!(snapshot, reused);
     let descriptor_json = serde_json::to_string(&snapshot).unwrap();
     assert!(!descriptor_json.contains("original request"));
     assert!(!descriptor_json.contains("first completed result"));

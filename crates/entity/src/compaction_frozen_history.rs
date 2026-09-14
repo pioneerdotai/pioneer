@@ -22,6 +22,7 @@ pub struct Model {
     pub imports_sha256: String,
     pub next_import: i64,
     pub ready: i64,
+    pub storage_registered: i64,
     #[sea_orm(has_many)]
     pub compaction_frozen_imports: HasMany<super::compaction_frozen_import::Entity>,
     #[sea_orm(has_many)]

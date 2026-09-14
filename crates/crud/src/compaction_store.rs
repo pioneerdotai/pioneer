@@ -1084,3 +1084,70 @@ impl CrudStore {
         .await
     }
 }
+
+impl CrudStore {
+    pub async fn compaction_equivalent_frozen_history(
+        &self,
+        workspace: &str,
+        owner: &str,
+        descriptor: &FrozenHistoryRef,
+        imports: u64,
+        digest: &str,
+    ) -> Result<Option<FrozenHistoryRef>> {
+        repositories::compaction_frozen_storage::equivalent(
+            self, workspace, owner, descriptor, imports, digest,
+        )
+        .await
+    }
+    pub async fn compaction_share_frozen_prefix(
+        &self,
+        workspace: &str,
+        owner: &str,
+        manifest: &str,
+        messages: &[pioneer_compaction::frozen::FrozenMessageRef],
+        imports: &[(u64, PreparedFrozenImport)],
+    ) -> Result<(u64, u64)> {
+        let refs = messages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let proofs = imports
+            .iter()
+            .map(|(ordinal, p)| serde_json::to_string(&p.record_at(*ordinal)))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let messages = repositories::compaction_frozen_storage::prepare(
+            self, workspace, owner, manifest, 0, &refs,
+        )
+        .await?;
+        let imports = repositories::compaction_frozen_storage::prepare(
+            self, workspace, owner, manifest, 1, &proofs,
+        )
+        .await?;
+        use pioneer_entity::compaction_frozen_layout as layout;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+        let registered = |kind| {
+            sea_orm::sea_query::Expr::exists(
+                layout::Entity::find()
+                    .select_only()
+                    .column(layout::Column::ManifestId)
+                    .filter(layout::Column::ManifestId.eq(manifest))
+                    .filter(layout::Column::Kind.eq(kind))
+                    .into_query(),
+            )
+        };
+        pioneer_entity::compaction_frozen_history::Entity::update_many()
+            .col_expr(
+                pioneer_entity::compaction_frozen_history::Column::StorageRegistered,
+                sea_orm::sea_query::Expr::val(1_i64),
+            )
+            .filter(pioneer_entity::compaction_frozen_history::Column::Id.eq(manifest))
+            .filter(registered(0))
+            .filter(registered(1))
+            .exec(&self.connection)
+            .await?;
+        Ok((messages, imports))
+    }
+    pub async fn compact_frozen_storage_quantum(&self) -> Result<bool> {
+        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access()).await
+    }
+}

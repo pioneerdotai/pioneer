@@ -353,6 +353,40 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         .record_tool_output("physical-output", &output)
         .await
         .unwrap();
+    let reference: pioneer_compaction::frozen::FrozenMessageRef = serde_json::from_value(serde_json::json!({
+        "logical_turn_id":"turn", "source_thread":"thread", "context_thread":null, "unit_id":"u",
+        "sources":[{"scope":"event:turn","id":"event-1","version":"event-revision:1"}],
+        "inherited":false,"complete":true,"protected_input":false,"wire_sha256":"a".repeat(64),
+        "replay_source":null,"tool_call_id":null,"tool_name":null
+    })).unwrap();
+    for id in ["storage-a", "storage-b"] {
+        let descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+            format: 1,
+            manifest_id: id.into(),
+            messages: 1,
+            identity_sha256: "b".repeat(64),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        store
+            .compaction_append_frozen_history(
+                "ws",
+                "thread",
+                id,
+                0,
+                std::slice::from_ref(&reference),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_finish_frozen_history("ws", "thread", &descriptor)
+                .await
+                .unwrap()
+        );
+    }
     let held = database.begin().await.unwrap();
     assert!(
         tokio::time::timeout(
@@ -367,6 +401,14 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
             store.compaction_prepare_history_quantum("ws", "thread")
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            store.compact_frozen_storage_quantum()
         )
         .await
         .is_err()
@@ -394,6 +436,13 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         .await,
         step
     );
+    assert_eq!(
+        scalar(&store, "SELECT count(*) AS n FROM compaction_frozen_layout").await,
+        0
+    );
+    for _ in 0..4 {
+        assert!(store.compact_frozen_storage_quantum().await.unwrap());
+    }
     drop(store);
     drop(database);
     drop(setup);
@@ -408,6 +457,28 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         rows.iter()
             .all(|(_, row)| row.text == "before cancellation")
     );
+    for _ in 0..30 {
+        if !reopened.compact_frozen_storage_quantum().await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        scalar(
+            &reopened,
+            "SELECT count(*) AS n FROM compaction_frozen_message_data"
+        )
+        .await,
+        1
+    );
+    for id in ["storage-a", "storage-b"] {
+        assert_eq!(
+            reopened
+                .compaction_frozen_history_page("ws", "thread", id, 0)
+                .await
+                .unwrap(),
+            vec![reference.clone()]
+        );
+    }
     finish(&reopened).await;
     assert_eq!(
         scalar(

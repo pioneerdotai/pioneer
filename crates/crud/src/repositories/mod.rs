@@ -109,3 +109,5 @@ pub enum ProjectionWriteOutcome {
 mod compaction_live_sources;
 
 pub(crate) mod tool_output;
+
+pub(crate) mod compaction_frozen_storage;

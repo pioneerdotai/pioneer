@@ -2736,7 +2736,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         "binding is revalidated after preparation"
     );
     db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('delivery','candidate','rt')").await.unwrap();
-    db.execute_unprepared("CREATE TEMP TRIGGER abort_frozen_import AFTER INSERT ON compaction_frozen_import BEGIN SELECT RAISE(ABORT,'fixture import rollback'); END").await.unwrap();
+    db.execute_unprepared("CREATE TEMP TRIGGER abort_frozen_import AFTER INSERT ON compaction_frozen_import_data BEGIN SELECT RAISE(ABORT,'fixture import rollback'); END").await.unwrap();
     assert!(
         store
             .compaction_append_frozen_imports("ws", "thread", &context.manifest_id, 0, &imports)
@@ -2790,6 +2790,49 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .await
             .unwrap()
             .is_empty()
+    );
+    for _ in 0..100 {
+        if !store.compact_frozen_storage_quantum().await.unwrap() {
+            break;
+        }
+    }
+    let shared = FrozenHistoryRef {
+        manifest_id: "assembled-shared".into(),
+        ..context.clone()
+    };
+    store
+        .compaction_begin_frozen_history_with_imports("ws", "thread", &shared, 1, &import_digest)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_share_frozen_prefix(
+                "ws",
+                "thread",
+                &shared.manifest_id,
+                std::slice::from_ref(&target),
+                &imports
+            )
+            .await
+            .unwrap(),
+        (1, 1)
+    );
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &shared)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_import_page("ws", "thread", &shared.manifest_id, 0)
+            .await
+            .unwrap(),
+        records
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_import_data").await,
+        1
     );
     // A new execution can adopt this metadata only through its exact TaskRun
     // snapshot; sharing a workspace or parent thread is insufficient.
@@ -3899,12 +3942,12 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
     // The CHECK measures UTF-8 bytes, not characters, and enforces the upper bound.
     for (table, columns, values) in [
         (
-            "compaction_frozen_message",
+            "compaction_frozen_message_data",
             "manifest_id,ordinal,reference_json,bytes",
             "'manifest',0,?,?",
         ),
         (
-            "compaction_frozen_import",
+            "compaction_frozen_import_data",
             "manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes",
             "'manifest',0,0,'scope','source','v1','thread',?,?",
         ),
@@ -3943,12 +3986,15 @@ async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
             "composite primary key must reject duplicate ordinals"
         );
     }
-    assert!(db.execute_unprepared("INSERT INTO compaction_frozen_import(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('manifest',1,0,'scope','source','v1','thread','{}',2)").await.is_err(), "source identity must remain unique within the manifest message");
-    assert!(db.execute_unprepared("INSERT INTO compaction_frozen_message(manifest_id,ordinal,reference_json,bytes) VALUES ('missing',0,'{}',2)").await.is_err());
+    assert!(db.execute_unprepared("INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('manifest',1,0,'scope','source','v1','thread','{}',2)").await.is_err(), "source identity must remain unique within the manifest message");
+    assert!(db.execute_unprepared("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('missing',0,'{}',2)").await.is_err());
     db.execute_unprepared("DELETE FROM compaction_frozen_history WHERE id='manifest'")
         .await
         .unwrap();
-    for table in ["compaction_frozen_message", "compaction_frozen_import"] {
+    for table in [
+        "compaction_frozen_message_data",
+        "compaction_frozen_import_data",
+    ] {
         let row = db
             .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
@@ -4033,5 +4079,327 @@ async fn old_summary_is_not_a_canonical_source_or_projection_dependency() {
             .compaction_reference_fragment("ws", "thread", &source, 0)
             .await
             .is_err()
+    );
+}
+
+fn shared_refs(count: usize) -> Vec<pioneer_compaction::frozen::FrozenMessageRef> {
+    (0..count)
+        .map(|i| pioneer_compaction::frozen::FrozenMessageRef {
+            logical_turn_id: Some("turn".into()),
+            context_thread: None,
+            source_thread: "thread".into(),
+            unit_id: format!("u{i}"),
+            sources: vec![SourceRef {
+                scope: "event:turn".into(),
+                id: format!("e{i}"),
+                version: "event-revision:1".into(),
+            }],
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "a".repeat(64),
+            replay_source: None,
+            tool_call_id: None,
+            tool_name: None,
+        })
+        .collect()
+}
+fn shared_descriptor(
+    id: &str,
+    refs: &[pioneer_compaction::frozen::FrozenMessageRef],
+) -> pioneer_compaction::frozen::FrozenHistoryRef {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for r in refs {
+        let b = serde_json::to_vec(r).unwrap();
+        digest.update((b.len() as u64).to_le_bytes());
+        digest.update(b);
+    }
+    pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: id.into(),
+        messages: refs.len() as u64,
+        identity_sha256: hex::encode(digest.finalize()),
+    }
+}
+async fn shared_capture(
+    store: &CrudStore,
+    id: &str,
+    refs: &[pioneer_compaction::frozen::FrozenMessageRef],
+    shared: bool,
+) -> pioneer_compaction::frozen::FrozenHistoryRef {
+    let d = shared_descriptor(id, refs);
+    store
+        .compaction_begin_frozen_history("ws", "thread", &d)
+        .await
+        .unwrap();
+    let start = if shared {
+        store
+            .compaction_share_frozen_prefix("ws", "thread", id, refs, &[])
+            .await
+            .unwrap()
+            .0 as usize
+    } else {
+        0
+    };
+    for (i, page) in refs[start..].chunks(128).enumerate() {
+        store
+            .compaction_append_frozen_history("ws", "thread", id, (start + i * 128) as u64, page)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &d)
+            .await
+            .unwrap()
+    );
+    d
+}
+async fn shared_read(
+    store: &CrudStore,
+    id: &str,
+) -> Vec<pioneer_compaction::frozen::FrozenMessageRef> {
+    let mut result = Vec::new();
+    loop {
+        let page = store
+            .compaction_frozen_history_page("ws", "thread", id, result.len() as u64)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        result.extend(page);
+    }
+    result
+}
+async fn frozen_count(store: &CrudStore, table: &str) -> i64 {
+    store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!("SELECT count(*) AS n FROM {table}"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap()
+}
+#[tokio::test]
+async fn shared_frozen_growth_is_linear_and_old_revisions_are_unchanged() {
+    let store = store().await;
+    let refs = shared_refs(400);
+    for n in (10..=400).step_by(10) {
+        shared_capture(&store, &format!("s{n:04}"), &refs[..n], true).await;
+    }
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        400
+    );
+    assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 40);
+    assert_eq!(shared_read(&store, "s0010").await, refs[..10]);
+    assert_eq!(shared_read(&store, "s0400").await, refs);
+    let plan = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "EXPLAIN QUERY PLAN SELECT reference_json FROM compaction_frozen_message WHERE manifest_id='s0400' AND ordinal>=200 AND ordinal<210 ORDER BY ordinal"))
+        .await.unwrap().into_iter().map(|row|row.try_get::<String>("","detail").unwrap()).collect::<Vec<_>>();
+    assert!(
+        !plan.iter().any(|line| line.starts_with("SCAN d")),
+        "range read must not scan the full payload table: {plan:?}"
+    );
+
+    let d = shared_descriptor("unused", &refs);
+    let found = store
+        .compaction_equivalent_frozen_history("ws", "thread", &d, 0, EMPTY_FROZEN_IMPORT_SHA256)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.manifest_id, "s0400");
+    assert!(
+        store
+            .compaction_equivalent_frozen_history(
+                "foreign",
+                "thread",
+                &d,
+                0,
+                EMPTY_FROZEN_IMPORT_SHA256
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_equivalent_frozen_history("ws", "thread", &d, 1, &"b".repeat(64))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut changed = refs.clone();
+    changed[200].wire_sha256 = "b".repeat(64);
+    shared_capture(&store, "branch", &changed, true).await;
+    assert_eq!(shared_read(&store, "branch").await, changed);
+    assert_eq!(shared_read(&store, "s0400").await, refs);
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        600
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM thread WHERE id='thread'")
+        .await
+        .unwrap();
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        0
+    );
+    assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 0);
+}
+#[tokio::test]
+async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_reads() {
+    let store = store().await;
+    let refs = shared_refs(300);
+    for id in ["a", "b", "c"] {
+        shared_capture(&store, id, &refs, false).await;
+    }
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        900
+    );
+    // Reusing a published legacy capture must not hide it from conversion.
+    assert_eq!(
+        store
+            .compaction_share_frozen_prefix("ws", "thread", "b", &refs, &[])
+            .await
+            .unwrap(),
+        (300, 0)
+    );
+
+    let mut quanta = 0;
+    while store.compact_frozen_storage_quantum().await.unwrap() {
+        quanta += 1;
+        assert!(quanta < 100);
+        for id in ["a", "b", "c"] {
+            assert_eq!(shared_read(&store, id).await, refs);
+        }
+    }
+    assert!(quanta > 10);
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        300
+    );
+    assert_eq!(frozen_count(&store, "compaction_frozen_history").await, 3);
+    let descriptor = shared_descriptor("b", &refs);
+    assert_eq!(
+        store
+            .compaction_frozen_history_owner("ws", &descriptor)
+            .await
+            .unwrap(),
+        Some("thread".into())
+    );
+    assert!(!store.compact_frozen_storage_quantum().await.unwrap());
+}
+
+#[tokio::test]
+async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequence() {
+    let store = store().await;
+    let refs = shared_refs(25);
+    let d = shared_descriptor("concurrent", &refs);
+    store
+        .compaction_begin_frozen_history("ws", "thread", &d)
+        .await
+        .unwrap();
+    store
+        .compaction_share_frozen_prefix("ws", "thread", &d.manifest_id, &refs, &[])
+        .await
+        .unwrap();
+    let db = store.database_connection();
+    db.execute_unprepared("CREATE TEMP TRIGGER reject_shared_append BEFORE INSERT ON compaction_frozen_message_data BEGIN SELECT RAISE(ABORT,'fixture rollback'); END").await.unwrap();
+    assert!(
+        store
+            .compaction_append_frozen_history("ws", "thread", &d.manifest_id, 0, &refs)
+            .await
+            .is_err()
+    );
+    assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 0);
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        0
+    );
+    assert!(
+        !store
+            .compaction_finish_frozen_history("ws", "thread", &d)
+            .await
+            .unwrap()
+    );
+    db.execute_unprepared("DROP TRIGGER reject_shared_append")
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        shared_capture(&store, "concurrent", &refs, true),
+        shared_capture(&store, "concurrent", &refs, true)
+    );
+    assert_eq!(a, b);
+    assert_eq!(shared_read(&store, "concurrent").await, refs);
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        25
+    );
+    assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 1);
+}
+
+#[tokio::test]
+async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history() {
+    let store = store().await;
+    let refs = shared_refs(20);
+    shared_capture(&store, "a", &refs, true).await;
+    shared_capture(&store, "b", &refs, false).await;
+    let db = store.database_connection();
+    db.execute_unprepared("CREATE TEMP TRIGGER reject_shared_cleanup BEFORE DELETE ON compaction_frozen_message_data BEGIN SELECT RAISE(ABORT,'fixture cleanup rollback'); END").await.unwrap();
+    let mut failed = false;
+    for _ in 0..20 {
+        if store.compact_frozen_storage_quantum().await.is_err() {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    assert_eq!(shared_read(&store, "b").await, refs);
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        40
+    );
+    db.execute_unprepared("DROP TRIGGER reject_shared_cleanup")
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        if !store.compact_frozen_storage_quantum().await.unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        20
+    );
+    shared_capture(&store, "c-broken", &refs, false).await;
+    shared_capture(&store, "d-good", &refs, false).await;
+    db.execute_unprepared(
+        "DELETE FROM compaction_frozen_message_data WHERE manifest_id='c-broken' AND ordinal=3",
+    )
+    .await
+    .unwrap();
+    let mut rejected = 0;
+    for _ in 0..40 {
+        match store.compact_frozen_storage_quantum().await {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(_) => rejected += 1,
+        }
+    }
+    assert_eq!(rejected, 1);
+    assert_eq!(shared_read(&store, "d-good").await, refs);
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        39
     );
 }

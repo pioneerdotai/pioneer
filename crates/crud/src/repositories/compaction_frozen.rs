@@ -155,13 +155,17 @@ pub(crate) async fn compaction_append_frozen_history(
             *ordinal < count,
             "frozen history ordinal exceeds declared count"
         );
-        if !ready {
-            compaction_frozen_message::Entity::insert(compaction_frozen_message::ActiveModel {
-                manifest_id: sea_orm::Set((manifest).to_owned()),
-                ordinal: sea_orm::Set(*ordinal),
-                reference_json: sea_orm::Set((json.clone()).to_owned()),
-                bytes: sea_orm::Set(json.len() as i64),
-            })
+        if !ready && *ordinal >= next {
+            let source =
+                super::compaction_frozen_storage::append_source(&tx, manifest, 0, *ordinal).await?;
+            pioneer_entity::compaction_frozen_message_data::Entity::insert(
+                pioneer_entity::compaction_frozen_message_data::ActiveModel {
+                    manifest_id: sea_orm::Set(source),
+                    ordinal: sea_orm::Set(*ordinal),
+                    reference_json: sea_orm::Set((json.clone()).to_owned()),
+                    bytes: sea_orm::Set(json.len() as i64),
+                },
+            )
             .on_conflict(
                 OnConflict::columns([
                     compaction_frozen_message::Column::ManifestId,
