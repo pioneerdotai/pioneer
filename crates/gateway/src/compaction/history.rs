@@ -244,7 +244,16 @@ pub(crate) async fn load_line_history(
     excluded_turn: Option<&str>,
     fence: &HistoryReadFence,
 ) -> Result<Vec<ChatMessage>> {
-    load_line_history_inner(store, workspace, thread, excluded_turn, fence, false, None).await
+    load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        excluded_turn,
+        fence,
+        false,
+        HistorySelection::All,
+    )
+    .await
 }
 
 pub(crate) async fn load_task_line_history(
@@ -254,8 +263,16 @@ pub(crate) async fn load_task_line_history(
     excluded_turn: Option<&str>,
     fence: &HistoryReadFence,
 ) -> Result<Vec<ChatMessage>> {
-    let mut messages =
-        load_line_history_inner(store, workspace, thread, excluded_turn, fence, true, None).await?;
+    let mut messages = load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        excluded_turn,
+        fence,
+        true,
+        HistorySelection::All,
+    )
+    .await?;
     let store = store.with_maintenance_access();
     for message in &mut messages {
         let Some(origin) = message.provenance.as_mut() else {
@@ -296,7 +313,44 @@ pub(crate) async fn load_exact_line_history(
     fence: &HistoryReadFence,
     selected: &BTreeSet<SourceRef>,
 ) -> Result<Vec<ChatMessage>> {
-    load_line_history_inner(store, workspace, thread, None, fence, false, Some(selected)).await
+    load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        None,
+        fence,
+        false,
+        HistorySelection::Sources(selected),
+    )
+    .await
+}
+
+/// Freeze only work physically produced by this child through the completed
+/// result turn. Later turns are filtered before any payload is loaded. Inherited
+/// TaskRun context is deliberately not a delivered contribution.
+pub(crate) async fn load_task_output_history(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    through_turn: &str,
+    fence: &HistoryReadFence,
+) -> Result<Vec<ChatMessage>> {
+    load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        None,
+        fence,
+        false,
+        HistorySelection::ThroughTurn(through_turn),
+    )
+    .await
+}
+
+enum HistorySelection<'a> {
+    All,
+    Sources(&'a BTreeSet<SourceRef>),
+    ThroughTurn(&'a str),
 }
 
 async fn load_line_history_inner(
@@ -306,8 +360,13 @@ async fn load_line_history_inner(
     excluded_turn: Option<&str>,
     fence: &HistoryReadFence,
     causal_task_context: bool,
-    selected: Option<&BTreeSet<SourceRef>>,
+    selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
+    let (selected, through_turn) = match selection {
+        HistorySelection::All => (None, None),
+        HistorySelection::Sources(sources) => (Some(sources), None),
+        HistorySelection::ThroughTurn(turn) => (None, Some(turn)),
+    };
     let store = store.with_maintenance_access();
     let mut turns = Vec::new();
     let mut after = String::new();
@@ -339,6 +398,17 @@ async fn load_line_history_inner(
                 &b.id,
             ))
     });
+    if let Some(through_turn) = through_turn {
+        let end = turns
+            .iter()
+            .position(|turn| turn.id == through_turn)
+            .ok_or_else(|| anyhow::anyhow!("completed output turn is outside its history fence"))?;
+        ensure!(
+            turns[end].status == "completed",
+            "output turn is not completed"
+        );
+        turns.truncate(end + 1);
+    }
     // Refresh relationship metadata before deciding whether earlier Task
     // commands are closed by later occurrence/delivery turns. A cold cache
     // must not drop a command merely because its outcome sorts after it.

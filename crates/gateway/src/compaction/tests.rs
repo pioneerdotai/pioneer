@@ -3542,3 +3542,87 @@ async fn compaction_commit_failure_does_not_mislabel_successful_provider_attempt
     assert_eq!(observation.diagnostic, None);
     assert_eq!(f.store.compaction_head("owner").await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn completed_task_output_excludes_later_turns_before_decoding_and_survives_compression() {
+    let f = fixture("unused", vec![], true, false).await;
+    let store = f.store.with_maintenance_access();
+    let db = store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    for sql in [
+        "UPDATE turn SET status='completed',created_at='2026-01-02T00:00:00+00:00' WHERE id='turn'",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('earlier','thread','completed','conversation','user','2026-01-01T00:00:00+00:00',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('later','thread','completed','conversation','user','2026-01-03T00:00:00+00:00',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('poison','thread','later',1,'fixture','not valid JSON',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    for (turn, text) in [
+        ("earlier", "own previous work"),
+        ("turn", "own final result"),
+    ] {
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: turn.into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: format!("answer-{turn}"),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    super::history::prepare_history(&store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let messages = super::history::load_task_output_history(&store, "ws", "thread", "turn", &fence)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>(),
+        ["own previous work", "own final result"]
+    );
+    assert!(
+        super::history::load_task_output_history(&store, "ws", "thread", "missing", &fence)
+            .await
+            .is_err()
+    );
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let frozen = super::frozen::capture(&store, "ws", "thread", &allowed, &messages)
+        .await
+        .unwrap();
+    assert!(
+        crate::database::compress_history_payloads_for_test(&store)
+            .await
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        super::frozen::restore(&store, "ws", &allowed, &frozen)
+            .await
+            .unwrap(),
+        messages
+    );
+    // An unrestricted read really does encounter the poison; the output path
+    // succeeds because later work is excluded, not because errors are swallowed.
+    assert!(
+        super::history::load_line_history(&store, "ws", "thread", None, &fence)
+            .await
+            .is_err()
+    );
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+}

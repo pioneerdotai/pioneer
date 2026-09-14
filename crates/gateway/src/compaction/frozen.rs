@@ -263,19 +263,49 @@ pub(crate) async fn capture_task_output(
         );
         return Ok(snapshot);
     }
-    let history = capture_execution_basis_json(
+    let started = std::time::Instant::now();
+    // A delivered output is the child's own work, not another copy of its
+    // accepted input context. H remains in the immutable TaskRun conversation
+    // snapshot and in the recipient's context; C composes H + own A + own B.
+    // In particular, do not hydrate/revalidate all of H's imported sources or
+    // project a compaction checkpoint on the terminal delivery path.
+    super::history::prepare_history(&store, workspace, &turn.thread_id).await?;
+    let epoch = store
+        .compaction_projection_version(workspace, &turn.thread_id)
+        .await?;
+    let fence = store.compaction_history_read_fence().await?;
+    let messages = super::history::load_task_output_history(
         &store,
         workspace,
         &turn.thread_id,
-        Some(&turn.turn_id),
-        None,
-        None,
+        &turn.turn_id,
+        &fence,
     )
     .await?;
-    let history: FrozenHistoryRef = serde_json::from_str(&history)?;
-    store
+    let history = capture(
+        &store,
+        workspace,
+        &turn.thread_id,
+        &BTreeSet::from([turn.thread_id.clone()]),
+        &messages,
+    )
+    .await?;
+    ensure!(
+        store
+            .compaction_projection_version(workspace, &turn.thread_id)
+            .await?
+            == epoch,
+        "child history changed while freezing its completed output"
+    );
+    let output = store
         .compaction_record_task_output(workspace, &turn.id, &history)
-        .await
+        .await?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        message_count = history.messages,
+        "completed Task output captured"
+    );
+    Ok(output)
 }
 
 /// `basis_turn` identifies the accepted parent execution independently of the

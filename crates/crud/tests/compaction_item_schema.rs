@@ -174,6 +174,19 @@ async fn item_capture_cleanup_preserves_revisions_and_restarts_on_plain_and_comp
         assert_eq!(count(&store, "SELECT count(*) n FROM compaction_item_revision WHERE source_id='item' AND revision=9 AND present=0").await, 1);
         db.execute_unprepared("INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES ('item','turn','item','command_execution','completed',0,'{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
         assert_eq!(count(&store, "SELECT count(*) n FROM compaction_item_revision WHERE source_id='item' AND revision=10 AND present=1").await, 1);
+        // Schema migration does not prepare legacy history. Complete the same
+        // bounded preparation used at runtime before capturing the read fence.
+        let mut prepared = false;
+        for _ in 0..100 {
+            prepared = store
+                .compaction_prepare_history_quantum("ws", "thread")
+                .await
+                .unwrap();
+            if prepared {
+                break;
+            }
+        }
+        assert!(prepared, "bounded fixture did not finish preparation");
         assert_eq!(
             store
                 .compaction_history_turn_page(

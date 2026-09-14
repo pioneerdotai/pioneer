@@ -10679,11 +10679,128 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
                 && origin.context_thread.as_ref() == c_context.as_ref()
         )));
     }
+    let accepted_c_basis = crud_store
+        .get_task_run_conversation_snapshot(&c_turn.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Fault injection after C's request is already materialized: its input
+    // manifest cannot be reopened during completion. Delivery of the newly
+    // produced result must remain independent of that expensive input path.
+    let accepted_c_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&accepted_c_basis.history_json).unwrap();
+    crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE compaction_frozen_history SET ready=0 WHERE id=?",
+            [accepted_c_descriptor.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap();
     provider.release_third.notify_one();
     assert_eq!(
         wait_for_task_status(crud_store.clone(), &c_task.id, TaskStatus::Completed).await,
         TaskStatus::Completed
     );
+    // Completion must not recapture H/A/B merely to deliver C. Its accepted
+    // input stays durable and its output snapshot contains only its own work.
+    let c_output = crud_store
+        .compaction_task_output(&workspace_id, &c_turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let c_refs = crud_store
+        .compaction_frozen_history_page(
+            &workspace_id,
+            &c_turn.thread_id,
+            &c_output.history.manifest_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(!c_refs.is_empty());
+    assert_eq!(c_output.history.messages, c_refs.len() as u64);
+    assert!(
+        c_refs
+            .iter()
+            .all(|reference| reference.source_thread == c_turn.thread_id)
+    );
+    assert_eq!(
+        crud_store
+            .compaction_frozen_import_state(
+                &workspace_id,
+                &c_turn.thread_id,
+                &c_output.history.manifest_id,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        0,
+        "terminal output must not copy accepted A/B import proofs"
+    );
+    let c_basis = crud_store
+        .get_task_run_conversation_snapshot(&c_turn.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c_basis.history_json, accepted_c_basis.history_json);
+    let c_output_messages = crate::compaction::frozen::restore(
+        crud_store.as_ref(),
+        &workspace_id,
+        &std::collections::BTreeSet::from([c_turn.thread_id.clone()]),
+        &c_output.history,
+    )
+    .await
+    .unwrap();
+    assert!(
+        c_output_messages
+            .iter()
+            .any(|m| m.content.contains("C complete"))
+    );
+    assert!(
+        c_output_messages
+            .iter()
+            .all(|m| !m.content.contains("A complete") && !m.content.contains("B complete"))
+    );
+    processor
+        .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(60), 10)
+        .await
+        .unwrap();
+    let c_deliveries = crud_store
+        .list_task_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(c_task.id.clone()),
+            run_id: Some(c_turn.run_id.clone()),
+            statuses: vec![],
+            limit: Some(10),
+        })
+        .await
+        .unwrap();
+    assert_eq!(c_deliveries.deliveries.len(), 1);
+    assert_eq!(
+        c_deliveries.deliveries[0].status,
+        pioneer_protocol::TaskDeliveryStatus::Delivered
+    );
+    assert_eq!(
+        crud_store
+            .compaction_delivery_output(&workspace_id, &c_deliveries.deliveries[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .output,
+        c_output
+    );
+    crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE compaction_frozen_history SET ready=1 WHERE id=?",
+            [accepted_c_descriptor.manifest_id.into()],
+        ))
+        .await
+        .unwrap();
     // Access-denial mutations are isolated from C execution admission.
     materialize_test_member_collaborator(crud_store.as_ref(), &workspace_id, parent_thread_id)
         .await;
