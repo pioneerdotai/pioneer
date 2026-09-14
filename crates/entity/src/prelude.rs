@@ -175,3 +175,5 @@ pub use super::turn_work_projection::Entity as TurnWorkProjection;
 pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
+
+pub use super::tool_output_chunk::Entity as ToolOutputChunk;

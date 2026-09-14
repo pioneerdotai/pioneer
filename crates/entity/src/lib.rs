@@ -177,3 +177,5 @@ pub mod turn_work_projection;
 pub mod user_notification_outbox;
 pub mod workspace;
 pub mod workspace_membership;
+
+pub mod tool_output_chunk;

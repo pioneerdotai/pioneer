@@ -2406,10 +2406,10 @@ impl ClaudeStreamClient {
         let (native_thread_id, native_turn_id, mcp_terminal_events) = {
             let mut state = self.state.lock().await;
             let ids = (state.native_thread_id.clone(), state.active_turn_id.clone());
-            let mcp_terminal_events = terminalize_running_claude_mcp_items(
+            let mcp_terminal_events = terminalize_running_claude_tools(
                 &mut state,
                 ClaudeMcpToolLifecycle::Failed,
-                "Claude process disconnected before the MCP call reached a terminal result",
+                "Claude process disconnected before the tool reached a terminal result",
                 "process_eof/mcp_terminal_reconciliation",
             );
             if ids.1.is_some() {
@@ -2769,10 +2769,52 @@ impl ClaudeStreamClient {
             Some("stream_event") => self.map_stream_event(value).await,
             Some("assistant") => self.map_assistant_message(value).await,
             Some("user") => self.map_user_message(value).await,
+            Some("tool_progress") => self.map_tool_progress_message(value).await,
             Some("result") => self.map_result_message(value).await,
             Some("error") => self.map_error_message(value).await,
             _ => Vec::new(),
         }
+    }
+
+    async fn map_tool_progress_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
+        let state = self.state.lock().await;
+        // Claude's bash progress uses a fresh tool_use_id for every update;
+        // parent_tool_use_id identifies the command that actually started.
+        let item = ["parent_tool_use_id", "tool_use_id"]
+            .into_iter()
+            .find_map(|key| {
+                let id = value.get(key)?.as_str()?;
+                state
+                    .tool_items
+                    .get(id)
+                    .map(|tool| (tool.item_id.clone(), tool.item_kind.clone()))
+                    .or_else(|| {
+                        state
+                            .mcp_items
+                            .get(id)
+                            .filter(|tool| tool.lifecycle == ClaudeMcpToolLifecycle::Running)
+                            .map(|tool| (tool.binding.native_item_id.clone(), "mcpToolCall".into()))
+                    })
+            });
+        let (Some((native_item_id, item_kind)), Some(native_turn_id)) =
+            (item, state.active_turn_id.clone())
+        else {
+            return Vec::new();
+        };
+        let elapsed = value
+            .get("elapsed_time_seconds")
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        vec![RuntimeEvent::ItemDelta(RuntimeItemDelta {
+            native_thread_id: state.native_thread_id.clone(),
+            native_turn_id,
+            native_item_id,
+            item_kind,
+            delta_kind: RuntimeItemDeltaKind::ToolProgress,
+            delta: format!("Tool running: {elapsed} seconds"),
+            metadata: Some(value.clone()),
+            native: None,
+        })]
     }
 
     async fn map_system_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
@@ -3191,6 +3233,9 @@ impl ClaudeStreamClient {
                 "message".to_owned(),
                 ToolMetadataValue::from_json(JsonValue::String(output.clone())),
             );
+            if let Some(result) = value.get("tool_use_result") {
+                metadata.insert("result", ToolMetadataValue::from_json(result.clone()));
+            }
             if is_error {
                 metadata.insert(
                     "error".to_owned(),
@@ -3216,13 +3261,55 @@ impl ClaudeStreamClient {
         let Some(tool) = state.tool_items.remove(tool_use_id) else {
             return Vec::new();
         };
-        let metadata = metadata_for_claude_tool(
+        let mut metadata = metadata_for_claude_tool(
             tool.tool_name.as_str(),
             &tool.input,
             Some(output.as_str()),
             Some(!is_error),
         );
-        vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+        let mut events = Vec::new();
+        if let Some(result) = value.get("tool_use_result") {
+            metadata["result"] = result.clone();
+            if tool.tool_name == "Bash" {
+                // Keep the provider's separate streams when present. Never infer
+                // an exit code from is_error or parse it out of display text.
+                for (source, target) in [
+                    ("stdout", "stdout"),
+                    ("stderr", "stderr"),
+                    ("exitCode", "exitCode"),
+                    ("exit_code", "exitCode"),
+                    ("durationMs", "durationMs"),
+                    ("timedOut", "timedOut"),
+                    ("truncated", "truncated"),
+                ] {
+                    if let Some(field) = result.get(source) {
+                        metadata[target] = field.clone();
+                    }
+                }
+                if result.get("interrupted").and_then(JsonValue::as_bool) == Some(true) {
+                    metadata["status"] = json!("cancelled");
+                    metadata["success"] = json!(false);
+                }
+                // Extra result facts (e.g. a provider output-file reference) must
+                // survive even though shell storage has only typed stream fields.
+                let mut extra = result.clone();
+                if let Some(fields) = extra.as_object_mut() {
+                    fields.remove("stdout");
+                    fields.remove("stderr");
+                }
+                events.push(RuntimeEvent::ItemDelta(RuntimeItemDelta {
+                    native_thread_id: state.native_thread_id.clone(),
+                    native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
+                    native_item_id: tool.item_id.clone(),
+                    item_kind: tool.item_kind.clone(),
+                    delta_kind: RuntimeItemDeltaKind::ToolProgress,
+                    delta: "Tool result details".into(),
+                    metadata: Some(json!({"result": extra})),
+                    native: None,
+                }));
+            }
+        }
+        events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
             native_thread_id: state.native_thread_id.clone(),
             native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
             native_item_id: tool.item_id,
@@ -3234,7 +3321,8 @@ impl ClaudeStreamClient {
             metadata: Some(metadata),
             native_item_redacted: Some(block.clone()),
             native: Some(native_event("user/tool_result", value.clone())),
-        })]
+        }));
+        events
     }
 
     async fn map_result_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
@@ -3289,7 +3377,7 @@ impl ClaudeStreamClient {
                 native: Some(native_event("result/final_text", value.clone())),
             }));
         }
-        events.extend(terminalize_running_claude_mcp_items(
+        events.extend(terminalize_running_claude_tools(
             &mut state,
             if interrupted {
                 ClaudeMcpToolLifecycle::Cancelled
@@ -3297,9 +3385,9 @@ impl ClaudeStreamClient {
                 ClaudeMcpToolLifecycle::Failed
             },
             if interrupted {
-                "Claude turn ended while the MCP call was cancelled"
+                "Claude turn ended while the tool was cancelled"
             } else {
-                "Claude turn ended before an MCP tool_result was observed"
+                "Claude turn ended before a tool_result was observed"
             },
             if interrupted {
                 "result/mcp_cancelled_reconciliation"
@@ -3347,10 +3435,10 @@ impl ClaudeStreamClient {
         let mut state = self.state.lock().await;
         let native_thread_id = state.native_thread_id.clone();
         let native_turn_id = state.active_turn_id.clone();
-        let mut events = terminalize_running_claude_mcp_items(
+        let mut events = terminalize_running_claude_tools(
             &mut state,
             ClaudeMcpToolLifecycle::Failed,
-            "Claude stream failed before the MCP call reached a terminal result",
+            "Claude stream failed before the tool reached a terminal result",
             "error/mcp_terminal_reconciliation",
         );
         state.active_turn_id = None;
@@ -3659,7 +3747,7 @@ fn claude_mcp_stream_error(
     })
 }
 
-fn terminalize_running_claude_mcp_items(
+fn terminalize_running_claude_tools(
     state: &mut ClaudeStreamState,
     lifecycle: ClaudeMcpToolLifecycle,
     message: &str,
@@ -3672,6 +3760,27 @@ fn terminalize_running_claude_mcp_items(
         ClaudeMcpToolLifecycle::Running => ("failed", false),
     };
     let mut events = Vec::new();
+    for (_, tool) in std::mem::take(&mut state.tool_items) {
+        let mut metadata =
+            metadata_for_claude_tool(&tool.tool_name, &tool.input, None, Some(false));
+        metadata["status"] = json!(status);
+        metadata["message"] = json!(message);
+        metadata["error"] = json!({"message":message});
+        events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: state.native_thread_id.clone(),
+            native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
+            native_item_id: tool.item_id,
+            item_kind: tool.item_kind,
+            text: Some(message.into()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: Some(metadata),
+            native_item_redacted: None,
+            native: Some(native_event(native_method, json!({"reason":message}))),
+        }));
+    }
+
     for item in state.mcp_items.values_mut() {
         if item.lifecycle != ClaudeMcpToolLifecycle::Running {
             continue;
@@ -3748,10 +3857,12 @@ fn claude_tool_result_text(block: &JsonValue) -> String {
         Some(JsonValue::String(text)) => text.clone(),
         Some(JsonValue::Array(items)) => items
             .iter()
-            .filter_map(|item| {
+            .map(|item| {
                 item.get("text")
                     .and_then(JsonValue::as_str)
                     .or_else(|| item.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| item.to_string())
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -3785,7 +3896,12 @@ fn claude_result_error_message(value: &JsonValue) -> String {
         .map(|errors| {
             errors
                 .iter()
-                .filter_map(JsonValue::as_str)
+                .map(|error| {
+                    error
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string())
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         })
@@ -3836,6 +3952,176 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::duplex;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn claude_bash_wire_results_and_parent_progress_are_retained() {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut child) = fake_claude_stream_client(&temp.path().join("bash.log")).await;
+        {
+            let mut state = client.state.lock().await;
+            state.native_thread_id = Some("session".into());
+            state.active_turn_id = Some("turn".into());
+            state.tool_items.insert(
+                "bash-use".into(),
+                ClaudeToolItemState {
+                    item_id: "bash-item".into(),
+                    item_kind: "commandExecution".into(),
+                    tool_name: "Bash".into(),
+                    input: json!({"command":"make"}),
+                },
+            );
+        }
+        let progress = client.map_message(json!({"type":"tool_progress", "tool_use_id":"new-progress-id", "parent_tool_use_id":"bash-use", "elapsed_time_seconds":30, "tool_name":"Bash"})).await;
+        let [RuntimeEvent::ItemDelta(delta)] = progress.as_slice() else {
+            panic!("progress missing")
+        };
+        assert_eq!(delta.native_item_id, "bash-item");
+        assert_eq!(delta.delta_kind, RuntimeItemDeltaKind::ToolProgress);
+        assert_eq!(delta.metadata.as_ref().unwrap()["elapsed_time_seconds"], 30);
+        let result = client.map_message(json!({"type":"user", "message":{"content":[{"type":"tool_result","tool_use_id":"bash-use","is_error":true,"content":"display error"}]},
+            "tool_use_result":{"stdout":"before failure\n","stderr":"compiler error\n","interrupted":true,"persistedOutputPath":"/provider/output.txt"}})).await;
+        assert_eq!(result.len(), 2);
+        let RuntimeEvent::ItemDelta(details) = &result[0] else {
+            panic!("details missing")
+        };
+        assert_eq!(
+            details.metadata.as_ref().unwrap()["result"]["persistedOutputPath"],
+            "/provider/output.txt"
+        );
+        assert!(
+            details.metadata.as_ref().unwrap()["result"]
+                .get("stdout")
+                .is_none()
+        );
+        let RuntimeEvent::ItemCompleted(item) = &result[1] else {
+            panic!("result missing")
+        };
+        let projected = project_cli_runtime_event(
+            &CLIRuntimeProjectorContext {
+                workspace_id: "w".into(),
+                thread_id: "t".into(),
+                turn_id: "u".into(),
+                recovery: None,
+            },
+            &RuntimeEvent::ItemCompleted(item.clone()),
+        );
+        let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+            panic!("terminal missing")
+        };
+        let TurnItem::CommandExecution {
+            status,
+            storage:
+                pioneer_protocol::ToolStoragePayload::Shell {
+                    stdout,
+                    stderr,
+                    exit_code,
+                    ..
+                },
+            ..
+        } = &notification.item
+        else {
+            panic!("shell missing")
+        };
+        assert_eq!(*status, ToolCallStatus::Failed);
+        assert_eq!(stdout.as_deref(), Some("before failure\n"));
+        assert_eq!(stderr.as_deref(), Some("compiler error\n"));
+        assert_eq!(*exit_code, None);
+        assert!(client.map_message(json!({"type":"tool_progress", "tool_use_id":"bash-use", "elapsed_time_seconds":60})).await.is_empty());
+        child.kill().await.unwrap();
+    }
+
+    #[test]
+    fn claude_bash_output_and_interruption_are_retained() {
+        let context = CLIRuntimeProjectorContext {
+            workspace_id: "w".into(),
+            thread_id: "t".into(),
+            turn_id: "u".into(),
+            recovery: None,
+        };
+        for (success, text) in [(true, "ok\n"), (false, "shell failed\n")] {
+            let e = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some("nt".into()),
+                native_turn_id: "nu".into(),
+                native_item_id: "cmd".into(),
+                item_kind: "commandExecution".into(),
+                text: Some(text.into()),
+                summary: vec![],
+                content: vec![],
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(metadata_for_claude_tool(
+                    "Bash",
+                    &json!({"command":"printf hi"}),
+                    Some(text),
+                    Some(success),
+                )),
+                native_item_redacted: None,
+                native: None,
+            });
+            let projected = project_cli_runtime_event(&context, &e);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                panic!("missing result")
+            };
+            let TurnItem::CommandExecution {
+                storage, status, ..
+            } = &notification.item
+            else {
+                panic!("missing command")
+            };
+            assert_eq!(
+                *status,
+                if success {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                }
+            );
+            let pioneer_protocol::ToolStoragePayload::Shell {
+                aggregated_output, ..
+            } = storage
+            else {
+                panic!("missing output")
+            };
+            assert_eq!(aggregated_output.as_deref(), Some(text));
+        }
+        let mut state = ClaudeStreamState::default();
+        state.native_thread_id = Some("nt".into());
+        state.active_turn_id = Some("nu".into());
+        state.tool_items.insert(
+            "use".into(),
+            ClaudeToolItemState {
+                item_id: "cmd".into(),
+                item_kind: "commandExecution".into(),
+                tool_name: "Bash".into(),
+                input: json!({"command":"sleep 60"}),
+            },
+        );
+        let events = terminalize_running_claude_tools(
+            &mut state,
+            ClaudeMcpToolLifecycle::Cancelled,
+            "execution interrupted before tool_result",
+            "test",
+        );
+        assert_eq!(events.len(), 1);
+        assert!(state.tool_items.is_empty());
+        let RuntimeEvent::ItemCompleted(item) = &events[0] else {
+            panic!("missing terminal item")
+        };
+        assert_eq!(item.metadata.as_ref().unwrap()["status"], "cancelled");
+        assert!(
+            item.metadata.as_ref().unwrap()["error"]
+                .to_string()
+                .contains("interrupted")
+        );
+        assert!(
+            terminalize_running_claude_tools(
+                &mut state,
+                ClaudeMcpToolLifecycle::Cancelled,
+                "repeat",
+                "test"
+            )
+            .is_empty()
+        );
+    }
 
     struct NeverInvoke;
 

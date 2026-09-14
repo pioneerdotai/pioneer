@@ -338,7 +338,31 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         "SELECT step AS n FROM compaction_history_preparation WHERE thread_id='thread'",
     )
     .await;
+    let output = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "persisted-shell".into(),
+        delta: "before cancellation".into(),
+        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    };
+    store
+        .record_tool_output("physical-output", &output)
+        .await
+        .unwrap();
     let held = database.begin().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            CrudStore::new(database.clone()).record_tool_output("cancelled-output", &output)
+        )
+        .await
+        .is_err()
+    );
+
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -348,6 +372,20 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         .is_err()
     );
     held.rollback().await.unwrap();
+    let rows = store
+        .tool_output_page("ws", "thread", "turn", "persisted-shell", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "cancelled queued write must not persist later"
+    );
+    store
+        .record_tool_output("after-cancel", &output)
+        .await
+        .unwrap();
+
     assert_eq!(
         scalar(
             &store,
@@ -361,6 +399,15 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
     drop(setup);
     // Reopen the file: no in-memory cursor or worker survives this boundary.
     let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
+    let rows = reopened
+        .tool_output_page("ws", "thread", "turn", "persisted-shell", 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|(_, row)| row.text == "before cancellation")
+    );
     finish(&reopened).await;
     assert_eq!(
         scalar(
@@ -374,4 +421,104 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+#[tokio::test]
+async fn tool_output_chunks_are_scoped_ordered_and_idempotent() {
+    let store = fixture(false).await;
+    let mut n = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "command".into(),
+        delta: "same text\n".into(),
+        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+        payload: None,
+        markdown: None,
+        markdown_version: None,
+    };
+    store.record_tool_output("chunk-a", &n).await.unwrap();
+    store.record_tool_output("chunk-a", &n).await.unwrap();
+    store.record_tool_output("chunk-b", &n).await.unwrap();
+    n.stream = Some(pioneer_protocol::ItemDeltaStream::Stderr);
+    n.delta = "failure detail".into();
+    store.record_tool_output("chunk-c", &n).await.unwrap();
+    assert!(store.record_tool_output("chunk-a", &n).await.is_err());
+    n.thread_id = "other".into();
+    assert!(store.record_tool_output("bad", &n).await.is_err());
+    let reopened = CrudStore::new(store.database_connection());
+    let rows = reopened
+        .tool_output_page("ws", "thread", "turn", "command", 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].1.text, "same text\n");
+    assert_eq!(rows[1].1.text, "same text\n");
+    assert_eq!(rows[2].1.text, "failure detail");
+    assert!(
+        reopened
+            .tool_output_page("foreign", "thread", "turn", "command", 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .tool_output_page("ws", "thread", "turn", "command", rows[2].0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn tool_output_large_unicode_chunks_survive_retry_without_snapshot_copies() {
+    let store = fixture(false).await;
+    let original = "вывод🦀\n".repeat(30000);
+    let n = pioneer_protocol::ItemDeltaNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        item_id: "large".into(),
+        delta: original.clone(),
+        stream: Some(pioneer_protocol::ItemDeltaStream::Stdout),
+        payload: Some(serde_json::json!({"truncated":false})),
+        markdown: None,
+        markdown_version: None,
+    };
+    store.record_tool_output("large", &n).await.unwrap();
+    store.record_tool_output("large", &n).await.unwrap();
+    let rows = store
+        .tool_output_page("ws", "thread", "turn", "large", 0)
+        .await
+        .unwrap();
+    assert!(rows.len() > 1);
+    let mut conflicting = n.clone();
+    conflicting.delta.truncate(195000);
+    assert!(
+        store
+            .record_tool_output("large", &conflicting)
+            .await
+            .is_err()
+    );
+    assert!(rows.iter().all(|(_, row)| row.text.len() <= 128 * 1024));
+    assert_eq!(
+        rows.iter()
+            .map(|(_, row)| row.text.as_str())
+            .collect::<String>(),
+        original
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|(_, row)| row.metadata.is_some())
+            .count(),
+        1
+    );
+    assert!(
+        store
+            .tool_output_page("ws", "thread", "turn", "large", rows.last().unwrap().0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

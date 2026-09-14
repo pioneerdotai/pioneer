@@ -358,8 +358,11 @@ impl ToolCallRuntime {
                 });
                 if let Some((stream, delta_text)) =
                     output_delta_from_projection(&projection.display, &call.output_policy.deltas)
+                    && !matches!(call.tool_name.as_str(), "exec_command" | "write_stdin")
                 {
-                    trace.emit_output_chunk_delta(1, stream, delta_text, false);
+                    trace
+                        .emit_output_chunk_delta(1, stream, delta_text, false)
+                        .await?;
                 }
                 output.set_projection(projection);
                 trace.emit_stage(

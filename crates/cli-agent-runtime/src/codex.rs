@@ -5114,9 +5114,6 @@ fn codex_notification_is_progress(method: &str) -> bool {
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/summaryPartAdded"
             | "item/plan/delta"
-            | "item/commandExecution/outputDelta"
-            | "item/fileChange/outputDelta"
-            | "item/fileChange/patchUpdated"
     )
 }
 
@@ -5651,6 +5648,16 @@ impl<'de> Visitor<'de> for StreamedLargeCodexParamsVisitor<'_> {
                 | "started_at_ms" | "exitCode" | "exit_code" => {
                     object.insert(key, map.next_value::<JsonValue>()?);
                 }
+                "delta" | "output" | "text" | "message"
+                    if matches!(
+                        self.method,
+                        "item/commandExecution/outputDelta"
+                            | "item/fileChange/outputDelta"
+                            | "item/mcpToolCall/progress"
+                    ) =>
+                {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
                 "diff" => {
                     map.next_value::<IgnoredAny>()?;
                     payload_omitted = true;
@@ -5731,10 +5738,18 @@ impl<'de> Visitor<'de> for StreamedLargeCodexItemVisitor {
                     object.insert(key, map.next_value_seed(StreamedCodexChangedFilesSeed)?);
                 }
                 "error" => {
-                    object.insert(key, map.next_value_seed(StreamedLargeCodexErrorSeed)?);
+                    object.insert(key, map.next_value::<JsonValue>()?);
                 }
                 "id" | "itemId" | "item_id" | "callId" | "call_id" | "threadId" | "thread_id"
                 | "turnId" | "turn_id" | "type" | "status" | "phase" | "exitCode" | "exit_code" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                // The spool is bounded by max_recovery_frame_bytes. Retain
+                // command/result facts even above the in-memory frame threshold.
+                "command" | "cmd" | "argv" | "cwd" | "workingDirectory" | "aggregatedOutput"
+                | "aggregated_output" | "stdout" | "stderr" | "durationMs" | "duration_ms"
+                | "tookMs" | "timedOut" | "timed_out" | "truncated" | "success" | "result"
+                | "contentItems" | "content" | "arguments" | "tool" | "toolName" | "server" => {
                     object.insert(key, map.next_value::<JsonValue>()?);
                 }
                 _ => {
@@ -10882,7 +10897,7 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn codex_terminal_snapshot_omits_an_oversized_target_item_payload() {
+    async fn codex_terminal_snapshot_retains_oversized_command_output() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 512,
             max_recovery_frame_bytes: 16 * 1024 * 1024,
@@ -10944,11 +10959,11 @@ while read line; do :; done
         assert_eq!(item["type"], json!("commandExecution"));
         assert_eq!(item["status"], json!("completed"));
         assert_eq!(item["exitCode"], json!(0));
-        assert!(item.get("aggregatedOutput").is_none());
         assert_eq!(
-            item["_pioneerOversizedPayloadOmitted"],
-            JsonValue::Bool(true)
+            item["aggregatedOutput"].as_str().unwrap().len(),
+            CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024
         );
+        assert!(item.get("_pioneerOversizedPayloadOmitted").is_none());
     }
 
     #[tokio::test]

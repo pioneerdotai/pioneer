@@ -1,3 +1,4 @@
+mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
 mod convention;

@@ -8485,23 +8485,133 @@ async fn reasoning_progress_delta_is_live_only_by_default() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stdout_progress_delta_is_live_only_for_now() {
+async fn command_output_is_persisted_before_ack_and_survives_live_progress_cleanup() {
     let harness = setup_progress_delta_harness(
         "stdout",
         command_execution_item("item_progress_stdout"),
         false,
     )
     .await;
-
+    let notification = progress_delta_notification(&harness, "chunk\n", ItemDeltaStream::Stdout);
+    for _ in 0..2 {
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
+                    id: "test-output-1".into(),
+                    notification: notification.clone(),
+                })
+                .await
+        );
+    }
     harness
         .processor
-        .handle_progress_agent_event(AgentProgressEvent::ItemDelta {
-            notification: progress_delta_notification(&harness, "chunk\n", ItemDeltaStream::Stdout),
-        })
+        .retire_execution_progress_state(harness.turn_id.as_str())
         .await;
+    let rows = harness
+        .processor
+        .crud_store
+        .tool_output_page(
+            &notification.workspace_id,
+            &notification.thread_id,
+            &notification.turn_id,
+            &notification.item_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.text, "chunk\n");
+    let page = harness
+        .processor
+        .read_thread_tool_result(pioneer_protocol::ThreadToolResultReadParams {
+            workspace_id: notification.workspace_id.clone(),
+            thread_id: notification.thread_id.clone(),
+            turn_id: notification.turn_id.clone(),
+            item_id: notification.item_id.clone(),
+            output_log: true,
+            cursor: None,
+            max_tokens: None,
+            max_bytes: None,
+        })
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&page.text).unwrap();
+    assert_eq!(value["text"], "chunk\n");
+    assert_eq!(value["stream"], "stdout");
+    assert!(page.eof);
+    let mut invalid = notification;
+    invalid.workspace_id = "wrong-workspace".into();
+    assert!(
+        !harness
+            .processor
+            .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
+                id: "rejected-output".into(),
+                notification: invalid,
+            })
+            .await
+    );
+}
 
-    let payloads = turn_item_payloads(&harness).await;
-    assert_no_persisted_item_delta(payloads.as_slice());
+#[tokio::test]
+async fn command_output_log_read_pages_are_ordered_and_bounded() {
+    let harness = setup_progress_delta_harness(
+        "paged-output",
+        command_execution_item("paged-command"),
+        false,
+    )
+    .await;
+    let text = "строка🦀\n".repeat(1000);
+    for (id, stream, output) in [
+        ("log-1", ItemDeltaStream::Stdout, text.as_str()),
+        ("log-2", ItemDeltaStream::Stderr, "failed"),
+    ] {
+        assert!(
+            harness
+                .processor
+                .handle_durable_agent_event(AgentDurableEvent::ToolOutputRecorded {
+                    id: id.into(),
+                    notification: progress_delta_notification(&harness, output, stream),
+                })
+                .await
+        );
+    }
+    let mut params = pioneer_protocol::ThreadToolResultReadParams {
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: harness.thread_id.clone(),
+        turn_id: harness.turn_id.clone(),
+        item_id: harness.item_id.clone(),
+        output_log: true,
+        cursor: None,
+        max_tokens: Some(512),
+        max_bytes: Some(512),
+    };
+    let mut full = String::new();
+    let mut done = false;
+    for _ in 0..1000 {
+        let page = harness
+            .processor
+            .read_thread_tool_result(params.clone())
+            .await
+            .unwrap();
+        assert!(serde_json::to_string(&page).unwrap().len() <= 512);
+        full.push_str(&page.text);
+        if page.eof {
+            done = true;
+            break;
+        }
+        params.cursor = page.next;
+        assert!(params.cursor.is_some());
+    }
+    assert!(done, "paged log must terminate");
+    let values = serde_json::Deserializer::from_str(&full)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0]["text"], text);
+    assert_eq!(values[1]["text"], "failed");
+    assert_eq!(values[1]["stream"], "stderr");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -54255,6 +54365,7 @@ Gateway HTTP skill body"#
         .unwrap();
     let saved_result = processor
         .read_thread_tool_result(pioneer_protocol::ThreadToolResultReadParams {
+            output_log: false,
             workspace_id: workspace_id.clone(),
             thread_id: "thr_000000000000000131".into(),
             turn_id: "turn_000000000000000131".into(),
@@ -63179,6 +63290,7 @@ async fn compaction_result_reader_pages_exact_source_and_rejects_cross_scope() {
     db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
         "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES ('result-source','result-turn','result-item',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)", [payload.clone().into()])).await.unwrap();
     let mut params = ThreadToolResultReadParams {
+        output_log: false,
         workspace_id,
         thread_id: "result-thread".into(),
         turn_id: "result-turn".into(),

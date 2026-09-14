@@ -3,6 +3,27 @@
   "title": "AgentDurableEvent",
   "oneOf": [
     {
+      "description": "A unique output chunk on the acknowledged lane, retained across interruption.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "tool_output_recorded"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemDeltaNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "notification"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -1797,6 +1818,74 @@
         "thread_id",
         "turn_id",
         "item"
+      ]
+    },
+    "ItemDeltaNotification": {
+      "type": "object",
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "markdown": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarkdownDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "markdown_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "payload": true,
+        "stream": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ItemDeltaStream"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "delta"
+      ]
+    },
+    "ItemDeltaStream": {
+      "type": "string",
+      "enum": [
+        "agent_message",
+        "stdout",
+        "stderr",
+        "tool_progress",
+        "file_change",
+        "generic"
       ]
     },
     "ItemStartedNotification": {

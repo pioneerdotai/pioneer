@@ -296,6 +296,9 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
             Some(preparation.thread_id.as_str())
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.thread_id.as_str()),
+        AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
+            Some(notification.thread_id.as_str())
+        }
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification }
         | AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
@@ -352,6 +355,9 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
             Some(preparation.turn_id.as_str())
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
+        AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
+            Some(notification.turn_id.as_str())
+        }
         AgentDurableEvent::ItemStarted { notification } => Some(notification.turn_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification }
         | AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
@@ -3263,6 +3269,24 @@ impl MessageProcessor {
                 }
                 true
             }),
+            AgentDurableEvent::ToolOutputRecorded { id, notification } => {
+                message_future(async move {
+                    if self
+                        .crud_store
+                        .record_tool_output(&id, &notification)
+                        .await
+                        .is_err()
+                    {
+                        warn!("failed to persist tool output");
+                        return false;
+                    }
+                    self.handle_progress_agent_event(AgentProgressEvent::ItemDelta {
+                        notification,
+                    })
+                    .await;
+                    true
+                })
+            }
             AgentDurableEvent::ItemStarted { notification } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_started_markdown(&mut notification).await;
@@ -4160,8 +4184,33 @@ impl MessageProcessor {
                     }
                 }
             }
-            AgentProgressEvent::ToolOutputDelta { .. }
-            | AgentProgressEvent::TaskProgress { .. } => {}
+            AgentProgressEvent::ToolOutputDelta {
+                workspace_id,
+                thread_id,
+                turn_id,
+                item_id,
+                stream,
+                delta,
+                payload,
+            } => {
+                self.send_progress_notification_to_thread_subscribers(
+                    &thread_id,
+                    Self::item_delta_event_method(Some(stream)),
+                    &pioneer_protocol::ItemDeltaNotification {
+                        workspace_id,
+                        thread_id: thread_id.clone(),
+                        turn_id,
+                        item_id,
+                        stream: Some(stream),
+                        delta,
+                        payload,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                )
+                .await;
+            }
+            AgentProgressEvent::TaskProgress { .. } => {}
         }
     }
 

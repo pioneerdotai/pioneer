@@ -29,6 +29,11 @@ pub enum ProtocolEventClass {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDurableEvent {
+    /// A unique output chunk on the acknowledged lane, retained across interruption.
+    ToolOutputRecorded {
+        id: String,
+        notification: ItemDeltaNotification,
+    },
     PromptManifestCompiled {
         thread_id: String,
         turn_id: String,
@@ -436,6 +441,9 @@ impl AgentDurableEvent {
             Self::TurnPermissionAudit { event } => DurableEventCausalityKey::Turn {
                 turn_id: event.turn_id.clone(),
             },
+            Self::ToolOutputRecorded { notification, .. } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
@@ -499,6 +507,7 @@ impl AgentDurableEvent {
             | Self::TurnLlmContextAppended { .. }
             | Self::TurnProviderHistoryAppended { .. }
             | Self::NativeTerminalEffectsPrepared { .. }
+            | Self::ToolOutputRecorded { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }

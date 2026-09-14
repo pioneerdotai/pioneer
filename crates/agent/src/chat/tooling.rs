@@ -1,11 +1,11 @@
 use super::PendingToolUiState;
 use crate::{AgentEventHub, AgentEventHubError};
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemStartedNotification, LlmRetentionPolicy, StorageOutputPolicy,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolMetadataValue,
-    ToolObservation, ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryPolicySnapshot,
-    ToolRecoveryView, ToolStoragePayload, TurnItem, TurnItemExecutionClass, TurnItemType,
+    AgentDurableEvent, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemStartedNotification, LlmRetentionPolicy, StorageOutputPolicy, TimelineOutputPolicy,
+    ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolMetadataValue, ToolObservation,
+    ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryPolicySnapshot, ToolRecoveryView,
+    ToolStoragePayload, TurnItem, TurnItemExecutionClass, TurnItemType,
 };
 use pioneer_tools::{ToolDeltaPayload, ToolEvent, ToolEventPayload, ToolOutcome, ToolResultView};
 use serde_json::Value as JsonValue;
@@ -121,8 +121,8 @@ pub(super) async fn forward_tool_event_to_agent(
             let should_forward = {
                 let mut pending = pending_tool_ui.lock().await;
                 let Some(state) = pending.get_mut(event.call_id.as_str()) else {
-                    // Progress is deliberately lossy. It must never synthesize
-                    // durable lifecycle state when CallStarted has not yet
+                    // Output cannot synthesize
+                    // lifecycle state when CallStarted has not yet
                     // crossed the acknowledged lane or when CallCompleted has
                     // already removed that state.
                     return Ok(());
@@ -134,23 +134,36 @@ pub(super) async fn forward_tool_event_to_agent(
                 return Ok(());
             }
 
-            if let Some((delta, stream, payload)) =
+            if let Some((delta, stream, mut payload)) =
                 protocol_delta_from_tool_delta(delta_event.delta)
-                && !delta.is_empty()
+                && (!delta.is_empty() || payload.is_some())
             {
-                event_tx.publish_progress(AgentProgressEvent::ItemDelta {
-                    notification: ItemDeltaNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item_id: event.call_id,
-                        delta,
-                        stream: Some(stream),
-                        payload,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                });
+                let fields = payload.get_or_insert_with(|| serde_json::json!({}));
+                fields["observation"] =
+                    serde_json::to_value(&event.observation).unwrap_or_default();
+                event_tx
+                    .publish_durable_and_wait(AgentDurableEvent::ToolOutputRecorded {
+                        id: format!(
+                            "{}:{}:{}:{}:{}",
+                            turn_id,
+                            event.call_id,
+                            event.observation.trace_id,
+                            event.observation.attempt_id,
+                            event.observation.event_seq
+                        ),
+                        notification: ItemDeltaNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item_id: event.call_id,
+                            delta,
+                            stream: Some(stream),
+                            payload,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    })
+                    .await?;
             }
         }
         ToolEventPayload::CallCompleted(completed) => {
@@ -1387,7 +1400,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
-    async fn lossy_delta_cannot_synthesize_missing_durable_tool_start() {
+    async fn output_delta_cannot_synthesize_missing_durable_tool_start() {
         let event_tx = AgentEventHub::with_capacity(8, 8);
         let mut durable_rx = event_tx
             .take_durable_receiver()
@@ -1427,7 +1440,7 @@ mod tests {
             "turn_1",
         )
         .await
-        .expect("lossy delta should be safely ignored");
+        .expect("orphan output delta should be safely ignored");
 
         assert!(
             timeout(Duration::from_millis(20), durable_rx.recv())

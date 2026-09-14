@@ -139,7 +139,8 @@ impl ToolEventPayload {
 
     pub fn event_class(&self) -> ProtocolEventClass {
         match self {
-            Self::Heartbeat | Self::OutputDelta(_) => ProtocolEventClass::Progress,
+            Self::Heartbeat => ProtocolEventClass::Progress,
+            Self::OutputDelta(_) => ProtocolEventClass::Durable,
             Self::CallStarted(_)
             | Self::PermissionAudit(_)
             | Self::CallCompleted(_)
@@ -413,50 +414,55 @@ impl ToolEventTrace {
         );
     }
 
-    pub fn emit_delta(&self, attempt_id: u32, text: String) {
-        self.emit_output_chunk_delta(attempt_id, ItemDeltaStream::Generic, text, false);
+    pub async fn emit_delta(&self, attempt_id: u32, text: String) -> Result<(), ToolError> {
+        self.emit_output_chunk_delta(attempt_id, ItemDeltaStream::Generic, text, false)
+            .await
     }
 
-    pub fn emit_output_chunk_delta(
+    pub async fn emit_output_chunk_delta(
         &self,
         attempt_id: u32,
         stream: ItemDeltaStream,
         text: String,
         truncated: bool,
-    ) {
-        self.event_bus.emit_progress(
-            self,
-            attempt_id,
-            "runtime.call.delta",
-            ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
-                delta: ToolDeltaPayload::OutputChunk {
-                    stream,
-                    text,
-                    truncated,
-                },
-            }),
-        );
+    ) -> Result<(), ToolError> {
+        self.event_bus
+            .emit_durable(
+                self,
+                attempt_id,
+                "runtime.call.delta",
+                ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
+                    delta: ToolDeltaPayload::OutputChunk {
+                        stream,
+                        text,
+                        truncated,
+                    },
+                }),
+            )
+            .await
     }
 
-    pub fn emit_progress_delta(
+    pub async fn emit_progress_delta(
         &self,
         attempt_id: u32,
         stage: impl Into<String>,
         metadata: Option<JsonValue>,
-    ) {
-        self.event_bus.emit_progress(
-            self,
-            attempt_id,
-            "runtime.call.delta",
-            ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
-                delta: ToolDeltaPayload::Progress {
-                    stage: stage.into(),
-                    metadata: metadata
-                        .map(ToolMetadata::from_json)
-                        .unwrap_or_else(ToolMetadata::empty),
-                },
-            }),
-        );
+    ) -> Result<(), ToolError> {
+        self.event_bus
+            .emit_durable(
+                self,
+                attempt_id,
+                "runtime.call.delta",
+                ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
+                    delta: ToolDeltaPayload::Progress {
+                        stage: stage.into(),
+                        metadata: metadata
+                            .map(ToolMetadata::from_json)
+                            .unwrap_or_else(ToolMetadata::empty),
+                    },
+                }),
+            )
+            .await
     }
 
     pub async fn emit_completed(
@@ -584,7 +590,7 @@ impl ToolEventBus {
 
     /// Installs the single lossless lifecycle consumer used by the native
     /// agent. Live observers remain on the lossy broadcast lane; start/audit/
-    /// terminal tool events cannot be skipped by a lagging Gateway forwarder.
+    /// terminal and output tool events cannot be skipped by a lagging Gateway forwarder.
     pub fn take_durable_receiver(
         &self,
     ) -> Option<tokio::sync::mpsc::Receiver<DurableToolEventEnvelope>> {
@@ -793,8 +799,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn output_chunk_waits_for_storage_and_propagates_failure() {
+        let bus = ToolEventBus::new(8);
+        let mut receiver = bus.take_durable_receiver().expect("receiver");
+        let trace = bus.trace_with_id("trace", "turn", "call", "exec_command");
+        let send = tokio::spawn(async move { trace.emit_delta(1, "must persist".into()).await });
+        let envelope = receiver.recv().await.unwrap();
+        assert_eq!(envelope.event.kind(), ToolEventKind::OutputDelta);
+        assert!(!send.is_finished());
+        envelope.acknowledge(Err("storage unavailable".into()));
+        assert!(send.await.unwrap().is_err());
+    }
+
     #[test]
-    fn output_delta_events_are_progress() {
+    fn output_delta_events_are_durable() {
         let event = ToolEventPayload::OutputDelta(ToolOutputDeltaEvent {
             delta: ToolDeltaPayload::OutputChunk {
                 stream: ItemDeltaStream::Stdout,
@@ -803,7 +822,7 @@ mod tests {
             },
         });
 
-        assert_eq!(event.event_class(), ProtocolEventClass::Progress);
+        assert_eq!(event.event_class(), ProtocolEventClass::Durable);
     }
 
     #[test]
@@ -862,8 +881,8 @@ mod tests {
                 .is_err(),
             "durable producer must wait for the canonical commit acknowledgement"
         );
-        for index in 0..32 {
-            trace.emit_delta(1, format!("chunk-{index}"));
+        for _ in 0..32 {
+            trace.emit_heartbeat(1);
         }
         let completion_trace = trace.clone();
         let completion =

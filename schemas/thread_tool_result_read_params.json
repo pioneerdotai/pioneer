@@ -35,6 +35,11 @@
       "default": null,
       "minimum": 0
     },
+    "output_log": {
+      "description": "Read the retained output/progress log instead of the terminal result.",
+      "type": "boolean",
+      "default": false
+    },
     "thread_id": {
       "type": "string"
     },

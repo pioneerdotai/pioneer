@@ -23,6 +23,9 @@ impl MessageProcessor {
         &self,
         params: ThreadToolResultReadParams,
     ) -> Result<ThreadToolResultReadResponse> {
+        if params.output_log {
+            return self.read_thread_tool_output_log(params).await;
+        }
         let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
         let fragment = self
             .crud_store
@@ -71,15 +74,100 @@ impl MessageProcessor {
         }
     }
 
+    async fn read_thread_tool_output_log(
+        &self,
+        params: ThreadToolResultReadParams,
+    ) -> Result<ThreadToolResultReadResponse> {
+        let ordinal = params
+            .cursor
+            .as_ref()
+            .map(|cursor| {
+                cursor
+                    .version
+                    .strip_prefix("output:")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid output cursor"))
+            })
+            .transpose()?;
+        let rows = self
+            .crud_store
+            .tool_output_page(
+                &params.workspace_id,
+                &params.thread_id,
+                &params.turn_id,
+                &params.item_id,
+                ordinal.map_or(0, |n| n - 1),
+            )
+            .await?;
+        let first = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("tool output log is unavailable"))?;
+        anyhow::ensure!(
+            ordinal.is_none_or(|n| n == first.0),
+            "output cursor is stale"
+        );
+        let text = serde_json::to_string(&serde_json::json!({
+            "stream": serde_json::from_str::<serde_json::Value>(&first.1.stream)?,
+            "text": first.1.text,
+            "metadata": first.1.metadata.as_ref().map(|m| serde_json::from_str::<serde_json::Value>(m)).transpose()?,
+        }))?;
+        let version = format!("output:{}", first.0);
+        let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
+        anyhow::ensure!(
+            offset <= text.chars().count() as u64,
+            "output cursor is stale"
+        );
+        let remainder = text.chars().skip(offset as usize).collect::<String>();
+        let max_tokens = params.max_tokens.unwrap_or(4096).min(4096);
+        let max_bytes = params.max_bytes.unwrap_or(32768).min(32768) as usize;
+        let mut token_budget = max_tokens;
+        let mut byte_budget = max_bytes;
+        loop {
+            let page = pioneer_compaction::results::result_page(
+                &remainder,
+                &version,
+                None,
+                token_budget,
+                byte_budget,
+            )?;
+            let next = if !page.eof {
+                Some(ThreadToolResultCursor {
+                    version: version.clone(),
+                    offset: offset + page.text.chars().count() as u64,
+                })
+            } else {
+                rows.get(1).map(|row| ThreadToolResultCursor {
+                    version: format!("output:{}", row.0),
+                    offset: 0,
+                })
+            };
+            let response = ThreadToolResultReadResponse {
+                text: page.text,
+                eof: next.is_none(),
+                next,
+            };
+            let encoded = serde_json::to_string(&response)?;
+            let token_excess = pioneer_compaction::text_tokens(&encoded).saturating_sub(max_tokens);
+            let byte_excess = encoded.len().saturating_sub(max_bytes);
+            if token_excess == 0 && byte_excess == 0 {
+                return Ok(response);
+            }
+            token_budget = token_budget.saturating_sub(token_excess);
+            byte_budget = byte_budget.saturating_sub(byte_excess);
+        }
+    }
+
     pub(super) fn thread_result_tools(
         self: &Arc<Self>,
         context: TurnToolContext,
     ) -> ToolExtensionBundle {
         let spec = ToolSpec::new(
             RESULT_READ_TOOL,
-            "Read a saved full tool result as bounded text pages of canonical JSON. Follow the version-bound cursor until eof. Attachment references remain references.",
+            "Read a saved full tool result as bounded text pages of canonical JSON. Follow the version-bound cursor until eof. Attachment references remain references. Set output_log=true to read saved stdout/stderr/progress chunks (including interrupted commands); each chunk is a separate JSON object, and eof refers to the currently saved log.",
             serde_json::json!({"type":"object","properties":{
                 "workspace_id":{"type":"string"},"thread_id":{"type":"string"},"turn_id":{"type":"string"},"item_id":{"type":"string"},
+                "output_log":{"type":"boolean","default":false},
                 "cursor":{"type":"object","properties":{"version":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["version","offset"]},
                 "max_tokens":{"type":"integer","minimum":1,"maximum":4096},"max_bytes":{"type":"integer","minimum":1,"maximum":32768}},
                 "required":["workspace_id","thread_id","turn_id","item_id"],"additionalProperties":false}),

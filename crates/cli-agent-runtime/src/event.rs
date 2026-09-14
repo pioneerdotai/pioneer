@@ -171,6 +171,17 @@ impl OrderedIngressEvent for RuntimeEvent {
 
     fn ingress_class(&self) -> OrderedIngressClass<Self::Key> {
         let key = match self {
+            Self::ItemDelta(delta)
+                if matches!(
+                    delta.delta_kind,
+                    RuntimeItemDeltaKind::Stdout
+                        | RuntimeItemDeltaKind::Stderr
+                        | RuntimeItemDeltaKind::FileChange
+                        | RuntimeItemDeltaKind::ToolProgress
+                ) =>
+            {
+                return OrderedIngressClass::Durable;
+            }
             Self::ItemDelta(delta) => format!(
                 "item:{:?}:{}:{}:{}",
                 delta.delta_kind,
@@ -1257,6 +1268,37 @@ fn codex_item_projection_metadata(item: &JsonValue) -> Option<JsonValue> {
     );
     insert_string(
         &mut metadata,
+        "aggregatedOutput",
+        first_string_path(item, &[&["aggregatedOutput"], &["aggregated_output"]]),
+    );
+    insert_bool(
+        &mut metadata,
+        "timedOut",
+        first_bool_path(item, &[&["timedOut"], &["timed_out"]]),
+    );
+    insert_bool(
+        &mut metadata,
+        "truncated",
+        first_bool_path(item, &[&["truncated"]]),
+    );
+    for marker in [
+        "_pioneerOversizedPayloadOmitted",
+        "_pioneerFileChangePayloadOmitted",
+        "_pioneerPayloadOmitted",
+    ] {
+        if item.get(marker).and_then(JsonValue::as_bool) == Some(true) {
+            metadata.insert("truncated".into(), JsonValue::Bool(true));
+            metadata.insert(marker.into(), JsonValue::Bool(true));
+        }
+    }
+    // Codex command is a shell string, while other runtimes may supply argv.
+    if !metadata.contains_key("command") {
+        if let Some(command) = first_string_path(item, &[&["command"], &["cmd"]]) {
+            metadata.insert("command".into(), serde_json::json!([command]));
+        }
+    }
+    insert_string(
+        &mut metadata,
         "stdout",
         first_string_path(item, &[&["stdout"]]),
     );
@@ -1405,6 +1447,18 @@ fn codex_item_projection_metadata(item: &JsonValue) -> Option<JsonValue> {
 fn codex_delta_projection_metadata(params: &JsonValue) -> Option<JsonValue> {
     let mut metadata = JsonMap::new();
 
+    for field in [
+        "eventId",
+        "sequence",
+        "progress",
+        "total",
+        "progressToken",
+        "elapsedTimeMs",
+        "truncated",
+        "_pioneerOversizedPayloadOmitted",
+    ] {
+        insert_json(&mut metadata, field, params.get(field).cloned());
+    }
     insert_string(
         &mut metadata,
         "stream",
@@ -1679,6 +1733,38 @@ mod tests {
     use crate::driver::JsonlRpcId;
     use chrono::TimeZone;
     use serde_json::json;
+
+    #[test]
+    fn command_output_is_durable_in_both_ingress_queues() {
+        use pioneer_runtime_events::{OrderedIngressClass, OrderedIngressEvent};
+        for method in [
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+            "item/mcpToolCall/progress",
+        ] {
+            let notification = CodexJsonlRpcNotificationEvent {
+                method: method.into(),
+                params: Some(
+                    json!({"threadId":"thread", "turnId":"turn", "itemId":"item", "delta":"x".repeat(70000)}),
+                ),
+                raw: json!({}),
+            };
+            assert!(matches!(
+                notification.ingress_class(),
+                OrderedIngressClass::Durable
+            ));
+            let event =
+                map_codex_notification_event(&notification, RuntimeEventMappingOptions::default());
+            assert!(matches!(
+                event.ingress_class(),
+                OrderedIngressClass::Durable
+            ));
+            let RuntimeEvent::ItemDelta(delta) = event else {
+                panic!("missing output")
+            };
+            assert_eq!(delta.delta.len(), 70000);
+        }
+    }
 
     #[test]
     fn usage_limit_message_maps_provider_cooldown_until_local_retry_time() {

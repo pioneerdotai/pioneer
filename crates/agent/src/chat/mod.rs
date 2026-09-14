@@ -4473,7 +4473,7 @@ async fn execute_agent_provider_response(
                         Ok(event)
                             if matches!(
                                 &event.payload,
-                                ToolEventPayload::Heartbeat | ToolEventPayload::OutputDelta(_)
+                                ToolEventPayload::Heartbeat
                             ) =>
                         {
                             tooling::forward_tool_event_to_agent(

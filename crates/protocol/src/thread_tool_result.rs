@@ -14,6 +14,9 @@ pub struct ThreadToolResultReadParams {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
+    /// Read the retained output/progress log instead of the terminal result.
+    #[serde(default)]
+    pub output_log: bool,
     #[serde(default)]
     pub cursor: Option<ThreadToolResultCursor>,
     #[serde(default)]
