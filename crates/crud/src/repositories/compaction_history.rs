@@ -1094,99 +1094,203 @@ pub(crate) async fn compaction_failed_delivery_command<C: ConnectionTrait>(
     let mut after = String::new();
     loop {
         let rows = task_delivery::Entity::find()
-        .select_only()
-        .join(JoinType::InnerJoin, task_delivery::Entity::belongs_to(task::Entity)
-            .from(task_delivery::Column::TaskId)
-            .to(task::Column::Id)
-            .on_condition(|_,_| sea_orm::Condition::all()
-                .add(Expr::col((task::Entity, task::Column::WorkspaceId))
-                    .eq(Expr::col((task_delivery::Entity, task_delivery::Column::WorkspaceId))))
-                .add(Expr::col((task::Entity, task::Column::CreatedByThreadId))
-                    .eq(Expr::col((task_delivery::Entity, task_delivery::Column::TargetThreadId)))))
-            .into())
-        .join(JoinType::InnerJoin, task_delivery::Entity::belongs_to(task_run::Entity)
-            .from(task_delivery::Column::RunId)
-            .to(task_run::Column::Id)
-            .on_condition(|_,_| sea_orm::Condition::all()
-                .add(Expr::col((task_run::Entity, task_run::Column::TaskId))
-                    .eq(Expr::col((task::Entity, task::Column::Id)))))
-            .into())
-        .join_as(JoinType::InnerJoin, task::Entity::belongs_to(turn::Entity)
-            .from(task::Column::CreatedByTurnId)
-            .to(turn::Column::Id)
-            .on_condition(|_,_| sea_orm::Condition::all()
-                .add(Expr::col(("command", turn::Column::ThreadId))
-                    .eq(Expr::col((task_delivery::Entity, task_delivery::Column::TargetThreadId)))))
-            .into(), Alias::new("command"))
-        .join_as(JoinType::InnerJoin, task_delivery::Entity::belongs_to(turn::Entity)
-            .from(task_delivery::Column::DeliveredTurnId)
-            .to(turn::Column::Id)
-            .on_condition(|_,_| sea_orm::Condition::all()
-                .add(Expr::col(("outcome", turn::Column::ThreadId))
-                    .eq(Expr::col((task_delivery::Entity, task_delivery::Column::TargetThreadId)))))
-            .into(), Alias::new("outcome"))
-        .join(JoinType::InnerJoin, sea_orm::RelationDef::from(turn::Entity::belongs_to(thread::Entity)
-                .from(turn::Column::ThreadId)
-                .to(thread::Column::Id)
-                .on_condition(|_,_| sea_orm::Condition::all()
-                    .add(Expr::col((thread::Entity, thread::Column::WorkspaceId))
-                        .eq(Expr::col((task_delivery::Entity, task_delivery::Column::WorkspaceId))))))
-            .from_alias(Alias::new("outcome")))
-        .expr(Expr::col((task_delivery::Entity, task_delivery::Column::Id)))
-        .expr(Expr::col((task_delivery::Entity, task_delivery::Column::DeliveredTurnId)))
-        .expr(Expr::col((task::Entity, task::Column::CreatedByTurnId)))
-        .filter(Expr::col((task_delivery::Entity, task_delivery::Column::WorkspaceId))
-            .eq(Expr::Value(workspace.into()))
-            .and(Expr::col((task_delivery::Entity, task_delivery::Column::TargetThreadId))
-                .eq(Expr::Value(thread.into())))
-            .and(Expr::col((task_delivery::Entity, task_delivery::Column::Status))
-                .eq(Expr::val("delivered")))
-            .and(Expr::col((task_delivery::Entity, task_delivery::Column::Id))
-                .gt(Expr::Value(after.clone()
-                        .into())))
-            .and(Expr::Value(command.map(str::to_owned)
-                    .into())
-                .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                .or(Expr::col((task::Entity, task::Column::CreatedByTurnId))
-                    .eq(Expr::Value(command.map(str::to_owned)
-                            .into()))))
-            .and(Expr::exists(Query::select()
-                    .expr(Expr::val(1_i64))
-                    .from_as(turn_event::Entity, "e")
-                    .join_as(JoinType::InnerJoin, compaction_event_revision::Entity, "r", Expr::col(("r", compaction_event_revision::Column::SourceId))
-                        .eq(Expr::col(("e", turn_event::Column::Id)))
-                        .and(Expr::col(("r", compaction_event_revision::Column::TurnId))
-                            .eq(Expr::col(("e", turn_event::Column::TurnId))))
-                        .and(Expr::col(("r", compaction_event_revision::Column::Present))
-                            .eq(Expr::val(1_i64))))
-                    .and_where(Expr::col(("e", turn_event::Column::TurnId))
-                        .eq(Expr::col(("outcome", turn::Column::Id)))
-                        .and(Expr::col(("e", turn_event::Column::ThreadId))
-                            .eq(Expr::col(("outcome", turn::Column::ThreadId))))
-                        .and(Expr::col(("e", turn_event::Column::EventType))
-                            .eq(Expr::Value(pioneer_protocol::constants::events::TURN_FAILED.into())))
-                        .and(Expr::col(("r", compaction_event_revision::Column::CaptureOrder))
-                            .lte(Expr::Value(event_fence.into())))
-                        .and(Expr::Value(source.map(|s|s.id.clone())
-                                .into())
+            .select_only()
+            .join(
+                JoinType::InnerJoin,
+                task_delivery::Entity::belongs_to(task::Entity)
+                    .from(task_delivery::Column::TaskId)
+                    .to(task::Column::Id)
+                    .on_condition(|_, _| {
+                        sea_orm::Condition::all()
+                            .add(Expr::col((task::Entity, task::Column::WorkspaceId)).eq(
+                                Expr::col((
+                                    task_delivery::Entity,
+                                    task_delivery::Column::WorkspaceId,
+                                )),
+                            ))
+                            .add(
+                                Expr::col((task::Entity, task::Column::CreatedByThreadId)).eq(
+                                    Expr::col((
+                                        task_delivery::Entity,
+                                        task_delivery::Column::TargetThreadId,
+                                    )),
+                                ),
+                            )
+                    })
+                    .into(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                task_delivery::Entity::belongs_to(task_run::Entity)
+                    .from(task_delivery::Column::RunId)
+                    .to(task_run::Column::Id)
+                    .on_condition(|_, _| {
+                        sea_orm::Condition::all().add(
+                            Expr::col((task_run::Entity, task_run::Column::TaskId))
+                                .eq(Expr::col((task::Entity, task::Column::Id))),
+                        )
+                    })
+                    .into(),
+            )
+            .join_as(
+                JoinType::InnerJoin,
+                task::Entity::belongs_to(turn::Entity)
+                    .from(task::Column::CreatedByTurnId)
+                    .to(turn::Column::Id)
+                    .on_condition(|_, _| {
+                        sea_orm::Condition::all().add(
+                            Expr::col(("command", turn::Column::ThreadId)).eq(Expr::col((
+                                task_delivery::Entity,
+                                task_delivery::Column::TargetThreadId,
+                            ))),
+                        )
+                    })
+                    .into(),
+                Alias::new("command"),
+            )
+            .join_as(
+                JoinType::InnerJoin,
+                task_delivery::Entity::belongs_to(turn::Entity)
+                    .from(task_delivery::Column::DeliveredTurnId)
+                    .to(turn::Column::Id)
+                    .on_condition(|_, _| {
+                        sea_orm::Condition::all().add(
+                            Expr::col(("outcome", turn::Column::ThreadId)).eq(Expr::col((
+                                task_delivery::Entity,
+                                task_delivery::Column::TargetThreadId,
+                            ))),
+                        )
+                    })
+                    .into(),
+                Alias::new("outcome"),
+            )
+            .join(
+                JoinType::InnerJoin,
+                sea_orm::RelationDef::from(
+                    turn::Entity::belongs_to(thread::Entity)
+                        .from(turn::Column::ThreadId)
+                        .to(thread::Column::Id)
+                        .on_condition(|_, _| {
+                            sea_orm::Condition::all().add(
+                                Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(
+                                    Expr::col((
+                                        task_delivery::Entity,
+                                        task_delivery::Column::WorkspaceId,
+                                    )),
+                                ),
+                            )
+                        }),
+                )
+                .from_alias(Alias::new("outcome")),
+            )
+            .expr(Expr::col((
+                task_delivery::Entity,
+                task_delivery::Column::Id,
+            )))
+            .expr(Expr::col((
+                task_delivery::Entity,
+                task_delivery::Column::DeliveredTurnId,
+            )))
+            .expr(Expr::col((task::Entity, task::Column::CreatedByTurnId)))
+            .filter(
+                Expr::col((task_delivery::Entity, task_delivery::Column::WorkspaceId))
+                    .eq(Expr::Value(workspace.into()))
+                    .and(
+                        Expr::col((task_delivery::Entity, task_delivery::Column::TargetThreadId))
+                            .eq(Expr::Value(thread.into())),
+                    )
+                    .and(
+                        Expr::col((task_delivery::Entity, task_delivery::Column::Status))
+                            .eq(Expr::val("delivered")),
+                    )
+                    .and(
+                        Expr::col((task_delivery::Entity, task_delivery::Column::Id))
+                            .gt(Expr::Value(after.clone().into())),
+                    )
+                    .and(
+                        Expr::Value(command.map(str::to_owned).into())
                             .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                            .or(Expr::col(("e", turn_event::Column::Id))
-                                .eq(Expr::Value(source.map(|s|s.id.clone())
-                                        .into()))
-                                .and(Expr::col(("e", turn_event::Column::TurnId))
-                                    .eq(Expr::Value(source.and_then(|s|s.scope.strip_prefix("event:"))
-                                            .map(str::to_owned)
-                                            .into())))
-                                .and(Expr::val("event-revision:")
-                                    .binary(BinOper::Custom("||"), Expr::col(("r", compaction_event_revision::Column::Revision)))
-                                    .eq(Expr::Value(source.map(|s|s.version.clone())
-                                            .into()))))))
-                    .to_owned())))
-        .order_by(Expr::col((task_delivery::Entity, task_delivery::Column::Id)), Order::Asc)
-        .limit(128)
-        .into_tuple::<(String,String,String)>()
-        .all(db)
-        .await?;
+                            .or(Expr::col((task::Entity, task::Column::CreatedByTurnId))
+                                .eq(Expr::Value(command.map(str::to_owned).into()))),
+                    )
+                    .and(Expr::exists(
+                        Query::select()
+                            .expr(Expr::val(1_i64))
+                            .from_as(turn_event::Entity, "e")
+                            .join_as(
+                                JoinType::InnerJoin,
+                                compaction_event_revision::Entity,
+                                "r",
+                                Expr::col(("r", compaction_event_revision::Column::SourceId))
+                                    .eq(Expr::col(("e", turn_event::Column::Id)))
+                                    .and(
+                                        Expr::col(("r", compaction_event_revision::Column::TurnId))
+                                            .eq(Expr::col(("e", turn_event::Column::TurnId))),
+                                    )
+                                    .and(
+                                        Expr::col((
+                                            "r",
+                                            compaction_event_revision::Column::Present,
+                                        ))
+                                        .eq(Expr::val(1_i64)),
+                                    ),
+                            )
+                            .and_where(
+                                Expr::col(("e", turn_event::Column::TurnId))
+                                    .eq(Expr::col(("outcome", turn::Column::Id)))
+                                    .and(
+                                        Expr::col(("e", turn_event::Column::ThreadId))
+                                            .eq(Expr::col(("outcome", turn::Column::ThreadId))),
+                                    )
+                                    .and(Expr::col(("e", turn_event::Column::EventType)).eq(
+                                        Expr::Value(
+                                            pioneer_protocol::constants::events::TURN_FAILED.into(),
+                                        ),
+                                    ))
+                                    .and(
+                                        Expr::col((
+                                            "r",
+                                            compaction_event_revision::Column::CaptureOrder,
+                                        ))
+                                        .lte(Expr::Value(event_fence.into())),
+                                    ),
+                            )
+                            // The source is an immutable argument, not prepared database
+                            // state. Emit its exact key directly: a nullable-parameter OR
+                            // hides the primary-key lookup from SQLite and makes every
+                            // historical message scan unrelated event revisions.
+                            .and_where_option(source.map(|source| {
+                                Expr::col(("e", turn_event::Column::Id))
+                                    .eq(source.id.clone())
+                                    .and(
+                                        Expr::col(("e", turn_event::Column::TurnId)).eq(source
+                                            .scope
+                                            .strip_prefix("event:")
+                                            .map(str::to_owned)),
+                                    )
+                                    .and(
+                                        Expr::val("event-revision:")
+                                            .binary(
+                                                BinOper::Custom("||"),
+                                                Expr::col((
+                                                    "r",
+                                                    compaction_event_revision::Column::Revision,
+                                                )),
+                                            )
+                                            .eq(source.version.clone()),
+                                    )
+                            }))
+                            .to_owned(),
+                    )),
+            )
+            .order_by(
+                Expr::col((task_delivery::Entity, task_delivery::Column::Id)),
+                Order::Asc,
+            )
+            .limit(128)
+            .into_tuple::<(String, String, String)>()
+            .all(db)
+            .await?;
         if rows.is_empty() {
             return Ok(None);
         }
