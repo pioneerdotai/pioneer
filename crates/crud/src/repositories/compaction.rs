@@ -405,6 +405,178 @@ struct CanonicalSourceMetadata {
     bytes: i64,
 }
 
+#[derive(FromQueryResult)]
+struct CanonicalSourcePayload {
+    id: String,
+    revision: i64,
+    payload: String,
+}
+
+#[derive(FromQueryResult)]
+struct CanonicalSourcePayloadMetadata {
+    id: String,
+    revision: i64,
+    bytes: i64,
+}
+
+pub(crate) async fn compaction_reference_payloads<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    kind: CanonicalSource,
+    references: &[SourceRef],
+) -> Result<std::collections::BTreeMap<SourceRef, String>> {
+    ensure!(
+        references.len() <= SOURCE_PAGE_ROWS as usize,
+        "reference payload batch exceeds row quantum"
+    );
+    match kind {
+        CanonicalSource::Input => {
+            read_reference_payloads(
+                db,
+                turn_input_projection(workspace, thread, turn),
+                kind,
+                turn,
+                references,
+            )
+            .await
+        }
+        CanonicalSource::Event => {
+            read_reference_payloads(
+                db,
+                turn_event_projection(workspace, thread, turn),
+                kind,
+                turn,
+                references,
+            )
+            .await
+        }
+        CanonicalSource::ProviderContext => {
+            read_reference_payloads(
+                db,
+                turn_llm_context_projection(workspace, thread, turn),
+                kind,
+                turn,
+                references,
+            )
+            .await
+        }
+        CanonicalSource::ToolItem => {
+            read_reference_payloads(
+                db,
+                turn_item_projection(workspace, thread, turn),
+                kind,
+                turn,
+                references,
+            )
+            .await
+        }
+    }
+}
+
+async fn read_reference_payloads<C: ConnectionTrait, E: EntityTrait, P>(
+    db: &C,
+    projection: CanonicalProjection<E, P>,
+    kind: CanonicalSource,
+    turn: &str,
+    references: &[SourceRef],
+) -> Result<std::collections::BTreeMap<SourceRef, String>> {
+    if references.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let expected_scope = format!("{}:{turn}", kind.prefix());
+    let expected_version_prefix = format!("{}:", kind.version_prefix());
+    ensure!(
+        references
+            .iter()
+            .all(|reference| reference.scope == expected_scope
+                && reference.version.starts_with(&expected_version_prefix)),
+        "reference payload batch mixes canonical source scopes"
+    );
+    let ids = references
+        .iter()
+        .map(|reference| reference.id.clone())
+        .collect::<Vec<_>>();
+    let metadata = projection
+        .query
+        .clone()
+        .select_only()
+        .column(projection.id)
+        .expr_as(projection.revision.clone(), "revision")
+        .expr_as(
+            Func::char_length(
+                Expr::col((E::default(), projection.payload)).cast_as(Alias::new("BLOB")),
+            ),
+            "bytes",
+        )
+        .filter(projection.id.is_in(ids))
+        .filter(projection.present.clone().eq(1_i64))
+        .into_model::<CanonicalSourcePayloadMetadata>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, (row.revision, row.bytes)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut batches = Vec::<Vec<String>>::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0usize;
+    for reference in references {
+        let Some((revision, bytes)) = metadata.get(&reference.id) else {
+            continue;
+        };
+        if reference.version != format!("{}:{revision}", kind.version_prefix()) {
+            continue;
+        }
+        let Ok(bytes) = usize::try_from(*bytes) else {
+            continue;
+        };
+        // Oversized sources retain the existing fragment reader fallback.
+        if bytes > SOURCE_PAGE_BYTES {
+            continue;
+        }
+        if !current.is_empty() && current_bytes + bytes > SOURCE_PAGE_BYTES {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += bytes;
+        current.push(reference.id.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    let references_by_id = references
+        .iter()
+        .map(|reference| (reference.id.clone(), reference.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut result = std::collections::BTreeMap::new();
+    for ids in batches {
+        let rows = projection
+            .query
+            .clone()
+            .select_only()
+            .column(projection.id)
+            .expr_as(projection.revision.clone(), "revision")
+            .column(projection.payload)
+            .filter(projection.id.is_in(ids))
+            .filter(projection.present.clone().eq(1_i64))
+            .into_model::<CanonicalSourcePayload>()
+            .all(db)
+            .await?;
+        for row in rows {
+            let Some(reference) = references_by_id.get(&row.id) else {
+                continue;
+            };
+            if reference.version == format!("{}:{}", kind.version_prefix(), row.revision) {
+                result.insert(reference.clone(), row.payload);
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
     db: &C,
@@ -426,10 +598,10 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         .select_only()
         .column(projection.id)
         .expr_as(projection.paging.sequence.clone(), "sequence")
-        .expr_as(projection.paging.source_type, "source_type")
-        .expr_as(projection.paging.item_id, "item_id")
-        .expr_as(projection.paging.tool_name, "tool_name")
-        .expr_as(projection.paging.projection_kind, "projection_kind")
+        .expr_as(projection.paging.source_type.clone(), "source_type")
+        .expr_as(projection.paging.item_id.clone(), "item_id")
+        .expr_as(projection.paging.tool_name.clone(), "tool_name")
+        .expr_as(projection.paging.projection_kind.clone(), "projection_kind")
         .expr_as(projection.revision.clone(), "revision")
         .expr_as(
             if include_payload {
@@ -440,16 +612,14 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
             "bytes",
         )
         .filter(projection.paging.sequence.clone().gt(after))
-        .filter(projection.paging.capture_order.lte(capture_order))
-        .order_by(projection.paging.sequence, Order::Asc)
+        .filter(projection.paging.capture_order.clone().lte(capture_order))
+        .order_by(projection.paging.sequence.clone(), Order::Asc)
         .limit(SOURCE_PAGE_ROWS)
         .into_model::<CanonicalSourceMetadata>()
         .all(db)
         .await?;
-    let mut page = SourcePage {
-        entries: Vec::new(),
-        next_sequence: after,
-    };
+    let mut selected = Vec::with_capacity(rows.len());
+    let mut payload_ids = Vec::new();
     let mut bytes = 0usize;
     for row in rows {
         let size = row.bytes;
@@ -460,27 +630,48 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         {
             break;
         }
-        let payload = if !include_payload || size < 0 || size as usize > SOURCE_PAGE_BYTES {
-            None
-        } else {
-            projection
-                .query
-                .clone()
-                .select_only()
-                .column(projection.payload)
-                .filter(projection.id.eq(row.id.clone()))
-                .filter(projection.revision.clone().eq(row.revision))
-                .filter(
-                    payload_bytes
-                        .clone()
-                        .lte((SOURCE_PAGE_BYTES - bytes) as u64),
-                )
-                .into_tuple::<String>()
-                .one(db)
-                .await?
-        };
-        // Reader capacity is released before parsing or assembling the page.
-        bytes += payload.as_ref().map_or(0, String::len);
+        if include_payload && size >= 0 && size as usize <= SOURCE_PAGE_BYTES {
+            bytes += size as usize;
+            payload_ids.push(row.id.clone());
+        }
+        selected.push(row);
+    }
+    // The metadata pass establishes an explicit byte bound before any payload
+    // is materialized. Fetch the selected rows together instead of issuing one
+    // SQLite query per source while reconstructing a long thread.
+    let payloads = if payload_ids.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        projection
+            .query
+            .clone()
+            .select_only()
+            .column(projection.id)
+            .expr_as(projection.revision.clone(), "revision")
+            .column(projection.payload)
+            .filter(projection.id.is_in(payload_ids))
+            .filter(projection.present.eq(1_i64))
+            .filter(projection.paging.capture_order.lte(capture_order))
+            .into_model::<CanonicalSourcePayload>()
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, (row.revision, row.payload)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let mut page = SourcePage {
+        entries: Vec::new(),
+        next_sequence: after,
+    };
+    for row in selected {
+        let payload = payloads
+            .get(&row.id)
+            .filter(|(revision, payload)| {
+                *revision == row.revision
+                    && payload.len() <= SOURCE_PAGE_BYTES
+                    && usize::try_from(row.bytes).ok() == Some(payload.len())
+            })
+            .map(|(_, payload)| payload.clone());
         page.next_sequence = row.sequence;
         page.entries.push(SourceRecord {
             source_type: row.source_type,

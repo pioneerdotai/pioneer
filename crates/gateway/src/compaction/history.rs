@@ -80,14 +80,7 @@ async fn metadata(
     let mut after = 0;
     while after < high_water {
         let page = store
-            .compaction_source_metadata_page_at_fence(
-                workspace,
-                thread,
-                turn,
-                kind,
-                after,
-                capture_order,
-            )
+            .compaction_source_page_at_fence(workspace, thread, turn, kind, after, capture_order)
             .await?;
         ensure!(
             page.next_sequence > after,
@@ -263,7 +256,7 @@ pub(crate) async fn load_task_line_history(
     excluded_turn: Option<&str>,
     fence: &HistoryReadFence,
 ) -> Result<Vec<ChatMessage>> {
-    let mut messages = load_line_history_inner(
+    load_line_history_inner(
         store,
         workspace,
         thread,
@@ -272,36 +265,30 @@ pub(crate) async fn load_task_line_history(
         true,
         HistorySelection::All,
     )
-    .await?;
-    let store = store.with_maintenance_access();
-    for message in &mut messages {
-        let Some(origin) = message.provenance.as_mut() else {
-            continue;
-        };
-        let mut logical = None;
-        for reference in &origin.sources {
-            if let Some(command) = store
-                .compaction_task_delivery_command(
-                    workspace,
-                    thread,
-                    &SourceRef {
-                        scope: reference.scope.clone(),
-                        id: reference.id.clone(),
-                        version: reference.version.clone(),
-                    },
-                )
-                .await?
-            {
-                ensure!(
-                    logical.as_ref().is_none_or(|previous| previous == &command),
-                    "canonical message spans different Task command outcomes"
-                );
-                logical = Some(command);
-            }
-        }
-        origin.logical_turn_id = logical;
-    }
-    Ok(messages)
+    .await
+}
+
+/// Load only the canonical suffix not already represented by an accepted
+/// frozen Task basis. The boundary turn itself is included because Composer
+/// snapshots deliberately exclude their current input turn.
+pub(crate) async fn load_task_line_history_from(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    excluded_turn: Option<&str>,
+    from_turn: &str,
+    fence: &HistoryReadFence,
+) -> Result<Vec<ChatMessage>> {
+    load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        excluded_turn,
+        fence,
+        true,
+        HistorySelection::FromTurn(from_turn),
+    )
+    .await
 }
 
 /// Reconstruct only the supplied exact canonical leaves. Later unrelated rows
@@ -351,6 +338,7 @@ enum HistorySelection<'a> {
     All,
     Sources(&'a BTreeSet<SourceRef>),
     ThroughTurn(&'a str),
+    FromTurn(&'a str),
 }
 
 async fn load_line_history_inner(
@@ -362,10 +350,11 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
-    let (selected, through_turn) = match selection {
-        HistorySelection::All => (None, None),
-        HistorySelection::Sources(sources) => (Some(sources), None),
-        HistorySelection::ThroughTurn(turn) => (None, Some(turn)),
+    let (selected, through_turn, from_turn) = match selection {
+        HistorySelection::All => (None, None, None),
+        HistorySelection::Sources(sources) => (Some(sources), None, None),
+        HistorySelection::ThroughTurn(turn) => (None, Some(turn), None),
+        HistorySelection::FromTurn(turn) => (None, None, Some(turn)),
     };
     let store = store.with_maintenance_access();
     let mut turns = Vec::new();
@@ -377,10 +366,7 @@ async fn load_line_history_inner(
         let Some(last) = page.last() else { break };
         ensure!(last.id > after, "history turn page made no progress");
         after = last.id.clone();
-        turns.extend(
-            page.into_iter()
-                .filter(|turn| Some(turn.id.as_str()) != excluded_turn),
-        );
+        turns.extend(page);
     }
     // IDs do not encode chronology. In particular, a detached Task answer may
     // share its parent's creation second and sort before its source request.
@@ -409,6 +395,14 @@ async fn load_line_history_inner(
         );
         turns.truncate(end + 1);
     }
+    if let Some(from_turn) = from_turn {
+        let start = turns
+            .iter()
+            .position(|turn| turn.id == from_turn)
+            .ok_or_else(|| anyhow::anyhow!("accepted basis turn is outside its history fence"))?;
+        turns.drain(..start);
+    }
+    turns.retain(|turn| Some(turn.id.as_str()) != excluded_turn);
     // Refresh relationship metadata before deciding whether earlier Task
     // commands are closed by later occurrence/delivery turns. A cold cache
     // must not drop a command merely because its outcome sorts after it.
@@ -760,13 +754,38 @@ async fn load_line_history_inner(
             let Some(mut message) = event_message(event)? else {
                 continue;
             };
-            message.provenance = Some(origin(
+            // Only delivery results and terminal Task outcomes can map a
+            // physical event to another logical command. Resolving every
+            // historical event performed a pair of relationship queries for
+            // tens of thousands of ordinary messages before each turn start.
+            let task_outcome = (row.source_type
+                == pioneer_protocol::constants::events::ITEM_COMPLETED
+                && row
+                    .item_id
+                    .as_deref()
+                    .and_then(pioneer_protocol::task_delivery_id_from_result_item_id)
+                    .is_some())
+                || matches!(
+                    row.source_type.as_str(),
+                    pioneer_protocol::constants::events::TURN_FAILED
+                        | pioneer_protocol::constants::events::TURN_BLOCKED
+                );
+            let logical_turn_id = if task_outcome {
+                store
+                    .compaction_task_delivery_command(workspace, thread, &row.reference)
+                    .await?
+            } else {
+                None
+            };
+            let mut provenance = origin(
                 workspace,
                 thread,
                 &turn.id,
                 &row.reference.id,
                 vec![row.reference.clone()],
-            ));
+            );
+            provenance.logical_turn_id = logical_turn_id;
+            message.provenance = Some(provenance);
             ordered.push((row.sequence, vec![message]));
         }
         if causal_task_context {

@@ -5,9 +5,9 @@ use super::history::NativeHistoryLayout;
 use anyhow::{Result, ensure};
 use pioneer_compaction::{SourceRef, SourceRole};
 use pioneer_provider::ChatMessage;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopedHistorySource {
     pub thread: String,
     pub source: SourceRef,
@@ -52,7 +52,11 @@ pub fn compose_context(
 ) -> Result<Vec<ChatMessage>> {
     ensure!(!destination.is_empty(), "missing destination context");
     let mut units: Vec<Unit> = Vec::new();
-    let mut revisions = BTreeMap::new();
+    // Accepted units are pairwise disjoint. Index every leaf as it is accepted
+    // so overlap detection stays proportional to the number of sources instead
+    // of comparing every unit with every unit on long histories.
+    let mut leaf_owners = HashMap::<ScopedHistorySource, usize>::new();
+    let mut revisions = HashMap::new();
     let mut branch_offset = 0;
     for branch in branches {
         ensure!(
@@ -117,25 +121,41 @@ pub fn compose_context(
                     );
                 }
             }
-            let mut duplicate = None;
-            for (index, previous) in units.iter().enumerate() {
-                if previous.leaves.is_disjoint(&leaves) {
-                    continue;
-                }
-                if previous.leaves != leaves {
-                    return Err(CompatibleProjectionRequired {
-                        affected: previous.leaves.union(&leaves).cloned().collect(),
+            let owners = leaves
+                .iter()
+                .filter_map(|leaf| leaf_owners.get(leaf).copied())
+                .collect::<HashSet<_>>();
+            let duplicate = match owners.len() {
+                0 => None,
+                1 => {
+                    let index = *owners.iter().next().expect("one overlap owner");
+                    let previous = &units[index];
+                    if previous.leaves != leaves {
+                        return Err(CompatibleProjectionRequired {
+                            affected: previous.leaves.union(&leaves).cloned().collect(),
+                        }
+                        .into());
                     }
-                    .into());
+                    Some(index)
                 }
-                duplicate = Some(index);
-                break;
-            }
+                _ => {
+                    let affected = owners
+                        .iter()
+                        .flat_map(|index| units[*index].leaves.iter().cloned())
+                        .chain(leaves.iter().cloned())
+                        .collect();
+                    return Err(CompatibleProjectionRequired { affected }.into());
+                }
+            };
             if let Some(index) = duplicate {
                 // A source inherited by one branch can be accepted own work of
                 // another. Its single projection then remains eligible in C.
                 units[index].own |= own;
             } else {
+                let index = units.len();
+                for leaf in &leaves {
+                    leaf_owners.insert(leaf.clone(), index);
+                }
                 units.push(Unit {
                     messages: indexes
                         .iter()

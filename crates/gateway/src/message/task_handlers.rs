@@ -568,7 +568,7 @@ impl MessageProcessor {
                 conversation_thread_id.as_str(),
                 source_turn_id,
                 composer.map(|work| work.launch.turn_id.as_str()),
-                composer.is_none().then_some(policy),
+                Some(policy),
             )
             .await
         } else {
@@ -580,7 +580,7 @@ impl MessageProcessor {
                 conversation_thread_id.as_str(),
                 source_turn_id,
                 composer.map(|work| work.launch.turn_id.as_str()),
-                composer.is_none().then_some(policy),
+                Some(policy),
             )
             .await
         }

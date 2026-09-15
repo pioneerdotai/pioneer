@@ -51,6 +51,7 @@ pub struct HistoryCausalBoundary {
 pub struct AcceptedTaskBasis {
     pub parent_thread: String,
     pub run_id: String,
+    pub source_turn: Option<String>,
     pub history_json: String,
 }
 
@@ -449,6 +450,10 @@ pub(crate) async fn compaction_task_basis_snapshot<C: ConnectionTrait>(
             task_run_conversation_snapshot::Entity,
             task_run_conversation_snapshot::Column::CreatedAt,
         )))
+        .expr(Expr::col((
+            task_run_conversation_snapshot::Entity,
+            task_run_conversation_snapshot::Column::SourceTurnId,
+        )))
         .expr_as(
             Expr::expr(
                 Func::cust(Alias::new("length")).args([Expr::col((
@@ -495,6 +500,7 @@ pub(crate) async fn compaction_task_basis_snapshot<C: ConnectionTrait>(
     let run_id: String = row.run_id;
     let parent_thread: String = row.conversation_thread_id;
     let created_at: String = row.created_at;
+    let source_turn = row.source_turn_id;
     let history_bytes = usize::try_from(row.history_bytes)?;
     let mut bytes = Vec::new();
     bytes.try_reserve(history_bytes)?;
@@ -642,6 +648,7 @@ pub(crate) async fn compaction_task_basis_snapshot<C: ConnectionTrait>(
     Ok(Some(AcceptedTaskBasis {
         parent_thread,
         run_id,
+        source_turn,
         history_json: String::from_utf8(bytes)?,
     }))
 }
@@ -1985,5 +1992,6 @@ struct BasisSnapshotMetadata {
     run_id: String,
     conversation_thread_id: String,
     created_at: String,
+    source_turn_id: Option<String>,
     history_bytes: i64,
 }
