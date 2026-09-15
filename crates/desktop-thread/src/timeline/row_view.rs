@@ -363,7 +363,9 @@ impl Render for TimelineRowView {
                 _ => false,
             };
             if content {
-                pioneer_observability::turn_startup::presented(&item.turn_id);
+                pioneer_client::timeline::presentation::observe_turn_content_presented(
+                    &item.turn_id,
+                );
             }
         }
         self.presentation.render(cx)

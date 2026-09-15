@@ -16,6 +16,11 @@ use std::{
     sync::Arc,
 };
 
+/// Records that a client shell has presented visible model output for a turn.
+pub fn observe_turn_content_presented(turn_id: &str) {
+    pioneer_observability::turn_startup::presented(turn_id);
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
