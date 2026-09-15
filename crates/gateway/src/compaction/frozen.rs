@@ -404,19 +404,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
     };
     let mut messages = if omits_history {
         Vec::new()
-    } else if let Some(from_turn) = basis
-        .as_ref()
-        .and_then(|basis| basis.source_turn.as_deref())
-    {
-        super::history::load_task_line_history_from(
-            &store,
-            workspace,
-            thread,
-            excluded_turn,
-            from_turn,
-            &fence,
-        )
-        .await?
     } else {
         super::history::load_task_line_history(&store, workspace, thread, excluded_turn, &fence)
             .await?
