@@ -11,9 +11,10 @@ use pioneer_provider::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Preparation belongs to the requesting operation, never a detached startup
-/// scan. Each quantum releases SQLite capacity; cancellation leaves a durable
-/// cursor for the next request. Capture the history fence only after this returns.
+/// The requesting operation can finish work not yet completed by proactive
+/// maintenance. Each quantum releases SQLite capacity; cancellation leaves a
+/// durable cursor for either owner. Capture the history fence only after this
+/// returns.
 pub(crate) async fn prepare_history(
     store: &CrudStore,
     workspace: &str,

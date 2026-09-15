@@ -10,7 +10,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // Schema only: existing history is registered on demand, never during startup.
+        // Schema only: never scan existing history inside the migration. The
+        // bounded maintenance worker registers it after startup, while an
+        // operation that needs an unfinished history can safely help it along.
         let db = manager.get_connection();
         manager
             .create_table(
@@ -42,7 +44,8 @@ impl MigrationTrait for Migration {
             .await?;
         // SeaQuery has no SQLite CREATE TRIGGER builder; only trigger DDL is raw.
         // New threads have no legacy history; their sources are covered by the
-        // existing revision triggers. This does not scan or mark old threads ready.
+        // existing revision triggers. This migration does not scan or mark old
+        // threads ready; the maintenance worker discovers them incrementally.
         db.execute_unprepared(
             "CREATE TRIGGER compaction_new_thread_prepared AFTER INSERT ON thread
              BEGIN INSERT INTO compaction_history_preparation(thread_id,ready)
