@@ -1787,23 +1787,23 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.6"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
+checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
 dependencies = [
  "clap_builder",
- "clap_derive 4.6.4",
+ "clap_derive 4.6.7",
 ]
 
 [[package]]
 name = "clap_builder"
-version = "4.6.6"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
+checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
 dependencies = [
  "anstream",
  "anstyle",
- "clap_lex 1.1.0",
+ "clap_lex 1.1.1",
  "strsim 0.11.1",
 ]
 
@@ -1822,9 +1822,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.4"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
+checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -1843,9 +1843,9 @@ dependencies = [
 
 [[package]]
 name = "clap_lex"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clipboard-win"
@@ -2729,7 +2729,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9a1b2f1087c32a26a8c6c7d89eb80b50c33d8466e2431ea2a8345c969cded18"
 dependencies = [
  "anyhow",
- "clap 4.6.6",
+ "clap 4.6.7",
  "futures",
  "keyring-core",
  "log",
@@ -8853,7 +8853,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8883,7 +8883,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "libc",
@@ -8898,7 +8898,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8923,7 +8923,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -8948,7 +8948,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8970,7 +8970,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "async-trait",
  "libc",
@@ -8984,7 +8984,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9017,7 +9017,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9036,7 +9036,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-compaction"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9049,7 +9049,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "config",
@@ -9060,7 +9060,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9082,7 +9082,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -9131,7 +9131,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-administration"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9145,7 +9145,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-agents-doc"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9156,7 +9156,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-foundation"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9164,7 +9164,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-mcp"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -9176,7 +9176,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-onboarding"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9189,7 +9189,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-providers"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9200,7 +9200,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-settings"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9216,7 +9216,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-skills"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -9228,7 +9228,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-task-notifications"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9240,7 +9240,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-thread"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9264,7 +9264,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-update"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -9281,7 +9281,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-workspaces"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9294,7 +9294,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "sea-orm",
  "serde",
@@ -9302,7 +9302,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9372,7 +9372,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -9387,7 +9387,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -9400,7 +9400,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9422,7 +9422,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9445,7 +9445,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9463,7 +9463,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -9480,7 +9480,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9499,7 +9499,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -9514,7 +9514,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9546,7 +9546,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -9556,7 +9556,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "hex",
@@ -9574,7 +9574,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9601,7 +9601,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9623,7 +9623,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9662,7 +9662,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.53.5"
+version = "0.53.6"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -11475,7 +11475,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2479056c3f9c96c8ec5b9091103050b5f3a0532c615d8ab01d3edb81af5c65a8"
 dependencies = [
  "chrono",
- "clap 4.6.6",
+ "clap 4.6.7",
  "dotenvy",
  "glob",
  "indoc",
@@ -11511,7 +11511,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9acbadc98b17aa94657122dae4b5a840c7cebe6359a5ba15d8eaa233768942a5"
 dependencies = [
  "async-trait",
- "clap 4.6.6",
+ "clap 4.6.7",
  "dotenvy",
  "sea-orm",
  "sea-orm-cli",
@@ -15372,11 +15372,10 @@ dependencies = [
 
 [[package]]
 name = "webclaw-core"
-version = "0.6.22"
-source = "git+https://github.com/0xMassi/webclaw#23c706e5ba6af74affa3d429d3678a8ef27c26ff"
+version = "0.6.23"
+source = "git+https://github.com/0xMassi/webclaw#aadf8ed1ef6102d4fccabef9680fa894c28a19f3"
 dependencies = [
  "ego-tree 0.10.0",
- "once_cell",
  "regex",
  "scraper 0.22.0",
  "serde",
