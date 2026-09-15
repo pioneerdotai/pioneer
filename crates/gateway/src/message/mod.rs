@@ -2545,9 +2545,6 @@ impl MessageProcessor {
                 tokio::spawn(Self::run_task_lifecycle_resilience_worker(
                     processor.clone(),
                 )),
-                tokio::spawn(Self::run_legacy_history_preparation_worker(
-                    processor.clone(),
-                )),
             ]);
             let mut next_skill_upload_cleanup = 0;
             let mut next_agent_action_ledger_compaction = 0;

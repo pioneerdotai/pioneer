@@ -35,66 +35,6 @@ impl Drop for OwnedHistoryCheck {
     }
 }
 impl MessageProcessor {
-    /// Gradually register pre-compaction histories without delaying ordinary
-    /// CLI turns. One thread is advanced by one bounded database quantum per
-    /// resilience interval. A failed candidate is skipped until the cursor
-    /// wraps, so later histories continue to make progress.
-    pub(crate) async fn run_legacy_history_preparation_worker(processor: Weak<Self>) {
-        let mut after_thread = String::new();
-        let mut active = None::<(String, String)>;
-        loop {
-            let mut idle = false;
-            let Some(this) = processor.upgrade() else {
-                break;
-            };
-            let this = this.for_background_reconciliation();
-            let store = this.crud_store.with_maintenance_access();
-            if active.is_none() {
-                let mut candidate = store
-                    .compaction_history_preparation_candidate_after(&after_thread)
-                    .await;
-                if matches!(candidate, Ok(None)) && !after_thread.is_empty() {
-                    after_thread.clear();
-                    candidate = store
-                        .compaction_history_preparation_candidate_after(&after_thread)
-                        .await;
-                }
-                match candidate {
-                    Ok(candidate) => {
-                        idle = candidate.is_none();
-                        active = candidate;
-                    }
-                    Err(_) => warn!("failed to discover legacy history preparation work"),
-                }
-            }
-            if let Some((workspace, thread)) = active.as_ref() {
-                match store
-                    .compaction_prepare_history_quantum(workspace, thread)
-                    .await
-                {
-                    Ok(true) => {
-                        after_thread.clone_from(thread);
-                        active = None;
-                    }
-                    Ok(false) => {}
-                    Err(_) => {
-                        warn!("failed to advance legacy history preparation");
-                        after_thread.clone_from(thread);
-                        active = None;
-                    }
-                }
-            }
-            // Once every legacy history is ready, only probe occasionally.
-            // Threads created after the migration are marked ready by trigger.
-            let delay = if idle {
-                Duration::from_secs(60)
-            } else {
-                Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)
-            };
-            sleep(delay).await;
-        }
-    }
-
     pub(crate) async fn enqueue_native_completed_history(
         &self,
         context: &pioneer_agent::compaction::controller::NativeContext,
