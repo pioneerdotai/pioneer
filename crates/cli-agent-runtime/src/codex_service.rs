@@ -1,17 +1,18 @@
-//! One nonpersistent service attempt on the existing Codex App Server codec.
-//! Supported profile: openai/codex rust-v0.154.0. Empty environments remove
-//! working tools independently of ephemeral persistence (see upstream
-//! app-server-protocol/v2/thread.rs and core/tools/spec_plan.rs).
+//! Isolated, nonpersistent Codex exec service. Each portion gets a fresh
+//! ephemeral context and uses the selected authorization home without loading
+//! its user config, MCP servers, plugins, rules, or conversation history.
 use super::*;
 use crate::event::{
     RuntimeEventMappingOptions, classify_runtime_provider_failure, map_codex_notification_event,
 };
 use crate::process::{CLIAgentProcess, SensitiveEnvironment};
-use crate::service::ServiceFailure;
-use crate::service::ServiceStage;
+use crate::service::{ServiceFailure, ServiceStage};
 use anyhow::{Context, Result, bail, ensure};
 use pioneer_protocol::ProviderFailureClass;
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
+};
 
 const RELEASE: &str = "0.154.0";
 const MAX_SERVICE_BYTES: usize = CODEX_MAX_MATERIALIZED_FRAME_BYTES;
@@ -70,15 +71,12 @@ pub struct CodexService {
     attempt: Mutex<Option<ServiceAttempt>>,
 }
 struct ServiceAttempt {
-    client: CodexAppServerClient,
-    owner: Option<CodexJsonlRpcOwner>,
     process: CLIAgentProcess,
-    directory: tempfile::TempDir,
+    _directory: tempfile::TempDir,
 }
 impl Drop for ServiceAttempt {
     fn drop(&mut self) {
         self.process.abort_service();
-        // The RPC owner aborts its bounded, in-memory tasks on Drop.
     }
 }
 impl CodexService {
@@ -103,52 +101,89 @@ impl CodexService {
                 <= MAX_SERVICE_BYTES,
             "service input exceeds transport capacity"
         );
-        let result = {
-            let mut attempt = self.attempt.lock().await;
-            ensure!(attempt.is_none(), "previous service attempt needs cleanup");
-            ensure!(Instant::now() < deadline, "service deadline exceeded");
-            let directory = tempfile::tempdir().context(ServiceStage("cli_directory"))?;
-            let config = process_config(&self.config, directory.path())
-                .context(ServiceStage("cli_configuration"))?;
-            let mut process =
-                spawn_cli_agent_process(&config).context(ServiceStage("cli_spawn"))?;
-            let (stdout, stdin) = process.take_stdio().context(ServiceStage("cli_stdio"))?;
-            let (rpc, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(stdout), stdin);
-            *attempt = Some(ServiceAttempt {
-                client: CodexAppServerClient::new(rpc),
-                owner: Some(owner),
-                process,
-                directory,
-            });
-            let state = attempt.as_mut().unwrap();
-            match tokio::time::timeout_at(
-                deadline,
-                exchange(&state.client, state.directory.path(), request, deadline),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("codex service deadline exceeded")),
-            }
+        let run = async {
+            let (version, success) = self.invoke(None, deadline, 4096).await?;
+            ensure!(
+                success && std::str::from_utf8(&version)?.trim() == format!("codex-cli {RELEASE}"),
+                "unsupported Codex service capability version"
+            );
+            let (output, success) = self
+                .invoke(Some(&request), deadline, MAX_SERVICE_BYTES)
+                .await?;
+            let completion =
+                decode_exec_completion(&output).context(ServiceStage("cli_exec_decode"))?;
+            ensure!(success, "Codex service process failed");
+            Ok(completion)
+        };
+        let result = match tokio::time::timeout_at(deadline, run).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("Codex service deadline exceeded")),
         };
         self.cleanup().await?;
         result
     }
-    /// Retains ownership across a cancelled summarize or cleanup future.
+    async fn invoke(
+        &self,
+        request: Option<&CodexServiceRequest>,
+        deadline: Instant,
+        cap: usize,
+    ) -> Result<(Vec<u8>, bool)> {
+        let result = {
+            let mut owner = self.attempt.lock().await;
+            ensure!(owner.is_none(), "previous service attempt needs cleanup");
+            ensure!(Instant::now() < deadline, "Codex service deadline exceeded");
+            let directory = tempfile::tempdir().context(ServiceStage("cli_directory"))?;
+            if let Some(request) = request {
+                // Instructions and transcript never go into process arguments.
+                // The private file is removed together with the owned attempt.
+                std::fs::write(
+                    directory.path().join("instructions.txt"),
+                    &request.instructions,
+                )
+                .context(ServiceStage("cli_configuration"))?;
+            }
+            let config = process_config(&self.config, directory.path(), request)
+                .context(ServiceStage("cli_configuration"))?;
+            let mut process =
+                spawn_cli_agent_process(&config).context(ServiceStage("cli_spawn"))?;
+            let (stdout, mut stdin) = process.take_stdio().context(ServiceStage("cli_stdio"))?;
+            *owner = Some(ServiceAttempt {
+                process,
+                _directory: directory,
+            });
+            let write = async move {
+                stdin
+                    .write_all(request.map_or(&[][..], |r| r.input.as_bytes()))
+                    .await?;
+                stdin.shutdown().await
+            };
+            let read = async {
+                let mut output = Vec::new();
+                stdout.take(cap as u64 + 1).read_to_end(&mut output).await?;
+                ensure!(output.len() <= cap, "Codex service output exceeds capacity");
+                Ok::<_, anyhow::Error>(output)
+            };
+            let exchange = async {
+                let (_, output) =
+                    tokio::try_join!(async { write.await.map_err(anyhow::Error::from) }, read)?;
+                let status = owner.as_mut().unwrap().process.wait().await?;
+                Ok((output, status.success()))
+            };
+            exchange.await
+        };
+        self.cleanup().await?;
+        result
+    }
+    /// The owner survives cancellation until cleanup or Drop kills the process.
     pub async fn cleanup(&self) -> Result<()> {
-        let mut attempt = self.attempt.lock().await;
-        if let Some(state) = attempt.as_mut() {
-            let process_result = state
+        let mut owner = self.attempt.lock().await;
+        if let Some(attempt) = owner.as_mut() {
+            let result = attempt
                 .process
                 .terminate_with_grace(Duration::from_secs(1))
                 .await;
-            if let Some(owner) = state.owner.as_mut() {
-                owner.abort_and_join().await;
-            }
-            state.owner.take();
-            // Even a termination error must release all other resources.
-            attempt.take();
-            process_result?;
+            owner.take();
+            result?;
         }
         Ok(())
     }
@@ -160,192 +195,135 @@ fn profile() -> JsonValue {
         features.insert((*name).into(), json!(false));
     }
     features.insert("skip_host_skill_discovery".into(), json!(true));
-    json!({
-        "features":features, "mcp_servers":{}, "plugins":{}, "marketplaces":{},
-        "apps":{}, "projects":{}, "agents":{"enabled":false},
+    json!({"features":features, "agents":{"enabled":false},
         "web_search":"disabled", "project_doc_max_bytes":0,
         "include_environment_context":false, "include_collaboration_mode_instructions":false,
-        "history":{"persistence":"none"}
-    })
+        "history":{"persistence":"none"}, "suppress_unstable_features_warning":true})
 }
-fn process_config(config: &CodexServiceConfig, cwd: &Path) -> Result<CLIAgentProcessSpawnConfig> {
+fn process_config(
+    config: &CodexServiceConfig,
+    cwd: &Path,
+    request: Option<&CodexServiceRequest>,
+) -> Result<CLIAgentProcessSpawnConfig> {
     let mut process =
         CLIAgentProcessSpawnConfig::codex_app_server(&config.executable, &config.home_path)
             .with_cwd(cwd)
             .with_environment(&config.environment)
             .with_stderr_ring_lines(0);
-    for (key, value) in profile().as_object().unwrap() {
-        let value = toml::Value::try_from(value)?;
-        process
-            .args
-            .extend(["--config".into(), format!("{key}={value}")]);
+    process.args = vec!["--version".into()];
+    if let Some(request) = request {
+        process.args = [
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--json",
+            "--model",
+            &request.model,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for (key, value) in profile().as_object().unwrap() {
+            process.args.extend([
+                "--config".into(),
+                format!("{key}={}", toml::Value::try_from(value)?),
+            ]);
+        }
+        process.args.extend([
+            "--config".into(),
+            format!(
+                "model_instructions_file={}",
+                toml::Value::String(cwd.join("instructions.txt").to_string_lossy().into_owned())
+            ),
+        ]);
+        if let Some(effort) = &request.effort {
+            process.args.extend([
+                "--config".into(),
+                format!(
+                    "model_reasoning_effort={}",
+                    toml::Value::String(effort.clone())
+                ),
+            ]);
+        }
+        process.args.push("-".into());
     }
     Ok(process)
 }
-fn verify_profile(actual: &JsonValue, expected: &JsonValue) -> bool {
-    match expected {
-        JsonValue::Object(expected) if !expected.is_empty() => {
-            actual.as_object().is_some_and(|actual| {
-                expected.iter().all(|(key, value)| {
-                    actual
-                        .get(key)
-                        .is_some_and(|actual| verify_profile(actual, value))
-                })
-            })
-        }
-        // config/read uses typed maps: e.g. an empty apps table is returned
-        // as {"_default":null}. Null defaults do not enable an integration.
-        JsonValue::Object(expected) if expected.is_empty() => actual
-            .as_object()
-            .is_some_and(|actual| actual.values().all(JsonValue::is_null)),
-        _ => actual == expected,
-    }
-}
-fn supports_release(initialize: &CodexInitializeSnapshot) -> bool {
-    if let Some(version) = &initialize.version {
-        return version == RELEASE;
-    }
-    initialize.user_agent.as_deref().is_some_and(|agent| {
-        agent
-            .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_')))
-            .any(|part| part == RELEASE)
-    })
-}
 
-fn remaining(deadline: Instant) -> Result<Duration> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    ensure!(!remaining.is_zero(), "service deadline exceeded");
-    Ok(remaining)
-}
-async fn exchange(
-    client: &CodexAppServerClient,
-    cwd: &Path,
-    request: CodexServiceRequest,
-    deadline: Instant,
-) -> Result<CodexServiceCompletion> {
-    let mut notifications = client
-        .rpc
-        .take_notification_receiver()
-        .ok_or_else(|| anyhow::anyhow!("service notification receiver already used"))?;
-    let mut interactions = client
-        .rpc
-        .take_server_request_receiver()
-        .ok_or_else(|| anyhow::anyhow!("service interaction receiver already used"))?;
-    let mut diagnostics = client
-        .rpc
-        .take_diagnostic_receiver()
-        .ok_or_else(|| anyhow::anyhow!("service diagnostic receiver already used"))?;
-    let initialize = client
-        .initialize(remaining(deadline)?)
-        .await
-        .context(ServiceStage("cli_initialize"))?;
-    ensure!(
-        supports_release(&initialize),
-        "unsupported Codex service capability version"
-    );
-    let config = client
-        .rpc
-        .request_value(
-            "config/read",
-            Some(json!({"cwd":cwd,"includeLayers":false})),
-            remaining(deadline)?,
-        )
-        .await
-        .context(ServiceStage("cli_config_read"))?;
-    ensure!(
-        verify_profile(&config["config"], &profile()),
-        "Codex service isolation was not applied"
-    );
-    let opened = client.rpc.request_thread_open_value("thread/start", Some(json!({
-        "model":request.model, "cwd":cwd, "approvalPolicy":"never", "sandbox":"read-only",
-        "ephemeral":true, "environments":[], "dynamicTools":[], "selectedCapabilityRoots":[],
-        "allowProviderModelFallback":false, "baseInstructions":request.instructions,
-        "developerInstructions":"", "personality":"none"
-    })), remaining(deadline)?).await.context(ServiceStage("cli_thread_start"))?;
-    let opened = decode_codex_thread_open_response("thread/start", opened)
-        .context(ServiceStage("cli_thread_decode"))?;
-    ensure!(
-        opened.model.as_deref() == Some(request.model.as_str()),
-        "Codex service model changed"
-    );
-    ensure!(
-        opened
-            .raw
-            .pointer("/thread/path")
-            .is_some_and(JsonValue::is_null),
-        "Codex service opened a persistent thread"
-    );
-    let started = client
-        .rpc
-        .request_value(
-            "turn/start",
-            Some(json!({
-                "threadId":opened.native_thread_id, "input":[{"type":"text","text":request.input}],
-                "model":request.model, "effort":request.effort, "environments":[]
-            })),
-            remaining(deadline)?,
-        )
-        .await
-        .context(ServiceStage("cli_turn_start"))?;
-    let started = decode_codex_turn_start_response("turn/start", &opened.native_thread_id, started)
-        .context(ServiceStage("cli_turn_decode"))?;
+fn decode_exec_completion(output: &[u8]) -> Result<CodexServiceCompletion> {
     let mut completion = CodexServiceCompletion {
         text: String::new(),
         input_tokens: None,
         output_tokens: None,
     };
-    loop {
-        let event = tokio::select! { biased;
-            _ = tokio::time::sleep_until(deadline) => bail!("Codex service deadline exceeded"),
-            Some(_) = interactions.recv() => bail!("Codex service requested interaction or transport closed"),
-            Some(_) = diagnostics.recv() => bail!("Codex service transport lost alignment"),
-            event = notifications.recv() => event.ok_or_else(|| anyhow::anyhow!("Codex service ended without completion"))?,
-        };
-        let params = event.params.as_ref().unwrap_or(&JsonValue::Null);
-        if params.get("threadId").and_then(JsonValue::as_str) != Some(&opened.native_thread_id) {
-            continue;
-        }
-        if let Some(turn) = params.get("turnId").and_then(JsonValue::as_str)
-            && turn != started.native_turn_id
-        {
-            continue;
-        }
-        if (event.method == "turn/completed"
-            && params["turn"]["id"].as_str() == Some(&started.native_turn_id)
-            && params["turn"]["status"].as_str() != Some("completed"))
-            || (event.method == "error" && params["willRetry"].as_bool() != Some(true))
-        {
-            return Err(terminal_failure(&event).into());
-        }
-        match event.method.as_str() {
-            "item/completed" => record_item(&params["item"], &mut completion)?,
-            "thread/tokenUsage/updated" => {
-                let last = &params["tokenUsage"]["last"];
-                completion.input_tokens = last["inputTokens"].as_u64();
-                completion.output_tokens = last["outputTokens"].as_u64();
-            }
-            "turn/completed" if params["turn"]["id"].as_str() == Some(&started.native_turn_id) => {
-                let turn = &params["turn"];
+    let (mut thread, mut started, mut completed) = (false, false, false);
+    for line in output
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let event: JsonValue =
+            serde_json::from_slice(line).context("invalid Codex service event")?;
+        ensure!(!completed, "Codex service emitted events after completion");
+        match event["type"].as_str() {
+            Some("thread.started") => {
                 ensure!(
-                    turn["status"].as_str() == Some("completed")
-                        && turn.get("error").is_none_or(JsonValue::is_null),
-                    "Codex service did not complete successfully"
+                    !thread && event["thread_id"].as_str().is_some_and(|id| !id.is_empty()),
+                    "invalid Codex service thread start"
                 );
-                if let Some(items) = turn["items"].as_array() {
-                    for item in items {
-                        record_item(item, &mut completion)?;
+                thread = true;
+            }
+            Some("turn.started") => {
+                ensure!(thread && !started, "invalid Codex service turn start");
+                started = true;
+            }
+            Some("item.started" | "item.updated" | "item.completed") => {
+                let item = &event["item"];
+                match item["type"].as_str() {
+                    Some("agent_message") => {
+                        ensure!(started, "Codex service answer preceded turn start");
+                        if event["type"] == "item.completed"
+                            && item["phase"].as_str() != Some("commentary")
+                        {
+                            completion.text = item["text"]
+                                .as_str()
+                                .ok_or_else(|| anyhow::anyhow!("invalid service answer"))?
+                                .to_owned();
+                        }
                     }
+                    Some("reasoning" | "error") => {} // CLI configuration warnings are item errors, not failed turns.
+                    _ => bail!("Codex service attempted a working action"),
                 }
+            }
+            Some("turn.failed") => {
+                let params = json!({"error":event["error"]});
+                return Err(terminal_failure(&CodexJsonlRpcNotificationEvent {
+                    method: "error".into(),
+                    params: Some(params.clone()),
+                    raw: params,
+                })
+                .into());
+            }
+            Some("turn.completed") => {
                 ensure!(
-                    !completion.text.trim().is_empty(),
+                    started && !completion.text.trim().is_empty(),
                     "Codex service returned no final answer"
                 );
-                return Ok(completion);
+                completion.input_tokens = event["usage"]["input_tokens"].as_u64();
+                completion.output_tokens = event["usage"]["output_tokens"].as_u64();
+                completed = true;
             }
-            _ => {}
+            Some("error") => {} // Retriable stream notices; success still requires a terminal completion.
+            _ => bail!("invalid Codex service event"),
         }
     }
+    ensure!(completed, "Codex service ended without completion");
+    Ok(completion)
 }
+
 /// Decode only the pinned release's structured error contract. Raw provider
 /// messages never escape this boundary; the existing mapper supplies cooldown
 /// compatibility for older, message-only rate limits.
@@ -411,36 +389,9 @@ fn terminal_failure(event: &CodexJsonlRpcNotificationEvent) -> ServiceFailure {
     }
 }
 
-fn record_item(item: &JsonValue, completion: &mut CodexServiceCompletion) -> Result<()> {
-    match item["type"].as_str() {
-        Some("agentMessage") if item["phase"].as_str() != Some("commentary") => {
-            let text = item["text"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("invalid service answer"))?;
-            ensure!(
-                text.len() <= MAX_SERVICE_BYTES,
-                "service answer exceeds capacity"
-            );
-            completion.text = text.to_owned();
-        }
-        Some(
-            "commandExecution"
-            | "fileChange"
-            | "webSearch"
-            | "mcpToolCall"
-            | "collabAgentToolCall"
-            | "imageGeneration",
-        ) => bail!("Codex service attempted a working action"),
-        _ => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
     #[test]
     fn terminal_failures_preserve_machine_class_and_cooldown_without_provider_text() {
         for (info, expected) in [
@@ -494,234 +445,118 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn service_process_uses_selected_auth_and_parsable_restrictive_overrides() {
-        let config = CodexServiceConfig {
-            executable: "fixture-codex".into(),
-            home_path: "/fixture/selected-auth".into(),
-            environment: SensitiveEnvironment::new(),
-        };
-        let command = process_config(&config, Path::new("/fixture/empty-cwd"))
-            .unwrap()
-            .prepare()
-            .unwrap();
-        assert_eq!(command.args[0], "app-server");
-        assert_eq!(
-            command.env.expose("CODEX_HOME"),
-            Some("/fixture/selected-auth")
-        );
-        let mut parsed = toml::Table::new();
-        for pair in command.args[1..].chunks_exact(2) {
-            assert_eq!(pair[0], "--config");
-            parsed.extend(toml::from_str::<toml::Table>(&pair[1]).unwrap());
-        }
-        let actual = serde_json::to_value(parsed).unwrap();
-        assert_eq!(actual["agents"]["enabled"], false);
-        assert_eq!(actual["features"]["multi_agent_v2"], false);
-        assert_eq!(actual["features"]["hooks"], false);
-        assert_eq!(actual["features"]["skip_host_skill_discovery"], true);
-        assert_eq!(actual["mcp_servers"], json!({}));
-        assert_eq!(actual["history"]["persistence"], "none");
-        assert!(verify_profile(&actual, &profile()));
-    }
-
-    #[test]
-    fn service_profile_accepts_normalized_0154_config_and_rejects_enabled_integrations() {
-        // Shape observed from the supported executable's real config/read.
-        // tools.update_plan/experimental_request_user_input are not serialized
-        // config fields in this version; working actions are isolated by the
-        // feature gates plus empty environments in thread/start and turn/start.
-        let mut actual = profile();
-        actual["apps"] = json!({"_default":null});
-        actual["agents"]["max_depth"] = JsonValue::Null;
-        actual["history"]["max_bytes"] = JsonValue::Null;
-        actual["tools"] = json!({"web_search":null});
-        assert!(verify_profile(&actual, &profile()));
-        actual["apps"]["_default"] = json!({"enabled":true});
-        assert!(!verify_profile(&actual, &profile()));
-        actual["apps"] = json!({"_default":null});
-        actual["mcp_servers"] = json!({"unexpected":{"command":"tool"}});
-        assert!(!verify_profile(&actual, &profile()));
-        actual["mcp_servers"] = json!({});
-        actual["features"]["shell_tool"] = json!(true);
-        assert!(!verify_profile(&actual, &profile()));
-    }
-
-    #[tokio::test]
-    async fn service_wire_is_ephemeral_for_each_fresh_attempt_and_rejects_unknown_version() {
-        for attempt in 0..3 {
-            let (io, server) = tokio::io::duplex(65536);
-            let (reader, writer) = tokio::io::split(io);
-            let (rpc, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
-            let client = CodexAppServerClient::new(rpc);
-            let version = if attempt == 2 {
-                "0.154.0-canary"
-            } else {
-                RELEASE
-            };
-            let server = tokio::spawn(async move {
-                let (reader, mut writer) = tokio::io::split(server);
-                let mut reader = BufReader::new(reader);
-                let mut seen = Vec::new();
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.unwrap() == 0 {
-                        break;
-                    }
-                    let value: JsonValue = serde_json::from_str(&line).unwrap();
-                    let method = value["method"].as_str().unwrap();
-                    seen.push(method.to_owned());
-                    let result = match method {
-                        "initialize" => json!({"version":version}),
-                        "initialized" => continue,
-                        "config/read" => {
-                            let mut config = profile();
-                            config["apps"] = json!({"_default":null});
-                            config["tools"] = json!({"web_search":null});
-                            json!({"config":config})
-                        }
-                        "thread/start" => {
-                            let p = &value["params"];
-                            assert_eq!(p["ephemeral"], true);
-                            assert_eq!(p["environments"], json!([]));
-                            assert_eq!(p["dynamicTools"], json!([]));
-                            assert_eq!(p["allowProviderModelFallback"], false);
-                            assert_eq!(p["model"], "selected-model");
-                            assert_eq!(p["baseInstructions"], "service instructions");
-                            json!({"thread":{"id":format!("fresh-{attempt}"),"path":null},"model":"selected-model"})
-                        }
-                        "turn/start" => {
-                            let p = &value["params"];
-                            assert_eq!(p["threadId"], format!("fresh-{attempt}"));
-                            assert_eq!(p["environments"], json!([]));
-                            assert_eq!(p["effort"], "high");
-                            assert_eq!(p["input"][0]["text"], format!("portion-{attempt}"));
-                            json!({"turn":{"id":"service-turn","status":"inProgress"}})
-                        }
-                        _ => panic!("unexpected service method: {method}"),
-                    };
-                    let response = json!({"jsonrpc":"2.0","id":value["id"],"result":result});
-                    writer
-                        .write_all(format!("{response}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    if method == "turn/start" {
-                        let event = json!({"jsonrpc":"2.0","method":"turn/completed","params":{
-                            "threadId":format!("fresh-{attempt}"),"turn":{"id":"service-turn","status":"completed","error":null,
-                            "items":[{"type":"agentMessage","phase":"final_answer","text":"summary"}]}}});
-                        writer
-                            .write_all(format!("{event}\n").as_bytes())
-                            .await
-                            .unwrap();
-                    }
-                }
-                seen
-            });
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
-                exchange(
-                    &client,
-                    Path::new("/fixture/service"),
-                    CodexServiceRequest {
-                        model: "selected-model".into(),
-                        effort: Some("high".into()),
-                        instructions: "service instructions".into(),
-                        input: format!("portion-{attempt}"),
-                    },
-                    Instant::now() + Duration::from_secs(5),
-                ),
-            )
-            .await
-            .unwrap();
-            owner.shutdown().await;
-            let seen = server.await.unwrap();
-            if attempt == 2 {
-                assert!(result.is_err());
-                assert!(!seen.iter().any(|method| method == "thread/start"));
-            } else {
-                assert_eq!(result.unwrap().text, "summary");
-                assert_eq!(
-                    seen.iter()
-                        .filter(|method| *method == "thread/start")
-                        .count(),
-                    1
-                );
-                assert_eq!(
-                    seen.iter().filter(|method| *method == "turn/start").count(),
-                    1
-                );
-            }
-            assert!(
-                !seen
-                    .iter()
-                    .any(|method| method.contains("resume") || method.contains("fork"))
-            );
-        }
-    }
 }
 
 #[cfg(all(test, unix))]
-mod process_tests {
+mod exec_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     fn request() -> CodexServiceRequest {
         CodexServiceRequest {
-            model: "selected-model".into(),
-            effort: Some("high".into()),
+            model: "gpt-5.6-luna".into(),
+            effort: Some("low".into()),
             instructions: "service instructions".into(),
-            input: "fixture portion".into(),
+            input: "private fixture portion".into(),
         }
+    }
+    fn events() -> Vec<JsonValue> {
+        vec![
+            json!({"type":"thread.started","thread_id":"temporary"}),
+            json!({"type":"item.completed","item":{"type":"error","message":"config warning"}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"type":"agent_message","text":"summary"}}),
+            json!({"type":"turn.completed","usage":{"input_tokens":123,"output_tokens":7}}),
+        ]
+    }
+    fn encode(events: &[JsonValue]) -> Vec<u8> {
+        events
+            .iter()
+            .map(|e| format!("{e}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    #[test]
+    fn exec_completion_requires_final_success_and_rejects_working_actions() {
+        let valid = events();
+        let completion = decode_exec_completion(&encode(&valid)).unwrap();
+        assert_eq!(completion.text, "summary");
+        assert_eq!(completion.input_tokens, Some(123));
+        assert_eq!(completion.output_tokens, Some(7));
+        assert!(decode_exec_completion(&encode(&valid[..4])).is_err());
+        let mut failed = valid.clone();
+        failed[4] = json!({"type":"turn.failed","error":{"message":"private source text","codexErrorInfo":"contextWindowExceeded"}});
+        let error = decode_exec_completion(&encode(&failed)).err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<ServiceFailure>().unwrap().class,
+            ProviderFailureClass::ContextTooLarge
+        );
+        assert!(!format!("{error:?}").contains("private source"));
+        for kind in [
+            "command_execution",
+            "file_change",
+            "mcp_tool_call",
+            "web_search",
+            "todo_list",
+            "unexpected",
+        ] {
+            let mut malicious = valid.clone();
+            malicious.insert(3, json!({"type":"item.started","item":{"type":kind}}));
+            assert!(decode_exec_completion(&encode(&malicious)).is_err());
+        }
+        let mut duplicate = valid.clone();
+        duplicate.extend(valid);
+        assert!(decode_exec_completion(&encode(&duplicate)).is_err());
+        assert!(decode_exec_completion(b"invalid JSON").is_err());
     }
 
     #[tokio::test]
-    async fn service_process_cleanup_covers_success_timeout_and_dropped_call() {
+    async fn exec_ignores_populated_user_config_and_cleans_up_success_timeout_and_cancellation() {
         let fixture = tempfile::tempdir().unwrap();
         let home = fixture.path().join("auth");
         std::fs::create_dir(&home).unwrap();
+        let user_config = "[mcp_servers.unexpected]\ncommand='never-run'\n[plugins.unexpected]\nenabled=true\n[projects.fixture]\ntrust_level='trusted'\n";
+        std::fs::write(home.join("config.toml"), user_config).unwrap();
         let executable = fixture.path().join("mock-codex");
-        let script = r#"#!/usr/bin/env python3
+        let script=r#"#!/usr/bin/env python3
 import json, os, pathlib, sys, time
-home = pathlib.Path(os.environ['CODEX_HOME'])
-with (home / 'trace').open('a') as out:
-    out.write(json.dumps({'pid': os.getpid(), 'cwd': os.getcwd()}) + '\n')
-profile = json.loads('__PROFILE__')
-thread = 'temporary-' + str(os.getpid())
-for line in sys.stdin:
-    call = json.loads(line)
-    method = call['method']
-    if method == 'initialized':
-        continue
-    if method == 'initialize':
-        result = {'version': '0.154.0'}
-    elif method == 'config/read':
-        result = {'config': profile}
-    elif method == 'thread/start':
-        assert call['params']['ephemeral'] is True
-        assert call['params']['environments'] == []
-        result = {'thread': {'id': thread, 'path': None}, 'model': 'selected-model'}
-    elif method == 'turn/start':
-        assert call['params']['environments'] == []
-        result = {'turn': {'id': 'turn', 'status': 'inProgress'}}
-    else:
-        raise RuntimeError('unexpected service method')
-    print(json.dumps({'jsonrpc': '2.0', 'id': call['id'], 'result': result}), flush=True)
-    if method == 'turn/start':
-        (home / 'turn-started').touch()
-        if (home / 'hang').exists():
-            time.sleep(60)
-        print(json.dumps({'jsonrpc': '2.0', 'method': 'turn/completed', 'params': {
-            'threadId': thread, 'turn': {'id': 'turn', 'status': 'completed', 'error': None,
-            'items': [{'type': 'agentMessage', 'phase': 'final_answer', 'text': 'summary'}]}}}), flush=True)
-"#.replace("__PROFILE__", &profile().to_string());
+home=pathlib.Path(os.environ['CODEX_HOME'])
+if sys.argv[1:] == ['--version']:
+    print('codex-cli 0.154.0-canary' if (home/'unsupported').exists() else 'codex-cli 0.154.0');sys.exit(0)
+a=sys.argv[1:]
+assert a[0]=='exec' and a[-1]=='-'
+assert all(flag in a for flag in ['--ephemeral','--ignore-user-config','--ignore-rules','--skip-git-repo-check','--json'])
+assert a[a.index('--model')+1]=='gpt-5.6-luna'
+assert a[a.index('--sandbox')+1]=='read-only'
+assert 'model_reasoning_effort="low"' in a
+assert 'private fixture portion' not in str(a)
+assert 'service instructions' not in str(a)
+assert pathlib.Path('instructions.txt').read_text()=='service instructions'
+assert '[mcp_servers.unexpected]' in (home/'config.toml').read_text()
+assert sys.stdin.read()=='private fixture portion'
+with (home/'trace').open('a') as f: f.write(json.dumps({'pid':os.getpid(),'cwd':os.getcwd()})+'\n')
+(home/'started').touch()
+if (home/'hang').exists(): time.sleep(60)
+for e in __EVENTS__: print(json.dumps(e),flush=True)
+if (home/'bad-exit').exists(): sys.exit(1)
+"#.replace("__EVENTS__", &serde_json::to_string(&events()).unwrap());
         std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let service = Arc::new(CodexService::new(CodexServiceConfig {
-            executable: executable.to_string_lossy().into_owned(),
-            home_path: home.to_string_lossy().into_owned(),
+            executable: executable.to_string_lossy().into(),
+            home_path: home.to_string_lossy().into(),
             environment: SensitiveEnvironment::new(),
         }));
+        std::fs::write(home.join("unsupported"), "").unwrap();
+        assert!(
+            service
+                .summarize(request(), Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(!home.join("trace").exists());
+        std::fs::remove_file(home.join("unsupported")).unwrap();
         for _ in 0..2 {
             assert_eq!(
                 service
@@ -733,6 +568,14 @@ for line in sys.stdin:
             );
             assert!(service.attempt.lock().await.is_none());
         }
+        std::fs::write(home.join("bad-exit"), "").unwrap();
+        assert!(
+            service
+                .summarize(request(), Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(home.join("bad-exit")).unwrap();
         std::fs::write(home.join("hang"), "").unwrap();
         assert!(
             service
@@ -741,13 +584,13 @@ for line in sys.stdin:
                 .is_err()
         );
         assert!(service.attempt.lock().await.is_none());
-        std::fs::remove_file(home.join("turn-started")).unwrap();
+        std::fs::remove_file(home.join("started")).unwrap();
         let work = tokio::spawn({
             let service = service.clone();
             async move { service.summarize(request(), Duration::from_secs(60)).await }
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !home.join("turn-started").exists() {
+            while !home.join("started").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -755,29 +598,47 @@ for line in sys.stdin:
         .unwrap();
         work.abort();
         assert!(matches!(work.await, Err(error) if error.is_cancelled()));
-        tokio::time::timeout(Duration::from_secs(5), service.cleanup())
-            .await
-            .unwrap()
-            .unwrap();
+        service.cleanup().await.unwrap();
         assert!(service.attempt.lock().await.is_none());
-        let trace = std::fs::read_to_string(home.join("trace")).unwrap();
-        let rows = trace
+        let rows = std::fs::read_to_string(home.join("trace"))
+            .unwrap()
             .lines()
-            .map(|line| serde_json::from_str::<JsonValue>(line).unwrap())
+            .map(|s| serde_json::from_str::<JsonValue>(s).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 4);
-        let pids = rows
-            .iter()
-            .map(|row| row["pid"].as_u64().unwrap())
-            .collect::<HashSet<_>>();
-        assert_eq!(pids.len(), 4, "each attempt must own a fresh process");
+        assert_eq!(rows.len(), 5);
         for row in rows {
-            assert!(
-                !Path::new(row["cwd"].as_str().unwrap()).exists(),
-                "owned service directory must be removed after cleanup"
+            assert!(!Path::new(row["cwd"].as_str().unwrap()).exists());
+            let pid = row["pid"].as_i64().unwrap() as i32;
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "owned process still alive"
             );
         }
         assert!(!home.join("sessions").exists());
-        assert!(!trace.contains("fixture portion"));
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            user_config
+        );
+    }
+
+    /// Explicit opt-in: one real model request using the installed CLI's normal auth.
+    #[tokio::test]
+    #[ignore = "requires explicit authorization for a real Luna Low request"]
+    async fn live_exec_service_with_existing_user_config() {
+        assert_eq!(
+            std::env::var("PIONEER_CODEX_SERVICE_LIVE").as_deref(),
+            Ok("1")
+        );
+        let home = std::env::var("HOME").unwrap();
+        let service = CodexService::new(CodexServiceConfig {
+            executable: "codex".into(),
+            home_path: format!("{home}/.codex"),
+            environment: SensitiveEnvironment::new(),
+        });
+        let response=service.summarize(CodexServiceRequest {model:"gpt-5.6-luna".into(),effort:Some("low".into()),instructions:"You are a text-only test service. Reply with exactly the text requested by the user. Do not use tools.".into(),input:"Reply exactly PIONEER_SERVICE_OK".into()},Duration::from_secs(90)).await.unwrap();
+        assert_eq!(response.text.trim(), "PIONEER_SERVICE_OK");
+        assert!(response.input_tokens.is_some());
+        assert!(service.attempt.lock().await.is_none());
     }
 }

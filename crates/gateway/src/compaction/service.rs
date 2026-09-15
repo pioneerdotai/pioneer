@@ -178,9 +178,28 @@ fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::Fail
                 "cli_transport_alignment",
                 "Codex transport lost protocol alignment",
             )),
-            "codex service deadline exceeded" | "Claude service deadline exceeded" => {
+            "codex service deadline exceeded"
+            | "Codex service deadline exceeded"
+            | "Claude service deadline exceeded" => {
                 Some(("cli_deadline", "CLI service exceeded the attempt deadline"))
             }
+            "Codex service process failed" => {
+                Some(("cli_process_failed", "Codex exec exited unsuccessfully"))
+            }
+            "invalid Codex service event" | "Codex service emitted events after completion" => {
+                Some((
+                    "cli_response_invalid",
+                    "Codex exec returned an invalid event stream",
+                ))
+            }
+            "Codex service output exceeds capacity" => Some((
+                "cli_output_capacity",
+                "Codex exec output exceeded the service capacity",
+            )),
+            "Codex service attempted a working action" => Some((
+                "cli_working_action_rejected",
+                "Codex exec attempted an action outside the summary service",
+            )),
             "unsupported Claude service capability version" => Some((
                 "cli_version_unsupported",
                 "Installed Claude version does not match the supported service protocol",
@@ -369,6 +388,25 @@ mod tests {
         let profile =
             service_diagnostic(&anyhow::anyhow!("Codex service isolation was not applied"));
         assert_eq!(profile.code, "cli_isolation_rejected");
+        for (message, code) in [
+            ("Codex service process failed", "cli_process_failed"),
+            ("invalid Codex service event", "cli_response_invalid"),
+            (
+                "Codex service output exceeds capacity",
+                "cli_output_capacity",
+            ),
+            (
+                "Codex service attempted a working action",
+                "cli_working_action_rejected",
+            ),
+            ("Codex service deadline exceeded", "cli_deadline"),
+        ] {
+            let diagnostic = service_diagnostic(
+                &anyhow::anyhow!(message).context(ServiceStage("cli_exec_decode")),
+            );
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.stage, "cli_exec_decode");
+        }
     }
 
     #[tokio::test]
