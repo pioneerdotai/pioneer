@@ -10,85 +10,6 @@ use pioneer_provider::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Metadata only, scoped to one capture. A hit means this exact wire projection
-/// was already reconstructed from originals, not that its revisions remain live.
-/// Capture revalidates all reused identities in bounded pages before publication.
-#[derive(Default)]
-struct VerifiedProjections {
-    references: BTreeMap<String, FrozenMessageRef>,
-    bytes: usize,
-}
-impl VerifiedProjections {
-    fn key(reference: &FrozenMessageRef) -> Result<String> {
-        Ok(serde_json::to_string(&(
-            &reference.source_thread,
-            &reference.sources,
-            &reference.wire_sha256,
-            &reference.tool_call_id,
-            &reference.tool_name,
-        ))?)
-    }
-    fn remember(&mut self, reference: &FrozenMessageRef) -> Result<()> {
-        // Checkpoint validity includes transitive coverage and operation state;
-        // retain its full restoration path rather than treating a header as proof.
-        if reference
-            .sources
-            .iter()
-            .any(|s| s.scope.starts_with("checkpoint:"))
-        {
-            return Ok(());
-        }
-        let key = Self::key(reference)?;
-        let bytes = key.len() + serde_json::to_vec(reference)?.len();
-        if !self.references.contains_key(&key)
-            && self.bytes.saturating_add(bytes)
-                <= pioneer_crud::compaction::FROZEN_IMPORT_PAGE_BYTES
-        {
-            self.bytes += bytes;
-            self.references.insert(key, reference.clone());
-        }
-        Ok(())
-    }
-}
-
-async fn validate_reused_sources(
-    store: &CrudStore,
-    workspace: &str,
-    sources: BTreeSet<(String, SourceRef)>,
-) -> Result<()> {
-    let mut page = Vec::new();
-    let mut bytes = 0;
-    for (thread, source) in sources {
-        let size = thread.len() + source.scope.len() + source.id.len() + source.version.len();
-        ensure!(
-            size <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
-            "source identity exceeds metadata quantum"
-        );
-        if !page.is_empty()
-            && (page.len() as u64 == pioneer_crud::compaction::SOURCE_PAGE_ROWS
-                || bytes + size > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
-        {
-            ensure!(
-                store
-                    .compaction_references_current(workspace, &page)
-                    .await?,
-                "reused frozen source revision changed"
-            );
-            page.clear();
-            bytes = 0;
-        }
-        bytes += size;
-        page.push((thread, source));
-    }
-    ensure!(
-        store
-            .compaction_references_current(workspace, &page)
-            .await?,
-        "reused frozen source revision changed"
-    );
-    Ok(())
-}
-
 /// Extend trusted execution scope by the TaskRun's durably accepted parent
 /// basis. This does not change hook routing or admit arbitrary sibling history.
 pub(crate) async fn execution_history_scopes(
@@ -418,7 +339,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
     policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     outputs: Option<&super::delivered::AuthorizedOutputSet>,
 ) -> Result<String> {
-    let started = std::time::Instant::now();
     let store = store.with_maintenance_access();
     if let Some(outputs) = outputs {
         ensure!(
@@ -462,7 +382,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
     let mut epochs = outputs
         .map(|outputs| outputs.source_epochs.clone())
         .unwrap_or_else(|| BTreeMap::from([(thread.to_owned(), epoch)]));
-    let mut verified = VerifiedProjections::default();
     let mut accepted_turn = basis_turn.map(str::to_owned);
     let mut imports = BTreeMap::new();
     let basis = if omits_history {
@@ -504,25 +423,13 @@ pub(super) async fn capture_execution_basis_with_outputs(
                 );
             }
         }
-        let mut inherited = if basis.history_json.trim_start().starts_with('[') {
-            crate::turn_runtime_snapshot::restore_history_json(
-                &store,
-                workspace,
-                &allowed,
-                &basis.history_json,
-            )
-            .await?
-        } else {
-            let descriptor = serde_json::from_str(&basis.history_json)?;
-            restore_recording(
-                &store,
-                workspace,
-                &allowed,
-                &descriptor,
-                Some(&mut verified),
-            )
-            .await?
-        };
+        let mut inherited = crate::turn_runtime_snapshot::restore_history_json(
+            &store,
+            workspace,
+            &allowed,
+            &basis.history_json,
+        )
+        .await?;
         if basis.history_json.trim_start().starts_with('[') {
             let reference = store
                 .compaction_legacy_task_basis_source(workspace, &basis.parent_thread, &basis.run_id)
@@ -571,27 +478,29 @@ pub(super) async fn capture_execution_basis_with_outputs(
         // Hydration promotes only explicitly accepted own imports. Preserve
         // that evidence when recapturing the child; provenance alone is not a grant.
         if !basis.history_json.trim_start().starts_with('[') {
+            let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
+            let (count, _) = store
+                .compaction_frozen_import_state(
+                    workspace,
+                    &basis.parent_thread,
+                    &descriptor.manifest_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("accepted import state disappeared"))?;
             let turn = accepted_turn
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("accepted execution turn missing"))?;
-            let prepared_basis = store
-                .compaction_prepare_accepted_imports(workspace, thread, turn)
-                .await?;
-            let mut ordinal = 0;
-            while ordinal < prepared_basis.len() {
-                let page = store
-                    .compaction_prepare_accepted_import_page(&prepared_basis, ordinal)
+            for ordinal in 0..count {
+                let prepared = store
+                    .compaction_prepare_accepted_import(workspace, thread, turn, ordinal)
                     .await?;
-                ordinal += page.len() as u64;
-                for prepared in page {
-                    imports.insert(
-                        ScopedHistorySource {
-                            thread: prepared.source_thread().into(),
-                            source: prepared.source().clone(),
-                        },
-                        prepared,
-                    );
-                }
+                imports.insert(
+                    ScopedHistorySource {
+                        thread: prepared.source_thread().into(),
+                        source: prepared.source().clone(),
+                    },
+                    prepared,
+                );
             }
         }
         messages = compose_frozen_basis(&store, workspace, thread, &allowed, &inherited, &messages)
@@ -609,14 +518,8 @@ pub(super) async fn capture_execution_basis_with_outputs(
                 "accepted delivery acknowledgement changed"
             );
             allowed.extend(branch.source_threads.iter().cloned());
-            let mut imported = restore_recording(
-                &store,
-                workspace,
-                &allowed,
-                &branch.snapshot.output.history,
-                Some(&mut verified),
-            )
-            .await?;
+            let mut imported =
+                restore(&store, workspace, &allowed, &branch.snapshot.output.history).await?;
             let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
                 workspace,
                 &branch.snapshot.output.source_thread,
@@ -741,10 +644,8 @@ pub(super) async fn capture_execution_basis_with_outputs(
             }
         }
     }
-    let descriptor = capture_with_verified_imports(
-        &store, workspace, thread, &allowed, &messages, &imports, &verified,
-    )
-    .await?;
+    let descriptor =
+        capture_with_imports(&store, workspace, thread, &allowed, &messages, &imports).await?;
 
     for (source_thread, expected) in epochs {
         ensure!(
@@ -755,12 +656,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
             "parent history changed while freezing the accepted context"
         );
     }
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        message_count = messages.len(),
-        import_source_count = imports.len(),
-        "execution history frozen"
-    );
     Ok(serde_json::to_string(&descriptor)?)
 }
 
@@ -1042,35 +937,12 @@ async fn capture_with_imports(
     messages: &[ChatMessage],
     imports: &BTreeMap<ScopedHistorySource, PreparedFrozenImport>,
 ) -> Result<FrozenHistoryRef> {
-    capture_with_verified_imports(
-        store,
-        workspace,
-        owner_thread,
-        allowed_threads,
-        messages,
-        imports,
-        &VerifiedProjections::default(),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn capture_with_verified_imports(
-    store: &CrudStore,
-    workspace: &str,
-    owner_thread: &str,
-    allowed_threads: &BTreeSet<String>,
-    messages: &[ChatMessage],
-    imports: &BTreeMap<ScopedHistorySource, PreparedFrozenImport>,
-    verified: &VerifiedProjections,
-) -> Result<FrozenHistoryRef> {
     ensure!(
         allowed_threads.contains(owner_thread),
         "frozen history owner is not authorized"
     );
     let store = store.with_maintenance_access();
     let mut references = Vec::with_capacity(messages.len());
-    let mut reused_sources = BTreeSet::new();
     let mut digest = Sha256::new();
     for message in messages {
         let origin = message.provenance.as_ref().ok_or_else(|| {
@@ -1092,50 +964,33 @@ async fn capture_with_verified_imports(
             tool_name: message.name.clone(),
         };
         reference.validate()?;
-        if let Some(previous) = verified
-            .references
-            .get(&VerifiedProjections::key(&reference)?)
+        if let [full_source] = reference.sources.as_slice()
+            && let Some(turn) = full_source.scope.strip_prefix("item:")
         {
-            reference.replay_source = previous.replay_source.clone();
-            for source in reference
-                .sources
-                .iter()
-                .chain(reference.replay_source.iter())
-            {
-                reused_sources.insert((reference.source_thread.clone(), source.clone()));
-            }
-        } else {
-            if let [full_source] = reference.sources.as_slice()
-                && let Some(turn) = full_source.scope.strip_prefix("item:")
-            {
-                let payload = super::history::reference_payload(
-                    &store,
+            let payload = super::history::reference_payload(
+                &store,
+                workspace,
+                &reference.source_thread,
+                full_source,
+            )
+            .await?;
+            let item: pioneer_protocol::TurnItem = serde_json::from_str(&payload)?;
+            reference.replay_source = store
+                .compaction_context_reference_for_item(
                     workspace,
                     &reference.source_thread,
-                    full_source,
+                    turn,
+                    item.item_id(),
+                    "tool_result_v2",
                 )
                 .await?;
-                let item: pioneer_protocol::TurnItem = serde_json::from_str(&payload)?;
-                reference.replay_source = store
-                    .compaction_context_reference_for_item(
-                        workspace,
-                        &reference.source_thread,
-                        turn,
-                        item.item_id(),
-                        "tool_result_v2",
-                    )
-                    .await?;
-            }
-            // Do not publish a snapshot whose exact model projection cannot be
-            // reconstructed from its originals. This also revalidates each revision.
-            restore_entry(&store, workspace, allowed_threads, &reference).await?;
         }
+        // Do not publish a snapshot whose exact model projection cannot be
+        // reconstructed from its originals. This also revalidates each revision.
+        restore_entry(&store, workspace, allowed_threads, &reference).await?;
         digest_entry(&mut digest, &reference)?;
         references.push(reference);
     }
-    // Reuse is only a rendering optimization. Check current source ownership
-    // and exact revisions again; the caller also fences source projection epochs.
-    validate_reused_sources(&store, workspace, reused_sources).await?;
     let mut accepted = Vec::new();
     for (ordinal, reference) in references.iter().enumerate() {
         for source in &reference.sources {
@@ -1268,16 +1123,6 @@ pub(crate) async fn restore(
     allowed_threads: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ChatMessage>> {
-    restore_recording(store, workspace, allowed_threads, descriptor, None).await
-}
-
-async fn restore_recording(
-    store: &CrudStore,
-    workspace: &str,
-    allowed_threads: &BTreeSet<String>,
-    descriptor: &FrozenHistoryRef,
-    mut verified: Option<&mut VerifiedProjections>,
-) -> Result<Vec<ChatMessage>> {
     let store = store.with_maintenance_access();
     let owner = store
         .compaction_frozen_history_owner(workspace, descriptor)
@@ -1313,9 +1158,6 @@ async fn restore_recording(
             );
             digest_entry(&mut digest, &reference)?;
             result.push(restore_entry(&store, workspace, allowed_threads, &reference).await?);
-            if let Some(verified) = verified.as_deref_mut() {
-                verified.remember(&reference)?;
-            }
         }
     }
     ensure!(
@@ -1515,123 +1357,6 @@ async fn restore_entry(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn compaction_reused_projection_revalidates_sources_and_exact_wire_after_compression() {
-        use migration::{Migrator, MigratorTrait};
-        use sea_orm::{ConnectionTrait, Database};
-        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        let store = CrudStore::new(db).with_maintenance_access();
-        let db = store.database_connection();
-        for sql in [
-            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
-            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('input','turn',0,'text','original','{"type":"text","text":"original"}',CURRENT_TIMESTAMP)"#,
-        ] {
-            db.execute_unprepared(sql).await.unwrap();
-        }
-        super::super::history::prepare_history(&store, "ws", "thread")
-            .await
-            .unwrap();
-        let fence = store.compaction_history_read_fence().await.unwrap();
-        let allowed = BTreeSet::from(["thread".to_owned()]);
-        let messages =
-            super::super::history::load_line_history(&store, "ws", "thread", None, &fence)
-                .await
-                .unwrap();
-        assert!(!messages.is_empty());
-        let descriptor = capture(&store, "ws", "thread", &allowed, &messages)
-            .await
-            .unwrap();
-        let mut verified = VerifiedProjections::default();
-        let restored = restore_recording(&store, "ws", &allowed, &descriptor, Some(&mut verified))
-            .await
-            .unwrap();
-        assert_eq!(restored, messages);
-        assert!(!verified.references.is_empty());
-        // Force real compressed storage before reusing the verified projections.
-        crate::database::compress_history_payloads_for_test(&store)
-            .await
-            .unwrap();
-        let again = capture_with_verified_imports(
-            &store,
-            "ws",
-            "thread",
-            &allowed,
-            &restored,
-            &BTreeMap::new(),
-            &verified,
-        )
-        .await
-        .unwrap();
-        assert_eq!(again, descriptor);
-        let mut tampered = restored.clone();
-        tampered[0].content = "invented replacement".into();
-        assert!(
-            capture_with_verified_imports(
-                &store,
-                "ws",
-                "thread",
-                &allowed,
-                &tampered,
-                &BTreeMap::new(),
-                &verified
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            capture_with_verified_imports(
-                &store,
-                "other",
-                "thread",
-                &allowed,
-                &restored,
-                &BTreeMap::new(),
-                &verified
-            )
-            .await
-            .is_err()
-        );
-        db.execute_unprepared(
-            r#"UPDATE turn_input SET payload='{"type":"text","text":"edited"}' WHERE id='input'"#,
-        )
-        .await
-        .unwrap();
-        assert!(
-            capture_with_verified_imports(
-                &store,
-                "ws",
-                "thread",
-                &allowed,
-                &restored,
-                &BTreeMap::new(),
-                &verified
-            )
-            .await
-            .is_err(),
-            "an existing equivalent manifest must not bypass current revision checks"
-        );
-        db.execute_unprepared("DELETE FROM turn_input WHERE id='input'")
-            .await
-            .unwrap();
-        assert!(
-            capture_with_verified_imports(
-                &store,
-                "ws",
-                "thread",
-                &allowed,
-                &restored,
-                &BTreeMap::new(),
-                &verified
-            )
-            .await
-            .is_err()
-        );
-    }
 
     #[test]
     fn compaction_last_turn_keeps_exact_task_command_with_its_later_outcome() {

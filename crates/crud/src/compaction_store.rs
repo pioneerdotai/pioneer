@@ -3,8 +3,8 @@ use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CommitOutcome,
     CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
     FrozenImportRecord, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
-    ManifestEntry, OperationRecord, PagedSource, PreparedAcceptedImports, PreparedFrozenImport,
-    RunnerPlanRecord, SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
+    ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport, RunnerPlanRecord,
+    SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -619,43 +619,6 @@ impl CrudStore {
             output_ordinal,
             source_thread,
             source,
-        )
-        .await
-    }
-    pub async fn compaction_prepare_accepted_imports(
-        &self,
-        workspace: &str,
-        destination: &str,
-        turn: &str,
-    ) -> Result<std::sync::Arc<PreparedAcceptedImports>> {
-        repositories::compaction::frozen_import::compaction_prepare_accepted_imports(
-            self,
-            workspace,
-            destination,
-            turn,
-        )
-        .await
-    }
-    pub async fn compaction_prepare_accepted_import_page(
-        &self,
-        snapshot: &std::sync::Arc<PreparedAcceptedImports>,
-        start: u64,
-    ) -> Result<Vec<PreparedFrozenImport>> {
-        repositories::compaction::frozen_import::compaction_prepare_accepted_import_page(
-            self, snapshot, start,
-        )
-        .await
-    }
-    /// Validate a bounded page of exact canonical identities without loading payloads.
-    pub async fn compaction_references_current(
-        &self,
-        workspace: &str,
-        references: &[(String, SourceRef)],
-    ) -> Result<bool> {
-        repositories::compaction::compaction_references_current(
-            &self.connection,
-            workspace,
-            references,
         )
         .await
     }
