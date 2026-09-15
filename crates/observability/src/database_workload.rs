@@ -452,6 +452,7 @@ mod tests {
             DatabaseWorkload::ZstdMaintenance,
             DatabaseWorkload::ProjectionReceiptCleanup,
             DatabaseWorkload::NativeEventCleanup,
+            DatabaseWorkload::CompactionMaintenance,
         ];
         assert_eq!(workloads.len(), DatabaseWorkload::CARDINALITY);
         assert_eq!(
@@ -476,6 +477,7 @@ mod tests {
                 "zstd.maintenance",
                 "projection.receipt_cleanup",
                 "cli_runtime.native_event_cleanup",
+                "compaction.maintenance",
             ]
         );
     }
