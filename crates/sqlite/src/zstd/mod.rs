@@ -11,7 +11,7 @@ mod dict_training;
 mod transparent;
 mod util;
 
-pub use basic::compress_column_value;
+pub use basic::{ColumnValueCompressor, compress_column_value};
 pub use dict_training::train_dictionary;
 pub use log::LevelFilter as LogLevel;
 
