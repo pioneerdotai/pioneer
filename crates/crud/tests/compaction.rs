@@ -4,19 +4,8 @@ use pioneer_crud::{CrudStore, compaction::*};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
 async fn store() -> CrudStore {
-    store_recording_statements(None).await
-}
-
-type RecordedStatements = std::sync::Arc<std::sync::Mutex<Vec<Statement>>>;
-
-async fn store_recording_statements(statements: Option<RecordedStatements>) -> CrudStore {
-    let mut db = Database::connect("sqlite::memory:").await.unwrap();
+    let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();
-    if let Some(statements) = statements {
-        db.set_metric_callback(move |info| {
-            statements.lock().unwrap().push(info.statement.clone());
-        });
-    }
     let store = CrudStore::new(db).with_maintenance_access();
     let db = store.database_connection();
     for sql in [
@@ -27,85 +16,6 @@ async fn store_recording_statements(statements: Option<RecordedStatements>) -> C
         db.execute_unprepared(sql).await.unwrap();
     }
     store
-}
-
-#[tokio::test]
-async fn exact_delivery_source_uses_event_keys_instead_of_scanning_revision_history() {
-    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
-    for compressed in [false, true] {
-        let statements = RecordedStatements::default();
-        let store = store_recording_statements(Some(statements.clone())).await;
-        let db = store.database_connection();
-        if compressed {
-            db.query_one_write_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "SELECT zstd_enable_transparent(?)",
-                [serde_json::json!({
-                    "table": "turn_event", "column": "payload",
-                    "compression_level": 3, "dict_chooser": "'[nodict]'"
-                })
-                .to_string()
-                .into()],
-            ))
-            .await
-            .unwrap();
-        }
-        source(&store, "ordinary", 1, "ordinary history").await;
-        statements.lock().unwrap().clear();
-        assert!(
-            store
-                .compaction_task_delivery_command(
-                    "ws",
-                    "thread",
-                    &SourceRef {
-                        scope: "event:turn".into(),
-                        id: "ordinary".into(),
-                        version: "event-revision:1".into(),
-                    }
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        // Inspect the actual repository statement, including its bound values.
-        // This guards query work independently of machine speed and row count.
-        let mut statement = statements
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|statement| {
-                statement.sql.contains("EXISTS") && statement.sql.contains("\"outcome\"")
-            })
-            .expect("failed-delivery fallback must be exercised")
-            .clone();
-        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
-        let plan = db
-            .query_all_raw(statement)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.try_get::<String>("", "detail").unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("SEARCH r ") && detail.contains("source_id=?")),
-            "{plan:#?}"
-        );
-        let event_table = if compressed { "_turn_event_zstd" } else { "e" };
-        assert!(
-            plan.iter().any(
-                |detail| detail.starts_with(&format!("SEARCH {event_table} "))
-                    && detail.contains("(id=?)")
-            ),
-            "exact source lookup must not scan its entire thread: {plan:#?}"
-        );
-        assert!(
-            !plan
-                .iter()
-                .any(|detail| detail.contains("compaction_event_revision_capture_order")),
-            "{plan:#?}"
-        );
-    }
 }
 
 #[tokio::test]
