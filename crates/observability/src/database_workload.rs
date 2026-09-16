@@ -39,11 +39,10 @@ pub enum DatabaseWorkload {
     ZstdMaintenance,
     ProjectionReceiptCleanup,
     NativeEventCleanup,
-    CompactionMaintenance,
 }
 
 impl DatabaseWorkload {
-    pub const CARDINALITY: usize = 20;
+    pub const CARDINALITY: usize = 19;
 
     const fn index(self) -> usize {
         match self {
@@ -66,7 +65,6 @@ impl DatabaseWorkload {
             Self::ZstdMaintenance => 16,
             Self::ProjectionReceiptCleanup => 17,
             Self::NativeEventCleanup => 18,
-            Self::CompactionMaintenance => 19,
         }
     }
 
@@ -91,7 +89,6 @@ impl DatabaseWorkload {
             Self::ZstdMaintenance => "zstd.maintenance",
             Self::ProjectionReceiptCleanup => "projection.receipt_cleanup",
             Self::NativeEventCleanup => "cli_runtime.native_event_cleanup",
-            Self::CompactionMaintenance => "compaction.maintenance",
         }
     }
 }

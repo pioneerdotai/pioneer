@@ -1,5 +1,4 @@
 mod frozen_storage;
-mod legacy_history_preparation;
 mod native_event_cleanup;
 mod projection_receipt_cleanup;
 mod zstd_payload_compression;
@@ -16,7 +15,6 @@ pub(crate) async fn run(
         zstd_payload_compression::run(crud_store.clone(), cancellation.clone()),
         projection_receipt_cleanup::run(crud_store.clone(), cancellation.clone()),
         frozen_storage::run(crud_store.clone(), cancellation.clone()),
-        legacy_history_preparation::run(crud_store.clone(), cancellation.clone()),
         native_event_cleanup::run(crud_store, cancellation),
     );
 }
