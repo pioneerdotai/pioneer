@@ -18,9 +18,7 @@ fn main() {
                 )
             });
             assert!(
-                metadata.is_file()
-                    && metadata.len() > 0
-                    && metadata.len() <= MAX_CATALOG_BYTES,
+                metadata.is_file() && metadata.len() > 0 && metadata.len() <= MAX_CATALOG_BYTES,
                 "bundled model catalog must be a non-empty regular file no larger than {MAX_CATALOG_BYTES} bytes"
             );
             fs::read(&path).unwrap_or_else(|error| {
