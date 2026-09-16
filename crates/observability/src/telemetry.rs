@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    MetricExporter, RetryPolicy, SpanExporter, WithExportConfig, WithHttpConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
@@ -109,6 +111,16 @@ pub(crate) struct ObservabilityState {
 static OBSERVABILITY: OnceLock<ObservabilityState> = OnceLock::new();
 static OBSERVABILITY_FLUSH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+fn otlp_retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        // Four total attempts: the initial request and three retries.
+        max_retries: 3,
+        initial_delay_ms: 250,
+        max_delay_ms: 2_000,
+        jitter_ms: 100,
+    }
+}
+
 pub fn init_otlp_observability(config: OtlpTelemetryConfig) -> Result<()> {
     init_otlp_observability_for(TelemetryTarget::Gateway, config)
 }
@@ -132,6 +144,7 @@ pub fn init_otlp_observability_for(
         .with_http()
         .with_endpoint(config.metrics_endpoint.trim())
         .with_timeout(config.export_timeout)
+        .with_retry_policy(otlp_retry_policy())
         .with_temporality(Temporality::Delta)
         .build()
         .context("failed to build OTLP/HTTP metrics exporter")?;
@@ -145,6 +158,7 @@ pub fn init_otlp_observability_for(
         .with_http()
         .with_endpoint(config.traces_endpoint.trim())
         .with_timeout(config.export_timeout)
+        .with_retry_policy(otlp_retry_policy())
         .build()
         .context("failed to build OTLP/HTTP traces exporter")?;
 
@@ -433,7 +447,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsentGatedMetricExporter, ConsentGatedSpanExporter, OtlpTelemetryConfig, validate_config,
+        ConsentGatedMetricExporter, ConsentGatedSpanExporter, OtlpTelemetryConfig,
+        otlp_retry_policy, validate_config,
     };
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::error::OTelSdkResult;
@@ -516,6 +531,15 @@ mod tests {
             deployment_environment: None,
             service_version: None,
         }
+    }
+
+    #[test]
+    fn retry_policy_is_bounded() {
+        let policy = otlp_retry_policy();
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.initial_delay_ms, 250);
+        assert_eq!(policy.max_delay_ms, 2_000);
+        assert_eq!(policy.jitter_ms, 100);
     }
 
     #[test]

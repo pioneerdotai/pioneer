@@ -122,7 +122,7 @@ sentry = { version = "0.49", default-features = false, features = ["anyhow", "ba
 dotenvy = "0.15"
 opentelemetry = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client", "experimental-http-retry"] }
 
 # UI
 gpui-kit = { git = "https://github.com/longbridge/gpui-kit", default-features = false }
