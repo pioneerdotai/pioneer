@@ -11,6 +11,7 @@ qualification-diagnostics = ["pioneer-client/qualification-diagnostics"]
 [dependencies]
 gpui-kit = { workspace = true, features = ["component"] }
 pioneer-client.workspace = true
+pioneer-observability.workspace = true
 pioneer-desktop-foundation.workspace = true
 terminal.workspace = true
 rust-i18n.workspace = true

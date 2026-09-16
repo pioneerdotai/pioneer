@@ -9252,6 +9252,7 @@ dependencies = [
  "image",
  "pioneer-client",
  "pioneer-desktop-foundation",
+ "pioneer-observability",
  "rust-i18n",
  "serde",
  "serde_json",
