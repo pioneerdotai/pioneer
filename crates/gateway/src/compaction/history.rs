@@ -269,6 +269,29 @@ pub(crate) async fn load_task_line_history(
     .await
 }
 
+/// Load only the canonical suffix not already represented by an accepted
+/// frozen Task basis. The boundary turn itself is included because Composer
+/// snapshots deliberately exclude their current input turn.
+pub(crate) async fn load_task_line_history_from(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    excluded_turn: Option<&str>,
+    from_turn: &str,
+    fence: &HistoryReadFence,
+) -> Result<Vec<ChatMessage>> {
+    load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        excluded_turn,
+        fence,
+        true,
+        HistorySelection::FromTurn(from_turn),
+    )
+    .await
+}
+
 /// Reconstruct only the supplied exact canonical leaves. Later unrelated rows
 /// may contribute metadata to discovery, but their payloads are never decoded.
 pub(crate) async fn load_exact_line_history(
@@ -316,6 +339,7 @@ enum HistorySelection<'a> {
     All,
     Sources(&'a BTreeSet<SourceRef>),
     ThroughTurn(&'a str),
+    FromTurn(&'a str),
 }
 
 async fn load_line_history_inner(
@@ -327,10 +351,11 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
-    let (selected, through_turn) = match selection {
-        HistorySelection::All => (None, None),
-        HistorySelection::Sources(sources) => (Some(sources), None),
-        HistorySelection::ThroughTurn(turn) => (None, Some(turn)),
+    let (selected, through_turn, from_turn) = match selection {
+        HistorySelection::All => (None, None, None),
+        HistorySelection::Sources(sources) => (Some(sources), None, None),
+        HistorySelection::ThroughTurn(turn) => (None, Some(turn), None),
+        HistorySelection::FromTurn(turn) => (None, None, Some(turn)),
     };
     let store = store.with_maintenance_access();
     let mut turns = Vec::new();
@@ -370,6 +395,13 @@ async fn load_line_history_inner(
             "output turn is not completed"
         );
         turns.truncate(end + 1);
+    }
+    if let Some(from_turn) = from_turn {
+        let start = turns
+            .iter()
+            .position(|turn| turn.id == from_turn)
+            .ok_or_else(|| anyhow::anyhow!("accepted basis turn is outside its history fence"))?;
+        turns.drain(..start);
     }
     turns.retain(|turn| Some(turn.id.as_str()) != excluded_turn);
     // Refresh relationship metadata before deciding whether earlier Task
