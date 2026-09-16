@@ -1326,7 +1326,36 @@ async fn post_turn_extractor_uses_configured_model_override() {
 }
 
 #[tokio::test]
-async fn post_turn_extractor_retries_configured_model_with_thread_model() {
+async fn post_turn_extractor_uses_thread_model_when_not_configured() {
+    let write_provider = Arc::new(TestMemoryWriteProvider::default());
+    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write_provider),
+        extractor_provider: Some(extractor_provider.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+
+    hook.execute(test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    ))
+    .await
+    .expect("post-turn extractor executes");
+
+    let context = extractor_provider
+        .contexts()
+        .into_iter()
+        .next()
+        .expect("extractor context recorded");
+    assert_eq!(context.model.as_deref(), Some("test-model"));
+    assert_eq!(context.model_provider.as_deref(), Some("test-provider"));
+}
+
+#[tokio::test]
+async fn post_turn_extractor_does_not_fallback_to_thread_model() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestSequencedPostTurnExtractorProvider::new([
         Err("configured extractor failed".to_owned()),
@@ -1342,44 +1371,27 @@ async fn post_turn_extractor_retries_configured_model_with_thread_model() {
         },
     };
 
-    let response = hook
+    let error = hook
         .execute(test_post_turn_hook_request(
             memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
             "Меня зовут Александр",
             "Понял.",
         ))
         .await
-        .expect("post-turn extractor retries with thread model");
+        .expect_err("configured extractor failure must not fall back to the thread model");
 
     let contexts = extractor_provider.contexts();
-    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts.len(), 1);
     assert_eq!(contexts[0].model.as_deref(), Some("memory-model"));
     assert_eq!(
         contexts[0].model_provider.as_deref(),
         Some("memory-provider")
     );
-    assert_eq!(contexts[1].model.as_deref(), Some("test-model"));
-    assert_eq!(contexts[1].model_provider.as_deref(), Some("test-provider"));
-
-    let params = write_provider
-        .write_params()
-        .into_iter()
-        .next()
-        .expect("write params recorded");
+    assert!(write_provider.write_params().is_empty());
     assert_eq!(
-        params.metadata.get("model"),
-        Some(&serde_json::json!("test-model"))
+        error.code.as_str(),
+        "memory.post_turn_extractor.provider_failed"
     );
-    assert_eq!(
-        params.metadata.get("model_provider"),
-        Some(&serde_json::json!("test-provider"))
-    );
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .as_str()
-            .contains("memory.post_turn_extractor.thread_model_retry_used")
-    }));
 }
 
 #[tokio::test]

@@ -594,6 +594,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 )
                 .await
                 .map_err(|error| {
+                    tracing::error!(
+                        target: "pioneer::memory_post_turn_extractor",
+                        stage = "checkpoint_load",
+                        provider = provider_name,
+                        model,
+                        durable = true,
+                        error = %format!("{error:#}"),
+                        "memory post-turn extractor checkpoint load failed"
+                    );
                     format!("failed to load memory post-turn extraction checkpoint: {error:#}")
                 })?
         {
@@ -601,7 +610,19 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 checkpoint_json.as_str(),
                 model,
                 provider_name,
-            );
+            )
+            .map_err(|error| {
+                tracing::error!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "checkpoint_decode",
+                    provider = provider_name,
+                    model,
+                    durable = true,
+                    error = %error,
+                    "memory post-turn extractor checkpoint decode failed"
+                );
+                error
+            });
         }
         let provider_authorization = processor
             .revalidate_post_turn_execution_authorization(
@@ -613,6 +634,14 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             )
             .await
             .map_err(|_| {
+                tracing::error!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "authorization_revalidation",
+                    provider = provider_name,
+                    model,
+                    durable = context.durable_terminal_effect.is_some(),
+                    "memory post-turn extractor authorization revalidation failed"
+                );
                 "memory post-turn extractor provider is unavailable for the current execution"
                     .to_owned()
             })?;
@@ -622,6 +651,14 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             provider_name,
             model,
         ) {
+            tracing::error!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "authorization_projection",
+                provider = provider_name,
+                model,
+                durable = context.durable_terminal_effect.is_some(),
+                "memory post-turn extractor authorization projection failed"
+            );
             return Err(
                 "memory post-turn extractor provider is outside the role projection".to_owned(),
             );
@@ -630,12 +667,32 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             .provider_registry()
             .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
             .map_err(|error| {
+                tracing::error!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "provider_resolution",
+                    provider = provider_name,
+                    model,
+                    durable = context.durable_terminal_effect.is_some(),
+                    error = %error,
+                    "memory post-turn extractor provider resolution failed"
+                );
                 format!("failed to create memory post-turn extractor provider: {error}")
             })?;
         let raw_json =
             request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
                 .await?;
         if raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
+            tracing::error!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "response_size_validation",
+                provider = provider_name,
+                model,
+                durable = context.durable_terminal_effect.is_some(),
+                response_bytes = raw_json.len(),
+                response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
+                response_limit_bytes = MAX_POST_TURN_EXTRACTOR_RAW_BYTES,
+                "memory post-turn extractor response size validation failed"
+            );
             return Err("memory post-turn extractor response exceeds its byte limit".to_owned());
         }
         if let Some(claim) = context.durable_terminal_effect.as_ref() {
@@ -643,7 +700,21 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 raw_json.as_str(),
                 model,
                 provider_name,
-            )?;
+            )
+            .map_err(|error| {
+                tracing::error!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "checkpoint_encode",
+                    provider = provider_name,
+                    model,
+                    durable = true,
+                    response_bytes = raw_json.len(),
+                    response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
+                    error = %error,
+                    "memory post-turn extractor checkpoint encode failed"
+                );
+                error
+            })?;
             processor
                 .crud_store
                 .store_native_terminal_effect_handler_checkpoint(
@@ -654,6 +725,17 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 )
                 .await
                 .map_err(|error| {
+                    tracing::error!(
+                        target: "pioneer::memory_post_turn_extractor",
+                        stage = "checkpoint_store",
+                        provider = provider_name,
+                        model,
+                        durable = true,
+                        response_bytes = raw_json.len(),
+                        response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
+                        error = %format!("{error:#}"),
+                        "memory post-turn extractor checkpoint store failed"
+                    );
                     format!("failed to persist memory post-turn extraction checkpoint: {error:#}")
                 })?;
         }
@@ -666,7 +748,9 @@ async fn request_post_turn_extractor_json(
     model: &str,
     prompt: String,
 ) -> Result<String, String> {
-    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), None).await {
+    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), None, "primary")
+        .await
+    {
         Ok(json) => Ok(json),
         Err(primary_error) => {
             if !should_retry_internal_memory_request_without_optional_params(primary_error.as_str())
@@ -676,7 +760,13 @@ async fn request_post_turn_extractor_json(
                 ));
             }
 
-            request_post_turn_extractor_json_once(provider, model, prompt, None)
+            request_post_turn_extractor_json_once(
+                provider,
+                model,
+                prompt,
+                None,
+                "compatibility_fallback",
+            )
                 .await
                 .map_err(|fallback_error| {
                     format!(
@@ -692,29 +782,66 @@ async fn request_post_turn_extractor_json_once(
     model: &str,
     prompt: String,
     temperature: Option<f32>,
+    request_attempt: &'static str,
 ) -> Result<String, String> {
     let request = post_turn_extractor_chat_request(model, prompt, temperature);
     if provider.capabilities().streaming {
-        let stream = provider
-            .stream_chat(request)
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-        return collect_post_turn_extractor_stream(stream).await;
+        let stream = provider.stream_chat(request).await.map_err(|error| {
+            tracing::error!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "provider_stream_start",
+                provider = provider.name(),
+                model,
+                request_attempt,
+                error = %format!("{error:#}"),
+                "memory post-turn extractor provider stream start failed"
+            );
+            format!("{error:#}")
+        })?;
+        return collect_post_turn_extractor_stream(stream, provider.name(), model, request_attempt)
+            .await;
     }
 
     provider
         .chat(request)
         .await
         .map(|response| response.text)
-        .map_err(|error| format!("{error:#}"))
+        .map_err(|error| {
+            tracing::error!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "provider_non_stream_response",
+                provider = provider.name(),
+                model,
+                request_attempt,
+                error = %format!("{error:#}"),
+                "memory post-turn extractor non-stream provider request failed"
+            );
+            format!("{error:#}")
+        })
 }
 
 async fn collect_post_turn_extractor_stream(
     mut stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
+    provider_name: &str,
+    model: &str,
+    request_attempt: &'static str,
 ) -> Result<String, String> {
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("{error:#}"))?;
+        let chunk = chunk.map_err(|error| {
+            tracing::error!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "provider_stream_item",
+                provider = provider_name,
+                model,
+                request_attempt,
+                collected_response_bytes = text.len(),
+                collected_response_sha256 = %post_turn_extractor_response_sha256(text.as_str()),
+                error = %format!("{error:#}"),
+                "memory post-turn extractor provider stream item failed"
+            );
+            format!("{error:#}")
+        })?;
         if !chunk.delta.is_empty() {
             text.push_str(chunk.delta.as_str());
         }
@@ -723,6 +850,10 @@ async fn collect_post_turn_extractor_stream(
         }
     }
     Ok(text)
+}
+
+fn post_turn_extractor_response_sha256(response: &str) -> String {
+    hex::encode(Sha256::digest(response.as_bytes()))
 }
 
 fn post_turn_extractor_chat_request(

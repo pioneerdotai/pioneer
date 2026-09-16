@@ -5481,6 +5481,21 @@ impl MessageProcessor {
         futures_util::stream::iter(records)
             .for_each_concurrent(MAX_CONCURRENCY, |record| async move {
                 let effect_started = Instant::now();
+                let is_memory_post_turn_extractor_effect = match &record.payload {
+                    pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                        runtime_snapshot,
+                        ..
+                    } => runtime_snapshot
+                        .get("subscriptions")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|subscriptions| {
+                            subscriptions.iter().any(|subscription| {
+                                subscription.get("hook_id").and_then(serde_json::Value::as_str)
+                                    == Some("memory.post_turn_extractor")
+                            })
+                        }),
+                    _ => false,
+                };
                 let timeout_secs = match &record.payload {
                     pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook { .. } => {
                         POST_TURN_TIMEOUT_SECS
@@ -5564,6 +5579,19 @@ impl MessageProcessor {
                             ),
                             Ok(Ok(())) => unreachable!("success handled above"),
                         };
+                        if is_memory_post_turn_extractor_effect {
+                            tracing::error!(
+                                target: "pioneer::memory_post_turn_extractor",
+                                stage = "durable_terminal_effect",
+                                error_code = code,
+                                retryable,
+                                attempt_count = record.attempt_count,
+                                max_attempts = record.max_attempts,
+                                elapsed_ms = ?effect_started.elapsed().as_millis(),
+                                error = %message,
+                                "memory post-turn extractor durable attempt failed"
+                            );
+                        }
                         let completed_at = chrono::Utc::now().timestamp();
                         let exponent = u32::from(record.attempt_count.saturating_sub(1)).min(8);
                         let retry_delay = 1_i64.checked_shl(exponent).unwrap_or(256).min(300);
