@@ -178,6 +178,14 @@ pub(crate) async fn prepare_completed_history_owned(
             )
             .await?;
         }
+        super::checkpoint::project_accepted_checkpoints(
+            &store,
+            workspace,
+            thread,
+            &allowed,
+            &mut messages,
+        )
+        .await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),

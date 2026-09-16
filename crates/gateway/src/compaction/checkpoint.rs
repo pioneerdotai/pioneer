@@ -55,6 +55,78 @@ pub(crate) async fn project_compatible_checkpoint(
     Ok(None)
 }
 
+/// Reuse completed work from accepted child contexts without changing their
+/// immutable output manifests. Only exact, wholly represented OWN coverage can
+/// be substituted; merely being an accessible sibling is never sufficient.
+pub(crate) async fn project_accepted_checkpoints(
+    store: &CrudStore,
+    workspace: &str,
+    context_thread: &str,
+    allowed: &BTreeSet<String>,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<()> {
+    let threads: BTreeSet<_> = messages
+        .iter()
+        .filter_map(|message| {
+            let origin = message.provenance.as_ref()?;
+            (!origin.inherited
+                && origin
+                    .context_thread
+                    .as_deref()
+                    .unwrap_or(&origin.thread_id)
+                    == context_thread
+                && origin.thread_id != context_thread)
+                .then(|| origin.thread_id.clone())
+        })
+        .collect();
+    for source_thread in threads {
+        ensure!(
+            allowed.contains(&source_thread),
+            "checkpoint source scope is not accepted"
+        );
+        let owner = super::native::native_owner(workspace, &source_thread);
+        let mut candidate = store.compaction_head(&owner).await?;
+        let mut seen = BTreeSet::new();
+        while let Some(id) = candidate {
+            ensure!(seen.insert(id.clone()), "cyclic checkpoint ancestry");
+            let edges = store
+                .compaction_checkpoint_edges(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("checkpoint ancestry is missing"))?;
+            ensure!(
+                edges.owner == owner,
+                "checkpoint belongs to another context"
+            );
+            if let Some(root) = store
+                .compaction_checkpoint_source(workspace, &source_thread, &id)
+                .await?
+                && let Some(scopes) =
+                    super::coverage::current_checkpoint_scopes(store, workspace, &root).await?
+                && scopes.is_subset(allowed)
+            {
+                match project_checkpoint_in_context(
+                    store,
+                    workspace,
+                    context_thread,
+                    &source_thread,
+                    &owner,
+                    &id,
+                    allowed,
+                    messages,
+                )
+                .await
+                {
+                    Ok(()) => break,
+                    Err(error) if error.downcast_ref::<ProjectionBoundary>().is_some() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            candidate = edges.previous;
+        }
+    }
+    Ok(())
+}
+
 struct Expanded {
     checkpoint: Checkpoint,
     leaves: BTreeSet<SourceRef>,
@@ -153,12 +225,29 @@ pub(crate) async fn project_checkpoint(
     allowed: &BTreeSet<String>,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
+    project_checkpoint_in_context(
+        store, workspace, thread, thread, owner, head, allowed, messages,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn project_checkpoint_in_context(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    source_thread: &str,
+    owner: &str,
+    head: &str,
+    allowed: &BTreeSet<String>,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<()> {
     let prefix = format!("checkpoint:{owner}");
     // A request may already contain this summary alongside covered originals
     // (for example after joining frozen branches). Normalize exact coverage in
     // that case too: the presence of a head reference does not prove that its
     // body is authoritative or that covered source messages were removed.
-    let expanded = expand(store, workspace, thread, owner, head, allowed).await?;
+    let expanded = expand(store, workspace, source_thread, owner, head, allowed).await?;
     let mut represented = BTreeSet::new();
     let mut leaves_by_message = BTreeMap::new();
     let mut cached = BTreeMap::<String, BTreeSet<SourceRef>>::new();
@@ -249,7 +338,7 @@ pub(crate) async fn project_checkpoint(
         }
     }
     let source = store
-        .compaction_checkpoint_source(workspace, thread, head)
+        .compaction_checkpoint_source(workspace, source_thread, head)
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint was invalidated during projection"))?;
     let mut summary = ChatMessage::user(format!(
@@ -259,8 +348,8 @@ pub(crate) async fn project_checkpoint(
     summary.provenance = Some(MessageProvenance {
         logical_turn_id: None,
         workspace_id: workspace.into(),
-        thread_id: thread.into(),
-        context_thread: None,
+        thread_id: source_thread.into(),
+        context_thread: (source_thread != thread).then(|| thread.into()),
         unit_id: prefix,
         sources: vec![MessageSourceRef {
             scope: source.scope,

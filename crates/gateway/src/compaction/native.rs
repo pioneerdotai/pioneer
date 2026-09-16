@@ -122,6 +122,14 @@ pub(super) async fn prepare_native_projection(
             )
             .await?;
         }
+        super::checkpoint::project_accepted_checkpoints(
+            &store,
+            workspace,
+            thread,
+            &authorized,
+            &mut request.messages,
+        )
+        .await?;
         let limits = catalog.limits(context.provider.name(), &request.model);
         let budget = ModelBudget::new(
             Some(limits.context_window),

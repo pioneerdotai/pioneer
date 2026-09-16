@@ -1989,7 +1989,96 @@ pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     db: &C,
     operation: &str,
 ) -> Result<bool> {
-    let stale = db.query_one_raw(sqlite_specific_sql("SELECT m.ordinal FROM compaction_manifest m JOIN compaction_operation o ON o.id=m.operation_id JOIN compaction_context owner ON owner.owner=o.owner WHERE m.operation_id=? AND (EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value OR NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=wanted.key AND t.workspace_id=owner.workspace_id)) OR COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=owner.thread_id),0)<>json_extract(o.snapshot,'$.projection_version') OR NOT EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.source_scope=m.source_scope AND s.source_id=m.source_id AND s.source_version=m.source_version AND s.thread_id=m.source_thread AND (m.reference_only=1 OR s.thread_id=owner.thread_id OR EXISTS (SELECT 1 FROM compaction_operation_projection accepted JOIN compaction_frozen_history h ON h.id=accepted.manifest_id AND h.workspace_id=owner.workspace_id AND h.ready=1 AND h.identity_sha256=accepted.identity_sha256 AND h.imports_sha256=accepted.imports_sha256 AND h.import_count=accepted.import_count AND h.next_import=accepted.import_count JOIN compaction_frozen_import imported ON imported.manifest_id=h.id WHERE accepted.operation_id=o.id AND imported.source_scope=s.source_scope AND imported.source_id=s.source_id AND imported.source_version=s.source_version AND imported.source_thread=s.thread_id)) AND s.workspace_id=owner.workspace_id)) LIMIT 1",[operation.into()]))
-            .await?;
+    // A foreign summary may replace accepted raw imports after output capture.
+    // Prove its entire immutable DAG against the SAME bound import manifest;
+    // read access to the sibling alone grants no ownership. This predicate is
+    // repeated inside the head CAS, including epochs and live leaf revisions.
+    // SQLite's recursive UNION deduplicates DAG nodes. The explicit 65,536
+    // reference bound fails closed (including cycles without any real leaves)
+    // and prevents unbounded traversal while holding database capacity. No
+    // transcript/summary payloads are read. Keep this with the existing SQLite
+    // JSON snapshot predicate rather than doing a racy read/check/write loop.
+    let stale = db.query_one_raw(sqlite_specific_sql(r#"
+WITH RECURSIVE
+current_operation AS (
+ SELECT o.id, o.snapshot, c.workspace_id, c.thread_id
+ FROM compaction_operation o JOIN compaction_context c ON c.owner=o.owner
+ WHERE o.id=?
+),
+accepted_imports AS (
+ SELECT i.source_scope, i.source_id, i.source_version, i.source_thread
+ FROM current_operation o
+ JOIN compaction_operation_projection p ON p.operation_id=o.id
+ JOIN compaction_frozen_history h ON h.id=p.manifest_id
+  AND h.workspace_id=o.workspace_id AND h.ready=1
+  AND h.identity_sha256=p.identity_sha256 AND h.imports_sha256=p.imports_sha256
+  AND h.import_count=p.import_count AND h.next_import=p.import_count
+ JOIN compaction_frozen_import i ON i.manifest_id=h.id
+),
+projected_roots AS (
+ SELECT m.ordinal, m.source_scope, m.source_id, m.source_version
+ FROM compaction_manifest m JOIN current_operation o ON o.id=m.operation_id
+ WHERE m.reference_only=0 AND m.source_thread<>o.thread_id
+  AND m.source_scope LIKE 'checkpoint:%'
+  AND NOT EXISTS (SELECT 1 FROM accepted_imports i
+    WHERE i.source_scope=m.source_scope AND i.source_id=m.source_id
+     AND i.source_version=m.source_version AND i.source_thread=m.source_thread)
+),
+coverage(root, source_scope, source_id, source_version) AS (
+ SELECT ordinal, source_scope, source_id, source_version FROM projected_roots
+ UNION
+ SELECT g.root, v.source_scope, v.source_id, v.source_version
+ FROM coverage g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
+ WHERE g.source_scope LIKE 'checkpoint:%'
+ UNION
+ SELECT g.root, 'checkpoint:'||COALESCE(p.owner,''), c.previous, COALESCE(p.identity_sha256,'')
+ FROM coverage g JOIN compaction_checkpoint c ON c.id=g.source_id
+ LEFT JOIN compaction_checkpoint p ON p.id=c.previous
+ WHERE g.source_scope LIKE 'checkpoint:%' AND c.previous IS NOT NULL
+ LIMIT 65537
+),
+valid_roots AS (
+ SELECT r.ordinal FROM projected_roots r, current_operation o
+ WHERE (SELECT COUNT(*) FROM coverage)<65537
+  AND EXISTS (SELECT 1 FROM coverage g WHERE g.root=r.ordinal AND g.source_scope NOT LIKE 'checkpoint:%')
+  AND NOT EXISTS (
+   SELECT 1 FROM coverage g WHERE g.root=r.ordinal AND NOT EXISTS (
+    SELECT 1 FROM compaction_live_sources s
+    WHERE s.workspace_id=o.workspace_id AND s.source_scope=g.source_scope
+     AND s.source_id=g.source_id AND s.source_version=g.source_version
+     AND EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') e WHERE e.key=s.thread_id)
+     AND (
+      (g.source_scope LIKE 'checkpoint:%' AND EXISTS (
+       SELECT 1 FROM compaction_checkpoint c WHERE c.id=g.source_id
+        AND 'checkpoint:'||c.owner=g.source_scope AND c.format_version=1
+      ))
+      OR (g.source_scope NOT LIKE 'checkpoint:%' AND (
+       s.thread_id=o.thread_id OR EXISTS (
+        SELECT 1 FROM accepted_imports i WHERE i.source_scope=s.source_scope
+         AND i.source_id=s.source_id AND i.source_version=s.source_version AND i.source_thread=s.thread_id
+       )
+      ))
+     )
+   )
+  )
+)
+SELECT m.ordinal FROM compaction_manifest m JOIN current_operation o ON o.id=m.operation_id
+WHERE
+ EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted
+  WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value
+   OR NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=wanted.key AND t.workspace_id=o.workspace_id))
+ OR COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=o.thread_id),0)<>json_extract(o.snapshot,'$.projection_version')
+ OR NOT EXISTS (
+  SELECT 1 FROM compaction_live_sources s
+  WHERE s.source_scope=m.source_scope AND s.source_id=m.source_id AND s.source_version=m.source_version
+   AND s.thread_id=m.source_thread AND s.workspace_id=o.workspace_id
+   AND (m.reference_only=1 OR s.thread_id=o.thread_id
+    OR EXISTS (SELECT 1 FROM accepted_imports i
+     WHERE i.source_scope=s.source_scope AND i.source_id=s.source_id
+      AND i.source_version=s.source_version AND i.source_thread=s.thread_id)
+    OR EXISTS (SELECT 1 FROM valid_roots r WHERE r.ordinal=m.ordinal))
+ )
+LIMIT 1
+"#, [operation.into()])).await?;
     Ok(stale.is_none())
 }

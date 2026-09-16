@@ -2880,6 +2880,141 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&operation.id, &context)
         .await
         .unwrap();
+    // A completed child's summary is created AFTER its immutable raw output.
+    // C may reuse that summary only if every leaf has a grant in C's accepted
+    // basis; the output manifest itself is never rewritten to add the summary.
+    let a_operation = admit_import_operation(&store, "summary-a", "child", "child-turn").await;
+    let a_ready = ready_import_operation(&store, &a_operation, "child", &own_source).await;
+    assert_eq!(
+        store
+            .compaction_apply_runner(&a_operation.id, &a_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let a_summary = store
+        .compaction_checkpoint_source("ws", "child", "checkpoint-summary-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut projected_operation = operation.clone();
+    projected_operation.id = "projected-c".into();
+    projected_operation.owner = "owner-projected-c".into();
+    projected_operation.plan.fingerprint = "projected-c".into();
+    for scope in ["child", "context-c", "thread"] {
+        projected_operation.source_epochs.insert(
+            scope.into(),
+            store
+                .compaction_projection_version("ws", scope)
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .compaction_admit("ws", "context-c", &projected_operation)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&projected_operation.id, "turn-c")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&projected_operation.id, &context)
+        .await
+        .unwrap();
+    let projected_ready =
+        ready_import_operation(&store, &projected_operation, "child", &a_summary).await;
+    assert!(
+        store
+            .compaction_manifest_sources_current(&projected_operation.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&projected_operation.id, &projected_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    // An accessible checkpoint must not launder H into accepted OWN work.
+    // Model an older mixed checkpoint: only one of its two leaves was delivered.
+    let mixed_op = admit_import_operation(&store, "mixed-summary", "child", "child-turn").await;
+    let mixed = Checkpoint {
+        id: "mixed-checkpoint".into(),
+        operation_id: mixed_op.id.clone(),
+        owner: mixed_op.owner.clone(),
+        previous: None,
+        format_version: 1,
+        coverage: vec![own_source.clone(), inherited.clone()],
+        summary: "mixed H and A".into(),
+        selection: mixed_op.admission.selection.clone(),
+        projection_version: mixed_op.projection_version,
+    };
+    store.compaction_save_candidate(&mixed, 0).await.unwrap();
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET status='applied' WHERE id='mixed-checkpoint'",
+    )
+    .await
+    .unwrap();
+    let mixed_source = store
+        .compaction_checkpoint_source("ws", "child", &mixed.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut mixed_target = projected_operation.clone();
+    mixed_target.id = "mixed-target".into();
+    mixed_target.owner = "owner-mixed-target".into();
+    mixed_target.plan.fingerprint = "mixed-target".into();
+    store
+        .compaction_admit("ws", "context-c", &mixed_target)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&mixed_target.id, "turn-c")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&mixed_target.id, &context)
+        .await
+        .unwrap();
+    let mixed_ready = ready_import_operation(&store, &mixed_target, "child", &mixed_source).await;
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&mixed_target.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&mixed_target.id, &mixed_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    let denied = admit_import_operation(&store, "unaccepted-summary", "context-c", "turn-c").await;
+    let denied_ready = ready_import_operation(&store, &denied, "child", &a_summary).await;
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&denied.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&denied.id, &denied_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_history_page("ws", "thread", &context.manifest_id, 0)
+            .await
+            .unwrap(),
+        vec![target.clone()]
+    );
+
     // Production path: the accepted parent basis is recaptured by the child.
     // Ownership evidence must survive that capture and authorize final commit.
     let maintenance = store.with_maintenance_access();

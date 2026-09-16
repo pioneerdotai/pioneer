@@ -11,7 +11,8 @@ pub(crate) async fn checkpoint_leaves(
     root: &SourceRef,
 ) -> Result<BTreeSet<ScopedHistorySource>> {
     checkpoint_graph(store, workspace, Some(allowed), root)
-        .await
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint coverage source changed or disappeared"))
         .map(|(leaves, _)| leaves)
 }
 
@@ -22,9 +23,22 @@ pub(crate) async fn checkpoint_scopes(
     workspace: &str,
     root: &SourceRef,
 ) -> Result<BTreeSet<String>> {
-    checkpoint_graph(store, workspace, None, root)
-        .await
-        .map(|(_, scopes)| scopes)
+    current_checkpoint_scopes(store, workspace, root)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint coverage source changed or disappeared"))
+}
+
+/// Discovery may encounter a head invalidated by an edit in another child.
+/// Such a candidate must not block use of the current accepted raw history.
+/// Malformed/cyclic graphs and database errors remain errors.
+pub(crate) async fn current_checkpoint_scopes(
+    store: &CrudStore,
+    workspace: &str,
+    root: &SourceRef,
+) -> Result<Option<BTreeSet<String>>> {
+    Ok(checkpoint_graph(store, workspace, None, root)
+        .await?
+        .map(|(_, scopes)| scopes))
 }
 
 async fn checkpoint_graph(
@@ -32,7 +46,7 @@ async fn checkpoint_graph(
     workspace: &str,
     allowed: Option<&BTreeSet<String>>,
     root: &SourceRef,
-) -> Result<(BTreeSet<ScopedHistorySource>, BTreeSet<String>)> {
+) -> Result<Option<(BTreeSet<ScopedHistorySource>, BTreeSet<String>)>> {
     let store = store.with_maintenance_access();
     let mut leaves = BTreeSet::new();
     let mut scopes = BTreeSet::new();
@@ -48,10 +62,12 @@ async fn checkpoint_graph(
         if done.contains(&source) {
             continue;
         }
-        let thread = store
+        let Some(thread) = store
             .compaction_reference_thread(workspace, &source)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint coverage source changed or disappeared"))?;
+        else {
+            return Ok(None);
+        };
         ensure!(
             allowed.is_none_or(|allowed| allowed.contains(&thread)),
             "checkpoint coverage crosses the accepted source scope"
@@ -80,10 +96,12 @@ async fn checkpoint_graph(
         );
         pending.push((source, true));
         if let Some(previous) = &checkpoint.previous {
-            let previous = store
+            let Some(previous) = store
                 .compaction_checkpoint_source(workspace, &thread, previous)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("previous checkpoint coverage is unavailable"))?;
+            else {
+                return Ok(None);
+            };
             ensure!(
                 previous.scope == format!("checkpoint:{}", checkpoint.owner),
                 "previous checkpoint changed owner"
@@ -101,5 +119,5 @@ async fn checkpoint_graph(
         !leaves.is_empty(),
         "checkpoint has no exact canonical coverage"
     );
-    Ok((leaves, scopes))
+    Ok(Some((leaves, scopes)))
 }

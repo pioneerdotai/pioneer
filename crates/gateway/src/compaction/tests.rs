@@ -3059,6 +3059,170 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     );
 }
 
+#[tokio::test]
+async fn compaction_reuses_completed_child_head_after_immutable_raw_output_capture() {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+    use std::collections::BTreeSet;
+    let f = fixture("completed A", vec![Reply::Success], true, false).await;
+    let CompactionExit::Applied(id) = f.runner.run(CancellationToken::new()).await.unwrap() else {
+        panic!("checkpoint must apply");
+    };
+    let mut checkpoint = f.store.compaction_checkpoint(&id).await.unwrap().unwrap();
+    let owner = super::native::native_owner("ws", "thread");
+    let mut snapshot = f.runner.snapshot.clone();
+    snapshot.id = "published-child-operation".into();
+    snapshot.owner = owner.clone();
+    snapshot.plan.fingerprint = snapshot.id.clone();
+    f.store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    checkpoint.id = "published-child-summary".into();
+    checkpoint.operation_id = snapshot.id.clone();
+    checkpoint.owner = owner.clone();
+    f.store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    // Historical published checkpoint. The real grant/commit boundary is
+    // covered in CRUD's frozen_own_imports regression below the Gateway.
+    let db = f.store.database_connection();
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET status='applied' WHERE id='published-child-summary'",
+    )
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_context SET head='published-child-summary' WHERE owner=?",
+        [owner.into()],
+    ))
+    .await
+    .unwrap();
+    let mut work = ChatMessage::assistant("completed A");
+    work.provenance = Some(MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: Some("next-child".into()),
+        unit_id: "A-work".into(),
+        sources: checkpoint
+            .coverage
+            .iter()
+            .map(|r| MessageSourceRef {
+                scope: r.scope.clone(),
+                id: r.id.clone(),
+                version: r.version.clone(),
+            })
+            .collect(),
+        complete: true,
+        inherited: false,
+        protected_input: false,
+    });
+    let allowed = BTreeSet::from(["thread".into(), "next-child".into()]);
+    let original = vec![work.clone()];
+    let mut projected = original.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &f.store,
+        "ws",
+        "next-child",
+        &allowed,
+        &mut projected,
+    )
+    .await
+    .unwrap();
+    assert_eq!(projected.len(), 1);
+    let origin = projected[0].provenance.as_ref().unwrap();
+    assert_eq!(origin.sources[0].id, checkpoint.id);
+    assert_eq!(origin.thread_id, "thread");
+    assert_eq!(origin.context_thread.as_deref(), Some("next-child"));
+    assert!(!origin.inherited);
+    assert_ne!(projected, original);
+    let once = projected.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &f.store,
+        "ws",
+        "next-child",
+        &allowed,
+        &mut projected,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        projected, once,
+        "repeated checks reuse the same representation"
+    );
+    // A newer head may include a later child turn outside this accepted basis.
+    // Find the older compatible checkpoint; never widen the frozen boundary.
+    db.execute_unprepared("INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('future-source','thread','turn',9,'fixture','{}',CURRENT_TIMESTAMP)").await.unwrap();
+    let mut later = checkpoint.clone();
+    later.id = "later-child-summary".into();
+    later.previous = Some(checkpoint.id.clone());
+    later.coverage = vec![SourceRef {
+        scope: "event:turn".into(),
+        id: "future-source".into(),
+        version: "event-revision:1".into(),
+    }];
+    later.summary = "work beyond the accepted boundary".into();
+    f.store.compaction_save_candidate(&later, 1).await.unwrap();
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET status='applied' WHERE id='later-child-summary'",
+    )
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_context SET head='later-child-summary' WHERE owner=?",
+        [checkpoint.owner.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let mut bounded = original.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &f.store,
+        "ws",
+        "next-child",
+        &allowed,
+        &mut bounded,
+    )
+    .await
+    .unwrap();
+    assert_eq!(bounded, once, "a later head cannot import later work");
+    work.provenance.as_mut().unwrap().inherited = true;
+    let mut inherited = vec![work];
+    let unchanged = inherited.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &f.store,
+        "ws",
+        "next-child",
+        &allowed,
+        &mut inherited,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        inherited, unchanged,
+        "H does not become an imported own contribution"
+    );
+    db.execute_unprepared("UPDATE turn_event SET payload='edited A' WHERE id='source'")
+        .await
+        .unwrap();
+    let mut current = original.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &f.store,
+        "ws",
+        "next-child",
+        &allowed,
+        &mut current,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        current, original,
+        "invalidated heads do not replace current source history"
+    );
+}
+
 struct CleanupGateSummarizer {
     inner: Arc<dyn Summarizer>,
     active: std::sync::atomic::AtomicBool,
