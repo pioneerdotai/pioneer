@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 const MIN_QUANTUM_PAUSE: Duration = Duration::from_millis(25);
 const IDLE_PAUSE: Duration = Duration::from_secs(60);
+const QUANTUM_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum QuantumError {
     StreamFailed(ProjectionReceiptCleanupOutcome),
@@ -24,27 +25,26 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
     let mut last_progress_log = Instant::now();
     loop {
         let started = Instant::now();
-        // Do not put a local timeout around dispatched SQLite work. Dropping
-        // the SQLx future does not interrupt sqlite3_step on its worker thread,
-        // so a timed-out quantum can keep consuming reader capacity while the
-        // maintenance loop starts another one.
+        // Dropping this future cancels reader/writer admission and rolls back
+        // an unfinished transaction. No detached maintenance tasks.
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            result = crate::database::attribution::scope_database_workload_result(
-                pioneer_observability::DatabaseWorkload::ProjectionReceiptCleanup,
-                async {
-                    match store.cleanup_projection_receipts_quantum(after_turn_id.as_deref()).await {
-                        Ok(outcome) if outcome.failed => Err(QuantumError::StreamFailed(outcome)),
-                        Ok(outcome) => Ok(outcome),
-                        Err(_) => Err(QuantumError::Database),
-                    }
-                },
-            ) => result,
+            result = tokio::time::timeout(QUANTUM_TIMEOUT,
+                crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ProjectionReceiptCleanup,
+                    async {
+                        match store.cleanup_projection_receipts_quantum(after_turn_id.as_deref()).await {
+                            Ok(outcome) if outcome.failed => Err(QuantumError::StreamFailed(outcome)),
+                            Ok(outcome) => Ok(outcome),
+                            Err(_) => Err(QuantumError::Database),
+                        }
+                    },
+                )) => result,
         };
         let pause = match result {
-            Ok(outcome) if !outcome.backfill_ready => IDLE_PAUSE,
-            Ok(outcome) | Err(QuantumError::StreamFailed(outcome)) => {
+            Ok(Ok(outcome)) if !outcome.backfill_ready => IDLE_PAUSE,
+            Ok(Ok(outcome)) | Ok(Err(QuantumError::StreamFailed(outcome))) => {
                 if let Some(turn_id) = outcome.last_turn_id {
                     after_turn_id = Some(turn_id);
                     scanned += 1;
@@ -94,9 +94,16 @@ pub(super) async fn run(crud_store: Arc<CrudStore>, cancellation: CancellationTo
                     pause
                 }
             }
-            Err(QuantumError::Database) => {
+            Ok(Err(QuantumError::Database)) => {
                 tracing::warn!(
                     reason = "database_error",
+                    "projection receipt cleanup quantum deferred"
+                );
+                IDLE_PAUSE
+            }
+            Err(_) => {
+                tracing::warn!(
+                    reason = "quantum_timeout",
                     "projection receipt cleanup quantum deferred"
                 );
                 IDLE_PAUSE

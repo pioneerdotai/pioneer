@@ -663,14 +663,14 @@ fn prepare_payload_rows(
     compression_level: i32,
     dictionary: Option<&[u8]>,
 ) -> Result<Vec<PreparedPayloadRow>> {
-    let mut compressor =
-        pioneer_sqlite::zstd::ColumnValueCompressor::new(compression_level, dictionary)
-            .context("failed to prepare bounded zstd payload batch compressor")?;
     rows.into_iter()
         .map(|row| {
-            let compressed_payload = compressor
-                .compress(row.payload.as_bytes())
-                .context("failed to compress bounded zstd payload row")?;
+            let compressed_payload = pioneer_sqlite::zstd::compress_column_value(
+                row.payload.as_bytes(),
+                compression_level,
+                dictionary,
+            )
+            .context("failed to compress bounded zstd payload row")?;
             Ok(PreparedPayloadRow {
                 rowid: row.rowid,
                 id: row.id,
