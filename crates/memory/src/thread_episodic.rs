@@ -16,8 +16,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::Mutex;
 
 const THREAD_EPISODIC_SCHEMA_VERSION: &str = "1";
 const THREAD_EPISODIC_TRACK: &str = "pioneer_thread_episodic";
@@ -639,38 +638,21 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
 
 pub struct MemvidThreadEpisodicBackend {
     capabilities: ThreadEpisodicMemvidBackendCapabilities,
-    locks: Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>>,
-    index_batch: Arc<Mutex<ThreadEpisodicIndexBatch>>,
-}
-
-type ThreadEpisodicIndexReply =
-    oneshot::Sender<Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>>;
-
-struct ThreadEpisodicPendingIndex {
-    request: ThreadEpisodicMemvidIndexRequest,
-    reply: ThreadEpisodicIndexReply,
-}
-
-#[derive(Default)]
-struct ThreadEpisodicIndexBatch {
-    worker_running: bool,
-    pending: Vec<ThreadEpisodicPendingIndex>,
+    locks: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 impl MemvidThreadEpisodicBackend {
     pub fn new() -> Self {
         Self {
             capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
-            locks: Arc::new(Mutex::new(BTreeMap::new())),
-            index_batch: Arc::new(Mutex::new(ThreadEpisodicIndexBatch::default())),
+            locks: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn with_capabilities(capabilities: ThreadEpisodicMemvidBackendCapabilities) -> Self {
         Self {
             capabilities,
-            locks: Arc::new(Mutex::new(BTreeMap::new())),
-            index_batch: Arc::new(Mutex::new(ThreadEpisodicIndexBatch::default())),
+            locks: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -680,86 +662,6 @@ impl MemvidThreadEpisodicBackend {
             .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
-    }
-
-    async fn run_index_batch_worker(
-        locks: Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>>,
-        batch: Arc<Mutex<ThreadEpisodicIndexBatch>>,
-    ) {
-        // Committed turn items arrive as a short burst. Give the sibling jobs a
-        // chance to join so one capsule rebuild covers the whole burst.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        loop {
-            let pending = {
-                let mut state = batch.lock().await;
-                if state.pending.is_empty() {
-                    state.worker_running = false;
-                    return;
-                }
-                std::mem::take(&mut state.pending)
-            };
-
-            let mut by_path = BTreeMap::<PathBuf, Vec<ThreadEpisodicPendingIndex>>::new();
-            for pending_index in pending {
-                match path_from_storage_uri(pending_index.request.storage_uri.as_str()) {
-                    Ok(path) => by_path.entry(path).or_default().push(pending_index),
-                    Err(error) => {
-                        let _ = pending_index.reply.send(Err(error));
-                    }
-                }
-            }
-
-            for (path, group) in by_path {
-                let lock = {
-                    let mut path_locks = locks.lock().await;
-                    path_locks
-                        .entry(path.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                };
-                let _guard = lock.lock().await;
-                let requests = group
-                    .iter()
-                    .map(|pending_index| pending_index.request.clone())
-                    .collect::<Vec<_>>();
-                let result =
-                    tokio::task::spawn_blocking(move || index_items_blocking(path, requests))
-                        .await
-                        .map_err(|error| {
-                            ThreadEpisodicMemvidError::retryable(format!(
-                                "thread episodic memvid index batch task failed: {error}"
-                            ))
-                        })
-                        .and_then(|result| result);
-
-                match result {
-                    Ok(outputs) if outputs.len() == group.len() => {
-                        for (pending_index, output) in group.into_iter().zip(outputs) {
-                            let _ = pending_index.reply.send(Ok(output));
-                        }
-                    }
-                    Ok(outputs) => {
-                        let error = ThreadEpisodicMemvidError::retryable(format!(
-                            "thread episodic memvid index batch returned {} outputs for {} requests",
-                            outputs.len(),
-                            group.len()
-                        ));
-                        for pending_index in group {
-                            let _ = pending_index.reply.send(Err(error.clone()));
-                        }
-                    }
-                    Err(error) => {
-                        for pending_index in group {
-                            let _ = pending_index.reply.send(Err(error.clone()));
-                        }
-                    }
-                }
-            }
-
-            // Let queued interactive readers acquire the per-capsule lock
-            // before another maintenance batch starts.
-            tokio::task::yield_now().await;
-        }
     }
 }
 
@@ -793,30 +695,18 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             ))
         })?;
 
-        let (reply, receiver) = oneshot::channel();
-        let start_worker = {
-            let mut batch = self.index_batch.lock().await;
-            batch
-                .pending
-                .push(ThreadEpisodicPendingIndex { request, reply });
-            if batch.worker_running {
-                false
-            } else {
-                batch.worker_running = true;
-                true
-            }
-        };
-        if start_worker {
-            tokio::spawn(Self::run_index_batch_worker(
-                self.locks.clone(),
-                self.index_batch.clone(),
-            ));
-        }
-        receiver.await.map_err(|error| {
-            ThreadEpisodicMemvidError::retryable(format!(
-                "thread episodic memvid index batch reply failed: {error}"
-            ))
-        })?
+        let lock = self.lock_for_path(path.as_path()).await;
+        let _guard = lock.lock().await;
+        let path_for_task = path.clone();
+        let request_for_task = request.clone();
+
+        tokio::task::spawn_blocking(move || index_item_blocking(path_for_task, request_for_task))
+            .await
+            .map_err(|error| {
+                ThreadEpisodicMemvidError::retryable(format!(
+                    "thread episodic memvid index task failed: {error}"
+                ))
+            })?
     }
 
     async fn search(
@@ -1027,89 +917,63 @@ fn finalize_thread_episodic_search_output(
     }
 }
 
-#[cfg(test)]
 fn index_item_blocking(
     path: PathBuf,
     request: ThreadEpisodicMemvidIndexRequest,
 ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
-    let mut outputs = index_items_blocking(path, vec![request])?;
-    outputs.pop().ok_or_else(|| {
-        ThreadEpisodicMemvidError::retryable(
-            "thread episodic memvid single-item batch returned no output",
-        )
-    })
-}
-
-fn index_items_blocking(
-    path: PathBuf,
-    requests: Vec<ThreadEpisodicMemvidIndexRequest>,
-) -> Result<Vec<ThreadEpisodicMemvidIndexOutput>, ThreadEpisodicMemvidError> {
-    if requests.is_empty() {
-        return Ok(Vec::new());
+    if let Some(embedding) = request.embedding.as_ref() {
+        validate_index_embedding(embedding)?;
     }
-    for request in &requests {
-        if let Some(embedding) = request.embedding.as_ref() {
-            validate_index_embedding(embedding)?;
-        }
+    let embedding_identity = request
+        .embedding
+        .as_ref()
+        .map(|embedding| embedding.identity.clone());
+    let mut memvid = open_or_create_memvid(path.as_path(), request.workspace_capsule)?;
+    if let Some(embedding) = request.embedding.as_ref() {
+        memvid.enable_vec().map_err(classify_memvid_error)?;
+        memvid
+            .set_vec_model(embedding.identity.memvid_model_id().as_str())
+            .map_err(classify_memvid_error)?;
     }
-    let mut memvid = open_or_create_memvid(path.as_path(), requests[0].workspace_capsule)?;
-    for request in &requests {
-        if let Some(embedding) = request.embedding.as_ref() {
-            memvid.enable_vec().map_err(classify_memvid_error)?;
+    let options = index_put_options(&request);
+    let payload = request.text.as_bytes().to_vec();
+    let embedding_vector = request
+        .embedding
+        .as_ref()
+        .map(|embedding| embedding.vector.clone());
+    match memvid.frame_by_uri(request.frame_uri.as_str()) {
+        Ok(frame) if frame.status == FrameStatus::Active => {
             memvid
-                .set_vec_model(embedding.identity.memvid_model_id().as_str())
+                .update_frame(frame.id, Some(payload), options, embedding_vector)
                 .map_err(classify_memvid_error)?;
         }
-        let options = index_put_options(request);
-        let payload = request.text.as_bytes().to_vec();
-        let embedding_vector = request
-            .embedding
-            .as_ref()
-            .map(|embedding| embedding.vector.clone());
-        match memvid.frame_by_uri(request.frame_uri.as_str()) {
-            Ok(frame) if frame.status == FrameStatus::Active => {
+        _ => {
+            if let Some(embedding_vector) = embedding_vector {
                 memvid
-                    .update_frame(frame.id, Some(payload), options, embedding_vector)
+                    .put_with_embedding_and_options(payload.as_slice(), embedding_vector, options)
                     .map_err(classify_memvid_error)?;
-            }
-            _ => {
-                if let Some(embedding_vector) = embedding_vector {
-                    memvid
-                        .put_with_embedding_and_options(
-                            payload.as_slice(),
-                            embedding_vector,
-                            options,
-                        )
-                        .map_err(classify_memvid_error)?;
-                } else {
-                    memvid
-                        .put_bytes_with_options(payload.as_slice(), options)
-                        .map_err(classify_memvid_error)?;
-                }
+            } else {
+                memvid
+                    .put_bytes_with_options(payload.as_slice(), options)
+                    .map_err(classify_memvid_error)?;
             }
         }
     }
     memvid.commit().map_err(classify_memvid_error)?;
+    let frame = memvid
+        .frame_by_uri(request.frame_uri.as_str())
+        .map_err(classify_memvid_error)?;
     let stats = memvid.stats().map_err(classify_memvid_error)?;
     let stats = thread_episodic_stats_from_memvid(stats)?;
-    requests
-        .into_iter()
-        .map(|request| {
-            let frame = memvid
-                .frame_by_uri(request.frame_uri.as_str())
-                .map_err(classify_memvid_error)?;
-            Ok(ThreadEpisodicMemvidIndexOutput {
-                frame_id: i64::try_from(frame.id).map_err(|_| {
-                    ThreadEpisodicMemvidError::non_retryable(
-                        "thread episodic frame id does not fit i64",
-                    )
-                })?,
-                frame_uri: request.frame_uri,
-                stats: stats.clone(),
-                embedding_identity: request.embedding.map(|embedding| embedding.identity),
-            })
-        })
-        .collect()
+
+    Ok(ThreadEpisodicMemvidIndexOutput {
+        frame_id: i64::try_from(frame.id).map_err(|_| {
+            ThreadEpisodicMemvidError::non_retryable("thread episodic frame id does not fit i64")
+        })?,
+        frame_uri: request.frame_uri,
+        stats,
+        embedding_identity,
+    })
 }
 
 fn validate_index_embedding(
@@ -2282,42 +2146,6 @@ mod tests {
         assert_eq!(output.embedding_identity, None);
         assert_eq!(output.stats.capacity_bytes, Some(50 * 1024 * 1024));
         assert!(output.stats.remaining_capacity_bytes.is_some());
-    }
-
-    #[tokio::test]
-    async fn concurrent_index_items_share_one_capsule_batch() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let path = temp_dir.path().join("segment-batched.mv2");
-        let storage_uri = thread_episodic_storage_uri_from_path(path.as_path());
-        let request = |suffix: &str| {
-            ThreadEpisodicMemvidIndexRequest {
-            storage_uri: storage_uri.clone(),
-            capsule_id: "capsule_batched".to_owned(),
-            capsule_ref: "mv2://pioneer/thread_episodic/workspace/workspace_hash/segments/000001/capsules/capsule_batched".to_owned(),
-            workspace_capsule: true,
-            index_item_id: format!("index_item_{suffix}"),
-            frame_uri: format!(
-                "mv2://workspace/workspace_1/thread/thread_1/turn/turn_1/item/item_{suffix}/index/index_{suffix}"
-            ),
-            text: format!("batched workspace memory item {suffix}"),
-            metadata: BTreeMap::new(),
-            embedding: None,
-        }
-        };
-        let backend = MemvidThreadEpisodicBackend::new();
-
-        let (first, second) = tokio::join!(
-            backend.index_item(request("one")),
-            backend.index_item(request("two"))
-        );
-        let first = first.expect("first item should index");
-        let second = second.expect("second item should index");
-
-        assert_eq!(first.stats.active_frame_count, Some(2));
-        assert_eq!(second.stats.active_frame_count, Some(2));
-        let memvid = Memvid::open_read_only(path).expect("batched capsule should reopen");
-        assert!(memvid.frame_by_uri(first.frame_uri.as_str()).is_ok());
-        assert!(memvid.frame_by_uri(second.frame_uri.as_str()).is_ok());
     }
 
     #[test]

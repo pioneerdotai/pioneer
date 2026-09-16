@@ -3,7 +3,7 @@
 use super::*;
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
-use pioneer_crud::compaction::{CanonicalSource, PreparedFrozenImport, SOURCE_PAGE_ROWS};
+use pioneer_crud::compaction::PreparedFrozenImport;
 use pioneer_provider::{
     CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
 };
@@ -372,6 +372,12 @@ pub(super) async fn capture_execution_basis_with_outputs(
         Some(outputs) => outputs.fence.clone(),
         None => store.compaction_history_read_fence().await?,
     };
+    let mut messages = if omits_history {
+        Vec::new()
+    } else {
+        super::history::load_task_line_history(&store, workspace, thread, excluded_turn, &fence)
+            .await?
+    };
     let mut allowed = BTreeSet::from([thread.to_owned()]);
     let mut epochs = outputs
         .map(|outputs| outputs.source_epochs.clone())
@@ -401,25 +407,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
         } else {
             None
         }
-    };
-    let mut messages = if omits_history {
-        Vec::new()
-    } else if let Some(from_turn) = basis
-        .as_ref()
-        .and_then(|basis| basis.source_turn.as_deref())
-    {
-        super::history::load_task_line_history_from(
-            &store,
-            workspace,
-            thread,
-            excluded_turn,
-            from_turn,
-            &fence,
-        )
-        .await?
-    } else {
-        super::history::load_task_line_history(&store, workspace, thread, excluded_turn, &fence)
-            .await?
     };
     if let Some(basis) = basis {
         allowed.extend(
@@ -787,11 +774,9 @@ pub(super) async fn compose_frozen_basis(
             }
         }
     }
-    let mut compatible_inherited = None::<Vec<ChatMessage>>;
-    let mut compatible_own = None::<Vec<ChatMessage>>;
+    let mut inherited = inherited.to_vec();
+    let mut own = own.to_vec();
     loop {
-        let inherited = compatible_inherited.as_deref().unwrap_or(inherited);
-        let own = compatible_own.as_deref().unwrap_or(own);
         let result = compose_context(
             workspace,
             thread,
@@ -816,7 +801,7 @@ pub(super) async fn compose_frozen_basis(
         ) else {
             return Err(error);
         };
-        let rematerialized_inherited = super::compatible::rematerialize_overlap(
+        let compatible_inherited = super::compatible::rematerialize_overlap(
             store,
             workspace,
             allowed,
@@ -825,7 +810,7 @@ pub(super) async fn compose_frozen_basis(
             &overlap.affected,
         )
         .await?;
-        let rematerialized_own = super::compatible::rematerialize_overlap(
+        let compatible_own = super::compatible::rematerialize_overlap(
             store,
             workspace,
             allowed,
@@ -835,11 +820,11 @@ pub(super) async fn compose_frozen_basis(
         )
         .await?;
         ensure!(
-            rematerialized_inherited != inherited || rematerialized_own != own,
+            compatible_inherited != inherited || compatible_own != own,
             "canonical units cannot form a compatible exact projection"
         );
-        compatible_inherited = Some(rematerialized_inherited);
-        compatible_own = Some(rematerialized_own);
+        inherited = compatible_inherited;
+        own = compatible_own;
     }
 }
 
@@ -1000,24 +985,11 @@ async fn capture_with_imports(
                 )
                 .await?;
         }
+        // Do not publish a snapshot whose exact model projection cannot be
+        // reconstructed from its originals. This also revalidates each revision.
+        restore_entry(&store, workspace, allowed_threads, &reference).await?;
         digest_entry(&mut digest, &reference)?;
         references.push(reference);
-    }
-    // Do not publish a snapshot whose exact model projection cannot be
-    // reconstructed from its originals. Revalidate in bounded payload batches
-    // instead of issuing one SQLite query for every message in a long history.
-    for page in references.chunks(SOURCE_PAGE_ROWS as usize) {
-        let payloads = preload_reference_payloads(&store, workspace, page).await?;
-        for reference in page {
-            restore_entry(
-                &store,
-                workspace,
-                allowed_threads,
-                reference,
-                Some(&payloads),
-            )
-            .await?;
-        }
     }
     let mut accepted = Vec::new();
     for (ordinal, reference) in references.iter().enumerate() {
@@ -1175,7 +1147,6 @@ pub(crate) async fn restore(
             !page.is_empty(),
             "frozen history lost an immutable reference page"
         );
-        let payloads = preload_reference_payloads(&store, workspace, &page).await?;
         for reference in page {
             ensure!(
                 allowed_threads.contains(&reference.source_thread)
@@ -1186,16 +1157,7 @@ pub(crate) async fn restore(
                 "frozen history source is outside the accepted context"
             );
             digest_entry(&mut digest, &reference)?;
-            result.push(
-                restore_entry(
-                    &store,
-                    workspace,
-                    allowed_threads,
-                    &reference,
-                    Some(&payloads),
-                )
-                .await?,
-            );
+            result.push(restore_entry(&store, workspace, allowed_threads, &reference).await?);
         }
     }
     ensure!(
@@ -1207,73 +1169,11 @@ pub(crate) async fn restore(
     Ok(result)
 }
 
-async fn preload_reference_payloads(
-    store: &CrudStore,
-    workspace: &str,
-    references: &[FrozenMessageRef],
-) -> Result<BTreeMap<(String, SourceRef), String>> {
-    let mut groups = BTreeMap::<(String, String, String), BTreeSet<SourceRef>>::new();
-    for message in references {
-        for reference in message.sources.iter().chain(message.replay_source.iter()) {
-            let Some((prefix, turn)) = reference.scope.split_once(':') else {
-                continue;
-            };
-            if !matches!(prefix, "input" | "event" | "context" | "item") {
-                continue;
-            }
-            groups
-                .entry((
-                    message.source_thread.clone(),
-                    prefix.to_owned(),
-                    turn.to_owned(),
-                ))
-                .or_default()
-                .insert(reference.clone());
-        }
-    }
-    let mut payloads = BTreeMap::new();
-    for ((thread, prefix, turn), references) in groups {
-        let kind = match prefix.as_str() {
-            "input" => CanonicalSource::Input,
-            "event" => CanonicalSource::Event,
-            "context" => CanonicalSource::ProviderContext,
-            "item" => CanonicalSource::ToolItem,
-            _ => unreachable!(),
-        };
-        let references = references.into_iter().collect::<Vec<_>>();
-        for page in references.chunks(SOURCE_PAGE_ROWS as usize) {
-            for (reference, payload) in store
-                .compaction_reference_payloads(workspace, &thread, &turn, kind, page)
-                .await?
-            {
-                payloads.insert((thread.clone(), reference), payload);
-            }
-        }
-    }
-    Ok(payloads)
-}
-
-async fn reference_payload_cached(
-    store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    reference: &SourceRef,
-    cached_payloads: Option<&BTreeMap<(String, SourceRef), String>>,
-) -> Result<String> {
-    if let Some(payload) =
-        cached_payloads.and_then(|payloads| payloads.get(&(thread.to_owned(), reference.clone())))
-    {
-        return Ok(payload.clone());
-    }
-    super::history::reference_payload(store, workspace, thread, reference).await
-}
-
 async fn restore_entry(
     store: &CrudStore,
     workspace: &str,
     allowed_threads: &BTreeSet<String>,
     reference: &FrozenMessageRef,
-    cached_payloads: Option<&BTreeMap<(String, SourceRef), String>>,
 ) -> Result<ChatMessage> {
     reference.validate()?;
     let mut payloads = Vec::new();
@@ -1282,14 +1182,8 @@ async fn restore_entry(
             super::coverage::checkpoint_leaves(store, workspace, allowed_threads, source).await?;
         }
         payloads.push(
-            reference_payload_cached(
-                store,
-                workspace,
-                &reference.source_thread,
-                source,
-                cached_payloads,
-            )
-            .await?,
+            super::history::reference_payload(store, workspace, &reference.source_thread, source)
+                .await?,
         );
     }
     let mut candidates = Vec::new();
@@ -1365,12 +1259,11 @@ async fn restore_entry(
                     replay.scope == format!("context:{turn}"),
                     "frozen tool replay crosses turn scope"
                 );
-                let body = reference_payload_cached(
+                let body = super::history::reference_payload(
                     store,
                     workspace,
                     &reference.source_thread,
                     replay,
-                    cached_payloads,
                 )
                 .await?;
                 let view: pioneer_tools::ToolResultView = serde_json::from_str(&body)?;

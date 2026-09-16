@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use pioneer_compaction::{HistoryUnit, SourceRef, SourceRole};
 use pioneer_provider::{ChatMessage, Role};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]
 pub enum PendingOriginKind {
@@ -67,8 +67,7 @@ impl NativeHistoryLayout {
             message_indexes: vec![],
             source_threads: BTreeMap::new(),
         };
-        let mut groups = HashMap::new();
-        let mut source_threads = HashMap::new();
+        let mut groups = BTreeMap::new();
         for (index, message) in messages.iter().enumerate() {
             let Some(origin) = &message.provenance else {
                 // Unattributed input is retained. Current user/steering is
@@ -132,8 +131,9 @@ impl NativeHistoryLayout {
                     id: reference.id.clone(),
                     version: reference.version.clone(),
                 };
-                if let Some(previous) =
-                    source_threads.insert(reference.clone(), origin.thread_id.clone())
+                if let Some(previous) = result
+                    .source_threads
+                    .insert(reference.clone(), origin.thread_id.clone())
                 {
                     ensure!(previous == origin.thread_id, "ambiguous source ownership");
                 }
@@ -168,7 +168,7 @@ impl NativeHistoryLayout {
             }
             unit.complete &= calls == outcomes;
         }
-        let mut seen = HashSet::new();
+        let mut seen = BTreeSet::new();
         for unit in &result.units {
             for reference in &unit.sources {
                 ensure!(
@@ -177,7 +177,6 @@ impl NativeHistoryLayout {
                 );
             }
         }
-        result.source_threads = source_threads.into_iter().collect();
         Ok(result)
     }
 }

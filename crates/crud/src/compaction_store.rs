@@ -103,21 +103,6 @@ impl CrudStore {
         )
         .await
     }
-    /// Read a byte-bounded source page at an already captured history fence.
-    /// Payloads are materialized in one bounded batch and decoded by the caller
-    /// after reader capacity has been released.
-    pub async fn compaction_source_page_at_fence(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        kind: PagedSource,
-        after: i64,
-        capture_order: i64,
-    ) -> Result<SourcePage> {
-        self.compaction_source_page_inner(workspace, thread, turn, kind, after, true, capture_order)
-            .await
-    }
     pub(crate) async fn compaction_source_page_inner(
         &self,
         workspace: &str,
@@ -359,27 +344,6 @@ impl CrudStore {
             thread,
             reference,
             character_offset,
-        )
-        .await
-    }
-    /// Resolve a bounded set of exact canonical references with byte-bounded
-    /// payload queries. Oversized or unavailable sources are omitted so callers
-    /// can retain the fragment-reader fallback.
-    pub async fn compaction_reference_payloads(
-        &self,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        kind: CanonicalSource,
-        references: &[SourceRef],
-    ) -> Result<std::collections::BTreeMap<SourceRef, String>> {
-        repositories::compaction::compaction_reference_payloads(
-            &self.connection,
-            workspace,
-            thread,
-            turn,
-            kind,
-            references,
         )
         .await
     }
