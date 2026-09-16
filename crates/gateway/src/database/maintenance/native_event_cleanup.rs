@@ -13,17 +13,20 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
     let mut last_log = Instant::now();
     loop {
         let started = Instant::now();
+        // Do not put a local timeout around dispatched SQLite work. Dropping
+        // the SQLx future does not interrupt sqlite3_step on its worker thread,
+        // so a timed-out quantum can keep consuming reader capacity while the
+        // maintenance loop starts another one.
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return,
-            result = tokio::time::timeout(Duration::from_secs(5),
-                crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::NativeEventCleanup,
-                    store.cleanup_native_events_quantum(after),
-                )) => result,
+            result = crate::database::attribution::scope_database_workload_result(
+                pioneer_observability::DatabaseWorkload::NativeEventCleanup,
+                store.cleanup_native_events_quantum(after),
+            ) => result,
         };
         let pause = match result {
-            Ok(Ok(outcome)) => {
+            Ok(outcome) => {
                 scanned += outcome.rows_scanned;
                 deleted += outcome.rows_deleted;
                 let complete = outcome.last_rowid.is_none();
@@ -50,15 +53,8 @@ pub(super) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) 
                         .max(Duration::from_millis(25))
                 }
             }
-            error => {
-                tracing::warn!(
-                    reason = if error.is_err() {
-                        "quantum_timeout"
-                    } else {
-                        "database_error"
-                    },
-                    "native event cleanup deferred"
-                );
+            Err(_) => {
+                tracing::warn!(reason = "database_error", "native event cleanup deferred");
                 Duration::from_secs(60)
             }
         };

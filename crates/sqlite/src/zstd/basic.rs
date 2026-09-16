@@ -104,11 +104,38 @@ pub fn compress_column_value(
     level: i32,
     dictionary: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
-    let encoder = match dictionary {
-        Some(dictionary) => Compressor::with_dictionary(level, dictionary),
-        None => Compressor::new(level),
-    };
-    compress_with_encoder(true, input_value, encoder)
+    ColumnValueCompressor::new(level, dictionary)?.compress(input_value)
+}
+
+/// Reusable compact-format compressor for a bounded batch of column values.
+///
+/// Constructing a level-19 compressor with a dictionary is expensive because
+/// zstd builds a CDict. Keep one context for the whole batch instead of paying
+/// that setup cost once per row.
+pub struct ColumnValueCompressor {
+    encoder: Compressor<'static>,
+}
+
+impl ColumnValueCompressor {
+    pub fn new(level: i32, dictionary: Option<&[u8]>) -> anyhow::Result<Self> {
+        let mut encoder = match dictionary {
+            Some(dictionary) => Compressor::with_dictionary(level, dictionary),
+            None => Compressor::new(level),
+        }
+        .context("creating zstd encoder")?;
+        configure_compact_encoder(&mut encoder)?;
+        Ok(Self { encoder })
+    }
+
+    pub fn compress(&mut self, input_value: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.encoder
+            .context_mut()
+            .set_pledged_src_size(Some(input_value.len() as u64))
+            .map_err(|code| anyhow::anyhow!("setting pledged source size (code {code})"))?;
+        self.encoder
+            .compress(input_value)
+            .context("writing data to zstd encoder")
+    }
 }
 
 fn compress_with_encoder(
@@ -117,27 +144,34 @@ fn compress_with_encoder(
     encoder: Result<Compressor, std::io::Error>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut encoder = encoder.context("creating zstd encoder")?;
-    {
-        // pledge source size (benchmarking shows this doesn't help any tho)
-        let cctx = encoder.context_mut();
-        cctx.set_pledged_src_size(Some(input_value.len() as u64))
-            .map_err(|c| anyhow::anyhow!("setting pledged source size (code {c})"))?;
-        // cctx.set_parameter(zstd::zstd_safe::CParameter::BlockDelimiters(false))
-        //    .map_err(|_| anyhow::anyhow!("no"))?;
-    }
     if compact {
-        encoder
-            .include_checksum(false)
-            .context("disable checksums")?;
-        encoder.include_contentsize(false).context("cs")?;
-        encoder.include_dictid(false).context("did")?;
-        encoder.include_magicbytes(false).context("did")?;
+        configure_compact_encoder(&mut encoder)?;
     }
+    encoder
+        .context_mut()
+        .set_pledged_src_size(Some(input_value.len() as u64))
+        .map_err(|code| anyhow::anyhow!("setting pledged source size (code {code})"))?;
     let res = encoder
         .compress(input_value)
         .context("writing data to zstd encoder")?;
 
     Ok(res)
+}
+
+fn configure_compact_encoder(encoder: &mut Compressor<'_>) -> anyhow::Result<()> {
+    encoder
+        .include_checksum(false)
+        .context("disable checksums")?;
+    encoder
+        .include_contentsize(false)
+        .context("disable content size")?;
+    encoder
+        .include_dictid(false)
+        .context("disable dictionary id")?;
+    encoder
+        .include_magicbytes(false)
+        .context("disable magic bytes")?;
+    Ok(())
 }
 
 pub(crate) fn zstd_decompress_fn<'a>(
@@ -248,7 +282,7 @@ fn zstd_decompress_inner<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::compress_column_value;
+    use super::{ColumnValueCompressor, compress_column_value};
     use rusqlite::{Connection, params};
 
     #[test]
@@ -269,5 +303,31 @@ mod tests {
             )
             .expect("decompress compact payload through SQLite function");
         assert_eq!(decompressed, input);
+    }
+
+    #[test]
+    fn reusable_compactor_keeps_the_transparent_column_wire_format() {
+        let database = Connection::open_in_memory().expect("open sqlite memory database");
+        crate::zstd::load(&database).expect("register sqlite-zstd functions");
+        let dictionary = b"shared payload dictionary words repeated across bounded rows";
+        let mut compressor =
+            ColumnValueCompressor::new(19, Some(dictionary)).expect("prepare batch compressor");
+
+        for input in [
+            "first shared payload dictionary words",
+            "second shared payload dictionary words",
+        ] {
+            let compressed = compressor
+                .compress(input.as_bytes())
+                .expect("compress batch row");
+            let decompressed: String = database
+                .query_row(
+                    "SELECT zstd_decompress(?1, 1, ?2, 1)",
+                    params![compressed, dictionary.as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("decompress compact payload through SQLite function");
+            assert_eq!(decompressed, input);
+        }
     }
 }
