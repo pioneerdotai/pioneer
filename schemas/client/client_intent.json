@@ -7875,6 +7875,24 @@
         {
           "type": "object",
           "properties": {
+            "kind": {
+              "type": "string",
+              "const": "model_catalog_proxy"
+            },
+            "proxy_url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "clear_key": {
               "type": "boolean"
             },

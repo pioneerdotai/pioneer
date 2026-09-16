@@ -124,6 +124,12 @@ impl SettingsScreenView {
                     .child(Self::render_settings_divider(cx))
                     .child(self.remote.clone().expect("general remote surface"))
                     .child(Self::render_settings_divider(cx))
+                    .child(self.render_model_catalog_setting(
+                        &settings.general.model_catalog,
+                        desktop_entity.clone(),
+                        cx,
+                    ))
+                    .child(Self::render_settings_divider(cx))
                     .child(Self::render_telemetry_setting(
                         settings.general.telemetry_enabled,
                         desktop_entity,
@@ -1109,6 +1115,77 @@ impl SettingsScreenView {
                             cx.notify();
                         });
                     }),
+            )
+            .into_any_element()
+    }
+
+    fn render_model_catalog_setting(
+        &self,
+        settings: &pioneer_client::settings::types::GatewayModelCatalogSettings,
+        desktop_entity: Entity<Self>,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let input = self.model_catalog_proxy.clone();
+        let transport = settings.proxy_url.as_deref().map_or_else(
+            || t!("settings.model_catalog.direct").to_string(),
+            |url| format!("{}: {url}", t!("settings.model_catalog.configured")),
+        );
+        let availability = if settings.catalog_available {
+            t!("settings.model_catalog.available").to_string()
+        } else {
+            t!("settings.model_catalog.unavailable").to_string()
+        };
+        v_flex()
+            .w_full()
+            .gap_2()
+            .py_3()
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.model_catalog.label").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .opacity(0.6)
+                            .child(t!("settings.model_catalog.description").to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .mt_1()
+                            .opacity(0.72)
+                            .child(format!("{transport} · {availability}")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(Input::new(&input).w_full().min_w_0())
+                    .when(settings.proxy_configured, |row| {
+                        row.child(
+                            small_outline_button("settings-model-catalog-proxy-clear")
+                                .label(t!("settings.model_catalog.clear").to_string())
+                                .on_click(move |_, _, cx| {
+                                    let _ = desktop_entity.update(cx, |view, cx| {
+                                        view.apply_model_catalog_proxy(None, cx);
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .opacity(0.6)
+                    .child(t!("settings.model_catalog.hint").to_string()),
             )
             .into_any_element()
     }
@@ -2350,6 +2427,7 @@ mod tests {
 
         assert!(general_view.contains("render_preflight_model_setting"));
         assert!(general_view.contains("render_telemetry_setting"));
+        assert!(general_view.contains("render_model_catalog_setting"));
         assert!(general_view.contains("self.remote.clone()"));
         assert!(general_view.contains("settings.general.preflight_model"));
         assert!(include_str!("screen.rs").contains("self.render_remote_access_setting"));
@@ -2366,6 +2444,7 @@ mod tests {
         assert!(!general_view.contains("settings.general.thread_context"));
         assert!(source.contains("\"settings-preflight-model\""));
         assert!(source.contains("\"settings-telemetry\""));
+        assert!(source.contains("\"settings-model-catalog-proxy-clear\""));
 
         let remote_access_view = source
             .split("fn render_remote_access_setting")

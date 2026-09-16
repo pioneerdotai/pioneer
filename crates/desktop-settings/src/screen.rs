@@ -182,6 +182,7 @@ pub(crate) struct SettingsScreenView {
     pub remote_access_settings_expanded: bool,
     pub remote_access_key_input_revision: u64,
     pub remote_key: Entity<InputState>,
+    pub model_catalog_proxy: Entity<InputState>,
     remote_key_authority: u64,
     remote_key_configured: bool,
     pub voice_input_action_error: Option<String>,
@@ -246,7 +247,11 @@ impl SettingsScreenView {
                     .placeholder(t!("settings.remote_access.key_placeholder").to_string())
                     .masked(true)
             });
-            let inputs = vec![cx.subscribe(
+            let model_catalog_proxy = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(t!("settings.model_catalog.proxy_placeholder").to_string())
+            });
+            let mut inputs = vec![cx.subscribe(
                 &remote_key,
                 |view, input, event: &gpui_kit::component::input::InputEvent, cx| {
                     if matches!(
@@ -266,6 +271,20 @@ impl SettingsScreenView {
                     }
                 },
             )];
+            inputs.push(cx.subscribe(
+                &model_catalog_proxy,
+                |view, input, event: &gpui_kit::component::input::InputEvent, cx| {
+                    if matches!(
+                        event,
+                        gpui_kit::component::input::InputEvent::PressEnter { .. }
+                    ) {
+                        let value = input.read(cx).value().trim().to_owned();
+                        if !value.is_empty() {
+                            view.apply_model_catalog_proxy(Some(value), cx);
+                        }
+                    }
+                },
+            ));
             let remote = (route == SettingsContentView::General && page.is_none()).then(|| {
                 Self::new(
                     config.clone(),
@@ -291,6 +310,7 @@ impl SettingsScreenView {
                 remote_access_settings_expanded: false,
                 remote_access_key_input_revision: 0,
                 remote_key,
+                model_catalog_proxy,
                 remote_key_authority: config.client.authorization_connection_generation(),
                 remote_key_configured: false,
                 voice_input_action_error: None,

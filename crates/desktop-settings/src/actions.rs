@@ -27,6 +27,9 @@ impl SettingsScreenView {
     pub fn apply_telemetry_setting(&mut self, enabled: bool, _: &mut Context<Self>) {
         self.intent(SettingsIntent::Telemetry { enabled });
     }
+    pub fn apply_model_catalog_proxy(&mut self, proxy_url: Option<String>, _: &mut Context<Self>) {
+        self.intent(SettingsIntent::ModelCatalogProxy { proxy_url });
+    }
     pub fn apply_preflight_model_setting(
         &mut self,
         selection: GatewayMemoryModelSelection,

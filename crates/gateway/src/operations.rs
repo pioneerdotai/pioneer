@@ -43,6 +43,7 @@ pub struct SecretKindCounts {
     pub provider_api_key: usize,
     pub provider_proxy: usize,
     pub cli_runtime_proxy: usize,
+    pub model_catalog_proxy: usize,
     pub mcp_secret: usize,
     pub gateway_access_jwt_signing_key: usize,
     pub gateway_auth_credential_hmac_key: usize,
@@ -252,6 +253,9 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
             }
             Some(SecretKind::CliRuntimeProxy) => {
                 counts.cli_runtime_proxy = counts.cli_runtime_proxy.saturating_add(1)
+            }
+            Some(SecretKind::ModelCatalogProxy) => {
+                counts.model_catalog_proxy = counts.model_catalog_proxy.saturating_add(1)
             }
             Some(SecretKind::McpSecret) => counts.mcp_secret = counts.mcp_secret.saturating_add(1),
             Some(SecretKind::GatewayAccessJwtSigningKey) => {

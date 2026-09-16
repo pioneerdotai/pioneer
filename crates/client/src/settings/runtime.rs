@@ -88,6 +88,9 @@ pub enum SettingsIntent {
     CompactionModel {
         selection: GatewayModelSelection,
     },
+    ModelCatalogProxy {
+        proxy_url: Option<String>,
+    },
     RemoteAccess {
         enabled: bool,
         key: Option<String>,
@@ -149,7 +152,8 @@ impl SettingsIntent {
             Self::Keepawake { .. }
             | Self::Telemetry { .. }
             | Self::PreflightModel { .. }
-            | Self::CompactionModel { .. } => SettingsPage::General,
+            | Self::CompactionModel { .. }
+            | Self::ModelCatalogProxy { .. } => SettingsPage::General,
             Self::RemoteAccess { .. } => SettingsPage::RemoteAccess,
             Self::Memory { .. }
             | Self::MemoryToggle { .. }
@@ -190,6 +194,10 @@ impl SettingsIntent {
                 }),
                 ..Default::default()
             }),
+            Self::ModelCatalogProxy { proxy_url } => {
+                g::model_catalog_proxy_update_plan(Some(snapshot), proxy_url.clone())
+                    .map(|plan| plan.update)
+            }
             Self::RemoteAccess {
                 enabled,
                 key,

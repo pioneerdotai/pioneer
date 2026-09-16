@@ -9,13 +9,44 @@ permissions:
   contents: write
 
 jobs:
+  generate-model-catalog:
+    name: generate-model-catalog
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: generate-and-validate-model-catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-model-catalog
+          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+            release-model-catalog/catalog.json
+
+      - name: upload-model-catalog
+        uses: actions/upload-artifact@v6
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog/catalog.json
+          if-no-files-found: error
+
   build-gateway:
     name: build-${{ matrix.target }}
+    needs: generate-model-catalog
     runs-on: ${{ matrix.os }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       PIONEER_SENTRY_DSN: ${{ secrets.PIONEER_SENTRY_DSN }}
       PIONEER_SENTRY_ENVIRONMENT: production
+      PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +117,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           submodules: recursive
+
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
 
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable

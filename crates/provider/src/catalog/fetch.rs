@@ -33,10 +33,20 @@ async fn fetch_source(client: &reqwest::Client, url: &str) -> Result<SourceRespo
         error: None,
     })
 }
-pub(super) async fn fetch_snapshot() -> Result<SourceSnapshot> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()?;
+fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+    if let Some(proxy_url) = proxy_url {
+        let proxy_url = crate::http::validate_proxy_url(proxy_url)?;
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url)
+                .map_err(|_| anyhow::anyhow!("invalid model catalog proxy URL"))?,
+        );
+    }
+    builder.build().map_err(Into::into)
+}
+
+pub(super) async fn fetch_snapshot(proxy_url: Option<&str>) -> Result<SourceSnapshot> {
+    let client = build_client(proxy_url)?;
     let mut sources = BTreeMap::new();
     for url in SOURCE_URLS {
         sources.insert(url.to_owned(), fetch_source(&client, url).await?);
@@ -81,5 +91,37 @@ mod tests {
             assert_eq!(result.is_ok(), success);
             task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn configured_proxy_carries_catalog_request_without_leaking_credentials_to_errors() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = proxy.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.starts_with("GET http://catalog.invalid/models "));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+        let client = build_client(Some(&format!("http://{address}"))).unwrap();
+        fetch_source(&client, "http://catalog.invalid/models")
+            .await
+            .unwrap();
+        task.await.unwrap();
+
+        let error = build_client(Some("http://secret-user:secret-password@["))
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret-user"));
+        assert!(!error.contains("secret-password"));
     }
 }

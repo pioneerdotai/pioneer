@@ -136,6 +136,13 @@
           "type": "boolean",
           "default": false
         },
+        "model_catalog": {
+          "$ref": "#/$defs/GatewayModelCatalogSettings",
+          "default": {
+            "catalog_available": false,
+            "proxy_configured": false
+          }
+        },
         "preflight_model": {
           "$ref": "#/$defs/GatewayMemoryModelSelection",
           "default": {
@@ -220,6 +227,26 @@
         "debug_trace_enabled",
         "strict_diagnostics_enabled"
       ]
+    },
+    "GatewayModelCatalogSettings": {
+      "type": "object",
+      "properties": {
+        "catalog_available": {
+          "type": "boolean",
+          "default": false
+        },
+        "proxy_configured": {
+          "type": "boolean",
+          "default": false
+        },
+        "proxy_url": {
+          "description": "Credential-free display URL. Userinfo, query, and fragment are removed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "GatewayModelSelection": {
       "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",
@@ -528,6 +555,10 @@
               "source": "inherit"
             },
             "keepawake": false,
+            "model_catalog": {
+              "catalog_available": false,
+              "proxy_configured": false
+            },
             "preflight_model": {
               "source": "thread"
             },

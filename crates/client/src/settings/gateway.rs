@@ -209,6 +209,7 @@ pub fn keepawake_update_plan(
                 keepawake: Some(enabled),
                 telemetry_enabled: None,
                 preflight_model: None,
+                model_catalog_proxy: None,
             }),
             memory: None,
             self_improvement: None,
@@ -235,6 +236,7 @@ pub fn telemetry_enabled_update_plan(
                 keepawake: None,
                 telemetry_enabled: Some(enabled),
                 preflight_model: None,
+                model_catalog_proxy: None,
             }),
             memory: None,
             self_improvement: None,
@@ -261,6 +263,7 @@ pub fn preflight_model_update_plan(
                 keepawake: None,
                 telemetry_enabled: None,
                 preflight_model: Some(model_selection),
+                model_catalog_proxy: None,
             }),
             memory: None,
             self_improvement: None,
@@ -270,6 +273,67 @@ pub fn preflight_model_update_plan(
             voice_input: None,
         },
     })
+}
+
+pub fn model_catalog_proxy_update_plan(
+    current: Option<&GatewaySettingsSnapshot>,
+    proxy_url: Option<String>,
+) -> Option<GatewaySettingsUpdatePlan> {
+    let mut snapshot = current.cloned()?;
+    snapshot.general.model_catalog.proxy_configured = proxy_url.is_some();
+    snapshot.general.model_catalog.proxy_url = None;
+    Some(GatewaySettingsUpdatePlan {
+        snapshot,
+        update: GatewaySettingsUpdate {
+            general: Some(GatewayGeneralSettingsUpdate {
+                model_catalog_proxy: Some(pioneer_protocol::GatewayModelCatalogProxyUpdate {
+                    proxy_url,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    })
+}
+
+#[cfg(test)]
+mod model_catalog_proxy_tests {
+    use super::*;
+    use pioneer_protocol::{GatewayGeneralSettings, GatewayMemorySettings};
+
+    fn snapshot() -> GatewaySettingsSnapshot {
+        GatewaySettingsSnapshot {
+            self_improvement_status: None,
+            general: GatewayGeneralSettings::default(),
+            memory: GatewayMemorySettings::default(),
+            self_improvement: Default::default(),
+            thread_episodic: Default::default(),
+            cli_runtimes: Default::default(),
+            remote_access: Default::default(),
+            voice_input: Default::default(),
+        }
+    }
+
+    #[test]
+    fn catalog_proxy_plan_transports_secret_only_in_the_update() {
+        let plan = model_catalog_proxy_update_plan(
+            Some(&snapshot()),
+            Some("http://user:pass@proxy.invalid:8080".to_owned()),
+        )
+        .unwrap();
+        assert!(plan.snapshot.general.model_catalog.proxy_configured);
+        assert_eq!(plan.snapshot.general.model_catalog.proxy_url, None);
+        assert_eq!(
+            plan.update
+                .general
+                .unwrap()
+                .model_catalog_proxy
+                .unwrap()
+                .proxy_url
+                .as_deref(),
+            Some("http://user:pass@proxy.invalid:8080")
+        );
+    }
 }
 
 pub fn thread_episodic_enabled_update_plan(

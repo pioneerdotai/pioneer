@@ -303,8 +303,9 @@ pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, Publi
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayNativeAgentConfig, GatewayRemoteAccessErrorKind,
-    GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
+    GatewayMemorySettings, GatewayModelCatalogProxyUpdate, GatewayModelCatalogSettings,
+    GatewayNativeAgentConfig, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
+    GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
     GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
     GatewaySelfImprovementSettings, GatewaySelfImprovementStatus, GatewaySettingsGetParams,

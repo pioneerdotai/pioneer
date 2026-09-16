@@ -7,13 +7,54 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{OnceLock, RwLock},
     time::Duration,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CACHE_FILE: &str = "catalog.json";
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const BUNDLED_CATALOG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/bundled_model_catalog.json"));
+
+#[derive(Default)]
+struct RefreshControl {
+    proxy_url: RwLock<Option<String>>,
+    changed: Notify,
+}
+
+fn refresh_control() -> &'static RefreshControl {
+    static CONTROL: OnceLock<RefreshControl> = OnceLock::new();
+    CONTROL.get_or_init(RefreshControl::default)
+}
+
+/// Update the process-wide catalog transport without restarting Gateway.
+/// The raw URL is retained only in memory and is never logged.
+pub fn normalize_refresh_proxy(proxy_url: Option<String>) -> Result<Option<String>> {
+    proxy_url
+        .map(|value| crate::http::validate_proxy_url(&value))
+        .transpose()
+}
+
+pub fn configure_refresh_proxy(proxy_url: Option<String>) -> Result<()> {
+    let normalized = normalize_refresh_proxy(proxy_url)?;
+    *refresh_control()
+        .proxy_url
+        .write()
+        .expect("catalog proxy lock") = normalized;
+    refresh_control().changed.notify_one();
+    Ok(())
+}
+
+fn refresh_proxy() -> Option<String> {
+    refresh_control()
+        .proxy_url
+        .read()
+        .expect("catalog proxy lock")
+        .clone()
+}
 
 #[derive(Serialize, Deserialize)]
 struct SavedCatalog {
@@ -53,6 +94,50 @@ fn load_cache(directory: &Path) -> Result<Option<ModelCatalog>> {
     saved.validate().map(Some)
 }
 
+fn validate_saved_bytes(bytes: &[u8]) -> Result<ModelCatalog> {
+    ensure!(!bytes.is_empty(), "bundled model catalog is unavailable");
+    ensure!(
+        bytes.len() as u64 <= MAX_CACHE_BYTES,
+        "model catalog cache too large"
+    );
+    serde_json::from_slice::<SavedCatalog>(bytes)?.validate()
+}
+
+fn persist_bytes(directory: &Path, bytes: &[u8]) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(directory.join(CACHE_FILE))?;
+    Ok(())
+}
+
+/// Publish the last-good cache, or atomically install the catalog embedded by
+/// the release build into the exact same path used by network refreshes.
+pub fn restore_or_install_catalog(directory: &Path) -> Result<()> {
+    restore_or_install_catalog_from_bytes(catalog_store(), directory, BUNDLED_CATALOG)
+}
+
+fn restore_or_install_catalog_from_bytes(
+    store: &CatalogStore,
+    directory: &Path,
+    bundled_catalog: &[u8],
+) -> Result<()> {
+    match load_cache(directory) {
+        Ok(Some(catalog)) => {
+            store.publish(catalog);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(error) if bundled_catalog.is_empty() => return Err(error),
+        Err(_) => {}
+    }
+    let catalog = validate_saved_bytes(bundled_catalog)?;
+    persist_bytes(directory, bundled_catalog)?;
+    store.publish(catalog);
+    Ok(())
+}
+
 /// Restore previously downloaded JSON without fetching. Run on a blocking worker.
 /// Missing cache leaves the catalog unavailable; malformed cache is an error.
 pub fn restore_cached_catalog(directory: &Path) -> Result<()> {
@@ -79,12 +164,34 @@ fn prepare_update(directory: &Path, snapshot: generator::SourceSnapshot) -> Resu
         bytes.len() as u64 <= MAX_CACHE_BYTES,
         "model catalog cache too large"
     );
-    fs::create_dir_all(directory)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    persist_bytes(directory, &bytes)?;
+    Ok(catalog)
+}
+
+/// Release-pipeline entry point. Network access happens only when this is
+/// called explicitly; ordinary local Cargo builds never fetch metadata.
+pub async fn generate_catalog_file(output: &Path, proxy_url: Option<&str>) -> Result<()> {
+    let snapshot = fetch::fetch_snapshot(proxy_url).await?;
+    let parent = output
+        .parent()
+        .context("model catalog output path has no parent")?;
+    let saved = SavedCatalog {
+        version: 1,
+        updated_at: snapshot.captured_at.clone(),
+        catalog: generator::generate(&snapshot, false)?,
+    };
+    saved.validate()?;
+    let bytes = serde_json::to_vec(&saved)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_CACHE_BYTES,
+        "model catalog cache too large"
+    );
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(directory.join(CACHE_FILE))?;
-    Ok(catalog)
+    temporary.persist(output)?;
+    Ok(())
 }
 
 #[async_trait]
@@ -95,7 +202,8 @@ struct PublicSources;
 #[async_trait]
 impl CatalogSource for PublicSources {
     async fn fetch(&self) -> Result<generator::SourceSnapshot> {
-        fetch::fetch_snapshot().await
+        let proxy_url = refresh_proxy();
+        fetch::fetch_snapshot(proxy_url.as_deref()).await
     }
 }
 
@@ -108,7 +216,7 @@ pub async fn run_catalog_updates(directory: PathBuf, cancellation: CancellationT
     }
     let saved_directory = directory.clone();
     if !matches!(
-        tokio::task::spawn_blocking(move || restore_cached_catalog(&saved_directory)).await,
+        tokio::task::spawn_blocking(move || restore_or_install_catalog(&saved_directory)).await,
         Ok(Ok(()))
     ) {
         tracing::warn!("model catalog cache unavailable; awaiting successful download");
@@ -140,6 +248,7 @@ async fn run_updates(
             biased;
             _ = cancellation.cancelled() => return,
             _ = timer.tick() => {},
+            _ = refresh_control().changed.notified() => {},
         }
         let snapshot = tokio::select! {
             biased;
@@ -242,6 +351,40 @@ mod tests {
         restarted.publish(load_cache(dir.path()).unwrap().unwrap());
         assert_eq!(label(&restarted), "fresh model");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn bundled_catalog_materializes_to_cache_path_and_existing_cache_wins() {
+        let source_dir = tempfile::tempdir().unwrap();
+        prepare_update(source_dir.path(), snapshot("bundled model")).unwrap();
+        let bundled = fs::read(source_dir.path().join(CACHE_FILE)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore::default();
+        restore_or_install_catalog_from_bytes(&store, dir.path(), &bundled).unwrap();
+        assert_eq!(label(&store), "bundled model");
+        assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), bundled);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        prepare_update(dir.path(), snapshot("downloaded model")).unwrap();
+        let restarted = CatalogStore::default();
+        restore_or_install_catalog_from_bytes(&restarted, dir.path(), &bundled).unwrap();
+        assert_eq!(label(&restarted), "downloaded model");
+    }
+
+    #[test]
+    fn corrupt_cache_is_replaced_only_by_a_valid_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(CACHE_FILE), b"broken").unwrap();
+        let store = CatalogStore::default();
+        assert!(restore_or_install_catalog_from_bytes(&store, dir.path(), b"broken").is_err());
+        assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), b"broken");
+
+        let source_dir = tempfile::tempdir().unwrap();
+        prepare_update(source_dir.path(), snapshot("fallback model")).unwrap();
+        let bundled = fs::read(source_dir.path().join(CACHE_FILE)).unwrap();
+        restore_or_install_catalog_from_bytes(&store, dir.path(), &bundled).unwrap();
+        assert_eq!(label(&store), "fallback model");
+        assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), bundled);
     }
     #[test]
     fn absent_corrupt_and_oversized_cache_leave_catalog_unavailable() {

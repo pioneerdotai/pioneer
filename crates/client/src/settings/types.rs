@@ -6,11 +6,11 @@ pub use pioneer_protocol::{
 };
 pub use pioneer_protocol::{
     GatewayGeneralSettings, GatewayMemoryModelSelection, GatewayMemorySettings,
-    GatewayModelSelection, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
-    GatewayRemoteAccessState, GatewaySelfImprovementModelSelection, GatewaySelfImprovementSettings,
-    GatewayThreadEpisodicVectorLocalModelStatus, GatewayThreadEpisodicVectorProvider,
-    GatewayThreadEpisodicVectorRefillStatus, GatewayThreadEpisodicVectorSearchSettings,
-    GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings,
-    ModelSelectionTransport, ProviderModelInfo, RuntimeSummary, SelfImprovementPhase,
-    SelfImprovementStatusReason,
+    GatewayModelCatalogSettings, GatewayModelSelection, GatewayRemoteAccessErrorKind,
+    GatewayRemoteAccessSettings, GatewayRemoteAccessState, GatewaySelfImprovementModelSelection,
+    GatewaySelfImprovementSettings, GatewayThreadEpisodicVectorLocalModelStatus,
+    GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorRefillStatus,
+    GatewayThreadEpisodicVectorSearchSettings, GatewayVoiceInputProvider,
+    GatewayVoiceInputRuntimePhase, GatewayVoiceInputSettings, ModelSelectionTransport,
+    ProviderModelInfo, RuntimeSummary, SelfImprovementPhase, SelfImprovementStatusReason,
 };

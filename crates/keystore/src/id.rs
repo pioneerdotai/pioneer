@@ -5,6 +5,7 @@ use crate::{KeystoreError, Result};
 pub const PROVIDER_API_KEY_SERVICE: &str = "pioneer.gateway.provider_api_key";
 pub const PROVIDER_PROXY_SERVICE: &str = "pioneer.gateway.provider_proxy";
 pub const CLI_RUNTIME_PROXY_SERVICE: &str = "pioneer.gateway.cli_runtime_proxy";
+pub const MODEL_CATALOG_PROXY_SERVICE: &str = "pioneer.gateway.model_catalog_proxy";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
 pub const USER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.user_jwt_token";
 pub const GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE: &str = "pioneer.gateway.access_jwt_signing_key";
@@ -53,6 +54,13 @@ impl SecretId {
             CLI_RUNTIME_PROXY_SERVICE,
             format!("workspace:{workspace_id}:runtime:{runtime_id}"),
         )
+    }
+
+    pub fn model_catalog_proxy() -> Self {
+        Self {
+            service: MODEL_CATALOG_PROXY_SERVICE.to_owned(),
+            user: GATEWAY_AUTH_KEY_USER.to_owned(),
+        }
     }
 
     pub fn user_jwt_token(token_id: &str) -> Result<Self> {
@@ -113,6 +121,7 @@ pub enum SecretKind {
     ProviderApiKey,
     ProviderProxy,
     CliRuntimeProxy,
+    ModelCatalogProxy,
     McpSecret,
     UserJwtToken,
     GatewayAccessJwtSigningKey,
@@ -127,6 +136,7 @@ impl SecretKind {
             SecretKind::ProviderApiKey => PROVIDER_API_KEY_SERVICE,
             SecretKind::ProviderProxy => PROVIDER_PROXY_SERVICE,
             SecretKind::CliRuntimeProxy => CLI_RUNTIME_PROXY_SERVICE,
+            SecretKind::ModelCatalogProxy => MODEL_CATALOG_PROXY_SERVICE,
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
             SecretKind::UserJwtToken => USER_JWT_TOKEN_SERVICE,
             SecretKind::GatewayAccessJwtSigningKey => GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE,
@@ -141,6 +151,7 @@ impl SecretKind {
             PROVIDER_API_KEY_SERVICE => Some(SecretKind::ProviderApiKey),
             PROVIDER_PROXY_SERVICE => Some(SecretKind::ProviderProxy),
             CLI_RUNTIME_PROXY_SERVICE => Some(SecretKind::CliRuntimeProxy),
+            MODEL_CATALOG_PROXY_SERVICE => Some(SecretKind::ModelCatalogProxy),
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
             USER_JWT_TOKEN_SERVICE => Some(SecretKind::UserJwtToken),
             GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE => Some(SecretKind::GatewayAccessJwtSigningKey),
@@ -278,6 +289,17 @@ mod tests {
 
         assert_eq!(id.service(), CLI_RUNTIME_PROXY_SERVICE);
         assert_eq!(id.user(), "workspace:ws_1:runtime:codex_work");
+    }
+
+    #[test]
+    fn model_catalog_proxy_id_is_gateway_global() {
+        let id = SecretId::model_catalog_proxy();
+        assert_eq!(id.service(), MODEL_CATALOG_PROXY_SERVICE);
+        assert_eq!(id.user(), GATEWAY_AUTH_KEY_USER);
+        assert_eq!(
+            SecretKind::from_service(id.service()),
+            Some(SecretKind::ModelCatalogProxy)
+        );
     }
 
     #[test]

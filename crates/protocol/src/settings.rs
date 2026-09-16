@@ -103,6 +103,26 @@ pub struct GatewayGeneralSettingsUpdate {
     pub telemetry_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_model: Option<GatewayMemoryModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_proxy: Option<GatewayModelCatalogProxyUpdate>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayModelCatalogProxyUpdate {
+    /// `Some` configures/replaces the proxy; `None` clears it. The value is
+    /// consumed by Gateway's keystore layer and is never persisted in settings.
+    pub proxy_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayModelCatalogSettings {
+    #[serde(default)]
+    pub proxy_configured: bool,
+    /// Credential-free display URL. Userinfo, query, and fragment are removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub catalog_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -229,6 +249,8 @@ pub struct GatewayGeneralSettings {
     pub telemetry_enabled: bool,
     #[serde(default)]
     pub preflight_model: GatewayMemoryModelSelection,
+    #[serde(default)]
+    pub model_catalog: GatewayModelCatalogSettings,
 }
 
 impl Default for GatewayGeneralSettings {
@@ -238,6 +260,7 @@ impl Default for GatewayGeneralSettings {
             keepawake: false,
             telemetry_enabled: default_telemetry_enabled(),
             preflight_model: GatewayMemoryModelSelection::default(),
+            model_catalog: GatewayModelCatalogSettings::default(),
         }
     }
 }
@@ -880,7 +903,8 @@ mod tests {
                 "compaction_model",
                 "keepawake",
                 "telemetry_enabled",
-                "preflight_model"
+                "preflight_model",
+                "model_catalog"
             ])
         );
         let update: GatewayGeneralSettingsUpdate = serde_json::from_value(
@@ -1000,6 +1024,7 @@ mod tests {
                 "planner-provider",
                 "planner-model",
             )),
+            model_catalog_proxy: None,
         };
 
         let serialized = serde_json::to_string(&update).expect("settings update should serialize");
@@ -1011,6 +1036,25 @@ mod tests {
         let roundtrip: GatewayGeneralSettingsUpdate =
             serde_json::from_str(serialized.as_str()).expect("settings update should deserialize");
         assert_eq!(roundtrip, update);
+    }
+
+    #[test]
+    fn model_catalog_proxy_update_is_explicit_and_snapshot_never_requires_a_secret() {
+        let update = GatewayGeneralSettingsUpdate {
+            model_catalog_proxy: Some(super::GatewayModelCatalogProxyUpdate {
+                proxy_url: Some("socks5://user:pass@127.0.0.1:1080".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&update).unwrap();
+        let decoded: GatewayGeneralSettingsUpdate = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.model_catalog_proxy.unwrap().proxy_url.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        let snapshot = GatewayGeneralSettings::default();
+        assert!(!snapshot.model_catalog.proxy_configured);
+        assert_eq!(snapshot.model_catalog.proxy_url, None);
     }
 
     #[test]

@@ -873,6 +873,41 @@ async fn run_gateway_until_shutdown_inner(
     let runtime_result = match services_start_result {
         Ok(()) => {
             services_start_stage.succeed();
+            let catalog_directory = runtime_home.join("providers").join("models");
+            match gateway_secrets.get_model_catalog_proxy() {
+                Ok(proxy_url) => {
+                    if let Err(error) =
+                        pioneer_provider::catalog::runtime::configure_refresh_proxy(proxy_url)
+                    {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "stored model catalog proxy is invalid; using direct transport"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    error = %format!("{error:#}"),
+                    "model catalog proxy unavailable; using direct transport"
+                ),
+            }
+            let restore_directory = catalog_directory.clone();
+            match tokio::task::spawn_blocking(move || {
+                pioneer_provider::catalog::runtime::restore_or_install_catalog(
+                    restore_directory.as_path(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    error = %format!("{error:#}"),
+                    "model catalog bootstrap unavailable; background refresh will retry"
+                ),
+                Err(error) => warn!(
+                    error = %format!("{error:#}"),
+                    "model catalog bootstrap task failed; background refresh will retry"
+                ),
+            }
             // Schema, identity, authorization and the fast in-process service
             // bindings are complete. Clients may now authenticate while the
             // single owned post-startup pipeline brings optional subsystems

@@ -102,6 +102,16 @@
             "null"
           ]
         },
+        "model_catalog_proxy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayModelCatalogProxyUpdate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "preflight_model": {
           "anyOf": [
             {
@@ -192,6 +202,18 @@
         "debug_trace_enabled",
         "strict_diagnostics_enabled"
       ]
+    },
+    "GatewayModelCatalogProxyUpdate": {
+      "type": "object",
+      "properties": {
+        "proxy_url": {
+          "description": "`Some` configures/replaces the proxy; `None` clears it. The value is\nconsumed by Gateway's keystore layer and is never persisted in settings.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "GatewayModelSelection": {
       "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",

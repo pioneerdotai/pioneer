@@ -199,6 +199,7 @@ impl GatewayGeneralSettings {
                     .as_ref()
                     .unwrap_or(&config.preflight_model),
             ),
+            model_catalog: Default::default(),
         }
     }
 
@@ -2958,6 +2959,9 @@ backend = "keystore"
                         "planner-provider",
                         "planner-model",
                     )),
+                    model_catalog_proxy: Some(pioneer_protocol::GatewayModelCatalogProxyUpdate {
+                        proxy_url: Some("http://user:pass@proxy.invalid:8080".to_owned()),
+                    }),
                 }),
                 memory: None,
                 self_improvement: None,
@@ -2976,6 +2980,7 @@ backend = "keystore"
         assert!(content.contains("preflight_model"));
         assert!(content.contains("model_provider = \"planner-provider\""));
         assert!(content.contains("model = \"planner-model\""));
+        assert!(!content.contains("model_catalog_proxy"));
         assert!(!content.contains("[memory]"));
 
         let _ = fs::remove_dir_all(temp_dir);

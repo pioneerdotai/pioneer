@@ -146,6 +146,45 @@ impl GatewaySecrets {
             .context("failed to read workspace CLI runtime proxy from keystore")
     }
 
+    pub(crate) fn get_model_catalog_proxy(&self) -> Result<Option<String>> {
+        self.store
+            .get_string(&SecretId::model_catalog_proxy())
+            .context("failed to read model catalog proxy from keystore")
+    }
+
+    pub(crate) fn set_model_catalog_proxy(&self, proxy_url: &str) -> Result<()> {
+        if proxy_url.trim().is_empty() {
+            bail!("model catalog proxy URL must not be empty");
+        }
+        let id = SecretId::model_catalog_proxy();
+        let now = current_unix_i64()?;
+        let created_at = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ModelCatalogProxy))?
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+        self.store
+            .put_string(
+                &id,
+                proxy_url.trim(),
+                SecretMeta {
+                    kind: SecretKind::ModelCatalogProxy,
+                    label: Some("model catalog proxy".to_owned()),
+                    created_at_unix: created_at,
+                    updated_at_unix: now,
+                },
+            )
+            .context("failed to write model catalog proxy to keystore")
+    }
+
+    pub(crate) fn delete_model_catalog_proxy(&self) -> Result<bool> {
+        self.store
+            .delete(&SecretId::model_catalog_proxy())
+            .context("failed to delete model catalog proxy from keystore")
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_provider_api_key(&self, provider: &str, api_key: &str) -> Result<String> {
         if api_key.trim().is_empty() {
@@ -1105,6 +1144,26 @@ mod tests {
                 .expect("read deleted proxy"),
             None
         );
+    }
+
+    #[test]
+    fn model_catalog_proxy_is_gateway_global_and_keystore_backed() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
+        secrets
+            .set_model_catalog_proxy("socks5://user:pass@127.0.0.1:1080")
+            .expect("set catalog proxy");
+        assert_eq!(
+            secrets
+                .get_model_catalog_proxy()
+                .expect("read catalog proxy"),
+            Some("socks5://user:pass@127.0.0.1:1080".to_owned())
+        );
+        assert!(
+            secrets
+                .delete_model_catalog_proxy()
+                .expect("delete catalog proxy")
+        );
+        assert_eq!(secrets.get_model_catalog_proxy().unwrap(), None);
     }
 
     #[test]

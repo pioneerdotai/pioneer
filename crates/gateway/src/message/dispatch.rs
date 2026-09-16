@@ -49,6 +49,17 @@ use crate::authorization::{
     record_authorization_unavailable, record_method_decision, record_method_decision_for_action,
 };
 
+fn public_proxy_url(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        parsed.set_username("").ok()?;
+        parsed.set_password(None).ok()?;
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
 pub(super) enum RequestAdmission {
     Superuser,
     /// The route domain resolves both exact collaboration roots from typed
@@ -7388,6 +7399,13 @@ impl MessageProcessor {
     ) -> anyhow::Result<pioneer_protocol::GatewaySettingsSnapshot> {
         let connection_id = request_context.connection_id();
         let _settings_guard = self.gateway_settings_update_lock.lock().await;
+        let catalog_proxy_update = update
+            .general
+            .as_ref()
+            .and_then(|general| general.model_catalog_proxy.as_ref())
+            .map(|update| update.proxy_url.clone())
+            .map(pioneer_provider::catalog::runtime::normalize_refresh_proxy)
+            .transpose()?;
         if update.self_improvement.is_some() && self.self_improvement_supervisor.is_none() {
             anyhow::bail!(
                 "self-improvement settings cannot be updated without the runtime supervisor"
@@ -7512,9 +7530,37 @@ impl MessageProcessor {
             self.apply_keepawake_setting(keepawake)
                 .context("failed to apply keepawake setting")?;
         }
+        let previous_catalog_proxy = if catalog_proxy_update.is_some() {
+            Some(self.gateway_secrets.get_model_catalog_proxy()?)
+        } else {
+            None
+        };
+        if let Some(proxy_url) = catalog_proxy_update.as_ref() {
+            match proxy_url {
+                Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url)?,
+                None => {
+                    self.gateway_secrets.delete_model_catalog_proxy()?;
+                }
+            }
+        }
         if let Err(error) =
             crate::settings::save_gateway_settings(settings_path.as_path(), &settings)
         {
+            if let Some(previous_proxy) = previous_catalog_proxy.as_ref() {
+                let rollback = match previous_proxy {
+                    Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url),
+                    None => self
+                        .gateway_secrets
+                        .delete_model_catalog_proxy()
+                        .map(|_| ()),
+                };
+                if let Err(rollback_error) = rollback {
+                    warn!(
+                        error = %format!("{rollback_error:#}"),
+                        "failed to restore model catalog proxy after settings save failure"
+                    );
+                }
+            }
             if changes.general.keepawake.is_some() {
                 if let Err(rollback_error) =
                     self.apply_keepawake_setting(previous_general_settings.keepawake)
@@ -7549,6 +7595,21 @@ impl MessageProcessor {
             let restore_error =
                 crate::settings::save_gateway_settings(settings_path.as_path(), &previous_settings)
                     .err();
+            if let Some(previous_proxy) = previous_catalog_proxy.as_ref() {
+                let rollback = match previous_proxy {
+                    Some(proxy_url) => self.gateway_secrets.set_model_catalog_proxy(proxy_url),
+                    None => self
+                        .gateway_secrets
+                        .delete_model_catalog_proxy()
+                        .map(|_| ()),
+                };
+                if let Err(error) = rollback {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "failed to restore model catalog proxy after settings projection failure"
+                    );
+                }
+            }
             let projection_restore_error = if restore_error.is_none() {
                 match previous_cli_identity_instances {
                     Some(instances) => pioneer_crud::sync_cli_runtime_identity_catalog(
@@ -7591,6 +7652,10 @@ impl MessageProcessor {
         if let Some(telemetry_enabled) = changes.general.telemetry_enabled {
             pioneer_observability::set_telemetry_enabled(telemetry_enabled);
             info!(telemetry_enabled, "gateway telemetry preference updated");
+        }
+
+        if let Some(proxy_url) = catalog_proxy_update {
+            pioneer_provider::catalog::runtime::configure_refresh_proxy(proxy_url)?;
         }
 
         if changes.cli_runtimes {
@@ -7786,6 +7851,12 @@ impl MessageProcessor {
             has_remote_access_key,
             remote_access_status,
         );
+        let catalog_proxy = self.gateway_secrets.get_model_catalog_proxy()?;
+        snapshot.general.model_catalog = pioneer_protocol::GatewayModelCatalogSettings {
+            proxy_configured: catalog_proxy.is_some(),
+            proxy_url: catalog_proxy.as_deref().and_then(public_proxy_url),
+            catalog_available: pioneer_provider::catalog::model_catalog().is_ok(),
+        };
         let desired = settings.effective_self_improvement_settings_for_workspace(workspace_id);
         let authoritative =
             crate::self_improvement::settings::resolve_authoritative_settings_for_workspace(
@@ -8075,5 +8146,20 @@ fn voice_reconfiguration_busy_error(
                 "details": {},
             })),
         },
+    }
+}
+
+#[cfg(test)]
+mod model_catalog_proxy_tests {
+    use super::public_proxy_url;
+
+    #[test]
+    fn public_proxy_url_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            public_proxy_url("http://alice:secret@proxy.example:8080/path?token=hidden#private")
+                .as_deref(),
+            Some("http://proxy.example:8080/path")
+        );
+        assert_eq!(public_proxy_url("not a url"), None);
     }
 }
