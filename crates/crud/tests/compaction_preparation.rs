@@ -59,50 +59,6 @@ async fn finish(store: &CrudStore) {
 }
 
 #[tokio::test]
-async fn maintenance_discovery_pages_only_histories_that_are_not_ready() {
-    let store = fixture(false).await;
-    let first = store
-        .compaction_history_preparation_candidate_after("")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(first, ("ws".to_owned(), "other".to_owned()));
-
-    while !store
-        .compaction_prepare_history_quantum(&first.0, &first.1)
-        .await
-        .unwrap()
-    {}
-    let second = store
-        .compaction_history_preparation_candidate_after(&first.1)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(second, ("ws".to_owned(), "thread".to_owned()));
-
-    store
-        .database_connection()
-        .execute_unprepared(
-            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('zz-new','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        )
-        .await
-        .unwrap();
-    assert!(
-        store
-            .compaction_history_prepared("ws", "zz-new")
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .compaction_history_preparation_candidate_after("thread")
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
 async fn legacy_history_is_prepared_in_bounded_resumable_pages_before_a_new_fence() {
     let store = fixture(false).await;
     assert_eq!(

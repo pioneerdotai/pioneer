@@ -13,19 +13,6 @@ use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
 
 impl CrudStore {
-    /// Select one legacy thread whose canonical history registration has not
-    /// completed. This is metadata-only discovery for the maintenance worker.
-    pub async fn compaction_history_preparation_candidate_after(
-        &self,
-        after_thread: &str,
-    ) -> Result<Option<(String, String)>> {
-        repositories::compaction_preparation::candidate_after(
-            &self.with_maintenance_access(),
-            after_thread,
-        )
-        .await
-    }
-
     /// One restart-safe, payload-free page of legacy history preparation.
     /// Dropping the caller cancels work; a later caller resumes its durable cursor.
     pub async fn compaction_prepare_history_quantum(

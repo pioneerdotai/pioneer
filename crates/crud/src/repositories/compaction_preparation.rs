@@ -1,6 +1,5 @@
-//! Bounded registration of legacy metadata, shared by proactive maintenance and
-//! on-demand correctness gates. Discovery happens outside the writer; sources
-//! and cursor are revalidated inside the transaction.
+//! Bounded, demand-driven registration of legacy metadata. Discovery happens
+//! outside the writer; sources and cursor are revalidated inside the transaction.
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 use pioneer_entity::{
@@ -8,7 +7,7 @@ use pioneer_entity::{
     compaction_input_revision, compaction_projection_epoch as epoch, compaction_source_revision,
     thread, turn, turn_event, turn_input, turn_llm_context,
 };
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Query};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, IntoActiveModel, QueryOrder, QuerySelect, TransactionTrait,
     entity::prelude::*,
@@ -39,43 +38,6 @@ pub(crate) async fn ready(store: &CrudStore, workspace: &str, thread: &str) -> R
     Ok(progress(&store.connection, workspace, thread)
         .await?
         .is_some_and(|p| p.ready == 1))
-}
-
-/// Find one legacy history that still needs registration. The caller owns the
-/// traversal cursor so a corrupt thread cannot permanently block later work.
-/// Newly created threads are excluded because their insert trigger records a
-/// ready preparation row immediately.
-pub(crate) async fn candidate_after(
-    store: &CrudStore,
-    after_thread: &str,
-) -> Result<Option<(String, String)>> {
-    Ok(thread::Entity::find()
-        .select_only()
-        .column(thread::Column::WorkspaceId)
-        .column(thread::Column::Id)
-        .filter(thread::Column::Id.gt(after_thread))
-        .filter(
-            Expr::exists(
-                Query::select()
-                    .expr(Expr::val(1_i64))
-                    .from(preparation::Entity)
-                    .and_where(
-                        Expr::col((preparation::Entity, preparation::Column::ThreadId))
-                            .eq(Expr::col((thread::Entity, thread::Column::Id)))
-                            .and(
-                                Expr::col((preparation::Entity, preparation::Column::Ready))
-                                    .eq(1_i64),
-                            ),
-                    )
-                    .to_owned(),
-            )
-            .not(),
-        )
-        .order_by_asc(thread::Column::Id)
-        .limit(1)
-        .into_tuple::<(String, String)>()
-        .one(&store.connection)
-        .await?)
 }
 
 // Entity projections deliberately select metadata only, including through the
