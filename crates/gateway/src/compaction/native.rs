@@ -9,8 +9,8 @@ use pioneer_agent::compaction::{
     request::NativeRequestProjection,
 };
 use pioneer_compaction::{
-    CompactionMode, CompactionSettings, ModelBudget, ModelSelection, SourceRole, Transport,
-    effective_selection, plan_compaction,
+    CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
+    coverage_domain_for, effective_selection, plan_compaction,
 };
 use pioneer_crud::compaction::ManifestEntry;
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
@@ -239,6 +239,7 @@ pub(super) async fn prepare_native_projection(
             fixed,
             goal,
             CompactionMode::Normal,
+            CoverageDomain::WorkingContext,
             recovery,
             &format!("{owner}:{version}:{head:?}"),
         )
@@ -250,6 +251,7 @@ pub(super) async fn prepare_native_projection(
                 fixed,
                 goal,
                 CompactionMode::Emergency,
+                CoverageDomain::WorkingContext,
                 recovery,
                 &format!("{owner}:{version}:{head:?}"),
             )
@@ -260,10 +262,10 @@ pub(super) async fn prepare_native_projection(
         // A new summary incorporates the old basis. Remove its old prompt slot
         // as part of the same replacement, even if the tail planner retained it.
         for (index, unit) in layout.units.iter().enumerate() {
-            if unit.role == SourceRole::Own
-                && unit.sources.iter().any(|s| {
-                    s.scope == format!("checkpoint:{owner}") && basis.as_ref() == Some(&s.id)
-                })
+            if unit
+                .sources
+                .iter()
+                .any(|s| s.scope == format!("checkpoint:{owner}") && basis.as_ref() == Some(&s.id))
             {
                 if !plan.compact.contains(&index) {
                     plan.compact.push(index);
@@ -272,6 +274,7 @@ pub(super) async fn prepare_native_projection(
             }
         }
         plan.compact.sort_unstable();
+        plan.coverage_domain = coverage_domain_for(&layout.units, &plan.compact);
         plan.coverage = plan
             .compact
             .iter()
@@ -342,6 +345,8 @@ pub(super) async fn prepare_native_projection(
     let Some((snapshot, summarizer, projection, summary_index)) = operation else {
         return Ok(NativePreparedRequest { request, receipt });
     };
+    let checkpoint_is_working_context =
+        snapshot.plan.coverage_domain == CoverageDomain::WorkingContext;
     let request_deadline = preparation_deadline.min(snapshot.admission.deadline_ms);
     let runner = CompactionRunner::new(
         store.clone(),
@@ -394,7 +399,7 @@ pub(super) async fn prepare_native_projection(
             }],
             complete: true,
             protected_input: false,
-            inherited: false,
+            inherited: checkpoint_is_working_context,
         });
         let receipt = NativeInputReceipt::for_request(
             &evaluated.request,

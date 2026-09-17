@@ -17,6 +17,17 @@ pub enum SourceRole {
     ReferenceOnly,
 }
 
+/// Describes what a checkpoint is allowed to stand for. A working-context
+/// checkpoint may compact accepted inherited history, but it must never be
+/// exported as though all of that history were the owner's contribution.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageDomain {
+    #[default]
+    OwnContribution,
+    WorkingContext,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryUnit {
     pub sources: Vec<SourceRef>,
@@ -36,6 +47,8 @@ pub enum CompactionMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompactionPlan {
     pub mode: CompactionMode,
+    #[serde(default)]
+    pub coverage_domain: CoverageDomain,
     pub compact: Vec<usize>,
     pub retain: Vec<usize>,
     pub coverage: Vec<SourceRef>,
@@ -59,6 +72,7 @@ pub fn plan_compaction(
     fixed_input: u64,
     summary_goal: u64,
     mode: CompactionMode,
+    coverage_domain: CoverageDomain,
     recovery: bool,
     basis: &str,
 ) -> Result<CompactionPlan, PlanError> {
@@ -75,7 +89,9 @@ pub fn plan_compaction(
     }
     let eligible = |u: &HistoryUnit| {
         u.complete
-            && u.role == SourceRole::Own
+            && (u.role == SourceRole::Own
+                || (coverage_domain == CoverageDomain::WorkingContext
+                    && u.role == SourceRole::Inherited))
             && (!u.protected_input || mode == CompactionMode::Emergency)
     };
     let mut retained: BTreeSet<usize> = units
@@ -138,17 +154,32 @@ pub fn plan_compaction(
             fixed_input,
             summary_goal,
             mode,
+            coverage_domain,
             recovery,
         ))
         .unwrap(),
     ));
     Ok(CompactionPlan {
         mode,
+        coverage_domain: coverage_domain_for(units, &compact),
         compact,
         retain: retained.into_iter().collect(),
         coverage,
         fingerprint,
     })
+}
+
+/// Recompute the semantic boundary after a caller adds an existing basis to a
+/// plan. This is based on source roles, never on summary text.
+pub fn coverage_domain_for(units: &[HistoryUnit], compact: &[usize]) -> CoverageDomain {
+    if compact
+        .iter()
+        .any(|index| units[*index].role == SourceRole::Inherited)
+    {
+        CoverageDomain::WorkingContext
+    } else {
+        CoverageDomain::OwnContribution
+    }
 }
 
 /// Assemble overlapping delivery snapshots by identity. Equal text is irrelevant.
@@ -195,6 +226,7 @@ mod tests {
             0,
             100,
             CompactionMode::Normal,
+            CoverageDomain::OwnContribution,
             true,
             "overflow",
         )
@@ -233,6 +265,7 @@ mod tests {
             0,
             1_000,
             CompactionMode::Normal,
+            CoverageDomain::OwnContribution,
             false,
             "b",
         )
@@ -246,6 +279,7 @@ mod tests {
             0,
             1_000,
             CompactionMode::Normal,
+            CoverageDomain::OwnContribution,
             false,
             "b",
         )
@@ -269,6 +303,7 @@ mod tests {
             100,
             100,
             CompactionMode::Normal,
+            CoverageDomain::OwnContribution,
             false,
             "b",
         )
@@ -283,6 +318,7 @@ mod tests {
                 100,
                 100,
                 CompactionMode::Normal,
+                CoverageDomain::OwnContribution,
                 false,
                 "b"
             )
@@ -295,12 +331,48 @@ mod tests {
             100,
             100,
             CompactionMode::Emergency,
+            CoverageDomain::OwnContribution,
             true,
             "b",
         )
         .unwrap();
         assert_eq!(p.compact, vec![0, 1]);
         assert_eq!(p.retain, vec![2]);
+    }
+
+    #[test]
+    fn working_context_can_cover_inherited_history_without_reclassifying_it() {
+        let mut inherited = unit("accepted-h", 70_000);
+        inherited.role = SourceRole::Inherited;
+        let budget = ModelBudget::new(Some(32_000), None, None);
+        assert!(matches!(
+            plan_compaction(
+                std::slice::from_ref(&inherited),
+                &budget,
+                8_000,
+                100,
+                1_000,
+                CompactionMode::Normal,
+                CoverageDomain::OwnContribution,
+                false,
+                "own-output",
+            ),
+            Err(PlanError::ProtectedInputTooLarge)
+        ));
+        let plan = plan_compaction(
+            &[inherited],
+            &budget,
+            8_000,
+            100,
+            1_000,
+            CompactionMode::Normal,
+            CoverageDomain::WorkingContext,
+            false,
+            "working-context",
+        )
+        .unwrap();
+        assert_eq!(plan.compact, vec![0]);
+        assert_eq!(plan.coverage_domain, CoverageDomain::WorkingContext);
     }
     #[test]
     fn independent_work_keeps_common_basis_once_and_conflicts_explicit() {

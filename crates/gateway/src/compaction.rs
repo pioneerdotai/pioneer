@@ -699,6 +699,7 @@ impl CompactionRunner {
             output_cap: state.target_tokens,
             input: SummaryInput {
                 mode: self.snapshot.plan.mode,
+                coverage_domain: self.snapshot.plan.coverage_domain,
                 previous_summary,
                 compact_units: vec![],
                 reference_only: vec![],

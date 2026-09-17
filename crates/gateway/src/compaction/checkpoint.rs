@@ -56,8 +56,9 @@ pub(crate) async fn project_compatible_checkpoint(
 }
 
 /// Reuse completed work from accepted child contexts without changing their
-/// immutable output manifests. Only exact, wholly represented OWN coverage can
-/// be substituted; merely being an accessible sibling is never sufficient.
+/// immutable output manifests. A pure contribution replaces only accepted OWN
+/// work. A working-context checkpoint may also replace its exact accepted H,
+/// but remains inherited and is never exported as the child's contribution.
 pub(crate) async fn project_accepted_checkpoints(
     store: &CrudStore,
     workspace: &str,
@@ -65,17 +66,21 @@ pub(crate) async fn project_accepted_checkpoints(
     allowed: &BTreeSet<String>,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
+    // Discovery follows only source owners that are actually represented in
+    // the accepted request. Inherited H may have been frozen before its owner
+    // published a working-context checkpoint, so it is a candidate source even
+    // without an OWN import. This is not an application grant: scope, current
+    // DAG leaves and exact whole-message coverage are checked below.
     let threads: BTreeSet<_> = messages
         .iter()
         .filter_map(|message| {
             let origin = message.provenance.as_ref()?;
-            (!origin.inherited
-                && origin
-                    .context_thread
-                    .as_deref()
-                    .unwrap_or(&origin.thread_id)
-                    == context_thread
-                && origin.thread_id != context_thread)
+            let context_owner = origin
+                .context_thread
+                .as_deref()
+                .unwrap_or(&origin.thread_id);
+            (origin.thread_id != context_thread
+                && (origin.inherited || context_owner == context_thread))
                 .then(|| origin.thread_id.clone())
         })
         .collect();
@@ -131,6 +136,7 @@ struct Expanded {
     checkpoint: Checkpoint,
     leaves: BTreeSet<SourceRef>,
     emergency_inputs: BTreeSet<SourceRef>,
+    coverage_domain: pioneer_compaction::CoverageDomain,
 }
 async fn expand(
     store: &CrudStore,
@@ -162,6 +168,7 @@ async fn expand(
         .ok_or_else(|| anyhow::anyhow!("checkpoint source is missing"))?;
     let mut leaves = BTreeSet::new();
     let mut emergency_inputs = BTreeSet::new();
+    let mut coverage_domain = pioneer_compaction::CoverageDomain::OwnContribution;
     let mut done = BTreeSet::new();
     let mut visiting = BTreeSet::new();
     let mut pending = vec![(head.to_owned(), false)];
@@ -188,6 +195,9 @@ async fn expand(
             .await?
             .ok_or_else(|| anyhow::anyhow!("checkpoint operation is missing"))?;
         let snapshot: OperationSnapshot = serde_json::from_str(&operation.snapshot)?;
+        if snapshot.plan.coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext {
+            coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
+        }
         let emergency = snapshot.plan.mode == pioneer_compaction::CompactionMode::Emergency;
         pending.push((id, true));
         let mut parents = BTreeSet::new();
@@ -211,6 +221,7 @@ async fn expand(
         checkpoint,
         leaves,
         emergency_inputs,
+        coverage_domain,
     })
 }
 
@@ -255,13 +266,19 @@ async fn project_checkpoint_in_context(
         let Some(origin) = &message.provenance else {
             continue;
         };
-        if origin
+        let context_owner = origin
             .context_thread
             .as_deref()
-            .unwrap_or(&origin.thread_id)
-            != thread
-            || origin.inherited
-        {
+            .unwrap_or(&origin.thread_id);
+        let replaceable = match expanded.coverage_domain {
+            pioneer_compaction::CoverageDomain::OwnContribution => {
+                !origin.inherited && context_owner == thread
+            }
+            pioneer_compaction::CoverageDomain::WorkingContext => {
+                allowed.contains(&origin.thread_id) && (origin.inherited || context_owner == thread)
+            }
+        };
+        if !replaceable {
             continue;
         }
         let mut leaves = BTreeSet::new();
@@ -358,7 +375,7 @@ async fn project_checkpoint_in_context(
         }],
         complete: true,
         protected_input: false,
-        inherited: false,
+        inherited: expanded.coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext,
     });
     let first = *selected.first().expect("nonempty selection");
     let mut projected = Vec::with_capacity(messages.len() + 1 - selected.len());

@@ -427,6 +427,7 @@ async fn candidate_with_epochs(
             .unwrap(),
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
             compact: vec![0],
             retain: vec![],
             coverage: vec![assertion.reference()],
@@ -918,6 +919,7 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
             .unwrap(),
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
             compact: vec![],
             retain: vec![],
             coverage: vec![],
@@ -2669,7 +2671,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             "child",
             &output.manifest_id,
             0,
-            &[own.clone(), basis],
+            &[own.clone(), basis.clone()],
         )
         .await
         .unwrap();
@@ -2785,8 +2787,32 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         context_thread: Some("thread".into()),
         ..own
     };
-    let context = descriptor("assembled", std::slice::from_ref(&target));
-    let imports = vec![(0, prepared.clone())];
+    // H is already represented by a published checkpoint S in the accepted
+    // snapshot. Later proofs must expand S for freshness without requiring the
+    // snapshot to contain its raw h leaf directly.
+    let s_operation = admit_import_operation(&store, "basis-s", "thread", "turn").await;
+    let s_ready = ready_import_operation(&store, &s_operation, "thread", &inherited).await;
+    assert_eq!(
+        store
+            .compaction_apply_runner(&s_operation.id, &s_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let s_source = store
+        .compaction_checkpoint_source("ws", "thread", "checkpoint-basis-s")
+        .await
+        .unwrap()
+        .unwrap();
+    let checkpoint_basis = FrozenMessageRef {
+        sources: vec![s_source.clone()],
+        wire_sha256: "c".repeat(64),
+        inherited: true,
+        ..basis.clone()
+    };
+    let context_messages = vec![checkpoint_basis, target.clone()];
+    let context = descriptor("assembled", &context_messages);
+    let imports = vec![(1, prepared.clone())];
     let import_digest = frozen_import_identity(&imports).unwrap();
     store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &context, 1, &import_digest)
@@ -2798,7 +2824,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             "thread",
             &context.manifest_id,
             0,
-            std::slice::from_ref(&target),
+            &context_messages,
         )
         .await
         .unwrap();
@@ -2900,12 +2926,12 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
                 "ws",
                 "thread",
                 &shared.manifest_id,
-                std::slice::from_ref(&target),
+                &context_messages,
                 &imports
             )
             .await
             .unwrap(),
-        (1, 1)
+        (2, 1)
     );
     assert!(
         store
@@ -3082,6 +3108,150 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .unwrap(),
         CommitOutcome::Stale
     );
+    // Publish K through the real runner path. K covers accepted S + imported A;
+    // its H leaves are not present directly in the accepted frozen messages.
+    let mut working_op = projected_operation.clone();
+    working_op.id = "working-summary-operation".into();
+    working_op.owner = "owner-working-summary".into();
+    working_op.plan.coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
+    working_op.plan.fingerprint = working_op.id.clone();
+    store
+        .compaction_admit("ws", "context-c", &working_op)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&working_op.id, "turn-c")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&working_op.id, &context)
+        .await
+        .unwrap();
+    let k_ready = ready_operation(
+        &store,
+        &working_op,
+        &[
+            ("thread".into(), s_source.clone()),
+            ("child".into(), own_source.clone()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        store
+            .compaction_apply_runner(&working_op.id, &k_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let k = store
+        .compaction_checkpoint("checkpoint-working-summary-operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(k.coverage, vec![s_source.clone(), own_source.clone()]);
+    let working_source = store
+        .compaction_checkpoint_source("ws", "context-c", "checkpoint-working-summary-operation")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A following child accepts the same S + raw A snapshot. Its compaction may
+    // consume K as WorkingContext, but the identical grants must not authorize
+    // K for an OwnContribution operation.
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('context-d','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('context-d','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-d','context-d','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task-d','ws','thread','thread','thread','turn','agent','running','Task D','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-d','task-d','run-d',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-d','task-d','run-d','context-d','turn-d','initial',0,1,'running',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run-d','task-d','ws','thread',?,CURRENT_TIMESTAMP)",
+        [serde_json::to_string(&context).unwrap().into()],
+    ))
+    .await
+    .unwrap();
+    let mut working_target = projected_operation.clone();
+    working_target.plan.coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
+    working_target.projection_version = store
+        .compaction_projection_version("ws", "context-d")
+        .await
+        .unwrap();
+    working_target.source_epochs.clear();
+    for scope in ["thread", "child", "context-c", "context-d"] {
+        working_target.source_epochs.insert(
+            scope.into(),
+            store
+                .compaction_projection_version("ws", scope)
+                .await
+                .unwrap(),
+        );
+    }
+    working_target.id = "working-target-admitted".into();
+    working_target.owner = "owner-working-target-admitted".into();
+    working_target.plan.fingerprint = working_target.id.clone();
+    store
+        .compaction_admit("ws", "context-d", &working_target)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&working_target.id, "turn-d")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&working_target.id, &context)
+        .await
+        .unwrap();
+    let working_ready =
+        ready_import_operation(&store, &working_target, "context-c", &working_source).await;
+    assert!(
+        store
+            .compaction_manifest_sources_current(&working_target.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&working_target.id, &working_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let mut own_target = working_target.clone();
+    own_target.id = "own-target".into();
+    own_target.owner = "owner-own-target".into();
+    own_target.plan.coverage_domain = pioneer_compaction::CoverageDomain::OwnContribution;
+    own_target.plan.fingerprint = own_target.id.clone();
+    store
+        .compaction_admit("ws", "context-d", &own_target)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&own_target.id, "turn-d")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&own_target.id, &context)
+        .await
+        .unwrap();
+    let own_ready = ready_import_operation(&store, &own_target, "context-c", &working_source).await;
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&own_target.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&own_target.id, &own_ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
     let denied = admit_import_operation(&store, "unaccepted-summary", "context-c", "turn-c").await;
     let denied_ready = ready_import_operation(&store, &denied, "child", &a_summary).await;
     assert!(
@@ -3102,7 +3272,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .compaction_frozen_history_page("ws", "thread", &context.manifest_id, 0)
             .await
             .unwrap(),
-        vec![target.clone()]
+        context_messages
     );
 
     // Production path: the accepted parent basis is recaptured by the child.
@@ -3401,6 +3571,7 @@ async fn admit_import_operation(
             .unwrap(),
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
             compact: vec![],
             retain: vec![],
             coverage: vec![],
@@ -3424,24 +3595,39 @@ async fn ready_import_operation(
     source_thread: &str,
     source: &SourceRef,
 ) -> pioneer_compaction::runner::RunnerState {
+    ready_operation(
+        store,
+        snapshot,
+        &[(source_thread.to_owned(), source.clone())],
+    )
+    .await
+}
+
+async fn ready_operation(
+    store: &CrudStore,
+    snapshot: &OperationSnapshot,
+    sources: &[(String, SourceRef)],
+) -> pioneer_compaction::runner::RunnerState {
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     let op = &snapshot.id;
     let budget = ModelBudget::new(None, None, None);
     store
-        .compaction_prepare_runner(op, &budget, 1, 0)
+        .compaction_prepare_runner(op, &budget, sources.len() as u64, 0)
         .await
         .unwrap();
+    let manifest = sources
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (thread_id, source))| ManifestEntry {
+            ordinal: ordinal as u64,
+            unit: ordinal as u64,
+            reference_only: false,
+            thread_id: thread_id.clone(),
+            source: source.clone(),
+        })
+        .collect::<Vec<_>>();
     store
-        .compaction_append_manifest(
-            op,
-            &[ManifestEntry {
-                ordinal: 0,
-                unit: 0,
-                reference_only: false,
-                thread_id: source_thread.into(),
-                source: source.clone(),
-            }],
-        )
+        .compaction_append_manifest(op, &manifest)
         .await
         .unwrap();
     let initial = RunnerState::new(snapshot.admission.deadline_ms, &budget, 1000, None).unwrap();
@@ -3462,7 +3648,7 @@ async fn ready_import_operation(
         format_version: 1,
         owner: snapshot.owner.clone(),
         previous: None,
-        coverage: vec![source.clone()],
+        coverage: sources.iter().map(|(_, source)| source.clone()).collect(),
         summary: "fixture summary".into(),
         selection: snapshot.admission.selection.clone(),
         projection_version: snapshot.projection_version,
@@ -3472,7 +3658,7 @@ async fn ready_import_operation(
             1,
             checkpoint.id.clone(),
             SourceCursor {
-                unit: 1,
+                unit: sources.len() as u64,
                 ..Default::default()
             },
             true,

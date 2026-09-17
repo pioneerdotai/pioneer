@@ -3,8 +3,8 @@
 use super::*;
 use pioneer_agent::compaction::{history::NativeHistoryLayout, request::NativeRequestProjection};
 use pioneer_compaction::{
-    CompactionMode, CompactionSettings, ModelBudget, ModelSelection, SourceRole, Transport,
-    effective_selection, plan_compaction,
+    CompactionMode, CompactionSettings, CoverageDomain, ModelBudget, ModelSelection, Transport,
+    coverage_domain_for, effective_selection, plan_compaction,
 };
 use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome, ManifestEntry};
 use pioneer_provider::ChatRequest;
@@ -279,6 +279,7 @@ pub(crate) async fn prepare_completed_history_owned(
             fixed,
             goal,
             CompactionMode::Normal,
+            CoverageDomain::WorkingContext,
             false,
             &format!("{owner}:{version}:{head:?}"),
         )
@@ -290,6 +291,7 @@ pub(crate) async fn prepare_completed_history_owned(
                 fixed,
                 goal,
                 CompactionMode::Emergency,
+                CoverageDomain::WorkingContext,
                 false,
                 &format!("{owner}:{version}:{head:?}"),
             )
@@ -298,12 +300,9 @@ pub(crate) async fn prepare_completed_history_owned(
             anyhow::anyhow!("completed history has no fitting whole-unit plan: {error:?}")
         })?;
         for (index, unit) in layout.units.iter().enumerate() {
-            if unit.role == SourceRole::Own
-                && unit.sources.iter().any(|source| {
-                    source.scope == format!("checkpoint:{owner}")
-                        && basis.as_ref() == Some(&source.id)
-                })
-            {
+            if unit.sources.iter().any(|source| {
+                source.scope == format!("checkpoint:{owner}") && basis.as_ref() == Some(&source.id)
+            }) {
                 if !plan.compact.contains(&index) {
                     plan.compact.push(index);
                 }
@@ -311,6 +310,7 @@ pub(crate) async fn prepare_completed_history_owned(
             }
         }
         plan.compact.sort_unstable();
+        plan.coverage_domain = coverage_domain_for(&layout.units, &plan.compact);
         plan.coverage = plan
             .compact
             .iter()

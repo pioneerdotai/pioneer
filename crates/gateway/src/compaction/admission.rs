@@ -121,6 +121,7 @@ pub(crate) async fn admit_operation(
             // The bounded snapshot stores a descriptor, never another history.
             plan: CompactionPlan {
                 mode: prepared.plan.mode,
+                coverage_domain: prepared.plan.coverage_domain,
                 compact: vec![],
                 retain: vec![],
                 coverage: vec![],

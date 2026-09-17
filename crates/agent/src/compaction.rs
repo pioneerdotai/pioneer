@@ -252,6 +252,7 @@ mod tests {
             output_cap: 500,
             input: SummaryInput {
                 mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
                 previous_summary: "previous state".into(),
                 reference_only: vec![],
                 target_tokens: 500,

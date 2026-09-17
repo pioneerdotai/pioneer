@@ -472,6 +472,7 @@ print(json.dumps([{'type':'system','subtype':'init','model':'claude-sonnet-4-6'}
             output_cap: 1024,
             input: SummaryInput {
                 mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
                 previous_summary: "previous Pioneer checkpoint".into(),
                 compact_units: vec![],
                 reference_only: vec![],
