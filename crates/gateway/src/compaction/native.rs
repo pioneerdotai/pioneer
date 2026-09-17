@@ -39,7 +39,6 @@ pub(super) async fn prepare_native_projection(
     accepted_projection: Option<pioneer_compaction::frozen::FrozenHistoryRef>,
     processor: Option<&crate::message::MessageProcessor>,
 ) -> Result<NativePreparedRequest> {
-    let store = store.with_maintenance_access();
     let workspace = context.workspace_id.as_str();
     let thread = context.thread_id.as_str();
     let owner = native_owner(workspace, thread);
@@ -496,7 +495,8 @@ impl pioneer_agent::compaction::controller::NativeContextController
             ) => result?.ok_or_else(|| anyhow::anyhow!("native context owner unavailable"))?,
         };
         drop(startup_wait);
-        let refresh = refresh_native_history(&processor, context, request);
+        let refresh =
+            refresh_native_history(&processor, processor.crud_store.as_ref(), context, request);
         let (request, projection) = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
@@ -544,13 +544,14 @@ impl pioneer_agent::compaction::controller::NativeContextController
 /// their canonical coverage before selecting the current-turn suffix.
 async fn refresh_native_history(
     processor: &crate::message::MessageProcessor,
+    store: &CrudStore,
     context: &NativeContext,
     mut request: ChatRequest,
 ) -> Result<(ChatRequest, pioneer_compaction::frozen::FrozenHistoryRef)> {
     use pioneer_agent::compaction::composition::ScopedHistorySource;
-    let store = processor.crud_store.with_maintenance_access();
     let json = processor
         .capture_current_context_basis(
+            store,
             &context.workspace_id,
             &context.thread_id,
             &context.turn_id,

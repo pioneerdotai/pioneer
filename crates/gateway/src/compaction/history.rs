@@ -273,7 +273,6 @@ pub(crate) async fn load_task_line_history(
         HistorySelection::All,
     )
     .await?;
-    let store = store.with_maintenance_access();
     for message in &mut messages {
         let Some(origin) = message.provenance.as_mut() else {
             continue;
@@ -367,7 +366,6 @@ async fn load_line_history_inner(
         HistorySelection::Sources(sources) => (Some(sources), None),
         HistorySelection::ThroughTurn(turn) => (None, Some(turn)),
     };
-    let store = store.with_maintenance_access();
     let mut turns = Vec::new();
     let mut after = String::new();
     loop {

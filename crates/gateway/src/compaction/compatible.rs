@@ -51,7 +51,6 @@ pub(crate) async fn rematerialize_overlap(
     checkpoints: &BTreeMap<ScopedHistorySource, BTreeSet<ScopedHistorySource>>,
     affected: &BTreeSet<ScopedHistorySource>,
 ) -> Result<Vec<ChatMessage>> {
-    let store = store.with_maintenance_access();
     for thread in affected
         .iter()
         .map(|source| &source.thread)

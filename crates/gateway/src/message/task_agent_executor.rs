@@ -6701,6 +6701,7 @@ async fn load_task_execution_conversation_scope(
         .await?;
     let history_json = processor
         .capture_authorized_task_basis(
+            processor.crud_store.as_ref(),
             current.principal(),
             task.workspace_id.as_str(),
             parent.parent_thread_id.as_str(),

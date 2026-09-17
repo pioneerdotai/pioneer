@@ -563,6 +563,7 @@ impl MessageProcessor {
             .unwrap_or(&default_policy);
         let history_json = if let Some(principal) = principal {
             self.capture_authorized_task_basis(
+                self.crud_store.as_ref(),
                 principal,
                 params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),

@@ -12,7 +12,6 @@ pub(crate) async fn resolve_message_origins(
     authorized_threads: &BTreeSet<String>,
     messages: &mut [ChatMessage],
 ) -> Result<()> {
-    let store = store.with_maintenance_access();
     for message in messages {
         let Some(origin) = &mut message.provenance else {
             continue;

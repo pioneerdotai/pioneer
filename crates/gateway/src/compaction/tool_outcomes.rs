@@ -13,7 +13,6 @@ pub(crate) async fn retained_shell_outcome(
     provider_call_id: &str,
     tool_name: &str,
 ) -> Result<Option<(SourceRef, ChatMessage)>> {
-    let store = store.with_maintenance_access();
     let Some(reference) = store
         .compaction_tool_item_reference(workspace, thread, turn, item_id)
         .await?
@@ -77,7 +76,6 @@ pub(crate) async fn retained_tool_policy(
     turn: &str,
     item_id: &str,
 ) -> Result<Option<pioneer_protocol::ToolRecoveryPolicySnapshot>> {
-    let store = store.with_maintenance_access();
     let Some(source) = store
         .compaction_item_reference(workspace, thread, turn, item_id)
         .await?

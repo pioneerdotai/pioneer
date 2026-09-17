@@ -47,7 +47,6 @@ async fn checkpoint_graph(
     allowed: Option<&BTreeSet<String>>,
     root: &SourceRef,
 ) -> Result<Option<(BTreeSet<ScopedHistorySource>, BTreeSet<String>)>> {
-    let store = store.with_maintenance_access();
     let mut leaves = BTreeSet::new();
     let mut scopes = BTreeSet::new();
     let mut done = BTreeSet::new();

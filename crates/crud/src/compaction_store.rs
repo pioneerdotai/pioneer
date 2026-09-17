@@ -20,21 +20,14 @@ impl CrudStore {
         workspace: &str,
         thread: &str,
     ) -> Result<bool> {
-        let store = self.with_maintenance_access();
-        store
-            .run_background_database_quantum(|| {
-                repositories::compaction_preparation::quantum(&store, workspace, thread)
-            })
-            .await
+        self.run_scoped_database_quantum(|| {
+            repositories::compaction_preparation::quantum(self, workspace, thread)
+        })
+        .await
     }
 
     pub async fn compaction_history_prepared(&self, workspace: &str, thread: &str) -> Result<bool> {
-        repositories::compaction_preparation::ready(
-            &self.with_maintenance_access(),
-            workspace,
-            thread,
-        )
-        .await
+        repositories::compaction_preparation::ready(self, workspace, thread).await
     }
 
     /// Pin append-only discovery to a bounded high water mark. Edits remain

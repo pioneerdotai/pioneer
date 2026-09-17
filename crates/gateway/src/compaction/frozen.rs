@@ -22,7 +22,6 @@ pub(crate) async fn execution_history_scopes(
     let mut allowed = BTreeSet::from([thread.to_owned()]);
     allowed.extend(conversation_thread.map(str::to_owned));
     if let Some(basis) = store
-        .with_maintenance_access()
         .compaction_task_basis_snapshot(workspace, thread, turn)
         .await?
     {
@@ -48,7 +47,6 @@ pub(crate) async fn accepted_history_scopes(
         return Ok(allowed);
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
-    let store = store.with_maintenance_access();
     ensure!(
         store
             .compaction_frozen_history_owner(workspace, &descriptor)
@@ -144,7 +142,6 @@ async fn read_accepted_imports(
     messages: &[ChatMessage],
     execution_thread: Option<&str>,
 ) -> Result<BTreeMap<usize, BTreeSet<SourceRef>>> {
-    let store = store.with_maintenance_access();
     ensure!(
         store
             .compaction_frozen_history_owner(workspace, descriptor)
@@ -339,7 +336,6 @@ pub(super) async fn capture_execution_basis_with_outputs(
     policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     outputs: Option<&super::delivered::AuthorizedOutputSet>,
 ) -> Result<String> {
-    let store = store.with_maintenance_access();
     if let Some(outputs) = outputs {
         ensure!(
             outputs.workspace == workspace && outputs.destination == thread,
@@ -941,7 +937,6 @@ async fn capture_with_imports(
         allowed_threads.contains(owner_thread),
         "frozen history owner is not authorized"
     );
-    let store = store.with_maintenance_access();
     let mut references = Vec::with_capacity(messages.len());
     let mut digest = Sha256::new();
     for message in messages {
@@ -1123,7 +1118,6 @@ pub(crate) async fn restore(
     allowed_threads: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ChatMessage>> {
-    let store = store.with_maintenance_access();
     let owner = store
         .compaction_frozen_history_owner(workspace, descriptor)
         .await?

@@ -74,11 +74,11 @@ impl MessageProcessor {
     /// A denied branch leaves its previously delivered summary in the context.
     pub(crate) async fn authorize_delivered_output_branches(
         &self,
+        store: &CrudStore,
         principal: &AuthenticatedSessionPrincipal,
         workspace: &str,
         destination: &str,
     ) -> Result<AuthorizedOutputSet> {
-        let store = self.crud_store.with_maintenance_access();
         let authorization_revision = self.current_authorization_revision().await?;
         let resolver = AuthorizationResolver::new(store.clone());
         let mut access = BTreeMap::new();
@@ -228,6 +228,7 @@ impl MessageProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn capture_authorized_task_basis(
         &self,
+        store: &CrudStore,
         principal: &AuthenticatedSessionPrincipal,
         workspace: &str,
         destination: &str,
@@ -244,7 +245,7 @@ impl MessageProcessor {
                 && !policy.include_parent_summary)
         }) {
             return super::frozen::capture_execution_basis_json(
-                self.crud_store.as_ref(),
+                store,
                 workspace,
                 destination,
                 basis_turn,
@@ -254,10 +255,10 @@ impl MessageProcessor {
             .await;
         }
         let outputs = self
-            .authorize_delivered_output_branches(principal, workspace, destination)
+            .authorize_delivered_output_branches(store, principal, workspace, destination)
             .await?;
         let json = super::frozen::capture_execution_basis_with_outputs(
-            self.crud_store.as_ref(),
+            store,
             workspace,
             destination,
             basis_turn,

@@ -3082,6 +3082,24 @@ struct CaptureSummaryProvider {
     calls: AtomicUsize,
 }
 
+#[derive(Default)]
+struct NativeSchedulingObserver {
+    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+}
+
+impl pioneer_sqlite::SqliteReadObserver for NativeSchedulingObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+        self.reads.lock().unwrap().push(event);
+    }
+}
+
+impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+        self.writes.lock().unwrap().push(event);
+    }
+}
+
 struct PreflightCaptureProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
@@ -10165,6 +10183,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     assert!(
         processor
             .capture_authorized_task_basis(
+                crud_store.as_ref(),
                 authenticated_test_member_collaborator().as_ref(),
                 &workspace_id,
                 parent_thread_id,
@@ -10178,6 +10197,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     );
     let assembled_json = processor
         .capture_authorized_task_basis(
+            crud_store.as_ref(),
             authenticated_test_superuser().as_ref(),
             &workspace_id,
             parent_thread_id,
@@ -10821,6 +10841,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .unwrap();
     let disclosed_only_json = processor
         .capture_authorized_task_basis(
+            crud_store.as_ref(),
             authenticated_test_member_collaborator().as_ref(),
             &workspace_id,
             parent_thread_id,
@@ -63980,6 +64001,204 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         pending.is_empty(),
         "second overflow must not schedule another main retry"
     );
+}
+
+#[tokio::test]
+async fn native_foreground_controller_uses_interactive_database_scope() {
+    use pioneer_sqlite::{
+        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
+        SqliteWriteExecutor,
+    };
+    use sea_orm::ConnectOptions;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("native-foreground.sqlite");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut bootstrap_options = ConnectOptions::new(url.clone());
+    bootstrap_options.max_connections(1).sqlx_logging(false);
+    let bootstrap_connection = Database::connect(bootstrap_options).await.unwrap();
+    let (workspaces, _bootstrap_store, workspace) =
+        setup_workspace_manager_with_connection(bootstrap_connection.clone()).await;
+    bootstrap_connection
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+
+    let mut writer_options = ConnectOptions::new(url.clone());
+    writer_options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(writer_options).await.unwrap();
+    let mut reader_options = ConnectOptions::new(url);
+    reader_options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+    let reader = Database::connect(reader_options).await.unwrap();
+    let observer = Arc::new(NativeSchedulingObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let store = Arc::new(CrudStore::new(database.clone()));
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let threads = Arc::new(ThreadManager::new("test-model", "openai"));
+    let provider = Arc::new(CaptureSummaryProvider::new("foreground answer"));
+    let processor = Arc::new(MessageProcessor::new(
+        threads.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            provider.clone(),
+        )),
+        sessions.clone(),
+        workspaces,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
+    let started = threads
+        .thread_start_seeded(
+            connection,
+            workspace.clone(),
+            ThreadStartParams {
+                thread_id: "native-foreground".into(),
+                workspace_id: workspace.clone(),
+                name: Some("Native foreground scheduling".into()),
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Chat),
+                origin_kind: Some(ThreadOriginKind::User),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_thread_model(
+            &started.response.thread,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+
+    let held = database.maintenance().begin_read().await.unwrap();
+    let read_start = observer.reads.lock().unwrap().len();
+    let write_start = observer.writes.lock().unwrap().len();
+    let request_id = generate_test_request_id("native-foreground", "start");
+    processor
+        .clone()
+        .process_owned_request(
+            sessions.connection_context(connection).await.unwrap(),
+            json!({
+                "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
+                "params": { "thread_id":"native-foreground", "turn_id":"native-foreground-turn",
+                    "input":[{"type":"text","text":"small foreground request"}],
+                    "model":"test-model", "model_provider":"openai", "mode":"Chat" }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let _: TurnStartResponse = serde_json::from_value(response.result).unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if provider.snapshot_requests().iter().any(|request| {
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "small foreground request")
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreground controller must reach the provider while maintenance is occupied");
+
+    let reads = observer.reads.lock().unwrap()[read_start..].to_vec();
+    let writes = observer.writes.lock().unwrap()[write_start..].to_vec();
+    assert!(reads.iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::OperationFinished {
+            class: SqliteReadClass::Interactive,
+            ..
+        }
+    )));
+    assert!(reads.iter().all(|event| !matches!(
+        event,
+        SqliteReadEvent::OperationFinished {
+            class: SqliteReadClass::Maintenance,
+            ..
+        }
+    )));
+    assert!(writes.iter().any(|event| matches!(
+        event,
+        SqliteWriteEvent::Acquired {
+            class: SqliteWriteClass::Interactive,
+            ..
+        }
+    )));
+    assert!(writes.iter().all(|event| !matches!(
+        event,
+        SqliteWriteEvent::Enqueued {
+            class: SqliteWriteClass::Maintenance,
+            ..
+        } | SqliteWriteEvent::Acquired {
+            class: SqliteWriteClass::Maintenance,
+            ..
+        } | SqliteWriteEvent::Released {
+            class: SqliteWriteClass::Maintenance,
+            ..
+        } | SqliteWriteEvent::Cancelled {
+            class: SqliteWriteClass::Maintenance,
+            ..
+        }
+    )));
+    drop(held);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, turn) = store
+                .get_turn("native-foreground", "native-foreground-turn")
+                .await
+                .unwrap()
+                .unwrap();
+            if turn.status == TurnStatus::Completed {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
 }
 
 #[tokio::test]

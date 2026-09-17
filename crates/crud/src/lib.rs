@@ -4325,7 +4325,16 @@ impl CrudStore {
         {
             bail!("background database quantum requires maintenance-scoped reads and writes");
         }
-        let mut operation = operation;
+        self.run_scoped_database_quantum(operation).await
+    }
+
+    /// Retains the caller's scheduling scope while applying the same bounded
+    /// SQLite lock-race retry policy used by background database quanta.
+    pub(crate) async fn run_scoped_database_quantum<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
         retry_with_backoff(
             || operation(),
             |error| {

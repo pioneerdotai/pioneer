@@ -19,6 +19,34 @@ use std::{
     },
 };
 
+#[derive(Default)]
+struct HistoryReadObserver {
+    reads: Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+    writes: Mutex<Vec<pioneer_sqlite::SqliteWriteEvent>>,
+}
+
+impl pioneer_sqlite::SqliteReadObserver for HistoryReadObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+        self.reads.lock().unwrap().push(event);
+    }
+}
+
+impl pioneer_sqlite::SqliteWriteObserver for HistoryReadObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+        self.writes.lock().unwrap().push(event);
+    }
+}
+
+impl HistoryReadObserver {
+    fn reads(&self) -> Vec<pioneer_sqlite::SqliteReadEvent> {
+        self.reads.lock().unwrap().clone()
+    }
+
+    fn writes(&self) -> Vec<pioneer_sqlite::SqliteWriteEvent> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
 struct ManualClock(tokio::sync::watch::Sender<u64>);
 impl ManualClock {
     fn new() -> Self {
@@ -4134,6 +4162,284 @@ async fn legacy_history_is_prepared_before_freezing_a_new_execution_basis() {
             .compaction_history_turn_page("ws", "thread", "", &stale)
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn history_capture_inherits_read_class_and_cancellation_releases_admission() {
+    use pioneer_sqlite::{
+        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome, SqliteWriteExecutor,
+    };
+    use sea_orm::ConnectOptions;
+
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history-scheduling.sqlite");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut writer_options = ConnectOptions::new(url.clone());
+    writer_options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(writer_options).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('background','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('background-turn','background','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('input','turn',0,'text','accepted','{\"type\":\"text\",\"text\":\"accepted\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('background-input','background-turn',0,'text','background','{\"type\":\"text\",\"text\":\"background\"}',CURRENT_TIMESTAMP)",
+    ] {
+        writer.execute_unprepared(sql).await.unwrap();
+    }
+    let mut reader_options = ConnectOptions::new(url);
+    reader_options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+    let reader = Database::connect(reader_options).await.unwrap();
+    let observer = Arc::new(HistoryReadObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let store = CrudStore::new(database.clone());
+    let maintenance_store = store.with_maintenance_access();
+
+    // Occupy the sole maintenance-read admission. Interactive turn history
+    // preparation must still reach SQLite and complete through the same store.
+    let held = database.maintenance().begin_read().await.unwrap();
+    let interactive_read_start = observer.reads().len();
+    let interactive_write_start = observer.writes().len();
+    let history_json = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::frozen::capture_execution_basis_json(&store, "ws", "thread", None, None, None),
+    )
+    .await
+    .expect("occupied maintenance admission must not block interactive capture")
+    .unwrap();
+    let mut runtime = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+        "thread",
+        "ws",
+        "turn",
+        pioneer_protocol::ThreadMode::Agent,
+        &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+        "fixture-model",
+        "fixture-provider",
+        None,
+        &std::collections::HashMap::new(),
+        &[],
+        &[],
+        &[],
+        &std::collections::HashMap::new(),
+        &[],
+        &[],
+    )
+    .unwrap();
+    runtime.history_json = history_json;
+    let runtime = store.upsert_turn_runtime_snapshot(runtime).await.unwrap();
+    let (_, restored) =
+        crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&store, &runtime)
+            .await
+            .unwrap();
+    let (_, retried) =
+        crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(&store, &runtime)
+            .await
+            .unwrap();
+    assert_eq!(restored, retried);
+    assert!(restored.iter().any(|message| message.content == "accepted"));
+    assert!(
+        store
+            .compaction_history_prepared("ws", "thread")
+            .await
+            .unwrap()
+    );
+    assert!(
+        observer.reads()[interactive_read_start..]
+            .iter()
+            .any(|event| matches!(
+                event,
+                SqliteReadEvent::OperationFinished {
+                    class: SqliteReadClass::Interactive,
+                    outcome: SqliteReadOutcome::Ok,
+                    ..
+                }
+            ))
+    );
+    assert!(
+        observer.reads()[interactive_read_start..]
+            .iter()
+            .all(|event| {
+                !matches!(
+                    event,
+                    SqliteReadEvent::OperationFinished {
+                        class: SqliteReadClass::Maintenance,
+                        ..
+                    }
+                )
+            })
+    );
+    assert!(
+        observer.writes()[interactive_write_start..]
+            .iter()
+            .all(|event| !matches!(
+                event,
+                pioneer_sqlite::SqliteWriteEvent::Enqueued {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                } | pioneer_sqlite::SqliteWriteEvent::Acquired {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                } | pioneer_sqlite::SqliteWriteEvent::Released {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                } | pioneer_sqlite::SqliteWriteEvent::Cancelled {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                }
+            ))
+    );
+    assert!(
+        observer.writes()[interactive_write_start..]
+            .iter()
+            .any(|event| matches!(
+                event,
+                pioneer_sqlite::SqliteWriteEvent::Acquired {
+                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                    ..
+                }
+            ))
+    );
+
+    // The same shared capture path retains an explicitly selected background
+    // scope. Cancelling its queued read must remove the waiter immediately.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::frozen::capture_execution_basis_json(
+                &maintenance_store,
+                "ws",
+                "background",
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .is_err()
+    );
+    assert!(observer.reads().iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::AdmissionCancelled {
+            class: SqliteReadClass::Maintenance,
+            queue_depth: 0,
+            active: 1,
+            ..
+        }
+    )));
+
+    drop(held);
+    let maintenance_read_start = observer.reads().len();
+    let maintenance_write_start = observer.writes().len();
+    let background_json = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::frozen::capture_execution_basis_json(
+            &maintenance_store,
+            "ws",
+            "background",
+            None,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("cancelled waiter must not retain maintenance admission")
+    .unwrap();
+    let background_allowed = std::collections::BTreeSet::from(["background".to_owned()]);
+    let restored_background = crate::turn_runtime_snapshot::restore_history_json(
+        &maintenance_store,
+        "ws",
+        &background_allowed,
+        &background_json,
+    )
+    .await
+    .unwrap();
+    assert!(
+        restored_background
+            .iter()
+            .any(|message| message.content == "background")
+    );
+    assert!(
+        maintenance_store
+            .compaction_history_prepared("ws", "background")
+            .await
+            .unwrap()
+    );
+    let maintenance_events = observer.reads();
+    assert!(
+        maintenance_events[maintenance_read_start..]
+            .iter()
+            .any(|event| matches!(
+                event,
+                SqliteReadEvent::OperationFinished {
+                    class: SqliteReadClass::Maintenance,
+                    outcome: SqliteReadOutcome::Ok,
+                    ..
+                }
+            ))
+    );
+    assert!(maintenance_events.iter().rev().any(|event| matches!(
+        event,
+        SqliteReadEvent::AdmissionReleased {
+            class: SqliteReadClass::Maintenance,
+            queue_depth: 0,
+            active: 0,
+            ..
+        }
+    )));
+    assert!(
+        maintenance_events[maintenance_read_start..]
+            .iter()
+            .all(|event| !matches!(
+                event,
+                SqliteReadEvent::OperationFinished {
+                    class: SqliteReadClass::Interactive,
+                    ..
+                }
+            ))
+    );
+    assert!(
+        observer.writes()[maintenance_write_start..]
+            .iter()
+            .all(|event| !matches!(
+                event,
+                pioneer_sqlite::SqliteWriteEvent::Enqueued {
+                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                    ..
+                } | pioneer_sqlite::SqliteWriteEvent::Acquired {
+                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                    ..
+                } | pioneer_sqlite::SqliteWriteEvent::Released {
+                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                    ..
+                } | pioneer_sqlite::SqliteWriteEvent::Cancelled {
+                    class: pioneer_sqlite::SqliteWriteClass::Interactive,
+                    ..
+                }
+            ))
+    );
+    assert!(
+        observer.writes()[maintenance_write_start..]
+            .iter()
+            .any(|event| matches!(
+                event,
+                pioneer_sqlite::SqliteWriteEvent::Acquired {
+                    class: pioneer_sqlite::SqliteWriteClass::Maintenance,
+                    ..
+                }
+            ))
     );
 }
 

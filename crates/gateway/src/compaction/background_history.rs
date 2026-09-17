@@ -140,7 +140,7 @@ pub(crate) async fn prepare_completed_history_owned(
             .compaction_projection_version(workspace, thread)
             .await?;
         let json = processor
-            .capture_current_context_basis(workspace, thread, turn, None)
+            .capture_current_context_basis(&store, workspace, thread, turn, None)
             .await?;
         let allowed =
             super::frozen::accepted_history_scopes(&store, workspace, thread, &json).await?;
