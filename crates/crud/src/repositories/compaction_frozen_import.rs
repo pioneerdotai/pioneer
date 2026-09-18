@@ -362,24 +362,169 @@ async fn accepted_import_current<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedFrozenImport,
 ) -> Result<bool> {
+    Ok(db
+        .query_one_raw(accepted_import_current_statement(
+            ACCEPTED_IMPORT_CURRENT_SQL,
+            prepared,
+        )?)
+        .await?
+        .is_some())
+}
+
+// This is the existence-only expansion of the six UNION ALL branches in
+// compaction_live_sources. Keep each branch's predicates in sync with the view.
+const ACCEPTED_IMPORT_CURRENT_SQL: &str = r#"
+SELECT 1
+FROM task_run_turn execution
+JOIN task_run_conversation_snapshot snapshot
+  ON snapshot.run_id=execution.run_id AND snapshot.task_id=execution.task_id
+JOIN thread_lineage lineage
+  ON lineage.child_thread_id=execution.thread_id
+ AND lineage.parent_thread_id=snapshot.conversation_thread_id
+JOIN thread child
+  ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id
+JOIN compaction_frozen_history h
+  ON h.id=?
+ AND h.owner_thread=snapshot.conversation_thread_id
+ AND h.workspace_id=snapshot.workspace_id
+JOIN compaction_frozen_import i
+  ON i.manifest_id=h.id AND i.ordinal=?
+WHERE execution.thread_id=?
+  AND execution.turn_id=?
+  AND snapshot.workspace_id=?
+  AND snapshot.history_json=?
+  AND h.ready=1
+  AND h.identity_sha256=?
+  AND h.next_import=h.import_count
+  AND i.proof_json=?
+  AND h.imports_sha256=?
+  AND h.import_count=?
+  AND (
+    EXISTS (
+      SELECT 1
+      FROM compaction_source_revision context_revision
+      JOIN turn_llm_context context_source
+        ON context_source.id=context_revision.source_id
+       AND context_source.turn_id=context_revision.turn_id
+      JOIN turn context_turn ON context_turn.id=context_revision.turn_id
+      JOIN thread context_thread ON context_thread.id=context_turn.thread_id
+      WHERE context_revision.present=1
+        AND context_thread.workspace_id=h.workspace_id
+        AND context_turn.thread_id=i.source_thread
+        AND 'context:'||context_revision.turn_id=i.source_scope
+        AND context_revision.source_id=i.source_id
+        AND 'revision:'||context_revision.revision=i.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_item_revision item_revision
+      JOIN turn_item item_source
+        ON item_source.id=item_revision.source_id
+       AND item_source.turn_id=item_revision.turn_id
+      JOIN turn item_turn ON item_turn.id=item_revision.turn_id
+      JOIN thread item_thread ON item_thread.id=item_turn.thread_id
+      WHERE item_revision.present=1
+        AND item_thread.workspace_id=h.workspace_id
+        AND item_turn.thread_id=i.source_thread
+        AND 'item:'||item_revision.turn_id=i.source_scope
+        AND item_revision.source_id=i.source_id
+        AND 'item-revision:'||item_revision.revision=i.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_event_revision event_revision
+      JOIN turn_event event_source
+        ON event_source.id=event_revision.source_id
+       AND event_source.turn_id=event_revision.turn_id
+      JOIN turn event_turn ON event_turn.id=event_revision.turn_id
+      JOIN thread event_thread ON event_thread.id=event_turn.thread_id
+      WHERE event_revision.present=1
+        AND event_thread.workspace_id=h.workspace_id
+        AND event_turn.thread_id=i.source_thread
+        AND 'event:'||event_revision.turn_id=i.source_scope
+        AND event_revision.source_id=i.source_id
+        AND 'event-revision:'||event_revision.revision=i.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_input_revision input_revision
+      JOIN turn_input input_source
+        ON input_source.id=input_revision.source_id
+       AND input_source.turn_id=input_revision.turn_id
+      JOIN turn input_turn ON input_turn.id=input_revision.turn_id
+      JOIN thread input_thread ON input_thread.id=input_turn.thread_id
+      WHERE input_revision.present=1
+        AND input_thread.workspace_id=h.workspace_id
+        AND input_turn.thread_id=i.source_thread
+        AND 'input:'||input_revision.turn_id=i.source_scope
+        AND input_revision.source_id=i.source_id
+        AND 'input-revision:'||input_revision.revision=i.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_checkpoint checkpoint
+      JOIN compaction_context context ON context.owner=checkpoint.owner
+      LEFT JOIN compaction_projection_epoch epoch ON epoch.thread_id=context.thread_id
+      WHERE (
+          checkpoint.status='applied'
+          OR (
+            checkpoint.status='retained'
+            AND EXISTS (
+              SELECT 1
+              FROM compaction_operation committed
+              WHERE committed.id=checkpoint.operation_id
+                AND committed.status='completed'
+            )
+          )
+        )
+        AND checkpoint.projection_version=COALESCE(epoch.version,0)
+        AND context.workspace_id=h.workspace_id
+        AND context.thread_id=i.source_thread
+        AND 'checkpoint:'||checkpoint.owner=i.source_scope
+        AND checkpoint.id=i.source_id
+        AND checkpoint.identity_sha256=i.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM task_run_conversation_snapshot basis
+      JOIN thread basis_thread
+        ON basis_thread.id=basis.conversation_thread_id
+       AND basis_thread.workspace_id=basis.workspace_id
+      LEFT JOIN compaction_task_basis_revision revision ON revision.run_id=basis.run_id
+      WHERE substr(ltrim(basis.history_json),1,1)='['
+        AND basis.workspace_id=h.workspace_id
+        AND basis.conversation_thread_id=i.source_thread
+        AND 'task-basis:'||basis.run_id=i.source_scope
+        AND basis.run_id=i.source_id
+        AND 'task-basis-revision:'||COALESCE(revision.revision,1)=i.source_version
+    )
+  )
+LIMIT 1
+"#;
+
+fn accepted_import_current_statement(
+    sql: &str,
+    prepared: &PreparedFrozenImport,
+) -> Result<sea_orm::Statement> {
     let basis = prepared
         .accepted_basis
         .as_ref()
         .expect("accepted import proof");
-    Ok(db.query_one_raw(sqlite_specific_sql(
-        "SELECT 1 FROM task_run_turn execution \
-         JOIN task_run_conversation_snapshot snapshot ON snapshot.run_id=execution.run_id AND snapshot.task_id=execution.task_id \
-         JOIN thread_lineage lineage ON lineage.child_thread_id=execution.thread_id AND lineage.parent_thread_id=snapshot.conversation_thread_id \
-         JOIN thread child ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id \
-         JOIN compaction_frozen_history h ON h.id=? AND h.owner_thread=snapshot.conversation_thread_id AND h.workspace_id=snapshot.workspace_id \
-         JOIN compaction_frozen_import i ON i.manifest_id=h.id AND i.ordinal=? \
-         JOIN compaction_live_sources s ON s.workspace_id=h.workspace_id AND s.thread_id=i.source_thread AND s.source_scope=i.source_scope AND s.source_id=i.source_id AND s.source_version=i.source_version \
-         WHERE execution.thread_id=? AND execution.turn_id=? AND snapshot.workspace_id=? AND snapshot.history_json=? \
-         AND h.ready=1 AND h.identity_sha256=? AND h.next_import=h.import_count AND i.proof_json=? AND h.imports_sha256=? AND h.import_count=? LIMIT 1",
-        [basis.manifest.clone().into(), basis.ordinal.into(), prepared.destination.clone().into(),
-         basis.turn.clone().into(), prepared.workspace.clone().into(), basis.history_json.clone().into(),
-         basis.digest.clone().into(), basis.proof_json.clone().into(), basis.imports_digest.clone().into(), i64::try_from(basis.import_count)?.into()],
-    )).await?.is_some())
+    Ok(sqlite_specific_sql(
+        sql,
+        [
+            basis.manifest.clone().into(),
+            basis.ordinal.into(),
+            prepared.destination.clone().into(),
+            basis.turn.clone().into(),
+            prepared.workspace.clone().into(),
+            basis.history_json.clone().into(),
+            basis.digest.clone().into(),
+            basis.proof_json.clone().into(),
+            basis.imports_digest.clone().into(),
+            i64::try_from(basis.import_count)?.into(),
+        ],
+    ))
 }
 
 pub(crate) async fn compaction_append_frozen_imports(
@@ -938,3 +1083,7 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
 }
 
 use super::compaction_live_sources;
+
+#[cfg(test)]
+#[path = "compaction_frozen_import_tests.rs"]
+mod tests;

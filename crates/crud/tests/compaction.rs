@@ -3656,6 +3656,34 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .unwrap();
     let imported_checkpoint_ready =
         ready_import_operation(&store, &imported_checkpoint_edited, "child", &a_summary).await;
+    let stale_forwarded = maintenance
+        .compaction_prepare_accepted_import("ws", "context-c", "turn-c", 0)
+        .await
+        .unwrap();
+    let stale_forwarded_imports = vec![(0, stale_forwarded)];
+    let stale_forwarded_digest = frozen_import_identity(&stale_forwarded_imports).unwrap();
+    let stale_forwarded_context =
+        descriptor("stale-forwarded", std::slice::from_ref(&child_target));
+    maintenance
+        .compaction_begin_frozen_history_with_imports(
+            "ws",
+            "context-c",
+            &stale_forwarded_context,
+            1,
+            &stale_forwarded_digest,
+        )
+        .await
+        .unwrap();
+    maintenance
+        .compaction_append_frozen_history(
+            "ws",
+            "context-c",
+            &stale_forwarded_context.manifest_id,
+            0,
+            std::slice::from_ref(&child_target),
+        )
+        .await
+        .unwrap();
     let stale = descriptor("stale-assembled", std::slice::from_ref(&target));
     store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &stale, 1, &import_digest)
@@ -3670,6 +3698,40 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     )
     .await
     .unwrap();
+    assert!(
+        maintenance
+            .compaction_append_frozen_imports(
+                "ws",
+                "context-c",
+                &stale_forwarded_context.manifest_id,
+                0,
+                &stale_forwarded_imports,
+            )
+            .await
+            .is_err(),
+        "accepted source revision is revalidated in the writer transaction"
+    );
+    let stale_forwarded_state = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT h.next_import,(SELECT COUNT(*) FROM compaction_frozen_import i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=?",
+            [stale_forwarded_context.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stale_forwarded_state
+            .try_get::<i64>("", "next_import")
+            .unwrap(),
+        0,
+        "rejected accepted import must not advance its cursor"
+    );
+    assert_eq!(
+        stale_forwarded_state.try_get::<i64>("", "stored").unwrap(),
+        0,
+        "rejected accepted import must not write metadata"
+    );
     assert!(
         store
             .compaction_append_frozen_imports("ws", "thread", &stale.manifest_id, 0, &imports)
