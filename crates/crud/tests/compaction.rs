@@ -4957,11 +4957,16 @@ async fn history_check_retries_are_durable_bounded_and_cas_protected() {
     let store = store().await.with_maintenance_access();
     store
         .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
         .await
         .unwrap();
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
     let mut now = 1000;
@@ -5092,11 +5097,16 @@ async fn history_check_waits_do_not_spend_retries_and_stop_wins_over_stale_resul
     let store = store().await.with_maintenance_access();
     store
         .database_connection()
-        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
         .await
         .unwrap();
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
     let mut now = 0;
@@ -5188,11 +5198,14 @@ async fn history_check_legacy_failures_are_reconciled_once_without_reviving_canc
     use pioneer_crud::compaction::{HistoryCheckDiagnostic as D, HistoryCheckOutcome as O};
     let store = store().await.with_maintenance_access();
     let db = store.database_connection();
-    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
+    db.execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
         .await
         .unwrap();
     store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    db.execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
     db.execute_unprepared("UPDATE compaction_history_check SET state='finished',outcome='failed' WHERE turn_id='turn'").await.unwrap();

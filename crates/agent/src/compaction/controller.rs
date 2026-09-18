@@ -121,6 +121,14 @@ pub struct NativeUsageMeasurement {
 pub struct NativePreparedRequest {
     pub request: ChatRequest,
     pub receipt: NativeInputReceipt,
+    /// Compact budgeting metadata captured while the provider request is
+    /// already materialized. It contains no messages or request payload.
+    pub history_check: NativeHistoryCheckMetadata,
+}
+#[derive(Clone, Debug)]
+pub struct NativeHistoryCheckMetadata {
+    pub target_output_cap: u32,
+    pub fixed_input_tokens: u64,
 }
 
 #[async_trait]
@@ -134,21 +142,12 @@ pub trait NativeContextController: Send + Sync {
         measurement: Option<NativeUsageMeasurement>,
         recovery: bool,
     ) -> Result<NativePreparedRequest>;
-    /// An owned post-turn check. The implementation schedules work only when a
-    /// fitting context needs it and retains cancellation/deadline ownership.
-    async fn after_turn(
-        &self,
-        context: &NativeContext,
-        request: ChatRequest,
-        measurement: Option<NativeUsageMeasurement>,
-    ) -> Result<()>;
 }
 
 pub struct NativeContextSession {
     pub context: NativeContext,
     controller: Arc<dyn NativeContextController>,
     measurement: Mutex<Option<NativeUsageMeasurement>>,
-    last_request: Mutex<Option<ChatRequest>>,
     recovery_pending: std::sync::atomic::AtomicBool,
     recovery_active: std::sync::atomic::AtomicBool,
     recovery_deadline: Option<tokio::time::Instant>,
@@ -169,7 +168,6 @@ impl NativeContextSession {
             context,
             controller,
             measurement: Mutex::new(None),
-            last_request: Mutex::new(None),
             recovery_pending: std::sync::atomic::AtomicBool::new(recovery),
             recovery_active: std::sync::atomic::AtomicBool::new(recovery),
             recovery_deadline,
@@ -221,11 +219,6 @@ impl NativeContextSession {
             _ = self.context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             result = work => result,
         }?;
-        *self
-            .last_request
-            .lock()
-            .map_err(|_| anyhow::anyhow!("native request state unavailable"))? =
-            Some(prepared.request.clone());
         Ok(prepared)
     }
     pub fn provider_deadline(&self) -> Option<tokio::time::Instant> {
@@ -252,24 +245,6 @@ impl NativeContextSession {
             .lock()
             .map_err(|_| anyhow::anyhow!("native usage state unavailable"))? = measurement;
         Ok(())
-    }
-    pub async fn after_turn(&self) -> Result<()> {
-        let request = self
-            .last_request
-            .lock()
-            .map_err(|_| anyhow::anyhow!("native request state unavailable"))?
-            .take();
-        let Some(request) = request else {
-            return Ok(());
-        };
-        let measurement = self
-            .measurement
-            .lock()
-            .map_err(|_| anyhow::anyhow!("native usage state unavailable"))?
-            .clone();
-        self.controller
-            .after_turn(&self.context, request, measurement)
-            .await
     }
     pub async fn stop(&self) -> Result<()> {
         let result = self.controller.stop(&self.context).await;

@@ -26,6 +26,49 @@ pub(super) struct OwnedHistoryCheck {
     suspending: Arc<AtomicBool>,
     pub(super) handle: Option<JoinHandle<()>>,
 }
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CompletedHistoryPreparationBarrier {
+    turn: std::sync::Mutex<Option<String>>,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl CompletedHistoryPreparationBarrier {
+    fn arm(&self, turn: &str) {
+        *self.turn.lock().expect("preparation barrier lock") = Some(turn.to_owned());
+    }
+
+    async fn wait_if_armed(&self, turn: &str, cancel: &CancellationToken) {
+        let armed = {
+            let mut target = self.turn.lock().expect("preparation barrier lock");
+            if target.as_deref() == Some(turn) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        if armed {
+            self.reached.notify_one();
+            tokio::select! {
+                _ = self.release.notified() => {}
+                _ = cancel.cancelled() => {}
+            }
+        }
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 impl Drop for OwnedHistoryCheck {
     fn drop(&mut self) {
         self.cancel.cancel();
@@ -35,61 +78,54 @@ impl Drop for OwnedHistoryCheck {
     }
 }
 impl MessageProcessor {
-    pub(crate) async fn enqueue_native_completed_history(
+    #[cfg(test)]
+    pub(crate) fn arm_completed_history_preparation_barrier(&self, turn: &str) {
+        self.completed_history_preparation_barrier.arm(turn);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_completed_history_preparation_barrier(&self) {
+        self.completed_history_preparation_barrier
+            .wait_until_reached()
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_completed_history_preparation_barrier(&self) {
+        self.completed_history_preparation_barrier.release();
+    }
+
+    pub(crate) async fn enqueue_native_history_check(
         &self,
         context: &pioneer_agent::compaction::controller::NativeContext,
-        mut request: pioneer_provider::ChatRequest,
+        prepared: &pioneer_agent::compaction::controller::NativePreparedRequest,
+        settings: CompactionSettings,
+        deadline: u64,
     ) -> anyhow::Result<()> {
-        let settings = self.compaction_settings_for_workspace(&context.workspace_id)?;
         let clock = SystemCompactionClock::default();
-        let deadline = clock
-            .now_ms()
-            .saturating_add(pioneer_compaction::OPERATION_MILLIS);
-        let prepare = async {
-            // Persist only the cost of fixed instructions/tools/media, not their
-            // contents or any conversational messages. The additive background
-            // estimate conservatively includes both request envelopes. Foreground
-            // materialization always recalculates its complete actual request.
-            request
-                .messages
-                .retain(|message| message.role == pioneer_provider::Role::System);
-            let limits = pioneer_provider::catalog::model_catalog()?
-                .limits(context.provider.name(), &request.model);
-            let budget = pioneer_compaction::ModelBudget::new(
-                Some(limits.context_window),
-                limits.max_input,
-                limits.max_output,
-            );
-            let materialized = context.provider.prepare_input_budget(request).await?;
-            let fixed = pioneer_agent::compaction::request::NativeRequestProjection::full(
-                materialized.request,
-                materialized.media,
-                budget,
-                false,
-            )?;
-            let current = ModelSelection {
-                transport: Transport::Api,
-                instance: context.provider_instance.clone(),
-                model: fixed.request.model.clone(),
-                effort: match fixed.request.reasoning {
-                    Some(pioneer_provider::ReasoningConfig::Effort(effort)) => {
-                        Some(effort.as_str().to_owned())
-                    }
-                    Some(pioneer_provider::ReasoningConfig::Disabled) => Some("none".to_owned()),
-                    None => None,
-                },
-            };
-            let captured = CapturedCheck {
-                current,
-                settings,
-                cli_override: None,
-                target_output_cap: Some(u32::try_from(fixed.output_reserve)?),
-                fixed_input_tokens: fixed.estimated_input_tokens,
-                deadline_ms: deadline,
-            };
-            let descriptor = serde_json::to_string(&captured)?;
+        let current = ModelSelection {
+            transport: Transport::Api,
+            instance: context.provider_instance.clone(),
+            model: prepared.request.model.clone(),
+            effort: match prepared.request.reasoning {
+                Some(pioneer_provider::ReasoningConfig::Effort(effort)) => {
+                    Some(effort.as_str().to_owned())
+                }
+                Some(pioneer_provider::ReasoningConfig::Disabled) => Some("none".to_owned()),
+                None => None,
+            },
+        };
+        let captured = CapturedCheck {
+            current,
+            settings,
+            cli_override: None,
+            target_output_cap: Some(prepared.history_check.target_output_cap),
+            fixed_input_tokens: prepared.history_check.fixed_input_tokens,
+            deadline_ms: deadline,
+        };
+        let descriptor = serde_json::to_string(&captured)?;
+        let enqueue = async {
             self.crud_store
-                .with_maintenance_access()
                 .compaction_enqueue_native_history_check(
                     &context.workspace_id,
                     &context.thread_id,
@@ -101,7 +137,7 @@ impl MessageProcessor {
         tokio::select! { biased;
             _=context.cancellation.cancelled()=>anyhow::bail!("background history registration cancelled"),
             _=clock.sleep_until(deadline)=>anyhow::bail!("background history registration deadline exceeded"),
-            result=prepare=>result,
+            result=enqueue=>result,
         }
     }
     /// Existing resilience owner polls only durable completion intents, not all
@@ -416,6 +452,10 @@ impl MessageProcessor {
             turn: row.turn_id.clone(),
         });
         let result = {
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(&row.turn_id, &cancel)
+                .await;
             let work = crate::compaction::prepare_completed_history_owned(
                 self,
                 &row.workspace_id,

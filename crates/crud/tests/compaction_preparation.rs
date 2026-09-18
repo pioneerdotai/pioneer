@@ -621,7 +621,17 @@ async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission
     let database = SqliteDatabase::new(reader, writer);
     let store = CrudStore::new(database.clone()).with_maintenance_access();
     store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='in_progress' WHERE id='turn'")
+        .await
+        .unwrap();
+    store
         .compaction_enqueue_native_history_check("ws", "thread", "turn", "{}")
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
         .await
         .unwrap();
     let page = store.compaction_due_history_checks(1000).await.unwrap();

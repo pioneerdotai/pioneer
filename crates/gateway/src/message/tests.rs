@@ -3077,9 +3077,17 @@ struct CountingDelayedProvider {
 
 struct CaptureSummaryProvider {
     pause_first: std::sync::atomic::AtomicBool,
+    first_delay_ms: std::sync::atomic::AtomicUsize,
+    release_first: Notify,
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     calls: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletedHistoryDeliveryBarrier {
+    Preparation,
+    Summarizer,
 }
 
 #[derive(Default)]
@@ -3420,6 +3428,8 @@ impl CaptureSummaryProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
             pause_first: std::sync::atomic::AtomicBool::new(false),
+            first_delay_ms: std::sync::atomic::AtomicUsize::new(0),
+            release_first: Notify::new(),
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
@@ -3435,6 +3445,18 @@ impl CaptureSummaryProvider {
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn with_first_delay(self, delay: Duration) -> Self {
+        self.first_delay_ms.store(
+            usize::try_from(delay.as_millis()).unwrap_or(usize::MAX),
+            Ordering::SeqCst,
+        );
+        self
+    }
+
+    fn release_paused_call(&self) {
+        self.release_first.notify_one();
     }
 }
 
@@ -3530,8 +3552,12 @@ impl Provider for CaptureSummaryProvider {
             .lock()
             .expect("capture summary requests lock")
             .push(request);
+        let delay_ms = self.first_delay_ms.swap(0, Ordering::SeqCst);
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms as u64)).await;
+        }
         if self.pause_first.swap(false, Ordering::SeqCst) {
-            futures_util::future::pending::<()>().await;
+            self.release_first.notified().await;
         }
         Ok(ChatResponse {
             text: self.text.clone(),
@@ -21354,23 +21380,37 @@ async fn scheduled_task_agent_run_creates_parent_visible_occurrence_turn_impl() 
 
 #[test]
 fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn() {
-    run_standard_stack_message_test(
-        "immediate detached Task occurrence delivery",
-        immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body(),
-    );
+    run_standard_stack_message_test("immediate detached Task occurrence delivery", async {
+        for barrier in [
+            CompletedHistoryDeliveryBarrier::Preparation,
+            CompletedHistoryDeliveryBarrier::Summarizer,
+        ] {
+            immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body(barrier)
+                .await;
+        }
+    });
 }
 
-async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body() {
+async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_turn_body(
+    barrier: CompletedHistoryDeliveryBarrier,
+) {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let provider = Arc::new(
+        CaptureSummaryProvider::new(format!(
+            r#"<task_result>{{"summary":"immediate background result","data":{{"rawText":"{}"}}}}</task_result>"#,
+            "🧪".repeat(60_000)
+        ))
+        .with_first_delay(Duration::from_millis(250)),
+    );
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_millis(250),
-            text: r#"<task_result>{"summary":"immediate background result","data":{"rawText":"immediate background result\nfull detail"}}</task_result>"#.to_owned(),
-        }),
+        provider.clone(),
     ));
+    provider_registry
+        .insert("echo", provider.clone())
+        .expect("summary provider should register");
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -21381,6 +21421,12 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         test_summary_config(),
         test_tool_loop_config(),
     ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
     let post_turn_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     install_recoverable_test_hook_runtime(
         &processor,
@@ -21660,10 +21706,69 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
     processor
         .set_thread_episodic_ingestor_for_test(delivery_ingestor.clone())
         .await;
+    let pending = crud_store
+        .compaction_pending_history_checks()
+        .await
+        .expect("Native completion intent should be queryable before worker admission");
+    assert!(
+        pending
+            .iter()
+            .any(|check| check.turn_id == lineage.child_turn_id),
+        "Native child completion must expose its intent before delivery"
+    );
+    let before_delivery = processor
+        .task_runtime
+        .service()
+        .list_deliveries(TaskDeliveriesParams {
+            workspace_id: workspace_id.clone(),
+            task_id: Some(response.task.id.clone()),
+            run_id: Some(run.id.clone()),
+            statuses: Vec::new(),
+            limit: Some(10),
+        })
+        .await
+        .expect("Native delivery should exist before its worker runs");
+    assert_eq!(before_delivery.deliveries.len(), 1);
+    assert!(
+        before_delivery
+            .deliveries
+            .iter()
+            .all(|delivery| delivery.status != TaskDeliveryStatus::Delivered),
+        "Native result must not be delivered before the history barrier is reached"
+    );
+    let summary_calls = provider.call_count();
+    match barrier {
+        CompletedHistoryDeliveryBarrier::Preparation => {
+            processor.arm_completed_history_preparation_barrier(&lineage.child_turn_id)
+        }
+        CompletedHistoryDeliveryBarrier::Summarizer => {
+            provider.pause_first.store(true, Ordering::SeqCst)
+        }
+    }
+    processor
+        .poll_completed_history_checks()
+        .await
+        .expect("Native history worker should start");
+    match barrier {
+        CompletedHistoryDeliveryBarrier::Preparation => timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .expect("Native worker must reach the preparation barrier"),
+        CompletedHistoryDeliveryBarrier::Summarizer => timeout(Duration::from_secs(10), async {
+            while provider.call_count() == summary_calls {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Native summarizer must reach the provider barrier"),
+    }
+
     processor
         .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
         .await
-        .expect("immediate detached delivery worker should run");
+        .expect("immediate detached delivery worker should run while history work is blocked");
     processor
         .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(2), 10)
         .await
@@ -21679,12 +21784,61 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             limit: Some(10),
         })
         .await
-        .expect("deliveries should read");
+        .expect("Native delivery should commit while history work is blocked");
     assert_eq!(deliveries.deliveries.len(), 1);
     assert_eq!(
         deliveries.deliveries[0].status,
         TaskDeliveryStatus::Delivered
     );
+    assert!(
+        deliveries.deliveries[0]
+            .result_snapshot
+            .as_ref()
+            .and_then(|result| result.summary.as_deref())
+            .is_some_and(|summary| summary.contains("immediate background result"))
+    );
+    let blocked_parent_items = crud_store
+        .get_turn_item_events(parent_thread_id, run.id.as_str())
+        .await
+        .expect("parent items should load while Native history work is blocked")
+        .expect("parent occurrence turn should exist");
+    assert!(blocked_parent_items.events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { text, .. },
+                ..
+            } if text.contains("immediate background result")
+        )
+    }));
+
+    match barrier {
+        CompletedHistoryDeliveryBarrier::Preparation => {
+            processor.release_completed_history_preparation_barrier()
+        }
+        CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
+    }
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let finished = processor
+                .completed_history_checks
+                .lock()
+                .await
+                .values()
+                .all(|job| {
+                    job.handle
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                });
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("released Native history worker should finish");
+    processor.poll_completed_history_checks().await.unwrap();
     assert_eq!(
         deliveries.deliveries[0].delivered_turn_id.as_deref(),
         Some(run.id.as_str()),
@@ -23062,10 +23216,18 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
         let cli_session = Arc::new(RecordingCliRuntimeSession::default());
         let cli_manager = test_cli_runtime_manager(cli_session.clone());
+        let summary_provider = Arc::new(CaptureSummaryProvider::new("released CLI summary"));
+        let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            summary_provider.clone(),
+        ));
+        provider_registry
+            .insert("openai", summary_provider.clone())
+            .expect("CLI test provider should register");
         let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
             MessageProcessor::new(
                 thread_manager,
-                test_provider(),
+                provider_registry,
                 session_manager,
                 workspace_manager,
                 crud_store.clone(),
@@ -23082,6 +23244,12 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
             .await
             .expect("recording CLI runtimes should seed authoritative readiness");
+        processor
+            .agent_manager
+            .set_context_controller(Some(Arc::new(
+                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+            )))
+            .await;
         processor.bind_task_bridge().await;
         processor.start_task_event_listener().await;
 
@@ -23226,8 +23394,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             }
         );
 
+        let barrier = if runtime_id == "codex" {
+            CompletedHistoryDeliveryBarrier::Preparation
+        } else {
+            CompletedHistoryDeliveryBarrier::Summarizer
+        };
+        let background_context = "🧪".repeat(60_000);
         let result = format!(
-            r#"<task_result>{{"summary":"{runtime_id} native result","data":{{"runtime":"{runtime_id}"}}}}</task_result>"#
+            r#"<task_result>{{"summary":"{runtime_id} native result","data":{{"runtime":"{runtime_id}","context":"{background_context}"}}}}</task_result>"#
         );
         complete_recorded_cli_task_turn(
             &processor,
@@ -23250,10 +23424,96 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             TaskStatus::Completed,
             "{runtime_id} native Task should reconcile through the normal Task result path"
         );
+        let pending = crud_store
+            .compaction_pending_history_checks()
+            .await
+            .expect("CLI completion intent should be queryable before worker admission");
+        assert!(
+            pending
+                .iter()
+                .any(|check| check.turn_id == lineage.child_turn_id),
+            "{runtime_id} delivery must not wait for background history preparation"
+        );
+        let before_delivery = processor
+            .task_runtime
+            .service()
+            .list_deliveries(TaskDeliveriesParams {
+                workspace_id: workspace_id.clone(),
+                task_id: Some(response.task.id.clone()),
+                run_id: Some(run.id.clone()),
+                statuses: Vec::new(),
+                limit: Some(10),
+            })
+            .await
+            .expect("CLI delivery should exist before its worker runs");
+        assert_eq!(before_delivery.deliveries.len(), 1);
+        assert!(
+            before_delivery
+                .deliveries
+                .iter()
+                .all(|delivery| delivery.status != TaskDeliveryStatus::Delivered),
+            "{runtime_id} result must not be delivered before the history barrier is reached"
+        );
+        let summary_calls = summary_provider.call_count();
+        match barrier {
+            CompletedHistoryDeliveryBarrier::Preparation => {
+                processor.arm_completed_history_preparation_barrier(&lineage.child_turn_id)
+            }
+            CompletedHistoryDeliveryBarrier::Summarizer => {
+                summary_provider.pause_first.store(true, Ordering::SeqCst)
+            }
+        }
+        processor
+            .poll_completed_history_checks()
+            .await
+            .expect("CLI history worker should start before delivery");
+        match barrier {
+            CompletedHistoryDeliveryBarrier::Preparation => timeout(
+                Duration::from_secs(10),
+                processor.wait_for_completed_history_preparation_barrier(),
+            )
+            .await
+            .expect("CLI worker must reach the preparation barrier"),
+            CompletedHistoryDeliveryBarrier::Summarizer => {
+                timeout(Duration::from_secs(10), async {
+                    while summary_provider.call_count() == summary_calls {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("CLI summarizer must reach the provider barrier")
+            }
+        }
         processor
             .process_due_task_deliveries(super::now_timestamp_secs().saturating_add(1), 10)
             .await
-            .expect("native Task delivery worker should run");
+            .expect("CLI Task delivery should run while history work is blocked");
+        let deliveries = processor
+            .task_runtime
+            .service()
+            .list_deliveries(TaskDeliveriesParams {
+                workspace_id: workspace_id.clone(),
+                task_id: Some(response.task.id.clone()),
+                run_id: Some(run.id.clone()),
+                statuses: Vec::new(),
+                limit: Some(10),
+            })
+            .await
+            .expect("CLI Task delivery should load while history work is blocked");
+        assert_eq!(deliveries.deliveries.len(), 1);
+        assert_eq!(
+            deliveries.deliveries[0].status,
+            TaskDeliveryStatus::Delivered
+        );
+        assert!(
+            deliveries.deliveries[0]
+                .result_snapshot
+                .as_ref()
+                .and_then(|result| result.summary.as_deref())
+                .is_some_and(
+                    |summary| summary.contains(format!("{runtime_id} native result").as_str())
+                )
+        );
         let occurrence_items = crud_store
             .get_turn_item_events(parent_thread_id.as_str(), run.id.as_str())
             .await
@@ -23268,6 +23528,33 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 } if text.contains(format!("{runtime_id} native result").as_str())
             )
         }));
+        match barrier {
+            CompletedHistoryDeliveryBarrier::Preparation => {
+                processor.release_completed_history_preparation_barrier()
+            }
+            CompletedHistoryDeliveryBarrier::Summarizer => summary_provider.release_paused_call(),
+        }
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let finished = processor
+                    .completed_history_checks
+                    .lock()
+                    .await
+                    .values()
+                    .all(|job| {
+                        job.handle
+                            .as_ref()
+                            .is_none_or(tokio::task::JoinHandle::is_finished)
+                    });
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released CLI history worker should finish");
+        processor.poll_completed_history_checks().await.unwrap();
     }
 }
 
@@ -64009,7 +64296,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteWriteClass, SqliteWriteEvent,
         SqliteWriteExecutor,
     };
-    use sea_orm::ConnectOptions;
+    use sea_orm::{ConnectOptions, TransactionTrait};
 
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("native-foreground.sqlite");
@@ -64199,6 +64486,139 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         .unwrap()
         .unwrap();
     assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+
+    materialize_cli_runtime_turn_with_text(
+        &store,
+        &workspace,
+        "native-cancelled-registration",
+        "native-cancelled-registration-turn",
+        "must not reach provider",
+    )
+    .await;
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    let held_writer = database.begin().await.unwrap();
+    let cancel_write_start = observer.writes.lock().unwrap().len();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let registration_context = pioneer_agent::compaction::controller::NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: workspace.clone(),
+        thread_id: "native-cancelled-registration".into(),
+        turn_id: "native-cancelled-registration-turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "openai".into(),
+        provider: provider.clone(),
+        events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+        cancellation: cancel.clone(),
+    };
+    let registration_request = ChatRequest {
+        model: "test-model".into(),
+        messages: vec![pioneer_provider::ChatMessage::user(
+            "must not reach provider",
+        )],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
+            &registration_request,
+            &registration_context.provider_instance,
+            "fixture-api",
+            0,
+            None,
+        )
+        .unwrap(),
+        request: registration_request,
+        history_check: pioneer_agent::compaction::controller::NativeHistoryCheckMetadata {
+            target_output_cap: 1024,
+            fixed_input_tokens: 64,
+        },
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "openai".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let deadline = (phase_13_now_secs() as u64)
+        .saturating_mul(1000)
+        .saturating_add(pioneer_compaction::OPERATION_MILLIS);
+    let calls_before_cancel = provider.call_count();
+    let registration_processor = processor.clone();
+    let registration = tokio::spawn(async move {
+        registration_processor
+            .enqueue_native_history_check(&registration_context, &prepared, settings, deadline)
+            .await
+    });
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if observer.writes.lock().unwrap()[cancel_write_start..]
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event,
+                        SqliteWriteEvent::Enqueued {
+                            class: SqliteWriteClass::Interactive,
+                            queue,
+                        } if queue.interactive > 0
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Native registration must wait in the interactive writer queue");
+    cancel.cancel();
+    assert!(
+        timeout(Duration::from_secs(10), registration)
+            .await
+            .expect("cancelled intent reservation must finish before the writer is released")
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(provider.call_count(), calls_before_cancel);
+    assert!(
+        observer.writes.lock().unwrap()[cancel_write_start..]
+            .iter()
+            .any(|event| matches!(
+                event,
+                SqliteWriteEvent::Cancelled {
+                    class: SqliteWriteClass::Interactive,
+                    ..
+                }
+            ))
+    );
+    drop(held_writer);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let row = store
+                .database_connection()
+                .query_one_raw(sea_orm::Statement::from_string(
+                    sea_orm::DbBackend::Sqlite,
+                    "SELECT count(*) AS n FROM compaction_history_check WHERE turn_id='native-cancelled-registration-turn'".to_owned(),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            if row.try_get::<i64>("", "n").unwrap() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled Native registration must not run after writer release");
+    assert_eq!(provider.call_count(), calls_before_cancel);
 }
 
 #[tokio::test]
@@ -64373,6 +64793,581 @@ async fn compaction_native_controller_runs_on_real_turn_and_checks_short_complet
 }
 
 #[tokio::test]
+async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverable() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+
+    let provider = Arc::new(CaptureSummaryProvider::new("unused summary"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    harness
+        .processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                &harness.processor,
+            )),
+        )))
+        .await;
+    let thread = "native-intent-thread";
+    let turn = "native-intent-turn";
+    materialize_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn,
+        "native current input",
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &harness.processor,
+        authenticated_test_superuser().as_ref(),
+        &harness.workspace_id,
+        thread,
+        turn,
+    )
+    .await;
+    let context = pioneer_agent::compaction::controller::NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: harness.workspace_id.clone(),
+        thread_id: thread.into(),
+        turn_id: turn.into(),
+        conversation_thread_id: None,
+        provider_instance: "summary-capture".into(),
+        provider: provider.clone(),
+        events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+    };
+    let request = ChatRequest {
+        model: "test-model".into(),
+        messages: vec![pioneer_provider::ChatMessage::user(
+            "payload is not persisted",
+        )],
+        temperature: None,
+        max_tokens: Some(1024),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let first_prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
+            &request,
+            &context.provider_instance,
+            "fixture-api",
+            0,
+            None,
+        )
+        .unwrap(),
+        request,
+        history_check: pioneer_agent::compaction::controller::NativeHistoryCheckMetadata {
+            target_output_cap: 1024,
+            fixed_input_tokens: 64,
+        },
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let deadline = (phase_13_now_secs() as u64)
+        .saturating_mul(1000)
+        .saturating_add(pioneer_compaction::OPERATION_MILLIS);
+
+    harness
+        .processor
+        .enqueue_native_history_check(&context, &first_prepared, settings.clone(), deadline)
+        .await
+        .unwrap();
+    let mut latest_request = first_prepared.request.clone();
+    latest_request.max_tokens = Some(2048);
+    latest_request
+        .messages
+        .push(pioneer_provider::ChatMessage::system(
+            "latest compact system metadata",
+        ));
+    let latest_prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
+            &latest_request,
+            &context.provider_instance,
+            "fixture-api",
+            0,
+            None,
+        )
+        .unwrap(),
+        request: latest_request,
+        history_check: pioneer_agent::compaction::controller::NativeHistoryCheckMetadata {
+            target_output_cap: 2048,
+            fixed_input_tokens: 777,
+        },
+    };
+    harness
+        .processor
+        .enqueue_native_history_check(&context, &latest_prepared, settings.clone(), deadline)
+        .await
+        .unwrap();
+    let row = harness
+        .crud_store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!(
+                "SELECT count(*) AS n, max(descriptor) AS descriptor FROM compaction_history_check WHERE turn_id='{turn}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
+    let descriptor = row.try_get::<String>("", "descriptor").unwrap();
+    assert!(!descriptor.contains("payload is not persisted"));
+    let descriptor: serde_json::Value = serde_json::from_str(&descriptor).unwrap();
+    assert_eq!(descriptor["target_output_cap"], 2048);
+    assert_eq!(descriptor["fixed_input_tokens"], 777);
+    assert!(
+        harness
+            .crud_store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unfinished turn intent must not be executable"
+    );
+    let completion = harness
+        .crud_store
+        .database_connection()
+        .begin()
+        .await
+        .unwrap();
+    turn::Entity::update_many()
+        .col_expr(turn::Column::Status, Expr::value("completed"))
+        .filter(turn::Column::Id.eq(turn))
+        .exec(&completion)
+        .await
+        .unwrap();
+    let visible_inside_completion = completion
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!(
+                "SELECT count(*) AS n FROM compaction_history_check h JOIN turn t ON t.id=h.turn_id WHERE h.turn_id='{turn}' AND t.status='completed' AND h.state='pending'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        visible_inside_completion.try_get::<i64>("", "n").unwrap(),
+        1,
+        "the pre-registered intent becomes eligible in the completion transaction"
+    );
+    completion.rollback().await.unwrap();
+    assert!(
+        harness
+            .crud_store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty(),
+        "rolling completion back must keep the intent unavailable to the worker"
+    );
+    let mut foreign = context.clone();
+    foreign.workspace_id = "foreign-workspace".into();
+    assert!(
+        harness
+            .processor
+            .enqueue_native_history_check(&foreign, &latest_prepared, settings.clone(), deadline)
+            .await
+            .is_err(),
+        "idempotency must not bypass workspace/thread/turn validation"
+    );
+
+    let mut completed = harness
+        .crud_store
+        .get_turn(thread, turn)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    completed.status = TurnStatus::Completed;
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn: completed,
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+    let due = harness
+        .crud_store
+        .compaction_pending_history_checks()
+        .await
+        .unwrap();
+    assert_eq!(
+        due.len(),
+        1,
+        "durable completion must activate the pre-registered intent"
+    );
+    let descriptor: serde_json::Value =
+        serde_json::from_str(due[0].descriptor.as_deref().unwrap()).unwrap();
+    assert_eq!(descriptor["target_output_cap"], 2048);
+    assert_eq!(descriptor["fixed_input_tokens"], 777);
+
+    // No in-memory owner survives this boundary; polling rediscovers the row
+    // exactly as a restarted service would.
+    harness.processor.suspend_completed_history_checks().await;
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let finished = harness
+                .processor
+                .completed_history_checks
+                .lock()
+                .await
+                .values()
+                .all(|job| {
+                    job.handle
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                });
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    let row = harness
+        .crud_store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!(
+                "SELECT outcome,diagnostic FROM compaction_history_check WHERE turn_id='{turn}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let diagnostic = row.try_get::<String>("", "diagnostic").ok();
+    assert_eq!(
+        row.try_get::<String>("", "outcome").unwrap(),
+        "fits",
+        "history worker diagnostic: {diagnostic:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "short history needs no summarizer"
+    );
+    context.events.shutdown_progress().await;
+}
+
+#[tokio::test]
+async fn native_history_descriptor_does_not_overwrite_processing_or_terminal_check() {
+    let provider = Arc::new(CaptureSummaryProvider::new("unused summary"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+    let thread = "native-descriptor-fence-thread";
+    let turn_id = "native-descriptor-fence-turn";
+    materialize_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn_id,
+        "native input",
+    )
+    .await;
+    harness
+        .crud_store
+        .compaction_enqueue_native_history_check(
+            &harness.workspace_id,
+            thread,
+            turn_id,
+            r#"{"fixed_input_tokens":64}"#,
+        )
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE compaction_history_check SET managed=1, revision=7, failures=3, attempt_deadline_ms=12345 WHERE turn_id='{turn_id}'"
+        ))
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .compaction_enqueue_native_history_check(
+            &harness.workspace_id,
+            thread,
+            turn_id,
+            r#"{"fixed_input_tokens":777}"#,
+        )
+        .await
+        .unwrap();
+    let processing = harness
+        .crud_store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!(
+                "SELECT descriptor,state,managed,revision,failures,attempt_deadline_ms FROM compaction_history_check WHERE turn_id='{turn_id}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        processing.try_get::<String>("", "descriptor").unwrap(),
+        r#"{"fixed_input_tokens":64}"#
+    );
+    assert_eq!(
+        processing.try_get::<String>("", "state").unwrap(),
+        "pending"
+    );
+    assert_eq!(processing.try_get::<i64>("", "managed").unwrap(), 1);
+    assert_eq!(processing.try_get::<i64>("", "revision").unwrap(), 7);
+    assert_eq!(processing.try_get::<i64>("", "failures").unwrap(), 3);
+    assert_eq!(
+        processing
+            .try_get::<i64>("", "attempt_deadline_ms")
+            .unwrap(),
+        12345
+    );
+
+    harness
+        .crud_store
+        .database_connection()
+        .execute_unprepared(&format!(
+            "UPDATE compaction_history_check SET state='finished', outcome='completed' WHERE turn_id='{turn_id}'"
+        ))
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .compaction_enqueue_native_history_check(
+            &harness.workspace_id,
+            thread,
+            turn_id,
+            r#"{"fixed_input_tokens":999}"#,
+        )
+        .await
+        .unwrap();
+    let terminal = harness
+        .crud_store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!(
+                "SELECT descriptor,state,outcome,managed,revision,failures,attempt_deadline_ms FROM compaction_history_check WHERE turn_id='{turn_id}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminal.try_get::<String>("", "descriptor").unwrap(),
+        r#"{"fixed_input_tokens":64}"#
+    );
+    assert_eq!(terminal.try_get::<String>("", "state").unwrap(), "finished");
+    assert_eq!(
+        terminal.try_get::<String>("", "outcome").unwrap(),
+        "completed"
+    );
+    assert_eq!(terminal.try_get::<i64>("", "managed").unwrap(), 1);
+    assert_eq!(terminal.try_get::<i64>("", "revision").unwrap(), 7);
+    assert_eq!(terminal.try_get::<i64>("", "failures").unwrap(), 3);
+    assert_eq!(
+        terminal.try_get::<i64>("", "attempt_deadline_ms").unwrap(),
+        12345
+    );
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_execution_turn_intents_are_not_worker_eligible() {
+    let provider = Arc::new(CaptureSummaryProvider::new("must not run"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    for (turn_id, status) in [
+        ("native-failed-intent-turn", "failed"),
+        ("native-cancelled-intent-turn", "interrupted"),
+    ] {
+        materialize_cli_runtime_turn_with_text(
+            &harness.crud_store,
+            &harness.workspace_id,
+            "native-noncompleted-intent-thread",
+            turn_id,
+            turn_id,
+        )
+        .await;
+        harness
+            .crud_store
+            .compaction_enqueue_native_history_check(
+                &harness.workspace_id,
+                "native-noncompleted-intent-thread",
+                turn_id,
+                r#"{"native":true}"#,
+            )
+            .await
+            .unwrap();
+        turn::Entity::update_many()
+            .col_expr(turn::Column::Status, Expr::value(status))
+            .filter(turn::Column::Id.eq(turn_id))
+            .exec(&harness.crud_store.database_connection())
+            .await
+            .unwrap();
+    }
+    assert!(
+        harness
+            .crud_store
+            .compaction_pending_history_checks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    harness
+        .processor
+        .poll_completed_history_checks()
+        .await
+        .unwrap();
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[tokio::test]
+async fn history_intents_are_per_execution_turn_for_followups_nested_and_cli() {
+    let provider = Arc::new(CaptureSummaryProvider::new("unused summary"));
+    let harness = setup_phase_13_compaction_harness(phase_13_provider_registry(provider)).await;
+
+    for turn in ["followup-turn-1", "followup-turn-2"] {
+        materialize_cli_runtime_turn_with_text(
+            &harness.crud_store,
+            &harness.workspace_id,
+            "followup-thread",
+            turn,
+            turn,
+        )
+        .await;
+        harness
+            .crud_store
+            .compaction_enqueue_native_history_check(
+                &harness.workspace_id,
+                "followup-thread",
+                turn,
+                r#"{"native":true}"#,
+            )
+            .await
+            .unwrap();
+    }
+
+    materialize_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "parent-execution-thread",
+        "parent-execution-turn",
+        "parent",
+    )
+    .await;
+    materialize_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "nested-execution-thread",
+        "nested-execution-turn",
+        "child",
+    )
+    .await;
+    harness
+        .crud_store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind,created_by_thread_id,created_by_turn_id) VALUES ('nested-execution-thread','parent-execution-thread','parent-execution-thread',1,CURRENT_TIMESTAMP,'task_run','parent-execution-thread','parent-execution-turn')",
+        )
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .compaction_enqueue_native_history_check(
+            &harness.workspace_id,
+            "nested-execution-thread",
+            "nested-execution-turn",
+            r#"{"native":true}"#,
+        )
+        .await
+        .unwrap();
+
+    seed_cli_runtime_turn_with_text(
+        &harness.crud_store,
+        &harness.workspace_id,
+        "fixture-cli",
+        "codex",
+        "cli-intent-thread",
+        "cli-intent-turn",
+        "cli-native-thread",
+        "cli result",
+    )
+    .await;
+    let mut cli_completed = harness
+        .crud_store
+        .get_turn("cli-intent-thread", "cli-intent-turn")
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    cli_completed.status = TurnStatus::Completed;
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: "cli-intent-thread".into(),
+                turn: cli_completed,
+            },
+            phase_13_now_secs(),
+        )
+        .await
+        .unwrap();
+
+    let row = harness
+        .crud_store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT (SELECT count(*) FROM compaction_history_check h JOIN turn t ON t.id=h.turn_id WHERE t.thread_id='followup-thread') AS followups,(SELECT count(*) FROM compaction_history_check WHERE turn_id='nested-execution-turn') AS nested,(SELECT count(*) FROM compaction_history_check WHERE turn_id='parent-execution-turn') AS parent,(SELECT count(*) FROM compaction_history_check WHERE turn_id='cli-intent-turn') AS cli".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "followups").unwrap(), 2);
+    assert_eq!(row.try_get::<i64>("", "nested").unwrap(), 1);
+    assert_eq!(
+        row.try_get::<i64>("", "parent").unwrap(),
+        0,
+        "nested execution registration must not cascade to ancestors"
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "cli").unwrap(),
+        1,
+        "CLI completion must keep using its existing trigger registration"
+    );
+}
+
+#[tokio::test]
 async fn compaction_history_load_rejects_missing_and_foreign_scope_before_provider_call() {
     let provider = Arc::new(CaptureSummaryProvider::new("must not run"));
     let harness =
@@ -64523,6 +65518,96 @@ async fn check_completed_history(
             .await
             .unwrap();
     }
+    let current = ModelSelection {
+        transport: Transport::Claude,
+        instance: "fixture-cli".into(),
+        model: "unknown-cli-model".into(),
+        effort: Some("high".into()),
+    };
+    let general = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let mut native_owner_context = None;
+    if owned {
+        harness
+            .processor
+            .apply_compaction_settings(general.clone())
+            .unwrap();
+        harness
+            .processor
+            .agent_manager
+            .set_context_controller(Some(Arc::new(
+                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                    &harness.processor,
+                )),
+            )))
+            .await;
+        if native {
+            let native_context = pioneer_agent::compaction::controller::NativeContext {
+                overflow_recovery: false,
+                recovery_deadline_ms: None,
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                conversation_thread_id: None,
+                provider_instance: "summary-capture".into(),
+                provider: provider.clone(),
+                events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            };
+            let request = ChatRequest {
+                model: "test-model".into(),
+                messages: vec![
+                    pioneer_provider::ChatMessage::system("fixed-native-instruction ".repeat(500)),
+                    pioneer_provider::ChatMessage::user("conversational-canary-must-not-be-copied"),
+                ],
+                temperature: None,
+                max_tokens: Some(16384),
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: Some(pioneer_provider::ReasoningConfig::effort(
+                    pioneer_provider::ReasoningEffort::High,
+                )),
+                compiled_prompt: None,
+            };
+            let receipt = pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
+                &request,
+                &native_context.provider_instance,
+                "fixture-api",
+                0,
+                None,
+            )
+            .unwrap();
+            let prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+                request,
+                receipt,
+                history_check: pioneer_agent::compaction::controller::NativeHistoryCheckMetadata {
+                    target_output_cap: 16384,
+                    fixed_input_tokens: 1000,
+                },
+            };
+            harness
+                .processor
+                .enqueue_native_history_check(
+                    &native_context,
+                    &prepared,
+                    general.clone(),
+                    (phase_13_now_secs() as u64)
+                        .saturating_mul(1000)
+                        .saturating_add(pioneer_compaction::OPERATION_MILLIS),
+                )
+                .await
+                .unwrap();
+            native_context.events.shutdown_progress().await;
+            native_owner_context = Some(native_context);
+        }
+    }
     let mut completed = harness
         .crud_store
         .get_turn(thread, turn)
@@ -64543,20 +65628,6 @@ async fn check_completed_history(
         )
         .await
         .unwrap();
-    let current = ModelSelection {
-        transport: Transport::Claude,
-        instance: "fixture-cli".into(),
-        model: "unknown-cli-model".into(),
-        effort: Some("high".into()),
-    };
-    let general = CompactionSettings {
-        selection: Some(ModelSelection {
-            transport: Transport::Api,
-            instance: "summary-capture".into(),
-            model: "test-model".into(),
-            effort: None,
-        }),
-    };
     let run = |workspace: String,
                settings: CompactionSettings,
                override_model: Option<ModelSelection>| {
@@ -64607,62 +65678,8 @@ async fn check_completed_history(
         .is_err()
     );
     assert_eq!(provider.call_count(), 0);
-    let mut native_owner_context = None;
     if owned {
-        harness
-            .processor
-            .apply_compaction_settings(general.clone())
-            .unwrap();
-        harness
-            .processor
-            .agent_manager
-            .set_context_controller(Some(Arc::new(
-                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
-                    &harness.processor,
-                )),
-            )))
-            .await;
         if native {
-            let native_context = pioneer_agent::compaction::controller::NativeContext {
-                overflow_recovery: false,
-                recovery_deadline_ms: None,
-                workspace_id: harness.workspace_id.clone(),
-                thread_id: thread.into(),
-                turn_id: turn.into(),
-                conversation_thread_id: None,
-                provider_instance: "summary-capture".into(),
-                provider: provider.clone(),
-                events: Arc::new(pioneer_runtime_events::ExecutionEventHub::new()),
-                cancellation: tokio_util::sync::CancellationToken::new(),
-            };
-            let request = ChatRequest {
-                model: "test-model".into(),
-                messages: vec![
-                    pioneer_provider::ChatMessage::system("fixed-native-instruction ".repeat(500)),
-                    pioneer_provider::ChatMessage::user("conversational-canary-must-not-be-copied"),
-                ],
-                temperature: None,
-                max_tokens: Some(16384),
-                tools: None,
-                tool_choice: None,
-                parallel_tool_calls: None,
-                reasoning: Some(pioneer_provider::ReasoningConfig::effort(
-                    pioneer_provider::ReasoningEffort::High,
-                )),
-                compiled_prompt: None,
-            };
-            pioneer_agent::compaction::controller::NativeContextController::after_turn(
-                &crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
-                    &harness.processor,
-                )),
-                &native_context,
-                request,
-                None,
-            )
-            .await
-            .unwrap();
-            native_context.events.shutdown_progress().await;
-            native_owner_context = Some(native_context);
             let pending = harness
                 .crud_store
                 .compaction_pending_history_checks()

@@ -18,6 +18,9 @@ pub struct NativeRequestProjection {
 pub struct EvaluatedRequest {
     pub request: ChatRequest,
     pub estimated_input_tokens: u64,
+    /// Exact fixed request cost with conversational messages removed. This is
+    /// derived from the already materialized request and media estimates.
+    pub fixed_input_tokens: u64,
     /// Framing plus materialized media, in final request message order.
     pub message_input_tokens: Vec<u64>,
     pub output_reserve: u64,
@@ -139,11 +142,11 @@ impl NativeRequestProjection {
         request.max_tokens = Some(u32::try_from(reserve)?);
         let message_input_tokens = budget_messages
             .iter()
-            .zip(per_message_media)
+            .zip(&per_message_media)
             .map(|(message, media)| {
                 Ok(text_tokens(&serde_json::to_string(message)?)
                     .saturating_add(1)
-                    .saturating_add(media))
+                    .saturating_add(*media))
             })
             .collect::<Result<Vec<_>>>()?;
         let input = serde_json::json!({
@@ -154,9 +157,29 @@ impl NativeRequestProjection {
             "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
         });
         let estimated_input_tokens = text_tokens(&input.to_string()).saturating_add(media_tokens);
+        let fixed_media_tokens = request
+            .messages
+            .iter()
+            .zip(&per_message_media)
+            .filter(|(message, _)| message.role == Role::System)
+            .fold(0_u64, |sum, (_, media)| sum.saturating_add(*media));
+        let fixed_messages = budget_messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .collect::<Vec<_>>();
+        let fixed_input = serde_json::json!({
+            "model":request.model,"messages":fixed_messages,"tools":request.tools,
+            "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
+            "temperature":request.temperature,"max_tokens":request.max_tokens,
+            "reasoning":request.reasoning.map(|value|format!("{value:?}")),
+            "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
+        });
+        let fixed_input_tokens =
+            text_tokens(&fixed_input.to_string()).saturating_add(fixed_media_tokens);
         Ok(EvaluatedRequest {
             request,
             estimated_input_tokens,
+            fixed_input_tokens,
             message_input_tokens,
             output_reserve: reserve,
             fits: self
@@ -238,6 +261,36 @@ mod tests {
         assert!(result.request.compiled_prompt.is_some());
         assert!(result.estimated_input_tokens > base.estimated_input_tokens + 1000);
     }
+
+    #[test]
+    fn fixed_input_counts_system_and_tools_but_not_conversation() {
+        let budget = ModelBudget::new(Some(32_768), None, None);
+        let mut source = request();
+        source.messages.insert(0, ChatMessage::system("authority"));
+        let base =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+
+        source.messages[1] = ChatMessage::user("conversation ".repeat(2_000));
+        source.messages[2] = ChatMessage::assistant("answer ".repeat(2_000));
+        let conversational =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert_eq!(conversational.fixed_input_tokens, base.fixed_input_tokens);
+        assert!(conversational.estimated_input_tokens > base.estimated_input_tokens);
+
+        source.messages[0] = ChatMessage::system("authority ".repeat(500));
+        let with_system =
+            NativeRequestProjection::full(source.clone(), vec![], budget.clone(), false).unwrap();
+        assert!(with_system.fixed_input_tokens > conversational.fixed_input_tokens);
+
+        source.tools = Some(vec![ToolDefinition {
+            name: "large_tool".into(),
+            description: "schema ".repeat(500),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let with_tools = NativeRequestProjection::full(source, vec![], budget, false).unwrap();
+        assert!(with_tools.fixed_input_tokens > with_system.fixed_input_tokens);
+    }
+
     #[test]
     fn materialized_media_counts_once_in_append_and_candidate_estimates() {
         let mut source = request();

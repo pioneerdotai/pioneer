@@ -538,6 +538,9 @@ pub struct MessageProcessor {
     compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
     compaction_recovery_cursor: Arc<StdRwLock<String>>,
     completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    #[cfg(test)]
+    completed_history_preparation_barrier:
+        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
@@ -1113,6 +1116,8 @@ impl MessageProcessor {
             ),
             compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            completed_history_preparation_barrier: Arc::new(Default::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
@@ -4451,6 +4456,8 @@ impl MessageProcessor {
             ),
             compaction_recovery_cursor: Arc::new(StdRwLock::new(String::new())),
             completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            completed_history_preparation_barrier: Arc::new(Default::default()),
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),

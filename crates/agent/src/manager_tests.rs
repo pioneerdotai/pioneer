@@ -15817,9 +15817,6 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
 #[derive(Default)]
 struct RecordingContextBoundary {
     inputs: std::sync::Mutex<Vec<(ChatRequest, Option<u64>, bool)>>,
-    after_turns: std::sync::Mutex<Vec<String>>,
-    hold_after_turn: bool,
-    live_checks: AtomicUsize,
 }
 #[async_trait::async_trait]
 impl crate::compaction::controller::NativeContextController for RecordingContextBoundary {
@@ -15847,31 +15844,14 @@ impl crate::compaction::controller::NativeContextController for RecordingContext
             1,
             None,
         )?;
-        Ok(crate::compaction::controller::NativePreparedRequest { request, receipt })
-    }
-    async fn after_turn(
-        &self,
-        context: &crate::compaction::controller::NativeContext,
-        request: ChatRequest,
-        _: Option<crate::compaction::controller::NativeUsageMeasurement>,
-    ) -> anyhow::Result<()> {
-        assert_eq!(request.max_tokens, Some(4321));
-        self.after_turns
-            .lock()
-            .unwrap()
-            .push(context.turn_id.clone());
-        if self.hold_after_turn {
-            struct Live<'a>(&'a AtomicUsize);
-            impl Drop for Live<'_> {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
-            self.live_checks.fetch_add(1, Ordering::SeqCst);
-            let _live = Live(&self.live_checks);
-            context.cancellation.cancelled().await;
-        }
-        Ok(())
+        Ok(crate::compaction::controller::NativePreparedRequest {
+            request,
+            receipt,
+            history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
+                target_output_cap: 4321,
+                fixed_input_tokens: 1,
+            },
+        })
     }
 }
 
@@ -16056,14 +16036,6 @@ impl crate::compaction::controller::NativeContextController for PendingContextBo
         let _live = Live(self.0.clone());
         std::future::pending().await
     }
-    async fn after_turn(
-        &self,
-        _: &crate::compaction::controller::NativeContext,
-        _: ChatRequest,
-        _: Option<crate::compaction::controller::NativeUsageMeasurement>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -16135,7 +16107,7 @@ async fn compaction_boundary_stop_and_recovery_deadline_drop_preparation() {
 }
 
 #[tokio::test]
-async fn compaction_post_turn_check_is_owned_and_new_input_cancels_it() {
+async fn compaction_boundary_prepares_each_follow_up_before_provider() {
     let provider = Arc::new(CaptureStandardProvider::default());
     let manager = AgentManager::new(
         Arc::new(ProviderRegistry::with_provider(
@@ -16144,10 +16116,7 @@ async fn compaction_post_turn_check_is_owned_and_new_input_cancels_it() {
         )),
         test_tool_loop_config(),
     );
-    let controller = Arc::new(RecordingContextBoundary {
-        hold_after_turn: true,
-        ..Default::default()
-    });
+    let controller = Arc::new(RecordingContextBoundary::default());
     manager
         .set_context_controller(Some(controller.clone()))
         .await;
@@ -16180,48 +16149,16 @@ async fn compaction_post_turn_check_is_owned_and_new_input_cancels_it() {
                 .unwrap()
                 .unwrap();
             let terminal = matches!(event, AgentDurableEvent::TurnCompleted { .. });
-            if terminal {
-                for _ in 0..20 {
-                    tokio::task::yield_now().await;
-                }
-                assert_eq!(
-                    controller.after_turns.lock().unwrap().len(),
-                    index,
-                    "post-turn preparation must wait for durable terminal acknowledgement"
-                );
-            }
             events.acknowledge_last(Ok(()));
             if terminal {
                 break;
             }
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if controller.after_turns.lock().unwrap().len() == index + 1
-                    && controller.live_checks.load(Ordering::SeqCst) == 1
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert_eq!(controller.inputs.lock().unwrap().len(), index + 1);
     }
     assert_eq!(
         provider.snapshot_requests().len(),
         2,
         "new input reached the provider once"
     );
-    manager
-        .cancel_turn("post-turn", "turn-1", "stop context preparation")
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while controller.live_checks.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
 }

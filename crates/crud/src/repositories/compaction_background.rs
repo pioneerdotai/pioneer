@@ -52,47 +52,89 @@ pub(crate) async fn compaction_enqueue_native_history_check<C: ConnectionTrait>(
         descriptor.len() <= 16384,
         "history descriptor exceeds bound"
     );
-    db.execute(
-        &Query::insert()
-            .into_table(compaction_history_check::Entity)
-            .columns([
-                compaction_history_check::Column::TurnId,
-                compaction_history_check::Column::Descriptor,
-            ])
-            .select_from(
-                turn::Entity::find()
-                    .select_only()
-                    .join(
-                        JoinType::InnerJoin,
-                        turn::Entity::belongs_to(thread::Entity)
-                            .from(turn::Column::ThreadId)
-                            .to(thread::Column::Id)
-                            .into(),
-                    )
-                    .expr(Expr::col((turn::Entity, turn::Column::Id)))
-                    .expr(Expr::Value(descriptor.into()))
-                    .filter(
-                        Expr::col((turn::Entity, turn::Column::Id))
-                            .eq(Expr::Value(turn.into()))
+    let inserted = db
+        .execute(
+            &Query::insert()
+                .into_table(compaction_history_check::Entity)
+                .columns([
+                    compaction_history_check::Column::TurnId,
+                    compaction_history_check::Column::Descriptor,
+                ])
+                .select_from(
+                    turn::Entity::find()
+                        .select_only()
+                        .join(
+                            JoinType::InnerJoin,
+                            turn::Entity::belongs_to(thread::Entity)
+                                .from(turn::Column::ThreadId)
+                                .to(thread::Column::Id)
+                                .into(),
+                        )
+                        .expr(Expr::col((turn::Entity, turn::Column::Id)))
+                        .expr(Expr::Value(descriptor.into()))
+                        .filter(
+                            Expr::col((turn::Entity, turn::Column::Id))
+                                .eq(Expr::Value(turn.into()))
+                                .and(
+                                    Expr::col((turn::Entity, turn::Column::ThreadId))
+                                        .eq(Expr::Value(thread.into())),
+                                )
+                                .and(
+                                    Expr::col((thread::Entity, thread::Column::WorkspaceId))
+                                        .eq(Expr::Value(workspace.into())),
+                                )
+                                .and(
+                                    Expr::col((turn::Entity, turn::Column::Status))
+                                        .eq(Expr::Value("in_progress".into())),
+                                ),
+                        )
+                        .into_query(),
+                )?
+                .on_conflict(
+                    OnConflict::column(compaction_history_check::Column::TurnId)
+                        .update_column(compaction_history_check::Column::Descriptor)
+                        .action_and_where(
+                            Expr::col((
+                                compaction_history_check::Entity,
+                                compaction_history_check::Column::State,
+                            ))
+                            .eq("pending")
                             .and(
-                                Expr::col((turn::Entity, turn::Column::ThreadId))
-                                    .eq(Expr::Value(thread.into())),
-                            )
-                            .and(
-                                Expr::col((thread::Entity, thread::Column::WorkspaceId))
-                                    .eq(Expr::Value(workspace.into())),
-                            )
-                            .and(
-                                Expr::col((turn::Entity, turn::Column::Status))
-                                    .eq(Expr::val("completed")),
+                                Expr::col((
+                                    compaction_history_check::Entity,
+                                    compaction_history_check::Column::Managed,
+                                ))
+                                .eq(0_i64),
                             ),
-                    )
-                    .into_query(),
-            )?
-            .on_conflict(OnConflict::columns(["turn_id"]).do_nothing().to_owned())
-            .to_owned(),
-    )
-    .await?;
+                        )
+                        .to_owned(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    if inserted.rows_affected() == 0 {
+        let valid_existing = compaction_history_check::Entity::find_by_id(turn)
+            .join(
+                JoinType::InnerJoin,
+                compaction_history_check::Entity::belongs_to(turn::Entity)
+                    .from(compaction_history_check::Column::TurnId)
+                    .to(turn::Column::Id)
+                    .into(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                turn::Entity::belongs_to(thread::Entity)
+                    .from(turn::Column::ThreadId)
+                    .to(thread::Column::Id)
+                    .into(),
+            )
+            .filter(turn::Column::ThreadId.eq(thread))
+            .filter(thread::Column::WorkspaceId.eq(workspace))
+            .one(db)
+            .await?
+            .is_some();
+        ensure!(valid_existing, "native history intent scope mismatch");
+    }
     Ok(())
 }
 /// Reconcile lost terminal publications and abandoned deadline/Stop states
@@ -479,6 +521,7 @@ pub(crate) async fn compaction_due_history_checks<C: ConnectionTrait>(
             compaction_history_check::Column::Managed,
         ])
         .filter(compaction_history_check::Column::NextAttemptMs.lte(now))
+        .filter(turn::Column::Status.eq("completed"))
         .filter(
             sea_orm::Condition::any()
                 .add(compaction_history_check::Column::State.eq("pending"))

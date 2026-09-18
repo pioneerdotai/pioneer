@@ -3,7 +3,8 @@
 use super::*;
 use pioneer_agent::compaction::{
     controller::{
-        NativeContext, NativeInputReceipt, NativePreparedRequest, NativeUsageMeasurement,
+        NativeContext, NativeHistoryCheckMetadata, NativeInputReceipt, NativePreparedRequest,
+        NativeUsageMeasurement,
     },
     history::NativeHistoryLayout,
     request::NativeRequestProjection,
@@ -15,6 +16,15 @@ use pioneer_compaction::{
 use pioneer_crud::compaction::ManifestEntry;
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
 use std::collections::BTreeSet;
+
+fn history_check_metadata(
+    prepared: &pioneer_agent::compaction::request::EvaluatedRequest,
+) -> Result<NativeHistoryCheckMetadata> {
+    Ok(NativeHistoryCheckMetadata {
+        target_output_cap: u32::try_from(prepared.output_reserve)?,
+        fixed_input_tokens: prepared.fixed_input_tokens,
+    })
+}
 
 pub(crate) fn native_owner(workspace: &str, thread: &str) -> String {
     // Lengths disambiguate arbitrary scope identifiers without parsing them.
@@ -190,8 +200,9 @@ pub(super) async fn prepare_native_projection(
                 )?;
             }
         }
+        let history_check = history_check_metadata(&full)?;
         if !recovery && budget.fits(input, full.output_reserve, false) {
-            return Ok::<_, anyhow::Error>((full.request, receipt, None));
+            return Ok::<_, anyhow::Error>((full.request, receipt, history_check, None));
         }
         let _startup_compaction = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::CompactionWork,
@@ -333,16 +344,21 @@ pub(super) async fn prepare_native_projection(
         Ok((
             full.request,
             receipt,
+            history_check,
             Some((snapshot, summarizer, projection, first)),
         ))
     };
-    let (request, receipt, operation) = tokio::select! { biased;
+    let (request, receipt, history_check, operation) = tokio::select! { biased;
         _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
         _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native context preparation deadline exceeded"),
         prepared = prepared => prepared?,
     };
     let Some((snapshot, summarizer, projection, summary_index)) = operation else {
-        return Ok(NativePreparedRequest { request, receipt });
+        return Ok(NativePreparedRequest {
+            request,
+            receipt,
+            history_check,
+        });
     };
     let checkpoint_is_working_context =
         snapshot.plan.coverage_domain == CoverageDomain::WorkingContext;
@@ -410,6 +426,7 @@ pub(super) async fn prepare_native_projection(
         Ok(NativePreparedRequest {
             request: evaluated.request,
             receipt,
+            history_check,
         })
     };
     tokio::select! { biased;
@@ -505,10 +522,11 @@ impl pioneer_agent::compaction::controller::NativeContextController
         let mut context = context.clone();
         context.recovery_deadline_ms = Some(deadline);
         context.cancellation = lease.cancellation();
-        prepare_native_projection(
+        let settings = processor.compaction_settings_for_workspace(&context.workspace_id)?;
+        let prepared = prepare_native_projection(
             processor.crud_store.as_ref(),
             processor.provider_registry().as_ref(),
-            &processor.compaction_settings_for_workspace(&context.workspace_id)?,
+            &settings,
             &context,
             request,
             measurement,
@@ -518,24 +536,14 @@ impl pioneer_agent::compaction::controller::NativeContextController
             Some(projection),
             Some(&processor),
         )
-        .await
-    }
-    async fn after_turn(
-        &self,
-        context: &NativeContext,
-        request: ChatRequest,
-        _measurement: Option<NativeUsageMeasurement>,
-    ) -> Result<()> {
-        let processor = self
-            .processor
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("context owner stopped"))?;
-        // This durable intent prepares retained history for a later turn. The
-        // foreground prepare path above always validates the full actual
-        // request, including its current instructions/tools/media and reserve.
+        .await?;
+        // Registration is part of foreground preparation: a provider call can
+        // only begin after this durable, idempotent intent exists. The worker
+        // still gates execution on the turn's durable completed status.
         processor
-            .enqueue_native_completed_history(context, request)
-            .await
+            .enqueue_native_history_check(&context, &prepared, settings, deadline)
+            .await?;
+        Ok(prepared)
     }
 }
 
