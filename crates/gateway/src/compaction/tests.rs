@@ -82,6 +82,7 @@ struct ProviderFixture {
     replies: Mutex<VecDeque<Reply>>,
     calls: Mutex<Vec<ChatRequest>>,
     count: tokio::sync::watch::Sender<usize>,
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     active: AtomicUsize,
 }
 struct Active<'a>(&'a AtomicUsize);
@@ -96,8 +97,14 @@ impl ProviderFixture {
             replies: Mutex::new(replies.into()),
             calls: Mutex::new(vec![]),
             count: tokio::sync::watch::channel(0).0,
+            gate: Mutex::new(None),
             active: AtomicUsize::new(0),
         }
+    }
+    fn pause_next(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
     async fn wait_calls(&self, count: usize) {
         let mut rx = self.count.subscribe();
@@ -127,6 +134,10 @@ impl Provider for ProviderFixture {
             calls.len()
         };
         self.count.send_replace(count);
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
         let reply = self
             .replies
             .lock()
@@ -242,7 +253,7 @@ async fn fixture(
         owner: "owner".into(),
         expected_checkpoint: None,
         projection_version: 0,
-        source_epochs: std::collections::BTreeMap::new(),
+        source_epochs: std::collections::BTreeMap::from([("thread".into(), 0)]),
         admission: CompactionSettings::default()
             .admit(&selection, None, 0)
             .unwrap(),
@@ -312,6 +323,93 @@ async fn fixture(
         observer,
         payload,
     }
+}
+
+#[tokio::test]
+async fn admitted_history_applies_after_real_new_message_materialization() {
+    let f = fixture(&"accepted history H ".repeat(4000), vec![], true, false).await;
+    let gate = f.provider.pause_next();
+    let runner = f.runner.clone();
+    let task = tokio::spawn(async move { runner.run(CancellationToken::new()).await });
+    f.provider.wait_calls(1).await;
+
+    let parent = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut next_turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    next_turn.id = "new-work-turn".into();
+    next_turn.reply_to_turn_id = None;
+    f.store
+        .materialize_turn_start(
+            &parent,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &next_turn,
+            &[pioneer_protocol::UserInput::Text {
+                text: "new work N".into(),
+                text_elements: vec![],
+            }],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let message = pioneer_protocol::TurnItem::UserMessage {
+        id: "new-work-n".into(),
+        text: "new work N".into(),
+        attachments: vec![],
+    };
+    f.store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: next_turn.id.clone(),
+                item: message.clone(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: next_turn.id,
+                item: message,
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        1
+    );
+    gate.add_permits(1);
+
+    let exit = task.await.unwrap().unwrap();
+    let CompactionExit::Applied(checkpoint) = exit else {
+        let state = f.store.compaction_runner_state("operation").await.unwrap();
+        panic!("accepted H was not published after appending N: {exit:?}; state={state:?}");
+    };
+    assert!(
+        f.provider.calls.lock().unwrap().len() > 1,
+        "the fixture must persist intermediate checkpoints"
+    );
+    let checkpoint = f
+        .store
+        .compaction_checkpoint(&checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.coverage.len(), 1);
+    assert!(
+        checkpoint
+            .coverage
+            .iter()
+            .all(|source| source.id != "new-work-n")
+    );
 }
 async fn wait_backoff(store: &CrudStore) {
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1330,6 +1428,7 @@ impl Provider for SmallWindowMain {
 async fn native_discovers_working_context_head_published_after_inherited_snapshot() {
     use pioneer_agent::compaction::controller::NativeContext;
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+    use pioneer_protocol::{PersistedActorRef, SandboxMode};
     use pioneer_provider::{ChatMessage, ProviderRegistry};
 
     // Large enough to overflow gpt-4's input budget, but still one bounded
@@ -1472,7 +1571,17 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         events: Arc::new(ExecutionEventHub::new()),
         cancellation: CancellationToken::new(),
     };
-    let d_prepared = super::native::prepare_native_projection(
+    let parent_thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut next_parent_turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    next_parent_turn.id = "next-parent-turn".into();
+    next_parent_turn.reply_to_turn_id = None;
+    let parent_epoch_before_n = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let barrier = f.provider.pause_next();
+    let preparation = super::native::prepare_native_projection(
         &f.store,
         &providers,
         &settings,
@@ -1494,9 +1603,64 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         f.clock.clone(),
         Some(d_projection),
         None,
-    )
-    .await
-    .unwrap();
+    );
+    let append_new_parent_work = async {
+        f.provider.wait_calls(1).await;
+        f.store
+            .materialize_turn_start(
+                &parent_thread,
+                SandboxMode::FullAccess,
+                &next_parent_turn,
+                &[pioneer_protocol::UserInput::Text {
+                    text: "new parent work N".into(),
+                    text_elements: vec![],
+                }],
+                PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let message = pioneer_protocol::TurnItem::UserMessage {
+            id: "new-parent-work-n".into(),
+            text: "new parent work N".into(),
+            attachments: vec![],
+        };
+        f.store
+            .materialize_item_started(
+                pioneer_protocol::ItemStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: next_parent_turn.id.clone(),
+                    item: message.clone(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        f.store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: next_parent_turn.id.clone(),
+                    item: message,
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        let parent_epoch_after_n = f
+            .store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap();
+        barrier.add_permits(1);
+        assert!(
+            parent_epoch_after_n > parent_epoch_before_n,
+            "real parent Turn materialization must register N as new work"
+        );
+    };
+    let (d_prepared, ()) = tokio::join!(preparation, append_new_parent_work);
+    let d_prepared = d_prepared.unwrap();
     assert!(d_prepared.receipt.identity.checkpoint.is_some());
     assert!(
         d_prepared.request.messages[0]
@@ -1507,6 +1671,351 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     );
     let summarizer_calls = f.provider.calls.lock().unwrap().len();
     assert!(summarizer_calls > 0);
+
+    // A later child accepts the already compacted H together with the new,
+    // separately captured N. Capture/restore and Native preparation must keep
+    // both exactly once and must not invoke the summarizer again.
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let parent_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let parent_after_n =
+        super::history::load_line_history(&f.store, "ws", "thread", None, &parent_fence)
+            .await
+            .unwrap();
+    let n = parent_after_n
+        .into_iter()
+        .find(|message| message.content.contains("new parent work N"))
+        .expect("new parent turn must materialize N");
+    let n_sources = n
+        .provenance
+        .as_ref()
+        .unwrap()
+        .sources
+        .iter()
+        .map(|source| {
+            (
+                source.scope.clone(),
+                source.id.clone(),
+                source.version.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let d_checkpoint = f
+        .store
+        .compaction_checkpoint(d_prepared.receipt.identity.checkpoint.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(d_checkpoint.coverage.iter().all(|source| {
+        !n_sources.contains(&(
+            source.scope.clone(),
+            source.id.clone(),
+            source.version.clone(),
+        ))
+    }));
+    let d_manifest = f
+        .store
+        .compaction_manifest_page(&d_checkpoint.operation_id, false, 0, 0)
+        .await
+        .unwrap();
+    assert!(d_manifest.iter().all(|entry| {
+        !n_sources.contains(&(
+            entry.source.scope.clone(),
+            entry.source.id.clone(),
+            entry.source.version.clone(),
+        ))
+    }));
+    // D completes a small own contribution and publishes it through the same
+    // immutable output/delivery path used by a real TaskRun. E's basis is then
+    // captured from the parent plus that accepted delivery; it is not assembled
+    // from the prepared request or granted an ad-hoc checkpoint scope.
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "context-d".into(),
+                turn_id: "turn-d".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "d-own-result".into(),
+                    text: "accepted own work D".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    for statement in [
+        "UPDATE turn SET status='completed' WHERE id='turn-d'",
+        "UPDATE task_run SET status='succeeded' WHERE id='run-d'",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    let d_task_turn = f.store.get_task_run_turn("rt-d").await.unwrap().unwrap();
+    let d_output = super::frozen::capture_task_output(&f.store, "ws", &d_task_turn)
+        .await
+        .unwrap();
+    for statement in [
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('candidate-d','task-d','run-d','rt-d','context-d','turn-d',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('delivery-turn-d','thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('delivery-d','ws','task-d','run-d','delivery-d','thread','origin_thread','thread','delivered',1,1,'delivery-turn-d')",
+        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('delivery-d','candidate-d','rt-d')",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "delivery-turn-d".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id("delivery-d"),
+                    text: "accepted own work D".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let acknowledgement = f
+        .store
+        .compaction_source_page("ws", "thread", "delivery-turn-d", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let delivered = f
+        .store
+        .compaction_delivery_output("ws", "delivery-d")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.output, d_output);
+    let source_threads = super::frozen::accepted_history_scopes(
+        &f.store,
+        "ws",
+        &delivered.output.source_thread,
+        &serde_json::to_string(&delivered.output.history).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        source_threads,
+        std::collections::BTreeSet::from(["context-d".to_owned()]),
+        "the delivered output grants only D's own immutable result"
+    );
+    let delivery_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut source_epochs = std::collections::BTreeMap::from([(
+        "thread".into(),
+        f.store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+    )]);
+    for source_thread in &source_threads {
+        source_epochs.insert(
+            source_thread.clone(),
+            f.store
+                .compaction_projection_version("ws", source_thread)
+                .await
+                .unwrap(),
+        );
+    }
+    let accepted_output = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        fence: delivery_fence,
+        authorization_revision: 0,
+        source_epochs,
+        branches: vec![super::delivered::AuthorizedOutputBranch {
+            snapshot: delivered,
+            acknowledgement: acknowledgement.clone(),
+            acknowledgements: vec![acknowledgement],
+            source_threads,
+        }],
+    };
+    let next_parent_projection_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&accepted_output),
+    )
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('context-e','ws','','agent','gpt-4','main-fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('context-e','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-e','context-e','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task-e','ws','thread','thread','thread','next-parent-turn','agent','running','Task E','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-e','task-e','run-e',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-e','task-e','run-e','context-e','turn-e','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-e','task-e','ws','thread','next-parent-turn',?,CURRENT_TIMESTAMP)",
+        [next_parent_projection_json.into()],
+    ))
+    .await
+    .unwrap();
+    let e_projection_json = super::frozen::capture_execution_basis_json(
+        &f.store,
+        "ws",
+        "context-e",
+        Some("turn-e"),
+        Some("turn-e"),
+        None,
+    )
+    .await
+    .unwrap();
+    let e_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&e_projection_json).unwrap();
+    let e_allowed =
+        super::frozen::accepted_history_scopes(&f.store, "ws", "context-e", &e_projection_json)
+            .await
+            .unwrap();
+    let e_history = super::frozen::restore(&f.store, "ws", &e_allowed, &e_projection)
+        .await
+        .unwrap();
+    assert_eq!(
+        e_history
+            .iter()
+            .filter(|message| message.content.contains("new parent work N"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        e_history
+            .iter()
+            .filter(|message| message.content.contains("accepted own work D"))
+            .count(),
+        1
+    );
+    assert!(e_history.iter().all(|message| {
+        message
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .all(|source| {
+                Some(source.id.as_str()) != d_prepared.receipt.identity.checkpoint.as_deref()
+            })
+    }));
+    let e_context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "context-e".into(),
+        turn_id: "turn-e".into(),
+        conversation_thread_id: Some("thread".into()),
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let e_prepared = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &e_context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: e_history
+                .into_iter()
+                .chain(std::iter::once(ChatMessage::user("Continue E")))
+                .collect(),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        Some(e_projection),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        e_prepared
+            .request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("new parent work N"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        e_prepared
+            .request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("accepted own work D"))
+            .count(),
+        1,
+        "the accepted own contribution from D must survive checkpoint reuse"
+    );
+    assert_eq!(
+        e_prepared
+            .request
+            .messages
+            .iter()
+            .flat_map(|message| {
+                message
+                    .provenance
+                    .iter()
+                    .flat_map(|origin| origin.sources.iter())
+            })
+            .filter(|source| {
+                Some(source.id.as_str()) == d_prepared.receipt.identity.checkpoint.as_deref()
+            })
+            .count(),
+        1,
+        "H must remain represented by one compatible checkpoint"
+    );
+    assert_eq!(
+        e_prepared
+            .request
+            .messages
+            .iter()
+            .flat_map(|message| {
+                message
+                    .provenance
+                    .iter()
+                    .flat_map(|origin| origin.sources.iter())
+            })
+            .filter(|source| {
+                d_checkpoint.coverage.iter().any(|covered| {
+                    covered.scope == source.scope
+                        && covered.id == source.id
+                        && covered.version == source.version
+                })
+            })
+            .count(),
+        0,
+        "checkpoint D must replace H instead of accompanying duplicate raw sources"
+    );
+    assert_eq!(f.provider.calls.lock().unwrap().len(), summarizer_calls);
 
     // K does not exist when C's immutable basis is captured.
     let source = accepted[0].provenance.as_ref().unwrap().sources[0].clone();
@@ -2540,6 +3049,27 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
 async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
     use pioneer_provider::ChatMessage;
+    fn identities(messages: &[ChatMessage]) -> Vec<Vec<(String, String, String)>> {
+        messages
+            .iter()
+            .map(|message| {
+                message
+                    .provenance
+                    .as_ref()
+                    .unwrap()
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        (
+                            source.scope.clone(),
+                            source.id.clone(),
+                            source.version.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
     async fn publish(
         store: &CrudStore,
         owner: &str,
@@ -2551,8 +3081,14 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
             .await
             .unwrap();
-        let assertions = page.entries[start..end]
-            .iter()
+        let assertions = (start + 1..=end)
+            .map(|number| {
+                let item = format!("work-{number:03}");
+                page.entries
+                    .iter()
+                    .find(|row| row.item_id.as_deref() == Some(item.as_str()))
+                    .unwrap_or_else(|| panic!("missing exact work source {number}"))
+            })
             .map(|row| SourceAssertion {
                 revision: Some(
                     row.reference
@@ -2595,7 +3131,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             plan: CompactionPlan {
                 mode: CompactionMode::Normal,
                 coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
-                compact: (start..end).collect(),
+                compact: (0..assertions.len()).collect(),
                 retain: vec![],
                 coverage: coverage.clone(),
                 fingerprint: id.clone(),
@@ -2638,7 +3174,16 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
         .await
         .unwrap();
+    let epoch_after_seed_delete = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
     let owner = super::native::native_owner("ws", "thread");
+    let parent = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut next_turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    next_turn.id = "new-parent-work-turn".into();
+    next_turn.reply_to_turn_id = None;
     let mut first = None;
     let mut at_sixty = None;
     for n in 1..=100 {
@@ -2663,6 +3208,73 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         if n == 40 {
             first = Some(publish(&f.store, &owner, 40, None, 0).await);
         }
+        if n == 41 {
+            f.store
+                .materialize_turn_start(
+                    &parent,
+                    pioneer_protocol::SandboxMode::FullAccess,
+                    &next_turn,
+                    &[pioneer_protocol::UserInput::Text {
+                        text: "new work after checkpoint H".into(),
+                        text_elements: vec![],
+                    }],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .unwrap();
+            let message = pioneer_protocol::TurnItem::UserMessage {
+                id: "new-parent-work".into(),
+                text: "new work after checkpoint H".into(),
+                attachments: vec![],
+            };
+            f.store
+                .materialize_item_started(
+                    pioneer_protocol::ItemStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: next_turn.id.clone(),
+                        item: message.clone(),
+                    },
+                    1,
+                )
+                .await
+                .unwrap();
+            f.store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: next_turn.id.clone(),
+                        item: message,
+                    },
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                f.store
+                    .compaction_projection_version("ws", "thread")
+                    .await
+                    .unwrap(),
+                epoch_after_seed_delete + 1
+            );
+            let checkpoint = f
+                .store
+                .compaction_checkpoint_source("ws", "thread", first.as_deref().unwrap())
+                .await
+                .unwrap()
+                .expect("new work must not retire checkpoint H");
+            assert!(
+                f.store
+                    .compaction_reference_fragment("ws", "thread", &checkpoint, 0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .text
+                    .contains("State through 40"),
+                "checkpoint text remains readable after harmless epoch growth"
+            );
+        }
         if n == 60 {
             at_sixty = Some(f.store.compaction_history_read_fence().await.unwrap());
         }
@@ -2673,7 +3285,12 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         super::history::load_task_line_history(&f.store, "ws", "thread", None, &at_sixty.unwrap())
             .await
             .unwrap();
-    assert_eq!(raw.len(), 60);
+    assert_eq!(raw.len(), 61);
+    let raw_n = raw
+        .iter()
+        .find(|message| message.content.contains("new work after checkpoint H"))
+        .unwrap();
+    let raw_n_identity = identities(std::slice::from_ref(raw_n));
     let mut selected = raw.clone();
     assert_eq!(
         super::checkpoint::project_compatible_checkpoint(
@@ -2689,17 +3306,32 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .unwrap(),
         Some(first.clone())
     );
-    assert_eq!(selected.len(), 21);
+    assert_eq!(selected.len(), 22);
     assert!(selected[0].content.contains("State through 40"));
     assert_eq!(
-        selected[1..]
+        selected[0].provenance.as_ref().unwrap().sources[0].id,
+        first
+    );
+    assert_eq!(identities(&selected[1..]), identities(&raw[40..]));
+    let selected_n = selected
+        .iter()
+        .find(|message| message.content.contains("new work after checkpoint H"))
+        .unwrap();
+    assert_eq!(identities(std::slice::from_ref(selected_n)), raw_n_identity);
+    assert_eq!(
+        selected
             .iter()
-            .map(|message| message.content.clone())
-            .collect::<Vec<_>>(),
-        (41..=60).map(|n| format!("work {n}")).collect::<Vec<_>>()
+            .filter(|message| message.content.contains("new work after checkpoint H"))
+            .count(),
+        1,
+        "new work is retained once while H is replaced by its checkpoint"
     );
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
-    let replacement_source = &raw[19].provenance.as_ref().unwrap().sources[0];
+    let replacement_index = raw
+        .iter()
+        .position(|message| message.content == "work 20")
+        .unwrap();
+    let replacement_source = &raw[replacement_index].provenance.as_ref().unwrap().sources[0];
     let replaced = super::frozen::remove_delivered_projection(
         &f.store,
         "ws",
@@ -2714,16 +3346,16 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     )
     .await
     .unwrap();
+    let expected_replaced = raw
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != replacement_index)
+        .map(|(_, message)| message.clone())
+        .collect::<Vec<_>>();
     assert_eq!(
-        replaced
-            .iter()
-            .map(|message| message.content.clone())
-            .collect::<Vec<_>>(),
-        (1..=60)
-            .filter(|n| *n != 20)
-            .map(|n| format!("work {n}"))
-            .collect::<Vec<_>>(),
-        "a covered transport copy is removed through exact original projection, preserving every other source"
+        identities(&replaced),
+        identities(&expected_replaced),
+        "a covered transport copy is removed through exact original projection, preserving every other source in order"
     );
     let mut inherited = selected.clone();
     for message in &mut inherited {
@@ -2739,26 +3371,28 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     )
     .await
     .unwrap();
-    assert_eq!(disjoint.len(), 21);
+    assert_eq!(disjoint.len(), selected.len());
     assert!(
         disjoint[0].content.contains("State through 40"),
         "disjoint prepared summary remains intact"
     );
+    assert_eq!(identities(&disjoint), identities(&selected));
     let joined =
         super::frozen::compose_frozen_basis(&f.store, "ws", "thread", &allowed, &inherited, &raw)
             .await
             .unwrap();
     assert_eq!(
         joined.len(),
-        60,
+        raw.len(),
         "overlapping summary is replaced by exact originals once"
     );
+    assert_eq!(identities(&joined), identities(&raw));
     assert_eq!(
         joined
             .iter()
-            .map(|message| message.content.clone())
-            .collect::<Vec<_>>(),
-        (1..=60).map(|n| format!("work {n}")).collect::<Vec<_>>()
+            .filter(|message| message.content.contains("new work after checkpoint H"))
+            .count(),
+        1
     );
     assert!(
         joined
@@ -2827,7 +3461,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     .await
     .unwrap();
     assert!(
-        crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &allowed, &json,)
+        crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &allowed, &json)
             .await
             .unwrap()
             .is_empty()
@@ -2874,6 +3508,41 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     assert!(
         f.provider.calls.lock().unwrap().is_empty(),
         "compatible selection needs no new generation"
+    );
+    let checkpoint_reference = SourceRef {
+        scope: selected[0].provenance.as_ref().unwrap().sources[0]
+            .scope
+            .clone(),
+        id: selected[0].provenance.as_ref().unwrap().sources[0]
+            .id
+            .clone(),
+        version: selected[0].provenance.as_ref().unwrap().sources[0]
+            .version
+            .clone(),
+    };
+    let covered_leaf = raw[0].provenance.as_ref().unwrap().sources[0].id.clone();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload='changed covered H' WHERE id=?",
+            [covered_leaf.into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_reference_fragment("ws", "thread", &checkpoint_reference, 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "checkpoint text must not be readable after a covered leaf changes"
+    );
+    assert!(
+        super::frozen::restore(&f.store, "ws", &allowed, &frozen)
+            .await
+            .is_err(),
+        "frozen checkpoint projection must fail after a covered leaf changes"
     );
 }
 

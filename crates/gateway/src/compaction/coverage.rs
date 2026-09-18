@@ -95,15 +95,27 @@ async fn checkpoint_graph(
         );
         pending.push((source, true));
         if let Some(previous) = &checkpoint.previous {
-            let Some(previous) = store
-                .compaction_checkpoint_source(workspace, &thread, previous)
+            let previous_edges = store
+                .compaction_checkpoint_edges(previous)
                 .await?
-            else {
-                return Ok(None);
+                .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
+            ensure!(
+                previous_edges.owner == checkpoint.owner
+                    && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
+                "previous checkpoint changed owner or format"
+            );
+            let previous = SourceRef {
+                scope: format!("checkpoint:{}", previous_edges.owner),
+                id: previous.clone(),
+                version: previous_edges.identity_sha256,
             };
             ensure!(
-                previous.scope == format!("checkpoint:{}", checkpoint.owner),
-                "previous checkpoint changed owner"
+                store
+                    .compaction_reference_thread(workspace, &previous)
+                    .await?
+                    .as_deref()
+                    == Some(thread.as_str()),
+                "previous checkpoint changed scope or publication status"
             );
             pending.push((previous, false));
         }

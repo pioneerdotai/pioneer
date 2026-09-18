@@ -41,6 +41,7 @@ pub use task_output::{
 #[derive(Clone, Debug)]
 pub struct CheckpointEdges {
     pub owner: String,
+    pub identity_sha256: String,
     pub previous: Option<String>,
     pub format_version: u32,
     pub coverage: Vec<SourceRef>,
@@ -943,7 +944,10 @@ pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
         payload.len() <= SOURCE_PAGE_BYTES,
         "source validation batch exceeds byte bound"
     );
-    let row = MatchedSourceCount::find_by_statement(sqlite_specific_sql("SELECT COUNT(*) AS matched FROM json_each(?) wanted WHERE EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.workspace_id=? AND s.thread_id=? AND s.source_scope=json_extract(wanted.value,'$.scope') AND s.source_id=json_extract(wanted.value,'$.id') AND s.source_version=json_extract(wanted.value,'$.version'))", [payload.into(),workspace.into(),thread.into()]))
+    // A checkpoint identity survives unrelated appends; callers expand and
+    // validate every DAG leaf immediately after this bounded identity batch.
+    // Its publication epoch is not a lifetime for the immutable checkpoint.
+    let row = MatchedSourceCount::find_by_statement(sqlite_specific_sql("SELECT COUNT(*) AS matched FROM json_each(?) wanted WHERE EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.workspace_id=? AND s.thread_id=? AND s.source_scope=json_extract(wanted.value,'$.scope') AND s.source_id=json_extract(wanted.value,'$.id') AND s.source_version=json_extract(wanted.value,'$.version') UNION ALL SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE c.workspace_id=? AND c.thread_id=? AND 'checkpoint:'||p.owner=json_extract(wanted.value,'$.scope') AND p.id=json_extract(wanted.value,'$.id') AND p.identity_sha256=json_extract(wanted.value,'$.version') AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS(SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed'))))", [payload.into(),workspace.into(),thread.into(),workspace.into(),thread.into()]))
     .one(db)
     .await?.ok_or_else(|| anyhow::anyhow!("source validation missing"))?;
     Ok(row.matched == sources.len() as i64)
@@ -966,6 +970,22 @@ pub(crate) async fn compaction_reference_thread<C: ConnectionTrait>(
             <= SOURCE_PAGE_BYTES,
         "source identity exceeds metadata quantum"
     );
+    if source.scope.starts_with("checkpoint:") {
+        return Ok(compaction_live_sources::ThreadRow::find_by_statement(
+            sqlite_specific_sql(
+                "SELECT c.thread_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE c.workspace_id=? AND 'checkpoint:'||p.owner=? AND p.id=? AND p.identity_sha256=? AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS(SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed'))) LIMIT 1",
+                [
+                    workspace.into(),
+                    source.scope.clone().into(),
+                    source.id.clone().into(),
+                    source.version.clone().into(),
+                ],
+            ),
+        )
+        .one(db)
+        .await?
+        .map(|row| row.thread_id));
+    }
     Ok(compaction_live_sources::ThreadRow::find_by_statement(
         db.get_database_backend().build(
             &(sea_orm::sea_query::Query::select()
@@ -1254,20 +1274,23 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
     id: &str,
 ) -> Result<Option<CheckpointEdges>> {
     use sea_orm::QuerySelect;
-    let Some((owner, previous, format_version)) = compaction_checkpoint::Entity::find_by_id(id)
-        .select_only()
-        .column(compaction_checkpoint::Column::Owner)
-        .column(compaction_checkpoint::Column::Previous)
-        .column(compaction_checkpoint::Column::FormatVersion)
-        .into_tuple::<(String, Option<String>, i64)>()
-        .one(db)
-        .await?
+    let Some((owner, identity_sha256, previous, format_version)) =
+        compaction_checkpoint::Entity::find_by_id(id)
+            .select_only()
+            .column(compaction_checkpoint::Column::Owner)
+            .column(compaction_checkpoint::Column::IdentitySha256)
+            .column(compaction_checkpoint::Column::Previous)
+            .column(compaction_checkpoint::Column::FormatVersion)
+            .into_tuple::<(String, String, Option<String>, i64)>()
+            .one(db)
+            .await?
     else {
         return Ok(None);
     };
     let coverage = checkpoint_coverage(db, id).await?;
     Ok(Some(CheckpointEdges {
         owner,
+        identity_sha256,
         previous,
         format_version: u32::try_from(format_version)?,
         coverage,
@@ -1865,88 +1888,62 @@ pub(crate) async fn compaction_reference_fragment(
         let offset = i64::try_from(character_offset)?
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("source offset overflow"))?;
-        let row = compaction_checkpoint::Entity::find()
-            .select_only()
-            .join(
-                JoinType::InnerJoin,
-                compaction_live_sources::join(
-                    compaction_checkpoint::Entity,
-                    compaction_checkpoint::Column::Id,
-                    compaction_live_sources::Column::SourceId,
-                )
-                .on_condition(|_, _| {
-                    sea_orm::Condition::all().add(
-                        Expr::col((
-                            compaction_live_sources::Column::Table,
-                            compaction_live_sources::Column::SourceScope,
-                        ))
-                        .eq(Expr::val("checkpoint:").binary(
-                            BinOper::Custom("||"),
-                            Expr::col((
-                                compaction_checkpoint::Entity,
-                                compaction_checkpoint::Column::Owner,
-                            )),
-                        )),
-                    )
-                }),
-            )
-            .expr_as(
-                Expr::expr(Func::cust(Alias::new("substr")).args([
-                    Expr::col((
-                        compaction_checkpoint::Entity,
-                        compaction_checkpoint::Column::Summary,
-                    )),
-                    Expr::Value(offset.into()),
-                    Expr::val(16384_i64),
-                ])),
-                "fragment",
-            )
-            .expr_as(
-                Expr::expr(Func::cust(Alias::new("length")).args([Expr::col((
-                    compaction_checkpoint::Entity,
-                    compaction_checkpoint::Column::Summary,
-                ))])),
-                "characters",
-            )
-            .filter(
-                Expr::col((
-                    compaction_live_sources::Column::Table,
-                    compaction_live_sources::Column::WorkspaceId,
-                ))
-                .eq(Expr::Value(workspace.into()))
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::ThreadId,
-                    ))
-                    .eq(Expr::Value(thread.into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceScope,
-                    ))
-                    .eq(Expr::Value(reference.scope.clone().into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceId,
-                    ))
-                    .eq(Expr::Value(reference.id.clone().into())),
-                )
-                .and(
-                    Expr::col((
-                        compaction_live_sources::Column::Table,
-                        compaction_live_sources::Column::SourceVersion,
-                    ))
-                    .eq(Expr::Value(reference.version.clone().into())),
-                ),
-            )
-            .into_tuple::<(String, i64)>()
-            .one(&store.connection)
-            .await?;
-        let Some((text, characters)) = row else {
+        let row = SourceFragmentRow::find_by_statement(sqlite_specific_sql(
+            r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
+ SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
+ FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+ WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
+  AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
+  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+ UNION
+ SELECT v.source_scope,v.source_id,v.source_version
+ FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
+ WHERE g.source_scope LIKE 'checkpoint:%'
+ UNION
+ SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
+ FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
+ LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
+ WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
+ LIMIT 65537
+)
+SELECT 1 AS revision,substr(root.summary,?,16384) AS fragment,length(root.summary) AS characters
+FROM compaction_checkpoint root
+WHERE root.id=? AND (SELECT COUNT(*) FROM graph)<65537
+ AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
+ AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
+  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_live_sources s
+   WHERE s.workspace_id=? AND s.source_scope=g.source_scope
+    AND s.source_id=g.source_id AND s.source_version=g.source_version
+  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
+    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
+    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+  ))
+ )) LIMIT 1"#,
+            [
+                reference.id.clone().into(),
+                reference.scope.clone().into(),
+                reference.version.clone().into(),
+                workspace.into(),
+                thread.into(),
+                offset.into(),
+                reference.id.clone().into(),
+                workspace.into(),
+                workspace.into(),
+            ],
+        ))
+        .one(&store.connection)
+        .await?;
+        let Some(SourceFragmentRow {
+            fragment: text,
+            characters,
+            ..
+        }) = row
+        else {
             return Ok(None);
         };
         let characters = u64::try_from(characters)?;
@@ -2032,32 +2029,52 @@ pub(crate) async fn compaction_checkpoint_source<C: ConnectionTrait>(
     thread: &str,
     checkpoint: &str,
 ) -> Result<Option<SourceRef>> {
-    let row = compaction_live_sources::SourceRow::find_by_statement(
-        db.get_database_backend().build(
-            &(sea_orm::sea_query::Query::select()
-                .from(compaction_live_sources::Column::Table)
-                .expr(Expr::col(compaction_live_sources::Column::SourceScope))
-                .expr(Expr::col(compaction_live_sources::Column::SourceId))
-                .expr(Expr::col(compaction_live_sources::Column::SourceVersion))
-                .and_where(
-                    Expr::col(compaction_live_sources::Column::SourceId)
-                        .eq(Expr::Value(checkpoint.into()))
-                        .and(
-                            Expr::col(compaction_live_sources::Column::SourceScope)
-                                .like("checkpoint:%"),
-                        )
-                        .and(
-                            Expr::col(compaction_live_sources::Column::WorkspaceId)
-                                .eq(Expr::Value(workspace.into())),
-                        )
-                        .and(
-                            Expr::col(compaction_live_sources::Column::ThreadId)
-                                .eq(Expr::Value(thread.into())),
-                        ),
-                )
-                .to_owned()),
-        ),
-    )
+    let row = compaction_live_sources::SourceRow::find_by_statement(sqlite_specific_sql(
+        r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
+ SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
+ FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+ WHERE p.id=? AND c.workspace_id=? AND c.thread_id=?
+  AND p.format_version=1
+  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+ UNION
+ SELECT v.source_scope,v.source_id,v.source_version
+ FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
+ WHERE g.source_scope LIKE 'checkpoint:%'
+ UNION
+ SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
+ FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
+ LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
+ WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
+ LIMIT 65537
+)
+SELECT root.source_scope,root.source_id,root.source_version
+FROM graph root
+WHERE root.source_scope LIKE 'checkpoint:%' AND root.source_id=?
+ AND (SELECT COUNT(*) FROM graph)<65537
+ AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
+ AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
+  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_live_sources s
+   WHERE s.source_scope=g.source_scope AND s.source_id=g.source_id AND s.source_version=g.source_version
+    AND s.workspace_id=?
+  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
+    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
+    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+  ))
+ )) LIMIT 1"#,
+        [
+            checkpoint.into(),
+            workspace.into(),
+            thread.into(),
+            checkpoint.into(),
+            workspace.into(),
+            workspace.into(),
+        ],
+    ))
     .one(db)
     .await?
     .map(|row| (row.source_scope, row.source_id, row.source_version));

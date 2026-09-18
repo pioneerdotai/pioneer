@@ -869,7 +869,7 @@ async fn durable_runner_manifest_candidate_and_state_commit_together() {
     verify_runner_commit_dependency(false).await;
 }
 #[tokio::test]
-async fn foreign_dependency_edit_fences_runner_commit() {
+async fn selected_source_edit_fences_runner_commit() {
     verify_runner_commit_dependency(true).await;
 }
 async fn verify_runner_commit_dependency(edit_parent: bool) {
@@ -1063,7 +1063,7 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         store
             .database_connection()
             .execute_unprepared(
-                "UPDATE turn_event SET payload='edited reference fact' WHERE id='parent-source'",
+                "UPDATE turn_event SET payload='edited selected source' WHERE id='runner-source'",
             )
             .await
             .unwrap();
@@ -1098,8 +1098,63 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         );
         return;
     }
-    // Appending new material leaves the old selected source and epoch intact.
-    source(&store, "runner-append", 2, "new unselected work").await;
+    // The real message materializer first creates and then completes the next
+    // user message. That update advances the parent's broad epoch, but the new
+    // item was never part of this operation's immutable manifest or coverage.
+    let parent = store.get_thread_model("parent").await.unwrap().unwrap();
+    let (_, mut next_turn) = store
+        .get_turn("parent", "parent-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    next_turn.id = "next-parent-turn".into();
+    next_turn.reply_to_turn_id = None;
+    store
+        .materialize_turn_start(
+            &parent,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &next_turn,
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let message = pioneer_protocol::TurnItem::UserMessage {
+        id: "next-parent-message".into(),
+        text: "new unselected work".into(),
+        attachments: vec![],
+    };
+    store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "parent".into(),
+                turn_id: next_turn.id.clone(),
+                item: message.clone(),
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "parent".into(),
+                turn_id: next_turn.id,
+                item: message,
+            },
+            4,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_projection_version("ws", "parent")
+            .await
+            .unwrap(),
+        1
+    );
     assert_eq!(
         store
             .compaction_apply_runner("runner", &ready, None)
@@ -1119,6 +1174,18 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         .await
         .unwrap()
         .unwrap();
+    let coverage = store
+        .compaction_checkpoint("runner-candidate")
+        .await
+        .unwrap()
+        .unwrap()
+        .coverage;
+    assert_eq!(coverage.len(), 1);
+    assert!(
+        coverage
+            .iter()
+            .all(|source| !source.scope.ends_with(":next-parent-turn"))
+    );
     assert_eq!(
         store
             .compaction_reference_fragment("ws", "thread", &derived, 0)
@@ -3497,6 +3564,38 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .await
         .unwrap();
     let edited_ready = ready_import_operation(&store, &edited, "child", &own_source).await;
+    let mut imported_checkpoint_edited = projected_operation.clone();
+    imported_checkpoint_edited.id = "edited-imported-checkpoint".into();
+    imported_checkpoint_edited.owner = "owner-edited-imported-checkpoint".into();
+    imported_checkpoint_edited.plan.fingerprint = imported_checkpoint_edited.id.clone();
+    imported_checkpoint_edited.projection_version = store
+        .compaction_projection_version("ws", "context-c")
+        .await
+        .unwrap();
+    imported_checkpoint_edited.source_epochs.clear();
+    for scope in ["child", "context-c", "thread"] {
+        imported_checkpoint_edited.source_epochs.insert(
+            scope.into(),
+            store
+                .compaction_projection_version("ws", scope)
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .compaction_admit("ws", "context-c", &imported_checkpoint_edited)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&imported_checkpoint_edited.id, "turn-c")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&imported_checkpoint_edited.id, &context)
+        .await
+        .unwrap();
+    let imported_checkpoint_ready =
+        ready_import_operation(&store, &imported_checkpoint_edited, "child", &a_summary).await;
     let stale = descriptor("stale-assembled", std::slice::from_ref(&target));
     store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &stale, 1, &import_digest)
@@ -3525,6 +3624,18 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .unwrap(),
         CommitOutcome::Stale
     );
+    assert_eq!(
+        store
+            .compaction_apply_runner(
+                &imported_checkpoint_edited.id,
+                &imported_checkpoint_ready,
+                None
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Stale,
+        "accepted import authority must not hide an edited checkpoint leaf"
+    );
 
     assert!(
         !store
@@ -3540,6 +3651,400 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         records,
         "accepted metadata is retained"
     );
+}
+
+#[tokio::test]
+async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
+    use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
+    use pioneer_compaction::runner::{RunnerState, SourceCursor};
+    use sha2::{Digest, Sha256};
+
+    fn descriptor(id: &str, messages: &[FrozenMessageRef]) -> FrozenHistoryRef {
+        let mut digest = Sha256::new();
+        for message in messages {
+            let bytes = serde_json::to_vec(message).unwrap();
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        FrozenHistoryRef {
+            format: 1,
+            manifest_id: id.into(),
+            messages: messages.len() as u64,
+            identity_sha256: hex::encode(digest.finalize()),
+        }
+    }
+
+    for delete_leaf in [false, true] {
+        let store = store().await;
+        let db = store.database_connection();
+        for statement in [
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-child','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-turn','portion-child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('portion-h','portion-child','portion-turn',1,'fixture','accepted H',CURRENT_TIMESTAMP)",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('portion-task','ws','thread','thread','thread','turn','agent','running','Task','fixture')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('portion-run','portion-task','portion-run',1,1,'succeeded','agent')",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('portion-rt','portion-task','portion-run','portion-child','portion-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('portion-candidate','portion-task','portion-run','portion-rt','portion-child','portion-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-delivery-turn','thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('portion-delivery','ws','portion-task','portion-run','portion-key','thread','origin_thread','thread','delivered',1,1,'portion-delivery-turn')",
+        ] {
+            db.execute_unprepared(statement).await.unwrap();
+        }
+        let h_assertion = SourceAssertion {
+            revision: Some(1),
+            kind: CanonicalSource::Event,
+            turn_id: "portion-turn".into(),
+            id: "portion-h".into(),
+            payload: "accepted H".into(),
+        };
+        let h = h_assertion.reference();
+        let operation =
+            admit_import_operation(&store, "portion-output", "portion-child", "portion-turn").await;
+        let budget = ModelBudget::new(None, None, None);
+        store
+            .compaction_prepare_runner(&operation.id, &budget, 1, 0)
+            .await
+            .unwrap();
+        store
+            .compaction_append_manifest(
+                &operation.id,
+                &[ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "portion-child".into(),
+                    source: h.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+        let initial =
+            RunnerState::new(operation.admission.deadline_ms, &budget, 1000, None).unwrap();
+        store
+            .compaction_activate_runner(&operation.id, &initial)
+            .await
+            .unwrap();
+        let first_attempt = initial.claim(1).unwrap();
+        assert!(
+            store
+                .compaction_runner_transition(
+                    &operation.id,
+                    initial.generation,
+                    &first_attempt,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        let p = Checkpoint {
+            id: "portion-p".into(),
+            operation_id: operation.id.clone(),
+            format_version: 1,
+            owner: operation.owner.clone(),
+            previous: None,
+            coverage: vec![],
+            summary: "partial prefix".into(),
+            selection: operation.admission.selection.clone(),
+            projection_version: operation.projection_version,
+        };
+        let p_state = first_attempt
+            .candidate(
+                1,
+                p.id.clone(),
+                SourceCursor {
+                    character: 1,
+                    ..Default::default()
+                },
+                false,
+                2,
+            )
+            .unwrap();
+        assert!(
+            store
+                .compaction_runner_transition(
+                    &operation.id,
+                    first_attempt.generation,
+                    &p_state,
+                    Some(&p),
+                )
+                .await
+                .unwrap()
+        );
+        let next = p_state.candidate_checked(true).unwrap();
+        assert!(
+            store
+                .compaction_runner_transition(&operation.id, p_state.generation, &next, None)
+                .await
+                .unwrap()
+        );
+        let second_attempt = next.claim(3).unwrap();
+        assert!(
+            store
+                .compaction_runner_transition(
+                    &operation.id,
+                    next.generation,
+                    &second_attempt,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        let k = Checkpoint {
+            id: "portion-k".into(),
+            operation_id: operation.id.clone(),
+            format_version: 1,
+            owner: operation.owner.clone(),
+            previous: Some(p.id.clone()),
+            coverage: vec![h.clone()],
+            summary: "complete H".into(),
+            selection: operation.admission.selection.clone(),
+            projection_version: operation.projection_version,
+        };
+        let k_state = second_attempt
+            .candidate(
+                2,
+                k.id.clone(),
+                SourceCursor {
+                    unit: 1,
+                    ..Default::default()
+                },
+                true,
+                4,
+            )
+            .unwrap();
+        assert!(
+            store
+                .compaction_runner_transition(
+                    &operation.id,
+                    second_attempt.generation,
+                    &k_state,
+                    Some(&k),
+                )
+                .await
+                .unwrap()
+        );
+        let ready = k_state.candidate_checked(true).unwrap();
+        assert!(
+            store
+                .compaction_runner_transition(&operation.id, k_state.generation, &ready, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .compaction_apply_runner(&operation.id, &ready, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        let p_status = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT status FROM compaction_checkpoint WHERE id=?",
+                [p.id.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "status")
+            .unwrap();
+        assert_eq!(p_status, "retained");
+        assert!(
+            store
+                .compaction_checkpoint_edges(&p.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .coverage
+                .is_empty()
+        );
+        let k_source = store
+            .compaction_checkpoint_source("ws", "portion-child", &k.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let output_message = FrozenMessageRef {
+            logical_turn_id: None,
+            context_thread: None,
+            source_thread: "portion-child".into(),
+            unit_id: "portion-output-unit".into(),
+            sources: vec![k_source],
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "d".repeat(64),
+            replay_source: None,
+            tool_call_id: None,
+            tool_name: None,
+        };
+        let output = descriptor(
+            "portion-output-manifest",
+            std::slice::from_ref(&output_message),
+        );
+        store
+            .compaction_begin_frozen_history("ws", "portion-child", &output)
+            .await
+            .unwrap();
+        store
+            .compaction_append_frozen_history(
+                "ws",
+                "portion-child",
+                &output.manifest_id,
+                0,
+                std::slice::from_ref(&output_message),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_finish_frozen_history("ws", "portion-child", &output)
+                .await
+                .unwrap()
+        );
+        store
+            .compaction_record_task_output("ws", "portion-rt", &output)
+            .await
+            .unwrap();
+        db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('portion-delivery','portion-candidate','portion-rt')").await.unwrap();
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "portion-delivery-turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: pioneer_protocol::task_delivery_result_item_id("portion-delivery"),
+                        text: "delivered".into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let acknowledgement = store
+            .compaction_source_page(
+                "ws",
+                "thread",
+                "portion-delivery-turn",
+                PagedSource::Event,
+                0,
+            )
+            .await
+            .unwrap()
+            .entries[0]
+            .reference
+            .clone();
+        let prepared = store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "portion-delivery",
+                &acknowledgement,
+                0,
+                "portion-child",
+                &h,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.source(), &h);
+        let imported_message = FrozenMessageRef {
+            context_thread: Some("thread".into()),
+            sources: vec![h.clone()],
+            ..output_message.clone()
+        };
+        let imported = descriptor(
+            "portion-import-manifest",
+            std::slice::from_ref(&imported_message),
+        );
+        let imports = vec![(0, prepared)];
+        let imports_digest = frozen_import_identity(&imports).unwrap();
+        store
+            .compaction_begin_frozen_history_with_imports(
+                "ws",
+                "thread",
+                &imported,
+                1,
+                &imports_digest,
+            )
+            .await
+            .unwrap();
+        store
+            .compaction_append_frozen_history(
+                "ws",
+                "thread",
+                &imported.manifest_id,
+                0,
+                std::slice::from_ref(&imported_message),
+            )
+            .await
+            .unwrap();
+        store
+            .compaction_append_frozen_imports("ws", "thread", &imported.manifest_id, 0, &imports)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_finish_frozen_history("ws", "thread", &imported)
+                .await
+                .unwrap()
+        );
+
+        db.execute_unprepared(
+            "UPDATE compaction_checkpoint SET status='candidate' WHERE id='portion-p'",
+        )
+        .await
+        .unwrap();
+        let error = store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "portion-delivery",
+                &acknowledgement,
+                0,
+                "portion-child",
+                &h,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "output checkpoint ancestry is unavailable",
+            "an unpublished predecessor must not authorize output ancestry"
+        );
+        db.execute_unprepared(
+            "UPDATE compaction_checkpoint SET status='retained' WHERE id='portion-p'",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(if delete_leaf {
+            "DELETE FROM turn_event WHERE id='portion-h'"
+        } else {
+            "UPDATE turn_event SET payload='changed H' WHERE id='portion-h'"
+        })
+        .await
+        .unwrap();
+        let error = store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "portion-delivery",
+                &acknowledgement,
+                0,
+                "portion-child",
+                &h,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "output coverage source changed",
+            "a changed or deleted output leaf must remain unavailable"
+        );
+    }
 }
 
 async fn admit_import_operation(
@@ -3608,23 +4113,36 @@ async fn ready_operation(
     snapshot: &OperationSnapshot,
     sources: &[(String, SourceRef)],
 ) -> pioneer_compaction::runner::RunnerState {
+    ready_operation_with_references(store, snapshot, sources, &[]).await
+}
+
+async fn ready_operation_with_references(
+    store: &CrudStore,
+    snapshot: &OperationSnapshot,
+    sources: &[(String, SourceRef)],
+    references: &[(String, SourceRef)],
+) -> pioneer_compaction::runner::RunnerState {
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     let op = &snapshot.id;
     let budget = ModelBudget::new(None, None, None);
     store
-        .compaction_prepare_runner(op, &budget, sources.len() as u64, 0)
+        .compaction_prepare_runner(op, &budget, sources.len() as u64, references.len() as u64)
         .await
         .unwrap();
     let manifest = sources
         .iter()
+        .map(|source| (false, source))
+        .chain(references.iter().map(|source| (true, source)))
         .enumerate()
-        .map(|(ordinal, (thread_id, source))| ManifestEntry {
-            ordinal: ordinal as u64,
-            unit: ordinal as u64,
-            reference_only: false,
-            thread_id: thread_id.clone(),
-            source: source.clone(),
-        })
+        .map(
+            |(ordinal, (reference_only, (thread_id, source)))| ManifestEntry {
+                ordinal: ordinal as u64,
+                unit: ordinal as u64,
+                reference_only,
+                thread_id: thread_id.clone(),
+                source: source.clone(),
+            },
+        )
         .collect::<Vec<_>>();
     store
         .compaction_append_manifest(op, &manifest)
@@ -3679,6 +4197,139 @@ async fn ready_operation(
             .unwrap()
     );
     ready
+}
+
+#[tokio::test]
+async fn runner_commit_revalidates_own_checkpoint_dag_after_admission() {
+    for delete in [false, true] {
+        let store = store().await;
+        let mut leaf = source(&store, "checkpoint-leaf", 1, "accepted H").await;
+        leaf.revision = Some(1);
+        let checkpoint = candidate(&store, "source-checkpoint", None, &leaf).await;
+        assert_eq!(
+            store
+                .compaction_apply(&checkpoint, None, std::slice::from_ref(&leaf))
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        let mut later_leaf =
+            source(&store, "later-checkpoint-leaf", 2, "later accepted work").await;
+        later_leaf.revision = Some(1);
+        let head = candidate(
+            &store,
+            "source-checkpoint-head",
+            Some(&checkpoint.id),
+            &later_leaf,
+        )
+        .await;
+        assert_eq!(
+            store
+                .compaction_apply(
+                    &head,
+                    Some(&checkpoint.id),
+                    std::slice::from_ref(&later_leaf)
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        let checkpoint_source = store
+            .compaction_checkpoint_source("ws", "thread", &head.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let operation =
+            admit_import_operation(&store, "own-checkpoint-target", "thread", "turn").await;
+        let ready = ready_import_operation(&store, &operation, "thread", &checkpoint_source).await;
+
+        store
+            .database_connection()
+            .execute_unprepared(if delete {
+                "DELETE FROM turn_event WHERE id='checkpoint-leaf'"
+            } else {
+                "UPDATE turn_event SET payload='changed H' WHERE id='checkpoint-leaf'"
+            })
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .compaction_manifest_sources_current(&operation.id)
+                .await
+                .unwrap(),
+            "own checkpoint identity must not hide a changed DAG leaf"
+        );
+        assert_eq!(
+            store
+                .compaction_apply_runner(&operation.id, &ready, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Stale
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_only_checkpoint_still_revalidates_its_dag() {
+    let store = store().await;
+    let mut leaf = source(&store, "reference-leaf", 1, "reference H").await;
+    leaf.revision = Some(1);
+    let checkpoint = candidate(&store, "reference-checkpoint", None, &leaf).await;
+    assert_eq!(
+        store
+            .compaction_apply(&checkpoint, None, std::slice::from_ref(&leaf))
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let checkpoint_source = store
+        .compaction_checkpoint_source("ws", "thread", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut selected = source(&store, "selected-leaf", 2, "selected work").await;
+    selected.revision = Some(1);
+    let selected_source = selected.reference();
+    let operation = admit_import_operation(&store, "reference-target", "thread", "turn").await;
+    let ready = ready_operation_with_references(
+        &store,
+        &operation,
+        &[("thread".into(), selected_source.clone())],
+        &[("thread".into(), checkpoint_source)],
+    )
+    .await;
+    assert!(
+        store
+            .compaction_manifest_sources_current(&operation.id)
+            .await
+            .unwrap(),
+        "valid selected work plus a current reference-only checkpoint must reach commit validation"
+    );
+    let candidate = store
+        .compaction_checkpoint(&format!("checkpoint-{}", operation.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.coverage, vec![selected_source]);
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='reference-leaf'")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_manifest_sources_current(&operation.id)
+            .await
+            .unwrap(),
+        "reference-only authority must not replace checkpoint DAG freshness"
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(&operation.id, &ready, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
 }
 
 #[tokio::test]

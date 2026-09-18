@@ -239,7 +239,7 @@ pub(crate) async fn compaction_prepare_frozen_import(
             .ok_or_else(|| anyhow::anyhow!("output coverage source changed"))?;
         if &reference == source && thread == source_thread {
             found = true;
-            break;
+            continue;
         }
         if let Some(owner) = reference.scope.strip_prefix("checkpoint:") {
             let checkpoint = store
@@ -251,14 +251,29 @@ pub(crate) async fn compaction_prepare_frozen_import(
                 "output checkpoint identity mismatch"
             );
             if let Some(previous) = checkpoint.previous {
-                pending.push(
-                    store
-                        .compaction_checkpoint_source(workspace, &thread, &previous)
-                        .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("output checkpoint ancestry is unavailable")
-                        })?,
+                let previous_edges = store
+                    .compaction_checkpoint_edges(&previous)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("output checkpoint ancestry is unavailable"))?;
+                ensure!(
+                    previous_edges.owner == checkpoint.owner
+                        && previous_edges.format_version == FORMAT_VERSION,
+                    "output checkpoint ancestry identity mismatch"
                 );
+                let previous = SourceRef {
+                    scope: format!("checkpoint:{}", previous_edges.owner),
+                    id: previous,
+                    version: previous_edges.identity_sha256,
+                };
+                ensure!(
+                    store
+                        .compaction_reference_thread(workspace, &previous)
+                        .await?
+                        .as_deref()
+                        == Some(thread.as_str()),
+                    "output checkpoint ancestry is unavailable"
+                );
+                pending.push(previous);
             }
             pending.extend(checkpoint.coverage);
         }

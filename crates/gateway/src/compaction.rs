@@ -238,7 +238,6 @@ struct Portion {
 pub(crate) struct CompactionRunner {
     store: CrudStore,
     workspace: String,
-    thread: String,
     snapshot: OperationSnapshot,
     summarizer: Arc<dyn Summarizer>,
     target: Arc<dyn CompactionTarget>,
@@ -250,7 +249,7 @@ impl CompactionRunner {
     pub fn new(
         store: CrudStore,
         workspace: String,
-        thread: String,
+        _thread: String,
         snapshot: OperationSnapshot,
         summarizer: Arc<dyn Summarizer>,
         target: Arc<dyn CompactionTarget>,
@@ -260,7 +259,6 @@ impl CompactionRunner {
         Self {
             store: store.with_maintenance_access(),
             workspace,
-            thread,
             snapshot,
             summarizer,
             target,
@@ -421,27 +419,6 @@ impl CompactionRunner {
                     .persist(&state, state.terminate(FailureKind::Cancelled)?, None)
                     .await?;
             }
-            if self
-                .store
-                .compaction_projection_version(&self.workspace, &self.thread)
-                .await?
-                != self.snapshot.projection_version
-            {
-                state = self
-                    .persist(
-                        &state,
-                        Self::diagnose(
-                            state.terminate(FailureKind::Permanent)?,
-                            FailureDiagnostic::new(
-                                "source_validation",
-                                "source_revision_changed",
-                                "History projection changed after admission",
-                            ),
-                        ),
-                        None,
-                    )
-                    .await?;
-            }
             match state.action(self.clock.now_ms()) {
                 RunnerAction::Expired => {
                     return Ok(CompactionExit::Reconcile(FailureKind::Deadline));
@@ -464,6 +441,27 @@ impl CompactionRunner {
                     state = self.persist(&state, next, None).await?;
                 }
                 RunnerAction::Prepare(purpose) => {
+                    if !self
+                        .store
+                        .compaction_manifest_sources_current(operation)
+                        .await?
+                    {
+                        state = self
+                            .persist(
+                                &state,
+                                Self::diagnose(
+                                    state.terminate(FailureKind::Permanent)?,
+                                    FailureDiagnostic::new(
+                                        "source_validation",
+                                        "source_revision_changed",
+                                        "History projection changed after admission",
+                                    ),
+                                ),
+                                None,
+                            )
+                            .await?;
+                        continue;
+                    }
                     let portion = match self.portion(&state, purpose).await {
                         Ok(portion) => portion,
                         Err(_) => {

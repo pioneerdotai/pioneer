@@ -1994,7 +1994,8 @@ pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     // occur in the SAME bound frozen basis. OWN imports still require their
     // delivery proofs; a frozen reference alone never launders them. Prove the
     // entire immutable DAG and repeat the predicate inside the head CAS,
-    // including epochs and live leaf revisions.
+    // including admitted epoch scopes and live leaf revisions. Epoch values
+    // fence admission, but later work outside this manifest is not staleness.
     // SQLite's recursive UNION deduplicates DAG nodes. The explicit 65,536
     // reference bound fails closed (including cycles without any real leaves)
     // and prevents unbounded traversal while holding database capacity. No
@@ -2006,6 +2007,17 @@ current_operation AS (
  SELECT o.id, o.snapshot, c.workspace_id, c.thread_id
  FROM compaction_operation o JOIN compaction_context c ON c.owner=o.owner
  WHERE o.id=?
+),
+current_sources AS (
+ SELECT source_scope,source_id,source_version,thread_id,workspace_id
+ FROM compaction_live_sources WHERE source_scope NOT LIKE 'checkpoint:%'
+ UNION ALL
+ SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256,c.thread_id,c.workspace_id
+ FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+ WHERE p.status='applied' OR (p.status='retained' AND EXISTS(
+  SELECT 1 FROM compaction_operation committed
+  WHERE committed.id=p.operation_id AND committed.status='completed'
+ ))
 ),
 accepted_imports AS (
  SELECT i.source_scope, i.source_id, i.source_version, i.source_thread
@@ -2069,7 +2081,7 @@ valid_basis_roots AS (
    SELECT 1 FROM basis_coverage g
    WHERE g.root_scope=r.root_scope AND g.root_id=r.root_id AND g.root_version=r.root_version
     AND NOT EXISTS (
-     SELECT 1 FROM compaction_live_sources s
+     SELECT 1 FROM current_sources s
      WHERE s.workspace_id=o.workspace_id AND s.source_scope=g.source_scope
       AND s.source_id=g.source_id AND s.source_version=g.source_version
       AND EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') e WHERE e.key=s.thread_id)
@@ -2090,22 +2102,22 @@ accepted_basis_grants AS (
  JOIN valid_basis_roots r ON r.root_scope=g.root_scope AND r.root_id=g.root_id
   AND r.root_version=g.root_version
  CROSS JOIN current_operation o
- JOIN compaction_live_sources s ON s.workspace_id=o.workspace_id
+ JOIN current_sources s ON s.workspace_id=o.workspace_id
   AND s.source_scope=g.source_scope AND s.source_id=g.source_id
   AND s.source_version=g.source_version
  WHERE g.source_scope NOT LIKE 'checkpoint:%'
 ),
-projected_roots AS (
- SELECT m.ordinal, m.source_scope, m.source_id, m.source_version
- FROM compaction_manifest m JOIN current_operation o ON o.id=m.operation_id
- WHERE m.reference_only=0 AND m.source_thread<>o.thread_id
-  AND m.source_scope LIKE 'checkpoint:%'
-  AND NOT EXISTS (SELECT 1 FROM accepted_imports i
+checkpoint_roots AS (
+ SELECT m.ordinal, m.source_scope, m.source_id, m.source_version,
+  m.reference_only=0 AND m.source_thread<>o.thread_id
+   AND NOT EXISTS (SELECT 1 FROM accepted_imports i
     WHERE i.source_scope=m.source_scope AND i.source_id=m.source_id
-     AND i.source_version=m.source_version AND i.source_thread=m.source_thread)
+     AND i.source_version=m.source_version AND i.source_thread=m.source_thread) AS requires_grant
+ FROM compaction_manifest m JOIN current_operation o ON o.id=m.operation_id
+ WHERE m.source_scope LIKE 'checkpoint:%'
 ),
 coverage(root, source_scope, source_id, source_version) AS (
- SELECT ordinal, source_scope, source_id, source_version FROM projected_roots
+ SELECT ordinal, source_scope, source_id, source_version FROM checkpoint_roots
  UNION
  SELECT g.root, v.source_scope, v.source_id, v.source_version
  FROM coverage g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
@@ -2117,13 +2129,31 @@ coverage(root, source_scope, source_id, source_version) AS (
  WHERE g.source_scope LIKE 'checkpoint:%' AND c.previous IS NOT NULL
  LIMIT 65537
 ),
-valid_roots AS (
- SELECT r.ordinal FROM projected_roots r, current_operation o
+current_roots AS (
+ SELECT r.ordinal FROM checkpoint_roots r, current_operation o
  WHERE (SELECT COUNT(*) FROM coverage)<65537
   AND EXISTS (SELECT 1 FROM coverage g WHERE g.root=r.ordinal AND g.source_scope NOT LIKE 'checkpoint:%')
   AND NOT EXISTS (
    SELECT 1 FROM coverage g WHERE g.root=r.ordinal AND NOT EXISTS (
-    SELECT 1 FROM compaction_live_sources s
+    SELECT 1 FROM current_sources s
+    WHERE s.workspace_id=o.workspace_id AND s.source_scope=g.source_scope
+     AND s.source_id=g.source_id AND s.source_version=g.source_version
+     AND (s.thread_id=o.thread_id OR EXISTS (
+      SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') e WHERE e.key=s.thread_id
+     ))
+     AND (g.source_scope NOT LIKE 'checkpoint:%' OR EXISTS (
+      SELECT 1 FROM compaction_checkpoint c WHERE c.id=g.source_id
+       AND 'checkpoint:'||c.owner=g.source_scope AND c.format_version=1
+     ))
+   )
+  )
+),
+valid_roots AS (
+ SELECT r.ordinal FROM checkpoint_roots r, current_operation o
+ WHERE r.requires_grant AND EXISTS (SELECT 1 FROM current_roots c WHERE c.ordinal=r.ordinal)
+  AND NOT EXISTS (
+   SELECT 1 FROM coverage g WHERE g.root=r.ordinal AND NOT EXISTS (
+    SELECT 1 FROM current_sources s
     WHERE s.workspace_id=o.workspace_id AND s.source_scope=g.source_scope
      AND s.source_id=g.source_id AND s.source_version=g.source_version
      AND EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') e WHERE e.key=s.thread_id)
@@ -2152,11 +2182,10 @@ valid_roots AS (
 SELECT m.ordinal FROM compaction_manifest m JOIN current_operation o ON o.id=m.operation_id
 WHERE
  EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted
-  WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value
-   OR NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=wanted.key AND t.workspace_id=o.workspace_id))
- OR COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=o.thread_id),0)<>json_extract(o.snapshot,'$.projection_version')
+  WHERE NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=wanted.key AND t.workspace_id=o.workspace_id))
+ OR NOT EXISTS (SELECT 1 FROM thread t WHERE t.id=o.thread_id AND t.workspace_id=o.workspace_id)
  OR NOT EXISTS (
-  SELECT 1 FROM compaction_live_sources s
+  SELECT 1 FROM current_sources s
   WHERE s.source_scope=m.source_scope AND s.source_id=m.source_id AND s.source_version=m.source_version
    AND s.thread_id=m.source_thread AND s.workspace_id=o.workspace_id
    AND (m.reference_only=1 OR s.thread_id=o.thread_id
@@ -2170,6 +2199,8 @@ WHERE
       WHERE b.source_scope=s.source_scope AND b.source_id=s.source_id
        AND b.source_version=s.source_version AND b.source_thread=s.thread_id))
     OR EXISTS (SELECT 1 FROM valid_roots r WHERE r.ordinal=m.ordinal))
+   AND (s.source_scope NOT LIKE 'checkpoint:%'
+    OR EXISTS (SELECT 1 FROM current_roots r WHERE r.ordinal=m.ordinal))
  )
 LIMIT 1
 "#, [operation.into()])).await?;
