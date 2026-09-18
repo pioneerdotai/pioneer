@@ -27,6 +27,34 @@ impl MessageProcessor {
             return self.read_thread_tool_output_log(params).await;
         }
         let offset = params.cursor.as_ref().map_or(0, |c| c.offset);
+        let item_reference = self
+            .crud_store
+            .compaction_tool_item_reference(
+                &params.workspace_id,
+                &params.thread_id,
+                &params.turn_id,
+                &params.item_id,
+            )
+            .await?;
+        let context_reference = self
+            .crud_store
+            .compaction_context_reference_for_item(
+                &params.workspace_id,
+                &params.thread_id,
+                &params.turn_id,
+                &params.item_id,
+                "tool_result_v2",
+            )
+            .await?;
+        let references = item_reference
+            .into_iter()
+            .chain(context_reference)
+            .collect::<Vec<_>>();
+        if !references.is_empty() {
+            self.crud_store
+                .compaction_prepare_references(&params.workspace_id, &params.thread_id, &references)
+                .await?;
+        }
         let fragment = self
             .crud_store
             .compaction_tool_result_fragment(

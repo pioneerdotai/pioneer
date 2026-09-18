@@ -248,6 +248,177 @@ async fn compaction_revisions_survive_physical_compression() {
 }
 
 #[tokio::test]
+async fn whole_and_batched_payload_loading_preserves_unicode_large_values_and_order() {
+    let (_file, store, _writer) = fixture().await;
+    let large = serde_json::json!({"text": "🧪漢字".repeat(90_000)}).to_string();
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=? WHERE id='event'",
+            [large.clone().into()],
+        ))
+        .await
+        .unwrap();
+    enable(&store, "turn_event").await;
+    compress(&store, "turn_event").await;
+    let event = pioneer_compaction::SourceRef {
+        scope: "event:turn".into(),
+        id: "event".into(),
+        version: "event-revision:2".into(),
+    };
+    assert_eq!(
+        store
+            .compaction_reference_payload("ws", "thread", &event)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(large.as_str())
+    );
+
+    let first = "a".repeat(130_000);
+    let second = "б".repeat(65_000);
+    let third = "c".repeat(130_000);
+    for (index, (id, payload)) in [("input", &first), ("input-2", &second), ("input-3", &third)]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 0 {
+            store
+                .database_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE turn_input SET payload=? WHERE id=?",
+                    [payload.clone().into(), id.into()],
+                ))
+                .await
+                .unwrap();
+        } else {
+            store.database_connection().execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES(?, 'turn', ?, 'text', '', ?, CURRENT_TIMESTAMP)",
+                [id.into(), (index as i64).into(), payload.clone().into()],
+            )).await.unwrap();
+        }
+    }
+    let refs = [
+        pioneer_compaction::SourceRef {
+            scope: "input:turn".into(),
+            id: "input".into(),
+            version: "input-revision:2".into(),
+        },
+        pioneer_compaction::SourceRef {
+            scope: "input:turn".into(),
+            id: "input-2".into(),
+            version: "input-revision:1".into(),
+        },
+        pioneer_compaction::SourceRef {
+            scope: "input:turn".into(),
+            id: "input-3".into(),
+            version: "input-revision:1".into(),
+        },
+    ];
+    let (consumed, payloads) = store
+        .compaction_reference_payload_batch("ws", "thread", &refs)
+        .await
+        .unwrap();
+    assert_eq!(consumed, 2);
+    assert_eq!(payloads, [first, second]);
+    let (consumed, payloads) = store
+        .compaction_reference_payload_batch("ws", "thread", &refs[2..])
+        .await
+        .unwrap();
+    assert_eq!(consumed, 1);
+    assert_eq!(payloads, [third]);
+    store
+        .database_connection()
+        .execute_unprepared("UPDATE turn_input SET payload='changed' WHERE id='input-2'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_reference_payload_batch("ws", "thread", &refs[..2])
+            .await
+            .is_err(),
+        "a stale member cannot disappear from a successful batch"
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_input WHERE id='input-3'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_reference_payload_batch("ws", "thread", &refs[2..])
+            .await
+            .is_err(),
+        "a tombstoned member cannot disappear from a successful batch"
+    );
+}
+
+/// Manual CRUD micro-scenario used beside the end-to-end Gateway benchmark.
+/// Calls and returned bytes are measured; the SQL-query figure is explicitly
+/// an implementation-derived estimate. Elapsed time is diagnostic only.
+#[tokio::test]
+#[ignore = "manual history preparation benchmark; run only in the dedicated benchmark stage"]
+async fn benchmark_history_payload_loading_many_small_and_one_large_compressed_result() {
+    let (_file, store, _writer) = fixture().await;
+    for index in 1..=1_000_i64 {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES(?, 'turn', ?, 'text', '', ?, CURRENT_TIMESTAMP)",
+            [format!("bench-{index}").into(), index.into(), serde_json::json!({"type":"text","text":format!("message-{index}")}).to_string().into()],
+        )).await.unwrap();
+    }
+    let large = serde_json::json!({"result":"z".repeat(4 * 1024 * 1024)}).to_string();
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=? WHERE id='event'",
+            [large.clone().into()],
+        ))
+        .await
+        .unwrap();
+    enable(&store, "turn_event").await;
+    compress(&store, "turn_event").await;
+
+    let mut refs = (1..=1_000_i64)
+        .map(|index| pioneer_compaction::SourceRef {
+            scope: "input:turn".into(),
+            id: format!("bench-{index}"),
+            version: "input-revision:1".into(),
+        })
+        .collect::<Vec<_>>();
+    refs.push(pioneer_compaction::SourceRef {
+        scope: "event:turn".into(),
+        id: "event".into(),
+        version: "event-revision:2".into(),
+    });
+    let started = std::time::Instant::now();
+    let mut offset = 0usize;
+    let mut batches = 0usize;
+    let mut retained_bytes = 0usize;
+    while offset < refs.len() {
+        let (consumed, payloads) = store
+            .compaction_reference_payload_batch("ws", "thread", &refs[offset..])
+            .await
+            .unwrap();
+        retained_bytes = retained_bytes.max(payloads.iter().map(String::len).sum());
+        offset += consumed;
+        batches += 1;
+    }
+    eprintln!(
+        "history_payload_crud_microbenchmark rows={} measured_payload_calls={} estimated_reader_queries={} measured_max_returned_bytes={} elapsed_ms={}",
+        refs.len(),
+        batches,
+        batches * 2 - 1,
+        retained_bytes,
+        started.elapsed().as_millis()
+    );
+}
+
+#[tokio::test]
 async fn stale_compaction_references_remain_stale_after_compression_and_restart() {
     let (file, store, writer) = fixture().await;
     let reference = pioneer_compaction::SourceRef {
@@ -279,6 +450,21 @@ async fn stale_compaction_references_remain_stale_after_compression_and_restart(
             .to_string()
             .contains("stale source revision")
     );
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", &reference)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale exact revision must not return a payload"
+    );
+    assert!(
+        store
+            .compaction_reference_payload_batch("ws", "thread", std::slice::from_ref(&reference))
+            .await
+            .is_err(),
+        "a stale batch must not return a partial success"
+    );
     assert_eq!(
         scalar(
             &store,
@@ -301,6 +487,19 @@ async fn stale_compaction_references_remain_stale_after_compression_and_restart(
             .unwrap_err()
             .to_string()
             .contains("stale source revision")
+    );
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", &reference)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_reference_payload_batch("ws", "thread", std::slice::from_ref(&reference))
+            .await
+            .is_err()
     );
     assert_eq!(
         scalar(
@@ -326,4 +525,69 @@ async fn stale_compaction_references_remain_stale_after_compression_and_restart(
         .await,
         3
     );
+    let current = pioneer_compaction::SourceRef {
+        scope: "event:turn".into(),
+        id: "event".into(),
+        version: "event-revision:3".into(),
+    };
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", &current)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='event'")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", &current)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_reference_payload_batch("ws", "thread", std::slice::from_ref(&current))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn whole_and_batch_reads_reject_noncanonical_revision_aliases() {
+    let (_file, store, _writer) = fixture().await;
+    for (scope, id, version) in [
+        ("input:turn", "input", "input-revision:01"),
+        ("context:turn", "context", "revision:+1"),
+        ("event:turn", "event", "event-revision:01"),
+        ("item:turn", "item", "item-revision:+1"),
+    ] {
+        let reference = pioneer_compaction::SourceRef {
+            scope: scope.into(),
+            id: id.into(),
+            version: version.into(),
+        };
+        assert!(
+            store
+                .compaction_reference_payload("ws", "thread", &reference)
+                .await
+                .is_err(),
+            "whole read accepted noncanonical version {version}"
+        );
+        assert!(
+            store
+                .compaction_reference_payload_batch(
+                    "ws",
+                    "thread",
+                    std::slice::from_ref(&reference),
+                )
+                .await
+                .is_err(),
+            "batch read accepted noncanonical version {version}"
+        );
+    }
 }

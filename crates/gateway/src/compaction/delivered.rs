@@ -236,6 +236,31 @@ impl MessageProcessor {
         excluded_turn: Option<&str>,
         policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     ) -> Result<String> {
+        let prepared = self
+            .capture_authorized_task_basis_prepared(
+                store,
+                principal,
+                workspace,
+                destination,
+                basis_turn,
+                excluded_turn,
+                policy,
+            )
+            .await?;
+        Ok(serde_json::to_string(&prepared.descriptor)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn capture_authorized_task_basis_prepared(
+        &self,
+        store: &CrudStore,
+        principal: &AuthenticatedSessionPrincipal,
+        workspace: &str,
+        destination: &str,
+        basis_turn: Option<&str>,
+        excluded_turn: Option<&str>,
+        policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
+    ) -> Result<super::frozen::PreparedHistory> {
         if policy.is_some_and(|policy| {
             matches!(
                 policy.mode,
@@ -244,7 +269,7 @@ impl MessageProcessor {
             ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
                 && !policy.include_parent_summary)
         }) {
-            return super::frozen::capture_execution_basis_json(
+            return super::frozen::capture_execution_basis_prepared(
                 store,
                 workspace,
                 destination,
@@ -257,7 +282,7 @@ impl MessageProcessor {
         let outputs = self
             .authorize_delivered_output_branches(store, principal, workspace, destination)
             .await?;
-        let json = super::frozen::capture_execution_basis_with_outputs(
+        let prepared = super::frozen::capture_execution_basis_prepared_with_outputs(
             store,
             workspace,
             destination,
@@ -271,6 +296,6 @@ impl MessageProcessor {
             self.current_authorization_revision().await? == outputs.authorization_revision,
             "authorization changed while freezing Task originals"
         );
-        Ok(json)
+        Ok(prepared)
     }
 }

@@ -6699,8 +6699,8 @@ async fn load_task_execution_conversation_scope(
             processor.current_authorization_revision().await?,
         )
         .await?;
-    let history_json = processor
-        .capture_authorized_task_basis(
+    let prepared_history = processor
+        .capture_authorized_task_basis_prepared(
             processor.crud_store.as_ref(),
             current.principal(),
             task.workspace_id.as_str(),
@@ -6716,30 +6716,273 @@ async fn load_task_execution_conversation_scope(
         )
         .await
         .context("failed to freeze Task conversation sources")?;
-    let persisted = processor
-        .crud_store
+    let history = publish_prepared_task_snapshot(
+        processor.crud_store.as_ref(),
+        run.id.as_str(),
+        task.id.as_str(),
+        task.workspace_id.as_str(),
+        parent.parent_thread_id.as_str(),
+        source_turn_id,
+        execution_thread_id,
+        prepared_history,
+        || async { Ok(()) },
+    )
+    .await?;
+    Ok((expected_hook_context, history))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_prepared_task_snapshot<B, F>(
+    store: &pioneer_crud::CrudStore,
+    run_id: &str,
+    task_id: &str,
+    workspace: &str,
+    conversation_thread: &str,
+    source_turn_id: Option<&str>,
+    execution_thread_id: &str,
+    prepared_history: crate::compaction::frozen::PreparedHistory,
+    before_insert: B,
+) -> Result<Vec<pioneer_provider::ChatMessage>>
+where
+    B: FnOnce() -> F,
+    F: std::future::Future<Output = Result<()>>,
+{
+    let history_json = serde_json::to_string(&prepared_history.descriptor)?;
+    before_insert().await?;
+    let persisted = store
         .insert_task_run_conversation_snapshot_if_absent(
             pioneer_crud::NewTaskRunConversationSnapshot {
-                run_id: run.id.clone(),
-                task_id: task.id.clone(),
-                workspace_id: task.workspace_id.clone(),
-                conversation_thread_id: parent.parent_thread_id.clone(),
+                run_id: run_id.to_owned(),
+                task_id: task_id.to_owned(),
+                workspace_id: workspace.to_owned(),
+                conversation_thread_id: conversation_thread.to_owned(),
                 source_turn_id: source_turn_id.map(str::to_owned),
-                history_json,
+                history_json: history_json.clone(),
                 created_at: chrono::Utc::now().fixed_offset(),
             },
         )
         .await?;
-    let history = restore_task_run_conversation_snapshot(
-        processor.crud_store.as_ref(),
-        &persisted,
-        task,
-        parent,
-        source_turn_id,
-        execution_thread_id,
+    select_accepted_task_snapshot(
+        &persisted.history_json,
+        &history_json,
+        async {
+            ensure_task_run_snapshot_identity_fields(
+                &persisted,
+                task_id,
+                workspace,
+                conversation_thread,
+                source_turn_id,
+            )?;
+            let mut history = prepared_history.messages;
+            crate::compaction::frozen::hydrate_accepted_own(
+                store,
+                &persisted.workspace_id,
+                &persisted.conversation_thread_id,
+                &persisted.history_json,
+                execution_thread_id,
+                &mut history,
+            )
+            .await?;
+            Ok(history)
+        },
+        async {
+            // insert-if-absent may have accepted another immutable snapshot.
+            // Never pair it with messages assembled by the losing capture.
+            restore_task_run_conversation_snapshot_fields(
+                store,
+                &persisted,
+                task_id,
+                workspace,
+                conversation_thread,
+                source_turn_id,
+                execution_thread_id,
+            )
+            .await
+        },
     )
-    .await?;
-    Ok((expected_hook_context, history))
+    .await
+}
+
+async fn select_accepted_task_snapshot<P, R>(
+    accepted_descriptor: &str,
+    prepared_descriptor: &str,
+    prepared: P,
+    restored: R,
+) -> Result<Vec<pioneer_provider::ChatMessage>>
+where
+    P: std::future::Future<Output = Result<Vec<pioneer_provider::ChatMessage>>>,
+    R: std::future::Future<Output = Result<Vec<pioneer_provider::ChatMessage>>>,
+{
+    if accepted_descriptor == prepared_descriptor {
+        prepared.await
+    } else {
+        restored.await
+    }
+}
+
+#[cfg(test)]
+mod prepared_snapshot_tests {
+    use super::*;
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_crud::compaction::PagedSource;
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+    use sea_orm::{ConnectionTrait, Database};
+    use std::{collections::BTreeSet, sync::Arc};
+
+    async fn fixture(workspace: &str) -> pioneer_crud::CrudStore {
+        pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&database, None).await.unwrap();
+        database.execute_unprepared(&format!(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('{workspace}','fixture',1,1);
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('parent','{workspace}','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('execution','{workspace}','','agent','m','p','active','task','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('own-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('loser-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('winner-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+             INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('own-input','own-turn',0,'text','own history','{{\"type\":\"text\",\"text\":\"own history\"}}',CURRENT_TIMESTAMP),('loser-input','loser-turn',0,'text','losing history','{{\"type\":\"text\",\"text\":\"losing history\"}}',CURRENT_TIMESTAMP),('winner-input','winner-turn',0,'text','winning history','{{\"type\":\"text\",\"text\":\"winning history\"}}',CURRENT_TIMESTAMP);
+             INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES('own-task','{workspace}','thread','parent','agent','running','Own','fixture'),('race-task','{workspace}','thread','parent','agent','running','Race','fixture');
+             INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('own-run','own-task','own-run',1,1,'running','agent'),('race-run','race-task','race-run',1,1,'running','agent')",
+        )).await.unwrap();
+        pioneer_crud::CrudStore::new(database)
+    }
+
+    async fn prepared(
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        turn: &str,
+        expected_text: &str,
+    ) -> crate::compaction::frozen::PreparedHistory {
+        let source = store
+            .compaction_source_page(workspace, "parent", turn, PagedSource::Input, 0)
+            .await
+            .unwrap()
+            .entries
+            .remove(0)
+            .reference;
+        let mut message = ChatMessage::user(expected_text);
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: None,
+            workspace_id: workspace.into(),
+            thread_id: "parent".into(),
+            context_thread: None,
+            unit_id: format!("{turn}:input"),
+            complete: true,
+            protected_input: false,
+            inherited: false,
+            sources: vec![MessageSourceRef {
+                scope: source.scope,
+                id: source.id,
+                version: source.version,
+            }],
+        });
+        let messages = vec![message];
+        let descriptor = crate::compaction::frozen::capture(
+            store,
+            workspace,
+            "parent",
+            &BTreeSet::from(["parent".to_owned()]),
+            &messages,
+        )
+        .await
+        .unwrap();
+        crate::compaction::frozen::PreparedHistory {
+            descriptor,
+            messages,
+        }
+    }
+
+    #[tokio::test]
+    async fn own_insert_if_absent_snapshot_reuses_only_prepared_messages() {
+        let store = fixture("own-ws").await;
+        let prepared = prepared(&store, "own-ws", "own-turn", "own history").await;
+        let descriptor = serde_json::to_string(&prepared.descriptor).unwrap();
+        let expected = prepared.messages.clone();
+        let restores = crate::compaction::frozen::observe_workspace_restores("own-ws");
+        let history = publish_prepared_task_snapshot(
+            &store,
+            "own-run",
+            "own-task",
+            "own-ws",
+            "parent",
+            None,
+            "execution",
+            prepared,
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(history, expected);
+        assert_eq!(restores.calls(), 0, "own accepted snapshot was restored");
+        let persisted = store
+            .get_task_run_conversation_snapshot("own-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.history_json, descriptor);
+        assert_eq!(persisted.task_id, "own-task");
+    }
+
+    #[tokio::test]
+    async fn competing_insert_if_absent_snapshot_restores_only_winner_messages() {
+        let store = fixture("race-ws").await;
+        let loser = prepared(&store, "race-ws", "loser-turn", "losing history").await;
+        let winner = prepared(&store, "race-ws", "winner-turn", "winning history").await;
+        let winner_json = serde_json::to_string(&winner.descriptor).unwrap();
+        let expected_winner = winner.messages.clone();
+        let restores = crate::compaction::frozen::observe_workspace_restores("race-ws");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let (published, accepted) = tokio::sync::oneshot::channel();
+        let competing_store = store.clone();
+        let competing_barrier = barrier.clone();
+        let competing_json = winner_json.clone();
+        let competitor = tokio::spawn(async move {
+            competing_barrier.wait().await;
+            let result = competing_store
+                .insert_task_run_conversation_snapshot_if_absent(
+                    pioneer_crud::NewTaskRunConversationSnapshot {
+                        run_id: "race-run".into(),
+                        task_id: "race-task".into(),
+                        workspace_id: "race-ws".into(),
+                        conversation_thread_id: "parent".into(),
+                        source_turn_id: None,
+                        history_json: competing_json,
+                        created_at: chrono::Utc::now().fixed_offset(),
+                    },
+                )
+                .await;
+            published.send(result).unwrap();
+        });
+        let history = publish_prepared_task_snapshot(
+            &store,
+            "race-run",
+            "race-task",
+            "race-ws",
+            "parent",
+            None,
+            "execution",
+            loser,
+            move || async move {
+                barrier.wait().await;
+                accepted.await??;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        competitor.await.unwrap();
+        assert_eq!(history, expected_winner);
+        assert_eq!(restores.calls(), 1, "concurrent winner was not restored");
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("losing history"))
+        );
+        let persisted = store
+            .get_task_run_conversation_snapshot("race-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.history_json, winner_json);
+        assert_eq!(persisted.task_id, "race-task");
+    }
 }
 
 async fn restore_task_run_conversation_snapshot(
@@ -6750,16 +6993,35 @@ async fn restore_task_run_conversation_snapshot(
     source_turn_id: Option<&str>,
     execution_thread_id: &str,
 ) -> Result<Vec<pioneer_provider::ChatMessage>> {
-    if snapshot.task_id != task.id
-        || snapshot.workspace_id != task.workspace_id
-        || snapshot.conversation_thread_id != parent.parent_thread_id
-        || snapshot.source_turn_id.as_deref() != source_turn_id
-    {
-        bail!(
-            "Task run `{}` conversation snapshot identity does not match its execution context",
-            snapshot.run_id
-        );
-    }
+    restore_task_run_conversation_snapshot_fields(
+        store,
+        snapshot,
+        &task.id,
+        &task.workspace_id,
+        &parent.parent_thread_id,
+        source_turn_id,
+        execution_thread_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_task_run_conversation_snapshot_fields(
+    store: &pioneer_crud::CrudStore,
+    snapshot: &pioneer_crud::TaskRunConversationSnapshotRecord,
+    task_id: &str,
+    workspace: &str,
+    conversation_thread: &str,
+    source_turn_id: Option<&str>,
+    execution_thread_id: &str,
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    ensure_task_run_snapshot_identity_fields(
+        snapshot,
+        task_id,
+        workspace,
+        conversation_thread,
+        source_turn_id,
+    )?;
     let allowed = crate::compaction::frozen::accepted_history_scopes(
         store,
         &snapshot.workspace_id,
@@ -6785,6 +7047,26 @@ async fn restore_task_run_conversation_snapshot(
     )
     .await?;
     Ok(history)
+}
+
+fn ensure_task_run_snapshot_identity_fields(
+    snapshot: &pioneer_crud::TaskRunConversationSnapshotRecord,
+    task_id: &str,
+    workspace: &str,
+    conversation_thread: &str,
+    source_turn_id: Option<&str>,
+) -> Result<()> {
+    if snapshot.task_id != task_id
+        || snapshot.workspace_id != workspace
+        || snapshot.conversation_thread_id != conversation_thread
+        || snapshot.source_turn_id.as_deref() != source_turn_id
+    {
+        bail!(
+            "Task run `{}` conversation snapshot identity does not match its execution context",
+            snapshot.run_id
+        );
+    }
+    Ok(())
 }
 
 async fn ensure_task_run_occurrence_context(

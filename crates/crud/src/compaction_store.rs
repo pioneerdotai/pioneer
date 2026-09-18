@@ -30,6 +30,42 @@ impl CrudStore {
         repositories::compaction_preparation::ready(self, workspace, thread).await
     }
 
+    /// Register one bounded provider-context page for a single retained turn.
+    /// This intentionally does not advance the thread-wide preparation cursor.
+    pub async fn compaction_prepare_turn_context_quantum(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        after_sequence: i64,
+    ) -> Result<Option<i64>> {
+        self.run_scoped_database_quantum(|| {
+            repositories::compaction_preparation::turn_context_quantum(
+                self,
+                workspace,
+                thread,
+                turn,
+                after_sequence,
+            )
+        })
+        .await
+    }
+
+    /// Explicit, bounded legacy registration for exact sources that are not
+    /// covered by sequenced history discovery (notably frozen tool items).
+    pub async fn compaction_prepare_references(
+        &self,
+        workspace: &str,
+        source_thread: &str,
+        sources: &[SourceRef],
+    ) -> Result<()> {
+        for batch in sources.chunks(repositories::compaction::SOURCE_PAGE_ROWS as usize) {
+            repositories::compaction_preparation::references(self, workspace, source_thread, batch)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Pin append-only discovery to a bounded high water mark. Edits remain
     /// governed by each source revision, not by this sequence boundary.
     pub async fn compaction_source_high_water(
@@ -337,6 +373,40 @@ impl CrudStore {
             thread,
             reference,
             character_offset,
+        )
+        .await
+    }
+    pub async fn compaction_reference_payload(
+        &self,
+        workspace: &str,
+        thread: &str,
+        reference: &SourceRef,
+    ) -> Result<Option<String>> {
+        repositories::compaction::compaction_reference_payload(self, workspace, thread, reference)
+            .await
+    }
+    pub async fn compaction_reference_payload_batch(
+        &self,
+        workspace: &str,
+        thread: &str,
+        references: &[SourceRef],
+    ) -> Result<(usize, Vec<String>)> {
+        repositories::compaction::compaction_reference_payload_batch(
+            self, workspace, thread, references,
+        )
+        .await
+    }
+    pub async fn compaction_references_current(
+        &self,
+        workspace: &str,
+        thread: &str,
+        references: &[SourceRef],
+    ) -> Result<bool> {
+        repositories::compaction::compaction_sources_current(
+            &self.connection,
+            workspace,
+            thread,
+            references,
         )
         .await
     }

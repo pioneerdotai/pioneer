@@ -10,6 +10,53 @@ use pioneer_provider::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+static WORKSPACE_RESTORE_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) struct WorkspaceRestoreObserver {
+    workspace: String,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl WorkspaceRestoreObserver {
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for WorkspaceRestoreObserver {
+    fn drop(&mut self) {
+        WORKSPACE_RESTORE_CALLS
+            .lock()
+            .unwrap()
+            .remove(&self.workspace);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_workspace_restores(workspace: &str) -> WorkspaceRestoreObserver {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let previous = WORKSPACE_RESTORE_CALLS
+        .lock()
+        .unwrap()
+        .insert(workspace.to_owned(), std::sync::Arc::downgrade(&calls));
+    assert!(
+        previous.is_none(),
+        "workspace restore observer already installed"
+    );
+    WorkspaceRestoreObserver {
+        workspace: workspace.to_owned(),
+        calls,
+    }
+}
+
 /// Extend trusted execution scope by the TaskRun's durably accepted parent
 /// basis. This does not change hook routing or admit arbitrary sibling history.
 pub(crate) async fn execution_history_scopes(
@@ -315,7 +362,56 @@ pub(crate) async fn capture_execution_basis_json(
     excluded_turn: Option<&str>,
     policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
 ) -> Result<String> {
-    capture_execution_basis_with_outputs(
+    let prepared = capture_execution_basis_prepared_with_outputs(
+        store,
+        workspace,
+        thread,
+        basis_turn,
+        excluded_turn,
+        policy,
+        None,
+    )
+    .await?;
+    Ok(serde_json::to_string(&prepared.descriptor)?)
+}
+
+#[cfg(test)]
+pub(super) async fn capture_execution_basis_with_outputs(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    basis_turn: Option<&str>,
+    excluded_turn: Option<&str>,
+    policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
+    outputs: Option<&super::delivered::AuthorizedOutputSet>,
+) -> Result<String> {
+    let prepared = capture_execution_basis_prepared_with_outputs(
+        store,
+        workspace,
+        thread,
+        basis_turn,
+        excluded_turn,
+        policy,
+        outputs,
+    )
+    .await?;
+    Ok(serde_json::to_string(&prepared.descriptor)?)
+}
+
+pub(crate) struct PreparedHistory {
+    pub(crate) descriptor: FrozenHistoryRef,
+    pub(crate) messages: Vec<ChatMessage>,
+}
+
+pub(crate) async fn capture_execution_basis_prepared(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    basis_turn: Option<&str>,
+    excluded_turn: Option<&str>,
+    policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
+) -> Result<PreparedHistory> {
+    capture_execution_basis_prepared_with_outputs(
         store,
         workspace,
         thread,
@@ -327,7 +423,7 @@ pub(crate) async fn capture_execution_basis_json(
     .await
 }
 
-pub(super) async fn capture_execution_basis_with_outputs(
+pub(super) async fn capture_execution_basis_prepared_with_outputs(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
@@ -335,7 +431,7 @@ pub(super) async fn capture_execution_basis_with_outputs(
     excluded_turn: Option<&str>,
     policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     outputs: Option<&super::delivered::AuthorizedOutputSet>,
-) -> Result<String> {
+) -> Result<PreparedHistory> {
     if let Some(outputs) = outputs {
         ensure!(
             outputs.workspace == workspace && outputs.destination == thread,
@@ -640,8 +736,9 @@ pub(super) async fn capture_execution_basis_with_outputs(
             }
         }
     }
-    let descriptor =
-        capture_with_imports(&store, workspace, thread, &allowed, &messages, &imports).await?;
+    let prepared =
+        capture_with_imports_prepared(&store, workspace, thread, &allowed, &messages, &imports)
+            .await?;
 
     for (source_thread, expected) in epochs {
         ensure!(
@@ -652,7 +749,7 @@ pub(super) async fn capture_execution_basis_with_outputs(
             "parent history changed while freezing the accepted context"
         );
     }
-    Ok(serde_json::to_string(&descriptor)?)
+    Ok(prepared)
 }
 
 /// Remove only identified transport copies. If a checkpoint already covers a
@@ -914,7 +1011,7 @@ pub(crate) async fn capture(
     allowed_threads: &BTreeSet<String>,
     messages: &[ChatMessage],
 ) -> Result<FrozenHistoryRef> {
-    capture_with_imports(
+    Ok(capture_with_imports_prepared(
         store,
         workspace,
         owner_thread,
@@ -922,28 +1019,34 @@ pub(crate) async fn capture(
         messages,
         &BTreeMap::new(),
     )
-    .await
+    .await?
+    .descriptor)
 }
 
-async fn capture_with_imports(
+async fn capture_with_imports_prepared(
     store: &CrudStore,
     workspace: &str,
     owner_thread: &str,
     allowed_threads: &BTreeSet<String>,
     messages: &[ChatMessage],
     imports: &BTreeMap<ScopedHistorySource, PreparedFrozenImport>,
-) -> Result<FrozenHistoryRef> {
+) -> Result<PreparedHistory> {
     ensure!(
         allowed_threads.contains(owner_thread),
         "frozen history owner is not authorized"
     );
+    for message in messages {
+        let origin = message.provenance.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("new frozen history requires canonical source identities")
+        })?;
+        authorize(workspace, allowed_threads, origin)?;
+    }
     let mut references = Vec::with_capacity(messages.len());
     let mut digest = Sha256::new();
     for message in messages {
         let origin = message.provenance.as_ref().ok_or_else(|| {
             anyhow::anyhow!("new frozen history requires canonical source identities")
         })?;
-        authorize(workspace, allowed_threads, origin)?;
         let mut reference = FrozenMessageRef {
             logical_turn_id: origin.logical_turn_id.clone(),
             source_thread: origin.thread_id.clone(),
@@ -962,6 +1065,13 @@ async fn capture_with_imports(
         if let [full_source] = reference.sources.as_slice()
             && let Some(turn) = full_source.scope.strip_prefix("item:")
         {
+            super::history::prepare_references(
+                store,
+                workspace,
+                &reference.source_thread,
+                std::slice::from_ref(full_source),
+            )
+            .await?;
             let payload = super::history::reference_payload(
                 &store,
                 workspace,
@@ -980,11 +1090,13 @@ async fn capture_with_imports(
                 )
                 .await?;
         }
-        // Do not publish a snapshot whose exact model projection cannot be
-        // reconstructed from its originals. This also revalidates each revision.
-        restore_entry(&store, workspace, allowed_threads, &reference).await?;
         digest_entry(&mut digest, &reference)?;
         references.push(reference);
+    }
+    let mut verified_messages = Vec::with_capacity(messages.len());
+    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+        verified_messages
+            .extend(restore_entries_page(store, workspace, allowed_threads, page).await?);
     }
     let mut accepted = Vec::new();
     for (ordinal, reference) in references.iter().enumerate() {
@@ -1024,7 +1136,17 @@ async fn capture_with_imports(
         )
         .await?
     {
-        return Ok(existing);
+        if existing == descriptor {
+            return Ok(PreparedHistory {
+                descriptor: existing,
+                messages: verified_messages,
+            });
+        }
+        let messages = restore(store, workspace, allowed_threads, &existing).await?;
+        return Ok(PreparedHistory {
+            descriptor: existing,
+            messages,
+        });
     }
     store
         .compaction_begin_frozen_history_with_imports(
@@ -1109,7 +1231,10 @@ async fn capture_with_imports(
             .await?,
         "frozen history publication failed"
     );
-    Ok(descriptor)
+    Ok(PreparedHistory {
+        descriptor,
+        messages: verified_messages,
+    })
 }
 
 pub(crate) async fn restore(
@@ -1118,6 +1243,15 @@ pub(crate) async fn restore(
     allowed_threads: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ChatMessage>> {
+    #[cfg(test)]
+    if let Some(calls) = WORKSPACE_RESTORE_CALLS
+        .lock()
+        .unwrap()
+        .get(workspace)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     let owner = store
         .compaction_frozen_history_owner(workspace, descriptor)
         .await?
@@ -1141,7 +1275,8 @@ pub(crate) async fn restore(
             !page.is_empty(),
             "frozen history lost an immutable reference page"
         );
-        for reference in page {
+        for reference in &page {
+            reference.validate()?;
             ensure!(
                 allowed_threads.contains(&reference.source_thread)
                     && reference
@@ -1151,8 +1286,8 @@ pub(crate) async fn restore(
                 "frozen history source is outside the accepted context"
             );
             digest_entry(&mut digest, &reference)?;
-            result.push(restore_entry(&store, workspace, allowed_threads, &reference).await?);
         }
+        result.extend(restore_entries_page(store, workspace, allowed_threads, &page).await?);
     }
     ensure!(
         result.len() as u64 == descriptor.messages
@@ -1170,16 +1305,151 @@ async fn restore_entry(
     reference: &FrozenMessageRef,
 ) -> Result<ChatMessage> {
     reference.validate()?;
-    let mut payloads = Vec::new();
     for source in &reference.sources {
         if source.scope.starts_with("checkpoint:") {
             super::coverage::checkpoint_leaves(store, workspace, allowed_threads, source).await?;
         }
-        payloads.push(
-            super::history::reference_payload(store, workspace, &reference.source_thread, source)
-                .await?,
-        );
     }
+    if reference
+        .sources
+        .iter()
+        .all(|source| source.scope.starts_with("input:"))
+    {
+        let mut inputs = Vec::with_capacity(reference.sources.len());
+        let mut offset = 0usize;
+        while offset < reference.sources.len() {
+            let (consumed, payloads) = store
+                .compaction_reference_payload_batch(
+                    workspace,
+                    &reference.source_thread,
+                    &reference.sources[offset..],
+                )
+                .await?;
+            ensure!(
+                consumed > 0 && consumed == payloads.len(),
+                "frozen input batch made no progress"
+            );
+            #[cfg(test)]
+            let _raw_payloads = super::history::observe_payload_batch(&payloads);
+            for payload in payloads {
+                inputs.push(serde_json::from_str::<pioneer_protocol::UserInput>(
+                    &payload,
+                )?);
+            }
+            offset += consumed;
+        }
+        return finish_restored_entry(
+            store,
+            workspace,
+            reference,
+            vec![super::history::input_message(&inputs)?],
+        )
+        .await;
+    }
+    ensure!(
+        reference.sources.len() == 1,
+        "unsupported composite frozen projection"
+    );
+    let payload = super::history::reference_payload(
+        store,
+        workspace,
+        &reference.source_thread,
+        &reference.sources[0],
+    )
+    .await?;
+    restore_entry_from_payloads(store, workspace, reference, std::slice::from_ref(&payload)).await
+}
+
+/// Restore a bounded manifest page. Consecutive single-source input/context
+/// entries share the CRUD byte/row bounded read; each message is projected and
+/// wire-checked only after that reader has been released.
+async fn restore_entries_page(
+    store: &CrudStore,
+    workspace: &str,
+    allowed_threads: &BTreeSet<String>,
+    references: &[FrozenMessageRef],
+) -> Result<Vec<ChatMessage>> {
+    let mut result = Vec::with_capacity(references.len());
+    let mut index = 0usize;
+    while index < references.len() {
+        let reference = &references[index];
+        let batchable = reference.sources.len() == 1
+            && reference.replay_source.is_none()
+            && matches!(
+                reference.sources[0]
+                    .scope
+                    .split_once(':')
+                    .map(|(kind, _)| kind),
+                Some("input" | "context")
+            );
+        if !batchable {
+            let mut sources = reference.sources.clone();
+            sources.extend(reference.replay_source.iter().cloned());
+            super::history::prepare_references(
+                store,
+                workspace,
+                &reference.source_thread,
+                &sources,
+            )
+            .await?;
+            result.push(restore_entry(store, workspace, allowed_threads, reference).await?);
+            index += 1;
+            continue;
+        }
+        let end = references[index..]
+            .iter()
+            .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+            .take_while(|next| {
+                next.source_thread == reference.source_thread
+                    && next.sources.len() == 1
+                    && next.replay_source.is_none()
+                    && matches!(
+                        next.sources[0].scope.split_once(':').map(|(kind, _)| kind),
+                        Some("input" | "context")
+                    )
+            })
+            .count();
+        let sources = references[index..index + end]
+            .iter()
+            .map(|entry| entry.sources[0].clone())
+            .collect::<Vec<_>>();
+        super::history::prepare_references(store, workspace, &reference.source_thread, &sources)
+            .await?;
+        let (consumed, payloads) = store
+            .compaction_reference_payload_batch(workspace, &reference.source_thread, &sources)
+            .await?;
+        ensure!(
+            consumed > 0 && consumed == payloads.len(),
+            "frozen payload batch made no progress"
+        );
+        #[cfg(test)]
+        let _raw_payloads = super::history::observe_payload_batch(&payloads);
+        for (entry, payload) in references[index..index + consumed].iter().zip(payloads) {
+            result.push(
+                restore_entry_from_payloads(
+                    store,
+                    workspace,
+                    entry,
+                    std::slice::from_ref(&payload),
+                )
+                .await?,
+            );
+        }
+        index += consumed;
+    }
+    Ok(result)
+}
+
+async fn restore_entry_from_payloads(
+    store: &CrudStore,
+    workspace: &str,
+    reference: &FrozenMessageRef,
+    payloads: &[String],
+) -> Result<ChatMessage> {
+    ensure!(
+        payloads.len() == reference.sources.len(),
+        "frozen payload count mismatch"
+    );
     let mut candidates = Vec::new();
     if reference
         .sources
@@ -1285,6 +1555,15 @@ async fn restore_entry(
             }
         }
     }
+    finish_restored_entry(store, workspace, reference, candidates).await
+}
+
+async fn finish_restored_entry(
+    store: &CrudStore,
+    workspace: &str,
+    reference: &FrozenMessageRef,
+    mut candidates: Vec<ChatMessage>,
+) -> Result<ChatMessage> {
     let replay_source = reference
         .replay_source
         .as_ref()

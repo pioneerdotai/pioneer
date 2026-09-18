@@ -44,7 +44,9 @@ pub async fn insert_if_absent<C: ConnectionTrait>(
             .do_nothing()
             .to_owned(),
     )
-    .exec(db)
+    // The immutable winner is read below. Avoid RETURNING here because SeaORM
+    // maps a legitimate insert-if-absent conflict to `RecordNotInserted`.
+    .exec_without_returning(db)
     .await
     .context("failed to insert immutable task run conversation snapshot")?;
 

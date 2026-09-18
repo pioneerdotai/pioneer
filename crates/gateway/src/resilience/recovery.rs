@@ -3844,6 +3844,23 @@ impl RecoveryCoordinator {
             .get_turn_location(turn_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("retained history scope is missing"))?;
+        let mut preparation_after = 0;
+        while let Some(next) = store
+            .compaction_prepare_turn_context_quantum(
+                &workspace,
+                &thread,
+                turn_id,
+                preparation_after,
+            )
+            .await?
+        {
+            anyhow::ensure!(
+                next > preparation_after,
+                "retained history preparation made no progress"
+            );
+            preparation_after = next;
+            tokio::task::yield_now().await;
+        }
         let high_water = store
             .compaction_source_high_water(
                 &workspace,
@@ -3877,33 +3894,10 @@ impl RecoveryCoordinator {
             {
                 let payload = match row.payload {
                     Some(payload) => payload,
-                    None => {
-                        let mut payload = String::new();
-                        let mut offset = 0;
-                        loop {
-                            let fragment = store
-                                .compaction_reference_fragment(
-                                    &workspace,
-                                    &thread,
-                                    &row.reference,
-                                    offset,
-                                )
-                                .await?
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("retained source revision disappeared")
-                                })?;
-                            payload.push_str(&fragment.text);
-                            let Some(next) = fragment.next_character else {
-                                break;
-                            };
-                            anyhow::ensure!(
-                                next > offset,
-                                "retained history fragment made no progress"
-                            );
-                            offset = next;
-                        }
-                        payload
-                    }
+                    None => store
+                        .compaction_reference_payload(&workspace, &thread, &row.reference)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("retained source revision disappeared"))?,
                 };
                 sources.insert(row.sequence, row.reference);
                 rows.push(RetainedProviderHistoryRow {

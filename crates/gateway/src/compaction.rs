@@ -39,7 +39,7 @@ use pioneer_compaction::summary::{
 use pioneer_compaction::{Checkpoint, OperationSnapshot, SourceRef};
 use pioneer_crud::{
     CrudStore,
-    compaction::{CHECKPOINT_SOURCE_LIMIT, CommitOutcome, SOURCE_PAGE_ROWS},
+    compaction::{CHECKPOINT_SOURCE_LIMIT, CanonicalFragment, CommitOutcome, SOURCE_PAGE_ROWS},
 };
 use pioneer_protocol::{
     AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemHeartbeatSource,
@@ -47,6 +47,7 @@ use pioneer_protocol::{
 };
 use pioneer_runtime_events::ExecutionEventHub;
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -235,6 +236,82 @@ struct Portion {
     final_portion: bool,
 }
 
+const RUNNER_FRAGMENT_CHARACTERS: u64 = 16_384;
+const RUNNER_INDEX_STRIDE: u64 = 1_024;
+
+struct IndexedPayload {
+    text: String,
+    characters: u64,
+    checkpoints: Vec<(u64, usize)>,
+}
+
+impl IndexedPayload {
+    fn new(text: String) -> Self {
+        let mut checkpoints = vec![(0, 0)];
+        let mut characters = 0_u64;
+        for (byte, _) in text.char_indices() {
+            if characters > 0 && characters.is_multiple_of(RUNNER_INDEX_STRIDE) {
+                checkpoints.push((characters, byte));
+            }
+            characters += 1;
+        }
+        Self {
+            text,
+            characters,
+            checkpoints,
+        }
+    }
+
+    fn fragment(&self, source: &SourceRef, character_offset: u64) -> Result<CanonicalFragment> {
+        ensure!(
+            character_offset <= self.characters,
+            "source offset is past end"
+        );
+        let checkpoint = self
+            .checkpoints
+            .partition_point(|(character, _)| *character <= character_offset)
+            .saturating_sub(1);
+        let (mut character, base_byte) = self.checkpoints[checkpoint];
+        let mut start_byte = base_byte;
+        for (relative, value) in self.text[base_byte..].char_indices() {
+            if character == character_offset {
+                start_byte = base_byte + relative;
+                break;
+            }
+            character += 1;
+            start_byte = base_byte + relative + value.len_utf8();
+        }
+        let mut end_byte = start_byte;
+        let mut taken = 0_u64;
+        for (relative, value) in self.text[start_byte..].char_indices() {
+            if taken == RUNNER_FRAGMENT_CHARACTERS {
+                break;
+            }
+            end_byte = start_byte + relative + value.len_utf8();
+            taken += 1;
+        }
+        let end = character_offset.saturating_add(taken);
+        Ok(CanonicalFragment {
+            reference: source.clone(),
+            text: self.text[start_byte..end_byte].to_owned(),
+            next_character: (end < self.characters).then_some(end),
+        })
+    }
+}
+
+struct ActivePayload {
+    thread: String,
+    source: SourceRef,
+    payload: Arc<IndexedPayload>,
+}
+
+#[derive(Clone)]
+struct ReferenceExcerpt {
+    thread: String,
+    source: SourceRef,
+    text: String,
+}
+
 pub(crate) struct CompactionRunner {
     store: CrudStore,
     workspace: String,
@@ -243,6 +320,12 @@ pub(crate) struct CompactionRunner {
     target: Arc<dyn CompactionTarget>,
     observer: Arc<dyn CompactionObserver>,
     clock: Arc<dyn CompactionClock>,
+    // Operation-local and revision-keyed. Only the active full object is kept;
+    // reference-only material is retained as bounded excerpts.
+    active_payload: tokio::sync::Mutex<Option<ActivePayload>>,
+    reference_excerpts: tokio::sync::OnceCell<Vec<ReferenceExcerpt>>,
+    #[cfg(test)]
+    active_payload_loads: std::sync::atomic::AtomicUsize,
 }
 impl CompactionRunner {
     #[allow(clippy::too_many_arguments)]
@@ -264,7 +347,116 @@ impl CompactionRunner {
             target,
             observer,
             clock,
+            active_payload: tokio::sync::Mutex::new(None),
+            reference_excerpts: tokio::sync::OnceCell::new(),
+            #[cfg(test)]
+            active_payload_loads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    async fn active_payload_fragment(
+        &self,
+        thread: &str,
+        source: &SourceRef,
+        character_offset: u64,
+    ) -> Result<CanonicalFragment> {
+        let cached = {
+            let mut cache = self.active_payload.lock().await;
+            if let Some(active) = cache.as_ref()
+                && active.thread == thread
+                && active.source == *source
+            {
+                Some(active.payload.clone())
+            } else {
+                // Release the previous decompressed object before the next DB
+                // read can materialize another one.
+                *cache = None;
+                None
+            }
+        };
+        let payload = match cached {
+            Some(payload) => {
+                ensure!(
+                    self.store
+                        .compaction_references_current(
+                            &self.workspace,
+                            thread,
+                            std::slice::from_ref(source),
+                        )
+                        .await?,
+                    "source unavailable or stale"
+                );
+                payload
+            }
+            None => {
+                let text = self
+                    .store
+                    .compaction_reference_payload(&self.workspace, thread, source)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("source unavailable or stale"))?;
+                #[cfg(test)]
+                self.active_payload_loads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Index construction happens after the reader has been released.
+                let payload = Arc::new(IndexedPayload::new(text));
+                *self.active_payload.lock().await = Some(ActivePayload {
+                    thread: thread.to_owned(),
+                    source: source.clone(),
+                    payload: payload.clone(),
+                });
+                payload
+            }
+        };
+        payload.fragment(source, character_offset)
+    }
+
+    async fn reference_excerpts(&self) -> Result<&Vec<ReferenceExcerpt>> {
+        self.reference_excerpts
+            .get_or_try_init(|| async {
+                let entries = self
+                    .store
+                    .compaction_manifest_page(&self.snapshot.id, true, 0, 0)
+                    .await?;
+                let mut excerpts = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    self.store
+                        .compaction_prepare_references(
+                            &self.workspace,
+                            &entry.thread_id,
+                            std::slice::from_ref(&entry.source),
+                        )
+                        .await?;
+                    let payload = self
+                        .store
+                        .compaction_reference_payload(
+                            &self.workspace,
+                            &entry.thread_id,
+                            &entry.source,
+                        )
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("reference source unavailable or stale"))?;
+                    let mut characters = payload.chars();
+                    let excerpt = characters
+                        .by_ref()
+                        .take(usize::try_from(RUNNER_FRAGMENT_CHARACTERS)?)
+                        .collect::<String>();
+                    let text = if characters.next().is_some() {
+                        format!(
+                            "{excerpt}\n[Reference-only excerpt; remaining source not included.]"
+                        )
+                    } else {
+                        excerpt
+                    };
+                    excerpts.push(ReferenceExcerpt {
+                        thread: entry.thread_id,
+                        source: entry.source,
+                        text,
+                    });
+                    // `payload` is dropped here before the next reference is read.
+                }
+                Ok(excerpts)
+            })
+            .await
     }
     /// No provider, observer or source transformation runs while DB capacity is held.
     /// Dropping drive cancels queued DB work and the owned summarizer transport.
@@ -735,6 +927,24 @@ impl CompactionRunner {
                 final_portion: true,
             });
         }
+        // Build bounded reference-only excerpts before materializing the active
+        // full payload. They are reused across portions and retries.
+        let reference_excerpts = self.reference_excerpts().await?;
+        let mut reference_scopes = BTreeMap::<&str, Vec<SourceRef>>::new();
+        for excerpt in reference_excerpts {
+            reference_scopes
+                .entry(&excerpt.thread)
+                .or_default()
+                .push(excerpt.source.clone());
+        }
+        for (thread, references) in reference_scopes {
+            ensure!(
+                self.store
+                    .compaction_references_current(&self.workspace, thread, &references)
+                    .await?,
+                "reference source unavailable or stale"
+            );
+        }
         let first = self
             .store
             .compaction_manifest_page(
@@ -753,18 +963,18 @@ impl CompactionRunner {
         {
             request.input.previous_summary.clear();
         }
+        self.store
+            .compaction_prepare_references(
+                &self.workspace,
+                &first.thread_id,
+                std::slice::from_ref(&first.source),
+            )
+            .await?;
         // Reference-only bodies are optional context. They never acquire coverage.
         // Reserve a source fragment before adding them, so they cannot starve work.
         let initial = self
-            .store
-            .compaction_reference_fragment(
-                &self.workspace,
-                &first.thread_id,
-                &first.source,
-                state.cursor.character,
-            )
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("source unavailable or stale"))?;
+            .active_payload_fragment(&first.thread_id, &first.source, state.cursor.character)
+            .await?;
         let reserve_part = SummaryPart {
             sources: vec![first.source.clone()],
             unit: first.unit,
@@ -772,28 +982,11 @@ impl CompactionRunner {
             last_part: false,
             text: initial.text,
         };
-        for entry in self
-            .store
-            .compaction_manifest_page(&self.snapshot.id, true, 0, 0)
-            .await?
-        {
-            let fragment = self
-                .store
-                .compaction_reference_fragment(&self.workspace, &entry.thread_id, &entry.source, 0)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("reference source unavailable or stale"))?;
-            let text = if fragment.next_character.is_some() {
-                format!(
-                    "{}\n[Reference-only excerpt; remaining source not included.]",
-                    fragment.text
-                )
-            } else {
-                fragment.text
-            };
+        for excerpt in reference_excerpts {
             let mut proposed = request.clone();
             proposed.input.reference_only.push(ReferenceMaterial {
-                source: entry.source,
-                text,
+                source: excerpt.source.clone(),
+                text: excerpt.text.clone(),
             });
             proposed.input.compact_units.push(reserve_part.clone());
             if self.fits(&proposed)? {
@@ -810,16 +1003,16 @@ impl CompactionRunner {
                 .compaction_manifest_page(&self.snapshot.id, false, cursor.unit, cursor.source)
                 .await?;
             let Some(entry) = page.first() else { break };
-            let fragment = self
-                .store
-                .compaction_reference_fragment(
+            self.store
+                .compaction_prepare_references(
                     &self.workspace,
                     &entry.thread_id,
-                    &entry.source,
-                    cursor.character,
+                    std::slice::from_ref(&entry.source),
                 )
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("source unavailable or stale"))?;
+                .await?;
+            let fragment = self
+                .active_payload_fragment(&entry.thread_id, &entry.source, cursor.character)
+                .await?;
             let next = page.get(1);
             let source_index = if entry.unit == cursor.unit {
                 cursor.source

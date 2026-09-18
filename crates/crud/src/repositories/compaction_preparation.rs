@@ -1,11 +1,12 @@
 //! Bounded, demand-driven registration of legacy metadata. Discovery happens
 //! outside the writer; sources and cursor are revalidated inside the transaction.
-use crate::CrudStore;
+use crate::{CrudStore, repositories::compaction::CanonicalSource};
 use anyhow::{Result, ensure};
+use pioneer_compaction::SourceRef;
 use pioneer_entity::{
     compaction_event_revision, compaction_history_preparation as preparation,
-    compaction_input_revision, compaction_projection_epoch as epoch, compaction_source_revision,
-    thread, turn, turn_event, turn_input, turn_llm_context,
+    compaction_input_revision, compaction_item_revision, compaction_projection_epoch as epoch,
+    compaction_source_revision, thread, turn, turn_event, turn_input, turn_item, turn_llm_context,
 };
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict};
 use sea_orm::{
@@ -13,6 +14,219 @@ use sea_orm::{
     entity::prelude::*,
 };
 const PAGE: u64 = 128;
+
+/// Register a bounded set of exact legacy sources before a read-only restore.
+/// Existing revisions and tombstones win through `ON CONFLICT DO NOTHING`.
+pub(crate) async fn references(
+    store: &CrudStore,
+    workspace: &str,
+    source_thread: &str,
+    sources: &[SourceRef],
+) -> Result<()> {
+    ensure!(
+        sources.len() <= PAGE as usize,
+        "history preparation batch is too large"
+    );
+    let mut canonical = Vec::new();
+    for source in sources {
+        let Some((prefix, source_turn)) = source.scope.split_once(':') else {
+            continue;
+        };
+        let kind = match prefix {
+            "input" => CanonicalSource::Input,
+            "event" => CanonicalSource::Event,
+            "context" => CanonicalSource::ProviderContext,
+            "item" => CanonicalSource::ToolItem,
+            _ => continue,
+        };
+        let version_prefix = format!("{}:", kind.version_prefix());
+        let revision = source
+            .version
+            .strip_prefix(&version_prefix)
+            .ok_or_else(|| anyhow::anyhow!("source revision is unknown"))?
+            .parse::<i64>()?;
+        ensure!(
+            source.version == format!("{version_prefix}{revision}"),
+            "source revision is not canonical"
+        );
+        canonical.push((kind, source_turn.to_owned(), source.id.clone()));
+    }
+    if canonical.is_empty() {
+        return Ok(());
+    }
+    if super::compaction::compaction_sources_current(
+        &store.connection,
+        workspace,
+        source_thread,
+        sources,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    store
+        .run_serialized_write(|| async {
+            let txn = store.connection.begin().await?;
+            for (kind, source_turn, source_id) in &canonical {
+                match kind {
+                    CanonicalSource::Input => {
+                        super::compaction::seed_canonical_revision::<
+                            _,
+                            turn_input::Entity,
+                            compaction_input_revision::Entity,
+                        >(
+                            &txn,
+                            workspace,
+                            source_thread,
+                            source_turn,
+                            source_id,
+                            (turn_input::Column::Id, turn_input::Column::TurnId),
+                            (
+                                compaction_input_revision::Column::SourceId,
+                                compaction_input_revision::Column::TurnId,
+                                compaction_input_revision::Column::Revision,
+                                compaction_input_revision::Column::Present,
+                            ),
+                        )
+                        .await?
+                    }
+                    CanonicalSource::Event => {
+                        super::compaction::seed_canonical_revision::<
+                            _,
+                            turn_event::Entity,
+                            compaction_event_revision::Entity,
+                        >(
+                            &txn,
+                            workspace,
+                            source_thread,
+                            source_turn,
+                            source_id,
+                            (turn_event::Column::Id, turn_event::Column::TurnId),
+                            (
+                                compaction_event_revision::Column::SourceId,
+                                compaction_event_revision::Column::TurnId,
+                                compaction_event_revision::Column::Revision,
+                                compaction_event_revision::Column::Present,
+                            ),
+                        )
+                        .await?
+                    }
+                    CanonicalSource::ProviderContext => {
+                        super::compaction::seed_canonical_revision::<
+                            _,
+                            turn_llm_context::Entity,
+                            compaction_source_revision::Entity,
+                        >(
+                            &txn,
+                            workspace,
+                            source_thread,
+                            source_turn,
+                            source_id,
+                            (
+                                turn_llm_context::Column::Id,
+                                turn_llm_context::Column::TurnId,
+                            ),
+                            (
+                                compaction_source_revision::Column::SourceId,
+                                compaction_source_revision::Column::TurnId,
+                                compaction_source_revision::Column::Revision,
+                                compaction_source_revision::Column::Present,
+                            ),
+                        )
+                        .await?
+                    }
+                    CanonicalSource::ToolItem => {
+                        super::compaction::seed_canonical_revision::<
+                            _,
+                            turn_item::Entity,
+                            compaction_item_revision::Entity,
+                        >(
+                            &txn,
+                            workspace,
+                            source_thread,
+                            source_turn,
+                            source_id,
+                            (turn_item::Column::Id, turn_item::Column::TurnId),
+                            (
+                                compaction_item_revision::Column::SourceId,
+                                compaction_item_revision::Column::TurnId,
+                                compaction_item_revision::Column::Revision,
+                                compaction_item_revision::Column::Present,
+                            ),
+                        )
+                        .await?
+                    }
+                }
+            }
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// One bounded page of legacy provider-context registration for a single turn.
+/// Recovery uses this instead of preparing unrelated turns or source kinds.
+pub(crate) async fn turn_context_quantum(
+    store: &CrudStore,
+    workspace: &str,
+    thread_id: &str,
+    turn_id: &str,
+    after_sequence: i64,
+) -> Result<Option<i64>> {
+    ensure!(
+        turn::Entity::find_by_id(turn_id)
+            .filter(turn::Column::ThreadId.eq(thread_id))
+            .join(
+                sea_orm::JoinType::InnerJoin,
+                turn::Entity::belongs_to(thread::Entity)
+                    .from(turn::Column::ThreadId)
+                    .to(thread::Column::Id)
+                    .into(),
+            )
+            .filter(thread::Column::WorkspaceId.eq(workspace))
+            .select_only()
+            .column(turn::Column::Id)
+            .into_tuple::<String>()
+            .one(&store.connection)
+            .await?
+            .is_some(),
+        "history preparation turn is unavailable"
+    );
+    let page = turn_llm_context::Entity::find()
+        .select_only()
+        .column(turn_llm_context::Column::Id)
+        .column(turn_llm_context::Column::Sequence)
+        .filter(turn_llm_context::Column::TurnId.eq(turn_id))
+        .filter(turn_llm_context::Column::Sequence.gt(after_sequence))
+        .order_by_asc(turn_llm_context::Column::Sequence)
+        .limit(PAGE)
+        .into_tuple::<(String, i64)>()
+        .all(&store.connection)
+        .await?;
+    let Some(next_sequence) = page.last().map(|(_, sequence)| *sequence) else {
+        return Ok(None);
+    };
+    let ids = page.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let registered = compaction_source_revision::Entity::find()
+        .select_only()
+        .column(compaction_source_revision::Column::SourceId)
+        .filter(compaction_source_revision::Column::SourceId.is_in(ids.clone()))
+        .into_tuple::<String>()
+        .all(&store.connection)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let missing = ids
+        .into_iter()
+        .filter(|id| !registered.contains(id))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        // Discovery can race edits/deletes. The writer transaction re-reads
+        // both source rows and revision/tombstone rows before inserting.
+        register_turn_context_page(store, workspace, thread_id, turn_id, missing).await?;
+    }
+    Ok(Some(next_sequence))
+}
 
 async fn scoped<C: ConnectionTrait>(db: &C, workspace: &str, thread_id: &str) -> Result<bool> {
     Ok(thread::Entity::find_by_id(thread_id)
@@ -112,6 +326,49 @@ macro_rules! register {
         }
         count
     }};
+}
+
+async fn register_turn_context_page(
+    store: &CrudStore,
+    workspace: &str,
+    thread_id: &str,
+    turn_id: &str,
+    ids: Vec<String>,
+) -> Result<()> {
+    store
+        .run_serialized_write(|| async {
+            let txn = store.connection.begin().await?;
+            ensure!(
+                turn::Entity::find_by_id(turn_id)
+                    .filter(turn::Column::ThreadId.eq(thread_id))
+                    .join(
+                        sea_orm::JoinType::InnerJoin,
+                        turn::Entity::belongs_to(thread::Entity)
+                            .from(turn::Column::ThreadId)
+                            .to(thread::Column::Id)
+                            .into(),
+                    )
+                    .filter(thread::Column::WorkspaceId.eq(workspace))
+                    .select_only()
+                    .column(turn::Column::Id)
+                    .into_tuple::<String>()
+                    .one(&txn)
+                    .await?
+                    .is_some(),
+                "history preparation turn is unavailable"
+            );
+            register!(
+                turn_llm_context,
+                compaction_source_revision,
+                Sequence,
+                &txn,
+                turn_id,
+                ids
+            );
+            txn.commit().await?;
+            Ok(())
+        })
+        .await
 }
 
 pub(crate) async fn quantum(store: &CrudStore, workspace: &str, thread_id: &str) -> Result<bool> {

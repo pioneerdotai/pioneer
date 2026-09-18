@@ -64385,6 +64385,11 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         )
         .await
         .unwrap();
+    store.database_connection().execute_unprepared(
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('native-foreground-prior','native-foreground','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('native-foreground-prior-input','native-foreground-prior',0,'text','earlier canonical history','{\"type\":\"text\",\"text\":\"earlier canonical history\"}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let foreground_restores = crate::compaction::frozen::observe_workspace_restores(&workspace);
 
     let held = database.maintenance().begin_read().await.unwrap();
     let read_start = observer.reads.lock().unwrap().len();
@@ -64420,6 +64425,30 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     })
     .await
     .expect("foreground controller must reach the provider while maintenance is occupied");
+    let foreground_request = provider
+        .snapshot_requests()
+        .into_iter()
+        .find(|request| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.content == "small foreground request")
+        })
+        .expect("native foreground request was not captured");
+    assert!(foreground_request.messages.iter().any(|message| {
+        message.content.contains("earlier canonical history")
+            && message.provenance.as_ref().is_some_and(|origin| {
+                origin.sources.iter().any(|source| {
+                    source.id == "native-foreground-prior-input"
+                        && source.version.starts_with("input-revision:")
+                })
+            })
+    }));
+    assert_eq!(
+        foreground_restores.calls(),
+        0,
+        "refresh_native_history restored the descriptor it had just published"
+    );
 
     let reads = observer.reads.lock().unwrap()[read_start..].to_vec();
     let writes = observer.writes.lock().unwrap()[write_start..].to_vec();

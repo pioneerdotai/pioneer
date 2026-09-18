@@ -1,6 +1,22 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::CrudStore;
+use pioneer_sqlite::{SqliteDatabase, SqliteWriteEvent, SqliteWriteObserver};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+#[derive(Default)]
+struct WriteCounter(AtomicUsize);
+
+impl SqliteWriteObserver for WriteCounter {
+    fn observe(&self, event: SqliteWriteEvent) {
+        if matches!(event, SqliteWriteEvent::Acquired { .. }) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 async fn scalar(store: &CrudStore, sql: &str) -> i64 {
     store
@@ -33,6 +49,8 @@ async fn fixture_on(db: sea_orm::DatabaseConnection, compressed: bool) -> CrudSt
         "WITH RECURSIVE nums(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM nums WHERE n<300) INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'event-'||n,'thread','turn',n,'fixture','{}',CURRENT_TIMESTAMP FROM nums",
         "WITH RECURSIVE nums(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM nums WHERE n<300) INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) SELECT 'context-'||n,'turn',n,'tool_result_v2','{}','{}',CURRENT_TIMESTAMP FROM nums",
         "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('unrelated','other-turn',0,'text','untouched','{}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('unrelated-context','other-turn',1,'tool_result_v2','{}','{}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES('legacy-item','turn','legacy-item','command_execution','completed',0,'{\"text\":\"legacy 🧪\"}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -43,6 +61,129 @@ async fn fixture_on(db: sea_orm::DatabaseConnection, compressed: bool) -> CrudSt
     }
     Migrator::up(&db, None).await.unwrap();
     CrudStore::new(db).with_maintenance_access()
+}
+
+#[tokio::test]
+async fn retained_turn_preparation_registers_only_that_turns_context_pages() {
+    let store = fixture(false).await;
+    let mut after = 0;
+    let mut pages = 0;
+    while let Some(next) = store
+        .compaction_prepare_turn_context_quantum("ws", "thread", "turn", after)
+        .await
+        .unwrap()
+    {
+        assert!(next > after);
+        after = next;
+        pages += 1;
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) AS n FROM compaction_source_revision WHERE turn_id='turn'"
+        )
+        .await,
+        300
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) AS n FROM compaction_source_revision WHERE source_id='unrelated-context'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) AS n FROM compaction_input_revision"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &store,
+            "SELECT count(*) AS n FROM compaction_history_preparation"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn repeated_retained_turn_preparation_does_not_reserve_writer() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let _ = fixture_on(db.clone(), false).await;
+    let writes = Arc::new(WriteCounter::default());
+    let store = CrudStore::new(SqliteDatabase::new_with_observer(
+        db.clone(),
+        db,
+        writes.clone(),
+    ))
+    .with_maintenance_access();
+
+    let mut after = 0;
+    while let Some(next) = store
+        .compaction_prepare_turn_context_quantum("ws", "thread", "turn", after)
+        .await
+        .unwrap()
+    {
+        after = next;
+    }
+    let after_first = writes.0.load(Ordering::SeqCst);
+    assert!(after_first > 0, "initial legacy preparation did not write");
+
+    let mut after = 0;
+    while let Some(next) = store
+        .compaction_prepare_turn_context_quantum("ws", "thread", "turn", after)
+        .await
+        .unwrap()
+    {
+        after = next;
+    }
+    assert_eq!(
+        writes.0.load(Ordering::SeqCst),
+        after_first,
+        "fully registered pages still reserved the serialized writer"
+    );
+}
+
+#[tokio::test]
+async fn exact_legacy_preparation_is_concurrent_idempotent_and_repeat_reads_are_read_only() {
+    let store = fixture(false).await;
+    let source = pioneer_compaction::SourceRef {
+        scope: "item:turn".into(),
+        id: "legacy-item".into(),
+        version: "item-revision:1".into(),
+    };
+    let (left, right) = tokio::join!(
+        store.compaction_prepare_references("ws", "thread", std::slice::from_ref(&source)),
+        store.compaction_prepare_references("ws", "thread", std::slice::from_ref(&source)),
+    );
+    left.unwrap();
+    right.unwrap();
+    assert_eq!(
+        scalar(&store, "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id='legacy-item' AND revision=1 AND present=1").await,
+        1
+    );
+    store.database_connection().execute_unprepared(
+        "CREATE TRIGGER reject_repeat_registration BEFORE INSERT ON compaction_item_revision BEGIN SELECT RAISE(ABORT,'unexpected registration'); END"
+    ).await.unwrap();
+    store
+        .compaction_prepare_references("ws", "thread", std::slice::from_ref(&source))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_reference_payload("ws", "thread", &source)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("{\"text\":\"legacy 🧪\"}")
+    );
 }
 
 async fn finish(store: &CrudStore) {

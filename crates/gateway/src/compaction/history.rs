@@ -9,7 +9,102 @@ use pioneer_crud::{
 use pioneer_provider::{
     CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef, Role,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+#[cfg(test)]
+#[derive(Default)]
+struct PayloadBatchStats {
+    calls: std::sync::atomic::AtomicUsize,
+    max_rows: std::sync::atomic::AtomicUsize,
+    max_returned_raw_bytes: std::sync::atomic::AtomicUsize,
+    current_raw_bytes: std::sync::atomic::AtomicUsize,
+    peak_concurrent_raw_bytes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PayloadBatchStatsSnapshot {
+    pub calls: usize,
+    pub max_rows: usize,
+    pub max_returned_raw_bytes: usize,
+    pub current_raw_bytes: usize,
+    pub peak_concurrent_raw_bytes: usize,
+}
+
+#[cfg(test)]
+pub(super) struct RawPayloadLease {
+    stats: Option<std::sync::Arc<PayloadBatchStats>>,
+    bytes: usize,
+}
+
+#[cfg(test)]
+impl Drop for RawPayloadLease {
+    fn drop(&mut self) {
+        if let Some(stats) = &self.stats {
+            use std::sync::atomic::Ordering;
+            stats
+                .current_raw_bytes
+                .fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PAYLOAD_BATCH_STATS: std::sync::Arc<PayloadBatchStats>;
+}
+
+#[cfg(test)]
+pub(super) async fn with_payload_batch_stats<F: std::future::Future>(
+    future: F,
+) -> (F::Output, PayloadBatchStatsSnapshot) {
+    use std::sync::atomic::Ordering;
+    let stats = std::sync::Arc::new(PayloadBatchStats::default());
+    let output = PAYLOAD_BATCH_STATS.scope(stats.clone(), future).await;
+    let snapshot = PayloadBatchStatsSnapshot {
+        calls: stats.calls.load(Ordering::SeqCst),
+        max_rows: stats.max_rows.load(Ordering::SeqCst),
+        max_returned_raw_bytes: stats.max_returned_raw_bytes.load(Ordering::SeqCst),
+        current_raw_bytes: stats.current_raw_bytes.load(Ordering::SeqCst),
+        peak_concurrent_raw_bytes: stats.peak_concurrent_raw_bytes.load(Ordering::SeqCst),
+    };
+    (output, snapshot)
+}
+
+#[cfg(test)]
+pub(super) fn observe_payload_batch(payloads: &[String]) -> RawPayloadLease {
+    let bytes = payloads.iter().map(String::len).sum();
+    let stats = PAYLOAD_BATCH_STATS
+        .try_with(|stats| {
+            use std::sync::atomic::Ordering;
+            stats.calls.fetch_add(1, Ordering::SeqCst);
+            stats.max_rows.fetch_max(payloads.len(), Ordering::SeqCst);
+            stats
+                .max_returned_raw_bytes
+                .fetch_max(bytes, Ordering::SeqCst);
+            let current = stats.current_raw_bytes.fetch_add(bytes, Ordering::SeqCst) + bytes;
+            stats
+                .peak_concurrent_raw_bytes
+                .fetch_max(current, Ordering::SeqCst);
+            stats.clone()
+        })
+        .ok();
+    RawPayloadLease { stats, bytes }
+}
+
+struct SourcePayloadBatch {
+    entries: std::vec::IntoIter<(SourceRecord, String)>,
+    #[cfg(test)]
+    _raw_payloads: RawPayloadLease,
+}
+
+impl Iterator for SourcePayloadBatch {
+    type Item = (SourceRecord, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next()
+    }
+}
 
 /// Preparation belongs to the requesting operation, never a detached startup
 /// scan. Each quantum releases SQLite capacity; cancellation leaves a durable
@@ -40,26 +135,82 @@ pub(crate) async fn source_payload(
     reference_payload(store, workspace, thread, &source.reference).await
 }
 
+async fn take_source_payload_batch(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    records: &mut VecDeque<SourceRecord>,
+) -> Result<SourcePayloadBatch> {
+    let Some(first) = records.front_mut() else {
+        return Ok(SourcePayloadBatch {
+            entries: Vec::new().into_iter(),
+            #[cfg(test)]
+            _raw_payloads: RawPayloadLease {
+                stats: None,
+                bytes: 0,
+            },
+        });
+    };
+    if let Some(payload) = first.payload.take() {
+        let record = records.pop_front().expect("front record disappeared");
+        #[cfg(test)]
+        let _raw_payloads = observe_payload_batch(std::slice::from_ref(&payload));
+        let entries = vec![(record, payload)];
+        return Ok(SourcePayloadBatch {
+            entries: entries.into_iter(),
+            #[cfg(test)]
+            _raw_payloads,
+        });
+    }
+    let references = records
+        .iter()
+        .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+        .take_while(|record| record.payload.is_none())
+        .map(|record| record.reference.clone())
+        .collect::<Vec<_>>();
+    let (consumed, payloads) = store
+        .compaction_reference_payload_batch(workspace, thread, &references)
+        .await?;
+    ensure!(
+        consumed > 0 && consumed == payloads.len(),
+        "history payload batch made no progress"
+    );
+    #[cfg(test)]
+    let _raw_payloads = observe_payload_batch(&payloads);
+    let mut ready = Vec::with_capacity(consumed);
+    for payload in payloads {
+        let mut record = records.pop_front().expect("payload record disappeared");
+        record.incomplete = false;
+        ready.push((record, payload));
+    }
+    Ok(SourcePayloadBatch {
+        entries: ready.into_iter(),
+        #[cfg(test)]
+        _raw_payloads,
+    })
+}
+
 pub(crate) async fn reference_payload(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
     reference: &SourceRef,
 ) -> Result<String> {
-    let mut text = String::new();
-    let mut offset = 0;
-    loop {
-        let fragment = store
-            .compaction_reference_fragment(workspace, thread, reference, offset)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("selected history source disappeared"))?;
-        text.push_str(&fragment.text);
-        let Some(next) = fragment.next_character else {
-            return Ok(text);
-        };
-        ensure!(next > offset, "history fragment made no progress");
-        offset = next;
-    }
+    store
+        .compaction_reference_payload(workspace, thread, reference)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("selected history source disappeared"))
+}
+
+pub(crate) async fn prepare_references(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    references: &[SourceRef],
+) -> Result<()> {
+    store
+        .compaction_prepare_references(workspace, thread, references)
+        .await
 }
 
 async fn metadata(
@@ -448,7 +599,10 @@ async fn load_line_history_inner(
                 let (item, kind) = pioneer_crud::compaction::event_projection_metadata(&parsed);
                 event.item_id = item;
                 event.projection_kind = Some(kind.into());
-                event.payload = Some(payload);
+                // Relationship discovery retains metadata only. Bodies that
+                // survive the later projection filters are loaded on demand.
+                event.payload = None;
+                event.incomplete = true;
             }
         }
         events_by_turn.push(events);
@@ -556,7 +710,7 @@ async fn load_line_history_inner(
                 && (matches!(turn.send_mode.as_deref(), Some("agent" | "chat")) || !has_event_input)
         };
         if use_input_rows {
-            let rows = metadata(
+            let mut rows = metadata(
                 &store,
                 workspace,
                 thread,
@@ -566,16 +720,19 @@ async fn load_line_history_inner(
                 fence,
             )
             .await?;
+            rows.retain(|row| selected.is_none_or(|sources| sources.contains(&row.reference)));
             let mut inputs = Vec::new();
             let mut sources = Vec::new();
-            for mut row in rows {
-                if selected.is_some_and(|sources| !sources.contains(&row.reference)) {
-                    continue;
+            let mut rows = VecDeque::from(rows);
+            while !rows.is_empty() {
+                for (row, payload) in
+                    take_source_payload_batch(store, workspace, thread, &mut rows).await?
+                {
+                    inputs.push(serde_json::from_str::<pioneer_protocol::UserInput>(
+                        &payload,
+                    )?);
+                    sources.push(row.reference);
                 }
-                inputs.push(serde_json::from_str::<pioneer_protocol::UserInput>(
-                    &source_payload(&store, workspace, thread, &mut row).await?,
-                )?);
-                sources.push(row.reference);
             }
             if !inputs.is_empty() {
                 let mut message = input_message(&inputs)?;
@@ -585,36 +742,101 @@ async fn load_line_history_inner(
             }
         }
         let mut pending: Option<Round> = None;
-        for mut row in contexts {
-            let payload = source_payload(&store, workspace, thread, &mut row).await?;
-            match row.source_type.as_str() {
-                "assistant_round" => {
-                    if let Some(round) = pending.take() {
-                        finish_round(
+        let mut contexts = VecDeque::from(contexts);
+        while !contexts.is_empty() {
+            for (row, payload) in
+                take_source_payload_batch(store, workspace, thread, &mut contexts).await?
+            {
+                match row.source_type.as_str() {
+                    "assistant_round" => {
+                        if let Some(round) = pending.take() {
+                            finish_round(
+                                workspace,
+                                thread,
+                                &turn.id,
+                                round,
+                                captured_active,
+                                &mut ordered,
+                            )?;
+                        }
+                        if let Ok(envelope) =
+                            serde_json::from_str::<CanonicalProviderRoundEnvelope>(&payload)
+                        {
+                            aliases.extend(
+                                envelope.calls.iter().map(|call| call.turn_item_id.clone()),
+                            );
+                            pending = Some(Round {
+                                sequence: starts
+                                    .get(&envelope.round_id)
+                                    .copied()
+                                    .unwrap_or(row.sequence),
+                                envelope,
+                                assistant_source: row.reference,
+                                results: BTreeMap::new(),
+                            });
+                        } else {
+                            let mut message = ChatMessage::user(format!(
+                                "Legacy provider observation (available original):\n{payload}"
+                            ));
+                            message.provenance = Some(origin(
+                                workspace,
+                                thread,
+                                &turn.id,
+                                &row.reference.id,
+                                vec![row.reference.clone()],
+                            ));
+                            ordered.push((row.sequence, vec![message]));
+                        }
+                    }
+                    "provider_observation" => {
+                        let mut message = provider_observation(&payload)?;
+                        message.provenance = Some(origin(
                             workspace,
                             thread,
                             &turn.id,
-                            round,
-                            captured_active,
-                            &mut ordered,
-                        )?;
+                            &row.reference.id,
+                            vec![row.reference.clone()],
+                        ));
+                        let order = row
+                            .item_id
+                            .as_ref()
+                            .and_then(|id| starts.get(id))
+                            .copied()
+                            .unwrap_or(row.sequence);
+                        ordered.push((order, vec![message]));
                     }
-                    if let Ok(envelope) =
-                        serde_json::from_str::<CanonicalProviderRoundEnvelope>(&payload)
-                    {
-                        aliases.extend(envelope.calls.iter().map(|call| call.turn_item_id.clone()));
-                        pending = Some(Round {
-                            sequence: starts
-                                .get(&envelope.round_id)
-                                .copied()
-                                .unwrap_or(row.sequence),
-                            envelope,
-                            assistant_source: row.reference,
-                            results: BTreeMap::new(),
-                        });
-                    } else {
+                    "tool_result_v2" => {
+                        let round = pending
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("canonical tool result has no round"))?;
+                        let item = row.item_id.ok_or_else(|| {
+                            anyhow::anyhow!("tool result has no durable item identity")
+                        })?;
+                        let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
+                        let pioneer_tools::ToolResultView::Json {
+                            value,
+                            truncated: false,
+                        } = view
+                        else {
+                            anyhow::bail!("canonical result is incomplete")
+                        };
+                        let full: ChatMessage = serde_json::from_value(value)?;
+                        let reference = serde_json::json!({"workspace_id":workspace,"thread_id":thread,"turn_id":turn.id,"item_id":item}).to_string();
+                        let message = pioneer_agent::compaction::restored_tool_result_message(
+                            &full, &reference,
+                        )?;
+                        let source = store
+                            .compaction_tool_item_reference(workspace, thread, &turn.id, &item)
+                            .await?
+                            .unwrap_or(row.reference);
+                        ensure!(
+                            round.results.insert(item, (source, message)).is_none(),
+                            "duplicate canonical tool result"
+                        );
+                    }
+                    _ => {
                         let mut message = ChatMessage::user(format!(
-                            "Legacy provider observation (available original):\n{payload}"
+                            "Legacy provider observation; outcome is not inferred:\n{payload}"
                         ));
                         message.provenance = Some(origin(
                             workspace,
@@ -625,64 +847,6 @@ async fn load_line_history_inner(
                         ));
                         ordered.push((row.sequence, vec![message]));
                     }
-                }
-                "provider_observation" => {
-                    let mut message = provider_observation(&payload)?;
-                    message.provenance = Some(origin(
-                        workspace,
-                        thread,
-                        &turn.id,
-                        &row.reference.id,
-                        vec![row.reference.clone()],
-                    ));
-                    let order = row
-                        .item_id
-                        .as_ref()
-                        .and_then(|id| starts.get(id))
-                        .copied()
-                        .unwrap_or(row.sequence);
-                    ordered.push((order, vec![message]));
-                }
-                "tool_result_v2" => {
-                    let round = pending
-                        .as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("canonical tool result has no round"))?;
-                    let item = row.item_id.ok_or_else(|| {
-                        anyhow::anyhow!("tool result has no durable item identity")
-                    })?;
-                    let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
-                    let pioneer_tools::ToolResultView::Json {
-                        value,
-                        truncated: false,
-                    } = view
-                    else {
-                        anyhow::bail!("canonical result is incomplete")
-                    };
-                    let full: ChatMessage = serde_json::from_value(value)?;
-                    let reference = serde_json::json!({"workspace_id":workspace,"thread_id":thread,"turn_id":turn.id,"item_id":item}).to_string();
-                    let message =
-                        pioneer_agent::compaction::restored_tool_result_message(&full, &reference)?;
-                    let source = store
-                        .compaction_tool_item_reference(workspace, thread, &turn.id, &item)
-                        .await?
-                        .unwrap_or(row.reference);
-                    ensure!(
-                        round.results.insert(item, (source, message)).is_none(),
-                        "duplicate canonical tool result"
-                    );
-                }
-                _ => {
-                    let mut message = ChatMessage::user(format!(
-                        "Legacy provider observation; outcome is not inferred:\n{payload}"
-                    ));
-                    message.provenance = Some(origin(
-                        workspace,
-                        thread,
-                        &turn.id,
-                        &row.reference.id,
-                        vec![row.reference.clone()],
-                    ));
-                    ordered.push((row.sequence, vec![message]));
                 }
             }
         }
@@ -727,45 +891,61 @@ async fn load_line_history_inner(
                     .or_insert(row.sequence);
             }
         }
-        for mut row in events {
+        let mut selected_events = events.into_iter().filter(|row| {
             let kind = row.projection_kind.as_deref().unwrap_or("observation");
-            if kind == "input_copy"
+            let superseded_copy = kind == "input_copy"
                 && (last_input_revision.is_some_and(|revision| row.sequence <= revision)
                     || row.item_id.as_ref().is_some_and(|item| {
                         last_attachment_copies.get(item) != Some(&row.sequence)
-                    }))
-            {
-                continue;
+                    }));
+            let metadata_only = matches!(kind, "start" | "technical")
+                || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
+            let superseded_input = matches!(kind, "input" | "input_revision" | "input_deleted")
+                && (use_input_rows || Some(row.sequence) != latest_input);
+            !superseded_copy && !metadata_only && !superseded_input
+        });
+        loop {
+            let mut page = selected_events
+                .by_ref()
+                .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+                .collect::<Vec<_>>();
+            if page.is_empty() {
+                break;
             }
-            if matches!(kind, "start" | "technical")
-                || row.item_id.as_ref().is_some_and(|id| aliases.contains(id))
-            {
-                continue;
+            while !page.is_empty() {
+                let references = page
+                    .iter()
+                    .map(|row| row.reference.clone())
+                    .collect::<Vec<_>>();
+                let (consumed, payloads) = store
+                    .compaction_reference_payload_batch(workspace, thread, &references)
+                    .await?;
+                ensure!(
+                    consumed > 0 && consumed == payloads.len(),
+                    "event payload batch made no progress"
+                );
+                let ready = page.drain(..consumed).collect::<Vec<_>>();
+                for (row, payload) in ready.into_iter().zip(payloads) {
+                    let event: Event = serde_json::from_str(&payload)?;
+                    ensure!(
+                        event.workspace_id() == workspace
+                            && event.thread_id() == thread
+                            && event.turn_id() == turn.id,
+                        "canonical event scope mismatch"
+                    );
+                    let Some(mut message) = event_message(event)? else {
+                        continue;
+                    };
+                    message.provenance = Some(origin(
+                        workspace,
+                        thread,
+                        &turn.id,
+                        &row.reference.id,
+                        vec![row.reference.clone()],
+                    ));
+                    ordered.push((row.sequence, vec![message]));
+                }
             }
-            if matches!(kind, "input" | "input_revision" | "input_deleted")
-                && (use_input_rows || Some(row.sequence) != latest_input)
-            {
-                continue;
-            }
-            let payload = source_payload(&store, workspace, thread, &mut row).await?;
-            let event: Event = serde_json::from_str(&payload)?;
-            ensure!(
-                event.workspace_id() == workspace
-                    && event.thread_id() == thread
-                    && event.turn_id() == turn.id,
-                "canonical event scope mismatch"
-            );
-            let Some(mut message) = event_message(event)? else {
-                continue;
-            };
-            message.provenance = Some(origin(
-                workspace,
-                thread,
-                &turn.id,
-                &row.reference.id,
-                vec![row.reference.clone()],
-            ));
-            ordered.push((row.sequence, vec![message]));
         }
         if causal_task_context {
             let boundary = store

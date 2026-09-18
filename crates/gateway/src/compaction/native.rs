@@ -557,8 +557,8 @@ async fn refresh_native_history(
     mut request: ChatRequest,
 ) -> Result<(ChatRequest, pioneer_compaction::frozen::FrozenHistoryRef)> {
     use pioneer_agent::compaction::composition::ScopedHistorySource;
-    let json = processor
-        .capture_current_context_basis(
+    let prepared = processor
+        .capture_current_context_basis_prepared(
             store,
             &context.workspace_id,
             &context.thread_id,
@@ -566,6 +566,7 @@ async fn refresh_native_history(
             Some(&context.turn_id),
         )
         .await?;
+    let json = serde_json::to_string(&prepared.descriptor)?;
     let allowed = super::frozen::accepted_history_scopes(
         &store,
         &context.workspace_id,
@@ -573,13 +574,7 @@ async fn refresh_native_history(
         &json,
     )
     .await?;
-    let mut history = crate::turn_runtime_snapshot::restore_history_json(
-        &store,
-        &context.workspace_id,
-        &allowed,
-        &json,
-    )
-    .await?;
+    let mut history = prepared.messages;
     let is_current = |thread: &str, scope: &str| {
         thread == context.thread_id
             && scope.split_once(':').is_some_and(|(kind, turn)| {

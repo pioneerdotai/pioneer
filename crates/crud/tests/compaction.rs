@@ -204,7 +204,8 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
                 [id.into(), id.into()])).await.unwrap();
         }
         // Both pre-migration states must remain readable by exact reference:
-        // missing revision metadata and a lazily seeded revision.
+        // missing revision metadata and an already seeded revision. Fragment
+        // reads remain physically read-only; legacy registration is explicit.
         db.execute_unprepared("DELETE FROM compaction_item_revision")
             .await
             .unwrap();
@@ -226,6 +227,34 @@ async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compressi
                 .unwrap()
                 .unwrap();
             assert_eq!(reference.version, "item-revision:1");
+            if id == "untracked" {
+                assert!(
+                    store
+                        .compaction_reference_fragment("ws", "thread", &reference, 0)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let revisions = db
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id=?",
+                        [id.into()],
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get::<i64>("", "n")
+                    .unwrap();
+                assert_eq!(
+                    revisions, 0,
+                    "read-only fragment lookup registered legacy revision"
+                );
+            }
+            store
+                .compaction_prepare_references("ws", "thread", std::slice::from_ref(&reference))
+                .await
+                .unwrap();
             let fragment = store
                 .compaction_reference_fragment("ws", "thread", &reference, 0)
                 .await
@@ -339,14 +368,45 @@ async fn history_capture_after_upgrading_an_already_compressed_database() {
         .await
         .unwrap();
     db.execute_unprepared("INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES ('item','turn','item','command_execution','completed',0,'{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    // History admission must work on an upgraded compressed database, and
-    // pre-migration payloads must remain readable by their exact references.
+    // Metadata discovery stays read-only after upgrading an already compressed
+    // database. The pre-migration source is unavailable to fragment reads until
+    // the explicit bounded legacy preparation phase registers its revision.
+    let legacy_reference = store
+        .compaction_tool_item_reference("ws", "thread", "turn", "legacy")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy_reference.version, "item-revision:1");
+    assert!(
+        store
+            .compaction_reference_fragment("ws", "thread", &legacy_reference, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let legacy_revisions = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id='legacy'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(legacy_revisions, 0);
+    store
+        .compaction_prepare_references("ws", "thread", std::slice::from_ref(&legacy_reference))
+        .await
+        .unwrap();
     let legacy = store
-        .compaction_tool_result_fragment("ws", "thread", "turn", "legacy", None, 0)
+        .compaction_reference_fragment("ws", "thread", &legacy_reference, 0)
         .await
         .unwrap()
         .unwrap();
     assert!(legacy.text.contains("retained old result"));
+    assert_eq!(legacy.reference, legacy_reference);
     let old_fence = store.compaction_history_read_fence().await.unwrap();
     assert!(
         store

@@ -1492,82 +1492,8 @@ pub(crate) async fn compaction_payload_fragment<C: ConnectionTrait>(
     let offset = i64::try_from(character_offset)?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("source offset overflow"))?;
-    // Lazy initialization only touches a single pre-migration row; no full-table backfill.
-    match kind {
-        CanonicalSource::Input => {
-            seed_canonical_revision::<_, turn_input::Entity, compaction_input_revision::Entity>(
-                db,
-                workspace,
-                thread,
-                turn,
-                id,
-                (turn_input::Column::Id, turn_input::Column::TurnId),
-                (
-                    compaction_input_revision::Column::SourceId,
-                    compaction_input_revision::Column::TurnId,
-                    compaction_input_revision::Column::Revision,
-                    compaction_input_revision::Column::Present,
-                ),
-            )
-            .await?
-        }
-        CanonicalSource::Event => {
-            seed_canonical_revision::<_, turn_event::Entity, compaction_event_revision::Entity>(
-                db,
-                workspace,
-                thread,
-                turn,
-                id,
-                (turn_event::Column::Id, turn_event::Column::TurnId),
-                (
-                    compaction_event_revision::Column::SourceId,
-                    compaction_event_revision::Column::TurnId,
-                    compaction_event_revision::Column::Revision,
-                    compaction_event_revision::Column::Present,
-                ),
-            )
-            .await?
-        }
-        CanonicalSource::ProviderContext => seed_canonical_revision::<
-            _,
-            turn_llm_context::Entity,
-            compaction_source_revision::Entity,
-        >(
-            db,
-            workspace,
-            thread,
-            turn,
-            id,
-            (
-                turn_llm_context::Column::Id,
-                turn_llm_context::Column::TurnId,
-            ),
-            (
-                compaction_source_revision::Column::SourceId,
-                compaction_source_revision::Column::TurnId,
-                compaction_source_revision::Column::Revision,
-                compaction_source_revision::Column::Present,
-            ),
-        )
-        .await?,
-        CanonicalSource::ToolItem => {
-            seed_canonical_revision::<_, turn_item::Entity, compaction_item_revision::Entity>(
-                db,
-                workspace,
-                thread,
-                turn,
-                id,
-                (turn_item::Column::Id, turn_item::Column::TurnId),
-                (
-                    compaction_item_revision::Column::SourceId,
-                    compaction_item_revision::Column::TurnId,
-                    compaction_item_revision::Column::Revision,
-                    compaction_item_revision::Column::Present,
-                ),
-            )
-            .await?
-        }
-    }
+    // Legacy registration is an explicit preparation phase. This path is a
+    // physically read-only exact revision lookup and must never queue a writer.
     let row = match kind {
         CanonicalSource::Input => {
             read_source_fragment(
@@ -1983,6 +1909,330 @@ WHERE root.id=? AND (SELECT COUNT(*) FROM graph)<65537
             kind,
         )
         .await
+}
+
+/// Load one exact source as a whole value. The reader is released when this
+/// future returns; callers parse/hash only afterward. Compressed event/item
+/// rows are deliberately loaded one object at a time so SQLite performs one
+/// transparent decompression and memory is bounded by one admitted object.
+fn exact_canonical_revision(reference: &SourceRef, kind: CanonicalSource) -> Result<i64> {
+    let prefix = format!("{}:", kind.version_prefix());
+    let revision = reference
+        .version
+        .strip_prefix(&prefix)
+        .ok_or_else(|| anyhow::anyhow!("source revision is unknown"))?
+        .parse::<i64>()?;
+    ensure!(
+        reference.version == format!("{prefix}{revision}"),
+        "source revision is not canonical"
+    );
+    Ok(revision)
+}
+
+pub(crate) async fn compaction_reference_payload(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    reference: &SourceRef,
+) -> Result<Option<String>> {
+    if reference.scope.starts_with("task-basis:") {
+        return Ok(task_run_conversation_snapshot::Entity::find()
+            .select_only()
+            .join(
+                JoinType::InnerJoin,
+                compaction_live_sources::join(
+                    task_run_conversation_snapshot::Entity,
+                    task_run_conversation_snapshot::Column::RunId,
+                    compaction_live_sources::Column::SourceId,
+                ),
+            )
+            .column(task_run_conversation_snapshot::Column::HistoryJson)
+            .filter(
+                Expr::col((
+                    compaction_live_sources::Column::Table,
+                    compaction_live_sources::Column::WorkspaceId,
+                ))
+                .eq(workspace),
+            )
+            .filter(
+                Expr::col((
+                    compaction_live_sources::Column::Table,
+                    compaction_live_sources::Column::ThreadId,
+                ))
+                .eq(thread),
+            )
+            .filter(
+                Expr::col((
+                    compaction_live_sources::Column::Table,
+                    compaction_live_sources::Column::SourceScope,
+                ))
+                .eq(&reference.scope),
+            )
+            .filter(
+                Expr::col((
+                    compaction_live_sources::Column::Table,
+                    compaction_live_sources::Column::SourceId,
+                ))
+                .eq(&reference.id),
+            )
+            .filter(
+                Expr::col((
+                    compaction_live_sources::Column::Table,
+                    compaction_live_sources::Column::SourceVersion,
+                ))
+                .eq(&reference.version),
+            )
+            .into_tuple::<String>()
+            .one(&store.connection)
+            .await?);
+    }
+    if reference.scope.starts_with("checkpoint:") {
+        let row = SourceFragmentRow::find_by_statement(sqlite_specific_sql(
+            r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
+ SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
+ FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+ WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
+  AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
+  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+ UNION
+ SELECT v.source_scope,v.source_id,v.source_version
+ FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
+ WHERE g.source_scope LIKE 'checkpoint:%'
+ UNION
+ SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
+ FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
+ LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
+ WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
+ LIMIT 65537
+)
+SELECT 1 AS revision,root.summary AS fragment,length(root.summary) AS characters
+FROM compaction_checkpoint root
+WHERE root.id=? AND (SELECT COUNT(*) FROM graph)<65537
+ AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
+ AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
+  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_live_sources s
+   WHERE s.workspace_id=? AND s.source_scope=g.source_scope
+    AND s.source_id=g.source_id AND s.source_version=g.source_version
+  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
+    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
+    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+  ))
+ )) LIMIT 1"#,
+            [
+                reference.id.clone().into(), reference.scope.clone().into(),
+                reference.version.clone().into(), workspace.into(), thread.into(),
+                reference.id.clone().into(), workspace.into(), workspace.into(),
+            ],
+        )).one(&store.connection).await?;
+        return Ok(row.map(|row| row.fragment));
+    }
+    let (prefix, turn) = reference
+        .scope
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid source scope"))?;
+    let kind = match prefix {
+        "input" => CanonicalSource::Input,
+        "context" => CanonicalSource::ProviderContext,
+        "event" => CanonicalSource::Event,
+        "item" => CanonicalSource::ToolItem,
+        _ => anyhow::bail!("unsupported canonical source"),
+    };
+    let expected = exact_canonical_revision(reference, kind)?;
+    let payload = match kind {
+        CanonicalSource::Input => {
+            read_source_payload(
+                &store.connection,
+                turn_input_projection(workspace, thread, turn),
+                &reference.id,
+                expected,
+            )
+            .await?
+        }
+        CanonicalSource::Event => {
+            read_source_payload(
+                &store.connection,
+                turn_event_projection(workspace, thread, turn),
+                &reference.id,
+                expected,
+            )
+            .await?
+        }
+        CanonicalSource::ProviderContext => {
+            read_source_payload(
+                &store.connection,
+                turn_llm_context_projection(workspace, thread, turn),
+                &reference.id,
+                expected,
+            )
+            .await?
+        }
+        CanonicalSource::ToolItem => {
+            read_source_payload(
+                &store.connection,
+                turn_item_projection(workspace, thread, turn),
+                &reference.id,
+                expected,
+            )
+            .await?
+        }
+    };
+    Ok(payload)
+}
+
+async fn read_source_payload<C: ConnectionTrait, E: EntityTrait, P>(
+    db: &C,
+    projection: CanonicalProjection<E, P>,
+    id: &str,
+    expected_revision: i64,
+) -> Result<Option<String>> {
+    Ok(projection
+        .query
+        .select_only()
+        .column(projection.payload)
+        .filter(projection.id.eq(id))
+        .filter(projection.revision.eq(expected_revision))
+        .filter(projection.present.eq(1_i64))
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+
+#[derive(FromQueryResult)]
+struct PayloadSizeRow {
+    ordinal: i64,
+    bytes: i64,
+}
+
+#[derive(FromQueryResult)]
+struct PayloadValueRow {
+    ordinal: i64,
+    payload: String,
+}
+
+/// Batch the uncompressed canonical columns by both row count and actual UTF-8
+/// bytes. Event and item payloads may be transparent-zstd views and therefore
+/// intentionally take the single-object path above: a size probe would itself
+/// decompress the complete value and repeat that work.
+pub(crate) async fn compaction_reference_payload_batch(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    references: &[SourceRef],
+) -> Result<(usize, Vec<String>)> {
+    ensure!(!references.is_empty(), "empty history payload batch");
+    let batchable = references
+        .iter()
+        .take(SOURCE_PAGE_ROWS as usize)
+        .take_while(|source| {
+            source.scope.starts_with("input:") || source.scope.starts_with("context:")
+        })
+        .count();
+    if batchable == 0 {
+        let payload = compaction_reference_payload(store, workspace, thread, &references[0])
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("selected history source disappeared"))?;
+        return Ok((1, vec![payload]));
+    }
+    let candidates = &references[..batchable];
+    for reference in candidates {
+        let kind = if reference.scope.starts_with("input:") {
+            CanonicalSource::Input
+        } else {
+            CanonicalSource::ProviderContext
+        };
+        exact_canonical_revision(reference, kind)?;
+    }
+    let encoded = serde_json::to_string(candidates)?;
+    let projection = |field: &str| {
+        format!(
+            "SELECT CAST(w.key AS INTEGER) AS ordinal,{field} FROM json_each(?) w \
+         JOIN compaction_live_sources s ON s.workspace_id=? AND s.thread_id=? \
+          AND s.source_scope=json_extract(w.value,'$.scope') \
+          AND s.source_id=json_extract(w.value,'$.id') \
+          AND s.source_version=json_extract(w.value,'$.version') \
+         JOIN turn_input i ON substr(s.source_scope,1,6)='input:' \
+          AND i.id=s.source_id AND i.turn_id=substr(s.source_scope,7) \
+         UNION ALL \
+         SELECT CAST(w.key AS INTEGER) AS ordinal,{context_field} FROM json_each(?) w \
+         JOIN compaction_live_sources s ON s.workspace_id=? AND s.thread_id=? \
+          AND s.source_scope=json_extract(w.value,'$.scope') \
+          AND s.source_id=json_extract(w.value,'$.id') \
+          AND s.source_version=json_extract(w.value,'$.version') \
+         JOIN turn_llm_context c ON substr(s.source_scope,1,8)='context:' \
+          AND c.id=s.source_id AND c.turn_id=substr(s.source_scope,9) ORDER BY ordinal",
+            context_field = field.replace("i.payload", "c.payload")
+        )
+    };
+    let values = || {
+        [
+            encoded.clone().into(),
+            workspace.into(),
+            thread.into(),
+            encoded.clone().into(),
+            workspace.into(),
+            thread.into(),
+        ]
+    };
+    let sizes = PayloadSizeRow::find_by_statement(sqlite_specific_sql(
+        &projection("length(CAST(i.payload AS BLOB)) AS bytes"),
+        values(),
+    ))
+    .all(&store.connection)
+    .await?;
+    ensure!(
+        sizes.len() == candidates.len(),
+        "selected history source disappeared"
+    );
+    let mut consumed = 0usize;
+    let mut bytes = 0usize;
+    for (ordinal, row) in sizes.iter().enumerate() {
+        ensure!(
+            row.ordinal == ordinal as i64 && row.bytes >= 0,
+            "invalid history payload size"
+        );
+        let size = usize::try_from(row.bytes)?;
+        if consumed > 0 && bytes.saturating_add(size) > SOURCE_PAGE_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        consumed += 1;
+    }
+    // A single large value is admitted rather than imposing a new history limit.
+    let selected = serde_json::to_string(&candidates[..consumed])?;
+    let selected_values = || {
+        [
+            selected.clone().into(),
+            workspace.into(),
+            thread.into(),
+            selected.clone().into(),
+            workspace.into(),
+            thread.into(),
+        ]
+    };
+    let rows = PayloadValueRow::find_by_statement(sqlite_specific_sql(
+        &projection("i.payload AS payload"),
+        selected_values(),
+    ))
+    .all(&store.connection)
+    .await?;
+    ensure!(
+        rows.len() == consumed,
+        "selected history source changed while loading"
+    );
+    let mut payloads = Vec::with_capacity(consumed);
+    for (ordinal, row) in rows.into_iter().enumerate() {
+        ensure!(
+            row.ordinal == ordinal as i64,
+            "history payload order changed"
+        );
+        payloads.push(row.payload);
+    }
+    Ok((consumed, payloads))
 }
 
 pub(crate) async fn compaction_projection_version<C: ConnectionTrait>(
@@ -2519,7 +2769,7 @@ async fn source_assertion_matches<C: ConnectionTrait, E: EntityTrait, R: EntityT
 /// SeaORM has no INSERT ... SELECT operation. This single conditional write
 /// seeds one old canonical row without adding a read/write race or a new
 /// transaction. Both sides use Entity columns; canonical content is not read.
-async fn seed_canonical_revision<C: ConnectionTrait, E: EntityTrait, R: EntityTrait>(
+pub(super) async fn seed_canonical_revision<C: ConnectionTrait, E: EntityTrait, R: EntityTrait>(
     db: &C,
     workspace: &str,
     source_thread: &str,

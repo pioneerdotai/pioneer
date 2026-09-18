@@ -1087,18 +1087,16 @@ impl MessageProcessor {
         turn_id: &str,
     ) -> anyhow::Result<Vec<ChatMessage>> {
         let store = self.crud_store.as_ref();
-        let frozen = self
-            .capture_current_context_basis(store, workspace_id, thread_id, turn_id, Some(turn_id))
+        let prepared = self
+            .capture_current_context_basis_prepared(
+                store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(turn_id),
+            )
             .await?;
-        let allowed = crate::compaction::frozen::accepted_history_scopes(
-            &store,
-            workspace_id,
-            thread_id,
-            &frozen,
-        )
-        .await?;
-        crate::turn_runtime_snapshot::restore_history_json(&store, workspace_id, &allowed, &frozen)
-            .await
+        Ok(prepared.messages)
     }
 
     #[cfg(test)]

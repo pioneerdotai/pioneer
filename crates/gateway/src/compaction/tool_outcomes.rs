@@ -19,20 +19,11 @@ pub(crate) async fn retained_shell_outcome(
     else {
         return Ok(None);
     };
-    let mut payload = String::new();
-    let mut offset = 0;
-    loop {
-        let fragment = store
-            .compaction_reference_fragment(workspace, thread, &reference, offset)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("terminal tool source changed during recovery"))?;
-        payload.push_str(&fragment.text);
-        let Some(next) = fragment.next_character else {
-            break;
-        };
-        ensure!(next > offset, "terminal tool fragment made no progress");
-        offset = next;
-    }
+    super::history::prepare_references(store, workspace, thread, std::slice::from_ref(&reference))
+        .await?;
+    let payload = super::history::reference_payload(store, workspace, thread, &reference)
+        .await
+        .map_err(|_| anyhow::anyhow!("terminal tool source changed during recovery"))?;
     let item: TurnItem = serde_json::from_str(&payload)?;
     ensure!(item.item_id() == item_id, "terminal tool identity mismatch");
     let value = serde_json::to_value(&item)?;
@@ -82,6 +73,8 @@ pub(crate) async fn retained_tool_policy(
     else {
         return Ok(None);
     };
+    super::history::prepare_references(store, workspace, thread, std::slice::from_ref(&source))
+        .await?;
     let payload = super::history::reference_payload(&store, workspace, thread, &source).await?;
     let item: TurnItem = serde_json::from_str(&payload)?;
     ensure!(

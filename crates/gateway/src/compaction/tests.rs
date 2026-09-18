@@ -211,6 +211,597 @@ struct Fixture {
     observer: Arc<Observer>,
     payload: String,
 }
+
+#[test]
+fn indexed_runner_payload_keeps_unicode_character_cursor_stable() {
+    let source = pioneer_compaction::SourceRef {
+        scope: "event:turn".into(),
+        id: "unicode".into(),
+        version: "event-revision:1".into(),
+    };
+    let text = "a漢🌍é".repeat(12_345);
+    let indexed = IndexedPayload::new(text.clone());
+    let mut rebuilt = String::new();
+    let mut cursor = 0;
+    loop {
+        let fragment = indexed.fragment(&source, cursor).unwrap();
+        let repeated = indexed.fragment(&source, cursor).unwrap();
+        assert_eq!(fragment.reference, repeated.reference);
+        assert_eq!(fragment.text, repeated.text);
+        assert_eq!(fragment.next_character, repeated.next_character);
+        rebuilt.push_str(&fragment.text);
+        let Some(next) = fragment.next_character else {
+            break;
+        };
+        assert_eq!(next, cursor + fragment.text.chars().count() as u64);
+        cursor = next;
+    }
+    assert_eq!(rebuilt, text);
+}
+
+#[tokio::test]
+async fn runner_keeps_large_compressed_active_payload_while_loading_reference_only_excerpt() {
+    let f = fixture(&"漢🌍".repeat(40_000), vec![], true, false).await;
+    let reference_payload = serde_json::json!({"text":"reference ".repeat(20_000)}).to_string();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('reference','thread','turn',2,'fixture',?,CURRENT_TIMESTAMP)",
+        [reference_payload.into()],
+    )).await.unwrap();
+    let reference = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 1)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,0,1,'thread',?,?,?)",
+        [reference.scope.clone().into(), reference.id.clone().into(), reference.version.clone().into()],
+    )).await.unwrap();
+    let config = serde_json::json!({
+        "table":"turn_event", "column":"payload", "compression_level":3,
+        "dict_chooser":"'[nodict]'"
+    });
+    f.store
+        .database_connection()
+        .query_one_write_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT zstd_enable_transparent(?)",
+            [config.to_string().into()],
+        ))
+        .await
+        .unwrap();
+    let raw: String = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM _turn_event_zstd WHERE id='source'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    let compressed = pioneer_sqlite::zstd::compress_column_value(raw.as_bytes(), 3, None).unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE _turn_event_zstd SET payload=?,_payload_dict=-1 WHERE id='source' AND payload=?",
+        [compressed.into(), raw.into()],
+    )).await.unwrap();
+
+    let source = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap()[0]
+        .source
+        .clone();
+    let first = f
+        .runner
+        .active_payload_fragment("thread", &source, 0)
+        .await
+        .unwrap();
+    assert!(first.next_character.is_some());
+    let before = {
+        let cache = f.runner.active_payload.lock().await;
+        Arc::as_ptr(&cache.as_ref().unwrap().payload)
+    };
+    assert_eq!(f.runner.reference_excerpts().await.unwrap().len(), 1);
+    let second = f
+        .runner
+        .active_payload_fragment("thread", &source, first.next_character.unwrap())
+        .await
+        .unwrap();
+    assert!(!second.text.is_empty());
+    let after = {
+        let cache = f.runner.active_payload.lock().await;
+        Arc::as_ptr(&cache.as_ref().unwrap().payload)
+    };
+    assert_eq!(
+        before, after,
+        "reference-only loading evicted the active payload"
+    );
+    assert_eq!(
+        f.runner.active_payload_loads.load(Ordering::SeqCst),
+        1,
+        "the active compressed object was materialized more than once"
+    );
+}
+
+#[tokio::test]
+async fn classified_technical_event_does_not_load_its_compressed_payload() {
+    let f = fixture("unused", vec![], true, false).await;
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='completed' WHERE id='turn';
+         UPDATE compaction_event_revision SET projection_revision=revision,projection_kind='technical' WHERE source_id='source'",
+    ).await.unwrap();
+    let config = serde_json::json!({
+        "table":"turn_event", "column":"payload", "compression_level":3,
+        "dict_chooser":"'[nodict]'"
+    });
+    f.store
+        .database_connection()
+        .query_one_write_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT zstd_enable_transparent(?)",
+            [config.to_string().into()],
+        ))
+        .await
+        .unwrap();
+    // Metadata remains readable, but touching the body would ask sqlite-zstd to
+    // decode deliberately invalid compressed bytes and fail the load.
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE _turn_event_zstd SET payload=?,_payload_dict=-1 WHERE id='source'",
+            [vec![0_u8, 1, 2, 3].into()],
+        ))
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert!(history.is_empty());
+}
+
+#[tokio::test]
+async fn canonical_inputs_and_contexts_release_each_bounded_raw_payload_batch() {
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderToolCall,
+    };
+    let f = fixture("unused", vec![], true, false).await;
+    let mut total_raw_bytes = 0usize;
+    let mut largest_payload_bytes = 0usize;
+    for index in 0..129_i64 {
+        let input = pioneer_protocol::UserInput::Text {
+            text: format!("input-{index}-🧪"),
+            text_elements: vec![],
+        };
+        let payload = serde_json::to_string(&input).unwrap();
+        total_raw_bytes += payload.len();
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES(?, 'turn', ?, 'text', '', ?, CURRENT_TIMESTAMP)",
+            [format!("batched-input-{index}").into(), index.into(), payload.into()],
+        )).await.unwrap();
+    }
+    for sequence in 1..=130_i64 {
+        let round = match sequence {
+            1 | 2 => Some(1),
+            65 | 66 => Some(2),
+            129 | 130 => Some(3),
+            _ => None,
+        };
+        let (source, item_id, payload) = if let Some(round) = round
+            && sequence % 2 == 1
+        {
+            let envelope = CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: format!("large-round-{round}"),
+                termination: ProviderTermination::ToolCalls,
+                message: ChatMessage::assistant_tool_calls(
+                    None::<String>,
+                    vec![ProviderToolCall {
+                        id: format!("large-call-{round}"),
+                        name: "large_tool".into(),
+                        arguments: "{}".into(),
+                    }],
+                ),
+                calls: vec![ProviderCallIdentity {
+                    provider_call_id: format!("large-call-{round}"),
+                    turn_item_id: format!("large-item-{round}"),
+                    ordinal: 0,
+                }],
+            };
+            (
+                "assistant_round",
+                Some(format!("large-round-{round}")),
+                serde_json::to_string(&envelope).unwrap(),
+            )
+        } else if let Some(round) = round {
+            let view = pioneer_tools::ToolResultView::Json {
+                value: serde_json::to_value(ChatMessage::tool_result(
+                    format!("large-call-{round}"),
+                    "large_tool",
+                    format!(
+                        "large-{round}-{}",
+                        "漢🌍".repeat(pioneer_crud::compaction::SOURCE_PAGE_BYTES / 7 + 100)
+                    ),
+                ))
+                .unwrap(),
+                truncated: false,
+            };
+            (
+                "tool_result_v2",
+                Some(format!("large-item-{round}")),
+                serde_json::to_string(&view).unwrap(),
+            )
+        } else {
+            ("legacy", None, format!("context-{sequence}-é"))
+        };
+        total_raw_bytes += payload.len();
+        largest_payload_bytes = largest_payload_bytes.max(payload.len());
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_llm_context(id,turn_id,item_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES(?, 'turn', ?, ?, ?, ?, '{}', CURRENT_TIMESTAMP)",
+            [format!("batched-context-{sequence}").into(), item_id.into(), sequence.into(), source.into(), payload.into()],
+        )).await.unwrap();
+    }
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='completed' WHERE id='turn';
+         UPDATE compaction_event_revision SET projection_revision=revision,projection_kind='technical' WHERE source_id='source'",
+    ).await.unwrap();
+
+    let (prepared, stats) = super::history::with_payload_batch_stats(
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None),
+    )
+    .await;
+    let prepared = prepared.unwrap();
+    assert!(
+        stats.calls >= 7,
+        "input/context loading did not cross several batches"
+    );
+    assert_eq!(
+        stats.max_rows,
+        pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize,
+        "the 128-row boundary was not exercised"
+    );
+    assert!(
+        stats.max_returned_raw_bytes >= largest_payload_bytes,
+        "an oversized source was not admitted as one bounded object"
+    );
+    assert!(
+        stats.max_returned_raw_bytes < total_raw_bytes,
+        "one returned batch unexpectedly contains the complete raw history"
+    );
+    assert_eq!(stats.current_raw_bytes, 0, "raw batch lease leaked");
+    assert_eq!(
+        stats.peak_concurrent_raw_bytes, stats.max_returned_raw_bytes,
+        "a previous raw payload batch remained live while the next batch was loaded"
+    );
+    assert!(prepared.messages[0].content.contains("input-0-🧪"));
+    let source_position = |id: &str| {
+        prepared
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|origin| origin.sources.iter().any(|source| source.id == id))
+            })
+            .unwrap()
+    };
+    let first = source_position("batched-context-2");
+    let last = source_position("batched-context-130");
+    assert!(first < last, "context order changed across payload batches");
+}
+
+#[tokio::test]
+async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+    use pioneer_sqlite::{SqliteDatabase, SqliteWriteExecutor};
+    use sea_orm::{ConnectOptions, TransactionTrait};
+
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("foreign-scope.sqlite");
+    let writer_url = format!("sqlite://{}?mode=rwc", path.display());
+    let mut writer_options = ConnectOptions::new(writer_url);
+    writer_options.max_connections(1).sqlx_logging(false);
+    let writer = Database::connect(writer_options).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    writer.execute_unprepared(
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1);
+         INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let reader_url = format!("sqlite://{}?mode=ro", path.display());
+    let mut reader_options = ConnectOptions::new(reader_url);
+    reader_options
+        .max_connections(2)
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+    let reader = Database::connect(reader_options).await.unwrap();
+    let observer = Arc::new(HistoryReadObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer,
+    );
+    let store = CrudStore::new(database);
+    store.database_connection().execute_unprepared(
+        "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES('legacy-forbidden','turn','legacy-forbidden','command_execution','completed',0,'{invalid',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         DELETE FROM compaction_item_revision WHERE source_id='legacy-forbidden'",
+    ).await.unwrap();
+    let mut message = ChatMessage::user("must not be inspected");
+    message.provenance = Some(MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "foreign-workspace".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "turn:foreign".into(),
+        complete: true,
+        protected_input: false,
+        inherited: false,
+        sources: vec![MessageSourceRef {
+            scope: "item:turn".into(),
+            id: "legacy-forbidden".into(),
+            version: "item-revision:1".into(),
+        }],
+    });
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let held_writer = store.database_connection().begin().await.unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::frozen::capture(&store, "ws", "thread", &allowed, &[message]),
+    )
+    .await
+    .expect("foreign capture waited for the serialized writer")
+    .unwrap_err();
+    held_writer.rollback().await.unwrap();
+    assert!(error.to_string().contains("outside the accepted context"));
+    let registered: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id='legacy-forbidden'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(registered, 0);
+
+    let input = pioneer_protocol::UserInput::Text {
+        text: "accepted".into(),
+        text_elements: vec![],
+    };
+    let payload = serde_json::to_string(&input).unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('restore-input','turn',0,'text','accepted',?,CURRENT_TIMESTAMP)",
+        [payload.into()],
+    )).await.unwrap();
+    let mut accepted = super::history::input_message(&[input]).unwrap();
+    accepted.provenance = Some(MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "turn:accepted".into(),
+        complete: true,
+        protected_input: false,
+        inherited: false,
+        sources: vec![MessageSourceRef {
+            scope: "input:turn".into(),
+            id: "restore-input".into(),
+            version: "input-revision:1".into(),
+        }],
+    });
+    let descriptor = super::frozen::capture(
+        &store,
+        "ws",
+        "thread",
+        &allowed,
+        std::slice::from_ref(&accepted),
+    )
+    .await
+    .unwrap();
+    store.database_connection().execute_unprepared(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('other','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('other-turn','other','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         INSERT INTO turn_item(id,turn_id,item_id,item_type,status,active_attempt_number,payload,created_at,updated_at) VALUES('restore-forbidden','other-turn','restore-forbidden','command_execution','completed',0,'{invalid',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         DELETE FROM compaction_item_revision WHERE source_id='restore-forbidden'",
+    ).await.unwrap();
+    let mut forbidden = store
+        .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+        .await
+        .unwrap()
+        .remove(0);
+    forbidden.source_thread = "other".into();
+    forbidden.sources = vec![pioneer_compaction::SourceRef {
+        scope: "item:other-turn".into(),
+        id: "restore-forbidden".into(),
+        version: "item-revision:1".into(),
+    }];
+    let reference_json = serde_json::to_string(&forbidden).unwrap();
+    let storage_manifest = store.database_connection().query_one_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT source_manifest FROM compaction_frozen_span WHERE manifest_id=? AND kind=0 AND start<=0 AND end>0 LIMIT 1",
+        [descriptor.manifest_id.clone().into()],
+    )).await.unwrap().map(|row| row.try_get::<String>("", "source_manifest").unwrap())
+        .unwrap_or_else(|| descriptor.manifest_id.clone());
+    store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
+        [reference_json.clone().into(), (reference_json.len() as i64).into(), storage_manifest.into()],
+    )).await.unwrap();
+    let held_writer = store.database_connection().begin().await.unwrap();
+    let restore_error = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::frozen::restore(&store, "ws", &allowed, &descriptor),
+    )
+    .await
+    .expect("foreign restore waited for the serialized writer")
+    .unwrap_err();
+    held_writer.rollback().await.unwrap();
+    assert!(
+        restore_error
+            .to_string()
+            .contains("outside the accepted context")
+    );
+    let restore_registered: i64 = store.database_connection().query_one_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT count(*) AS n FROM compaction_item_revision WHERE source_id='restore-forbidden'".to_owned(),
+    )).await.unwrap().unwrap().try_get("", "n").unwrap();
+    assert_eq!(restore_registered, 0);
+}
+
+/// Manual end-to-end scenario for the dedicated performance stage. Unlike the
+/// CRUD microbenchmark, this exercises frozen capture, frozen restore and the
+/// real runner. Durations are observations, never test thresholds.
+#[tokio::test]
+#[ignore = "manual end-to-end history benchmark; run only in the dedicated benchmark stage"]
+async fn benchmark_frozen_capture_restore_and_compressed_runner() {
+    use pioneer_provider::ChatMessage;
+
+    let f = fixture("runner seed", vec![], true, false).await;
+    for index in 0..1_000_i64 {
+        let id = format!("benchmark-input-{index}");
+        let text = format!("small history message {index}");
+        let input = pioneer_protocol::UserInput::Text {
+            text: text.clone(),
+            text_elements: vec![],
+        };
+        let payload = serde_json::to_string(&input).unwrap();
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES(?, 'turn', ?, 'text', ?, ?, CURRENT_TIMESTAMP)",
+            [id.clone().into(), index.into(), text.into(), payload.into()],
+        )).await.unwrap();
+    }
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='completed' WHERE id='turn';
+         UPDATE compaction_event_revision SET projection_revision=revision,projection_kind='technical' WHERE source_id='source'",
+    ).await.unwrap();
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let capture_started = std::time::Instant::now();
+    let (prepared, payload_stats) = super::history::with_payload_batch_stats(
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None),
+    )
+    .await;
+    let prepared = prepared.unwrap();
+    let capture_elapsed = capture_started.elapsed();
+    let restore_started = std::time::Instant::now();
+    let restored = super::frozen::restore(&f.store, "ws", &allowed, &prepared.descriptor)
+        .await
+        .unwrap();
+    let restore_elapsed = restore_started.elapsed();
+    assert_eq!(prepared.messages, restored);
+
+    let large = serde_json::json!({
+        "type":"json", "value":{"role":"tool","content":"漢🌍".repeat(1_000_000)},
+        "truncated":false
+    })
+    .to_string();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,output_policy_snapshot,created_at) VALUES('benchmark-large-result','turn',1,'tool_result_v2',?,'{}',CURRENT_TIMESTAMP)",
+        [large.into()],
+    )).await.unwrap();
+    let large_source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::ProviderContext, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let reference_only = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET source_scope=?,source_id=?,source_version=? WHERE operation_id='operation' AND ordinal=0",
+        [large_source.scope.into(), large_source.id.into(), large_source.version.into()],
+    )).await.unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,0,1,'thread',?,?,?)",
+        [reference_only.scope.into(), reference_only.id.into(), reference_only.version.into()],
+    )).await.unwrap();
+    let config = serde_json::json!({
+        "table":"turn_llm_context", "column":"payload", "compression_level":3,
+        "dict_chooser":"'[nodict]'"
+    });
+    f.store
+        .database_connection()
+        .query_one_write_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT zstd_enable_transparent(?)",
+            [config.to_string().into()],
+        ))
+        .await
+        .unwrap();
+    let raw: String = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM _turn_llm_context_zstd WHERE id='benchmark-large-result'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    let compressed = pioneer_sqlite::zstd::compress_column_value(raw.as_bytes(), 3, None).unwrap();
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE _turn_llm_context_zstd SET payload=?,_payload_dict=-1 WHERE id='benchmark-large-result' AND payload=?",
+        [compressed.into(), raw.into()],
+    )).await.unwrap();
+    let runner_started = std::time::Instant::now();
+    let outcome = f.runner.run(CancellationToken::new()).await.unwrap();
+    let runner_elapsed = runner_started.elapsed();
+    assert!(matches!(outcome, CompactionExit::Applied(_)));
+    eprintln!(
+        "history_e2e_benchmark canonical_rows=1000 projected_messages={} measured_capture_payload_batch_calls={} measured_max_payload_batch_rows={} measured_max_returned_raw_payload_batch_bytes={} measured_peak_concurrent_raw_payload_bytes={} measured_capture_ms={} measured_restore_ms={} measured_runner_ms={} measured_runner_provider_calls={} measured_runner_full_payload_loads={} measured_restored_utf8_bytes={}",
+        restored.len(),
+        payload_stats.calls,
+        payload_stats.max_rows,
+        payload_stats.max_returned_raw_bytes,
+        payload_stats.peak_concurrent_raw_bytes,
+        capture_elapsed.as_millis(),
+        restore_elapsed.as_millis(),
+        runner_elapsed.as_millis(),
+        *f.provider.count.borrow(),
+        f.runner.active_payload_loads.load(Ordering::SeqCst),
+        restored
+            .iter()
+            .map(|message: &ChatMessage| message.content.len())
+            .sum::<usize>(),
+    );
+}
 async fn fixture(
     text: &str,
     replies: Vec<Reply>,
@@ -2873,6 +3464,15 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
             .await
             .unwrap();
     assert_eq!(captured, current);
+    let prepared =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    let restored_prepared = super::frozen::restore(&f.store, "ws", &allowed, &prepared.descriptor)
+        .await
+        .unwrap();
+    assert_eq!(prepared.messages, restored_prepared);
+    assert_eq!(prepared.messages, current);
     // Policy applies to the separately delivered history, and never cuts a
     // canonical tool round into an orphan call or result.
     for mode in [
