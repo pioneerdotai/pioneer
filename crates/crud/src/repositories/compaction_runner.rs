@@ -1981,45 +1981,99 @@ async fn manifest_source_exists<C: ConnectionTrait, E: EntityTrait>(
         .is_some())
 }
 
-use sea_orm::QueryTrait;
+use sea_orm::{QueryTrait, Statement};
 
-/// Shared admission/commit predicate. Read-only preflight avoids provider work
-/// for an invalid grant; commit repeats it under the atomic writer boundary.
-pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
-    db: &C,
-    operation: &str,
-) -> Result<bool> {
-    // A foreign summary may replace accepted raw imports after output capture.
-    // A working-context summary may additionally cover inherited sources that
-    // occur in the SAME bound frozen basis. OWN imports still require their
-    // delivery proofs; a frozen reference alone never launders them. Prove the
-    // entire immutable DAG and repeat the predicate inside the head CAS,
-    // including admitted epoch scopes and live leaf revisions. Epoch values
-    // fence admission, but later work outside this manifest is not staleness.
-    // SQLite's recursive UNION deduplicates DAG nodes. The explicit 65,536
-    // reference bound fails closed (including cycles without any real leaves)
-    // and prevents unbounded traversal while holding database capacity. No
-    // transcript/summary payloads are read. Keep this with the existing SQLite
-    // JSON snapshot predicate rather than doing a racy read/check/write loop.
-    let stale = db.query_one_raw(sqlite_specific_sql(r#"
+const COMPACTION_MANIFEST_SOURCES_CURRENT_SQL: &str = r#"
 WITH RECURSIVE
 current_operation AS (
  SELECT o.id, o.snapshot, c.workspace_id, c.thread_id
  FROM compaction_operation o JOIN compaction_context c ON c.owner=o.owner
- WHERE o.id=?
+ WHERE o.id=?1
 ),
-current_sources AS (
- SELECT source_scope,source_id,source_version,thread_id,workspace_id
- FROM compaction_live_sources WHERE source_scope NOT LIKE 'checkpoint:%'
+needed_refs(source_scope,source_id,source_version) AS (
+ SELECT m.source_scope,m.source_id,m.source_version
+ FROM compaction_manifest m JOIN current_operation o ON o.id=m.operation_id
+ UNION
+ SELECT source_scope,source_id,source_version FROM coverage
+ UNION
+ SELECT source_scope,source_id,source_version FROM basis_coverage
+),
+current_sources(source_scope,source_id,source_version,thread_id,workspace_id) AS (
+ SELECT 'context:'||context_revision.turn_id,context_revision.source_id,
+  'revision:'||context_revision.revision,context_turn.thread_id,context_thread.workspace_id
+ FROM needed_refs need CROSS JOIN current_operation o
+ CROSS JOIN compaction_source_revision context_revision ON context_revision.source_id=need.source_id
+ JOIN turn_llm_context context_source ON context_source.id=context_revision.source_id
+  AND context_source.turn_id=context_revision.turn_id
+ JOIN turn context_turn ON context_turn.id=context_revision.turn_id
+ JOIN thread context_thread ON context_thread.id=context_turn.thread_id
+ WHERE context_revision.present=1 AND 'context:'||context_revision.turn_id=need.source_scope
+  AND 'revision:'||context_revision.revision=need.source_version
+  AND context_thread.workspace_id=o.workspace_id
  UNION ALL
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256,c.thread_id,c.workspace_id
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.status='applied' OR (p.status='retained' AND EXISTS(
-  SELECT 1 FROM compaction_operation committed
-  WHERE committed.id=p.operation_id AND committed.status='completed'
- ))
+ SELECT 'item:'||item_revision.turn_id,item_revision.source_id,
+  'item-revision:'||item_revision.revision,item_turn.thread_id,item_thread.workspace_id
+ FROM needed_refs need CROSS JOIN current_operation o
+ CROSS JOIN compaction_item_revision item_revision ON item_revision.source_id=need.source_id
+ JOIN turn_item item_source ON item_source.id=item_revision.source_id
+  AND item_source.turn_id=item_revision.turn_id
+ JOIN turn item_turn ON item_turn.id=item_revision.turn_id
+ JOIN thread item_thread ON item_thread.id=item_turn.thread_id
+ WHERE item_revision.present=1 AND 'item:'||item_revision.turn_id=need.source_scope
+  AND 'item-revision:'||item_revision.revision=need.source_version
+  AND item_thread.workspace_id=o.workspace_id
+ UNION ALL
+ SELECT 'event:'||event_revision.turn_id,event_revision.source_id,
+  'event-revision:'||event_revision.revision,event_turn.thread_id,event_thread.workspace_id
+ FROM needed_refs need CROSS JOIN current_operation o
+ CROSS JOIN compaction_event_revision event_revision ON event_revision.source_id=need.source_id
+ JOIN turn_event event_source ON event_source.id=event_revision.source_id
+  AND event_source.turn_id=event_revision.turn_id
+ JOIN turn event_turn ON event_turn.id=event_revision.turn_id
+ JOIN thread event_thread ON event_thread.id=event_turn.thread_id
+ WHERE event_revision.present=1 AND 'event:'||event_revision.turn_id=need.source_scope
+  AND 'event-revision:'||event_revision.revision=need.source_version
+  AND event_thread.workspace_id=o.workspace_id
+ UNION ALL
+ SELECT 'input:'||input_revision.turn_id,input_revision.source_id,
+  'input-revision:'||input_revision.revision,input_turn.thread_id,input_thread.workspace_id
+ FROM needed_refs need CROSS JOIN current_operation o
+ CROSS JOIN compaction_input_revision input_revision ON input_revision.source_id=need.source_id
+ JOIN turn_input input_source ON input_source.id=input_revision.source_id
+  AND input_source.turn_id=input_revision.turn_id
+ JOIN turn input_turn ON input_turn.id=input_revision.turn_id
+ JOIN thread input_thread ON input_thread.id=input_turn.thread_id
+ WHERE input_revision.present=1 AND 'input:'||input_revision.turn_id=need.source_scope
+  AND 'input-revision:'||input_revision.revision=need.source_version
+  AND input_thread.workspace_id=o.workspace_id
+ UNION ALL
+ SELECT 'checkpoint:'||checkpoint_source.owner,checkpoint_source.id,
+  checkpoint_source.identity_sha256,checkpoint_context.thread_id,checkpoint_context.workspace_id
+ FROM needed_refs need CROSS JOIN current_operation o
+ JOIN compaction_checkpoint checkpoint_source ON checkpoint_source.id=need.source_id
+ JOIN compaction_context checkpoint_context ON checkpoint_context.owner=checkpoint_source.owner
+ WHERE 'checkpoint:'||checkpoint_source.owner=need.source_scope
+  AND checkpoint_source.identity_sha256=need.source_version
+  AND checkpoint_context.workspace_id=o.workspace_id
+  AND (checkpoint_source.status='applied' OR (checkpoint_source.status='retained' AND EXISTS(
+   SELECT 1 FROM compaction_operation committed
+   WHERE committed.id=checkpoint_source.operation_id AND committed.status='completed'
+  )))
+ UNION ALL
+ SELECT 'task-basis:'||basis_source.run_id,basis_source.run_id,
+  'task-basis-revision:'||COALESCE(basis_revision.revision,1),
+  basis_source.conversation_thread_id,basis_source.workspace_id
+ FROM needed_refs need CROSS JOIN current_operation o
+ JOIN task_run_conversation_snapshot basis_source ON basis_source.run_id=need.source_id
+ JOIN thread basis_thread ON basis_thread.id=basis_source.conversation_thread_id
+  AND basis_thread.workspace_id=basis_source.workspace_id
+ LEFT JOIN compaction_task_basis_revision basis_revision ON basis_revision.run_id=basis_source.run_id
+ WHERE substr(ltrim(basis_source.history_json),1,1)='['
+  AND 'task-basis:'||basis_source.run_id=need.source_scope
+  AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=need.source_version
+  AND basis_source.workspace_id=o.workspace_id
 ),
-accepted_imports AS (
+accepted_imports AS MATERIALIZED (
  SELECT i.source_scope, i.source_id, i.source_version, i.source_thread
  FROM current_operation o
  JOIN compaction_operation_projection p ON p.operation_id=o.id
@@ -2028,6 +2082,7 @@ accepted_imports AS (
   AND h.identity_sha256=p.identity_sha256 AND h.imports_sha256=p.imports_sha256
   AND h.import_count=p.import_count AND h.next_import=p.import_count
  JOIN compaction_frozen_import i ON i.manifest_id=h.id
+  AND i.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?1)
 ),
 accepted_basis AS (
  SELECT json_extract(f.reference_json,'$.source_thread') AS source_thread,
@@ -2042,6 +2097,7 @@ accepted_basis AS (
   AND h.import_count=p.import_count AND h.next_import=p.import_count
   AND h.next_ordinal=h.message_count
  JOIN compaction_frozen_message f ON f.manifest_id=h.id
+  AND f.manifest_id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?1)
  JOIN json_each(f.reference_json,'$.sources') j
  WHERE json_extract(f.reference_json,'$.inherited')=1
  LIMIT 65537
@@ -2203,6 +2259,36 @@ WHERE
     OR EXISTS (SELECT 1 FROM current_roots r WHERE r.ordinal=m.ordinal))
  )
 LIMIT 1
-"#, [operation.into()])).await?;
+"#;
+
+fn compaction_manifest_sources_current_statement(operation: &str) -> Statement {
+    sqlite_specific_sql(COMPACTION_MANIFEST_SOURCES_CURRENT_SQL, [operation.into()])
+}
+
+/// Shared admission/commit predicate. Read-only preflight avoids provider work
+/// for an invalid grant; commit repeats it under the atomic writer boundary.
+pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+) -> Result<bool> {
+    // A foreign summary may replace accepted raw imports after output capture.
+    // A working-context summary may additionally cover inherited sources that
+    // occur in the SAME bound frozen basis. OWN imports still require their
+    // delivery proofs; a frozen reference alone never launders them. Prove the
+    // entire immutable DAG and repeat the predicate inside the head CAS,
+    // including admitted epoch scopes and live leaf revisions. Epoch values
+    // fence admission, but later work outside this manifest is not staleness.
+    // SQLite's recursive UNION deduplicates DAG nodes. The explicit 65,536
+    // reference bound fails closed (including cycles without any real leaves)
+    // and prevents unbounded traversal while holding database capacity. No
+    // transcript/summary payloads are read. Keep this with the existing SQLite
+    // JSON snapshot predicate rather than doing a racy read/check/write loop.
+    let stale = db
+        .query_one_raw(compaction_manifest_sources_current_statement(operation))
+        .await?;
     Ok(stale.is_none())
 }
+
+#[cfg(test)]
+#[path = "compaction_manifest_source_lookup_tests.rs"]
+mod manifest_source_lookup_tests;
