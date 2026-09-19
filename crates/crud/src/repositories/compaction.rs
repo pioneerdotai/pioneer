@@ -929,6 +929,151 @@ pub(crate) async fn compaction_operation<C: ConnectionTrait>(
 /// Validate a bounded batch of exact identities after preparing its JSON
 /// outside reader capacity. An edited/deleted source or stale summary may
 /// never pass an otherwise-fitting native preflight as current history.
+const COMPACTION_SOURCES_CURRENT_SQL: &str = r#"
+SELECT COUNT(*) AS matched
+FROM json_each(?1) wanted
+WHERE
+  EXISTS (
+    SELECT 1
+    FROM compaction_source_revision context_revision
+    JOIN turn_llm_context context_source
+      ON context_source.id=context_revision.source_id
+     AND context_source.turn_id=context_revision.turn_id
+    JOIN turn context_turn ON context_turn.id=context_revision.turn_id
+    JOIN thread context_thread ON context_thread.id=context_turn.thread_id
+    WHERE context_revision.present=1
+      AND context_thread.workspace_id=?2
+      AND context_turn.thread_id=?3
+      AND 'context:'||context_revision.turn_id=json_extract(wanted.value,'$.scope')
+      AND context_revision.source_id=json_extract(wanted.value,'$.id')
+      AND 'revision:'||context_revision.revision=json_extract(wanted.value,'$.version')
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM compaction_item_revision item_revision
+    JOIN turn_item item_source
+      ON item_source.id=item_revision.source_id
+     AND item_source.turn_id=item_revision.turn_id
+    JOIN turn item_turn ON item_turn.id=item_revision.turn_id
+    JOIN thread item_thread ON item_thread.id=item_turn.thread_id
+    WHERE item_revision.present=1
+      AND item_thread.workspace_id=?2
+      AND item_turn.thread_id=?3
+      AND 'item:'||item_revision.turn_id=json_extract(wanted.value,'$.scope')
+      AND item_revision.source_id=json_extract(wanted.value,'$.id')
+      AND 'item-revision:'||item_revision.revision=json_extract(wanted.value,'$.version')
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM compaction_event_revision event_revision
+    JOIN turn_event event_source
+      ON event_source.id=event_revision.source_id
+     AND event_source.turn_id=event_revision.turn_id
+    JOIN turn event_turn ON event_turn.id=event_revision.turn_id
+    JOIN thread event_thread ON event_thread.id=event_turn.thread_id
+    WHERE event_revision.present=1
+      AND event_thread.workspace_id=?2
+      AND event_turn.thread_id=?3
+      AND 'event:'||event_revision.turn_id=json_extract(wanted.value,'$.scope')
+      AND event_revision.source_id=json_extract(wanted.value,'$.id')
+      AND 'event-revision:'||event_revision.revision=json_extract(wanted.value,'$.version')
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM compaction_input_revision input_revision
+    JOIN turn_input input_source
+      ON input_source.id=input_revision.source_id
+     AND input_source.turn_id=input_revision.turn_id
+    JOIN turn input_turn ON input_turn.id=input_revision.turn_id
+    JOIN thread input_thread ON input_thread.id=input_turn.thread_id
+    WHERE input_revision.present=1
+      AND input_thread.workspace_id=?2
+      AND input_turn.thread_id=?3
+      AND 'input:'||input_revision.turn_id=json_extract(wanted.value,'$.scope')
+      AND input_revision.source_id=json_extract(wanted.value,'$.id')
+      AND 'input-revision:'||input_revision.revision=json_extract(wanted.value,'$.version')
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM compaction_checkpoint live_checkpoint
+    JOIN compaction_context live_context ON live_context.owner=live_checkpoint.owner
+    LEFT JOIN compaction_projection_epoch live_epoch ON live_epoch.thread_id=live_context.thread_id
+    WHERE (
+        live_checkpoint.status='applied'
+        OR (
+          live_checkpoint.status='retained'
+          AND EXISTS (
+            SELECT 1
+            FROM compaction_operation live_operation
+            WHERE live_operation.id=live_checkpoint.operation_id
+              AND live_operation.status='completed'
+          )
+        )
+      )
+      AND live_checkpoint.projection_version=COALESCE(live_epoch.version,0)
+      AND live_context.workspace_id=?2
+      AND live_context.thread_id=?3
+      AND 'checkpoint:'||live_checkpoint.owner=json_extract(wanted.value,'$.scope')
+      AND live_checkpoint.id=json_extract(wanted.value,'$.id')
+      AND live_checkpoint.identity_sha256=json_extract(wanted.value,'$.version')
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM task_run_conversation_snapshot basis
+    JOIN thread basis_thread
+      ON basis_thread.id=basis.conversation_thread_id
+     AND basis_thread.workspace_id=basis.workspace_id
+    LEFT JOIN compaction_task_basis_revision basis_revision
+      ON basis_revision.run_id=basis.run_id
+    WHERE substr(ltrim(basis.history_json),1,1)='['
+      AND basis.workspace_id=?2
+      AND basis.conversation_thread_id=?3
+      AND 'task-basis:'||basis.run_id=json_extract(wanted.value,'$.scope')
+      AND basis.run_id=json_extract(wanted.value,'$.id')
+      AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=json_extract(wanted.value,'$.version')
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM compaction_checkpoint immutable_checkpoint
+    JOIN compaction_context immutable_context ON immutable_context.owner=immutable_checkpoint.owner
+    WHERE immutable_context.workspace_id=?4
+      AND immutable_context.thread_id=?5
+      AND 'checkpoint:'||immutable_checkpoint.owner=json_extract(wanted.value,'$.scope')
+      AND immutable_checkpoint.id=json_extract(wanted.value,'$.id')
+      AND immutable_checkpoint.identity_sha256=json_extract(wanted.value,'$.version')
+      AND immutable_checkpoint.format_version=1
+      AND (
+        immutable_checkpoint.status='applied'
+        OR (
+          immutable_checkpoint.status='retained'
+          AND EXISTS (
+            SELECT 1
+            FROM compaction_operation immutable_operation
+            WHERE immutable_operation.id=immutable_checkpoint.operation_id
+              AND immutable_operation.status='completed'
+          )
+        )
+      )
+  )
+"#;
+
+fn compaction_sources_current_statement(
+    payload: String,
+    workspace: &str,
+    thread: &str,
+) -> Statement {
+    sqlite_specific_sql(
+        COMPACTION_SOURCES_CURRENT_SQL,
+        [
+            payload.into(),
+            workspace.into(),
+            thread.into(),
+            workspace.into(),
+            thread.into(),
+        ],
+    )
+}
+
 pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
@@ -947,9 +1092,12 @@ pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
     // A checkpoint identity survives unrelated appends; callers expand and
     // validate every DAG leaf immediately after this bounded identity batch.
     // Its publication epoch is not a lifetime for the immutable checkpoint.
-    let row = MatchedSourceCount::find_by_statement(sqlite_specific_sql("SELECT COUNT(*) AS matched FROM json_each(?) wanted WHERE EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.workspace_id=? AND s.thread_id=? AND s.source_scope=json_extract(wanted.value,'$.scope') AND s.source_id=json_extract(wanted.value,'$.id') AND s.source_version=json_extract(wanted.value,'$.version') UNION ALL SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE c.workspace_id=? AND c.thread_id=? AND 'checkpoint:'||p.owner=json_extract(wanted.value,'$.scope') AND p.id=json_extract(wanted.value,'$.id') AND p.identity_sha256=json_extract(wanted.value,'$.version') AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS(SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed'))))", [payload.into(),workspace.into(),thread.into(),workspace.into(),thread.into()]))
+    let row = MatchedSourceCount::find_by_statement(compaction_sources_current_statement(
+        payload, workspace, thread,
+    ))
     .one(db)
-    .await?.ok_or_else(|| anyhow::anyhow!("source validation missing"))?;
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("source validation missing"))?;
     Ok(row.matched == sources.len() as i64)
 }
 
@@ -1929,6 +2077,151 @@ fn exact_canonical_revision(reference: &SourceRef, kind: CanonicalSource) -> Res
     Ok(revision)
 }
 
+macro_rules! non_checkpoint_graph_source_exists {
+    ($workspace:literal) => {
+        concat!(
+            r#"(
+    EXISTS (
+      SELECT 1
+      FROM compaction_source_revision context_revision
+      JOIN turn_llm_context context_source
+        ON context_source.id=context_revision.source_id
+       AND context_source.turn_id=context_revision.turn_id
+      JOIN turn context_turn ON context_turn.id=context_revision.turn_id
+      JOIN thread context_thread ON context_thread.id=context_turn.thread_id
+      WHERE context_revision.present=1
+        AND context_thread.workspace_id="#,
+            $workspace,
+            r#"
+        AND 'context:'||context_revision.turn_id=g.source_scope
+        AND context_revision.source_id=g.source_id
+        AND 'revision:'||context_revision.revision=g.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_item_revision item_revision
+      JOIN turn_item item_source
+        ON item_source.id=item_revision.source_id
+       AND item_source.turn_id=item_revision.turn_id
+      JOIN turn item_turn ON item_turn.id=item_revision.turn_id
+      JOIN thread item_thread ON item_thread.id=item_turn.thread_id
+      WHERE item_revision.present=1
+        AND item_thread.workspace_id="#,
+            $workspace,
+            r#"
+        AND 'item:'||item_revision.turn_id=g.source_scope
+        AND item_revision.source_id=g.source_id
+        AND 'item-revision:'||item_revision.revision=g.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_event_revision event_revision
+      JOIN turn_event event_source
+        ON event_source.id=event_revision.source_id
+       AND event_source.turn_id=event_revision.turn_id
+      JOIN turn event_turn ON event_turn.id=event_revision.turn_id
+      JOIN thread event_thread ON event_thread.id=event_turn.thread_id
+      WHERE event_revision.present=1
+        AND event_thread.workspace_id="#,
+            $workspace,
+            r#"
+        AND 'event:'||event_revision.turn_id=g.source_scope
+        AND event_revision.source_id=g.source_id
+        AND 'event-revision:'||event_revision.revision=g.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM compaction_input_revision input_revision
+      JOIN turn_input input_source
+        ON input_source.id=input_revision.source_id
+       AND input_source.turn_id=input_revision.turn_id
+      JOIN turn input_turn ON input_turn.id=input_revision.turn_id
+      JOIN thread input_thread ON input_thread.id=input_turn.thread_id
+      WHERE input_revision.present=1
+        AND input_thread.workspace_id="#,
+            $workspace,
+            r#"
+        AND 'input:'||input_revision.turn_id=g.source_scope
+        AND input_revision.source_id=g.source_id
+        AND 'input-revision:'||input_revision.revision=g.source_version
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM task_run_conversation_snapshot basis
+      JOIN thread basis_thread
+        ON basis_thread.id=basis.conversation_thread_id
+       AND basis_thread.workspace_id=basis.workspace_id
+      LEFT JOIN compaction_task_basis_revision basis_revision
+        ON basis_revision.run_id=basis.run_id
+      WHERE substr(ltrim(basis.history_json),1,1)='['
+        AND basis.workspace_id="#,
+            $workspace,
+            r#"
+        AND 'task-basis:'||basis.run_id=g.source_scope
+        AND basis.run_id=g.source_id
+        AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=g.source_version
+    )
+  )"#,
+        )
+    };
+}
+
+const COMPACTION_REFERENCE_CHECKPOINT_PAYLOAD_SQL: &str = concat!(
+    r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
+ SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
+ FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+ WHERE p.id=?1 AND 'checkpoint:'||p.owner=?2 AND p.identity_sha256=?3
+  AND p.format_version=1 AND c.workspace_id=?4 AND c.thread_id=?5
+  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+ UNION
+ SELECT v.source_scope,v.source_id,v.source_version
+ FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
+ WHERE g.source_scope LIKE 'checkpoint:%'
+ UNION
+ SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
+ FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
+ LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
+ WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
+ LIMIT 65537
+)
+SELECT 1 AS revision,root.summary AS fragment,length(root.summary) AS characters
+FROM compaction_checkpoint root
+WHERE root.id=?6 AND (SELECT COUNT(*) FROM graph)<65537
+ AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
+ AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
+  (g.source_scope NOT LIKE 'checkpoint:%' AND "#,
+    non_checkpoint_graph_source_exists!("?7"),
+    r#") OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
+   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
+    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?8
+    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+  ))
+ )) LIMIT 1"#,
+);
+
+fn compaction_reference_checkpoint_payload_statement(
+    workspace: &str,
+    thread: &str,
+    reference: &SourceRef,
+) -> Statement {
+    sqlite_specific_sql(
+        COMPACTION_REFERENCE_CHECKPOINT_PAYLOAD_SQL,
+        [
+            reference.id.clone().into(),
+            reference.scope.clone().into(),
+            reference.version.clone().into(),
+            workspace.into(),
+            thread.into(),
+            reference.id.clone().into(),
+            workspace.into(),
+            workspace.into(),
+        ],
+    )
+}
+
 pub(crate) async fn compaction_reference_payload(
     store: &CrudStore,
     workspace: &str,
@@ -1987,48 +2280,11 @@ pub(crate) async fn compaction_reference_payload(
             .await?);
     }
     if reference.scope.starts_with("checkpoint:") {
-        let row = SourceFragmentRow::find_by_statement(sqlite_specific_sql(
-            r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
-  AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
-  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
- UNION
- SELECT v.source_scope,v.source_id,v.source_version
- FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
- WHERE g.source_scope LIKE 'checkpoint:%'
- UNION
- SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
- FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
- LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
- WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
- LIMIT 65537
-)
-SELECT 1 AS revision,root.summary AS fragment,length(root.summary) AS characters
-FROM compaction_checkpoint root
-WHERE root.id=? AND (SELECT COUNT(*) FROM graph)<65537
- AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
- AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_live_sources s
-   WHERE s.workspace_id=? AND s.source_scope=g.source_scope
-    AND s.source_id=g.source_id AND s.source_version=g.source_version
-  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
-    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
-  ))
- )) LIMIT 1"#,
-            [
-                reference.id.clone().into(), reference.scope.clone().into(),
-                reference.version.clone().into(), workspace.into(), thread.into(),
-                reference.id.clone().into(), workspace.into(), workspace.into(),
-            ],
-        )).one(&store.connection).await?;
+        let row = SourceFragmentRow::find_by_statement(
+            compaction_reference_checkpoint_payload_statement(workspace, thread, reference),
+        )
+        .one(&store.connection)
+        .await?;
         return Ok(row.map(|row| row.fragment));
     }
     let (prefix, turn) = reference
@@ -2273,17 +2529,11 @@ pub(crate) async fn compaction_projection_version<C: ConnectionTrait>(
         .ok_or_else(|| anyhow::anyhow!("context scope unavailable"))?;
     Ok(u64::try_from(row)?)
 }
-pub(crate) async fn compaction_checkpoint_source<C: ConnectionTrait>(
-    db: &C,
-    workspace: &str,
-    thread: &str,
-    checkpoint: &str,
-) -> Result<Option<SourceRef>> {
-    let row = compaction_live_sources::SourceRow::find_by_statement(sqlite_specific_sql(
-        r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
+const COMPACTION_CHECKPOINT_SOURCE_SQL: &str = concat!(
+    r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
  SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
  FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=? AND c.workspace_id=? AND c.thread_id=?
+ WHERE p.id=?1 AND c.workspace_id=?2 AND c.thread_id=?3
   AND p.format_version=1
   AND (p.status='applied' OR (p.status='retained' AND EXISTS(
    SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
@@ -2300,22 +2550,29 @@ pub(crate) async fn compaction_checkpoint_source<C: ConnectionTrait>(
 )
 SELECT root.source_scope,root.source_id,root.source_version
 FROM graph root
-WHERE root.source_scope LIKE 'checkpoint:%' AND root.source_id=?
+WHERE root.source_scope LIKE 'checkpoint:%' AND root.source_id=?4
  AND (SELECT COUNT(*) FROM graph)<65537
  AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
  AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_live_sources s
-   WHERE s.source_scope=g.source_scope AND s.source_id=g.source_id AND s.source_version=g.source_version
-    AND s.workspace_id=?
-  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
+  (g.source_scope NOT LIKE 'checkpoint:%' AND "#,
+    non_checkpoint_graph_source_exists!("?5"),
+    r#") OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
    SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
    WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
+    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?6
     AND (p.status='applied' OR (p.status='retained' AND EXISTS(
      SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
   ))
  )) LIMIT 1"#,
+);
+
+fn compaction_checkpoint_source_statement(
+    workspace: &str,
+    thread: &str,
+    checkpoint: &str,
+) -> Statement {
+    sqlite_specific_sql(
+        COMPACTION_CHECKPOINT_SOURCE_SQL,
         [
             checkpoint.into(),
             workspace.into(),
@@ -2324,7 +2581,18 @@ WHERE root.source_scope LIKE 'checkpoint:%' AND root.source_id=?
             workspace.into(),
             workspace.into(),
         ],
-    ))
+    )
+}
+
+pub(crate) async fn compaction_checkpoint_source<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    checkpoint: &str,
+) -> Result<Option<SourceRef>> {
+    let row = compaction_live_sources::SourceRow::find_by_statement(
+        compaction_checkpoint_source_statement(workspace, thread, checkpoint),
+    )
     .one(db)
     .await?
     .map(|row| (row.source_scope, row.source_id, row.source_version));
@@ -2823,3 +3091,7 @@ struct MatchedSourceCount {
 }
 
 pub use super::compaction_check_result::{HistoryCheckDiagnostic, HistoryCheckOutcome};
+
+#[cfg(test)]
+#[path = "compaction_source_lookup_tests.rs"]
+mod source_lookup_tests;
