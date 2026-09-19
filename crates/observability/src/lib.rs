@@ -3,7 +3,8 @@
 //! `PIONEER_SENTRY_DSN` is used by non-desktop binaries. `PIONEER_DESKTOP_SENTRY_DSN`
 //! is used by the desktop app. A local `.env` file is loaded automatically before
 //! reading these values. Runtime environment variables take precedence over `.env`
-//! and build-time values with the same names.
+//! and build-time values with the same names. Sentry is initialized only when
+//! `PIONEER_SENTRY_ENVIRONMENT` is exactly `production`.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,6 +115,7 @@ pub const SENTRY_ENVIRONMENT_ENV: &str = "PIONEER_SENTRY_ENVIRONMENT";
 const BUILD_SENTRY_DSN: Option<&str> = option_env!("PIONEER_SENTRY_DSN");
 const BUILD_DESKTOP_SENTRY_DSN: Option<&str> = option_env!("PIONEER_DESKTOP_SENTRY_DSN");
 const BUILD_SENTRY_ENVIRONMENT: Option<&str> = option_env!("PIONEER_SENTRY_ENVIRONMENT");
+const PRODUCTION_SENTRY_ENVIRONMENT: &str = "production";
 
 static LOAD_DOTENV: Once = Once::new();
 // Runtime binaries participate by default. The gateway explicitly closes this
@@ -170,16 +172,19 @@ impl SentryTarget {
 pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
     load_local_dotenv();
 
+    let environment = configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT);
+    if !sentry_enabled_for_environment(environment.as_deref()) {
+        return None;
+    }
+
     let dsn = configured_value(target.dsn_env(), target.build_dsn())?;
     let dsn = dsn.parse::<sentry::types::Dsn>().ok()?;
-    let environment =
-        configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT).map(Cow::Owned);
 
     let mut options = ClientOptions::new()
         .release(format!("pioneer@{}", env!("CARGO_PKG_VERSION")))
         .before_send(|event| telemetry_enabled().then_some(event));
     if let Some(environment) = environment {
-        options = options.environment(environment);
+        options = options.environment(Cow::Owned(environment));
     }
     let guard = sentry::init((dsn, options));
 
@@ -188,6 +193,10 @@ pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
     });
 
     Some(guard)
+}
+
+fn sentry_enabled_for_environment(environment: Option<&str>) -> bool {
+    environment == Some(PRODUCTION_SENTRY_ENVIRONMENT)
 }
 
 pub fn init_tracing(sentry_enabled: bool) {
@@ -618,7 +627,7 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        database_metrics_target_enabled, sentry_event_filter,
+        database_metrics_target_enabled, sentry_enabled_for_environment, sentry_event_filter,
         should_demote_gpui_asset_cache_http_not_found,
         should_demote_rathole_client_control_channel_retry,
         should_demote_rmcp_transport_worker_failure,
@@ -632,6 +641,15 @@ mod tests {
     use tracing_subscriber::layer::{Context as TracingContext, Layer, SubscriberExt};
 
     struct CountingLayer(Arc<AtomicUsize>);
+
+    #[test]
+    fn sentry_is_enabled_only_for_production() {
+        assert!(sentry_enabled_for_environment(Some("production")));
+        assert!(!sentry_enabled_for_environment(Some("development")));
+        assert!(!sentry_enabled_for_environment(Some("staging")));
+        assert!(!sentry_enabled_for_environment(Some("Production")));
+        assert!(!sentry_enabled_for_environment(None));
+    }
 
     impl<S> Layer<S> for CountingLayer
     where
