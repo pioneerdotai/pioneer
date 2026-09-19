@@ -7,6 +7,8 @@ mod compatible;
 mod coordination;
 pub(crate) use coordination::{ContextCompactionCoordinator, ContextWorkPriority};
 mod coverage;
+#[cfg(test)]
+pub(crate) use coverage::{CheckpointGraphResolver, observe_preparation_work};
 mod delivered;
 pub(crate) mod frozen;
 mod history;
@@ -24,6 +26,8 @@ pub(crate) use background_history::{HistoryCheckDeadline, prepare_completed_hist
 #[cfg(test)]
 pub(crate) use history::load_line_history;
 pub(crate) use history::provider_observation;
+#[cfg(test)]
+pub(crate) use native::observe_prepared_transfers;
 pub(crate) use native::{GatewayNativeContextController, native_owner};
 pub(crate) use tool_outcomes::{retained_shell_outcome, retained_tool_policy};
 

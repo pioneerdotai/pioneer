@@ -36,7 +36,258 @@ pub(crate) fn native_owner(workspace: &str, thread: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn prepare_native_projection(
+    store: &CrudStore,
+    providers: &ProviderRegistry,
+    settings: &CompactionSettings,
+    context: &NativeContext,
+    request: ChatRequest,
+    measured: Option<NativeUsageMeasurement>,
+    recovery: bool,
+    observer: Arc<dyn CompactionObserver>,
+    clock: Arc<dyn CompactionClock>,
+    accepted_projection: Option<pioneer_compaction::frozen::FrozenHistoryRef>,
+    processor: Option<&crate::message::MessageProcessor>,
+) -> Result<NativePreparedRequest> {
+    prepare_native_projection_with_prepared(
+        store,
+        providers,
+        settings,
+        context,
+        request,
+        measured,
+        recovery,
+        observer,
+        clock,
+        accepted_projection.map(AcceptedProjection::Descriptor),
+        processor,
+    )
+    .await
+}
+
+struct PreparedProjection {
+    descriptor: pioneer_compaction::frozen::FrozenHistoryRef,
+    accepted_scopes: BTreeSet<String>,
+    source_epochs: std::collections::BTreeMap<String, u64>,
+    checkpoint_graphs: super::coverage::CheckpointGraphResolver,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PreparedTransferState {
+    refreshed: Option<(String, Vec<pioneer_provider::ChatMessage>)>,
+    refreshed_graph_units: Option<usize>,
+    refreshed_graph_identity: Option<usize>,
+    refreshed_work: Option<super::coverage::PreparationWorkSnapshot>,
+    reused_work: Option<super::coverage::PreparationWorkSnapshot>,
+    consumptions: usize,
+    matches: usize,
+    graph_matches: usize,
+}
+
+#[cfg(test)]
+static PREPARED_TRANSFERS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (usize, String, String),
+            std::sync::Weak<std::sync::Mutex<PreparedTransferState>>,
+        >,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) struct PreparedTransferObserver {
+    key: (usize, String, String),
+    state: Arc<std::sync::Mutex<PreparedTransferState>>,
+}
+
+#[cfg(test)]
+impl PreparedTransferObserver {
+    pub(crate) fn consumptions(&self) -> usize {
+        self.state.lock().unwrap().consumptions
+    }
+
+    pub(crate) fn matches(&self) -> usize {
+        self.state.lock().unwrap().matches
+    }
+
+    pub(crate) fn graph_matches(&self) -> usize {
+        self.state.lock().unwrap().graph_matches
+    }
+
+    pub(crate) fn reused_work(&self) -> Option<super::coverage::PreparationWorkSnapshot> {
+        self.state.lock().unwrap().reused_work
+    }
+}
+
+#[cfg(test)]
+impl Drop for PreparedTransferObserver {
+    fn drop(&mut self) {
+        PREPARED_TRANSFERS.lock().unwrap().remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_prepared_transfers(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+) -> PreparedTransferObserver {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+        thread.to_owned(),
+    );
+    let state = Arc::new(std::sync::Mutex::new(PreparedTransferState::default()));
+    let previous = PREPARED_TRANSFERS
+        .lock()
+        .unwrap()
+        .insert(key.clone(), Arc::downgrade(&state));
+    assert!(
+        previous.is_none(),
+        "prepared transfer observer already installed"
+    );
+    PreparedTransferObserver { key, state }
+}
+
+#[cfg(test)]
+fn observe_refreshed_projection(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    request: &ChatRequest,
+    projection: &PreparedProjection,
+) -> Result<()> {
+    if let Some(state) = PREPARED_TRANSFERS
+        .lock()
+        .unwrap()
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace.to_owned(),
+            thread.to_owned(),
+        ))
+        .and_then(std::sync::Weak::upgrade)
+    {
+        let mut state = state.lock().unwrap();
+        state.refreshed = Some((
+            serde_json::to_string(&projection.descriptor)?,
+            request.messages.clone(),
+        ));
+        state.refreshed_graph_units = Some(projection.checkpoint_graphs.cached_graph_units());
+        state.refreshed_graph_identity = Some(projection.checkpoint_graphs.test_identity());
+        state.refreshed_work = super::coverage::preparation_work_snapshot(store, workspace);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn observe_reused_projection(store: &CrudStore, workspace: &str, thread: &str) {
+    let state = PREPARED_TRANSFERS
+        .lock()
+        .unwrap()
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace.to_owned(),
+            thread.to_owned(),
+        ))
+        .and_then(std::sync::Weak::upgrade);
+    let Some(state) = state else {
+        return;
+    };
+    let current = super::coverage::preparation_work_snapshot(store, workspace);
+    let mut state = state.lock().unwrap();
+    state.reused_work = state.refreshed_work.zip(current).map(|(before, after)| {
+        super::coverage::PreparationWorkSnapshot {
+            edge_loads: after.edge_loads.saturating_sub(before.edge_loads),
+            body_loads: after.body_loads.saturating_sub(before.body_loads),
+            closure_builds: after.closure_builds.saturating_sub(before.closure_builds),
+            revalidations: after.revalidations.saturating_sub(before.revalidations),
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn observe_reused_projection(_store: &CrudStore, _workspace: &str, _thread: &str) {}
+
+#[cfg(not(test))]
+fn observe_refreshed_projection(
+    _store: &CrudStore,
+    _workspace: &str,
+    _thread: &str,
+    _request: &ChatRequest,
+    _projection: &PreparedProjection,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn observe_consumed_projection(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    request: &ChatRequest,
+    projection: &PreparedProjection,
+) -> Result<()> {
+    if let Some(state) = PREPARED_TRANSFERS
+        .lock()
+        .unwrap()
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace.to_owned(),
+            thread.to_owned(),
+        ))
+        .and_then(std::sync::Weak::upgrade)
+    {
+        let consumed = (
+            serde_json::to_string(&projection.descriptor)?,
+            request.messages.clone(),
+        );
+        let mut state = state.lock().unwrap();
+        state.consumptions += 1;
+        if state.refreshed.as_ref() == Some(&consumed) {
+            state.matches += 1;
+        }
+        if state.refreshed_graph_identity == Some(projection.checkpoint_graphs.test_identity())
+            && state.refreshed_graph_units
+                == Some(projection.checkpoint_graphs.cached_graph_units())
+            && state.refreshed_graph_units.is_some_and(|units| units > 0)
+        {
+            state.graph_matches += 1;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn observe_consumed_projection(
+    _store: &CrudStore,
+    _workspace: &str,
+    _thread: &str,
+    _request: &ChatRequest,
+    _projection: &PreparedProjection,
+) -> Result<()> {
+    Ok(())
+}
+
+enum AcceptedProjection {
+    #[cfg(test)]
+    Descriptor(pioneer_compaction::frozen::FrozenHistoryRef),
+    Prepared(PreparedProjection),
+}
+
+impl AcceptedProjection {
+    fn descriptor(&self) -> &pioneer_compaction::frozen::FrozenHistoryRef {
+        match self {
+            #[cfg(test)]
+            Self::Descriptor(descriptor) => descriptor,
+            Self::Prepared(prepared) => &prepared.descriptor,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_native_projection_with_prepared(
     store: &CrudStore,
     providers: &ProviderRegistry,
     settings: &CompactionSettings,
@@ -46,7 +297,7 @@ pub(super) async fn prepare_native_projection(
     recovery: bool,
     observer: Arc<dyn CompactionObserver>,
     clock: Arc<dyn CompactionClock>,
-    accepted_projection: Option<pioneer_compaction::frozen::FrozenHistoryRef>,
+    mut accepted_projection: Option<AcceptedProjection>,
     processor: Option<&crate::message::MessageProcessor>,
 ) -> Result<NativePreparedRequest> {
     let workspace = context.workspace_id.as_str();
@@ -57,6 +308,9 @@ pub(super) async fn prepare_native_projection(
     let preparation_deadline = now
         .saturating_add(pioneer_compaction::OPERATION_MILLIS)
         .min(operation_deadline.unwrap_or(u64::MAX));
+    if let Some(AcceptedProjection::Prepared(projection)) = &accepted_projection {
+        observe_consumed_projection(store, workspace, thread, &request, projection)?;
+    }
     // This deadline includes reader/writer queues and admission, not just LLM time.
     let prepared = async {
         let catalog = pioneer_provider::catalog::model_catalog()?;
@@ -81,18 +335,28 @@ pub(super) async fn prepare_native_projection(
         )
         .await?;
         if let Some(projection) = &accepted_projection {
-            authorized.extend(
-                super::frozen::accepted_history_scopes(
-                    &store,
-                    workspace,
-                    thread,
-                    &serde_json::to_string(projection)?,
-                )
-                .await?,
-            );
+            match projection {
+                AcceptedProjection::Prepared(prepared) => {
+                    authorized.extend(prepared.accepted_scopes.iter().cloned());
+                }
+                #[cfg(test)]
+                AcceptedProjection::Descriptor(descriptor) => {
+                    authorized.extend(
+                        super::frozen::accepted_history_scopes(
+                            &store,
+                            workspace,
+                            thread,
+                            &serde_json::to_string(descriptor)?,
+                        )
+                        .await?,
+                    );
+                }
+            }
         }
         let source_projection = if accepted_projection.is_some() {
             accepted_projection
+                .as_ref()
+                .map(|projection| projection.descriptor().clone())
         } else {
             store
                 .compaction_task_basis_snapshot(workspace, thread, &context.turn_id)
@@ -101,44 +365,73 @@ pub(super) async fn prepare_native_projection(
                 .map(|basis| serde_json::from_str(&basis.history_json))
                 .transpose()?
         };
-        let mut source_epochs = std::collections::BTreeMap::from([(thread.to_owned(), version)]);
-        // The parent scope comes from the Gateway's accepted execution snapshot,
-        // not model-provided text or an arbitrary source reference.
-        for parent in authorized.iter().filter(|parent| parent.as_str() != thread) {
-            let parent_epoch = store
-                .compaction_projection_version(workspace, parent)
-                .await?;
-            source_epochs.insert(parent.clone(), parent_epoch);
-        }
-        super::origins::resolve_message_origins(
+        let source_epochs =
+            if let Some(AcceptedProjection::Prepared(prepared)) = &accepted_projection {
+                ensure!(
+                    prepared
+                        .source_epochs
+                        .keys()
+                        .eq(prepared.accepted_scopes.iter()),
+                    "prepared projection scopes lost their captured epochs"
+                );
+                prepared.source_epochs.clone()
+            } else {
+                let mut source_epochs =
+                    std::collections::BTreeMap::from([(thread.to_owned(), version)]);
+                // The parent scope comes from the Gateway's accepted execution snapshot,
+                // not model-provided text or an arbitrary source reference.
+                for parent in authorized.iter().filter(|parent| parent.as_str() != thread) {
+                    let parent_epoch = store
+                        .compaction_projection_version(workspace, parent)
+                        .await?;
+                    source_epochs.insert(parent.clone(), parent_epoch);
+                }
+                source_epochs
+            };
+        let mut checkpoint_graphs = match &mut accepted_projection {
+            Some(AcceptedProjection::Prepared(prepared)) => {
+                std::mem::take(&mut prepared.checkpoint_graphs)
+            }
+            _ => super::coverage::CheckpointGraphResolver::default(),
+        };
+        super::origins::resolve_message_origins_with_resolver(
             &store,
             workspace,
             thread,
             &context.turn_id,
             &authorized,
             &mut request.messages,
+            &mut checkpoint_graphs,
         )
         .await?;
         if let Some(basis) = &basis {
-            super::checkpoint::project_checkpoint(
+            super::checkpoint::project_checkpoint_with_resolver(
                 &store,
-                workspace,
-                thread,
-                &owner,
+                super::checkpoint::ProjectionContext {
+                    workspace,
+                    context_thread: thread,
+                    source_thread: thread,
+                    owner: &owner,
+                    allowed: &authorized,
+                },
                 basis,
-                &authorized,
                 &mut request.messages,
+                &mut checkpoint_graphs,
             )
             .await?;
         }
-        super::checkpoint::project_accepted_checkpoints(
+        super::checkpoint::project_accepted_checkpoints_with_resolver(
             &store,
             workspace,
             thread,
             &authorized,
             &mut request.messages,
+            &mut checkpoint_graphs,
         )
         .await?;
+        if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
+            observe_reused_projection(store, workspace, thread);
+        }
         let limits = catalog.limits(context.provider.name(), &request.model);
         let budget = ModelBudget::new(
             Some(limits.context_window),
@@ -436,6 +729,46 @@ pub(super) async fn prepare_native_projection(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn prepare_native_projection_from_history(
+    store: &CrudStore,
+    providers: &ProviderRegistry,
+    settings: &CompactionSettings,
+    context: &NativeContext,
+    request: ChatRequest,
+    prepared: super::frozen::PreparedHistory,
+    observer: Arc<dyn CompactionObserver>,
+    clock: Arc<dyn CompactionClock>,
+) -> Result<NativePreparedRequest> {
+    let super::frozen::PreparedHistory {
+        descriptor,
+        messages: _,
+        accepted_scopes,
+        source_epochs,
+        checkpoint_graphs,
+    } = prepared;
+    prepare_native_projection_with_prepared(
+        store,
+        providers,
+        settings,
+        context,
+        request,
+        None,
+        false,
+        observer,
+        clock,
+        Some(AcceptedProjection::Prepared(PreparedProjection {
+            descriptor,
+            accepted_scopes,
+            source_epochs,
+            checkpoint_graphs,
+        })),
+        None,
+    )
+    .await
+}
+
 /// Gateway owns settings, durable source projection and service transports.
 /// The agent loop owns this controller's per-turn/background future.
 pub(crate) struct GatewayNativeContextController {
@@ -523,7 +856,7 @@ impl pioneer_agent::compaction::controller::NativeContextController
         context.recovery_deadline_ms = Some(deadline);
         context.cancellation = lease.cancellation();
         let settings = processor.compaction_settings_for_workspace(&context.workspace_id)?;
-        let prepared = prepare_native_projection(
+        let prepared = prepare_native_projection_with_prepared(
             processor.crud_store.as_ref(),
             processor.provider_registry().as_ref(),
             &settings,
@@ -533,7 +866,7 @@ impl pioneer_agent::compaction::controller::NativeContextController
             recovery,
             self.observer(&context),
             clock,
-            Some(projection),
+            Some(AcceptedProjection::Prepared(projection)),
             Some(&processor),
         )
         .await?;
@@ -555,7 +888,7 @@ async fn refresh_native_history(
     store: &CrudStore,
     context: &NativeContext,
     mut request: ChatRequest,
-) -> Result<(ChatRequest, pioneer_compaction::frozen::FrozenHistoryRef)> {
+) -> Result<(ChatRequest, PreparedProjection)> {
     use pioneer_agent::compaction::composition::ScopedHistorySource;
     let prepared = processor
         .capture_current_context_basis_prepared(
@@ -566,15 +899,13 @@ async fn refresh_native_history(
             Some(&context.turn_id),
         )
         .await?;
-    let json = serde_json::to_string(&prepared.descriptor)?;
-    let allowed = super::frozen::accepted_history_scopes(
-        &store,
-        &context.workspace_id,
-        &context.thread_id,
-        &json,
-    )
-    .await?;
-    let mut history = prepared.messages;
+    let super::frozen::PreparedHistory {
+        descriptor,
+        messages: mut history,
+        accepted_scopes: allowed,
+        source_epochs,
+        mut checkpoint_graphs,
+    } = prepared;
     let is_current = |thread: &str, scope: &str| {
         thread == context.thread_id
             && scope.split_once(':').is_some_and(|(kind, turn)| {
@@ -609,13 +940,14 @@ async fn refresh_native_history(
                 id: checkpoint.id.clone(),
                 version: checkpoint.version.clone(),
             };
-            let leaves = super::coverage::checkpoint_leaves(
-                &store,
-                &context.workspace_id,
-                &allowed,
-                &source,
-            )
-            .await?;
+            let leaves = checkpoint_graphs
+                .resolve(&store, &context.workspace_id, Some(&allowed), &source)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                })?
+                .leaves
+                .clone();
             if !leaves
                 .iter()
                 .any(|leaf| is_current(&leaf.thread, &leaf.source.scope))
@@ -668,7 +1000,20 @@ async fn refresh_native_history(
         }
     }
     request.messages = history;
-    Ok((request, serde_json::from_str(&json)?))
+    let projection = PreparedProjection {
+        descriptor,
+        accepted_scopes: allowed,
+        source_epochs,
+        checkpoint_graphs,
+    };
+    observe_refreshed_projection(
+        store,
+        &context.workspace_id,
+        &context.thread_id,
+        &request,
+        &projection,
+    )?;
+    Ok((request, projection))
 }
 
 /// Completed canonical history replaces conversational messages, while the

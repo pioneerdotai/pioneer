@@ -3016,14 +3016,121 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .await
         .unwrap()
         .unwrap();
-    let leaves = super::coverage::checkpoint_leaves(
-        &f.store,
-        "ws",
-        &std::collections::BTreeSet::from(["thread".into()]),
-        &checkpoint_ref,
-    )
-    .await
-    .unwrap();
+    let preparation_work = super::coverage::observe_preparation_work(&f.store, "ws");
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    let first_graph = resolver
+        .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_edge_loads = preparation_work.edge_loads();
+    let first_closure_builds = preparation_work.closure_builds();
+    assert!(first_edge_loads > 0);
+    assert_eq!(first_closure_builds, 1);
+    let first_projection = resolver
+        .projection_metadata(&f.store, "ws", &first_graph)
+        .await
+        .unwrap();
+    let first_body = resolver
+        .projection_body(&f.store, "ws", &checkpoint_ref)
+        .await
+        .unwrap();
+    let first_body_loads = preparation_work.body_loads();
+    assert_eq!(first_body.id, checkpoint_ref.id);
+    assert_eq!(
+        first_projection.coverage_domain,
+        pioneer_compaction::CoverageDomain::OwnContribution
+    );
+    assert!(first_body_loads > 0);
+    assert!(resolver.cached_payload_bytes() > 0);
+    let repeated_graph = resolver
+        .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_graph.leaves, repeated_graph.leaves);
+    assert_eq!(
+        preparation_work.edge_loads(),
+        first_edge_loads,
+        "one preparation reloaded immutable checkpoint edges"
+    );
+    assert_eq!(preparation_work.closure_builds(), first_closure_builds);
+    assert!(preparation_work.revalidations() > 0);
+    let repeated_projection = resolver
+        .projection_metadata(&f.store, "ws", &repeated_graph)
+        .await
+        .unwrap();
+    let repeated_body = resolver
+        .projection_body(&f.store, "ws", &checkpoint_ref)
+        .await
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first_body, &repeated_body));
+    assert_eq!(
+        repeated_projection.coverage_domain,
+        first_projection.coverage_domain
+    );
+    assert_eq!(
+        preparation_work.body_loads(),
+        first_body_loads,
+        "one preparation reloaded checkpoint bodies and coverage"
+    );
+    assert!(
+        resolver
+            .resolve(
+                &f.store,
+                "ws",
+                Some(&std::collections::BTreeSet::from([
+                    "other-thread".to_owned()
+                ])),
+                &checkpoint_ref,
+            )
+            .await
+            .is_err(),
+        "prepared graph metadata became authority for a narrower scope"
+    );
+    assert!(
+        resolver
+            .resolve(&f.store, "other-workspace", Some(&allowed), &checkpoint_ref)
+            .await
+            .unwrap()
+            .is_none(),
+        "prepared graph metadata crossed its workspace boundary"
+    );
+    let mut wrong_scope = checkpoint_ref.clone();
+    wrong_scope.scope = "checkpoint:other-owner".into();
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &wrong_scope)
+            .await
+            .unwrap()
+            .is_none(),
+        "an equal checkpoint id in another scope reused prepared metadata"
+    );
+    let mut stale_identity = checkpoint_ref.clone();
+    stale_identity.version.push_str("-stale");
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &stale_identity)
+            .await
+            .unwrap()
+            .is_none(),
+        "an equal checkpoint id with another version reused prepared metadata"
+    );
+    let mut next_preparation = super::coverage::CheckpointGraphResolver::default();
+    next_preparation
+        .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        preparation_work.edge_loads() > first_edge_loads
+            && preparation_work.closure_builds() > first_closure_builds,
+        "an independent preparation retained the previous request's graph"
+    );
+    let leaves = super::coverage::checkpoint_leaves(&f.store, "ws", &allowed, &checkpoint_ref)
+        .await
+        .unwrap();
     assert_eq!(leaves.len(), 1);
     assert_eq!(leaves.first().unwrap().thread, "thread");
     assert!(
@@ -3124,16 +3231,102 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .contains("selected history boundary")
     );
     // A versioned origin cannot silently pass the cheap fitting path after edit.
-    let id = &raw_request.messages[0].provenance.as_ref().unwrap().sources[0].id;
+    let edited_source = &raw_request.messages[0].provenance.as_ref().unwrap().sources[0];
+    let edited_source = SourceRef {
+        scope: edited_source.scope.clone(),
+        id: edited_source.id.clone(),
+        version: edited_source.version.clone(),
+    };
+    let original_revision: i64 = edited_source
+        .version
+        .strip_prefix("event-revision:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let original_payload =
+        super::history::reference_payload(&f.store, "ws", "thread", &edited_source)
+            .await
+            .unwrap();
+    let cold_body = super::coverage::pause_body_load(&f.store, "ws", &checkpoint_ref.id);
+    let projection_store = f.store.clone();
+    let projection_head = checkpoint_ref.id.clone();
+    let projection_owner = super::native::native_owner("ws", "thread");
+    let original_messages = raw_request.messages.clone();
+    let projected_messages = original_messages.clone();
+    let projection = tokio::spawn(async move {
+        let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+        let mut messages = projected_messages;
+        let mut resolver = super::coverage::CheckpointGraphResolver::default();
+        let result = super::checkpoint::project_checkpoint_with_resolver(
+            &projection_store,
+            super::checkpoint::ProjectionContext {
+                workspace: "ws",
+                context_thread: "thread",
+                source_thread: "thread",
+                owner: &projection_owner,
+                allowed: &allowed,
+            },
+            &projection_head,
+            &mut messages,
+            &mut resolver,
+        )
+        .await;
+        (result, messages)
+    });
+    cold_body.reached().await;
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload='changed during cold checkpoint body load' WHERE id=?",
+            [edited_source.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    cold_body.release();
+    let (projection_result, messages_after_rejection) = projection.await.unwrap();
+    assert!(
+        projection_result.is_err(),
+        "checkpoint projection accepted a leaf changed during cold body loading"
+    );
+    assert_eq!(
+        messages_after_rejection, original_messages,
+        "failed checkpoint projection modified the original messages"
+    );
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE turn_event SET payload='changed source' WHERE id=?",
-            [id.clone().into()],
+            [edited_source.id.clone().into()],
         ))
         .await
         .unwrap();
+    let changed_source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == edited_source.id)
+        .unwrap()
+        .reference;
+    let changed_revision: i64 = changed_source
+        .version
+        .strip_prefix("event-revision:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(changed_revision > original_revision);
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
+            .await
+            .unwrap()
+            .is_none(),
+        "cached graph metadata hid an edited canonical leaf"
+    );
     let stale = super::test_support::prepare_native_request(
         &f.store,
         &providers,
@@ -3157,7 +3350,369 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .await
         .is_err()
     );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=? WHERE id=?",
+            [original_payload.into(), edited_source.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let restored_source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == edited_source.id)
+        .unwrap()
+        .reference;
+    let restored_revision: i64 = restored_source
+        .version
+        .strip_prefix("event-revision:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(restored_revision > changed_revision);
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
+            .await
+            .unwrap()
+            .is_none(),
+        "restoring equal text must not revive a stale revision"
+    );
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
+}
+
+#[tokio::test]
+async fn prepared_graph_revalidates_other_thread_edit_and_delete_independently() {
+    let f = fixture("current leaf", vec![], true, false).await;
+    f.store.database_connection().execute_unprepared(
+        r#"INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('source-thread','ws','','chat','fixture','fixture','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('source-turn','source-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
+         INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('edit-leaf','source-turn',0,'text','edit leaf','{"type":"text","text":"edit leaf"}',CURRENT_TIMESTAMP),('delete-leaf','source-turn',1,'text','delete leaf','{"type":"text","text":"delete leaf"}',CURRENT_TIMESTAMP)"#
+    ).await.unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut parent_basis =
+        super::history::load_line_history(&f.store, "ws", "source-thread", None, &fence)
+            .await
+            .unwrap();
+    for message in &mut parent_basis {
+        message.provenance.as_mut().unwrap().inherited = true;
+    }
+    let parent_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "source-thread",
+        &std::collections::BTreeSet::from(["source-thread".to_owned()]),
+        &parent_basis,
+    )
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('edit-root-thread','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('edit-root-turn','edit-root-thread','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('edit-root-thread','source-thread','source-thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('edit-root-task','ws','thread','source-thread','source-thread','source-turn','agent','running','Edit root','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('edit-root-run','edit-root-task','edit-root-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('edit-root-run-turn','edit-root-task','edit-root-run','edit-root-thread','edit-root-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('delete-root-thread','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('delete-root-turn','delete-root-thread','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('delete-root-thread','source-thread','source-thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('delete-root-task','ws','thread','source-thread','source-thread','source-turn','agent','running','Delete root','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('delete-root-run','delete-root-task','delete-root-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('delete-root-run-turn','delete-root-task','delete-root-run','delete-root-thread','delete-root-turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    let parent_json = serde_json::to_string(&parent_descriptor).unwrap();
+    for (run, task) in [
+        ("edit-root-run", "edit-root-task"),
+        ("delete-root-run", "delete-root-task"),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES (?,?,'ws','source-thread','source-turn',?,CURRENT_TIMESTAMP)",
+                [run.into(), task.into(), parent_json.clone().into()],
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn publish(
+        fixture: &Fixture,
+        source_id: &str,
+        root_thread: &str,
+        operation_id: &str,
+    ) -> SourceRef {
+        let source = fixture
+            .store
+            .compaction_source_page("ws", "source-thread", "source-turn", PagedSource::Input, 0)
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|entry| entry.reference.id == source_id)
+            .unwrap()
+            .reference;
+        let execution_turn = match root_thread {
+            "edit-root-thread" => "edit-root-turn",
+            "delete-root-thread" => "delete-root-turn",
+            _ => panic!("unexpected cross-thread root"),
+        };
+        let accepted_basis = super::frozen::capture_execution_basis_prepared(
+            &fixture.store,
+            "ws",
+            root_thread,
+            Some(execution_turn),
+            Some(execution_turn),
+            None,
+        )
+        .await
+        .unwrap();
+        let selection = ModelSelection {
+            transport: Transport::Api,
+            instance: "fixture".into(),
+            model: "fixture".into(),
+            effort: None,
+        };
+        let root_epoch = accepted_basis.source_epochs[root_thread];
+        let operation = OperationSnapshot {
+            id: operation_id.into(),
+            owner: super::native::native_owner("ws", root_thread),
+            expected_checkpoint: None,
+            projection_version: root_epoch,
+            source_epochs: accepted_basis.source_epochs.clone(),
+            admission: CompactionSettings::default()
+                .admit(&selection, None, 0)
+                .unwrap(),
+            plan: CompactionPlan {
+                mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+                compact: vec![0],
+                retain: vec![],
+                coverage: vec![source.clone()],
+                fingerprint: format!("{operation_id}-plan"),
+            },
+        };
+        fixture
+            .store
+            .compaction_admit_for_turn("ws", root_thread, &operation, Some(execution_turn))
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_bind_source_projection(operation_id, &accepted_basis.descriptor)
+            .await
+            .unwrap();
+        let budget = ModelBudget::new(Some(4096), None, None);
+        fixture
+            .store
+            .compaction_prepare_runner(operation_id, &budget, 1, 0)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_append_manifest(
+                operation_id,
+                &[ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "source-thread".into(),
+                    source,
+                }],
+            )
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_activate_runner(
+                operation_id,
+                &RunnerState::new(900_000, &budget, 500, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        let summarizer = Arc::new(
+            pioneer_agent::compaction::NativeSummarizer::new(
+                fixture.provider.clone(),
+                selection,
+                budget,
+            )
+            .unwrap(),
+        );
+        let runner = CompactionRunner::new(
+            fixture.store.clone(),
+            "ws".into(),
+            root_thread.into(),
+            operation,
+            summarizer,
+            Arc::new(Target(true)),
+            fixture.observer.clone(),
+            fixture.clock.clone(),
+        );
+        let CompactionExit::Applied(checkpoint_id) =
+            runner.run(CancellationToken::new()).await.unwrap()
+        else {
+            panic!("cross-thread checkpoint did not apply")
+        };
+        fixture
+            .store
+            .compaction_checkpoint_source("ws", root_thread, &checkpoint_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    let edit_root = publish(&f, "edit-leaf", "edit-root-thread", "edit-leaf-operation").await;
+    let delete_root = publish(
+        &f,
+        "delete-leaf",
+        "delete-root-thread",
+        "delete-leaf-operation",
+    )
+    .await;
+    let allowed = std::collections::BTreeSet::from([
+        "edit-root-thread".to_owned(),
+        "delete-root-thread".to_owned(),
+        "source-thread".to_owned(),
+    ]);
+    assert_eq!(
+        f.store
+            .compaction_reference_thread("ws", &edit_root)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("edit-root-thread")
+    );
+    assert_eq!(
+        f.store
+            .compaction_reference_thread("ws", &delete_root)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("delete-root-thread")
+    );
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    for root in [&edit_root, &delete_root] {
+        let graph = resolver
+            .resolve(&f.store, "ws", Some(&allowed), root)
+            .await
+            .unwrap()
+            .expect("cross-thread graph must be valid before mutation");
+        assert_eq!(graph.leaves.len(), 1);
+        assert_eq!(
+            graph.leaves.iter().next().unwrap().thread.as_str(),
+            "source-thread"
+        );
+    }
+    let source_epoch_before_edit = f
+        .store
+        .compaction_projection_version("ws", "source-thread")
+        .await
+        .unwrap();
+    let edit_root_epoch = f
+        .store
+        .compaction_projection_version("ws", "edit-root-thread")
+        .await
+        .unwrap();
+    let delete_root_epoch = f
+        .store
+        .compaction_projection_version("ws", "delete-root-thread")
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            r#"UPDATE turn_input SET text='edited',payload='{"type":"text","text":"edited"}' WHERE id='edit-leaf'"#,
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_projection_version("ws", "source-thread")
+            .await
+            .unwrap()
+            > source_epoch_before_edit
+    );
+    assert_eq!(
+        f.store
+            .compaction_projection_version("ws", "edit-root-thread")
+            .await
+            .unwrap(),
+        edit_root_epoch
+    );
+    assert_eq!(
+        f.store
+            .compaction_projection_version("ws", "delete-root-thread")
+            .await
+            .unwrap(),
+        delete_root_epoch
+    );
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &edit_root)
+            .await
+            .unwrap()
+            .is_none(),
+        "cached graph hid an edited canonical leaf"
+    );
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &delete_root)
+            .await
+            .unwrap()
+            .is_some(),
+        "independent delete graph was not current immediately before delete"
+    );
+    let source_epoch_before_delete = f
+        .store
+        .compaction_projection_version("ws", "source-thread")
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_input WHERE id='delete-leaf'")
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_projection_version("ws", "source-thread")
+            .await
+            .unwrap()
+            > source_epoch_before_delete
+    );
+    assert_eq!(
+        f.store
+            .compaction_projection_version("ws", "edit-root-thread")
+            .await
+            .unwrap(),
+        edit_root_epoch
+    );
+    assert_eq!(
+        f.store
+            .compaction_projection_version("ws", "delete-root-thread")
+            .await
+            .unwrap(),
+        delete_root_epoch
+    );
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &delete_root)
+            .await
+            .unwrap()
+            .is_none(),
+        "cached graph hid deletion of its current canonical leaf"
+    );
 }
 
 #[tokio::test]
@@ -3196,6 +3751,272 @@ async fn compaction_empty_task_policy_never_reads_unselected_parent_payload() {
         super::test_support::capture_line_json(&f.store, "ws", "thread", None)
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn prepared_empty_manifest_keeps_only_manifest_scopes_and_epochs() {
+    let f = fixture("unused", vec![], true, false).await;
+    let build_scopes = std::collections::BTreeSet::from([
+        "thread".to_owned(),
+        "authorized-but-unselected".to_owned(),
+    ]);
+    let prepared = super::frozen::capture_with_imports_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        &build_scopes,
+        &[],
+        &std::collections::BTreeMap::new(),
+        super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    assert!(prepared.messages.is_empty());
+    let descriptor_json = serde_json::to_string(&prepared.descriptor).unwrap();
+    let restored_scopes =
+        super::frozen::accepted_history_scopes(&f.store, "ws", "thread", &descriptor_json)
+            .await
+            .unwrap();
+    assert_eq!(
+        prepared.accepted_scopes,
+        std::collections::BTreeSet::from(["thread".to_owned()])
+    );
+    assert_eq!(prepared.accepted_scopes, restored_scopes);
+    let captured_epochs = std::collections::BTreeMap::from([
+        ("thread".to_owned(), 7_u64),
+        ("authorized-but-unselected".to_owned(), 11_u64),
+    ]);
+    let downstream_epochs =
+        super::frozen::prepared_source_epochs(&prepared.accepted_scopes, &captured_epochs).unwrap();
+    assert_eq!(
+        downstream_epochs,
+        std::collections::BTreeMap::from([("thread".to_owned(), 7_u64)])
+    );
+}
+
+#[tokio::test]
+async fn native_prepared_history_keeps_captured_epoch_until_admission() {
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_protocol::{PersistedActorRef, SandboxMode, UserInput};
+    use pioneer_provider::{ChatMessage, ProviderRegistry};
+
+    let f = fixture("unused synthetic event", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "captured-canonical-history".into(),
+                    text: "captured canonical history ".repeat(4_000),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, mut mutation_turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    mutation_turn.id = "epoch-mutation-turn".into();
+    mutation_turn.reply_to_turn_id = None;
+    f.store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &mutation_turn,
+            &[UserInput::Text {
+                text: "source excluded from prepared context".into(),
+                text_elements: vec![],
+            }],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let mutation_source = f
+        .store
+        .compaction_source_page("ws", "thread", &mutation_turn.id, PagedSource::Input, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .next()
+        .expect("materialized mutation input is missing")
+        .reference;
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let prepared = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        None,
+        Some(&mutation_turn.id),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        prepared
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            > 32_000,
+        "canonical prepared history is too small to require compaction"
+    );
+    assert!(prepared.messages.iter().all(|message| {
+        message.provenance.as_ref().is_none_or(|origin| {
+            origin
+                .sources
+                .iter()
+                .all(|source| source.id != mutation_source.id)
+        })
+    }));
+    let captured_epoch = prepared.source_epochs["thread"];
+    let owner = super::native::native_owner("ws", "thread");
+    let head_before = f.store.compaction_head(&owner).await.unwrap();
+    let operations_before = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "count")
+        .unwrap();
+    let changed_input = UserInput::Text {
+        text: "changed source excluded from prepared context".into(),
+        text_elements: vec![],
+    };
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_input SET text=?,payload=? WHERE id=?",
+            [
+                "changed source excluded from prepared context".into(),
+                serde_json::to_string(&changed_input).unwrap().into(),
+                mutation_source.id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    let current_epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    assert!(current_epoch > captured_epoch);
+    let captured_sources = prepared
+        .messages
+        .iter()
+        .flat_map(|message| message.provenance.iter())
+        .flat_map(|origin| origin.sources.iter())
+        .map(|source| SourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        })
+        .collect::<Vec<_>>();
+    assert!(!captured_sources.is_empty());
+    assert!(
+        f.store
+            .compaction_references_current("ws", "thread", &captured_sources)
+            .await
+            .unwrap(),
+        "unrelated epoch mutation invalidated an exact prepared reference"
+    );
+    let request = ChatRequest {
+        model: "gpt-4".into(),
+        messages: prepared
+            .messages
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ChatMessage::user("Continue")))
+            .collect(),
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let error = super::native::prepare_native_projection_from_history(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        request,
+        prepared,
+        f.observer.clone(),
+        f.clock.clone(),
+    )
+    .await
+    .err()
+    .expect("stale captured epoch unexpectedly reached a successful native preparation");
+    assert!(
+        error
+            .to_string()
+            .contains("source scope or epoch changed before admission"),
+        "native preparation failed before captured epochs reached admission: {error:#}"
+    );
+    let operations_after = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS count FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "count")
+        .unwrap();
+    assert_eq!(operations_after, operations_before);
+    assert_eq!(
+        f.store.compaction_head(&owner).await.unwrap(),
+        head_before,
+        "stale prepared context changed the published head"
     );
 }
 
@@ -3473,6 +4294,21 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         .unwrap();
     assert_eq!(prepared.messages, restored_prepared);
     assert_eq!(prepared.messages, current);
+    let prepared_scopes = super::frozen::accepted_history_scopes(
+        &f.store,
+        "ws",
+        "thread",
+        &serde_json::to_string(&prepared.descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.accepted_scopes, prepared_scopes);
+    assert!(
+        prepared
+            .source_epochs
+            .keys()
+            .eq(prepared.accepted_scopes.iter())
+    );
     // Policy applies to the separately delivered history, and never cuts a
     // canonical tool round into an orphan call or result.
     for mode in [
@@ -3880,7 +4716,108 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         }
     }
     let first = first.unwrap();
-    let head = publish(&f.store, &owner, 100, Some(&first), 40).await;
+    let seventy = publish(&f.store, &owner, 70, Some(&first), 40).await;
+    let eighty_five = publish(&f.store, &owner, 85, Some(&seventy), 70).await;
+    let head = publish(&f.store, &owner, 100, Some(&eighty_five), 85).await;
+    let head_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &head)
+        .await
+        .unwrap()
+        .unwrap();
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let mut prepared_graph = super::coverage::CheckpointGraphResolver::default();
+    prepared_graph
+        .resolve(&f.store, "ws", Some(&allowed), &head_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_checkpoint = f
+        .store
+        .compaction_checkpoint(&first)
+        .await
+        .unwrap()
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET status='failed' WHERE id=?",
+            [first.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        prepared_graph
+            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+            .await
+            .is_err(),
+        "cached graph metadata hid a changed intermediate checkpoint"
+    );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET status='retained' WHERE id=?",
+            [first.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_checkpoint WHERE id=?",
+            [first.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        prepared_graph
+            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+            .await
+            .is_err(),
+        "cached graph metadata hid a deleted intermediate checkpoint"
+    );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET status='running' WHERE id=?",
+            [first_checkpoint.operation_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .compaction_save_candidate(&first_checkpoint, 0)
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET status='retained' WHERE id=?",
+            [first.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET status='completed' WHERE id=?",
+            [first_checkpoint.operation_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        prepared_graph
+            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+            .await
+            .unwrap()
+            .is_some(),
+        "restored intermediate checkpoint did not revalidate cached metadata"
+    );
     let raw =
         super::history::load_task_line_history(&f.store, "ws", "thread", None, &at_sixty.unwrap())
             .await
@@ -3892,20 +4829,80 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .unwrap();
     let raw_n_identity = identities(std::slice::from_ref(raw_n));
     let mut selected = raw.clone();
+    let selection_work = super::coverage::observe_preparation_work(&f.store, "ws");
+    let mut selection_resolver =
+        super::coverage::CheckpointGraphResolver::with_cache_limits(256, 64 * 1024);
     assert_eq!(
-        super::checkpoint::project_compatible_checkpoint(
+        super::checkpoint::project_compatible_checkpoint_with_resolver(
             &f.store,
-            "ws",
-            "thread",
-            &owner,
+            super::checkpoint::ProjectionContext {
+                workspace: "ws",
+                context_thread: "thread",
+                source_thread: "thread",
+                owner: &owner,
+                allowed: &allowed,
+            },
             &head,
-            &std::collections::BTreeSet::from(["thread".to_owned()]),
             &mut selected,
+            &mut selection_resolver,
         )
         .await
         .unwrap(),
         Some(first.clone())
     );
+    assert!(
+        selection_work.closure_builds() >= 4,
+        "head and three older candidates were not evaluated independently"
+    );
+    assert_eq!(
+        selection_work.body_loads(),
+        1,
+        "rejected ancestors loaded summary payload before compatibility was known"
+    );
+    assert!(selection_resolver.cached_graph_units() <= 256);
+    assert!(
+        selection_resolver.cached_graph_roots() < 4,
+        "root closure cache retained every overlapping ancestry"
+    );
+    let selected_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &first)
+        .await
+        .unwrap()
+        .unwrap();
+    let selected_graph = selection_resolver
+        .resolve(&f.store, "ws", Some(&allowed), &selected_source)
+        .await
+        .unwrap()
+        .unwrap();
+    let selected_metadata = selection_resolver
+        .projection_metadata(&f.store, "ws", &selected_graph)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected_metadata.coverage_domain,
+        pioneer_compaction::CoverageDomain::OwnContribution
+    );
+    assert!(selected_metadata.emergency_inputs.is_empty());
+    assert!(selection_resolver.cached_payload_bytes() <= 64 * 1024);
+    let builds_before_miss = selection_work.closure_builds();
+    assert!(
+        selection_resolver
+            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+            .await
+            .unwrap()
+            .is_some(),
+        "evicted optimization data changed compatible graph validity"
+    );
+    assert!(selection_work.closure_builds() > builds_before_miss);
+    let mut merged = super::coverage::CheckpointGraphResolver::with_cache_limits(256, 64 * 1024);
+    merged
+        .resolve(&f.store, "ws", Some(&allowed), &selected_source)
+        .await
+        .unwrap()
+        .unwrap();
+    selection_resolver.merge(merged);
+    assert!(selection_resolver.cached_graph_units() <= 256);
     assert_eq!(selected.len(), 22);
     assert!(selected[0].content.contains("State through 40"));
     assert_eq!(
@@ -3926,7 +4923,6 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         1,
         "new work is retained once while H is replaced by its checkpoint"
     );
-    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
     let replacement_index = raw
         .iter()
         .position(|message| message.content == "work 20")

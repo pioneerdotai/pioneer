@@ -4,6 +4,7 @@ use pioneer_crud::{CrudStore, compaction::PagedSource};
 use pioneer_provider::{ChatMessage, MessageSourceRef};
 use std::collections::BTreeSet;
 
+#[cfg(test)]
 pub(crate) async fn resolve_message_origins(
     store: &CrudStore,
     workspace: &str,
@@ -11,6 +12,28 @@ pub(crate) async fn resolve_message_origins(
     current_turn: &str,
     authorized_threads: &BTreeSet<String>,
     messages: &mut [ChatMessage],
+) -> Result<()> {
+    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
+    resolve_message_origins_with_resolver(
+        store,
+        workspace,
+        current_thread,
+        current_turn,
+        authorized_threads,
+        messages,
+        &mut checkpoint_graphs,
+    )
+    .await
+}
+
+pub(super) async fn resolve_message_origins_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    current_thread: &str,
+    current_turn: &str,
+    authorized_threads: &BTreeSet<String>,
+    messages: &mut [ChatMessage],
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
     for message in messages {
         let Some(origin) = &mut message.provenance else {
@@ -125,17 +148,21 @@ pub(crate) async fn resolve_message_origins(
         }
         for source in &resolved {
             if source.scope.starts_with("checkpoint:") {
-                super::coverage::checkpoint_leaves(
-                    &store,
-                    workspace,
-                    authorized_threads,
-                    &pioneer_compaction::SourceRef {
-                        scope: source.scope.clone(),
-                        id: source.id.clone(),
-                        version: source.version.clone(),
-                    },
-                )
-                .await?;
+                checkpoint_graphs
+                    .resolve(
+                        store,
+                        workspace,
+                        Some(authorized_threads),
+                        &pioneer_compaction::SourceRef {
+                            scope: source.scope.clone(),
+                            id: source.id.clone(),
+                            version: source.version.clone(),
+                        },
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                    })?;
             }
         }
         origin.sources = resolved;

@@ -502,6 +502,10 @@ impl std::fmt::Debug for SqliteWriteExecutor {
 }
 
 impl SqliteWriteExecutor {
+    pub(crate) fn runtime_identity(&self) -> usize {
+        Arc::as_ptr(&self.admission) as usize
+    }
+
     pub fn new(connection: DatabaseConnection) -> Self {
         Self::with_policy_and_observer(
             connection,

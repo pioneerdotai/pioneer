@@ -388,6 +388,13 @@ pub struct SqliteDatabase {
 }
 
 impl SqliteDatabase {
+    /// Stable across scheduling-class clones. Intended for process-local test
+    /// instrumentation; it conveys no database authority or durable identity.
+    #[doc(hidden)]
+    pub fn runtime_identity(&self) -> usize {
+        self.writer.runtime_identity()
+    }
+
     pub fn new(reader: DatabaseConnection, writer: DatabaseConnection) -> Self {
         Self::from_executor(reader, SqliteWriteExecutor::new(writer))
     }

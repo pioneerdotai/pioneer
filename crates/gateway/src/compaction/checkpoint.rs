@@ -13,10 +13,37 @@ impl std::fmt::Display for ProjectionBoundary {
 }
 impl std::error::Error for ProjectionBoundary {}
 
+pub(super) struct ProjectionContext<'a> {
+    pub(super) workspace: &'a str,
+    pub(super) context_thread: &'a str,
+    pub(super) source_thread: &'a str,
+    pub(super) owner: &'a str,
+    pub(super) allowed: &'a BTreeSet<String>,
+}
+
+impl<'a> ProjectionContext<'a> {
+    #[cfg(test)]
+    fn local(
+        workspace: &'a str,
+        thread: &'a str,
+        owner: &'a str,
+        allowed: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            workspace,
+            context_thread: thread,
+            source_thread: thread,
+            owner,
+            allowed,
+        }
+    }
+}
+
 /// Select a whole compatible checkpoint from the captured head's ancestry.
 /// A later summary must never import work past a TaskRun/fork boundary. Failure
 /// to find an exact projection leaves the original selected history intact;
 /// storage errors and malformed coverage remain errors, not a silent fallback.
+#[cfg(test)]
 pub(crate) async fn project_compatible_checkpoint(
     store: &CrudStore,
     workspace: &str,
@@ -26,25 +53,41 @@ pub(crate) async fn project_compatible_checkpoint(
     allowed: &BTreeSet<String>,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<Option<String>> {
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    project_compatible_checkpoint_with_resolver(
+        store,
+        ProjectionContext::local(workspace, thread, owner, allowed),
+        head,
+        messages,
+        &mut resolver,
+    )
+    .await
+}
+
+pub(super) async fn project_compatible_checkpoint_with_resolver(
+    store: &CrudStore,
+    context: ProjectionContext<'_>,
+    head: &str,
+    messages: &mut Vec<ChatMessage>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<Option<String>> {
     let mut candidate = Some(head.to_owned());
     let mut seen = BTreeSet::new();
     while let Some(id) = candidate {
         ensure!(seen.insert(id.clone()), "cyclic checkpoint ancestry");
-        let checkpoint = store
-            .compaction_checkpoint(&id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint ancestry is missing"))?;
+        let checkpoint = resolver
+            .ancestry_edges(store, context.workspace, &id)
+            .await?;
         ensure!(
-            checkpoint.owner == owner,
+            checkpoint.owner == context.owner,
             "checkpoint belongs to another context"
         );
         if store
-            .compaction_checkpoint_source(workspace, thread, &id)
+            .compaction_checkpoint_source(context.workspace, context.source_thread, &id)
             .await?
             .is_some()
         {
-            match project_checkpoint(store, workspace, thread, owner, &id, allowed, messages).await
-            {
+            match project_checkpoint_in_context(store, &context, &id, messages, resolver).await {
                 Ok(()) => return Ok(Some(id)),
                 Err(error) if error.downcast_ref::<ProjectionBoundary>().is_some() => {}
                 Err(error) => return Err(error),
@@ -59,12 +102,33 @@ pub(crate) async fn project_compatible_checkpoint(
 /// immutable output manifests. A pure contribution replaces only accepted OWN
 /// work. A working-context checkpoint may also replace its exact accepted H,
 /// but remains inherited and is never exported as the child's contribution.
+#[cfg(test)]
 pub(crate) async fn project_accepted_checkpoints(
     store: &CrudStore,
     workspace: &str,
     context_thread: &str,
     allowed: &BTreeSet<String>,
     messages: &mut Vec<ChatMessage>,
+) -> Result<()> {
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    project_accepted_checkpoints_with_resolver(
+        store,
+        workspace,
+        context_thread,
+        allowed,
+        messages,
+        &mut resolver,
+    )
+    .await
+}
+
+pub(super) async fn project_accepted_checkpoints_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    context_thread: &str,
+    allowed: &BTreeSet<String>,
+    messages: &mut Vec<ChatMessage>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
     // Discovery follows only source owners that are actually represented in
     // the accepted request. Inherited H may have been frozen before its owner
@@ -94,10 +158,7 @@ pub(crate) async fn project_accepted_checkpoints(
         let mut seen = BTreeSet::new();
         while let Some(id) = candidate {
             ensure!(seen.insert(id.clone()), "cyclic checkpoint ancestry");
-            let edges = store
-                .compaction_checkpoint_edges(&id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("checkpoint ancestry is missing"))?;
+            let edges = resolver.ancestry_edges(store, workspace, &id).await?;
             ensure!(
                 edges.owner == owner,
                 "checkpoint belongs to another context"
@@ -105,19 +166,21 @@ pub(crate) async fn project_accepted_checkpoints(
             if let Some(root) = store
                 .compaction_checkpoint_source(workspace, &source_thread, &id)
                 .await?
-                && let Some(scopes) =
-                    super::coverage::current_checkpoint_scopes(store, workspace, &root).await?
-                && scopes.is_subset(allowed)
+                && let Some(graph) = resolver.resolve(store, workspace, None, &root).await?
+                && graph.scopes.is_subset(allowed)
             {
                 match project_checkpoint_in_context(
                     store,
-                    workspace,
-                    context_thread,
-                    &source_thread,
-                    &owner,
+                    &ProjectionContext {
+                        workspace,
+                        context_thread,
+                        source_thread: &source_thread,
+                        owner: &owner,
+                        allowed,
+                    },
                     &id,
-                    allowed,
                     messages,
+                    resolver,
                 )
                 .await
                 {
@@ -133,100 +196,63 @@ pub(crate) async fn project_accepted_checkpoints(
 }
 
 struct Expanded {
-    checkpoint: Checkpoint,
+    root: SourceRef,
     leaves: BTreeSet<SourceRef>,
     emergency_inputs: BTreeSet<SourceRef>,
     coverage_domain: pioneer_compaction::CoverageDomain,
 }
+
 async fn expand(
     store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    owner: &str,
     head: &str,
-    allowed: &BTreeSet<String>,
+    context: &ProjectionContext<'_>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Expanded> {
     let root = store
-        .compaction_checkpoint_source(workspace, thread, head)
+        .compaction_checkpoint_source(context.workspace, context.source_thread, head)
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint is not a current scoped source"))?;
     ensure!(
-        root.scope == format!("checkpoint:{owner}"),
+        root.scope == format!("checkpoint:{}", context.owner),
         "checkpoint owner mismatch"
     );
     // Discover and validate the complete DAG using metadata before reading any
     // foreign summary. A narrower Task/fork projection tries an older head.
-    let scopes = super::coverage::checkpoint_scopes(store, workspace, &root).await?;
+    let graph = resolver
+        .resolve(store, context.workspace, None, &root)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint coverage source changed or disappeared"))?;
     ensure!(
-        scopes.is_subset(allowed),
+        graph.scopes.is_subset(context.allowed),
         ProjectionBoundary("checkpoint crosses the selected source scope")
     );
-    super::coverage::checkpoint_leaves(store, workspace, allowed, &root).await?;
-    let checkpoint = store
-        .compaction_checkpoint(head)
+    // Recheck every exact source against the allowed context. Cached graph
+    // metadata is not an authorization grant and current status may have
+    // changed since metadata discovery.
+    let graph = resolver
+        .resolve(store, context.workspace, Some(context.allowed), &root)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("checkpoint source is missing"))?;
-    let mut leaves = BTreeSet::new();
-    let mut emergency_inputs = BTreeSet::new();
-    let mut coverage_domain = pioneer_compaction::CoverageDomain::OwnContribution;
-    let mut done = BTreeSet::new();
-    let mut visiting = BTreeSet::new();
-    let mut pending = vec![(head.to_owned(), false)];
-    while let Some((id, exiting)) = pending.pop() {
-        if exiting {
-            visiting.remove(&id);
-            done.insert(id);
-            continue;
-        }
-        if done.contains(&id) {
-            continue;
-        }
-        ensure!(visiting.insert(id.clone()), "cyclic checkpoint coverage");
-        let node = store
-            .compaction_checkpoint(&id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint coverage link is missing"))?;
-        ensure!(
-            node.format_version == pioneer_compaction::FORMAT_VERSION,
-            "checkpoint format mismatch"
-        );
-        let operation = store
-            .compaction_operation(&node.operation_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint operation is missing"))?;
-        let snapshot: OperationSnapshot = serde_json::from_str(&operation.snapshot)?;
-        if snapshot.plan.coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext {
-            coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
-        }
-        let emergency = snapshot.plan.mode == pioneer_compaction::CompactionMode::Emergency;
-        pending.push((id, true));
-        let mut parents = BTreeSet::new();
-        if let Some(previous) = node.previous {
-            parents.insert(previous);
-        }
-        for source in node.coverage {
-            if source.scope.starts_with("checkpoint:") {
-                parents.insert(source.id);
-            } else {
-                if emergency && source.scope.starts_with("input:") {
-                    emergency_inputs.insert(source.clone());
-                }
-                leaves.insert(source);
-            }
-        }
-        pending.extend(parents.into_iter().map(|id| (id, false)));
-    }
+        .ok_or_else(|| anyhow::anyhow!("checkpoint coverage source changed or disappeared"))?;
+    let leaves: BTreeSet<SourceRef> = graph
+        .leaves
+        .iter()
+        .map(|leaf| leaf.source.clone())
+        .collect();
+    let prepared = resolver
+        .projection_metadata(store, context.workspace, &graph)
+        .await?;
     ensure!(!leaves.is_empty(), "checkpoint has no canonical coverage");
     Ok(Expanded {
-        checkpoint,
+        root,
         leaves,
-        emergency_inputs,
-        coverage_domain,
+        emergency_inputs: prepared.emergency_inputs,
+        coverage_domain: prepared.coverage_domain,
     })
 }
 
 /// Request origins have already been resolved and scope/version checked. A
 /// checkpoint that crosses a fork/snapshot boundary cannot be inserted here.
+#[cfg(test)]
 pub(crate) async fn project_checkpoint(
     store: &CrudStore,
     workspace: &str,
@@ -236,32 +262,43 @@ pub(crate) async fn project_checkpoint(
     allowed: &BTreeSet<String>,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
-    project_checkpoint_in_context(
-        store, workspace, thread, thread, owner, head, allowed, messages,
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    project_checkpoint_with_resolver(
+        store,
+        ProjectionContext::local(workspace, thread, owner, allowed),
+        head,
+        messages,
+        &mut resolver,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) async fn project_checkpoint_with_resolver(
+    store: &CrudStore,
+    context: ProjectionContext<'_>,
+    head: &str,
+    messages: &mut Vec<ChatMessage>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<()> {
+    project_checkpoint_in_context(store, &context, head, messages, resolver).await
+}
+
 async fn project_checkpoint_in_context(
     store: &CrudStore,
-    workspace: &str,
-    thread: &str,
-    source_thread: &str,
-    owner: &str,
+    context: &ProjectionContext<'_>,
     head: &str,
-    allowed: &BTreeSet<String>,
     messages: &mut Vec<ChatMessage>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
-    let prefix = format!("checkpoint:{owner}");
+    let prefix = format!("checkpoint:{}", context.owner);
     // A request may already contain this summary alongside covered originals
     // (for example after joining frozen branches). Normalize exact coverage in
     // that case too: the presence of a head reference does not prove that its
     // body is authoritative or that covered source messages were removed.
-    let expanded = expand(store, workspace, source_thread, owner, head, allowed).await?;
+    let expanded = expand(store, head, context, resolver).await?;
     let mut represented = BTreeSet::new();
     let mut leaves_by_message = BTreeMap::new();
-    let mut cached = BTreeMap::<String, BTreeSet<SourceRef>>::new();
+    let mut cached = BTreeMap::<SourceRef, BTreeSet<SourceRef>>::new();
     for (index, message) in messages.iter().enumerate() {
         let Some(origin) = &message.provenance else {
             continue;
@@ -272,10 +309,11 @@ async fn project_checkpoint_in_context(
             .unwrap_or(&origin.thread_id);
         let replaceable = match expanded.coverage_domain {
             pioneer_compaction::CoverageDomain::OwnContribution => {
-                !origin.inherited && context_owner == thread
+                !origin.inherited && context_owner == context.context_thread
             }
             pioneer_compaction::CoverageDomain::WorkingContext => {
-                allowed.contains(&origin.thread_id) && (origin.inherited || context_owner == thread)
+                context.allowed.contains(&origin.thread_id)
+                    && (origin.inherited || context_owner == context.context_thread)
             }
         };
         if !replaceable {
@@ -284,22 +322,31 @@ async fn project_checkpoint_in_context(
         let mut leaves = BTreeSet::new();
         for source in &origin.sources {
             if let Some(source_owner) = source.scope.strip_prefix("checkpoint:") {
-                if !cached.contains_key(&source.id) {
+                let source_ref = SourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                };
+                if !cached.contains_key(&source_ref) {
                     cached.insert(
-                        source.id.clone(),
+                        source_ref.clone(),
                         expand(
                             store,
-                            workspace,
-                            &origin.thread_id,
-                            source_owner,
                             &source.id,
-                            allowed,
+                            &ProjectionContext {
+                                workspace: context.workspace,
+                                context_thread: context.context_thread,
+                                source_thread: &origin.thread_id,
+                                owner: source_owner,
+                                allowed: context.allowed,
+                            },
+                            resolver,
                         )
                         .await?
                         .leaves,
                     );
                 }
-                leaves.extend(cached[&source.id].iter().cloned());
+                leaves.extend(cached[&source_ref].iter().cloned());
             } else {
                 leaves.insert(SourceRef {
                     scope: source.scope.clone(),
@@ -341,8 +388,8 @@ async fn project_checkpoint_in_context(
         "checkpoint has no replaceable source messages"
     );
     let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
-        workspace,
-        thread,
+        context.workspace,
+        context.context_thread,
         messages,
         &vec![0; messages.len()],
     )?;
@@ -354,19 +401,48 @@ async fn project_checkpoint_in_context(
             );
         }
     }
-    let source = store
-        .compaction_checkpoint_source(workspace, source_thread, head)
+    let checkpoint = resolver
+        .projection_body(store, context.workspace, &expanded.root)
+        .await?;
+    // Body loading may yield while a canonical dependency changes. Complete
+    // the final asynchronous validation sequence before applying: revalidate
+    // the exact graph and bind the current root to the identity used for both
+    // graph metadata and the selected body.
+    let graph = resolver
+        .resolve(
+            store,
+            context.workspace,
+            Some(context.allowed),
+            &expanded.root,
+        )
         .await?
         .ok_or_else(|| anyhow::anyhow!("checkpoint was invalidated during projection"))?;
+    ensure!(
+        graph.checkpoints.contains(&expanded.root),
+        "checkpoint root disappeared from its prepared graph"
+    );
+    let source = store
+        .compaction_checkpoint_source(context.workspace, context.source_thread, head)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint was invalidated during projection"))?;
+    ensure!(
+        source == expanded.root,
+        "checkpoint identity changed during projection"
+    );
+    ensure!(
+        checkpoint.id == source.id && checkpoint.identity_sha256 == source.version,
+        "checkpoint body identity changed during projection"
+    );
     let mut summary = ChatMessage::user(format!(
         "Summary of completed work (historical data):\n{}",
-        expanded.checkpoint.summary
+        checkpoint.summary
     ));
     summary.provenance = Some(MessageProvenance {
         logical_turn_id: None,
-        workspace_id: workspace.into(),
-        thread_id: source_thread.into(),
-        context_thread: (source_thread != thread).then(|| thread.into()),
+        workspace_id: context.workspace.into(),
+        thread_id: context.source_thread.into(),
+        context_thread: (context.source_thread != context.context_thread)
+            .then(|| context.context_thread.into()),
         unit_id: prefix,
         sources: vec![MessageSourceRef {
             scope: source.scope,

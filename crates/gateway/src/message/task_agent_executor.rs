@@ -6886,6 +6886,9 @@ mod prepared_snapshot_tests {
         crate::compaction::frozen::PreparedHistory {
             descriptor,
             messages,
+            accepted_scopes: BTreeSet::from(["parent".to_owned()]),
+            source_epochs: Default::default(),
+            checkpoint_graphs: Default::default(),
         }
     }
 

@@ -1134,41 +1134,6 @@ impl MessageProcessor {
         Ok(())
     }
 
-    pub(crate) async fn capture_current_context_basis(
-        &self,
-        store: &pioneer_crud::CrudStore,
-        workspace: &str,
-        thread: &str,
-        turn: &str,
-        excluded_turn: Option<&str>,
-    ) -> Result<String> {
-        let authority =
-            crate::authorization::ExecutionAuthorizationContext::load_for_turn(store, turn).await?;
-        anyhow::ensure!(
-            authority.workspace_id() == workspace,
-            "context authority workspace changed"
-        );
-        let current = self
-            .execution_leases
-            .revalidate_context(
-                store,
-                &authority,
-                authority.continuation_action(),
-                self.current_authorization_revision().await?,
-            )
-            .await?;
-        self.capture_authorized_task_basis(
-            store,
-            current.principal(),
-            workspace,
-            thread,
-            Some(turn),
-            excluded_turn,
-            None,
-        )
-        .await
-    }
-
     pub(crate) async fn capture_current_context_basis_prepared(
         &self,
         store: &pioneer_crud::CrudStore,

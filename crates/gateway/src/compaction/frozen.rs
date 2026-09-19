@@ -13,20 +13,36 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 static STORE_RESTORE_CALLS: std::sync::LazyLock<
     std::sync::Mutex<
-        std::collections::HashMap<(usize, String), std::sync::Weak<std::sync::atomic::AtomicUsize>>,
+        std::collections::HashMap<(usize, String), std::sync::Weak<StoreRestoreState>>,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
+#[derive(Default)]
+struct StoreRestoreState {
+    descriptors: std::sync::Mutex<Vec<FrozenHistoryRef>>,
+}
+
+#[cfg(test)]
 pub(crate) struct StoreRestoreObserver {
     key: (usize, String),
-    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    state: std::sync::Arc<StoreRestoreState>,
 }
 
 #[cfg(test)]
 impl StoreRestoreObserver {
     pub(crate) fn calls(&self) -> usize {
-        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        self.state.descriptors.lock().unwrap().len()
+    }
+
+    pub(crate) fn calls_for(&self, descriptor: &FrozenHistoryRef) -> usize {
+        self.state
+            .descriptors
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|restored| *restored == descriptor)
+            .count()
     }
 }
 
@@ -39,17 +55,20 @@ impl Drop for StoreRestoreObserver {
 
 #[cfg(test)]
 pub(crate) fn observe_store_restores(store: &CrudStore, workspace: &str) -> StoreRestoreObserver {
-    let key = (store as *const CrudStore as usize, workspace.to_owned());
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+    );
+    let state = std::sync::Arc::new(StoreRestoreState::default());
     let previous = STORE_RESTORE_CALLS
         .lock()
         .unwrap()
-        .insert(key.clone(), std::sync::Arc::downgrade(&calls));
+        .insert(key.clone(), std::sync::Arc::downgrade(&state));
     assert!(
         previous.is_none(),
         "store restore observer already installed"
     );
-    StoreRestoreObserver { key, calls }
+    StoreRestoreObserver { key, state }
 }
 
 /// Extend trusted execution scope by the TaskRun's durably accepted parent
@@ -84,9 +103,22 @@ pub(crate) async fn accepted_history_scopes(
     accepted_parent: &str,
     history_json: &str,
 ) -> Result<BTreeSet<String>> {
+    Ok(
+        accepted_history_scopes_prepared(store, workspace, accepted_parent, history_json)
+            .await?
+            .0,
+    )
+}
+
+async fn accepted_history_scopes_prepared(
+    store: &CrudStore,
+    workspace: &str,
+    accepted_parent: &str,
+    history_json: &str,
+) -> Result<(BTreeSet<String>, super::coverage::CheckpointGraphResolver)> {
     let mut allowed = BTreeSet::from([accepted_parent.to_owned()]);
     if history_json.trim_start().starts_with('[') {
-        return Ok(allowed);
+        return Ok((allowed, Default::default()));
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
     ensure!(
@@ -99,6 +131,7 @@ pub(crate) async fn accepted_history_scopes(
     );
     let mut ordinal = 0_u64;
     let mut digest = Sha256::new();
+    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
     while ordinal < descriptor.messages {
         let page = store
             .compaction_frozen_history_page(
@@ -117,9 +150,13 @@ pub(crate) async fn accepted_history_scopes(
             digest_entry(&mut digest, &reference)?;
             for reference in &reference.sources {
                 if reference.scope.starts_with("checkpoint:") {
-                    allowed.extend(
-                        super::coverage::checkpoint_scopes(&store, workspace, reference).await?,
-                    );
+                    let graph = checkpoint_graphs
+                        .resolve(store, workspace, None, reference)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                        })?;
+                    allowed.extend(graph.scopes.iter().cloned());
                 }
             }
             allowed.insert(reference.source_thread);
@@ -137,7 +174,7 @@ pub(crate) async fn accepted_history_scopes(
         hex::encode(digest.finalize()) == descriptor.identity_sha256,
         "accepted Task manifest digest mismatch"
     );
-    Ok(allowed)
+    Ok((allowed, checkpoint_graphs))
 }
 
 /// Hydrate only the explicit own imports admitted with this Task basis. The
@@ -396,6 +433,15 @@ pub(super) async fn capture_execution_basis_with_outputs(
 pub(crate) struct PreparedHistory {
     pub(crate) descriptor: FrozenHistoryRef,
     pub(crate) messages: Vec<ChatMessage>,
+    /// Scopes admitted while the messages and descriptor were prepared. This
+    /// is request-owned context, not a permission token for another request.
+    pub(crate) accepted_scopes: BTreeSet<String>,
+    /// Projection epochs checked at the end of capture. Consumers still
+    /// recheck them at publication/admission boundaries after intervening work.
+    pub(crate) source_epochs: BTreeMap<String, u64>,
+    /// Metadata reuse is bounded by this PreparedHistory's lifetime. Exact
+    /// source status and allowed scopes are revalidated on every traversal.
+    pub(crate) checkpoint_graphs: super::coverage::CheckpointGraphResolver,
 }
 
 pub(crate) async fn capture_execution_basis_prepared(
@@ -427,6 +473,7 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
     policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     outputs: Option<&super::delivered::AuthorizedOutputSet>,
 ) -> Result<PreparedHistory> {
+    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
     if let Some(outputs) = outputs {
         ensure!(
             outputs.workspace == workspace && outputs.destination == thread,
@@ -496,10 +543,15 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
         }
     };
     if let Some(basis) = basis {
-        allowed.extend(
-            accepted_history_scopes(&store, workspace, &basis.parent_thread, &basis.history_json)
-                .await?,
-        );
+        let (basis_scopes, basis_graphs) = accepted_history_scopes_prepared(
+            &store,
+            workspace,
+            &basis.parent_thread,
+            &basis.history_json,
+        )
+        .await?;
+        allowed.extend(basis_scopes);
+        checkpoint_graphs.merge(basis_graphs);
         for source_thread in &allowed {
             if !epochs.contains_key(source_thread) {
                 epochs.insert(
@@ -510,14 +562,27 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 );
             }
         }
-        let mut inherited = crate::turn_runtime_snapshot::restore_history_json(
-            &store,
-            workspace,
-            &allowed,
-            &basis.history_json,
-        )
-        .await?;
-        if basis.history_json.trim_start().starts_with('[') {
+        let legacy_basis = basis.history_json.trim_start().starts_with('[');
+        let mut inherited = if legacy_basis {
+            crate::turn_runtime_snapshot::restore_history_json(
+                &store,
+                workspace,
+                &allowed,
+                &basis.history_json,
+            )
+            .await?
+        } else {
+            let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
+            restore_with_resolver(
+                &store,
+                workspace,
+                &allowed,
+                &descriptor,
+                &mut checkpoint_graphs,
+            )
+            .await?
+        };
+        if legacy_basis {
             let reference = store
                 .compaction_legacy_task_basis_source(workspace, &basis.parent_thread, &basis.run_id)
                 .await?
@@ -564,7 +629,7 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
         .await?;
         // Hydration promotes only explicitly accepted own imports. Preserve
         // that evidence when recapturing the child; provenance alone is not a grant.
-        if !basis.history_json.trim_start().starts_with('[') {
+        if !legacy_basis {
             let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
             let (count, _) = store
                 .compaction_frozen_import_state(
@@ -590,8 +655,16 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 );
             }
         }
-        messages = compose_frozen_basis(&store, workspace, thread, &allowed, &inherited, &messages)
-            .await?;
+        messages = compose_frozen_basis_with_resolver(
+            &store,
+            workspace,
+            thread,
+            &allowed,
+            &inherited,
+            &messages,
+            &mut checkpoint_graphs,
+        )
+        .await?;
     }
     let mut own_outputs = BTreeMap::<ScopedHistorySource, (usize, u64)>::new();
     if !omits_history && let Some(outputs) = outputs {
@@ -605,8 +678,14 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                 "accepted delivery acknowledgement changed"
             );
             allowed.extend(branch.source_threads.iter().cloned());
-            let mut imported =
-                restore(&store, workspace, &allowed, &branch.snapshot.output.history).await?;
+            let mut imported = restore_with_resolver(
+                &store,
+                workspace,
+                &allowed,
+                &branch.snapshot.output.history,
+                &mut checkpoint_graphs,
+            )
+            .await?;
             let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
                 workspace,
                 &branch.snapshot.output.source_thread,
@@ -634,13 +713,17 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
                             })
                             .or_insert((branch_index, *index as u64));
                         if reference.scope.starts_with("checkpoint:") {
-                            for leaf in super::coverage::checkpoint_leaves(
-                                &store, workspace, &allowed, &reference,
-                            )
-                            .await?
-                            {
+                            let graph = checkpoint_graphs
+                                .resolve(&store, workspace, Some(&allowed), &reference)
+                                .await?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "checkpoint coverage source changed or disappeared"
+                                    )
+                                })?;
+                            for leaf in &graph.leaves {
                                 own_outputs
-                                    .entry(leaf)
+                                    .entry(leaf.clone())
                                     .or_insert((branch_index, *index as u64));
                             }
                         }
@@ -661,18 +744,26 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             }
             // The delivered text is the transport copy of this exact output.
             // Denied branches never reach here and retain that disclosed text.
-            messages = remove_delivered_projection(
+            messages = remove_delivered_projection_with_resolver(
                 &store,
                 workspace,
                 thread,
                 &allowed,
                 messages,
                 &branch.acknowledgements,
+                &mut checkpoint_graphs,
             )
             .await?;
-            messages =
-                compose_frozen_basis(&store, workspace, thread, &allowed, &messages, &imported)
-                    .await?;
+            messages = compose_frozen_basis_with_resolver(
+                &store,
+                workspace,
+                thread,
+                &allowed,
+                &messages,
+                &imported,
+                &mut checkpoint_graphs,
+            )
+            .await?;
         }
     }
     let owner = super::native::native_owner(workspace, thread);
@@ -685,14 +776,18 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             )
     }) && let Some(head) = store.compaction_head(&owner).await?
     {
-        super::checkpoint::project_compatible_checkpoint(
+        super::checkpoint::project_compatible_checkpoint_with_resolver(
             &store,
-            workspace,
-            thread,
-            &owner,
+            super::checkpoint::ProjectionContext {
+                workspace,
+                context_thread: thread,
+                source_thread: thread,
+                owner: &owner,
+                allowed: &allowed,
+            },
             &head,
-            &allowed,
             &mut messages,
+            &mut checkpoint_graphs,
         )
         .await?;
     }
@@ -731,31 +826,79 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             }
         }
     }
-    let prepared =
-        capture_with_imports_prepared(&store, workspace, thread, &allowed, &messages, &imports)
-            .await?;
+    let mut prepared = capture_with_imports_prepared(
+        &store,
+        workspace,
+        thread,
+        &allowed,
+        &messages,
+        &imports,
+        checkpoint_graphs,
+    )
+    .await?;
 
-    for (source_thread, expected) in epochs {
+    for (source_thread, expected) in &epochs {
         ensure!(
             store
-                .compaction_projection_version(workspace, &source_thread)
+                .compaction_projection_version(workspace, source_thread)
                 .await?
-                == expected,
+                == *expected,
             "parent history changed while freezing the accepted context"
         );
     }
+    prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
     Ok(prepared)
+}
+
+pub(super) fn prepared_source_epochs(
+    accepted_scopes: &BTreeSet<String>,
+    captured_epochs: &BTreeMap<String, u64>,
+) -> Result<BTreeMap<String, u64>> {
+    accepted_scopes
+        .iter()
+        .map(|source_thread| {
+            captured_epochs
+                .get(source_thread)
+                .copied()
+                .map(|epoch| (source_thread.clone(), epoch))
+                .ok_or_else(|| anyhow::anyhow!("prepared manifest scope lost its source epoch"))
+        })
+        .collect()
 }
 
 /// Remove only identified transport copies. If a checkpoint already covers a
 /// copy, first reconstruct its exact originals; never subtract text from it.
+#[cfg(test)]
 pub(super) async fn remove_delivered_projection(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    allowed: &BTreeSet<String>,
+    messages: Vec<ChatMessage>,
+    acknowledgements: &[SourceRef],
+) -> Result<Vec<ChatMessage>> {
+    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
+    remove_delivered_projection_with_resolver(
+        store,
+        workspace,
+        thread,
+        allowed,
+        messages,
+        acknowledgements,
+        &mut checkpoint_graphs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn remove_delivered_projection_with_resolver(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
     allowed: &BTreeSet<String>,
     mut messages: Vec<ChatMessage>,
     acknowledgements: &[SourceRef],
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
     use pioneer_agent::compaction::composition::ScopedHistorySource;
     let copies = acknowledgements.iter().cloned().collect::<BTreeSet<_>>();
@@ -775,9 +918,14 @@ pub(super) async fn remove_delivered_projection(
         for reference in &origin.sources {
             if reference.scope.starts_with("checkpoint:") {
                 let reference = source(reference);
-                let closure =
-                    super::coverage::checkpoint_leaves(store, workspace, allowed, &reference)
-                        .await?;
+                let closure = checkpoint_graphs
+                    .resolve(store, workspace, Some(allowed), &reference)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                    })?
+                    .leaves
+                    .clone();
                 if !closure.is_disjoint(&affected) {
                     checkpoints.insert(
                         ScopedHistorySource {
@@ -829,6 +977,7 @@ pub(super) async fn remove_delivered_projection(
     Ok(messages)
 }
 
+#[cfg(test)]
 pub(super) async fn compose_frozen_basis(
     store: &CrudStore,
     workspace: &str,
@@ -836,6 +985,29 @@ pub(super) async fn compose_frozen_basis(
     allowed: &BTreeSet<String>,
     inherited: &[ChatMessage],
     own: &[ChatMessage],
+) -> Result<Vec<ChatMessage>> {
+    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
+    compose_frozen_basis_with_resolver(
+        store,
+        workspace,
+        thread,
+        allowed,
+        inherited,
+        own,
+        &mut checkpoint_graphs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compose_frozen_basis_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    allowed: &BTreeSet<String>,
+    inherited: &[ChatMessage],
+    own: &[ChatMessage],
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
     use pioneer_agent::compaction::composition::{
         AcceptedContextBranch, ScopedHistorySource, compose_context,
@@ -853,11 +1025,13 @@ pub(super) async fn compose_frozen_basis(
                     source: source.clone(),
                 };
                 if !checkpoints.contains_key(&key) {
-                    checkpoints.insert(
-                        key,
-                        super::coverage::checkpoint_leaves(store, workspace, allowed, &source)
-                            .await?,
-                    );
+                    let graph = checkpoint_graphs
+                        .resolve(store, workspace, Some(allowed), &source)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                        })?;
+                    checkpoints.insert(key, graph.leaves.clone());
                 }
             }
         }
@@ -1013,18 +1187,20 @@ pub(crate) async fn capture(
         allowed_threads,
         messages,
         &BTreeMap::new(),
+        super::coverage::CheckpointGraphResolver::default(),
     )
     .await?
     .descriptor)
 }
 
-async fn capture_with_imports_prepared(
+pub(super) async fn capture_with_imports_prepared(
     store: &CrudStore,
     workspace: &str,
     owner_thread: &str,
     allowed_threads: &BTreeSet<String>,
     messages: &[ChatMessage],
     imports: &BTreeMap<ScopedHistorySource, PreparedFrozenImport>,
+    mut checkpoint_graphs: super::coverage::CheckpointGraphResolver,
 ) -> Result<PreparedHistory> {
     ensure!(
         allowed_threads.contains(owner_thread),
@@ -1090,9 +1266,25 @@ async fn capture_with_imports_prepared(
     }
     let mut verified_messages = Vec::with_capacity(messages.len());
     for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-        verified_messages
-            .extend(restore_entries_page(store, workspace, allowed_threads, page).await?);
+        verified_messages.extend(
+            restore_entries_page(
+                store,
+                workspace,
+                allowed_threads,
+                page,
+                &mut checkpoint_graphs,
+            )
+            .await?,
+        );
     }
+    let accepted_scopes = prepared_manifest_scopes(
+        store,
+        workspace,
+        owner_thread,
+        &references,
+        &mut checkpoint_graphs,
+    )
+    .await?;
     let mut accepted = Vec::new();
     for (ordinal, reference) in references.iter().enumerate() {
         for source in &reference.sources {
@@ -1135,12 +1327,25 @@ async fn capture_with_imports_prepared(
             return Ok(PreparedHistory {
                 descriptor: existing,
                 messages: verified_messages,
+                accepted_scopes,
+                source_epochs: BTreeMap::new(),
+                checkpoint_graphs,
             });
         }
-        let messages = restore(store, workspace, allowed_threads, &existing).await?;
+        let messages = restore_with_resolver(
+            store,
+            workspace,
+            allowed_threads,
+            &existing,
+            &mut checkpoint_graphs,
+        )
+        .await?;
         return Ok(PreparedHistory {
             descriptor: existing,
             messages,
+            accepted_scopes,
+            source_epochs: BTreeMap::new(),
+            checkpoint_graphs,
         });
     }
     store
@@ -1229,7 +1434,36 @@ async fn capture_with_imports_prepared(
     Ok(PreparedHistory {
         descriptor,
         messages: verified_messages,
+        accepted_scopes,
+        source_epochs: BTreeMap::new(),
+        checkpoint_graphs,
     })
+}
+
+async fn prepared_manifest_scopes(
+    store: &CrudStore,
+    workspace: &str,
+    owner_thread: &str,
+    references: &[FrozenMessageRef],
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<BTreeSet<String>> {
+    let mut scopes = BTreeSet::from([owner_thread.to_owned()]);
+    for reference in references {
+        scopes.insert(reference.source_thread.clone());
+        scopes.extend(reference.context_thread.iter().cloned());
+        for source in &reference.sources {
+            if source.scope.starts_with("checkpoint:") {
+                let graph = checkpoint_graphs
+                    .resolve(store, workspace, None, source)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                    })?;
+                scopes.extend(graph.scopes.iter().cloned());
+            }
+        }
+    }
+    Ok(scopes)
 }
 
 pub(crate) async fn restore(
@@ -1238,14 +1472,35 @@ pub(crate) async fn restore(
     allowed_threads: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ChatMessage>> {
+    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
+    restore_with_resolver(
+        store,
+        workspace,
+        allowed_threads,
+        descriptor,
+        &mut checkpoint_graphs,
+    )
+    .await
+}
+
+async fn restore_with_resolver(
+    store: &CrudStore,
+    workspace: &str,
+    allowed_threads: &BTreeSet<String>,
+    descriptor: &FrozenHistoryRef,
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<Vec<ChatMessage>> {
     #[cfg(test)]
-    if let Some(calls) = STORE_RESTORE_CALLS
+    if let Some(state) = STORE_RESTORE_CALLS
         .lock()
         .unwrap()
-        .get(&(store as *const CrudStore as usize, workspace.to_owned()))
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace.to_owned(),
+        ))
         .and_then(std::sync::Weak::upgrade)
     {
-        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.descriptors.lock().unwrap().push(descriptor.clone());
     }
     let owner = store
         .compaction_frozen_history_owner(workspace, descriptor)
@@ -1282,7 +1537,10 @@ pub(crate) async fn restore(
             );
             digest_entry(&mut digest, &reference)?;
         }
-        result.extend(restore_entries_page(store, workspace, allowed_threads, &page).await?);
+        result.extend(
+            restore_entries_page(store, workspace, allowed_threads, &page, checkpoint_graphs)
+                .await?,
+        );
     }
     ensure!(
         result.len() as u64 == descriptor.messages
@@ -1298,11 +1556,17 @@ async fn restore_entry(
     workspace: &str,
     allowed_threads: &BTreeSet<String>,
     reference: &FrozenMessageRef,
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<ChatMessage> {
     reference.validate()?;
     for source in &reference.sources {
         if source.scope.starts_with("checkpoint:") {
-            super::coverage::checkpoint_leaves(store, workspace, allowed_threads, source).await?;
+            checkpoint_graphs
+                .resolve(store, workspace, Some(allowed_threads), source)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("checkpoint coverage source changed or disappeared")
+                })?;
         }
     }
     if reference
@@ -1363,6 +1627,7 @@ async fn restore_entries_page(
     workspace: &str,
     allowed_threads: &BTreeSet<String>,
     references: &[FrozenMessageRef],
+    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
     let mut result = Vec::with_capacity(references.len());
     let mut index = 0usize;
@@ -1387,7 +1652,16 @@ async fn restore_entries_page(
                 &sources,
             )
             .await?;
-            result.push(restore_entry(store, workspace, allowed_threads, reference).await?);
+            result.push(
+                restore_entry(
+                    store,
+                    workspace,
+                    allowed_threads,
+                    reference,
+                    checkpoint_graphs,
+                )
+                .await?,
+            );
             index += 1;
             continue;
         }

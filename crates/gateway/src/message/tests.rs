@@ -64389,8 +64389,117 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('native-foreground-prior','native-foreground','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
          INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('native-foreground-prior-input','native-foreground-prior',0,'text','earlier canonical history','{\"type\":\"text\",\"text\":\"earlier canonical history\"}',CURRENT_TIMESTAMP)",
     ).await.unwrap();
+    let source = store
+        .compaction_source_page(
+            &workspace,
+            "native-foreground",
+            "native-foreground-prior",
+            pioneer_crud::compaction::PagedSource::Input,
+            0,
+        )
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == "native-foreground-prior-input")
+        .unwrap();
+    let assertion = pioneer_crud::compaction::SourceAssertion {
+        revision: Some(
+            source
+                .reference
+                .version
+                .strip_prefix("input-revision:")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ),
+        kind: pioneer_crud::compaction::CanonicalSource::Input,
+        turn_id: "native-foreground-prior".into(),
+        id: source.reference.id.clone(),
+        payload: source.payload.unwrap(),
+    };
+    let selection = pioneer_compaction::ModelSelection {
+        transport: pioneer_compaction::Transport::Api,
+        instance: "openai".into(),
+        model: "test-model".into(),
+        effort: None,
+    };
+    let owner = crate::compaction::native_owner(&workspace, "native-foreground");
+    let projection_version = store
+        .compaction_projection_version(&workspace, "native-foreground")
+        .await
+        .unwrap();
+    let operation = pioneer_compaction::OperationSnapshot {
+        id: "native-foreground-checkpoint-operation".into(),
+        owner: owner.clone(),
+        expected_checkpoint: None,
+        projection_version,
+        source_epochs: std::collections::BTreeMap::from([(
+            "native-foreground".into(),
+            projection_version,
+        )]),
+        admission: pioneer_compaction::CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: pioneer_compaction::CompactionPlan {
+            mode: pioneer_compaction::CompactionMode::Emergency,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![assertion.reference()],
+            fingerprint: "native-foreground-checkpoint-plan".into(),
+        },
+    };
+    store
+        .compaction_admit(&workspace, "native-foreground", &operation)
+        .await
+        .unwrap();
+    let checkpoint = pioneer_compaction::Checkpoint {
+        id: "native-foreground-checkpoint".into(),
+        operation_id: operation.id,
+        owner,
+        previous: None,
+        summary: "Prepared checkpoint summary".into(),
+        selection,
+        coverage: vec![assertion.reference()],
+        projection_version,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply(&checkpoint, None, &[assertion])
+            .await
+            .unwrap(),
+        pioneer_crud::compaction::CommitOutcome::Applied
+    );
+    let checkpoint_source = store
+        .compaction_checkpoint_source(&workspace, "native-foreground", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let operations_before_foreground = store
+        .database_connection()
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_operation".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
     let foreground_restores =
         crate::compaction::frozen::observe_store_restores(store.as_ref(), &workspace);
+    let prepared_transfers = crate::compaction::observe_prepared_transfers(
+        store.as_ref(),
+        &workspace,
+        "native-foreground",
+    );
+    let preparation_work = crate::compaction::observe_preparation_work(store.as_ref(), &workspace);
 
     let held = database.maintenance().begin_read().await.unwrap();
     let read_start = observer.reads.lock().unwrap().len();
@@ -64437,19 +64546,93 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         })
         .expect("native foreground request was not captured");
     assert!(foreground_request.messages.iter().any(|message| {
-        message.content.contains("earlier canonical history")
+        message.content.contains("Prepared checkpoint summary")
             && message.provenance.as_ref().is_some_and(|origin| {
-                origin.sources.iter().any(|source| {
-                    source.id == "native-foreground-prior-input"
-                        && source.version.starts_with("input-revision:")
-                })
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == checkpoint.id)
             })
     }));
+    let prior_index = foreground_request
+        .messages
+        .iter()
+        .position(|message| message.content.contains("Prepared checkpoint summary"))
+        .unwrap();
+    let current_index = foreground_request
+        .messages
+        .iter()
+        .position(|message| message.content == "small foreground request")
+        .unwrap();
+    assert!(
+        prior_index < current_index,
+        "prepared history order changed"
+    );
+    let current_origin = foreground_request.messages[current_index]
+        .provenance
+        .as_ref()
+        .expect("current input lost canonical provenance");
+    assert!(current_origin.protected_input);
+    assert!(current_origin.sources.iter().any(|source| {
+        source.scope == "input:native-foreground-turn"
+            && source.version.starts_with("input-revision:")
+    }));
+    assert_eq!(prepared_transfers.consumptions(), 1);
+    assert_eq!(
+        prepared_transfers.matches(),
+        1,
+        "production native preparation did not consume the descriptor and messages produced by refresh"
+    );
+    assert_eq!(
+        prepared_transfers.graph_matches(),
+        1,
+        "production native preparation did not receive the checkpoint graph prepared by refresh"
+    );
     assert_eq!(
         foreground_restores.calls(),
         0,
         "refresh_native_history restored the descriptor it had just published"
     );
+    let reused_work = prepared_transfers
+        .reused_work()
+        .expect("prepared transfer did not record its request-local reuse interval");
+    assert_eq!(
+        reused_work.closure_builds, 0,
+        "the stage consuming PreparedProjection rebuilt its checkpoint closure"
+    );
+    assert_eq!(
+        reused_work.body_loads, 0,
+        "the stage consuming PreparedProjection reloaded its selected checkpoint summary"
+    );
+    assert_eq!(
+        reused_work.edge_loads, 0,
+        "the stage consuming PreparedProjection reloaded checkpoint edges"
+    );
+    assert!(reused_work.revalidations > 0);
+    let closure_builds = preparation_work.closure_builds();
+    let body_loads = preparation_work.body_loads();
+    let allowed = std::collections::BTreeSet::from(["native-foreground".to_owned()]);
+    let mut next_preparation = crate::compaction::CheckpointGraphResolver::default();
+    let next_graph = next_preparation
+        .resolve(
+            store.as_ref(),
+            &workspace,
+            Some(&allowed),
+            &checkpoint_source,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    next_preparation
+        .projection_metadata(store.as_ref(), &workspace, &next_graph)
+        .await
+        .unwrap();
+    next_preparation
+        .projection_body(store.as_ref(), &workspace, &checkpoint_source)
+        .await
+        .unwrap();
+    assert_eq!(preparation_work.closure_builds(), closure_builds + 1);
+    assert_eq!(preparation_work.body_loads(), body_loads + 1);
 
     let reads = observer.reads.lock().unwrap()[read_start..].to_vec();
     let writes = observer.writes.lock().unwrap()[write_start..].to_vec();
@@ -64515,7 +64698,11 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        operations_before_foreground,
+        "the fitting foreground request created a new compaction operation"
+    );
 
     materialize_cli_runtime_turn_with_text(
         &store,
@@ -65708,6 +65895,37 @@ async fn check_completed_history(
         .is_err()
     );
     assert_eq!(provider.call_count(), 0);
+    let background_restores = crate::compaction::frozen::observe_store_restores(
+        harness.crud_store.as_ref(),
+        &harness.workspace_id,
+    );
+    let maintenance = harness.crud_store.with_maintenance_access();
+    let control = harness
+        .processor
+        .capture_current_context_basis_prepared(
+            &maintenance,
+            &harness.workspace_id,
+            thread,
+            turn,
+            None,
+        )
+        .await
+        .unwrap();
+    let restores_before_control = background_restores.calls_for(&control.descriptor);
+    crate::compaction::frozen::restore(
+        &maintenance,
+        &harness.workspace_id,
+        &control.accepted_scopes,
+        &control.descriptor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        background_restores.calls_for(&control.descriptor),
+        restores_before_control + 1,
+        "restore observer did not follow the maintenance-scoped CrudStore clone"
+    );
+    let target_restores_before_preparation = background_restores.calls_for(&control.descriptor);
     if owned {
         if native {
             let pending = harness
@@ -65931,6 +66149,11 @@ async fn check_completed_history(
             .unwrap();
         assert!(applied.is_some());
     }
+    assert_eq!(
+        background_restores.calls_for(&control.descriptor),
+        target_restores_before_preparation,
+        "completed-history preparation restored the manifest it had just captured"
+    );
     let calls = provider.call_count();
     assert!(calls > 0);
     assert!(

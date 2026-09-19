@@ -1,7 +1,7 @@
 //! CrudStore facade; persistence operations live in repositories.
 use crate::compaction::{
-    AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CommitOutcome,
-    CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
+    AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
+    CommitOutcome, CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
     FrozenImportRecord, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
     ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport, RunnerPlanRecord,
     SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
@@ -264,6 +264,20 @@ impl CrudStore {
     }
     pub async fn compaction_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
         repositories::compaction::compaction_checkpoint(&self.connection, id).await
+    }
+    /// Projection fields without coverage, which callers already resolved and
+    /// authorized through `compaction_checkpoint_edges`.
+    pub async fn compaction_checkpoint_body(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::compaction::CheckpointBody>> {
+        repositories::compaction::compaction_checkpoint_body(&self.connection, id).await
+    }
+    pub async fn compaction_checkpoint_metadata(
+        &self,
+        id: &str,
+    ) -> Result<Option<CheckpointMetadata>> {
+        repositories::compaction::compaction_checkpoint_metadata(&self.connection, id).await
     }
     /// Atomic CAS. Appends do not invalidate selected sources; edits, Stop and another head do.
     pub async fn compaction_apply(

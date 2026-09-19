@@ -9,7 +9,7 @@ use pioneer_compaction::{
 use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome, ManifestEntry};
 use pioneer_provider::ChatRequest;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 #[derive(Debug)]
 pub(crate) struct HistoryCheckDeadline;
 impl std::fmt::Display for HistoryCheckDeadline {
@@ -136,27 +136,19 @@ pub(crate) async fn prepare_completed_history_owned(
         );
         diagnostic.stage = "history_capture".into();
         let owner = super::native::native_owner(workspace, thread);
-        let version = store
-            .compaction_projection_version(workspace, thread)
+        let prepared = processor
+            .capture_current_context_basis_prepared(&store, workspace, thread, turn, None)
             .await?;
-        let json = processor
-            .capture_current_context_basis(&store, workspace, thread, turn, None)
-            .await?;
-        let allowed =
-            super::frozen::accepted_history_scopes(&store, workspace, thread, &json).await?;
-        let mut source_epochs = BTreeMap::new();
-        for source_thread in &allowed {
-            source_epochs.insert(
-                source_thread.clone(),
-                store
-                    .compaction_projection_version(workspace, source_thread)
-                    .await?,
-            );
-        }
-        source_epochs.insert(thread.to_owned(), version);
-        let mut messages =
-            crate::turn_runtime_snapshot::restore_history_json(&store, workspace, &allowed, &json)
-                .await?;
+        let super::frozen::PreparedHistory {
+            descriptor,
+            mut messages,
+            accepted_scopes: allowed,
+            source_epochs,
+            mut checkpoint_graphs,
+        } = prepared;
+        let version = *source_epochs
+            .get(thread)
+            .ok_or_else(|| anyhow::anyhow!("prepared history lost its owner epoch"))?;
         let head = store.compaction_head(&owner).await?;
         let basis = if let Some(head) = &head {
             store
@@ -167,23 +159,28 @@ pub(crate) async fn prepare_completed_history_owned(
             None
         };
         if let Some(basis) = &basis {
-            super::checkpoint::project_checkpoint(
+            super::checkpoint::project_checkpoint_with_resolver(
                 &store,
-                workspace,
-                thread,
-                &owner,
+                super::checkpoint::ProjectionContext {
+                    workspace,
+                    context_thread: thread,
+                    source_thread: thread,
+                    owner: &owner,
+                    allowed: &allowed,
+                },
                 basis,
-                &allowed,
                 &mut messages,
+                &mut checkpoint_graphs,
             )
             .await?;
         }
-        super::checkpoint::project_accepted_checkpoints(
+        super::checkpoint::project_accepted_checkpoints_with_resolver(
             &store,
             workspace,
             thread,
             &allowed,
             &mut messages,
+            &mut checkpoint_graphs,
         )
         .await?;
         diagnostic.stage = "target_configuration".into();
@@ -372,7 +369,7 @@ pub(crate) async fn prepare_completed_history_owned(
             PreparedOperation {
                 owner,
                 execution_turn: turn.into(),
-                source_projection: Some(serde_json::from_str(&json)?),
+                source_projection: Some(descriptor),
                 expected_checkpoint: head,
                 summary_basis: basis,
                 operation_deadline_ms: Some(deadline),
