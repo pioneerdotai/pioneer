@@ -6895,7 +6895,7 @@ mod prepared_snapshot_tests {
         let prepared = prepared(&store, "own-ws", "own-turn", "own history").await;
         let descriptor = serde_json::to_string(&prepared.descriptor).unwrap();
         let expected = prepared.messages.clone();
-        let restores = crate::compaction::frozen::observe_workspace_restores("own-ws");
+        let restores = crate::compaction::frozen::observe_store_restores(&store, "own-ws");
         let history = publish_prepared_task_snapshot(
             &store,
             "own-run",
@@ -6927,7 +6927,7 @@ mod prepared_snapshot_tests {
         let winner = prepared(&store, "race-ws", "winner-turn", "winning history").await;
         let winner_json = serde_json::to_string(&winner.descriptor).unwrap();
         let expected_winner = winner.messages.clone();
-        let restores = crate::compaction::frozen::observe_workspace_restores("race-ws");
+        let restores = crate::compaction::frozen::observe_store_restores(&store, "race-ws");
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let (published, accepted) = tokio::sync::oneshot::channel();
         let competing_store = store.clone();

@@ -2,7 +2,12 @@
 #[test]
 fn thread_has_one_public_root_and_only_approved_workspace_dependencies() {
     let manifest = include_str!("../Cargo.toml");
-    let allowed = ["pioneer-client", "pioneer-desktop-foundation", "terminal"];
+    let allowed = [
+        "pioneer-client",
+        "pioneer-desktop-foundation",
+        "pioneer-observability",
+        "terminal",
+    ];
     for line in manifest.lines().map(str::trim) {
         if line.starts_with("pioneer-") && line.contains("workspace") {
             let name = line.split(['.', ' ', '=']).next().unwrap();

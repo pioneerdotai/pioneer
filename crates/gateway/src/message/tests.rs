@@ -64389,7 +64389,8 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('native-foreground-prior','native-foreground','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
          INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('native-foreground-prior-input','native-foreground-prior',0,'text','earlier canonical history','{\"type\":\"text\",\"text\":\"earlier canonical history\"}',CURRENT_TIMESTAMP)",
     ).await.unwrap();
-    let foreground_restores = crate::compaction::frozen::observe_workspace_restores(&workspace);
+    let foreground_restores =
+        crate::compaction::frozen::observe_store_restores(store.as_ref(), &workspace);
 
     let held = database.maintenance().begin_read().await.unwrap();
     let read_start = observer.reads.lock().unwrap().len();

@@ -115,6 +115,11 @@ pub(crate) fn format_status_human(report: &SecretsStatusReport) -> String {
         "CLI runtime proxies: {}",
         report.counts.cli_runtime_proxy
     );
+    let _ = writeln!(
+        output,
+        "Model catalog proxies: {}",
+        report.counts.model_catalog_proxy
+    );
     let _ = writeln!(output, "MCP secrets: {}", report.counts.mcp_secret);
     let _ = writeln!(output, "User JWT tokens: {}", report.counts.user_jwt_token);
     let _ = writeln!(
@@ -289,6 +294,7 @@ mod tests {
         let output = format_status_human(&report);
 
         assert!(output.contains("Provider API keys: 1"));
+        assert!(output.contains("Model catalog proxies: 1"));
         assert!(output.contains("MCP secrets: 2"));
         assert!(output.contains("MCP orphan refs: 1"));
         assert!(output.contains("runtime_home: ok"));
@@ -336,6 +342,7 @@ mod tests {
         let status_json = serde_json::to_string(&status_fixture()).expect("status json");
         assert!(status_json.contains("storage_path"));
         assert!(status_json.contains("provider_api_key"));
+        assert!(status_json.contains("model_catalog_proxy"));
         assert!(!status_json.contains("sk-provider-secret"));
 
         let gc_json = serde_json::to_string(&McpSecretGarbageCollectionReport {
@@ -361,6 +368,7 @@ mod tests {
                 provider_api_key: 1,
                 provider_proxy: 1,
                 cli_runtime_proxy: 1,
+                model_catalog_proxy: 1,
                 mcp_secret: 2,
                 user_jwt_token: 0,
                 gateway_access_jwt_signing_key: 1,
@@ -369,7 +377,7 @@ mod tests {
                 desktop_gateway_session: 1,
                 unknown: 0,
             },
-            total_entries: 8,
+            total_entries: 9,
             permissions: vec![SecretPermissionHealthReport {
                 path: PathBuf::from("/tmp/pioneer"),
                 target: "runtime_home".to_owned(),

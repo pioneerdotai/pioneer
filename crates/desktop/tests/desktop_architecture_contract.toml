@@ -53,7 +53,7 @@ path = "desktop-thread"
 root = "ThreadView"
 constructor = "ThreadView::new"
 public_modules = []
-edges = ["pioneer-client", "pioneer-desktop-foundation", "terminal"]
+edges = ["pioneer-client", "pioneer-desktop-foundation", "pioneer-observability", "terminal"]
 [[features]]
 package = "pioneer-desktop-providers"
 path = "desktop-providers"

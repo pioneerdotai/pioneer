@@ -11,50 +11,45 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
-static WORKSPACE_RESTORE_CALLS: std::sync::LazyLock<
+static STORE_RESTORE_CALLS: std::sync::LazyLock<
     std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<std::sync::atomic::AtomicUsize>>,
+        std::collections::HashMap<(usize, String), std::sync::Weak<std::sync::atomic::AtomicUsize>>,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
-pub(crate) struct WorkspaceRestoreObserver {
-    workspace: String,
+pub(crate) struct StoreRestoreObserver {
+    key: (usize, String),
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(test)]
-impl WorkspaceRestoreObserver {
+impl StoreRestoreObserver {
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 #[cfg(test)]
-impl Drop for WorkspaceRestoreObserver {
+impl Drop for StoreRestoreObserver {
     fn drop(&mut self) {
-        WORKSPACE_RESTORE_CALLS
-            .lock()
-            .unwrap()
-            .remove(&self.workspace);
+        STORE_RESTORE_CALLS.lock().unwrap().remove(&self.key);
     }
 }
 
 #[cfg(test)]
-pub(crate) fn observe_workspace_restores(workspace: &str) -> WorkspaceRestoreObserver {
+pub(crate) fn observe_store_restores(store: &CrudStore, workspace: &str) -> StoreRestoreObserver {
+    let key = (store as *const CrudStore as usize, workspace.to_owned());
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let previous = WORKSPACE_RESTORE_CALLS
+    let previous = STORE_RESTORE_CALLS
         .lock()
         .unwrap()
-        .insert(workspace.to_owned(), std::sync::Arc::downgrade(&calls));
+        .insert(key.clone(), std::sync::Arc::downgrade(&calls));
     assert!(
         previous.is_none(),
-        "workspace restore observer already installed"
+        "store restore observer already installed"
     );
-    WorkspaceRestoreObserver {
-        workspace: workspace.to_owned(),
-        calls,
-    }
+    StoreRestoreObserver { key, calls }
 }
 
 /// Extend trusted execution scope by the TaskRun's durably accepted parent
@@ -1244,10 +1239,10 @@ pub(crate) async fn restore(
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ChatMessage>> {
     #[cfg(test)]
-    if let Some(calls) = WORKSPACE_RESTORE_CALLS
+    if let Some(calls) = STORE_RESTORE_CALLS
         .lock()
         .unwrap()
-        .get(workspace)
+        .get(&(store as *const CrudStore as usize, workspace.to_owned()))
         .and_then(std::sync::Weak::upgrade)
     {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
