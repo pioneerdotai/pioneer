@@ -428,7 +428,6 @@ where
         let chunk_sink: DesktopVoiceChunkSink = Box::new(
             move |samples, input_channels, input_sample_rate_hz, captured_at| {
                 let sequence = next_sequence;
-                next_sequence = next_sequence.saturating_add(1);
                 let chunk = desktop_voice_chunk_from_samples(
                     samples,
                     input_channels,
@@ -444,7 +443,9 @@ where
                     chunk.captured_at_unix_ms,
                     chunk.duration_ms,
                     chunk.pcm_s16le_mono,
-                )
+                )?;
+                next_sequence = next_sequence.saturating_add(1);
+                Ok(())
             },
         );
 

@@ -32,6 +32,8 @@ pub(crate) struct VoiceChunkIngestReport {
     pub(crate) sequence: u64,
     pub(crate) buffered_chunks: usize,
     pub(crate) buffered_bytes: usize,
+    pub(crate) missing_chunks: u64,
+    pub(crate) already_buffered: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +41,6 @@ pub(crate) enum VoiceChunkIngestErrorKind {
     UnknownSession,
     DuplicateSession,
     StaleChunk,
-    SequenceGap,
     AudioFormatMismatch,
     BufferLimitExceeded,
 }
@@ -60,10 +61,6 @@ impl VoiceChunkIngestError {
             ),
             VoiceChunkIngestErrorKind::StaleChunk => (
                 VoiceErrorKind::StaleChunk,
-                pioneer_protocol::PublicErrorCode::InvalidInput,
-            ),
-            VoiceChunkIngestErrorKind::SequenceGap => (
-                VoiceErrorKind::SequenceGap,
                 pioneer_protocol::PublicErrorCode::InvalidInput,
             ),
             VoiceChunkIngestErrorKind::AudioFormatMismatch => (
@@ -227,23 +224,17 @@ impl VoiceSessionBuffer {
             ));
         }
         if header.sequence < self.next_sequence {
-            return Err(ingest_error(
-                VoiceChunkIngestErrorKind::StaleChunk,
-                format!(
-                    "voice chunk sequence {} is stale; expected {}",
-                    header.sequence, self.next_sequence
-                ),
-            ));
+            return Ok(VoiceChunkIngestReport {
+                session_id: header.session_id,
+                sequence: header.sequence,
+                buffered_chunks: self.chunks.len(),
+                buffered_bytes: self.buffered_bytes,
+                missing_chunks: 0,
+                already_buffered: true,
+            });
         }
-        if header.sequence > self.next_sequence {
-            return Err(ingest_error(
-                VoiceChunkIngestErrorKind::SequenceGap,
-                format!(
-                    "voice chunk sequence gap: expected {}, got {}",
-                    self.next_sequence, header.sequence
-                ),
-            ));
-        }
+
+        let missing_chunks = header.sequence - self.next_sequence;
 
         let normalized = normalize_voice_pcm_chunk(header.audio_format(), audio_payload.as_slice())
             .map_err(|error| match error {
@@ -287,7 +278,7 @@ impl VoiceSessionBuffer {
         let duration_ms = header.duration_ms;
         let captured_at_unix_ms = header.captured_at_unix_ms;
         self.buffered_bytes = next_buffered_bytes;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence = sequence.saturating_add(1);
         self.chunks.push_back(BufferedVoiceChunk {
             sequence,
             audio_payload,
@@ -301,6 +292,8 @@ impl VoiceSessionBuffer {
             sequence,
             buffered_chunks: self.chunks.len(),
             buffered_bytes: self.buffered_bytes,
+            missing_chunks,
+            already_buffered: false,
         })
     }
 
@@ -390,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_gap_sequences_are_rejected() {
+    fn stale_chunks_are_idempotent_and_sequence_gaps_resume_capture() {
         let store = GatewayVoiceSessionBufferStore::default();
         store
             .start_session("voice_session_1", target_format())
@@ -401,13 +394,22 @@ mod tests {
 
         let stale = store
             .append_chunk(header("voice_session_1", 0), vec![0; 640])
-            .expect_err("stale sequence should fail");
-        assert_eq!(stale.kind, VoiceChunkIngestErrorKind::StaleChunk);
+            .expect("a repeated chunk should be acknowledged idempotently");
+        assert!(stale.already_buffered);
+        assert_eq!(stale.buffered_chunks, 1);
 
         let gap = store
-            .append_chunk(header("voice_session_1", 2), vec![0; 640])
-            .expect_err("sequence gap should fail");
-        assert_eq!(gap.kind, VoiceChunkIngestErrorKind::SequenceGap);
+            .append_chunk(header("voice_session_1", 3), vec![0; 640])
+            .expect("a sequence gap should resume capture");
+        assert!(!gap.already_buffered);
+        assert_eq!(gap.missing_chunks, 2);
+        assert_eq!(gap.buffered_chunks, 2);
+
+        let resumed = store
+            .append_chunk(header("voice_session_1", 4), vec![0; 640])
+            .expect("capture should continue after a gap");
+        assert_eq!(resumed.missing_chunks, 0);
+        assert_eq!(resumed.buffered_chunks, 3);
     }
 
     #[test]

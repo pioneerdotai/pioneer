@@ -389,14 +389,31 @@ impl MessageProcessor {
             .append_chunk(chunk.header, chunk.audio_payload)
         {
             Ok(report) => {
-                debug!(
-                    connection_id,
-                    session_id = %report.session_id,
-                    sequence = report.sequence,
-                    buffered_chunks = report.buffered_chunks,
-                    buffered_bytes = report.buffered_bytes,
-                    "decoded voice chunk appended to session buffer"
-                );
+                if report.already_buffered {
+                    debug!(
+                        connection_id,
+                        session_id = %report.session_id,
+                        sequence = report.sequence,
+                        "acknowledging repeated voice chunk"
+                    );
+                } else if report.missing_chunks > 0 {
+                    warn!(
+                        connection_id,
+                        session_id = %report.session_id,
+                        sequence = report.sequence,
+                        missing_chunks = report.missing_chunks,
+                        "resumed voice capture after missing audio chunks"
+                    );
+                } else {
+                    debug!(
+                        connection_id,
+                        session_id = %report.session_id,
+                        sequence = report.sequence,
+                        buffered_chunks = report.buffered_chunks,
+                        buffered_bytes = report.buffered_bytes,
+                        "decoded voice chunk appended to session buffer"
+                    );
+                }
                 self.send_notification_to_connections(
                     events::VOICE_CHUNK_ACK,
                     &VoiceChunkAckNotification {
