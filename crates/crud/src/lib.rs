@@ -15,7 +15,11 @@ mod timeline_projection_model;
 mod turn_item_terminal;
 mod util;
 
-pub use repositories::native_event_cleanup::NativeEventCleanupOutcome;
+pub use repositories::native_event_cleanup::{
+    NativeEventCleanupBootstrap, NativeEventCleanupMetrics,
+};
+#[cfg(test)]
+use repositories::native_event_cleanup_baseline::NativeEventCleanupOutcome;
 pub use repositories::projection_receipt_cleanup::ProjectionReceiptCleanupOutcome;
 
 pub use events::{
@@ -6447,13 +6451,15 @@ impl CrudStore {
         cli_runtime_binding::list_native_events(&self.connection, filter).await
     }
 
-    pub async fn cleanup_native_events_quantum(
+    #[cfg(test)]
+    pub async fn cleanup_native_events_baseline_quantum(
         &self,
         after_rowid: i64,
     ) -> Result<NativeEventCleanupOutcome> {
         self.run_background_database_quantum(|| async {
             let page =
-                repositories::native_event_cleanup::prepare(&self.connection, after_rowid).await?;
+                repositories::native_event_cleanup_baseline::prepare(&self.connection, after_rowid)
+                    .await?;
             let mut outcome = NativeEventCleanupOutcome {
                 last_rowid: page.last().map(|row| row.source_rowid),
                 rows_scanned: page.len() as u64,
@@ -6462,9 +6468,32 @@ impl CrudStore {
             if !page.is_empty() {
                 // One DELETE revalidates eligibility under the maintenance writer.
                 outcome.rows_deleted =
-                    repositories::native_event_cleanup::apply(&self.connection, &page).await?;
+                    repositories::native_event_cleanup_baseline::apply(&self.connection, &page)
+                        .await?;
             }
             Ok(outcome)
+        })
+        .await
+    }
+
+    /// One bounded, turn-addressed maintenance quantum. No source-table scan.
+    pub async fn cleanup_native_events_quantum(&self) -> Result<NativeEventCleanupMetrics> {
+        self.run_background_database_quantum(|| async {
+            repositories::native_event_cleanup::run(
+                &self.connection,
+                chrono::Utc::now().timestamp_micros(),
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Incremental registration of pre-upgrade rows; completion is durable.
+    pub async fn bootstrap_native_event_cleanup_quantum(
+        &self,
+    ) -> Result<NativeEventCleanupBootstrap> {
+        self.run_background_database_quantum(|| async {
+            repositories::native_event_cleanup::bootstrap(&self.connection).await
         })
         .await
     }
@@ -37890,7 +37919,7 @@ mod tests {
 
         let compacted = store
             .with_maintenance_access()
-            .cleanup_native_events_quantum(0)
+            .cleanup_native_events_baseline_quantum(0)
             .await
             .expect("compaction should succeed");
         assert_eq!(compacted.rows_scanned, 9);

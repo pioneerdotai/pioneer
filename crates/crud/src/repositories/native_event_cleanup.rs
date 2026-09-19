@@ -1,271 +1,331 @@
-use anyhow::Result;
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+//! One Gateway worker owns this queue. Reader selections are advisory: the
+//! serialized DELETE transaction revalidates readiness, ownership and bytes.
+use anyhow::{Context, Result};
+use pioneer_entity::{
+    cli_runtime_native_event as event, native_event_cleanup_bootstrap as bootstrap_state,
+    native_event_cleanup_job as job, native_event_cleanup_scheduler as scheduler,
+};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
+};
+use std::{collections::BTreeSet, time::Instant};
 
-const PAGE_ROWS: u64 = 128;
-const PAYLOAD_BUDGET: i64 = 256 * 1024;
+pub(crate) const PAGE_ROWS: usize = 128;
+pub(crate) const PAYLOAD_BUDGET: i64 = 256 * 1024;
+const RETRY_DELAY_MICROS: i64 = 60_000_000;
+#[path = "native_event_cleanup_queries.rs"]
+mod queries;
 
+/// Statement counts exclude trigger VM and BEGIN/COMMIT. Elapsed times include
+/// queue waiting; actual writer hold/wait is recorded by SQLite observers.
 #[derive(Debug, Default)]
-pub struct NativeEventCleanupOutcome {
-    pub last_rowid: Option<i64>,
+pub struct NativeEventCleanupMetrics {
+    pub jobs_examined: u64,
+    pub candidate_rows_fetched: u64,
+    pub events_selected: u64,
+    pub selected_bytes: i64,
+    pub events_revalidated: u64,
+    pub events_deleted: u64,
+    pub deleted_bytes: i64,
+    pub prepare_reads: u64,
+    pub apply_reads: u64,
+    pub apply_writes: u64,
+    pub queue_rows_changed: u64,
+    pub scheduler_rows_changed: u64,
+    pub errors_deferred: u64,
+    pub prepare_elapsed_us: u64,
+    pub apply_elapsed_us: u64,
+}
+#[derive(Debug, Default)]
+pub struct NativeEventCleanupBootstrap {
     pub rows_scanned: u64,
-    pub rows_deleted: u64,
+    pub jobs_inserted: u64,
+    pub complete: bool,
+}
+#[derive(FromQueryResult)]
+struct Job {
+    turn_id: String,
+    regular_lane: Option<String>,
+}
+#[derive(FromQueryResult)]
+struct Candidate {
+    runtime_id: String,
+    id: Option<String>,
+    payload_bytes: Option<i64>,
+}
+struct Prepared {
+    job: Job,
+    runtime_id: Option<String>,
+    ids: Vec<String>,
+}
+#[derive(FromQueryResult)]
+struct Remaining {
+    current_runtime_remaining: bool,
+    any_remaining: bool,
+}
+fn elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
 }
 
-#[derive(Debug, FromQueryResult)]
-pub(crate) struct SourceRow {
-    pub source_rowid: i64,
-    id: String,
-    payload_bytes: i64,
-}
-
-pub(crate) async fn prepare<C: ConnectionTrait>(db: &C, after: i64) -> Result<Vec<SourceRow>> {
-    // Page the source before filtering: retained/orphan rows must not cause
-    // an unbounded candidate search or prevent reaching later eligible rows.
-    let rows = SourceRow::find_by_statement(Statement::from_sql_and_values(
-        db.get_database_backend(),
-        "SELECT rowid AS source_rowid, id, length(CAST(payload_redacted_json AS BLOB)) AS payload_bytes \
-         FROM cli_runtime_native_event WHERE rowid > ? ORDER BY rowid LIMIT ?",
-        [after.into(), PAGE_ROWS.into()],
-    ))
+async fn candidates<C: ConnectionTrait>(
+    db: &C,
+    turn: &str,
+    selected: Option<&[String]>,
+) -> Result<Vec<Candidate>> {
+    Ok(Candidate::find_by_statement(
+        db.get_database_backend()
+            .build(&queries::candidates(turn, selected)),
+    )
     .all(db)
-    .await?;
-    let mut bytes = 0;
-    let mut page = Vec::new();
-    for row in rows {
-        if !page.is_empty() && bytes + row.payload_bytes > PAYLOAD_BUDGET {
-            break;
-        }
-        bytes += row.payload_bytes;
-        page.push(row);
-    }
-    Ok(page)
+    .await?)
 }
-
-pub(crate) async fn apply<C: ConnectionTrait>(db: &C, page: &[SourceRow]) -> Result<u64> {
-    let mut remaining = PAYLOAD_BUDGET;
-    let ids: Vec<_> = page
-        .iter()
-        .filter_map(|row| {
-            if row.payload_bytes > remaining {
-                return None;
+fn bounded_ids(rows: Vec<Candidate>) -> (Vec<String>, i64) {
+    let mut ids = Vec::new();
+    let mut bytes = 0_i64;
+    for row in rows.into_iter().take(PAGE_ROWS) {
+        if let (Some(id), Some(size)) = (row.id, row.payload_bytes) {
+            if bytes.saturating_add(size) > PAYLOAD_BUDGET {
+                break;
             }
-            remaining -= row.payload_bytes;
-            Some(row.id.clone().into())
-        })
-        .collect();
-    if ids.is_empty() {
-        return Ok(0);
+            bytes += size;
+            ids.push(id);
+        }
     }
-    let placeholders = vec!["?"; ids.len()].join(",");
-    // Keep lifecycle/error events. Only redundant item traffic is eligible,
-    // after both canonical execution and runtime/recovery have settled.
-    let sql = format!(
-        r#"
-        DELETE FROM cli_runtime_native_event AS e
-        WHERE e.id IN ({placeholders})
-          AND e.native_method IN (
-            'item/started', 'item/completed', 'item/agentMessage/delta',
-            'item/commandExecution/outputDelta', 'turn/diff/updated',
-            'thread/tokenUsage/updated', 'account/rateLimits/updated'
-          )
-          AND EXISTS (SELECT 1 FROM "turn" t WHERE t.id = e.turn_id
-              AND t.status IN ('completed', 'failed', 'interrupted'))
-          AND EXISTS (SELECT 1 FROM turn_cli_runtime_binding b
-              WHERE b.turn_id = e.turn_id AND b.runtime_id = e.runtime_id
-                AND b.status IN ('completed', 'failed', 'interrupted'))
-          AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_attempt a
-              WHERE a.turn_id = e.turn_id AND a.status IN ('starting', 'running'))
-          AND NOT EXISTS (SELECT 1 FROM turn_cli_runtime_execution_segment s
-              WHERE s.turn_id = e.turn_id AND s.status = 'running')
-          AND NOT EXISTS (SELECT 1 FROM recovery_job r WHERE r.turn_id = e.turn_id
-              AND (r.status IN ('pending', 'active') OR r.resolution_pending = 1))
-          AND EXISTS (SELECT 1 FROM turn_event_projection_stream_state p
-              WHERE p.turn_id = e.turn_id AND p.status = 'healthy'
-                AND p.projected_through_sequence > 0
-                AND NOT EXISTS (SELECT 1 FROM turn_event_projection_state receipt
-                    WHERE receipt.turn_id = p.turn_id
-                      AND receipt.sequence > p.projected_through_sequence))
-    "#
-    );
-    Ok(db
-        .execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            sql,
-            ids,
-        ))
-        .await?
-        .rows_affected())
+    (ids, bytes)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sea_orm::{Database, DatabaseConnection};
-
-    const REDUNDANT_METHODS: [&str; 7] = [
-        "item/started",
-        "item/completed",
-        "item/agentMessage/delta",
-        "item/commandExecution/outputDelta",
-        "turn/diff/updated",
-        "thread/tokenUsage/updated",
-        "account/rateLimits/updated",
-    ];
-
-    async fn database() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        db.execute_unprepared(r#"
-            CREATE TABLE "turn" (id TEXT PRIMARY KEY, status TEXT);
-            CREATE TABLE turn_cli_runtime_binding (turn_id TEXT PRIMARY KEY, runtime_id TEXT, status TEXT);
-            CREATE TABLE turn_cli_runtime_attempt (turn_id TEXT, status TEXT);
-            CREATE TABLE turn_cli_runtime_execution_segment (turn_id TEXT, status TEXT);
-            CREATE TABLE recovery_job (turn_id TEXT, status TEXT, resolution_pending INTEGER);
-            CREATE TABLE turn_event_projection_stream_state (
-                turn_id TEXT PRIMARY KEY, status TEXT, projected_through_sequence INTEGER);
-            CREATE TABLE turn_event_projection_state (turn_id TEXT, sequence INTEGER, status TEXT);
-            CREATE TABLE cli_runtime_native_event (
-                id TEXT PRIMARY KEY, turn_id TEXT, runtime_id TEXT,
-                native_method TEXT, payload_redacted_json TEXT);
-            INSERT INTO "turn" VALUES ('done', 'completed');
-            INSERT INTO turn_cli_runtime_binding VALUES ('done', 'codex', 'completed');
-            INSERT INTO turn_event_projection_stream_state VALUES ('done', 'healthy', 10);
-        "#).await.unwrap();
-        db
-    }
-
-    async fn insert(
-        db: &DatabaseConnection,
-        id: &str,
-        turn_id: Option<&str>,
-        method: &str,
-        bytes: usize,
-    ) {
-        db.execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            "INSERT INTO cli_runtime_native_event VALUES (?, ?, 'codex', ?, ?)",
-            [
-                id.into(),
-                turn_id.into(),
-                method.into(),
-                "x".repeat(bytes).into(),
-            ],
-        ))
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn deletes_only_redundant_terminal_traffic_and_can_restart() {
-        let db = database().await;
-        for method in REDUNDANT_METHODS {
-            insert(&db, method, Some("done"), method, 2).await;
+pub(crate) async fn run(db: &SqliteDatabase, now: i64) -> Result<NativeEventCleanupMetrics> {
+    let now = std::cmp::max(now, 1);
+    let started = Instant::now();
+    let mut metrics = NativeEventCleanupMetrics {
+        prepare_reads: 1,
+        ..Default::default()
+    };
+    let Some(job) =
+        Job::find_by_statement(db.get_database_backend().build(&queries::discovery(now)))
+            .one(db)
+            .await?
+    else {
+        metrics.prepare_elapsed_us = elapsed_us(started);
+        return Ok(metrics);
+    };
+    metrics.jobs_examined = 1;
+    metrics.prepare_reads += 1;
+    let rows = match candidates(db, &job.turn_id, None).await {
+        Ok(rows) => rows,
+        Err(_) => {
+            metrics.prepare_elapsed_us = elapsed_us(started);
+            let started = Instant::now();
+            defer(db, &job.turn_id, now, "prepare_failed", &mut metrics).await?;
+            metrics.apply_elapsed_us = elapsed_us(started);
+            return Ok(metrics);
         }
-        for method in ["turn/completed", "error", "future/event"] {
-            insert(&db, method, Some("done"), method, 2).await;
-        }
-        insert(&db, "orphan", Some("missing"), "item/completed", 2).await;
-        insert(&db, "unbound", None, "item/completed", 2).await;
-        let page = prepare(&db, 0).await.unwrap();
-        assert_eq!(page.len(), 12);
-        assert_eq!(apply(&db, &page).await.unwrap(), 7);
-        assert_eq!(apply(&db, &page).await.unwrap(), 0);
-        let restarted = prepare(&db, 0).await.unwrap();
-        assert_eq!(restarted.len(), 5);
-        assert_eq!(apply(&db, &restarted).await.unwrap(), 0);
+    };
+    let runtime_id = rows.first().map(|row| row.runtime_id.clone());
+    metrics.candidate_rows_fetched = rows.iter().filter(|row| row.id.is_some()).count() as u64;
+    let (ids, bytes) = bounded_ids(rows);
+    metrics.events_selected = ids.len() as u64;
+    metrics.selected_bytes = bytes;
+    metrics.prepare_elapsed_us = elapsed_us(started);
+    let prepared = Prepared {
+        job,
+        runtime_id,
+        ids,
+    };
+    let started = Instant::now();
+    if apply(db, &prepared, now, &mut metrics).await.is_err() {
+        // Failed transactions roll back: don't count their DELETEs as committed.
+        metrics.events_deleted = 0;
+        metrics.deleted_bytes = 0;
+        metrics.queue_rows_changed = 0;
+        metrics.scheduler_rows_changed = 0;
+        defer(db, &prepared.job.turn_id, now, "apply_failed", &mut metrics).await?;
     }
-
-    #[tokio::test]
-    async fn revalidates_execution_recovery_and_projection_after_discovery() {
-        for change in [
-            "UPDATE \"turn\" SET status = 'in_progress'",
-            "UPDATE \"turn\" SET status = 'blocked'",
-            "UPDATE turn_cli_runtime_binding SET status = 'starting'",
-            "UPDATE turn_cli_runtime_binding SET status = 'running'",
-            "DELETE FROM turn_cli_runtime_binding",
-            "INSERT INTO turn_cli_runtime_attempt VALUES ('done', 'starting')",
-            "INSERT INTO turn_cli_runtime_attempt VALUES ('done', 'running')",
-            "INSERT INTO turn_cli_runtime_execution_segment VALUES ('done', 'running')",
-            "INSERT INTO recovery_job VALUES ('done', 'pending', 0)",
-            "INSERT INTO recovery_job VALUES ('done', 'active', 0)",
-            "INSERT INTO recovery_job VALUES ('done', 'exhausted', 1)",
-            "UPDATE turn_event_projection_stream_state SET status = 'quarantined'",
-            "DELETE FROM turn_event_projection_stream_state",
-            "INSERT INTO turn_event_projection_state VALUES ('done', 11, 'pending')",
-            "INSERT INTO turn_event_projection_state VALUES ('done', 11, 'exhausted')",
-            "INSERT INTO turn_event_projection_state VALUES ('done', 11, 'projected')",
-        ] {
-            let db = database().await;
-            for method in REDUNDANT_METHODS {
-                insert(&db, method, Some("done"), method, 2).await;
-            }
-            let page = prepare(&db, 0).await.unwrap();
-            db.execute_unprepared(change).await.unwrap();
-            assert_eq!(apply(&db, &page).await.unwrap(), 0, "{change}");
-            assert_eq!(
-                prepare(&db, 0).await.unwrap().len(),
-                REDUNDANT_METHODS.len()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn bounds_scan_and_bytes_without_getting_stuck_on_retained_rows() {
-        let db = database().await;
-        for id in 0..130 {
-            insert(&db, &format!("orphan-{id}"), None, "item/completed", 1).await;
-        }
-        let first = prepare(&db, 0).await.unwrap();
-        assert_eq!(first.len(), 128);
-        assert_eq!(apply(&db, &first).await.unwrap(), 0);
-        let second = prepare(&db, first.last().unwrap().source_rowid)
-            .await
-            .unwrap();
-        assert_eq!(second.len(), 2);
-
-        insert(
-            &db,
-            "oversized",
-            Some("done"),
-            "item/completed",
-            PAYLOAD_BUDGET as usize + 1,
+    metrics.apply_elapsed_us = elapsed_us(started);
+    Ok(metrics)
+}
+async fn defer(
+    db: &SqliteDatabase,
+    turn: &str,
+    now: i64,
+    reason: &str,
+    metrics: &mut NativeEventCleanupMetrics,
+) -> Result<()> {
+    metrics.apply_writes += 1;
+    metrics.queue_rows_changed += job::Entity::update_many()
+        .col_expr(job::Column::State, Expr::val("queued"))
+        .col_expr(
+            job::Column::AvailableAt,
+            Expr::val(now.saturating_add(RETRY_DELAY_MICROS)),
         )
-        .await;
-        insert(&db, "a", Some("done"), "item/completed", 180_000).await;
-        insert(&db, "b", Some("done"), "item/completed", 180_000).await;
-        let oversized = prepare(&db, second.last().unwrap().source_rowid)
-            .await
-            .unwrap();
-        assert_eq!(oversized.len(), 1);
-        assert_eq!(apply(&db, &oversized).await.unwrap(), 0);
-        let a = prepare(&db, oversized[0].source_rowid).await.unwrap();
-        assert_eq!(a.len(), 1);
-        assert_eq!(apply(&db, &a).await.unwrap(), 1);
-        let b = prepare(&db, a[0].source_rowid).await.unwrap();
-        assert_eq!(b.len(), 1);
-        assert_eq!(apply(&db, &b).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn cleanup_uses_the_current_schema_and_requires_maintenance_access() {
-        use migration::{Migrator, MigratorTrait};
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        Migrator::up(&db, None).await.unwrap();
-        let absent = vec![SourceRow {
-            source_rowid: 1,
-            id: "missing".into(),
-            payload_bytes: 0,
-        }];
-        assert_eq!(apply(&db, &absent).await.unwrap(), 0);
-        let store = crate::CrudStore::new(db);
-        assert!(store.cleanup_native_events_quantum(0).await.is_err());
-        assert!(
-            store
-                .with_maintenance_access()
-                .cleanup_native_events_quantum(0)
-                .await
-                .unwrap()
-                .last_rowid
-                .is_none()
-        );
-    }
+        .col_expr(job::Column::LastError, Expr::val(reason))
+        .col_expr(
+            job::Column::Revision,
+            Expr::col(job::Column::Revision).add(1),
+        )
+        .filter(job::Column::TurnId.eq(turn))
+        .exec(db)
+        .await?
+        .rows_affected;
+    metrics.errors_deferred += 1;
+    Ok(())
 }
+async fn apply(
+    db: &SqliteDatabase,
+    prepared: &Prepared,
+    now: i64,
+    metrics: &mut NativeEventCleanupMetrics,
+) -> Result<()> {
+    let tx = db.begin().await?;
+    metrics.apply_reads += 1;
+    let rows = candidates(&tx, &prepared.job.turn_id, Some(&prepared.ids)).await?;
+    let runtime_id = rows.first().map(|row| row.runtime_id.clone());
+    if runtime_id.is_some() && runtime_id == prepared.runtime_id {
+        metrics.events_revalidated = rows.iter().filter(|row| row.id.is_some()).count() as u64;
+        let (ids, bytes) = bounded_ids(rows);
+        if !ids.is_empty() {
+            metrics.apply_writes += 1;
+            metrics.events_deleted = event::Entity::delete_many()
+                .filter(event::Column::Id.is_in(ids))
+                .exec(&tx)
+                .await?
+                .rows_affected;
+            metrics.deleted_bytes = bytes;
+        }
+    }
+    // Late writes are either visible below or run their triggers after commit.
+    metrics.apply_reads += 1;
+    let remaining = Remaining::find_by_statement(tx.get_database_backend().build(
+        &queries::remaining(&prepared.job.turn_id, runtime_id.as_deref()),
+    ))
+    .one(&tx)
+    .await?
+    .context("missing remaining-candidate result")?;
+    metrics.apply_writes += 1;
+    metrics.queue_rows_changed += if remaining.any_remaining {
+        let state = if runtime_id.is_some() && remaining.current_runtime_remaining {
+            "queued"
+        } else {
+            "waiting"
+        };
+        job::Entity::update_many()
+            .col_expr(job::Column::State, Expr::val(state))
+            .col_expr(job::Column::AvailableAt, Expr::val(0_i64))
+            .col_expr(job::Column::LastServedAt, Expr::val(now))
+            .col_expr(job::Column::LastError, Expr::val(None::<String>))
+            .col_expr(
+                job::Column::Revision,
+                Expr::col(job::Column::Revision).add(1),
+            )
+            .filter(job::Column::TurnId.eq(&prepared.job.turn_id))
+            .exec(&tx)
+            .await?
+            .rows_affected
+    } else {
+        job::Entity::delete_by_id(prepared.job.turn_id.clone())
+            .exec(&tx)
+            .await?
+            .rows_affected
+    };
+    if let Some(lane) = prepared.job.regular_lane.as_deref() {
+        let update = scheduler::Entity::update_many().filter(scheduler::Column::Singleton.eq(1));
+        let counter = scheduler::Column::NewJobsSinceServed;
+        let update = match lane {
+            "new" => update
+                .col_expr(counter, Expr::col(counter).add(1))
+                .filter(counter.lt(4)),
+            "served" => update
+                .col_expr(counter, Expr::val(0_i64))
+                .filter(counter.ne(0)),
+            _ => anyhow::bail!("invalid cleanup scheduler lane"),
+        };
+        metrics.apply_writes += 1;
+        metrics.scheduler_rows_changed += update.exec(&tx).await?.rows_affected;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+#[derive(FromQueryResult)]
+struct BootstrapRow {
+    id: String,
+    turn_id: Option<String>,
+    eligible: bool,
+}
+pub(crate) async fn bootstrap(db: &SqliteDatabase) -> Result<NativeEventCleanupBootstrap> {
+    let state = bootstrap_state::Entity::find_by_id(1_i64)
+        .one(db)
+        .await?
+        .context("missing cleanup bootstrap marker")?;
+    if state.complete {
+        return Ok(NativeEventCleanupBootstrap {
+            complete: true,
+            ..Default::default()
+        });
+    }
+    let mut query = event::Entity::find()
+        .select_only()
+        .columns([event::Column::Id, event::Column::TurnId])
+        .column_as(queries::candidate_predicate(None), "eligible")
+        .order_by_asc(event::Column::Id)
+        .limit(PAGE_ROWS as u64);
+    if let Some(after) = state.cursor_id.as_deref() {
+        query = query.filter(event::Column::Id.gt(after));
+    }
+    let rows = query.into_model::<BootstrapRow>().all(db).await?;
+    let turns = rows
+        .iter()
+        .filter(|row| row.eligible)
+        .filter_map(|row| row.turn_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut result = NativeEventCleanupBootstrap {
+        rows_scanned: rows.len() as u64,
+        complete: rows.is_empty(),
+        ..Default::default()
+    };
+    let tx = db.begin().await?;
+    // CAS prevents an overlapping bootstrap caller from moving the cursor back.
+    let cursor = match state.cursor_id.as_deref() {
+        Some(id) => bootstrap_state::Column::CursorId.eq(id),
+        None => bootstrap_state::Column::CursorId.is_null(),
+    };
+    let updated = bootstrap_state::Entity::update_many()
+        .col_expr(
+            bootstrap_state::Column::CursorId,
+            Expr::val(rows.last().map(|row| row.id.clone()).or(state.cursor_id)),
+        )
+        .col_expr(
+            bootstrap_state::Column::Complete,
+            Expr::val(result.complete),
+        )
+        .filter(bootstrap_state::Column::Singleton.eq(1))
+        .filter(bootstrap_state::Column::Complete.eq(false))
+        .filter(cursor)
+        .exec(&tx)
+        .await?
+        .rows_affected;
+    if updated == 0 {
+        tx.rollback().await?;
+        return Ok(NativeEventCleanupBootstrap::default());
+    }
+    for turn in turns {
+        result.jobs_inserted += job::Entity::insert(job::ActiveModel {
+            turn_id: Set(turn.to_owned()),
+            state: Set("queued".to_owned()),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(job::Column::TurnId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(&tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(result)
+}
+#[cfg(test)]
+#[path = "native_event_cleanup_tests.rs"]
+mod tests;
