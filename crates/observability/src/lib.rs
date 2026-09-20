@@ -443,6 +443,13 @@ where
         event.metadata().target(),
         fields.log_target.as_deref(),
         fields.message.as_deref(),
+    ) || should_demote_gpui_closed_window_activation_event(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.log_file.as_deref(),
+        fields.log_line,
+        fields.message.as_deref(),
     ) || should_demote_rathole_client_control_channel_retry(
         event.metadata().level(),
         event.metadata().target(),
@@ -552,6 +559,25 @@ fn should_demote_gpui_asset_cache_http_not_found(
         && message.is_some_and(is_gpui_asset_cache_http_not_found)
 }
 
+fn should_demote_gpui_closed_window_activation_event(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    log_file: Option<&str>,
+    log_line: Option<u64>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && target == "log"
+        && log_target.is_none_or(str::is_empty)
+        && log_file.is_some_and(|file| {
+            file.ends_with("gpui-pre-0.3.5/src/window.rs")
+                || file.ends_with(r"gpui-pre-0.3.5\src\window.rs")
+        })
+        && log_line == Some(1899)
+        && message == Some("window not found")
+}
+
 fn should_demote_rathole_client_control_channel_retry(
     level: &tracing::Level,
     target: &str,
@@ -643,6 +669,8 @@ fn tracing_event_fields(event: &tracing::Event<'_>) -> EventFieldVisitor {
 struct EventFieldVisitor {
     message: Option<String>,
     log_target: Option<String>,
+    log_file: Option<String>,
+    log_line: Option<u64>,
     name: Option<String>,
     root_error_code: Option<String>,
 }
@@ -652,9 +680,16 @@ impl Visit for EventFieldVisitor {
         match field.name() {
             "message" => self.message = Some(value.to_owned()),
             "log.target" => self.log_target = Some(value.to_owned()),
+            "log.file" => self.log_file = Some(value.to_owned()),
             "name" => self.name = Some(value.to_owned()),
             "root_error_code" => self.root_error_code = Some(value.to_owned()),
             _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "log.line" {
+            self.log_line = Some(value);
         }
     }
 
@@ -664,6 +699,7 @@ impl Visit for EventFieldVisitor {
             "log.target" => {
                 self.log_target = Some(format!("{value:?}").trim_matches('"').to_owned())
             }
+            "log.file" => self.log_file = Some(format!("{value:?}").trim_matches('"').to_owned()),
             "name" => self.name = Some(format!("{value:?}").trim_matches('"').to_owned()),
             "root_error_code" => {
                 self.root_error_code = Some(format!("{value:?}").trim_matches('"').to_owned())
@@ -692,6 +728,7 @@ mod tests {
     use super::{
         database_metrics_target_enabled, sentry_enabled_for_environment, sentry_event_filter,
         should_demote_gpui_asset_cache_http_not_found,
+        should_demote_gpui_closed_window_activation_event,
         should_demote_rathole_client_control_channel_retry,
         should_demote_rmcp_transport_worker_failure,
         should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
@@ -944,6 +981,46 @@ mod tests {
             Some(
                 "Failed to load asset: unexpected http status for https://example.com/favicon.ico: 404 Not Found, body: not found",
             ),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_closed_window_activation_event_on_windows() {
+        assert!(should_demote_gpui_closed_window_activation_event(
+            &tracing::Level::ERROR,
+            "log",
+            Some(""),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
+            ),
+            Some(1899),
+            Some("window not found"),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_window_not_found_from_other_callbacks_as_event() {
+        assert!(!should_demote_gpui_closed_window_activation_event(
+            &tracing::Level::ERROR,
+            "log",
+            Some(""),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
+            ),
+            Some(1900),
+            Some("window not found"),
+        ));
+    }
+
+    #[test]
+    fn keeps_window_not_found_from_application_code_as_event() {
+        assert!(!should_demote_gpui_closed_window_activation_event(
+            &tracing::Level::ERROR,
+            "pioneer_desktop",
+            None,
+            Some("crates/desktop/src/window.rs"),
+            Some(1899),
+            Some("window not found"),
         ));
     }
 
