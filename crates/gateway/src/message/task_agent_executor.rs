@@ -7940,13 +7940,19 @@ async fn record_task_run_turn_failure(
     error: Option<TaskError>,
     completed_at: i64,
 ) -> Result<()> {
-    handle
-        .record_task_run_turn_failed(
-            failed_task_run_turn(task_run_turn, status, completed_at),
-            error,
-            completed_at,
-        )
-        .await?;
+    let terminal_turn = failed_task_run_turn(task_run_turn, status, completed_at);
+    match status {
+        TaskRunTurnStatus::Blocked => {
+            handle
+                .record_task_run_turn_blocked(terminal_turn, error, completed_at)
+                .await?;
+        }
+        _ => {
+            handle
+                .record_task_run_turn_failed(terminal_turn, error, completed_at)
+                .await?;
+        }
+    }
     Ok(())
 }
 

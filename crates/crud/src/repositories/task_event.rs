@@ -357,6 +357,7 @@ fn existing_event_outcome(
     let existing = appended_task_event_from_model(model, TaskEventAppendStatus::AlreadyExists)?;
     if existing.payload != *attempted_payload
         && !equivalent_cancelled_terminal_payload(&existing.payload, attempted_payload)
+        && !equivalent_replayed_task_run_turn_terminal_payload(&existing.payload, attempted_payload)
     {
         anyhow::bail!(
             "task event idempotency key `{}` already exists with a different payload",
@@ -364,6 +365,51 @@ fn existing_event_outcome(
         );
     }
     Ok(existing)
+}
+
+fn equivalent_replayed_task_run_turn_terminal_payload(
+    existing: &TaskEventPayload,
+    attempted: &TaskEventPayload,
+) -> bool {
+    let (existing_turn, existing_error, attempted_turn, attempted_error) =
+        match (existing, attempted) {
+            (
+                TaskEventPayload::TaskRunTurnFailed {
+                    task_run_turn: existing_turn,
+                    error: existing_error,
+                },
+                TaskEventPayload::TaskRunTurnFailed {
+                    task_run_turn: attempted_turn,
+                    error: attempted_error,
+                },
+            )
+            | (
+                TaskEventPayload::TaskRunTurnBlocked {
+                    task_run_turn: existing_turn,
+                    error: existing_error,
+                },
+                TaskEventPayload::TaskRunTurnBlocked {
+                    task_run_turn: attempted_turn,
+                    error: attempted_error,
+                },
+            ) => (
+                existing_turn,
+                existing_error,
+                attempted_turn,
+                attempted_error,
+            ),
+            _ => return false,
+        };
+
+    if existing_error != attempted_error {
+        return false;
+    }
+
+    let mut existing_turn = existing_turn.clone();
+    let mut attempted_turn = attempted_turn.clone();
+    existing_turn.completed_at = None;
+    attempted_turn.completed_at = None;
+    existing_turn == attempted_turn
 }
 
 fn equivalent_cancelled_terminal_payload(
@@ -659,4 +705,93 @@ async fn next_sequence_for_task<C: ConnectionTrait>(db: &C, task_id: &str) -> Re
         .unwrap_or(0);
 
     Ok(max_sequence + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::{
+        TaskError, TaskErrorClass, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
+    };
+
+    fn terminal_turn(status: TaskRunTurnStatus, completed_at: i64) -> TaskRunTurn {
+        TaskRunTurn {
+            id: "task-run-turn-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            execution_id: Some("execution-1".to_owned()),
+            thread_id: "thread-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: 10,
+            started_at: Some(11),
+            completed_at: Some(completed_at),
+        }
+    }
+
+    fn cancelled_error() -> TaskError {
+        TaskError {
+            code: "task_cli_runtime_start_superseded".to_owned(),
+            message: "task run became terminal before activation".to_owned(),
+            class: TaskErrorClass::Cancelled,
+            details: None,
+            failed_run_id: Some("run-1".to_owned()),
+        }
+    }
+
+    #[test]
+    fn repeated_blocked_turn_terminalization_ignores_only_completion_time() {
+        let existing = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 20),
+            error: Some(cancelled_error()),
+        };
+        let replay = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 30),
+            error: Some(cancelled_error()),
+        };
+
+        assert!(equivalent_replayed_task_run_turn_terminal_payload(
+            &existing, &replay
+        ));
+    }
+
+    #[test]
+    fn repeated_failed_turn_terminalization_ignores_only_completion_time() {
+        let existing = TaskEventPayload::TaskRunTurnFailed {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Failed, 20),
+            error: Some(cancelled_error()),
+        };
+        let replay = TaskEventPayload::TaskRunTurnFailed {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Failed, 30),
+            error: Some(cancelled_error()),
+        };
+
+        assert!(equivalent_replayed_task_run_turn_terminal_payload(
+            &existing, &replay
+        ));
+    }
+
+    #[test]
+    fn repeated_turn_terminalization_rejects_meaningful_payload_changes() {
+        let existing = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 20),
+            error: Some(cancelled_error()),
+        };
+        let mut different_error = cancelled_error();
+        different_error.code = "different_reason".to_owned();
+        let replay = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 30),
+            error: Some(different_error),
+        };
+
+        assert!(!equivalent_replayed_task_run_turn_terminal_payload(
+            &existing, &replay
+        ));
+    }
 }
