@@ -12,7 +12,7 @@ use pioneer_promt::{
     MemoryActiveRecallProviderOutputSections, TurnPreflightMemoryActiveRecallPromptInput,
     TurnPreflightPromptInput, render_turn_preflight_prompt,
 };
-use pioneer_protocol::ThreadMode;
+use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage, ThreadMode};
 use pioneer_provider::{
     ChatMessage, ChatRequest, Provider, ProviderRegistry, ProviderResponseLimits,
     ProviderResponseTooLarge, ReasoningConfig,
@@ -23,6 +23,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +32,8 @@ use tracing::debug;
 const PREFLIGHT_DIAGNOSTIC_CODE_MAX_CHARS: usize = 160;
 const PREFLIGHT_DIAGNOSTIC_MAX_COUNT: usize = 16;
 const PREFLIGHT_DIAGNOSTIC_MESSAGE_MAX_CHARS: usize = 512;
-pub(crate) const TURN_PREFLIGHT_PROVIDER_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const TURN_PREFLIGHT_PROVIDER_DEFAULT_TIMEOUT_MS: u64 = 15_000;
+const TURN_PREFLIGHT_PROVIDER_MAX_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const TURN_PREFLIGHT_PROVIDER_DEFAULT_MAX_OUTPUT_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -419,6 +421,78 @@ pub(crate) struct TurnPreflightProviderAttemptFailure {
     pub provider_call: TurnPreflightProviderCallMetadata,
 }
 
+#[derive(Debug)]
+struct TurnPreflightProviderRequestFailure {
+    stage: &'static str,
+    source: anyhow::Error,
+    failure_class: Option<ProviderFailureClass>,
+    collected_response_chars: usize,
+    collected_response_bytes: usize,
+    collected_response_sha256: Option<String>,
+}
+
+impl TurnPreflightProviderRequestFailure {
+    fn provider_error(
+        provider: &dyn Provider,
+        stage: &'static str,
+        failure_stage: ProviderFailureStage,
+        source: impl Into<anyhow::Error>,
+    ) -> Self {
+        let source = source.into();
+        let failure_class = provider
+            .classify_failure(&source)
+            .map(|classification| classification.class)
+            .unwrap_or_else(|| {
+                super::provider::classify_provider_failure_message(
+                    format!("{source:#}").as_str(),
+                    failure_stage,
+                )
+            });
+        Self {
+            stage,
+            source,
+            failure_class: Some(failure_class),
+            collected_response_chars: 0,
+            collected_response_bytes: 0,
+            collected_response_sha256: None,
+        }
+    }
+
+    fn response_validation(
+        stage: &'static str,
+        source: impl Into<anyhow::Error>,
+        response: &str,
+    ) -> Self {
+        Self {
+            stage,
+            source: source.into(),
+            failure_class: None,
+            collected_response_chars: response.chars().count(),
+            collected_response_bytes: response.len(),
+            collected_response_sha256: Some(turn_preflight_response_sha256(response)),
+        }
+    }
+
+    fn with_response_prefix(mut self, response: &str) -> Self {
+        self.collected_response_chars = response.chars().count();
+        self.collected_response_bytes = response.len();
+        self.collected_response_sha256 = Some(turn_preflight_response_sha256(response));
+        self
+    }
+
+    fn is_transient_network(&self) -> bool {
+        self.failure_class == Some(ProviderFailureClass::NetworkTransient)
+    }
+}
+
+impl fmt::Display for TurnPreflightProviderRequestFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {:#}", self.stage, self.source)
+    }
+}
+
+impl Error for TurnPreflightProviderRequestFailure {}
+
 pub(crate) async fn call_turn_preflight_provider(
     input: TurnPreflightProviderCallInput,
 ) -> TurnPreflightProviderCallResult {
@@ -448,7 +522,7 @@ pub(crate) async fn call_turn_preflight_provider(
     let timeout_ms = input
         .timeout_ms
         .max(1)
-        .min(TURN_PREFLIGHT_PROVIDER_DEFAULT_TIMEOUT_MS.saturating_mul(10));
+        .min(TURN_PREFLIGHT_PROVIDER_MAX_TIMEOUT_MS);
     let max_output_chars = input.max_output_chars.max(1);
 
     let result = call_turn_preflight_provider_once(
@@ -522,7 +596,7 @@ async fn call_turn_preflight_provider_once(
     let elapsed_ms = elapsed_ms(started);
     let raw = match response {
         Err(_) => {
-            tracing::error!(
+            tracing::warn!(
                 target: "pioneer::turn_preflight",
                 stage = "provider_timeout",
                 provider = endpoint.provider_name,
@@ -531,7 +605,7 @@ async fn call_turn_preflight_provider_once(
                 timeout_ms,
                 elapsed_ms,
                 input_chars,
-                "turn preflight provider request timed out"
+                "turn preflight provider request timed out; using local fallback"
             );
             return Err(turn_preflight_attempt_failure(
                 TurnPreflightFallbackReason::Timeout,
@@ -545,17 +619,41 @@ async fn call_turn_preflight_provider_once(
             ));
         }
         Ok(Err(error)) => {
-            tracing::error!(
-                target: "pioneer::turn_preflight",
-                stage = "provider_request",
-                provider = endpoint.provider_name,
-                model = endpoint.model,
-                attempt,
-                elapsed_ms,
-                input_chars,
-                error = %format!("{error:#}"),
-                "turn preflight provider request failed"
-            );
+            if let Some(failure) = error.downcast_ref::<TurnPreflightProviderRequestFailure>() {
+                if failure.is_transient_network() {
+                    tracing::warn!(
+                        target: "pioneer::turn_preflight",
+                        stage = failure.stage,
+                        provider = endpoint.provider_name,
+                        model = endpoint.model,
+                        attempt,
+                        elapsed_ms,
+                        input_chars,
+                        failure_class = ?failure.failure_class,
+                        collected_response_chars = failure.collected_response_chars,
+                        collected_response_bytes = failure.collected_response_bytes,
+                        collected_response_sha256 = ?failure.collected_response_sha256,
+                        error = %format!("{:#}", failure.source),
+                        "turn preflight network request failed; using local fallback"
+                    );
+                } else {
+                    tracing::error!(
+                        target: "pioneer::turn_preflight",
+                        stage = failure.stage,
+                        provider = endpoint.provider_name,
+                        model = endpoint.model,
+                        attempt,
+                        elapsed_ms,
+                        input_chars,
+                        failure_class = ?failure.failure_class,
+                        collected_response_chars = failure.collected_response_chars,
+                        collected_response_bytes = failure.collected_response_bytes,
+                        collected_response_sha256 = ?failure.collected_response_sha256,
+                        error = %format!("{:#}", failure.source),
+                        "turn preflight provider response failed"
+                    );
+                }
+            }
             return Err(turn_preflight_attempt_failure(
                 TurnPreflightFallbackReason::ProviderError,
                 "preflight.provider.error",
@@ -746,71 +844,49 @@ async fn request_turn_preflight_provider_json(
     let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
         let mut stream = provider.stream_chat(request).await.map_err(|error| {
-            tracing::error!(
-                target: "pioneer::turn_preflight",
-                stage = "provider_stream_start",
-                provider = provider.name(),
-                model,
-                attempt,
-                error = %format!("{error:#}"),
-                "turn preflight provider stream start failed"
-            );
-            error
+            TurnPreflightProviderRequestFailure::provider_error(
+                provider,
+                "provider_stream_start",
+                ProviderFailureStage::Connect,
+                error,
+            )
         })?;
         let mut text = String::new();
         while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
             let chunk = chunk.map_err(|error| {
-                tracing::error!(
-                    target: "pioneer::turn_preflight",
-                    stage = "provider_stream_item",
-                    provider = provider.name(),
-                    model,
-                    attempt,
-                    collected_response_chars = text.chars().count(),
-                    collected_response_bytes = text.len(),
-                    collected_response_sha256 = %turn_preflight_response_sha256(text.as_str()),
-                    error = %format!("{error:#}"),
-                    "turn preflight provider stream item failed"
-                );
-                error
+                let failure_stage = if text.is_empty() {
+                    ProviderFailureStage::FirstChunk
+                } else {
+                    ProviderFailureStage::MidStream
+                };
+                TurnPreflightProviderRequestFailure::provider_error(
+                    provider,
+                    "provider_stream_item",
+                    failure_stage,
+                    error,
+                )
+                .with_response_prefix(text.as_str())
             })?;
             limits.validate_stream_chunk(&chunk).map_err(|error| {
-                tracing::error!(
-                    target: "pioneer::turn_preflight",
-                    stage = "stream_chunk_validation",
-                    provider = provider.name(),
-                    model,
-                    attempt,
-                    collected_response_chars = text.chars().count(),
-                    collected_response_bytes = text.len(),
-                    collected_response_sha256 = %turn_preflight_response_sha256(text.as_str()),
-                    error = %format!("{error:#}"),
-                    "turn preflight stream chunk validation failed"
-                );
-                error
+                TurnPreflightProviderRequestFailure::response_validation(
+                    "stream_chunk_validation",
+                    error,
+                    text.as_str(),
+                )
             })?;
             let next_chars = text
                 .chars()
                 .count()
                 .saturating_add(chunk.delta.chars().count());
             if next_chars > max_output_chars {
-                tracing::error!(
-                    target: "pioneer::turn_preflight",
-                    stage = "stream_response_size_validation",
-                    provider = provider.name(),
-                    model,
-                    attempt,
-                    collected_response_chars = text.chars().count(),
-                    collected_response_bytes = text.len(),
-                    collected_response_sha256 = %turn_preflight_response_sha256(text.as_str()),
-                    next_response_chars = next_chars,
-                    max_output_chars,
-                    "turn preflight streaming response size validation failed"
-                );
-                return Err(ProviderResponseTooLarge::new(
-                    "preflight_response_text",
-                    max_output_chars,
-                    next_chars,
+                return Err(TurnPreflightProviderRequestFailure::response_validation(
+                    "stream_response_size_validation",
+                    ProviderResponseTooLarge::new(
+                        "preflight_response_text",
+                        max_output_chars,
+                        next_chars,
+                    ),
+                    text.as_str(),
                 )
                 .into());
             }
@@ -823,50 +899,30 @@ async fn request_turn_preflight_provider_json(
     }
 
     let response = provider.chat(request).await.map_err(|error| {
-        tracing::error!(
-            target: "pioneer::turn_preflight",
-            stage = "provider_non_stream_response",
-            provider = provider.name(),
-            model,
-            attempt,
-            error = %format!("{error:#}"),
-            "turn preflight non-stream provider request failed"
-        );
-        error
+        TurnPreflightProviderRequestFailure::provider_error(
+            provider,
+            "provider_non_stream_response",
+            ProviderFailureStage::Connect,
+            error,
+        )
     })?;
     limits.validate_chat_response(&response).map_err(|error| {
-        tracing::error!(
-            target: "pioneer::turn_preflight",
-            stage = "non_stream_response_validation",
-            provider = provider.name(),
-            model,
-            attempt,
-            response_chars = response.text.chars().count(),
-            response_bytes = response.text.len(),
-            response_sha256 = %turn_preflight_response_sha256(response.text.as_str()),
-            error = %format!("{error:#}"),
-            "turn preflight non-stream response validation failed"
-        );
-        error
+        TurnPreflightProviderRequestFailure::response_validation(
+            "non_stream_response_validation",
+            error,
+            response.text.as_str(),
+        )
     })?;
     let output_chars = response.text.chars().count();
     if output_chars > max_output_chars {
-        tracing::error!(
-            target: "pioneer::turn_preflight",
-            stage = "non_stream_response_size_validation",
-            provider = provider.name(),
-            model,
-            attempt,
-            output_chars,
-            max_output_chars,
-            response_bytes = response.text.len(),
-            response_sha256 = %turn_preflight_response_sha256(response.text.as_str()),
-            "turn preflight non-stream response size validation failed"
-        );
-        return Err(ProviderResponseTooLarge::new(
-            "preflight_response_text",
-            max_output_chars,
-            output_chars,
+        return Err(TurnPreflightProviderRequestFailure::response_validation(
+            "non_stream_response_size_validation",
+            ProviderResponseTooLarge::new(
+                "preflight_response_text",
+                max_output_chars,
+                output_chars,
+            ),
+            response.text.as_str(),
         )
         .into());
     }
@@ -2018,6 +2074,14 @@ mod tests {
                 name,
                 true,
                 [FakePreflightResponse::Text(text.into())],
+            ))
+        }
+
+        fn streaming_failing(name: impl Into<String>, error: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self::new(
+                name,
+                true,
+                [FakePreflightResponse::Error(error.into())],
             ))
         }
 
@@ -3204,6 +3268,49 @@ mod tests {
         assert!(requests[0].tools.is_none());
         assert!(requests[0].tool_choice.is_none());
         assert_eq!(requests[0].compiled_prompt, None);
+    }
+
+    #[tokio::test]
+    async fn preflight_stream_start_failure_uses_one_attempt_then_local_fallback() {
+        let provider = FakePreflightProvider::streaming_failing(
+            "preflight-provider",
+            "tunnel error: unexpected end of file",
+        );
+        let classified = TurnPreflightProviderRequestFailure::provider_error(
+            provider.as_ref(),
+            "provider_stream_start",
+            ProviderFailureStage::Connect,
+            anyhow::anyhow!("tunnel error: unexpected end of file"),
+        );
+        assert!(classified.is_transient_network());
+        let endpoint = provider_endpoint(provider.clone(), "preflight-provider", "preflight-model");
+        let local_modules = sample_provider_needed_modules();
+
+        let result = call_turn_preflight_provider(provider_call_input(endpoint)).await;
+        let failure = match &result {
+            TurnPreflightProviderCallResult::Failure(failure) => failure,
+            TurnPreflightProviderCallResult::Success(success) => {
+                panic!("expected provider failure, got {success:?}")
+            }
+        };
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(failure.attempts.len(), 1);
+        assert_eq!(failure.attempts[0].provider_call.attempt, 1);
+
+        let plan = compose_turn_preflight_plan(&local_modules, result);
+        assert_eq!(plan.source, TurnPreflightPlanSource::Fallback);
+        assert!(plan.diagnostics.preflight_failed);
+    }
+
+    #[test]
+    fn preflight_invalid_provider_response_is_not_a_transient_network_failure() {
+        let failure = TurnPreflightProviderRequestFailure::response_validation(
+            "response_json_parse",
+            anyhow::anyhow!("invalid provider response"),
+            "{",
+        );
+
+        assert!(!failure.is_transient_network());
     }
 
     #[tokio::test]

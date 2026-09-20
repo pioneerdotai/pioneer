@@ -1419,6 +1419,8 @@ fn classify_provider_failure_class(
         || message_lower.contains("connection")
         || message_lower.contains("dns")
         || message_lower.contains("timed out")
+        || message_lower.contains("tunnel error")
+        || message_lower.contains("unexpected end of file")
         || message_lower.contains("connection reset")
         || message_lower.contains("broken pipe")
     {
