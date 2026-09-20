@@ -44,7 +44,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.53.12"
+version = "0.53.13"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -165,7 +165,7 @@ cpal = "0.18"
 transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
-memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.3", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
+memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.4", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
 
 # Embed
 rust-embed = "8"

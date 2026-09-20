@@ -894,7 +894,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae67d5c03ee972c101a1d8db3ddbf8a9c819ad1ea9d6fd9cd385605547b60edb"
 dependencies = [
  "nix 0.31.3",
- "rand 0.10.2",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -4372,7 +4372,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#f698b4bcac037b8d208b34eca86cc940081c498f"
+source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4409,7 +4409,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#f698b4bcac037b8d208b34eca86cc940081c498f"
+source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4452,7 +4452,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#f698b4bcac037b8d208b34eca86cc940081c498f"
+source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -4463,7 +4463,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#f698b4bcac037b8d208b34eca86cc940081c498f"
+source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -4476,7 +4476,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#f698b4bcac037b8d208b34eca86cc940081c498f"
+source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -6597,7 +6597,7 @@ dependencies = [
  "log",
  "md-5 0.11.0",
  "nom 8.0.0",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rangemap",
  "sha2 0.11.0",
  "stringprep",
@@ -6939,8 +6939,8 @@ dependencies = [
 
 [[package]]
 name = "memvid-core"
-version = "3.1.3"
-source = "git+https://github.com/pioneerdotai/memory?tag=v3.1.3#42a30af5f8fe4200fd8fbc122dd118809cfd4597"
+version = "3.1.4"
+source = "git+https://github.com/pioneerdotai/memory?tag=v3.1.4#2c972f1bc49f6d147de4f9e8737153ab0cdeca58"
 dependencies = [
  "atomic-write-file",
  "base64 0.22.1",
@@ -7419,9 +7419,9 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 
 [[package]]
 name = "normpath"
-version = "1.5.1"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9985ef7269fa99f3b12437bb698381da2428743ab90f20393f399fa14cab21a"
+checksum = "b11ce00d2594068e8a27c9146fdc5cf9f3ac38eb42c7cd34d05fea618873ac9f"
 dependencies = [
  "windows-sys 0.61.2",
 ]
@@ -8860,7 +8860,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8890,7 +8890,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "libc",
@@ -8905,7 +8905,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8930,7 +8930,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -8955,7 +8955,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8977,7 +8977,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "async-trait",
  "libc",
@@ -8991,7 +8991,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9024,7 +9024,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9043,7 +9043,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-compaction"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9056,7 +9056,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "config",
@@ -9067,7 +9067,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9089,7 +9089,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -9138,7 +9138,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-administration"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9152,7 +9152,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-agents-doc"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9163,7 +9163,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-foundation"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9171,7 +9171,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-mcp"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -9183,7 +9183,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-onboarding"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9196,7 +9196,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-providers"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9207,7 +9207,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-settings"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9223,7 +9223,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-skills"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -9235,7 +9235,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-task-notifications"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9247,7 +9247,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-thread"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9271,7 +9271,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-update"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -9288,7 +9288,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-workspaces"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9301,7 +9301,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "sea-orm",
  "serde",
@@ -9309,7 +9309,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9354,7 +9354,7 @@ dependencies = [
  "pioneer-tasks",
  "pioneer-tools",
  "pioneer-tunnel",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest",
  "schemars 1.2.2",
  "sea-orm",
@@ -9379,7 +9379,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -9394,7 +9394,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -9407,7 +9407,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9429,7 +9429,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9453,7 +9453,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9471,7 +9471,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -9488,7 +9488,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9507,7 +9507,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -9522,7 +9522,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9554,7 +9554,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -9564,7 +9564,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "hex",
@@ -9582,7 +9582,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9596,7 +9596,7 @@ dependencies = [
  "owning_ref",
  "pioneer-observability",
  "pretty_assertions",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rusqlite",
  "sea-orm",
  "sea-orm-migration",
@@ -9609,7 +9609,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9631,7 +9631,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9670,7 +9670,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.53.12"
+version = "0.53.13"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -10225,7 +10225,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_pcg 0.10.2",
  "ring",
  "rustc-hash 2.1.3",
@@ -10303,9 +10303,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -12755,7 +12755,7 @@ dependencies = [
  "log",
  "md-5 0.11.0",
  "memchr",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -14340,7 +14340,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rustls",
  "rustls-pki-types",
  "sha1 0.11.0",
@@ -14549,7 +14549,7 @@ version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 dependencies = [
- "rand 0.10.2",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -16589,7 +16589,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "percent-encoding",
  "pipewire",
- "rand 0.10.2",
+ "rand 0.10.3",
  "scopeguard",
  "serde",
  "thiserror 2.0.20",
