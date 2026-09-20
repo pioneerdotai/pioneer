@@ -270,6 +270,34 @@ struct StreamDelta {
     function_call: Option<StreamToolFunctionDelta>,
 }
 
+impl StreamDelta {
+    fn has_payload(&self) -> bool {
+        self.content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning_details
+                .as_ref()
+                .is_some_and(|details| !details.is_empty())
+            || self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(StreamToolCallDelta::has_payload))
+            || self
+                .function_call
+                .as_ref()
+                .is_some_and(StreamToolFunctionDelta::has_payload)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StreamError {
     #[serde(default)]
@@ -993,9 +1021,11 @@ impl crate::traits::Provider for OpenRouterProvider {
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
-                            if terminal_reason.is_some() && !resp.choices.is_empty() {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
                                 let _ = tx
-                                    .send(Err(anyhow!("provider sent choices after finish_reason")))
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
                                     .await;
                                 return;
                             }
@@ -1025,6 +1055,17 @@ impl crate::traits::Provider for OpenRouterProvider {
                                 return;
                             }
                             for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 if let Some(details) = choice.delta.reasoning_details {
                                     reasoning_details.extend(details);
                                 }
@@ -1809,6 +1850,37 @@ mod tests {
         let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}]}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(!response.choices[0].delta.has_payload());
+    }
+
+    #[test]
+    fn stream_response_distinguishes_empty_terminal_repeats_from_real_payload() {
+        for json in [
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{"content":"","reasoning":"","tool_calls":[],"function_call":{}},"finish_reason":"stop"}]}"#,
+        ] {
+            let response: StreamResponse = serde_json::from_str(json).unwrap();
+            assert!(!response.choices[0].delta.has_payload(), "{json}");
+        }
+
+        for json in [
+            r#"{"choices":[{"delta":{"content":"late"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"late"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"late"}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"late"}}]},"finish_reason":null}]}"#,
+        ] {
+            let response: StreamResponse = serde_json::from_str(json).unwrap();
+            assert!(response.choices[0].delta.has_payload(), "{json}");
+        }
+    }
+
+    #[test]
+    fn stream_response_allows_usage_with_empty_post_terminal_choices() {
+        let json = r#"{"usage":{"prompt_tokens":42,"completion_tokens":15},"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+        let response: StreamResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.usage.is_some());
+        assert!(!response.choices[0].delta.has_payload());
     }
 
     #[test]

@@ -272,6 +272,30 @@ struct StreamDelta {
     function_call: Option<StreamToolFunctionDelta>,
 }
 
+impl StreamDelta {
+    fn has_payload(&self) -> bool {
+        self.content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(StreamToolCallDelta::has_payload))
+            || self
+                .function_call
+                .as_ref()
+                .is_some_and(StreamToolFunctionDelta::has_payload)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StreamError {
     #[serde(default)]
@@ -1224,9 +1248,11 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
 
                     match serde_json::from_str::<StreamResponse>(data) {
                         Ok(resp) => {
-                            if terminal_reason.is_some() && !resp.choices.is_empty() {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
                                 let _ = tx
-                                    .send(Err(anyhow!("provider sent choices after finish_reason")))
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
                                     .await;
                                 return;
                             }
@@ -1257,6 +1283,17 @@ impl crate::traits::Provider for OpenAiCompatibleProvider {
                                 return;
                             }
                             for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 if let Some(rc) =
                                     choice.delta.reasoning_content.or(choice.delta.reasoning)
                                 {

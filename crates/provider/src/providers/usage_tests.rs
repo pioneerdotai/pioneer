@@ -1,5 +1,5 @@
 //! HTTP fixtures exercise the production stream decoder; no external service.
-use super::{AnthropicProvider, OpenAiProvider};
+use super::{AnthropicProvider, OpenAiProvider, OpenRouterProvider};
 use crate::{ChatMessage, ChatRequest, Provider, TokenUsage};
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +67,7 @@ async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"Привет\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":140,\"completion_tokens\":9,\"prompt_tokens_details\":{\"cached_tokens\":100}}}\n\n",
         "data: [DONE]\n\n").to_owned();
     let (url, server) = fixture(body).await;
@@ -99,6 +100,74 @@ async fn openai_usage_after_finish_is_read_before_terminal_without_cache_double_
         server.await.unwrap()["stream_options"]["include_usage"],
         true
     );
+}
+
+#[tokio::test]
+async fn openrouter_ignores_repeated_empty_terminal_choice_and_preserves_usage() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"memory\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let (url, server) = fixture(body).await;
+    let provider = OpenRouterProvider::with_base_url("fixture-key", url);
+    let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
+        "usage-fixture-authority".into(),
+        provider.stream_chat(request()),
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await;
+
+    assert!(chunks.iter().all(Result::is_ok));
+    let chunks = chunks.into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.delta.as_str())
+            .collect::<String>(),
+        "memory"
+    );
+    let usage = chunks
+        .iter()
+        .find_map(|chunk| chunk.usage.as_ref())
+        .expect("usage frame should be preserved");
+    assert_eq!(usage.input_tokens, Some(12));
+    assert_eq!(usage.output_tokens, Some(3));
+    assert!(chunks.last().is_some_and(|chunk| chunk.is_final));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn openai_rejects_real_payload_after_finish_reason() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_owned();
+    let (url, server) = fixture(body).await;
+    let provider = OpenAiProvider::with_base_url("fixture-key", url);
+    let chunks: Vec<_> = crate::attachments::runtime::with_async_authority_scope(
+        "usage-fixture-authority".into(),
+        provider.stream_chat(request()),
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await;
+
+    assert!(chunks.iter().any(|chunk| {
+        chunk.as_ref().is_err_and(|error| {
+            error
+                .to_string()
+                .contains("provider sent payload after finish_reason")
+        })
+    }));
+    server.await.unwrap();
 }
 
 #[tokio::test]

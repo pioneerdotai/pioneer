@@ -18,12 +18,37 @@ pub(crate) struct StreamToolCallDelta {
     pub(crate) arguments: Option<String>,
 }
 
+impl StreamToolCallDelta {
+    pub(crate) fn has_payload(&self) -> bool {
+        self.id.as_deref().is_some_and(|value| !value.is_empty())
+            || self.name.as_deref().is_some_and(|value| !value.is_empty())
+            || self
+                .arguments
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .function
+                .as_ref()
+                .is_some_and(StreamToolFunctionDelta::has_payload)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct StreamToolFunctionDelta {
     #[serde(default)]
     pub(crate) name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_argument_fragment")]
     pub(crate) arguments: Option<String>,
+}
+
+impl StreamToolFunctionDelta {
+    pub(crate) fn has_payload(&self) -> bool {
+        self.name.as_deref().is_some_and(|value| !value.is_empty())
+            || self
+                .arguments
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +172,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_delta_payload_detection_ignores_empty_structural_frames() {
+        let empty: StreamToolCallDelta = serde_json::from_str(r#"{"index":0,"function":{}}"#)
+            .expect("empty structural tool delta should deserialize");
+        let populated: StreamToolCallDelta =
+            serde_json::from_str(r#"{"index":0,"function":{"arguments":"{}"}}"#)
+                .expect("populated tool delta should deserialize");
+
+        assert!(!empty.has_payload());
+        assert!(populated.has_payload());
+    }
 
     #[test]
     fn accumulates_incremental_tool_call_arguments() {
