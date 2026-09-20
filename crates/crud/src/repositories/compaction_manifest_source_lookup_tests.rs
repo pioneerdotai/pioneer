@@ -1,9 +1,12 @@
 use super::*;
 use crate::CrudStore;
-use migration::Migrator;
+use migration::{Migrator, MigratorTrait};
+use pioneer_compaction::runner::{RunnerPhase, RunnerState, SourceCursor};
+use pioneer_compaction::{ModelSelection, Transport};
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 struct TestFile(PathBuf);
 
@@ -17,6 +20,7 @@ impl Drop for TestFile {
 
 struct Fixture {
     store: CrudStore,
+    writer: SqliteWriteExecutor,
     _file: TestFile,
 }
 
@@ -24,13 +28,25 @@ impl Fixture {
     fn db(&self) -> SqliteDatabase {
         self.store.database_connection()
     }
+
+    fn arm_publication_hook(
+        &self,
+        operation: &str,
+        phase: PublicationTestPause,
+    ) -> PublicationTestHookHandle {
+        arm_publication_test_hook(&self.store, operation, phase)
+    }
 }
 
-async fn open(path: &Path) -> CrudStore {
+async fn open(path: &Path) -> (CrudStore, SqliteWriteExecutor) {
     let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
     options.max_connections(1).min_connections(1);
     let writer_connection = Database::connect(options).await.unwrap();
     let writer = SqliteWriteExecutor::new(writer_connection);
+    writer
+        .apply_pragmas(SqliteWriteClass::Maintenance)
+        .await
+        .unwrap();
     writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
@@ -39,11 +55,33 @@ async fn open(path: &Path) -> CrudStore {
     let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
     options.max_connections(1).min_connections(1);
     let reader = Database::connect(options).await.unwrap();
+    let journal_mode: String = reader
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA journal_mode".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "journal_mode")
+        .unwrap();
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
     reader
         .execute_unprepared("PRAGMA query_only=ON")
         .await
         .unwrap();
-    CrudStore::new(SqliteDatabase::from_executor(reader, writer)).with_maintenance_access()
+    let store = CrudStore::new(SqliteDatabase::from_executor(reader, writer.clone()))
+        .with_maintenance_access();
+    // `apply_pragmas` is the supported way to put this fixture in WAL mode,
+    // but it also applies the production `foreign_keys=OFF` setting. Restore
+    // the fixture's pre-existing FK semantics so cascade assertions keep
+    // exercising the same database behavior they did before WAL was explicit.
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=ON")
+        .await
+        .unwrap();
+    (store, writer)
 }
 
 async fn fixture() -> Fixture {
@@ -52,7 +90,7 @@ async fn fixture() -> Fixture {
         "pioneer-manifest-source-lookups-{}.sqlite",
         uuid::Uuid::new_v4()
     )));
-    let store = open(&file.0).await;
+    let (store, writer) = open(&file.0).await;
     let db = store.database_connection();
     for sql in [
         "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
@@ -87,7 +125,11 @@ async fn fixture() -> Fixture {
     db.execute_unprepared("DELETE FROM compaction_task_basis_revision WHERE run_id='basis-run'")
         .await
         .unwrap();
-    Fixture { store, _file: file }
+    Fixture {
+        store,
+        writer,
+        _file: file,
+    }
 }
 
 #[derive(Clone)]
@@ -1710,4 +1752,1858 @@ async fn production_plan_scopes_plain_source_and_logical_frozen_view_lookups() {
 async fn production_plan_scopes_zstd_source_and_logical_frozen_view_lookups() {
     let plan = production_plan(true).await;
     assert_production_plan(&plan, true);
+}
+
+async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usize) -> RunnerState {
+    assert!(sources > 0);
+    let db = fixture.db();
+    for ordinal in 0..sources {
+        let id = format!("{operation}-source-{ordinal}");
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_event(\
+                id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+             VALUES (?,'root-thread','root-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+            [id.into(), (10_000_i64 + ordinal as i64).into()],
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_operation(\
+            id,owner,fingerprint,status,snapshot,deadline_ms) \
+         VALUES (?,'root-owner',?,'running',\
+          '{\"plan\":{\"coverage_domain\":\"own_contribution\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0,\"foreign-thread\":0}}',900000)",
+        [operation.into(), operation.into()],
+    ))
+    .await
+    .unwrap();
+    for ordinal in 0..sources {
+        let id = format!("{operation}-source-{ordinal}");
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_manifest(\
+                operation_id,ordinal,unit_ordinal,reference_only,source_thread,\
+                source_scope,source_id,source_version) \
+             VALUES (?,?,?,?,'root-thread','event:root-turn',?,'event-revision:1')",
+            [
+                operation.into(),
+                (ordinal as i64).into(),
+                (ordinal as i64).into(),
+                0_i64.into(),
+                id.into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    let checkpoint = format!("{operation}-checkpoint");
+    let selection = serde_json::to_string(&ModelSelection {
+        transport: Transport::Api,
+        instance: "publication-fixture".into(),
+        model: "publication-model".into(),
+        effort: None,
+    })
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_checkpoint(\
+            id,operation_id,owner,portion,summary,identity_sha256,selection,\
+            projection_version,format_version,status) \
+         VALUES (?,?,'root-owner',0,'prepared summary','candidate-identity',?,0,1,'candidate')",
+        [
+            checkpoint.clone().into(),
+            operation.into(),
+            selection.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    for ordinal in 0..sources {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_coverage(\
+                checkpoint_id,source_scope,source_id,source_version) \
+             VALUES (?,'event:root-turn',?,'event-revision:1')",
+            [
+                checkpoint.clone().into(),
+                format!("{operation}-source-{ordinal}").into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    let state = RunnerState {
+        generation: 7,
+        deadline_ms: 900_000,
+        attempts: 1,
+        retries: 0,
+        corrections: 0,
+        target_tokens: 100,
+        cursor: SourceCursor {
+            unit: sources as u64,
+            ..Default::default()
+        },
+        previous_checkpoint: Some(checkpoint.clone()),
+        phase: RunnerPhase::Commit { checkpoint },
+        observation: None,
+        diagnostic: None,
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES (?,?,?)",
+        [
+            operation.into(),
+            i64::try_from(state.generation).unwrap().into(),
+            serde_json::to_string(&state).unwrap().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    state
+}
+
+async fn publication_preflight(
+    fixture: &Fixture,
+    operation: &str,
+    state: &RunnerState,
+) -> PreparedRunnerPublication {
+    let RunnerPhase::Commit { checkpoint } = &state.phase else {
+        panic!("publication fixture is not in Commit")
+    };
+    fixture
+        .store
+        .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
+        .await
+        .unwrap();
+    prepare_runner_publication(
+        &fixture.store,
+        operation,
+        checkpoint,
+        state.generation,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+async fn assert_positive_publication_preflight(
+    fixture: &Fixture,
+    operation: &str,
+    state: &RunnerState,
+) {
+    let prepared = publication_preflight(fixture, operation, state).await;
+    assert!(
+        prepared.identity_current,
+        "{operation} identity is not current"
+    );
+    assert!(
+        prepared.sources_current,
+        "{operation} fixture is stale before its race mutation"
+    );
+}
+
+async fn source_fence(db: &SqliteDatabase, workspace: &str) -> (i64, i64) {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT mutation_generation,insert_generation \
+             FROM compaction_publication_source_fence WHERE workspace_id=?",
+            [workspace.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        row.try_get("", "mutation_generation").unwrap(),
+        row.try_get("", "insert_generation").unwrap(),
+    )
+}
+
+async fn structural_fence(db: &SqliteDatabase) -> i64 {
+    db.query_one_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT structural_generation FROM compaction_publication_fence WHERE singleton=1"
+            .to_owned(),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get("", "structural_generation")
+    .unwrap()
+}
+
+async fn bind_reference_checkpoint_dag(fixture: &Fixture, operation: &str, retained_middle: bool) {
+    let middle_status = if retained_middle {
+        "retained"
+    } else {
+        "applied"
+    };
+    let db = fixture.db();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_checkpoint(\
+          id,operation_id,owner,previous,portion,summary,identity_sha256,selection,\
+          projection_version,format_version,status) \
+         VALUES ('publication-dag-mid','source-operation','source-owner','source-checkpoint',1,\
+          'mid','publication-dag-mid-version','{}',0,1,?)",
+        [middle_status.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO compaction_checkpoint(\
+          id,operation_id,owner,previous,portion,summary,identity_sha256,selection,\
+          projection_version,format_version,status) \
+         VALUES ('publication-dag-root','source-operation','source-owner','publication-dag-mid',2,\
+          'root','publication-dag-root-version','{}',0,1,'applied')",
+    )
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET reference_only=1,source_thread='source-thread',\
+          source_scope='checkpoint:source-owner',source_id='publication-dag-root',\
+          source_version='publication-dag-root-version' \
+          WHERE operation_id=? AND ordinal=0",
+        [operation.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=?",
+        [format!("{operation}-checkpoint").into()],
+    ))
+    .await
+    .unwrap();
+}
+
+async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nodes: usize) {
+    assert!(nodes > 0);
+    let db = fixture.db();
+    let mut previous = "source-checkpoint".to_owned();
+    for ordinal in 0..nodes {
+        let id = format!("{operation}-dag-{ordinal}");
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_checkpoint(\
+              id,operation_id,owner,previous,portion,summary,identity_sha256,selection,\
+              projection_version,format_version,status) \
+             VALUES (?,'source-operation','source-owner',?,?, 'dag',?,'{}',0,1,'applied')",
+            [
+                id.clone().into(),
+                previous.into(),
+                (ordinal as i64 + 1).into(),
+                format!("{operation}-dag-version-{ordinal}").into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        previous = id;
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET reference_only=1,source_thread='source-thread',\
+          source_scope='checkpoint:source-owner',source_id=?,source_version=? \
+         WHERE operation_id=? AND ordinal=0",
+        [
+            previous.into(),
+            format!("{operation}-dag-version-{}", nodes - 1).into(),
+            operation.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=?",
+        [format!("{operation}-checkpoint").into()],
+    ))
+    .await
+    .unwrap();
+}
+
+async fn bind_publication_foreign_import(fixture: &Fixture, operation: &str, shared_range: bool) {
+    let db = fixture.db();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_manifest SET reference_only=0,source_thread='foreign-thread',\
+          source_scope='event:foreign-turn',source_id='foreign-event',\
+          source_version='event-revision:1' WHERE operation_id=? AND ordinal=0",
+        [operation.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_coverage SET source_scope='event:foreign-turn',\
+          source_id='foreign-event',source_version='event-revision:1' \
+          WHERE checkpoint_id=?",
+        [format!("{operation}-checkpoint").into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO compaction_frozen_history(\
+          id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,\
+          import_count,imports_sha256,next_import,ready) \
+         VALUES ('publication-bound-manifest','ws','root-thread','bound-identity',0,0,1,\
+          'bound-imports',1,1)",
+    )
+    .await
+    .unwrap();
+    let data_manifest = if shared_range {
+        db.execute_unprepared(
+            "INSERT INTO compaction_frozen_history(\
+              id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,\
+              import_count,imports_sha256,next_import,ready) \
+             VALUES ('publication-import-storage','ws','root-thread','storage-identity',0,0,1,\
+              'storage-imports',1,1); \
+             INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) \
+              VALUES ('publication-bound-manifest',1,1,0); \
+             INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) \
+              VALUES ('publication-bound-manifest',1,0,1,'publication-import-storage')",
+        )
+        .await
+        .unwrap();
+        "publication-import-storage"
+    } else {
+        "publication-bound-manifest"
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_import_data(\
+          manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,\
+          source_thread,proof_json,bytes) \
+         VALUES (?,0,0,'event:foreign-turn','foreign-event','event-revision:1',\
+          'foreign-thread','{}',2)",
+        [data_manifest.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_operation_projection(\
+          operation_id,manifest_id,identity_sha256,imports_sha256,import_count) \
+         VALUES (?,'publication-bound-manifest','bound-identity','bound-imports',1)",
+        [operation.into()],
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn publication_fence_mismatch_retries_without_losing_candidate_or_runner_budget() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-retry";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        fixture
+            .db()
+            .begin_read()
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("reader preflight was still reserved before writer publication");
+    fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE turn_llm_context SET payload='{\"changed\":true}' \
+             WHERE id='context-source'",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+
+    let candidate = fixture
+        .store
+        .compaction_checkpoint(&format!("{operation}-checkpoint"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.summary, "prepared summary");
+    let durable = fixture
+        .store
+        .compaction_runner_state(operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable, state, "validation retry consumed runner budget");
+
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE turn_llm_context SET payload='{\"changed_again\":true}' \
+             WHERE id='context-source'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied,
+        "a successful retry must remain idempotent after later source edits"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_success_is_already_applied_even_after_its_fence_bumps() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-concurrent-success";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    let checkpoint = format!("{operation}-checkpoint");
+    let applied_state = state.applied(&checkpoint).unwrap();
+    let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+
+    let txn = fixture.db().begin().await.unwrap();
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_context SET head=? WHERE owner='root-owner' AND head IS NULL",
+        [checkpoint.clone().into()],
+    ))
+    .await
+    .unwrap();
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+        [checkpoint.clone().into()],
+    ))
+    .await
+    .unwrap();
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+        [operation.into()],
+    ))
+    .await
+    .unwrap();
+    txn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_runner_state SET generation=?,state=? WHERE operation_id=?",
+        [
+            i64::try_from(applied_state.generation).unwrap().into(),
+            serde_json::to_string(&applied_state).unwrap().into(),
+            operation.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    txn.commit().await.unwrap();
+
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::AlreadyApplied);
+}
+
+#[tokio::test]
+async fn reader_preflight_is_one_snapshot_and_does_not_reserve_the_writer() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-reader-race";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::ReaderPreflight);
+    let store = fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+
+    // The first fence/identity reads have fixed the reader snapshot, but its
+    // heavy predicates have not run. A separate interactive write must finish
+    // before the test releases that reader barrier.
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        fixture
+            .store
+            .with_interactive_writes()
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE turn_event SET payload='{\"raced\":true}' \
+             WHERE id='publication-reader-race-source-0'",
+            ),
+    )
+    .await
+    .expect("interactive write waited for reader preflight")
+    .unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale,
+        "the retry must see the source edit made after the first snapshot"
+    );
+}
+
+#[tokio::test]
+async fn validation_fence_and_predicates_are_captured_from_the_same_reader_snapshot() {
+    let fixture = fixture().await;
+    let operation = "publication-single-snapshot";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    let checkpoint = format!("{operation}-checkpoint");
+    let before_mutation = source_fence(&fixture.db(), "ws").await;
+    let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::ReaderPreflight);
+    let store = fixture.store.clone();
+    let prepare = tokio::spawn(async move {
+        prepare_runner_publication(&store, operation, &checkpoint, state.generation, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    fixture
+        .store
+        .with_interactive_writes()
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn_event SET payload='{\"new_snapshot\":true}' \
+             WHERE id='publication-single-snapshot-source-0'",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    let prepared = prepare.await.unwrap();
+    assert!(
+        prepared.sources_current,
+        "predicate escaped the snapshot that supplied its old fence"
+    );
+    assert_eq!(prepared.source_mutation_generation, Some(before_mutation.0));
+    assert!(source_fence(&fixture.db(), "ws").await.0 > before_mutation.0);
+}
+
+#[tokio::test]
+async fn delete_reinsert_task_basis_and_coverage_races_retry_then_revalidate() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    for (operation, mutation) in [
+        (
+            "publication-delete",
+            "DELETE FROM turn_event WHERE id='publication-delete-source-0'",
+        ),
+        (
+            "publication-reinsert",
+            "DELETE FROM turn_event WHERE id='publication-reinsert-source-0'; \
+             INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+             VALUES ('publication-reinsert-source-0','root-thread','root-turn',10000,\
+              'fixture','{}',CURRENT_TIMESTAMP)",
+        ),
+        (
+            "publication-manifest-race",
+            "UPDATE compaction_manifest SET source_version='event-revision:99' \
+             WHERE operation_id='publication-manifest-race' AND ordinal=0",
+        ),
+    ] {
+        let case_fixture = fixture().await;
+        let state = publication_candidate(&case_fixture, operation, 1).await;
+        assert_positive_publication_preflight(&case_fixture, operation, &state).await;
+        let mut hook =
+            case_fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+        let store = case_fixture.store.clone();
+        let state_for_task = state.clone();
+        let apply = tokio::spawn(async move {
+            store
+                .compaction_apply_runner(operation, &state_for_task, None)
+                .await
+                .unwrap()
+        });
+        hook.reached().await;
+        case_fixture
+            .db()
+            .execute_unprepared(mutation)
+            .await
+            .unwrap();
+        hook.release();
+        assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+        assert_eq!(
+            case_fixture
+                .store
+                .compaction_apply_runner(operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Stale,
+            "{operation} did not revalidate its changed dependency"
+        );
+    }
+
+    let basis_shape_fixture = fixture().await;
+    let operation = "publication-task-basis-race";
+    let state = publication_candidate(&basis_shape_fixture, operation, 1).await;
+    basis_shape_fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE compaction_manifest SET reference_only=1,source_thread='source-thread',\
+          source_scope='task-basis:basis-run',source_id='basis-run',\
+          source_version='task-basis-revision:1' \
+         WHERE operation_id='publication-task-basis-race' AND ordinal=0; \
+         DELETE FROM compaction_coverage \
+          WHERE checkpoint_id='publication-task-basis-race-checkpoint'",
+        )
+        .await
+        .unwrap();
+    assert_positive_publication_preflight(&basis_shape_fixture, operation, &state).await;
+    let mut hook =
+        basis_shape_fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = basis_shape_fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    basis_shape_fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE task_run_conversation_snapshot SET history_json='{}' WHERE run_id='basis-run'",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+    assert_eq!(
+        basis_shape_fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+
+    let basis_revision_fixture = fixture().await;
+    let operation = "publication-task-basis-revision-race";
+    let state = publication_candidate(&basis_revision_fixture, operation, 1).await;
+    basis_revision_fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE compaction_manifest SET reference_only=1,source_thread='source-thread',\
+          source_scope='task-basis:basis-run',source_id='basis-run',\
+          source_version='task-basis-revision:1' \
+         WHERE operation_id='publication-task-basis-revision-race' AND ordinal=0; \
+         DELETE FROM compaction_coverage \
+          WHERE checkpoint_id='publication-task-basis-revision-race-checkpoint'",
+        )
+        .await
+        .unwrap();
+    assert_positive_publication_preflight(&basis_revision_fixture, operation, &state).await;
+    let mut hook =
+        basis_revision_fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = basis_revision_fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    basis_revision_fixture
+        .db()
+        .execute_unprepared(
+            "INSERT INTO compaction_task_basis_revision(run_id,revision) VALUES ('basis-run',2)",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+    assert_eq!(
+        basis_revision_fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale,
+        "an explicit task-basis revision reused the fallback-revision proof"
+    );
+
+    let coverage_fixture = fixture().await;
+    let operation = "publication-coverage-race";
+    let state = publication_candidate(&coverage_fixture, operation, 1).await;
+    assert_positive_publication_preflight(&coverage_fixture, operation, &state).await;
+    let mut hook =
+        coverage_fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = coverage_fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    coverage_fixture
+        .db()
+        .execute_unprepared(
+            "INSERT INTO compaction_coverage(\
+          checkpoint_id,source_scope,source_id,source_version) \
+         VALUES ('publication-coverage-race-checkpoint','context:source-turn',\
+          'context-source','revision:1')",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+    assert_eq!(
+        coverage_fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+}
+
+#[tokio::test]
+async fn projection_and_frozen_storage_races_retry_then_revalidate() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    for (operation, shared_range, mutation) in [
+        (
+            "publication-projection-race",
+            false,
+            "UPDATE compaction_operation_projection SET identity_sha256='wrong' \
+             WHERE operation_id='publication-projection-race'",
+        ),
+        (
+            "publication-frozen-metadata-race",
+            false,
+            "UPDATE compaction_frozen_history SET ready=0 \
+             WHERE id='publication-bound-manifest'",
+        ),
+        (
+            "publication-ordinary-frozen-race",
+            false,
+            "UPDATE compaction_frozen_import_data SET source_version='event-revision:2' \
+             WHERE manifest_id='publication-bound-manifest' AND ordinal=0",
+        ),
+        (
+            "publication-shared-frozen-race",
+            true,
+            "UPDATE compaction_frozen_import_data SET source_version='event-revision:2' \
+             WHERE manifest_id='publication-import-storage' AND ordinal=0",
+        ),
+    ] {
+        let fixture = fixture().await;
+        let state = publication_candidate(&fixture, operation, 1).await;
+        bind_publication_foreign_import(&fixture, operation, shared_range).await;
+        assert_positive_publication_preflight(&fixture, operation, &state).await;
+        let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+        let store = fixture.store.clone();
+        let state_for_task = state.clone();
+        let apply = tokio::spawn(async move {
+            store
+                .compaction_apply_runner(operation, &state_for_task, None)
+                .await
+                .unwrap()
+        });
+        hook.reached().await;
+        fixture.db().execute_unprepared(mutation).await.unwrap();
+        hook.release();
+        assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+        assert_eq!(
+            fixture
+                .store
+                .compaction_apply_runner(operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Stale,
+            "{operation} reused a changed projection/frozen proof"
+        );
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_dag_status_delete_and_dependency_operation_races_are_fenced() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    for (operation, retained, mutation) in [
+        (
+            "publication-dag-status",
+            false,
+            "UPDATE compaction_checkpoint SET status='failed' \
+             WHERE id='publication-dag-mid'",
+        ),
+        (
+            "publication-dag-delete",
+            false,
+            "DELETE FROM compaction_checkpoint WHERE id='publication-dag-mid'",
+        ),
+        (
+            "publication-dag-operation",
+            true,
+            "UPDATE compaction_operation SET status='running' WHERE id='source-operation'",
+        ),
+    ] {
+        let fixture = fixture().await;
+        let state = publication_candidate(&fixture, operation, 1).await;
+        bind_reference_checkpoint_dag(&fixture, operation, retained).await;
+        assert_positive_publication_preflight(&fixture, operation, &state).await;
+        let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+        let store = fixture.store.clone();
+        let state_for_task = state.clone();
+        let apply = tokio::spawn(async move {
+            store
+                .compaction_apply_runner(operation, &state_for_task, None)
+                .await
+                .unwrap()
+        });
+        hook.reached().await;
+        fixture.db().execute_unprepared(mutation).await.unwrap();
+        hook.release();
+        assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+        assert_eq!(
+            fixture
+                .store
+                .compaction_apply_runner(operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Stale,
+            "{operation} reused a proof after its checkpoint DAG changed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn positive_preflight_ignores_pure_append_but_retries_create_then_complete() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let append_fixture = fixture().await;
+    let operation = "publication-append";
+    let state = publication_candidate(&append_fixture, operation, 1).await;
+    assert_positive_publication_preflight(&append_fixture, operation, &state).await;
+    let mut hook =
+        append_fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = append_fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    append_fixture.db().execute_unprepared(
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+         VALUES ('post-proof-append','root-thread','root-turn',20000,'fixture','{}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::Applied);
+
+    let streaming_fixture = fixture().await;
+    let operation = "publication-stream-complete";
+    let state = publication_candidate(&streaming_fixture, operation, 1).await;
+    assert_positive_publication_preflight(&streaming_fixture, operation, &state).await;
+    let mut hook =
+        streaming_fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = streaming_fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    streaming_fixture
+        .db()
+        .execute_unprepared(
+            "INSERT INTO turn_item(\
+          id,turn_id,item_id,item_type,status,payload,created_at,updated_at) \
+         VALUES ('streaming-user','root-turn','streaming-user','user_message',NULL,'{}',\
+          CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+         UPDATE turn_item SET status='completed',payload='{\"done\":true}' \
+          WHERE id='streaming-user'",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+    assert_eq!(
+        streaming_fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied,
+        "finite streaming churn must still make publication progress"
+    );
+}
+
+#[tokio::test]
+async fn negative_preflight_retries_when_missing_source_is_inserted() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-negative-insert";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE compaction_manifest SET source_id='publication-late-source' \
+              WHERE operation_id='publication-negative-insert'; \
+             UPDATE compaction_coverage SET source_id='publication-late-source' \
+              WHERE checkpoint_id='publication-negative-insert-checkpoint'",
+        )
+        .await
+        .unwrap();
+    let prepared = publication_preflight(&fixture, operation, &state).await;
+    assert!(prepared.identity_current);
+    assert!(!prepared.sources_current);
+    let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = fixture.store.clone();
+    let state_for_task = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &state_for_task, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    let source_before = source_fence(&fixture.db(), "ws").await;
+    let structural_before = structural_fence(&fixture.db()).await;
+    fixture.db().execute_unprepared(
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+         VALUES ('publication-late-source','root-thread','root-turn',30001,'fixture','{}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let source_after = source_fence(&fixture.db(), "ws").await;
+    assert_eq!(source_after.0, source_before.0);
+    assert!(source_after.1 > source_before.1);
+    assert_eq!(structural_fence(&fixture.db()).await, structural_before);
+    hook.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+}
+
+#[tokio::test]
+async fn stable_negative_preflight_is_final_stale() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-stable-negative";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    fixture
+        .db()
+        .execute_unprepared(
+            "UPDATE compaction_manifest SET source_id='publication-never-created' \
+              WHERE operation_id='publication-stable-negative'; \
+             UPDATE compaction_coverage SET source_id='publication-never-created' \
+              WHERE checkpoint_id='publication-stable-negative-checkpoint'",
+        )
+        .await
+        .unwrap();
+    let prepared = publication_preflight(&fixture, operation, &state).await;
+    assert!(prepared.identity_current);
+    assert!(!prepared.sources_current);
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+}
+
+#[tokio::test]
+async fn repeated_streaming_mutations_retry_without_consuming_commit_state_then_progress() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-stream-churn";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    for revision in 0..4 {
+        let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+        let store = fixture.store.clone();
+        let state_for_task = state.clone();
+        let apply = tokio::spawn(async move {
+            store
+                .compaction_apply_runner(operation, &state_for_task, None)
+                .await
+                .unwrap()
+        });
+        hook.reached().await;
+        fixture
+            .db()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE turn_llm_context SET payload=? WHERE id='context-source'",
+                [format!("{{\"stream_revision\":{revision}}}").into()],
+            ))
+            .await
+            .unwrap();
+        hook.release();
+        assert_eq!(apply.await.unwrap(), CommitOutcome::RetryValidation);
+        assert_eq!(
+            fixture
+                .store
+                .compaction_runner_state(operation)
+                .await
+                .unwrap()
+                .unwrap(),
+            state
+        );
+    }
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied,
+        "publication did not progress after streaming reached a stable window"
+    );
+}
+
+#[tokio::test]
+async fn publication_hook_is_scoped_to_one_database_with_reused_operation_id() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let first = fixture().await;
+    let second = fixture().await;
+    let operation = "publication-shared-operation-id";
+    let first_state = publication_candidate(&first, operation, 1).await;
+    let second_state = publication_candidate(&second, operation, 1).await;
+    let mut hook = first.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+
+    let second_outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        second
+            .store
+            .compaction_apply_runner(operation, &second_state, None),
+    )
+    .await
+    .expect("a hook from another database intercepted publication")
+    .unwrap();
+    assert_eq!(second_outcome, CommitOutcome::Applied);
+
+    let first_store = first.store.clone();
+    let first_apply = tokio::spawn(async move {
+        first_store
+            .compaction_apply_runner(operation, &first_state, None)
+            .await
+            .unwrap()
+    });
+    hook.reached().await;
+    hook.release();
+    assert_eq!(first_apply.await.unwrap(), CommitOutcome::Applied);
+}
+
+#[tokio::test]
+async fn publication_hook_is_consumed_by_only_one_concurrent_publication() {
+    let fixture = fixture().await;
+    let operation = "publication-single-consumer-hook";
+    let mut hook = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let (completed, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let store = fixture.store.clone();
+        let completed = completed.clone();
+        tasks.push(tokio::spawn(async move {
+            trigger_publication_test_hook(&store, operation, PublicationTestPause::BeforeWriter)
+                .await;
+            completed.send(()).unwrap();
+        }));
+    }
+    drop(completed);
+    hook.reached().await;
+
+    tokio::time::timeout(Duration::from_secs(10), received.recv())
+        .await
+        .expect("both concurrent callers consumed one hook")
+        .expect("unpaused hook caller ended without reporting completion");
+    let mut replacement =
+        fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    hook.release();
+    tokio::time::timeout(Duration::from_secs(10), received.recv())
+        .await
+        .expect("the paused hook caller did not resume")
+        .expect("paused hook caller ended without reporting completion");
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let store = fixture.store.clone();
+    let replacement_task = tokio::spawn(async move {
+        trigger_publication_test_hook(&store, operation, PublicationTestPause::BeforeWriter).await;
+    });
+    replacement.reached().await;
+    replacement.release();
+    replacement_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn aborted_publication_hook_can_be_rearmed_without_leaking_registration() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    let fixture = fixture().await;
+    let operation = "publication-aborted-hook";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    let cancelled = fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    drop(cancelled);
+    let mut aborted_hook =
+        fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = fixture.store.clone();
+    let aborted_state = state.clone();
+    let aborted = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &aborted_state, None)
+            .await
+    });
+    aborted_hook.reached().await;
+    aborted.abort();
+    assert!(aborted.await.unwrap_err().is_cancelled());
+    drop(aborted_hook);
+
+    let mut replacement =
+        fixture.arm_publication_hook(operation, PublicationTestPause::BeforeWriter);
+    let store = fixture.store.clone();
+    let replacement_state = state.clone();
+    let apply = tokio::spawn(async move {
+        store
+            .compaction_apply_runner(operation, &replacement_state, None)
+            .await
+            .unwrap()
+    });
+    replacement.reached().await;
+    replacement.release();
+    assert_eq!(apply.await.unwrap(), CommitOutcome::Applied);
+}
+
+#[tokio::test]
+async fn writer_publication_boundary_has_no_heavy_checks_as_manifest_and_dag_grow() {
+    use crate::repositories::compaction::CommitOutcome;
+
+    for (operation, sources) in [("publication-small", 1), ("publication-large", 255)] {
+        let fixture = fixture().await;
+        let state = publication_candidate(&fixture, operation, sources).await;
+        reset_publication_test_metrics(operation);
+        assert_eq!(publication_writer_fence_checks(operation), 0);
+        assert_eq!(
+            fixture
+                .store
+                .compaction_apply_runner(operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        assert_eq!(
+            publication_writer_fence_checks(operation),
+            1,
+            "writer fence work grew for {sources} manifest/DAG leaves"
+        );
+        let metrics = publication_test_metrics(operation);
+        assert_eq!(metrics.coverage_checks, 1);
+        assert_eq!(metrics.manifest_checks, 1);
+        assert_eq!(metrics.heavy_checks_while_writer, 0);
+        assert_eq!(metrics.writer_entries, 1);
+    }
+
+    for (operation, nodes) in [("publication-dag-small", 1), ("publication-dag-large", 257)] {
+        let fixture = fixture().await;
+        let state = publication_candidate(&fixture, operation, 1).await;
+        bind_reference_checkpoint_chain(&fixture, operation, nodes).await;
+        assert_positive_publication_preflight(&fixture, operation, &state).await;
+        reset_publication_test_metrics(operation);
+        assert_eq!(
+            fixture
+                .store
+                .compaction_apply_runner(operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        let metrics = publication_test_metrics(operation);
+        assert_eq!(metrics.coverage_checks, 1);
+        assert_eq!(metrics.manifest_checks, 1);
+        assert_eq!(metrics.heavy_checks_while_writer, 0);
+        assert_eq!(
+            metrics.writer_entries, 1,
+            "writer traversed {nodes} DAG nodes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn publication_triggers_cover_logical_sources_topology_and_frozen_storage() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+
+    let before = source_fence(&db, "ws").await;
+    db.execute_unprepared(
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+         VALUES ('fence-append','source-thread','source-turn',30000,'fixture','{}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let appended = source_fence(&db, "ws").await;
+    assert_eq!(appended.0, before.0);
+    assert!(appended.1 > before.1);
+
+    db.execute_unprepared(
+        "UPDATE turn_event SET payload='{\"edited\":true}' WHERE id='fence-append'",
+    )
+    .await
+    .unwrap();
+    let edited = source_fence(&db, "ws").await;
+    assert!(edited.0 > appended.0);
+    db.execute_unprepared(
+        "DELETE FROM turn_event WHERE id='fence-append'; \
+         INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+         VALUES ('fence-append','source-thread','source-turn',30000,'fixture','{}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let recreated = source_fence(&db, "ws").await;
+    assert!(
+        recreated.0 > edited.0,
+        "delete/reinsert lost its tombstone generation"
+    );
+    assert!(recreated.1 > edited.1);
+    db.execute_unprepared(
+        "UPDATE turn_event SET id='fence-append-renamed' WHERE id='fence-append'",
+    )
+    .await
+    .unwrap();
+    let renamed = source_fence(&db, "ws").await;
+    assert!(
+        renamed.0 > recreated.0,
+        "changing a canonical source key did not invalidate the old identity"
+    );
+
+    db.execute_unprepared(
+        "INSERT INTO task_run(\
+          id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) \
+         VALUES ('basis-append','task','basis-append',1,2,'succeeded','agent'); \
+         INSERT INTO task_run_conversation_snapshot(\
+          run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) \
+         VALUES ('basis-append','task','ws','source-thread','[]',CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    let basis_appended = source_fence(&db, "ws").await;
+    assert_eq!(
+        basis_appended.0, renamed.0,
+        "a new task-basis plus its fallback-equivalent revision caused mutation invalidation"
+    );
+    assert!(basis_appended.1 > renamed.1);
+
+    let basis_before = basis_appended;
+    db.execute_unprepared(
+        "INSERT INTO compaction_task_basis_revision(run_id,revision) VALUES ('basis-run',2)",
+    )
+    .await
+    .unwrap();
+    let basis_revision = source_fence(&db, "ws").await;
+    assert!(
+        basis_revision.0 > basis_before.0,
+        "inserting an explicit revision did not invalidate fallback revision 1"
+    );
+    db.execute_unprepared(
+        "UPDATE task_run_conversation_snapshot SET history_json=' {not-an-array}' \
+         WHERE run_id='basis-run'",
+    )
+    .await
+    .unwrap();
+    assert!(source_fence(&db, "ws").await.0 > basis_revision.0);
+
+    db.execute_unprepared(
+        "INSERT INTO turn_item(\
+          id,turn_id,item_id,item_type,status,payload,created_at,updated_at) \
+         VALUES ('non-epoch-item','source-turn','non-epoch-item','assistant_message','completed','{}',\
+          CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let epoch_before = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COALESCE(version,0) AS version FROM compaction_projection_epoch \
+         WHERE thread_id='source-thread'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .map(|row| row.try_get::<i64>("", "version").unwrap())
+        .unwrap_or(0);
+    let logical_before = source_fence(&db, "ws").await;
+    db.execute_unprepared(
+        "UPDATE turn_item SET payload='{\"logical\":true}' WHERE id='non-epoch-item'",
+    )
+    .await
+    .unwrap();
+    let epoch_after = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COALESCE(version,0) AS version FROM compaction_projection_epoch \
+         WHERE thread_id='source-thread'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .map(|row| row.try_get::<i64>("", "version").unwrap())
+        .unwrap_or(0);
+    assert_eq!(epoch_after, epoch_before);
+    assert!(source_fence(&db, "ws").await.0 > logical_before.0);
+
+    db.execute_unprepared(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
+         VALUES ('moved-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+         VALUES ('moved-turn','moved-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let ownership_before = structural_fence(&db).await;
+    db.execute_unprepared("UPDATE turn SET thread_id='source-thread' WHERE id='moved-turn'")
+        .await
+        .unwrap();
+    assert!(structural_fence(&db).await > ownership_before);
+
+    let canonical_revision_before = source_fence(&db, "ws").await;
+    db.execute_unprepared(
+        "UPDATE compaction_event_revision SET revision=revision+1 WHERE source_id='event-source'",
+    )
+    .await
+    .unwrap();
+    assert!(source_fence(&db, "ws").await.0 > canonical_revision_before.0);
+
+    let canonical_present_before = source_fence(&db, "ws").await;
+    db.execute_unprepared(
+        "UPDATE compaction_event_revision SET present=0 WHERE source_id='event-source'",
+    )
+    .await
+    .unwrap();
+    assert!(source_fence(&db, "ws").await.0 > canonical_present_before.0);
+
+    db.execute_unprepared(
+        "INSERT INTO compaction_frozen_history(\
+          id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,\
+          import_count,imports_sha256,next_import,ready) \
+         VALUES ('fence-storage','ws','root-thread','storage',1,1,0,'imports',0,1); \
+         INSERT INTO compaction_frozen_history(\
+          id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,\
+          import_count,imports_sha256,next_import,ready) \
+         VALUES ('fence-view','ws','root-thread','view',1,1,0,'imports',0,1); \
+         INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) \
+          VALUES ('fence-storage',0,'{}',2); \
+         INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) \
+          VALUES ('fence-view',0,1,0); \
+         INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) \
+          VALUES ('fence-view',0,0,1,'fence-storage')",
+    )
+    .await
+    .unwrap();
+
+    let inherited_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_message_data SET reference_json='{\"inherited\":false}',bytes=19 \
+          WHERE manifest_id='fence-storage' AND ordinal=0",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > inherited_before);
+
+    let layout_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_layout SET active=0 WHERE manifest_id='fence-view' AND kind=0",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > layout_before);
+
+    let span_range_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_span SET end=2 WHERE manifest_id='fence-view' AND kind=0",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > span_range_before);
+
+    let span_source_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_span SET source_manifest='fence-view' \
+          WHERE manifest_id='fence-view' AND kind=0",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > span_source_before);
+
+    db.execute_unprepared(
+        "INSERT INTO compaction_frozen_import_data(\
+          manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,\
+          source_thread,proof_json,bytes) \
+         VALUES ('fence-storage',0,0,'event:source-turn','event-source','event-revision:1',\
+          'source-thread','{}',2)",
+    )
+    .await
+    .unwrap();
+    let physical_frozen_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_import_data SET proof_json='{\"changed\":true}',bytes=16 \
+          WHERE manifest_id='fence-storage' AND ordinal=0",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > physical_frozen_before);
+
+    let binding_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "INSERT INTO compaction_operation_projection(\
+          operation_id,manifest_id,identity_sha256,imports_sha256,import_count) \
+         VALUES ('manifest-operation','fence-view','view','imports',0)",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > binding_before);
+
+    let ready_before = structural_fence(&db).await;
+    db.execute_unprepared("UPDATE compaction_frozen_history SET ready=0 WHERE id='fence-view'")
+        .await
+        .unwrap();
+    assert!(structural_fence(&db).await > ready_before);
+
+    let previous_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET previous='source-checkpoint' WHERE id='source-checkpoint'",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > previous_before);
+
+    let coverage_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_coverage SET source_version='event-revision:2' \
+          WHERE checkpoint_id='source-checkpoint' AND source_id='event-source'",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > coverage_before);
+
+    let dependency_status_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_operation SET status='running' WHERE id='source-operation'",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > dependency_status_before);
+
+    let snapshot_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"all\"}}' \
+          WHERE id='manifest-operation'",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > snapshot_before);
+
+    let manifest_before = structural_fence(&db).await;
+    db.execute_unprepared(
+        "INSERT INTO compaction_manifest(\
+          operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) \
+         VALUES ('manifest-operation',999,999,1,'root-thread','event:root-turn',\
+          'event-source','event-revision:1')",
+    )
+    .await
+    .unwrap();
+    assert!(structural_fence(&db).await > manifest_before);
+}
+
+#[tokio::test]
+async fn zstd_physical_rewrite_does_not_look_like_a_logical_source_edit() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    let before = source_fence(&db, "ws").await;
+    enable_and_physically_compress_canonical_payloads(&db).await;
+    assert_eq!(
+        source_fence(&db, "ws").await,
+        before,
+        "physical zstd storage maintenance changed the logical source fence"
+    );
+    db.execute_unprepared(
+        "UPDATE turn_event SET payload='{\"logical_after_zstd\":true}' WHERE id='event-source'",
+    )
+    .await
+    .unwrap();
+    assert!(source_fence(&db, "ws").await.0 > before.0);
+}
+
+#[tokio::test]
+async fn publication_migration_installs_source_fence_on_existing_zstd_storage() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let file = TestFile(std::env::temp_dir().join(format!(
+        "pioneer-publication-existing-zstd-{}.sqlite",
+        uuid::Uuid::new_v4()
+    )));
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", file.0.display()));
+    options.max_connections(1).min_connections(1);
+    let writer_connection = Database::connect(options).await.unwrap();
+    let writer = SqliteWriteExecutor::new(writer_connection);
+    writer
+        .run_migrations::<Migrator>(
+            SqliteWriteClass::Maintenance,
+            Some((Migrator::migrations().len() - 1) as u32),
+        )
+        .await
+        .unwrap();
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", file.0.display()));
+    options.max_connections(1).min_connections(1);
+    let reader = Database::connect(options).await.unwrap();
+    reader
+        .execute_unprepared("PRAGMA query_only=ON")
+        .await
+        .unwrap();
+    let db = SqliteDatabase::from_executor(reader, writer.clone()).maintenance();
+    db.execute_unprepared(
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('zstd-ws','zstd',1,1); \
+         INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
+          VALUES ('zstd-thread','zstd-ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+          VALUES ('zstd-turn','zstd-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+         INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+          VALUES ('zstd-event','zstd-thread','zstd-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let config = serde_json::json!({
+        "table": "turn_event",
+        "column": "payload",
+        "compression_level": 3,
+        "dict_chooser": "'[nodict]'",
+    });
+    db.query_one_write_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT zstd_enable_transparent(?)",
+        [config.to_string().into()],
+    ))
+    .await
+    .unwrap();
+    writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+
+    let before = source_fence(&db, "zstd-ws").await;
+    let compressed = pioneer_sqlite::zstd::compress_column_value(b"{}", 3, None).unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE _turn_event_zstd SET payload=?,_payload_dict=-1 WHERE id='zstd-event'",
+        [compressed.into()],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(source_fence(&db, "zstd-ws").await, before);
+    db.execute_unprepared(
+        "UPDATE turn_event SET payload='{\"logical\":true}' WHERE id='zstd-event'",
+    )
+    .await
+    .unwrap();
+    assert!(source_fence(&db, "zstd-ws").await.0 > before.0);
+}
+
+#[tokio::test]
+async fn publication_generations_fail_closed_on_overflow_and_workspace_recreation() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    db.execute_unprepared(
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('aba-workspace','aba',1,0)",
+    )
+    .await
+    .unwrap();
+    let before = source_fence(&db, "aba-workspace").await;
+    db.execute_unprepared(
+        "DELETE FROM workspace WHERE id='aba-workspace'; \
+         INSERT INTO workspace(id,name,is_active,is_current) VALUES ('aba-workspace','aba',1,0)",
+    )
+    .await
+    .unwrap();
+    let recreated = source_fence(&db, "aba-workspace").await;
+    assert!(recreated.0 > before.0 && recreated.1 > before.1);
+
+    db.execute_unprepared(
+        "UPDATE compaction_publication_source_fence \
+         SET mutation_generation=9223372036854775807 WHERE workspace_id='ws'",
+    )
+    .await
+    .unwrap();
+    let update = db
+        .execute_unprepared(
+            "UPDATE turn_event SET payload='{\"must_rollback\":true}' WHERE id='event-source'",
+        )
+        .await;
+    assert!(update.is_err(), "generation overflow was silently reused");
+    let payload: String = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_event WHERE id='event-source'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    assert_eq!(payload, "{}");
+}
+
+#[tokio::test]
+async fn publication_migration_is_idempotent_without_resetting_generations() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    db.execute_unprepared(
+        "UPDATE turn_event SET payload='{\"idempotent\":true}' WHERE id='event-source'",
+    )
+    .await
+    .unwrap();
+    let before = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT database_id,structural_generation FROM compaction_publication_fence \
+             WHERE singleton=1"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let database_id: String = before.try_get("", "database_id").unwrap();
+    let structural: i64 = before.try_get("", "structural_generation").unwrap();
+    let source = source_fence(&db, "ws").await;
+
+    fixture
+        .writer
+        .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+        .await
+        .unwrap();
+
+    let after = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT database_id,structural_generation FROM compaction_publication_fence \
+             WHERE singleton=1"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.try_get::<String>("", "database_id").unwrap(),
+        database_id
+    );
+    assert_eq!(
+        after.try_get::<i64>("", "structural_generation").unwrap(),
+        structural
+    );
+    assert_eq!(source_fence(&db, "ws").await, source);
+}
+
+#[tokio::test]
+async fn publication_generations_survive_database_reopen() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let file = TestFile(std::env::temp_dir().join(format!(
+        "pioneer-publication-reopen-{}.sqlite",
+        uuid::Uuid::new_v4()
+    )));
+    let connection = Database::connect(format!("sqlite://{}?mode=rwc", file.0.display()))
+        .await
+        .unwrap();
+    Migrator::up(&connection, None).await.unwrap();
+    connection
+        .execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('restart-ws','restart',1,1); \
+             UPDATE compaction_publication_fence SET structural_generation=7 WHERE singleton=1; \
+             UPDATE compaction_publication_source_fence \
+              SET mutation_generation=5,insert_generation=9 WHERE workspace_id='restart-ws'",
+        )
+        .await
+        .unwrap();
+    let database_id: String = connection
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT database_id FROM compaction_publication_fence WHERE singleton=1".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "database_id")
+        .unwrap();
+    connection.close().await.unwrap();
+
+    let reopened = Database::connect(format!("sqlite://{}?mode=rw", file.0.display()))
+        .await
+        .unwrap();
+    let row = reopened
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT database_id,structural_generation FROM compaction_publication_fence \
+             WHERE singleton=1"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "database_id").unwrap(),
+        database_id
+    );
+    assert_eq!(row.try_get::<i64>("", "structural_generation").unwrap(), 7);
+    let source = reopened
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT mutation_generation,insert_generation \
+             FROM compaction_publication_source_fence WHERE workspace_id='restart-ws'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.try_get::<i64>("", "mutation_generation").unwrap(), 5);
+    assert_eq!(source.try_get::<i64>("", "insert_generation").unwrap(), 9);
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn publication_migration_failure_rolls_back_schema_triggers_and_marker() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let connection = Database::connect("sqlite::memory:").await.unwrap();
+    let migration = "m20260919_000002_compaction_publication_fence";
+    Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
+        .await
+        .unwrap();
+    connection
+        .execute_unprepared(&format!(
+            "CREATE TRIGGER reject_publication_migration BEFORE INSERT ON seaql_migrations \
+         WHEN NEW.version='{migration}' BEGIN SELECT RAISE(ABORT,'fixture marker failure'); END"
+        ))
+        .await
+        .unwrap();
+    assert!(Migrator::up(&connection, None).await.is_err());
+    let objects: i64 = connection
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM sqlite_master \
+             WHERE name LIKE 'compaction_publication_%' \
+              AND name<>'reject_publication_migration'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(objects, 0);
+    let marker: i64 = connection
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM seaql_migrations WHERE version=?",
+            [migration.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(marker, 0);
+    connection
+        .execute_unprepared("DROP TRIGGER reject_publication_migration")
+        .await
+        .unwrap();
+    Migrator::up(&connection, None).await.unwrap();
+    let installed: i64 = connection
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_publication_fence".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(installed, 1);
+}
+
+#[tokio::test]
+async fn rolled_back_domain_mutation_rolls_back_publication_fence_bump() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    let before = source_fence(&db, "ws").await;
+    let txn = db.begin().await.unwrap();
+    txn.execute_unprepared(
+        "UPDATE turn_event SET payload='{\"rolled_back\":true}' WHERE id='event-source'",
+    )
+    .await
+    .unwrap();
+    let inside: i64 = txn
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT mutation_generation FROM compaction_publication_source_fence \
+             WHERE workspace_id='ws'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "mutation_generation")
+        .unwrap();
+    assert!(inside > before.0);
+    txn.rollback().await.unwrap();
+    assert_eq!(source_fence(&db, "ws").await, before);
+    let payload: String = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_event WHERE id='event-source'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "payload")
+        .unwrap();
+    assert_eq!(payload, "{}");
 }

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+test-support = ["dep:tokio"]
+
 [dependencies]
 pioneer-compaction.workspace = true
 anyhow.workspace = true
@@ -20,6 +24,7 @@ hex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+tokio = { workspace = true, optional = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 pioneer-migration.workspace = true

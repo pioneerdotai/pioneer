@@ -27,6 +27,11 @@ use pioneer_entity::{
     turn_llm_context,
 };
 pub use runner::{ManifestEntry, RunnerPlanRecord};
+#[cfg(any(test, feature = "test-support"))]
+pub use runner::{
+    PublicationTestHookHandle, PublicationTestPause, arm_publication_test_hook,
+    trigger_publication_test_hook,
+};
 use sea_orm::sea_query::{
     Alias, BinOper, Expr, ExprTrait, Func, JoinType, OnConflict, Order, Query,
 };
@@ -210,6 +215,9 @@ impl From<compaction_operation::Model> for OperationRecord {
 pub enum CommitOutcome {
     Applied,
     AlreadyApplied,
+    /// A reader proof raced a relevant mutation. The candidate and successful
+    /// provider result remain durable; only publication validation is retried.
+    RetryValidation,
     Stale,
     Cancelled,
 }

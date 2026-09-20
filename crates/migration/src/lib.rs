@@ -6,6 +6,7 @@ mod m20260914_000002_tool_output_chunk;
 mod m20260914_000003_shared_frozen_ranges;
 mod m20260914_000004_history_check_outcomes;
 mod m20260919_000001_native_event_cleanup_queue;
+mod m20260919_000002_compaction_publication_fence;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -148,6 +149,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260914_000003_shared_frozen_ranges::Migration),
             Box::new(m20260914_000004_history_check_outcomes::Migration),
             Box::new(m20260919_000001_native_event_cleanup_queue::Migration),
+            Box::new(m20260919_000002_compaction_publication_fence::Migration),
         ]
     }
 }

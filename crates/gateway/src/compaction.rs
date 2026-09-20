@@ -581,6 +581,7 @@ impl CompactionRunner {
                 tracing::warn!("compaction observer unavailable");
             }
         }
+        let mut publication_validation_retries = 0_u32;
         loop {
             let durable = self
                 .store
@@ -819,6 +820,22 @@ impl CompactionRunner {
                         }
                         CommitOutcome::Cancelled => {
                             return Ok(CompactionExit::Reconcile(FailureKind::Cancelled));
+                        }
+                        CommitOutcome::RetryValidation => {
+                            // The proof raced a dependency mutation. Keep the
+                            // Commit phase and its durable summary; this delay
+                            // occurs after both reader and writer resources are
+                            // released and consumes no provider retry budget.
+                            let shift = publication_validation_retries.min(5);
+                            let delay_ms = 10_u64.saturating_mul(1_u64 << shift);
+                            publication_validation_retries =
+                                publication_validation_retries.saturating_add(1);
+                            let wake = self
+                                .clock
+                                .now_ms()
+                                .saturating_add(delay_ms)
+                                .min(self.snapshot.admission.deadline_ms);
+                            self.clock.sleep_until(wake).await;
                         }
                         CommitOutcome::Stale => {
                             state = self

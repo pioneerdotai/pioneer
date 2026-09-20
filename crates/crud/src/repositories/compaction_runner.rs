@@ -17,6 +17,240 @@ use sea_orm::sea_query::{
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PublicationTestPause {
+    ReaderPreflight,
+    BeforeWriter,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct RegisteredPublicationTestHook {
+    token: std::sync::Arc<()>,
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static PUBLICATION_TEST_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::BTreeMap<
+            (usize, String, PublicationTestPause),
+            RegisteredPublicationTestHook,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct PublicationTestHookHandle {
+    key: (usize, String, PublicationTestPause),
+    token: std::sync::Arc<()>,
+    _store: CrudStore,
+    reached: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PublicationTestHookHandle {
+    pub async fn reached(&mut self) {
+        let reached = self
+            .reached
+            .take()
+            .expect("publication hook already awaited");
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("publication hook was not reached before the diagnostic timeout")
+            .expect("publication hook participant ended before reaching the pause");
+    }
+
+    pub fn release(mut self) {
+        self.release
+            .take()
+            .expect("publication hook already released")
+            .send(())
+            .expect("publication hook participant ended before release");
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for PublicationTestHookHandle {
+    fn drop(&mut self) {
+        let mut hooks = PUBLICATION_TEST_HOOKS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hooks
+            .get(&self.key)
+            .is_some_and(|hook| std::sync::Arc::ptr_eq(&hook.token, &self.token))
+        {
+            hooks.remove(&self.key);
+        }
+        // Dropping the release sender also unblocks a participant that already
+        // took this registration and is waiting at the pause.
+    }
+}
+#[cfg(test)]
+static PUBLICATION_WRITER_FENCE_CHECKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PublicationTestMetrics {
+    coverage_checks: usize,
+    manifest_checks: usize,
+    heavy_checks_while_writer: usize,
+    writer_entries: usize,
+    writer_depth: usize,
+}
+
+#[cfg(test)]
+static PUBLICATION_TEST_METRICS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, PublicationTestMetrics>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn reset_publication_test_metrics(operation: &str) {
+    PUBLICATION_TEST_METRICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(operation.to_owned(), PublicationTestMetrics::default());
+}
+
+#[cfg(test)]
+fn publication_test_metrics(operation: &str) -> PublicationTestMetrics {
+    PUBLICATION_TEST_METRICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(operation)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn record_publication_heavy_check(operation: &str, manifest: bool) {
+    let mut all = PUBLICATION_TEST_METRICS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(metrics) = all.get_mut(operation) else {
+        return;
+    };
+    if manifest {
+        metrics.manifest_checks += 1;
+    } else {
+        metrics.coverage_checks += 1;
+    }
+    if metrics.writer_depth != 0 {
+        metrics.heavy_checks_while_writer += 1;
+    }
+}
+
+#[cfg(test)]
+struct PublicationWriterTestGuard(String);
+
+#[cfg(test)]
+impl PublicationWriterTestGuard {
+    fn enter(operation: &str) -> Self {
+        let mut all = PUBLICATION_TEST_METRICS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(metrics) = all.get_mut(operation) {
+            metrics.writer_entries += 1;
+            metrics.writer_depth += 1;
+        }
+        Self(operation.to_owned())
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationWriterTestGuard {
+    fn drop(&mut self) {
+        let mut all = PUBLICATION_TEST_METRICS
+            .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(metrics) = all.get_mut(&self.0) {
+            metrics.writer_depth -= 1;
+        }
+    }
+}
+
+#[cfg(test)]
+fn publication_writer_fence_checks(operation: &str) -> usize {
+    *PUBLICATION_WRITER_FENCE_CHECKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(operation)
+        .unwrap_or(&0)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn arm_publication_test_hook(
+    store: &CrudStore,
+    operation: &str,
+    phase: PublicationTestPause,
+) -> PublicationTestHookHandle {
+    let key = (
+        store.connection.runtime_identity(),
+        operation.to_owned(),
+        phase,
+    );
+    let token = std::sync::Arc::new(());
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let hook = RegisteredPublicationTestHook {
+        token: token.clone(),
+        reached: reached_tx,
+        release: release_rx,
+    };
+    let mut hooks = PUBLICATION_TEST_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(!hooks.contains_key(&key), "publication hook already armed");
+    hooks.insert(key.clone(), hook);
+    PublicationTestHookHandle {
+        key,
+        token,
+        _store: store.clone(),
+        reached: Some(reached_rx),
+        release: Some(release_tx),
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn trigger_publication_test_hook(
+    store: &CrudStore,
+    operation: &str,
+    phase: PublicationTestPause,
+) {
+    pause_publication_test_hook(store.connection.runtime_identity(), operation, phase).await;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+async fn pause_publication_test_hook(
+    runtime_identity: usize,
+    operation: &str,
+    phase: PublicationTestPause,
+) {
+    let key = (runtime_identity, operation.to_owned(), phase);
+    let hook = PUBLICATION_TEST_HOOKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let _ = hook.release.await;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ManifestEntry {
     pub ordinal: u64,
@@ -1477,10 +1711,286 @@ pub(crate) async fn prepare_checkpoint_ancestry<C: ConnectionTrait>(
     Ok(())
 }
 
-/// One atomic domain transition. The immutable, admitted manifest bounds
-/// validation to this operation's selected sources; it never scans transcript
-/// payloads or the complete history. Every source version and the owner head
-/// are checked inside the same transaction which publishes the candidate.
+/// A request-local proof created only by the reader preflight below. Keeping
+/// the type private prevents callers from substituting an unchecked boolean.
+/// The durable database nonce also prevents moving a proof between stores.
+#[derive(Debug)]
+struct PreparedRunnerPublication {
+    database_id: String,
+    operation: String,
+    checkpoint: String,
+    generation: u64,
+    expected_head: Option<String>,
+    workspace: Option<String>,
+    structural_generation: i64,
+    source_mutation_generation: Option<i64>,
+    source_insert_generation: Option<i64>,
+    identity_current: bool,
+    sources_current: bool,
+}
+
+async fn prepare_runner_publication(
+    store: &CrudStore,
+    operation: &str,
+    checkpoint: &str,
+    generation: u64,
+    expected_head: Option<&str>,
+) -> Result<PreparedRunnerPublication> {
+    let snapshot = store.connection.begin_read().await?;
+    let database_fence = snapshot
+        .query_one_raw(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT database_id,structural_generation \
+             FROM compaction_publication_fence WHERE singleton=1"
+                .to_owned(),
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("compaction publication database fence is missing"))?;
+    let database_id: String = database_fence.try_get("", "database_id")?;
+    let structural_generation: i64 = database_fence.try_get("", "structural_generation")?;
+
+    // Existence and ownership are independent from the later negative stale
+    // scans: an empty scan is not evidence that the operation or candidate
+    // exists. Read all identity fields in this same snapshot as the fence.
+    let identity = snapshot
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            r#"
+SELECT o.owner AS operation_owner,o.status,o.expected_head,
+ c.workspace_id,p.operation_id AS candidate_operation,p.owner AS candidate_owner,
+ s.generation AS runner_generation,
+ json_extract(s.state,'$.phase.Commit.checkpoint') AS runner_checkpoint
+FROM compaction_operation o
+LEFT JOIN compaction_context c ON c.owner=o.owner
+LEFT JOIN compaction_checkpoint p ON p.id=?2
+LEFT JOIN compaction_runner_state s ON s.operation_id=o.id
+WHERE o.id=?1
+"#,
+            [operation.into(), checkpoint.into()],
+        ))
+        .await?;
+    let expected_generation = i64::try_from(generation)?;
+    let (workspace, identity_current) = if let Some(identity) = identity {
+        let operation_owner: String = identity.try_get("", "operation_owner")?;
+        let _status: String = identity.try_get("", "status")?;
+        let stored_head: Option<String> = identity.try_get("", "expected_head")?;
+        let workspace: Option<String> = identity.try_get("", "workspace_id")?;
+        let candidate_operation: Option<String> = identity.try_get("", "candidate_operation")?;
+        let candidate_owner: Option<String> = identity.try_get("", "candidate_owner")?;
+        let runner_generation: Option<i64> = identity.try_get("", "runner_generation")?;
+        let runner_checkpoint: Option<String> = identity.try_get("", "runner_checkpoint")?;
+        let current = workspace.is_some()
+            && candidate_operation.as_deref() == Some(operation)
+            && candidate_owner.as_deref() == Some(operation_owner.as_str())
+            && stored_head.as_deref() == expected_head
+            && runner_generation == Some(expected_generation)
+            && runner_checkpoint.as_deref() == Some(checkpoint);
+        (workspace, current)
+    } else {
+        (None, false)
+    };
+
+    let (source_mutation_generation, source_insert_generation) =
+        if let Some(workspace) = workspace.as_deref() {
+            let source_fence = snapshot
+                .query_one_raw(Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Sqlite,
+                    "SELECT mutation_generation,insert_generation \
+                     FROM compaction_publication_source_fence WHERE workspace_id=?",
+                    [workspace.into()],
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("compaction publication source fence is missing"))?;
+            (
+                Some(source_fence.try_get("", "mutation_generation")?),
+                Some(source_fence.try_get("", "insert_generation")?),
+            )
+        } else {
+            (None, None)
+        };
+
+    let sources_current = if identity_current {
+        #[cfg(any(test, feature = "test-support"))]
+        pause_publication_test_hook(
+            store.connection.runtime_identity(),
+            operation,
+            PublicationTestPause::ReaderPreflight,
+        )
+        .await;
+        let coverage_exact = compaction_runner_coverage_exact(&snapshot, operation).await?;
+        let manifest_current = compaction_manifest_sources_current(&snapshot, operation).await?;
+        coverage_exact && manifest_current
+    } else {
+        false
+    };
+    // Explicitly end the read snapshot before queuing for the writer. This
+    // also releases the maintenance-read permit carried by the scoped store.
+    snapshot.commit().await?;
+    Ok(PreparedRunnerPublication {
+        database_id,
+        operation: operation.to_owned(),
+        checkpoint: checkpoint.to_owned(),
+        generation,
+        expected_head: expected_head.map(str::to_owned),
+        workspace,
+        structural_generation,
+        source_mutation_generation,
+        source_insert_generation,
+        identity_current,
+        sources_current,
+    })
+}
+
+async fn compaction_runner_coverage_exact<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+) -> Result<bool> {
+    #[cfg(test)]
+    record_publication_heavy_check(operation, false);
+    // Exact coverage: every selected record has a fully read version, and no
+    // reference-only or unselected source has acquired coverage.
+    let missing = compaction_manifest::Entity::find()
+        .select_only()
+        .expr(Expr::col((
+            compaction_manifest::Entity,
+            compaction_manifest::Column::Ordinal,
+        )))
+        .filter(
+            Expr::col((
+                compaction_manifest::Entity,
+                compaction_manifest::Column::OperationId,
+            ))
+            .eq(Expr::Value(operation.into()))
+            .and(
+                Expr::col((
+                    compaction_manifest::Entity,
+                    compaction_manifest::Column::ReferenceOnly,
+                ))
+                .eq(Expr::val(0_i64)),
+            )
+            .and(
+                Expr::exists(
+                    Query::select()
+                        .expr(Expr::val(1_i64))
+                        .from_as(compaction_coverage::Entity, "c")
+                        .join_as(
+                            JoinType::InnerJoin,
+                            compaction_checkpoint::Entity,
+                            "p",
+                            Expr::col(("p", compaction_checkpoint::Column::Id))
+                                .eq(Expr::col(("c", compaction_coverage::Column::CheckpointId))),
+                        )
+                        .and_where(
+                            Expr::col(("p", compaction_checkpoint::Column::OperationId))
+                                .eq(Expr::col((
+                                    compaction_manifest::Entity,
+                                    compaction_manifest::Column::OperationId,
+                                )))
+                                .and(
+                                    Expr::col(("c", compaction_coverage::Column::SourceScope)).eq(
+                                        Expr::col((
+                                            compaction_manifest::Entity,
+                                            compaction_manifest::Column::SourceScope,
+                                        )),
+                                    ),
+                                )
+                                .and(Expr::col(("c", compaction_coverage::Column::SourceId)).eq(
+                                    Expr::col((
+                                        compaction_manifest::Entity,
+                                        compaction_manifest::Column::SourceId,
+                                    )),
+                                ))
+                                .and(
+                                    Expr::col(("c", compaction_coverage::Column::SourceVersion))
+                                        .eq(Expr::col((
+                                            compaction_manifest::Entity,
+                                            compaction_manifest::Column::SourceVersion,
+                                        ))),
+                                ),
+                        )
+                        .to_owned(),
+                )
+                .not(),
+            ),
+        )
+        .limit(1)
+        .into_tuple::<i64>()
+        .one(db)
+        .await?;
+    let extra = compaction_coverage::Entity::find()
+        .select_only()
+        .join(
+            JoinType::InnerJoin,
+            compaction_coverage::Entity::belongs_to(compaction_checkpoint::Entity)
+                .from(compaction_coverage::Column::CheckpointId)
+                .to(compaction_checkpoint::Column::Id)
+                .into(),
+        )
+        .expr(Expr::col((
+            compaction_coverage::Entity,
+            compaction_coverage::Column::SourceId,
+        )))
+        .filter(
+            Expr::col((
+                compaction_checkpoint::Entity,
+                compaction_checkpoint::Column::OperationId,
+            ))
+            .eq(Expr::Value(operation.into()))
+            .and(
+                Expr::exists(
+                    Query::select()
+                        .expr(Expr::val(1_i64))
+                        .from_as(compaction_manifest::Entity, "m")
+                        .and_where(
+                            Expr::col(("m", compaction_manifest::Column::OperationId))
+                                .eq(Expr::col((
+                                    compaction_checkpoint::Entity,
+                                    compaction_checkpoint::Column::OperationId,
+                                )))
+                                .and(
+                                    Expr::col(("m", compaction_manifest::Column::ReferenceOnly))
+                                        .eq(Expr::val(0_i64)),
+                                )
+                                .and(
+                                    Expr::col((
+                                        compaction_coverage::Entity,
+                                        compaction_coverage::Column::SourceScope,
+                                    ))
+                                    .eq(Expr::col(("m", compaction_manifest::Column::SourceScope))),
+                                )
+                                .and(
+                                    Expr::col((
+                                        compaction_coverage::Entity,
+                                        compaction_coverage::Column::SourceId,
+                                    ))
+                                    .eq(Expr::col(("m", compaction_manifest::Column::SourceId))),
+                                )
+                                .and(
+                                    Expr::col((
+                                        compaction_coverage::Entity,
+                                        compaction_coverage::Column::SourceVersion,
+                                    ))
+                                    .eq(Expr::col((
+                                        "m",
+                                        compaction_manifest::Column::SourceVersion,
+                                    ))),
+                                ),
+                        )
+                        .to_owned(),
+                )
+                .not(),
+            ),
+        )
+        .limit(1)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    Ok(missing.is_none() && extra.is_none())
+}
+
+/// Two-phase publication: the graph/manifest predicates run in one reader
+/// snapshot, then the writer compares constant-size generations and performs
+/// the existing atomic domain transition.
 pub(crate) async fn compaction_apply_runner(
     store: &CrudStore,
     operation: &str,
@@ -1495,9 +2005,36 @@ pub(crate) async fn compaction_apply_runner(
     store
         .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
         .await?;
+    let prepared = store
+        .run_scoped_database_quantum(|| {
+            prepare_runner_publication(
+                store,
+                operation,
+                checkpoint,
+                state.generation,
+                expected_head,
+            )
+        })
+        .await?;
+    #[cfg(any(test, feature = "test-support"))]
+    pause_publication_test_hook(
+        store.connection.runtime_identity(),
+        operation,
+        PublicationTestPause::BeforeWriter,
+    )
+    .await;
+    ensure!(
+        prepared.operation.as_str() == operation
+            && prepared.checkpoint.as_str() == checkpoint.as_str()
+            && prepared.generation == state.generation
+            && prepared.expected_head.as_deref() == expected_head,
+        "runner publication preflight identity mismatch"
+    );
     store
         .run_serialized_write(|| async {
             let txn = store.connection.begin().await?;
+            #[cfg(test)]
+            let _writer_test_guard = PublicationWriterTestGuard::enter(operation);
             let row = compaction_operation::Entity::find()
                 .select_only()
                 .join(
@@ -1688,167 +2225,65 @@ pub(crate) async fn compaction_apply_runner(
                 txn.rollback().await?;
                 return Ok(super::compaction::CommitOutcome::Stale);
             }
-            // Exact coverage: every selected record has a fully read version,
-            // and no reference-only or unselected source has acquired coverage.
-            let missing = compaction_manifest::Entity::find()
-                .select_only()
-                .expr(Expr::col((
-                    compaction_manifest::Entity,
-                    compaction_manifest::Column::Ordinal,
-                )))
-                .filter(
-                    Expr::col((
-                        compaction_manifest::Entity,
-                        compaction_manifest::Column::OperationId,
-                    ))
-                    .eq(Expr::Value(operation.into()))
-                    .and(
-                        Expr::col((
-                            compaction_manifest::Entity,
-                            compaction_manifest::Column::ReferenceOnly,
-                        ))
-                        .eq(Expr::val(0_i64)),
-                    )
-                    .and(
-                        Expr::exists(
-                            Query::select()
-                                .expr(Expr::val(1_i64))
-                                .from_as(compaction_coverage::Entity, "c")
-                                .join_as(
-                                    JoinType::InnerJoin,
-                                    compaction_checkpoint::Entity,
-                                    "p",
-                                    Expr::col(("p", compaction_checkpoint::Column::Id)).eq(
-                                        Expr::col(("c", compaction_coverage::Column::CheckpointId)),
-                                    ),
-                                )
-                                .and_where(
-                                    Expr::col(("p", compaction_checkpoint::Column::OperationId))
-                                        .eq(Expr::col((
-                                            compaction_manifest::Entity,
-                                            compaction_manifest::Column::OperationId,
-                                        )))
-                                        .and(
-                                            Expr::col((
-                                                "c",
-                                                compaction_coverage::Column::SourceScope,
-                                            ))
-                                            .eq(
-                                                Expr::col((
-                                                    compaction_manifest::Entity,
-                                                    compaction_manifest::Column::SourceScope,
-                                                )),
-                                            ),
-                                        )
-                                        .and(
-                                            Expr::col(("c", compaction_coverage::Column::SourceId))
-                                                .eq(Expr::col((
-                                                    compaction_manifest::Entity,
-                                                    compaction_manifest::Column::SourceId,
-                                                ))),
-                                        )
-                                        .and(
-                                            Expr::col((
-                                                "c",
-                                                compaction_coverage::Column::SourceVersion,
-                                            ))
-                                            .eq(
-                                                Expr::col((
-                                                    compaction_manifest::Entity,
-                                                    compaction_manifest::Column::SourceVersion,
-                                                )),
-                                            ),
-                                        ),
-                                )
-                                .to_owned(),
-                        )
-                        .not(),
-                    ),
-                )
-                .limit(1)
-                .into_tuple::<i64>()
-                .one(&txn)
-                .await?;
-            let extra =
-                compaction_coverage::Entity::find()
-                    .select_only()
-                    .join(
-                        JoinType::InnerJoin,
-                        compaction_coverage::Entity::belongs_to(compaction_checkpoint::Entity)
-                            .from(compaction_coverage::Column::CheckpointId)
-                            .to(compaction_checkpoint::Column::Id)
-                            .into(),
-                    )
-                    .expr(Expr::col((
-                        compaction_coverage::Entity,
-                        compaction_coverage::Column::SourceId,
-                    )))
-                    .filter(
-                        Expr::col((
-                            compaction_checkpoint::Entity,
-                            compaction_checkpoint::Column::OperationId,
-                        ))
-                        .eq(Expr::Value(operation.into()))
-                        .and(
-                            Expr::exists(
-                                Query::select()
-                                    .expr(Expr::val(1_i64))
-                                    .from_as(compaction_manifest::Entity, "m")
-                                    .and_where(
-                                        Expr::col(("m", compaction_manifest::Column::OperationId))
-                                            .eq(Expr::col((
-                                                compaction_checkpoint::Entity,
-                                                compaction_checkpoint::Column::OperationId,
-                                            )))
-                                            .and(
-                                                Expr::col((
-                                                    "m",
-                                                    compaction_manifest::Column::ReferenceOnly,
-                                                ))
-                                                .eq(Expr::val(0_i64)),
-                                            )
-                                            .and(
-                                                Expr::col((
-                                                    compaction_coverage::Entity,
-                                                    compaction_coverage::Column::SourceScope,
-                                                ))
-                                                .eq(Expr::col((
-                                                    "m",
-                                                    compaction_manifest::Column::SourceScope,
-                                                ))),
-                                            )
-                                            .and(
-                                                Expr::col((
-                                                    compaction_coverage::Entity,
-                                                    compaction_coverage::Column::SourceId,
-                                                ))
-                                                .eq(Expr::col((
-                                                    "m",
-                                                    compaction_manifest::Column::SourceId,
-                                                ))),
-                                            )
-                                            .and(
-                                                Expr::col((
-                                                    compaction_coverage::Entity,
-                                                    compaction_coverage::Column::SourceVersion,
-                                                ))
-                                                .eq(Expr::col((
-                                                    "m",
-                                                    compaction_manifest::Column::SourceVersion,
-                                                ))),
-                                            ),
-                                    )
-                                    .to_owned(),
-                            )
-                            .not(),
-                        ),
-                    )
-                    .limit(1)
-                    .into_tuple::<String>()
-                    .one(&txn)
-                    .await?;
-            let sources_current = compaction_manifest_sources_current(&txn, operation).await?;
-            if missing.is_some() || extra.is_some() || !sources_current {
+            if !prepared.identity_current {
+                txn.rollback().await?;
+                return Ok(if prepared.workspace.is_some() {
+                    // The constant-size writer guards now match even though
+                    // reader identity did not. Rebuild the proof from the new
+                    // snapshot instead of treating that race as domain stale.
+                    super::compaction::CommitOutcome::RetryValidation
+                } else {
+                    super::compaction::CommitOutcome::Stale
+                });
+            }
+            let (Some(workspace), Some(source_mutation_generation), Some(source_insert_generation)) = (
+                prepared.workspace.as_deref(),
+                prepared.source_mutation_generation,
+                prepared.source_insert_generation,
+            ) else {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            };
+            // Constant-size fence lookup. Insert generations matter for a
+            // negative result (an insertion can repair it), while an append of
+            // a distinct canonical ID cannot invalidate an already-positive
+            // exact-ID proof.
+            #[cfg(test)]
+            {
+                let mut checks = PUBLICATION_WRITER_FENCE_CHECKS
+                    .get_or_init(|| {
+                        std::sync::Mutex::new(std::collections::BTreeMap::new())
+                    })
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *checks.entry(operation.to_owned()).or_default() += 1;
+            }
+            let fence_matches = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Sqlite,
+                    r#"
+SELECT f.singleton
+FROM compaction_publication_fence f
+JOIN compaction_publication_source_fence s ON s.workspace_id=?2
+WHERE f.singleton=1 AND f.database_id=?1 AND f.structural_generation=?3
+ AND s.mutation_generation=?4 AND (?5=1 OR s.insert_generation=?6)
+"#,
+                    [
+                        prepared.database_id.clone().into(),
+                        workspace.into(),
+                        prepared.structural_generation.into(),
+                        source_mutation_generation.into(),
+                        (if prepared.sources_current { 1_i64 } else { 0_i64 }).into(),
+                        source_insert_generation.into(),
+                    ],
+                ))
+                .await?
+                .is_some();
+            if !fence_matches {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::RetryValidation);
+            }
+            if !prepared.sources_current {
                 txn.rollback().await?;
                 return Ok(super::compaction::CommitOutcome::Stale);
             }
@@ -2265,19 +2700,22 @@ fn compaction_manifest_sources_current_statement(operation: &str) -> Statement {
     sqlite_specific_sql(COMPACTION_MANIFEST_SOURCES_CURRENT_SQL, [operation.into()])
 }
 
-/// Shared admission/commit predicate. Read-only preflight avoids provider work
-/// for an invalid grant; commit repeats it under the atomic writer boundary.
+/// Shared admission/final-preflight predicate. Admission avoids provider work
+/// for an invalid grant; final publication runs it in a fenced reader snapshot.
 pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     db: &C,
     operation: &str,
 ) -> Result<bool> {
+    #[cfg(test)]
+    record_publication_heavy_check(operation, true);
     // A foreign summary may replace accepted raw imports after output capture.
     // A working-context summary may additionally cover inherited sources that
     // occur in the SAME bound frozen basis. OWN imports still require their
     // delivery proofs; a frozen reference alone never launders them. Prove the
-    // entire immutable DAG and repeat the predicate inside the head CAS,
-    // including admitted epoch scopes and live leaf revisions. Epoch values
-    // fence admission, but later work outside this manifest is not staleness.
+    // entire immutable DAG in the final reader preflight, including admitted
+    // epoch scopes and live leaf revisions. Dedicated publication generations
+    // fence the short head CAS; admission epoch equality is intentionally not
+    // introduced because later work outside this manifest is not staleness.
     // SQLite's recursive UNION deduplicates DAG nodes. The explicit 65,536
     // reference bound fails closed (including cycles without any real leaves)
     // and prevents unbounded traversal while holding database capacity. No

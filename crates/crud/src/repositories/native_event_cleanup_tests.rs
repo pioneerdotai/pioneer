@@ -91,7 +91,15 @@ impl Fixture {
             if latest {
                 None
             } else {
-                Some((Migrator::migrations().len() - 1) as u32)
+                Some(
+                    Migrator::migrations()
+                        .iter()
+                        .position(|migration| {
+                            migration.name() == "m20260919_000001_native_event_cleanup_queue"
+                        })
+                        .expect("native cleanup migration is registered")
+                        as u32,
+                )
             },
         )
         .await?;
@@ -140,7 +148,24 @@ impl Fixture {
         let writer = Database::connect(options).await?;
         match migration {
             Some(true) => Migrator::down(&writer, Some(1)).await?,
-            Some(false) => Migrator::up(&writer, None).await?,
+            Some(false) => {
+                let applied: i64 = writer
+                    .query_one_raw(Statement::from_string(
+                        DatabaseBackend::Sqlite,
+                        "SELECT COUNT(*) AS count FROM seaql_migrations \
+                         WHERE version='m20260919_000001_native_event_cleanup_queue'"
+                            .to_owned(),
+                    ))
+                    .await?
+                    .expect("migration table returns a count")
+                    .try_get("", "count")?;
+                if applied == 0 {
+                    // This fixture models the release boundary immediately
+                    // before/after native cleanup. Do not advance into later,
+                    // independently irreversible migrations on a repeated up.
+                    Migrator::up(&writer, Some(1)).await?;
+                }
+            }
             None => {}
         }
         Self::connect(path, writer).await

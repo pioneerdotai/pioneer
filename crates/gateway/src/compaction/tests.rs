@@ -4,7 +4,9 @@ use pioneer_compaction::summary::{HEADINGS, SummaryInput};
 use pioneer_compaction::{
     CompactionMode, CompactionPlan, CompactionSettings, ModelBudget, ModelSelection, Transport,
 };
-use pioneer_crud::compaction::{CanonicalSource, ManifestEntry, PagedSource};
+use pioneer_crud::compaction::{
+    CanonicalSource, ManifestEntry, PagedSource, PublicationTestPause, arm_publication_test_hook,
+};
 use pioneer_protocol::ProviderFailureClass;
 use pioneer_provider::{
     ChatRequest, ChatResponse, Provider, ProviderFailureClassification, ProviderTermination,
@@ -47,23 +49,33 @@ impl HistoryReadObserver {
     }
 }
 
-struct ManualClock(tokio::sync::watch::Sender<u64>);
+struct ManualClock {
+    now: tokio::sync::watch::Sender<u64>,
+    sleeps: tokio::sync::broadcast::Sender<u64>,
+}
 impl ManualClock {
     fn new() -> Self {
-        Self(tokio::sync::watch::channel(0).0)
+        Self {
+            now: tokio::sync::watch::channel(0).0,
+            sleeps: tokio::sync::broadcast::channel(64).0,
+        }
     }
     fn advance(&self, value: u64) {
         assert!(value >= self.now_ms());
-        self.0.send_replace(value);
+        self.now.send_replace(value);
+    }
+    fn subscribe_sleeps(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.sleeps.subscribe()
     }
 }
 #[async_trait]
 impl CompactionClock for ManualClock {
     fn now_ms(&self) -> u64 {
-        *self.0.borrow()
+        *self.now.borrow()
     }
     async fn sleep_until(&self, deadline: u64) {
-        let mut rx = self.0.subscribe();
+        let _ = self.sleeps.send(deadline);
+        let mut rx = self.now.subscribe();
         loop {
             if *rx.borrow_and_update() >= deadline {
                 return;
@@ -71,6 +83,18 @@ impl CompactionClock for ManualClock {
             rx.changed().await.unwrap();
         }
     }
+}
+
+async fn wait_for_sleep(sleeps: &mut tokio::sync::broadcast::Receiver<u64>, expected: u64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if sleeps.recv().await.unwrap() == expected {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("runner did not enter the expected validation backoff");
 }
 #[derive(Clone, Copy)]
 enum Reply {
@@ -914,6 +938,207 @@ async fn fixture(
         observer,
         payload,
     }
+}
+
+async fn install_publication_retry_probe(fixture: &Fixture) {
+    fixture
+        .store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+         VALUES ('publication-retry-probe','thread','turn',2,'fixture','{}',CURRENT_TIMESTAMP)",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gateway_retry_validation_reuses_candidate_and_provider_budget() {
+    let f = fixture("publication source", vec![Reply::Success], true, false).await;
+    install_publication_retry_probe(&f).await;
+    let mut sleeps = f.clock.subscribe_sleeps();
+    let mut hook =
+        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+    let runner = f.runner.clone();
+    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+    f.provider.wait_calls(1).await;
+    hook.reached().await;
+    let commit_state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let checkpoint = match &commit_state.phase {
+        RunnerPhase::Commit { checkpoint } => checkpoint.clone(),
+        _ => panic!("publication hook was reached before Commit"),
+    };
+    let candidate = f
+        .store
+        .compaction_checkpoint(&checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn_event SET payload='{\"race\":1}' WHERE id='publication-retry-probe'",
+        )
+        .await
+        .unwrap();
+    hook.release();
+    wait_for_sleep(&mut sleeps, 10).await;
+
+    let during_backoff = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(during_backoff.phase, commit_state.phase);
+    assert_eq!(during_backoff.attempts, commit_state.attempts);
+    assert_eq!(during_backoff.retries, commit_state.retries);
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(&checkpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary,
+        candidate.summary
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let reader = f.store.database_connection().begin_read().await.unwrap();
+        reader.rollback().await.unwrap();
+        f.store
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE turn_event SET payload='{\"race\":2}' WHERE id='publication-retry-probe'",
+            )
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("validation backoff retained a database reservation");
+
+    f.clock.advance(10);
+    assert!(matches!(run.await.unwrap(), CompactionExit::Applied(_)));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn gateway_retry_validation_cancellation_and_deadline_interrupt_backoff() {
+    let f = fixture("publication source", vec![Reply::Success], true, false).await;
+    install_publication_retry_probe(&f).await;
+    let mut sleeps = f.clock.subscribe_sleeps();
+    let mut hook =
+        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+    let cancel = CancellationToken::new();
+    let runner = f.runner.clone();
+    let child_cancel = cancel.clone();
+    let run = tokio::spawn(async move { runner.run(child_cancel).await.unwrap() });
+    hook.reached().await;
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET payload='{\"cancel_race\":true}' WHERE id='publication-retry-probe'",
+    ).await.unwrap();
+    hook.release();
+    wait_for_sleep(&mut sleeps, 10).await;
+    cancel.cancel();
+    assert!(matches!(
+        run.await.unwrap(),
+        CompactionExit::Reconcile(FailureKind::Cancelled)
+    ));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+
+    let f = fixture("publication source", vec![Reply::Success], true, false).await;
+    install_publication_retry_probe(&f).await;
+    let mut sleeps = f.clock.subscribe_sleeps();
+    let mut first_hook =
+        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+    let runner = f.runner.clone();
+    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+    first_hook.reached().await;
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET payload='{\"deadline_race\":1}' WHERE id='publication-retry-probe'",
+    ).await.unwrap();
+    first_hook.release();
+    wait_for_sleep(&mut sleeps, 10).await;
+    let mut second_hook =
+        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+    f.clock.advance(10);
+    second_hook.reached().await;
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET payload='{\"deadline_race\":2}' WHERE id='publication-retry-probe'",
+    ).await.unwrap();
+    second_hook.release();
+    wait_for_sleep(&mut sleeps, 30).await;
+    f.clock.advance(900_000);
+    assert!(matches!(
+        run.await.unwrap(),
+        CompactionExit::Reconcile(FailureKind::Deadline)
+    ));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn gateway_restart_from_commit_reprepares_publication_proof() {
+    let f = fixture("publication source", vec![Reply::Success], true, false).await;
+    install_publication_retry_probe(&f).await;
+    let mut sleeps = f.clock.subscribe_sleeps();
+    let mut hook =
+        arm_publication_test_hook(&f.store, "operation", PublicationTestPause::BeforeWriter);
+    let runner = f.runner.clone();
+    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+    hook.reached().await;
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn_event SET payload='{\"restart_race\":true}' WHERE id='publication-retry-probe'",
+    ).await.unwrap();
+    hook.release();
+    wait_for_sleep(&mut sleeps, 10).await;
+    let before_restart = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    let commit_checkpoint = match &before_restart.phase {
+        RunnerPhase::Commit { checkpoint } => checkpoint.clone(),
+        _ => panic!("validation retry did not preserve Commit phase"),
+    };
+    let summary = f
+        .store
+        .compaction_checkpoint(&commit_checkpoint)
+        .await
+        .unwrap()
+        .unwrap()
+        .summary;
+    run.abort();
+    let _ = run.await;
+
+    let exit = f.runner.run(CancellationToken::new()).await.unwrap();
+    assert!(matches!(exit, CompactionExit::Applied(_)));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
+    let applied = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.attempts, before_restart.attempts);
+    assert_eq!(applied.retries, before_restart.retries);
+    let RunnerPhase::Applied { checkpoint } = &applied.phase else {
+        panic!("restarted Commit did not publish its candidate")
+    };
+    assert_eq!(checkpoint, &commit_checkpoint);
+    assert_eq!(
+        f.store
+            .compaction_checkpoint(checkpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .summary,
+        summary
+    );
 }
 
 #[tokio::test]

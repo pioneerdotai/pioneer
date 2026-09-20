@@ -1083,10 +1083,8 @@ impl CrudStore {
         )
         .await
     }
-    /// One atomic domain transition. The immutable, admitted manifest bounds
-    /// validation to this operation's selected sources; it never scans transcript
-    /// payloads or the complete history. Every source version and the owner head
-    /// are checked inside the same transaction which publishes the candidate.
+    /// Validate the admitted manifest in one reader snapshot, then compare its
+    /// compact fence and publish the candidate in one short writer transaction.
     pub async fn compaction_apply_runner(
         &self,
         operation: &str,
