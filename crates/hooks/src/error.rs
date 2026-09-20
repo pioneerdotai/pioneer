@@ -1,8 +1,13 @@
-use crate::{HookDiagnosticCode, HookDiagnosticMessage, HookId, HookPhase, HookSubscriptionId};
+use crate::{
+    HookDiagnosticCode, HookDiagnosticMessage, HookId, HookMetadataKey, HookPhase,
+    HookSubscriptionId,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub type HookResult<T> = Result<T, HookError>;
+pub type HookErrorMetadata = BTreeMap<HookMetadataKey, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookError {
@@ -10,6 +15,8 @@ pub struct HookError {
     pub message: HookDiagnosticMessage,
     pub retryable: bool,
     pub safe_for_user: bool,
+    #[serde(default, skip_serializing_if = "HookErrorMetadata::is_empty")]
+    pub metadata: HookErrorMetadata,
 }
 
 impl HookError {
@@ -19,6 +26,7 @@ impl HookError {
             message,
             retryable: false,
             safe_for_user: false,
+            metadata: HookErrorMetadata::default(),
         }
     }
 
@@ -29,6 +37,11 @@ impl HookError {
 
     pub fn with_safe_for_user(mut self, safe_for_user: bool) -> Self {
         self.safe_for_user = safe_for_user;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: HookErrorMetadata) -> Self {
+        self.metadata = metadata;
         self
     }
 }

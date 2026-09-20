@@ -23816,6 +23816,23 @@ impl CrudStore {
         .await
     }
 
+    pub async fn requeue_retryable_unresolved_native_terminal_effects(
+        &self,
+        now_unix: i64,
+        limit: u64,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            native_terminal_effect_outbox::requeue_retryable_unresolved(
+                &self.connection,
+                unix_to_datetime(now_unix),
+                unix_to_datetime(now_unix.saturating_sub(60 * 60)),
+                unix_to_datetime(now_unix.saturating_sub(24 * 60 * 60)),
+                limit,
+            )
+        })
+        .await
+    }
+
     pub async fn complete_native_terminal_effect(
         &self,
         effect_id: &str,
@@ -33656,6 +33673,99 @@ mod tests {
                 .unresolved,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn retryable_post_turn_effect_reopens_after_bounded_cooldown() {
+        let timestamp = 1_700_040_000;
+        let workspace_id = "ws_post_turn_reopen";
+        let thread_id = "thr_post_turn_reopen";
+        let turn_id = "turn_post_turn_reopen";
+        let (store, _, mut terminal_turn) =
+            test_store_with_started_turn(workspace_id, thread_id, turn_id).await;
+        let effect_id = format!("{turn_id}:terminal-effect:post-turn");
+        store
+            .prepare_native_terminal_effects(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:batch:post-turn-reopen"),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    runtime_generation: 1,
+                    effects: vec![pioneer_protocol::NativeTerminalEffectSpec {
+                        effect_id: effect_id.clone(),
+                        effect_kind: pioneer_protocol::NativeTerminalEffectKind::PostTurnHook,
+                        gate: pioneer_protocol::NativeTerminalEffectGate::TerminalCommit,
+                        payload: pioneer_protocol::NativeTerminalEffectPayload::PostTurnHook {
+                            request: serde_json::json!({}),
+                            runtime_snapshot: serde_json::json!({}),
+                        },
+                        max_attempts: 1,
+                    }],
+                },
+                timestamp,
+            )
+            .await
+            .expect("post-turn effect should prepare");
+        terminal_turn.status = TurnStatus::Completed;
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn: terminal_turn,
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("terminal commit should activate post-turn effect");
+
+        let first = store
+            .claim_due_native_terminal_effects(timestamp + 1, 10, 1)
+            .await
+            .expect("first attempt should claim")
+            .pop()
+            .expect("first attempt must exist");
+        assert!(
+            store
+                .fail_native_terminal_effect(
+                    effect_id.as_str(),
+                    first.claim_token.as_str(),
+                    "memory.post_turn_extractor.provider_network_transient",
+                    "provider request failed (network_transient)",
+                    true,
+                    timestamp + 2,
+                    timestamp + 1,
+                )
+                .await
+                .expect("exhausted transient failure should persist")
+        );
+        assert_eq!(
+            store
+                .native_terminal_effect_status(effect_id.as_str())
+                .await
+                .expect("status should load")
+                .expect("effect should exist")
+                .status,
+            "unresolved"
+        );
+
+        assert_eq!(
+            store
+                .requeue_retryable_unresolved_native_terminal_effects(timestamp + 3_602, 1)
+                .await
+                .expect("recovery scan should succeed"),
+            1
+        );
+        let reopened = store
+            .claim_due_native_terminal_effects(timestamp + 3_602, 10, 1)
+            .await
+            .expect("recovery scan should succeed")
+            .pop()
+            .expect("recent transient post-turn failure should reopen");
+        assert_eq!(reopened.effect_id, effect_id);
+        assert_eq!(reopened.attempt_count, 1);
+        assert_eq!(reopened.max_attempts, 8);
     }
 
     #[tokio::test]

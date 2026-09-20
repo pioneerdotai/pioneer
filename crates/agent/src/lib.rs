@@ -1100,16 +1100,24 @@ pub enum AgentTerminalEffectExecutionError {
     RuntimeUnavailable,
     ProviderUnavailable,
     InvalidPayload(String),
-    HookFailed { message: String, retryable: bool },
+    HookFailed {
+        message: String,
+        retryable: bool,
+        root_error: Option<pioneer_hooks::HookRunErrorSummary>,
+    },
     CleanupFailed(String),
 }
 
 impl AgentTerminalEffectExecutionError {
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::RuntimeUnavailable => "hook_runtime_unavailable",
             Self::ProviderUnavailable => "task_provider_unavailable",
             Self::InvalidPayload(_) => "invalid_payload",
+            Self::HookFailed {
+                root_error: Some(error),
+                ..
+            } => error.code.as_str(),
             Self::HookFailed { .. } => "hook_failed",
             Self::CleanupFailed(_) => "cleanup_failed",
         }
@@ -1126,6 +1134,13 @@ impl AgentTerminalEffectExecutionError {
                 }
                 | Self::CleanupFailed(_)
         )
+    }
+
+    pub fn root_hook_error(&self) -> Option<&pioneer_hooks::HookRunErrorSummary> {
+        match self {
+            Self::HookFailed { root_error, .. } => root_error.as_ref(),
+            _ => None,
+        }
     }
 }
 
@@ -2844,9 +2859,26 @@ impl AgentManager {
                 let phase_result = runtime
                     .run_phase_with_snapshot_to_completion(request, subscriptions)
                     .await;
-                phase_result.map_err(|error| AgentTerminalEffectExecutionError::HookFailed {
-                    message: error.to_string(),
-                    retryable: error.retryable(),
+                phase_result.map_err(|error| {
+                    let root_error = match &error {
+                        pioneer_hooks::HookRuntimeError::HookFailed { error, .. }
+                        | pioneer_hooks::HookRuntimeError::HookFailedClosed { error, .. } => {
+                            Some(pioneer_hooks::HookRunErrorSummary::from_error(
+                                error,
+                                &pioneer_hooks::HookDiagnosticRedactionPolicy::new(512, false),
+                            ))
+                        }
+                        pioneer_hooks::HookRuntimeError::DurableExecutionIncomplete {
+                            error,
+                            ..
+                        } => error.clone(),
+                        _ => None,
+                    };
+                    AgentTerminalEffectExecutionError::HookFailed {
+                        message: error.to_string(),
+                        retryable: error.retryable(),
+                        root_error,
+                    }
                 })?;
                 Ok(())
             }

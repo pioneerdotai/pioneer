@@ -22,6 +22,47 @@ const TITLE_JOB_MAX_ATTEMPTS: u32 = 3;
 const TITLE_JOB_BASE_BACKOFF_MS: u64 = 200;
 const TITLE_JOB_MAX_JITTER_MS: u64 = 250;
 
+fn hook_error_metadata_text<'a>(
+    error: &'a pioneer_hooks::HookRunErrorSummary,
+    key: &str,
+) -> Option<&'a str> {
+    error
+        .metadata
+        .iter()
+        .find(|(metadata_key, _)| metadata_key.as_str() == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn hook_error_metadata_i64(error: &pioneer_hooks::HookRunErrorSummary, key: &str) -> Option<i64> {
+    error
+        .metadata
+        .iter()
+        .find(|(metadata_key, _)| metadata_key.as_str() == key)
+        .and_then(|(_, value)| value.parse().ok())
+}
+
+fn native_terminal_effect_retry_delay_secs(
+    attempt_count: u16,
+    memory_post_turn_extractor: bool,
+    retry_after_ms: Option<i64>,
+) -> i64 {
+    const MEMORY_RETRY_DELAYS_SECS: [i64; 7] = [5, 30, 120, 600, 1_800, 7_200, 21_600];
+    let policy_delay = if memory_post_turn_extractor {
+        let index = usize::from(attempt_count.saturating_sub(1))
+            .min(MEMORY_RETRY_DELAYS_SECS.len().saturating_sub(1));
+        MEMORY_RETRY_DELAYS_SECS[index]
+    } else {
+        let exponent = u32::from(attempt_count.saturating_sub(1)).min(8);
+        1_i64.checked_shl(exponent).unwrap_or(256).min(300)
+    };
+    let provider_delay = retry_after_ms
+        .unwrap_or_default()
+        .max(0)
+        .saturating_add(999)
+        .saturating_div(1_000);
+    policy_delay.max(provider_delay)
+}
+
 fn remove_agent_listener_task_if_generation(
     listeners: &mut HashMap<String, AgentListenerTask>,
     thread_id: &str,
@@ -5566,41 +5607,96 @@ impl MessageProcessor {
                                 elapsed: Some(effect_started.elapsed()),
                             },
                         );
-                        let (code, message, retryable) = match outcome {
+                        let (code, message, retryable, root_error) = match outcome {
                             Ok(Err(error)) => {
-                                (error.code(), error.to_string(), error.retryable())
+                                let root_error = error.root_hook_error().cloned();
+                                let message = root_error
+                                    .as_ref()
+                                    .map(|root| root.message.to_string())
+                                    .unwrap_or_else(|| error.to_string());
+                                (
+                                    error.code().to_owned(),
+                                    message,
+                                    error.retryable(),
+                                    root_error,
+                                )
                             }
                             Err(_) => (
-                                "effect_timeout",
+                                "effect_timeout".to_owned(),
                                 format!(
                                     "native terminal effect exceeded its {timeout_secs}s execution deadline"
                                 ),
                                 true,
+                                None,
                             ),
                             Ok(Ok(())) => unreachable!("success handled above"),
                         };
+                        let final_failure = !retryable || record.attempt_count >= record.max_attempts;
                         if is_memory_post_turn_extractor_effect {
-                            tracing::error!(
-                                target: "pioneer::memory_post_turn_extractor",
-                                stage = "durable_terminal_effect",
-                                error_code = code,
-                                retryable,
-                                attempt_count = record.attempt_count,
-                                max_attempts = record.max_attempts,
-                                elapsed_ms = ?effect_started.elapsed().as_millis(),
-                                error = %message,
-                                "memory post-turn extractor durable attempt failed"
-                            );
+                            let provider = root_error
+                                .as_ref()
+                                .and_then(|error| hook_error_metadata_text(error, "provider"));
+                            let model = root_error
+                                .as_ref()
+                                .and_then(|error| hook_error_metadata_text(error, "model"));
+                            let failure_class = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "failure_class")
+                            });
+                            let failure_stage = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_text(error, "failure_stage")
+                            });
+                            let http_status = root_error.as_ref().and_then(|error| {
+                                hook_error_metadata_i64(error, "http_status")
+                            });
+                            if final_failure {
+                                tracing::error!(
+                                    target: "pioneer::memory_post_turn_extractor",
+                                    stage = "durable_terminal_effect",
+                                    root_error_code = code,
+                                    provider = provider.unwrap_or("unknown"),
+                                    model = model.unwrap_or("unknown"),
+                                    failure_class = failure_class.unwrap_or("unknown"),
+                                    failure_stage = failure_stage.unwrap_or("unknown"),
+                                    http_status = ?http_status,
+                                    retryable,
+                                    attempt_count = record.attempt_count,
+                                    max_attempts = record.max_attempts,
+                                    elapsed_ms = ?effect_started.elapsed().as_millis(),
+                                    "memory post-turn extractor exhausted durable delivery"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    target: "pioneer::memory_post_turn_extractor",
+                                    stage = "durable_terminal_effect",
+                                    root_error_code = code,
+                                    provider = provider.unwrap_or("unknown"),
+                                    model = model.unwrap_or("unknown"),
+                                    failure_class = failure_class.unwrap_or("unknown"),
+                                    failure_stage = failure_stage.unwrap_or("unknown"),
+                                    http_status = ?http_status,
+                                    retryable,
+                                    attempt_count = record.attempt_count,
+                                    max_attempts = record.max_attempts,
+                                    elapsed_ms = ?effect_started.elapsed().as_millis(),
+                                    "memory post-turn extractor durable attempt will retry"
+                                );
+                            }
                         }
                         let completed_at = chrono::Utc::now().timestamp();
-                        let exponent = u32::from(record.attempt_count.saturating_sub(1)).min(8);
-                        let retry_delay = 1_i64.checked_shl(exponent).unwrap_or(256).min(300);
+                        let retry_after_ms = root_error.as_ref().and_then(|error| {
+                            hook_error_metadata_i64(error, "retry_after_ms")
+                        });
+                        let retry_delay = native_terminal_effect_retry_delay_secs(
+                            record.attempt_count,
+                            is_memory_post_turn_extractor_effect,
+                            retry_after_ms,
+                        );
                         match self
                             .crud_store
                             .fail_native_terminal_effect(
                                 record.effect_id.as_str(),
                                 record.claim_token.as_str(),
-                                code,
+                                code.as_str(),
                                 message.as_str(),
                                 retryable,
                                 completed_at.saturating_add(retry_delay),

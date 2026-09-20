@@ -136,7 +136,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         {
             Ok(manifest) => manifest,
             Err(error) => {
-                tracing::error!(
+                tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "manifest_load",
                     durable = durable_terminal_effect.is_some(),
@@ -180,12 +180,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         .await
         {
             Ok(extraction) => extraction,
-            Err(MemoryPostTurnExtractorFailure::ProviderFailed) => {
-                return Err(memory_retryable_safe_hook_error(
-                    "memory.post_turn_extractor.provider_failed",
-                    "memory post-turn extractor provider failed",
-                ));
-            }
+            Err(MemoryPostTurnExtractorFailure::ProviderFailed(error)) => return Err(error),
             Err(MemoryPostTurnExtractorFailure::InvalidJson(error)) => {
                 if durable_terminal_effect.is_some() {
                     return Err(memory_hook_error(
@@ -242,7 +237,7 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 }
                 Err(error) => {
                     stats.write_failure_count += 1;
-                    tracing::error!(
+                    tracing::warn!(
                         target: "pioneer::memory_post_turn_extractor",
                         stage = "semantic_write",
                         durable = durable_terminal_effect.is_some(),
@@ -282,7 +277,7 @@ struct MemoryPostTurnExtractionOutcome {
 }
 
 enum MemoryPostTurnExtractorFailure {
-    ProviderFailed,
+    ProviderFailed(HookError),
     InvalidJson(String),
 }
 
@@ -296,20 +291,21 @@ async fn extract_post_turn_memory_once(
         .extract_post_turn_memory_json(context.clone(), request)
         .await
         .map_err(|error| {
-            tracing::error!(
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
                 stage = "extractor_provider",
                 durable = context.durable_terminal_effect.is_some(),
                 provider = ?context.model_provider.as_deref(),
                 model = ?context.model.as_deref(),
-                error = %error,
+                error_code = %error.code,
+                retryable = error.retryable,
                 "memory post-turn extractor provider execution failed"
             );
-            MemoryPostTurnExtractorFailure::ProviderFailed
+            MemoryPostTurnExtractorFailure::ProviderFailed(error)
         })?;
     let parsed =
         parse_memory_post_turn_extractor_json(raw_json.as_str(), config).map_err(|error| {
-            tracing::error!(
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
                 stage = "response_json_parse",
                 durable = context.durable_terminal_effect.is_some(),

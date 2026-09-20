@@ -1245,6 +1245,7 @@ fn error_from_columns(
             .context("invalid hook run error message preview")?,
         retryable,
         safe_for_user,
+        metadata: pioneer_hooks::HookErrorMetadata::default(),
     }))
 }
 
@@ -1638,6 +1639,7 @@ mod tests {
                         message: HookDiagnosticMessage::new("token=secret").expect("valid error"),
                         retryable: true,
                         safe_for_user: false,
+                        metadata: pioneer_hooks::HookErrorMetadata::default(),
                     }),
                     completed_at: Some(timestamp(1)),
                 },

@@ -1358,7 +1358,10 @@ async fn post_turn_extractor_uses_thread_model_when_not_configured() {
 async fn post_turn_extractor_does_not_fallback_to_thread_model() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestSequencedPostTurnExtractorProvider::new([
-        Err("configured extractor failed".to_owned()),
+        Err(memory_retryable_safe_hook_error(
+            "memory.post_turn_extractor.provider_network_transient",
+            "configured extractor failed",
+        )),
         Ok(valid_post_turn_extractor_json()),
     ]));
     let hook = MemoryPostTurnExtractorHook {
@@ -1390,7 +1393,7 @@ async fn post_turn_extractor_does_not_fallback_to_thread_model() {
     assert!(write_provider.write_params().is_empty());
     assert_eq!(
         error.code.as_str(),
-        "memory.post_turn_extractor.provider_failed"
+        "memory.post_turn_extractor.provider_network_transient"
     );
 }
 
@@ -1480,7 +1483,7 @@ async fn post_turn_extractor_provider_failure_is_retryable_hook_failure() {
 
     assert_eq!(
         error.code.as_str(),
-        "memory.post_turn_extractor.provider_failed"
+        "memory.post_turn_extractor.provider_network_transient"
     );
     assert!(error.retryable);
     assert!(error.safe_for_user);

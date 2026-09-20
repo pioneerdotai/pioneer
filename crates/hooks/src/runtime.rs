@@ -79,6 +79,7 @@ pub enum HookRuntimeError {
         timed_out_runs: usize,
         incomplete_runs: usize,
         retryable: bool,
+        error: Option<HookRunErrorSummary>,
     },
 }
 
@@ -244,6 +245,8 @@ pub struct HookRunErrorSummary {
     pub message: HookDiagnosticMessage,
     pub retryable: bool,
     pub safe_for_user: bool,
+    #[serde(default, skip_serializing_if = "crate::HookErrorMetadata::is_empty")]
+    pub metadata: crate::HookErrorMetadata,
 }
 
 impl HookRunErrorSummary {
@@ -261,6 +264,7 @@ impl HookRunErrorSummary {
             message: preview.message,
             retryable: error.retryable,
             safe_for_user: preview.safe_for_user,
+            metadata: error.metadata.clone(),
         }
     }
 }
@@ -354,6 +358,8 @@ pub struct HookBackgroundRunSummary {
     /// later durable attempt with the same immutable input.
     #[serde(default)]
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<HookRunErrorSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -365,6 +371,8 @@ pub struct HookBackgroundDrainSummary {
     pub skipped_count: usize,
     pub incomplete_count: usize,
     pub retryable_failed_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_error: Option<HookRunErrorSummary>,
 }
 
 impl HookBackgroundDrainSummary {
@@ -376,6 +384,9 @@ impl HookBackgroundDrainSummary {
                 self.failed_count += 1;
                 if run.retryable {
                     self.retryable_failed_count += 1;
+                }
+                if self.first_error.is_none() {
+                    self.first_error.clone_from(&run.error);
                 }
             }
             HookRunStatus::TimedOut => self.timed_out_count += 1,
@@ -730,6 +741,7 @@ impl HookRuntime {
                     timed_out_runs: drain.timed_out_count,
                     incomplete_runs: drain.incomplete_count,
                     retryable: false,
+                    error: drain.first_error,
                 })
             }
             (Err(phase_error), Err(drain_error))
@@ -778,6 +790,11 @@ impl HookRuntime {
                         // the whole immutable invocation terminal because a
                         // retry cannot make every obligation succeed.
                         retryable: retryable_failed_runs == failed_runs,
+                        error: response
+                            .runs
+                            .iter()
+                            .find_map(|run| run.error.clone())
+                            .or(drain.first_error),
                     });
                 }
                 Ok(response)
@@ -1455,7 +1472,7 @@ async fn execute_queued_background_run(
         .complete_background_for_outcome(&run.node, run.request.phase, &outcome, options)
         .await;
     run.persistence.ensure_healthy()?;
-    Ok(background_run_summary(&run, &outcome, status))
+    Ok(background_run_summary(&run, &outcome, status, options))
 }
 
 async fn recover_background_run(
@@ -2770,6 +2787,7 @@ fn background_run_summary(
     run: &HookQueuedBackgroundRun,
     outcome: &HookNodeOutcome,
     status: HookRunStatus,
+    options: &HookRuntimeOptions,
 ) -> HookBackgroundRunSummary {
     let (contribution_count, diagnostic_count) = match outcome {
         HookNodeOutcome::Succeeded(response) => {
@@ -2791,6 +2809,19 @@ fn background_run_summary(
             HookNodeOutcome::TimedOut { .. } => true,
             HookNodeOutcome::Succeeded(_) | HookNodeOutcome::Skipped | HookNodeOutcome::Queued => {
                 false
+            }
+        },
+        error: match outcome {
+            HookNodeOutcome::Failed(error) => Some(HookRunErrorSummary::from_error(
+                error,
+                &options.diagnostic_redaction_policy(),
+            )),
+            HookNodeOutcome::TimedOut { timeout_ms } => Some(HookRunErrorSummary::from_error(
+                &timeout_error(*timeout_ms),
+                &options.diagnostic_redaction_policy(),
+            )),
+            HookNodeOutcome::Succeeded(_) | HookNodeOutcome::Skipped | HookNodeOutcome::Queued => {
+                None
             }
         },
     }

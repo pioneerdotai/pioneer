@@ -2,6 +2,10 @@ use crate::message::MessageProcessor;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use pioneer_crud::workspace_agent_memory_scope_key;
+use pioneer_hooks::{
+    HookDiagnosticCode, HookDiagnosticMessage, HookError, HookErrorMetadata, HookMetadataKey,
+    HookResult,
+};
 use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
@@ -15,9 +19,12 @@ use pioneer_protocol::{
     MemoryCategory, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryListParams,
     MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryScope, MemoryScopeKind,
     MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
-    MemorySensitivity, MemorySourceContextKind, MemoryStatus,
+    MemorySensitivity, MemorySourceContextKind, MemoryStatus, ProviderFailureClass,
+    ProviderFailureStage,
 };
-use pioneer_provider::{ChatMessage, ChatRequest, Provider, StreamChunk};
+use pioneer_provider::{
+    ChatMessage, ChatRequest, Provider, ProviderFailureClassification, StreamChunk,
+};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
@@ -558,8 +565,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         &self,
         context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
-    ) -> Result<String, String> {
-        let processor = self.processor()?;
+    ) -> HookResult<String> {
+        let processor = self.processor().map_err(|_| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.runtime_unavailable",
+                "memory post-turn extractor runtime is unavailable",
+                true,
+                HookErrorMetadata::default(),
+            )
+        })?;
         let config = processor.memory_loop_config().post_turn_extractor;
         if !config.enabled || !config.provider_enabled || !config.proactive_writes_enabled {
             return Ok(r#"{"facts":[]}"#.to_owned());
@@ -572,19 +586,37 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             None,
             MemoryExecutionAccess::Read,
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.authorization_unavailable",
+                "memory post-turn extractor authorization is unavailable",
+                false,
+                HookErrorMetadata::default(),
+            )
+        })?;
         let (provider_name, model) = self.resolve_internal_model(
             processor.as_ref(),
             MemoryInternalModelPurpose::PostTurnExtractor,
             context.model_provider.as_deref(),
             context.model.as_deref(),
         );
-        let provider_name = provider_name
-            .as_deref()
-            .ok_or_else(|| "missing model provider for memory post-turn extractor".to_owned())?;
-        let model = model
-            .as_deref()
-            .ok_or_else(|| "missing model for memory post-turn extractor".to_owned())?;
+        let provider_name = provider_name.as_deref().ok_or_else(|| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.provider_not_configured",
+                "memory post-turn extractor provider is not configured",
+                false,
+                HookErrorMetadata::default(),
+            )
+        })?;
+        let model = model.as_deref().ok_or_else(|| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.model_not_configured",
+                "memory post-turn extractor model is not configured",
+                false,
+                provider_model_metadata(provider_name, "", "configuration"),
+            )
+        })?;
         if let Some(claim) = context.durable_terminal_effect.as_ref()
             && let Some(checkpoint_json) = processor
                 .crud_store
@@ -593,17 +625,21 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     claim.claim_token.as_str(),
                 )
                 .await
-                .map_err(|error| {
-                    tracing::error!(
+                .map_err(|_error| {
+                    tracing::warn!(
                         target: "pioneer::memory_post_turn_extractor",
                         stage = "checkpoint_load",
                         provider = provider_name,
                         model,
                         durable = true,
-                        error = %format!("{error:#}"),
                         "memory post-turn extractor checkpoint load failed"
                     );
-                    format!("failed to load memory post-turn extraction checkpoint: {error:#}")
+                    memory_extractor_hook_error(
+                        "memory.post_turn_extractor.checkpoint_load_failed",
+                        "memory post-turn extractor checkpoint loading failed",
+                        true,
+                        provider_model_metadata(provider_name, model, "checkpoint_load"),
+                    )
                 })?
         {
             return decode_memory_post_turn_extractor_checkpoint(
@@ -611,17 +647,21 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 model,
                 provider_name,
             )
-            .map_err(|error| {
-                tracing::error!(
+            .map_err(|_error| {
+                tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "checkpoint_decode",
                     provider = provider_name,
                     model,
                     durable = true,
-                    error = %error,
                     "memory post-turn extractor checkpoint decode failed"
                 );
-                error
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.checkpoint_invalid",
+                    "memory post-turn extractor checkpoint is invalid",
+                    false,
+                    provider_model_metadata(provider_name, model, "checkpoint_decode"),
+                )
             });
         }
         let provider_authorization = processor
@@ -634,7 +674,7 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             )
             .await
             .map_err(|_| {
-                tracing::error!(
+                tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "authorization_revalidation",
                     provider = provider_name,
@@ -642,8 +682,12 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     durable = context.durable_terminal_effect.is_some(),
                     "memory post-turn extractor authorization revalidation failed"
                 );
-                "memory post-turn extractor provider is unavailable for the current execution"
-                    .to_owned()
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.authorization_rejected",
+                    "memory post-turn extractor provider authorization was rejected",
+                    false,
+                    provider_model_metadata(provider_name, model, "authorization_revalidation"),
+                )
             })?;
         if !crate::authorization::AuthorizationService::new().provider_model_allowed(
             provider_authorization.principal().kind,
@@ -651,7 +695,7 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             provider_name,
             model,
         ) {
-            tracing::error!(
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
                 stage = "authorization_projection",
                 provider = provider_name,
@@ -659,30 +703,43 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 durable = context.durable_terminal_effect.is_some(),
                 "memory post-turn extractor authorization projection failed"
             );
-            return Err(
-                "memory post-turn extractor provider is outside the role projection".to_owned(),
-            );
+            return Err(memory_extractor_hook_error(
+                "memory.post_turn_extractor.permission_denied",
+                "memory post-turn extractor provider is outside the role projection",
+                false,
+                provider_model_metadata(provider_name, model, "authorization_projection"),
+            ));
         }
         let provider = processor
             .provider_registry()
             .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
             .map_err(|error| {
-                tracing::error!(
+                let class = pioneer_agent::classify_provider_failure_message(
+                    error.to_string().as_str(),
+                    ProviderFailureStage::Connect,
+                );
+                tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "provider_resolution",
                     provider = provider_name,
                     model,
                     durable = context.durable_terminal_effect.is_some(),
-                    error = %error,
+                    failure_class = memory_provider_failure_class_name(class),
                     "memory post-turn extractor provider resolution failed"
                 );
-                format!("failed to create memory post-turn extractor provider: {error}")
+                classified_memory_provider_error(
+                    provider_name,
+                    model,
+                    "provider_resolution",
+                    ProviderFailureStage::Connect,
+                    ProviderFailureClassification::new(class),
+                )
             })?;
         let raw_json =
             request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
                 .await?;
         if raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
-            tracing::error!(
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
                 stage = "response_size_validation",
                 provider = provider_name,
@@ -693,7 +750,12 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 response_limit_bytes = MAX_POST_TURN_EXTRACTOR_RAW_BYTES,
                 "memory post-turn extractor response size validation failed"
             );
-            return Err("memory post-turn extractor response exceeds its byte limit".to_owned());
+            return Err(memory_extractor_hook_error(
+                "memory.post_turn_extractor.response_too_large",
+                "memory post-turn extractor response exceeds its byte limit",
+                false,
+                provider_model_metadata(provider_name, model, "response_size_validation"),
+            ));
         }
         if let Some(claim) = context.durable_terminal_effect.as_ref() {
             let checkpoint_json = encode_memory_post_turn_extractor_checkpoint(
@@ -701,8 +763,8 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                 model,
                 provider_name,
             )
-            .map_err(|error| {
-                tracing::error!(
+            .map_err(|_error| {
+                tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "checkpoint_encode",
                     provider = provider_name,
@@ -710,10 +772,14 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     durable = true,
                     response_bytes = raw_json.len(),
                     response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
-                    error = %error,
                     "memory post-turn extractor checkpoint encode failed"
                 );
-                error
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.checkpoint_encode_failed",
+                    "memory post-turn extractor checkpoint encoding failed",
+                    false,
+                    provider_model_metadata(provider_name, model, "checkpoint_encode"),
+                )
             })?;
             processor
                 .crud_store
@@ -724,8 +790,8 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     chrono::Utc::now().timestamp(),
                 )
                 .await
-                .map_err(|error| {
-                    tracing::error!(
+                .map_err(|_error| {
+                    tracing::warn!(
                         target: "pioneer::memory_post_turn_extractor",
                         stage = "checkpoint_store",
                         provider = provider_name,
@@ -733,10 +799,14 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                         durable = true,
                         response_bytes = raw_json.len(),
                         response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
-                        error = %format!("{error:#}"),
                         "memory post-turn extractor checkpoint store failed"
                     );
-                    format!("failed to persist memory post-turn extraction checkpoint: {error:#}")
+                    memory_extractor_hook_error(
+                        "memory.post_turn_extractor.checkpoint_store_failed",
+                        "memory post-turn extractor checkpoint persistence failed",
+                        true,
+                        provider_model_metadata(provider_name, model, "checkpoint_store"),
+                    )
                 })?;
         }
         Ok(raw_json)
@@ -747,34 +817,8 @@ async fn request_post_turn_extractor_json(
     provider: &dyn Provider,
     model: &str,
     prompt: String,
-) -> Result<String, String> {
-    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), None, "primary")
-        .await
-    {
-        Ok(json) => Ok(json),
-        Err(primary_error) => {
-            if !should_retry_internal_memory_request_without_optional_params(primary_error.as_str())
-            {
-                return Err(format!(
-                    "memory post-turn extractor request failed: {primary_error}"
-                ));
-            }
-
-            request_post_turn_extractor_json_once(
-                provider,
-                model,
-                prompt,
-                None,
-                "compatibility_fallback",
-            )
-                .await
-                .map_err(|fallback_error| {
-                    format!(
-                        "memory post-turn extractor request failed: {primary_error}; compatibility fallback failed: {fallback_error}"
-                    )
-                })
-        }
-    }
+) -> HookResult<String> {
+    request_post_turn_extractor_json_once(provider, model, prompt, None, "primary").await
 }
 
 async fn request_post_turn_extractor_json_once(
@@ -783,23 +827,30 @@ async fn request_post_turn_extractor_json_once(
     prompt: String,
     temperature: Option<f32>,
     request_attempt: &'static str,
-) -> Result<String, String> {
+) -> HookResult<String> {
     let request = post_turn_extractor_chat_request(model, prompt, temperature);
     if provider.capabilities().streaming {
         let stream = provider.stream_chat(request).await.map_err(|error| {
-            tracing::error!(
+            let classified = memory_provider_request_error(
+                provider,
+                model,
+                "provider_stream_start",
+                ProviderFailureStage::Connect,
+                &error,
+            );
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
                 stage = "provider_stream_start",
                 provider = provider.name(),
                 model,
                 request_attempt,
-                error = %format!("{error:#}"),
+                error_code = %classified.code,
+                retryable = classified.retryable,
                 "memory post-turn extractor provider stream start failed"
             );
-            format!("{error:#}")
+            classified
         })?;
-        return collect_post_turn_extractor_stream(stream, provider.name(), model, request_attempt)
-            .await;
+        return collect_post_turn_extractor_stream(stream, provider, model, request_attempt).await;
     }
 
     provider
@@ -807,40 +858,59 @@ async fn request_post_turn_extractor_json_once(
         .await
         .map(|response| response.text)
         .map_err(|error| {
-            tracing::error!(
+            let classified = memory_provider_request_error(
+                provider,
+                model,
+                "provider_non_stream_response",
+                ProviderFailureStage::Connect,
+                &error,
+            );
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
                 stage = "provider_non_stream_response",
                 provider = provider.name(),
                 model,
                 request_attempt,
-                error = %format!("{error:#}"),
+                error_code = %classified.code,
+                retryable = classified.retryable,
                 "memory post-turn extractor non-stream provider request failed"
             );
-            format!("{error:#}")
+            classified
         })
 }
 
 async fn collect_post_turn_extractor_stream(
     mut stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
-    provider_name: &str,
+    provider: &dyn Provider,
     model: &str,
     request_attempt: &'static str,
-) -> Result<String, String> {
+) -> HookResult<String> {
     let mut text = String::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            tracing::error!(
+            let (stage_name, stage) = if text.is_empty() {
+                (
+                    "provider_stream_first_chunk",
+                    ProviderFailureStage::FirstChunk,
+                )
+            } else {
+                ("provider_stream_item", ProviderFailureStage::MidStream)
+            };
+            let classified =
+                memory_provider_request_error(provider, model, stage_name, stage, &error);
+            tracing::warn!(
                 target: "pioneer::memory_post_turn_extractor",
-                stage = "provider_stream_item",
-                provider = provider_name,
+                stage = stage_name,
+                provider = provider.name(),
                 model,
                 request_attempt,
                 collected_response_bytes = text.len(),
                 collected_response_sha256 = %post_turn_extractor_response_sha256(text.as_str()),
-                error = %format!("{error:#}"),
+                error_code = %classified.code,
+                retryable = classified.retryable,
                 "memory post-turn extractor provider stream item failed"
             );
-            format!("{error:#}")
+            classified
         })?;
         if !chunk.delta.is_empty() {
             text.push_str(chunk.delta.as_str());
@@ -874,15 +944,153 @@ fn post_turn_extractor_chat_request(
     }
 }
 
-fn should_retry_internal_memory_request_without_optional_params(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("400")
-        || error.contains("bad request")
-        || error.contains("invalid request")
-        || error.contains("invalid parameter")
-        || error.contains("unsupported")
-        || error.contains("temperature")
-        || error.contains("reasoning")
+fn memory_provider_request_error(
+    provider: &dyn Provider,
+    model: &str,
+    stage_name: &'static str,
+    stage: ProviderFailureStage,
+    error: &anyhow::Error,
+) -> HookError {
+    let classification = provider.classify_failure(error).unwrap_or_else(|| {
+        ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
+            error.to_string().as_str(),
+            stage,
+        ))
+    });
+    classified_memory_provider_error(provider.name(), model, stage_name, stage, classification)
+}
+
+fn classified_memory_provider_error(
+    provider: &str,
+    model: &str,
+    stage_name: &'static str,
+    stage: ProviderFailureStage,
+    classification: ProviderFailureClassification,
+) -> HookError {
+    let class_name = memory_provider_failure_class_name(classification.class);
+    let retryable = memory_provider_failure_is_retryable(classification.class);
+    let mut metadata = provider_model_metadata(provider, model, stage_name);
+    insert_hook_text_metadata(&mut metadata, "failure_class", class_name);
+    insert_hook_text_metadata(
+        &mut metadata,
+        "provider_stage",
+        provider_failure_stage_name(stage),
+    );
+    if let Some(status) = classification.http_status {
+        insert_hook_text_metadata(&mut metadata, "http_status", status.to_string());
+    }
+    if let Some(code) = classification.provider_code.as_deref() {
+        insert_hook_text_metadata(&mut metadata, "provider_code", bounded_diagnostic(code, 96));
+    }
+    if let Some(retry_after_ms) = classification.retry_after_ms {
+        insert_hook_text_metadata(
+            &mut metadata,
+            "retry_after_ms",
+            i64::try_from(retry_after_ms)
+                .unwrap_or(i64::MAX)
+                .to_string(),
+        );
+    }
+    memory_extractor_hook_error(
+        format!(
+            "memory.post_turn_extractor.provider_{}",
+            if classification.class == ProviderFailureClass::Provider5xx {
+                "5xx"
+            } else {
+                class_name
+            }
+        ),
+        format!("memory post-turn extractor provider request failed ({class_name})"),
+        retryable,
+        metadata,
+    )
+}
+
+fn provider_model_metadata(provider: &str, model: &str, stage: &str) -> HookErrorMetadata {
+    let mut metadata = HookErrorMetadata::default();
+    insert_hook_text_metadata(&mut metadata, "provider", bounded_diagnostic(provider, 80));
+    if !model.trim().is_empty() {
+        insert_hook_text_metadata(&mut metadata, "model", bounded_diagnostic(model, 160));
+    }
+    insert_hook_text_metadata(&mut metadata, "failure_stage", stage);
+    metadata
+}
+
+fn insert_hook_text_metadata(
+    metadata: &mut HookErrorMetadata,
+    key: &'static str,
+    value: impl Into<String>,
+) {
+    metadata.insert(
+        HookMetadataKey::new(key).expect("static metadata key is valid"),
+        value.into(),
+    );
+}
+
+fn memory_extractor_hook_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retryable: bool,
+    metadata: HookErrorMetadata,
+) -> HookError {
+    HookError::new(
+        HookDiagnosticCode::new(code.into()).expect("memory extractor error code is valid"),
+        HookDiagnosticMessage::new(message.into()).expect("memory extractor message is valid"),
+    )
+    .with_retryable(retryable)
+    .with_safe_for_user(true)
+    .with_metadata(metadata)
+}
+
+fn bounded_diagnostic(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
+}
+
+fn memory_provider_failure_is_retryable(class: ProviderFailureClass) -> bool {
+    matches!(
+        class,
+        ProviderFailureClass::NetworkTransient
+            | ProviderFailureClass::RateLimit
+            | ProviderFailureClass::Provider5xx
+            | ProviderFailureClass::StreamStall
+            | ProviderFailureClass::StreamTruncated
+    )
+}
+
+fn memory_provider_failure_class_name(class: ProviderFailureClass) -> &'static str {
+    match class {
+        ProviderFailureClass::NetworkTransient => "network_transient",
+        ProviderFailureClass::RateLimit => "rate_limited",
+        ProviderFailureClass::Provider5xx => "provider_5xx",
+        ProviderFailureClass::AuthExpired => "auth_expired",
+        ProviderFailureClass::AuthOrPermission => "auth_or_permission",
+        ProviderFailureClass::ModelNotFound => "model_not_found",
+        ProviderFailureClass::PromptTooLong => "prompt_too_long",
+        ProviderFailureClass::ContextTooLarge => "context_too_large",
+        ProviderFailureClass::MaxOutputTokens => "max_output_tokens",
+        ProviderFailureClass::StreamStall => "stream_stall",
+        ProviderFailureClass::StreamTruncated => "stream_truncated",
+        ProviderFailureClass::EmptyResponse => "empty_response",
+        ProviderFailureClass::ProviderRejected => "provider_rejected",
+        ProviderFailureClass::UnsupportedParameter => "unsupported_parameter",
+        ProviderFailureClass::UnsupportedCapability => "unsupported_capability",
+        ProviderFailureClass::UnsupportedImageInput => "unsupported_image_input",
+        ProviderFailureClass::UnsupportedToolCalling => "unsupported_tool_calling",
+        ProviderFailureClass::UnsupportedStreaming => "unsupported_streaming",
+        ProviderFailureClass::MalformedProviderRequest => "malformed_provider_request",
+        ProviderFailureClass::InvalidRequest => "invalid_request",
+        ProviderFailureClass::PermissionDenied => "permission_denied",
+        ProviderFailureClass::Unknown => "unknown",
+    }
+}
+
+fn provider_failure_stage_name(stage: ProviderFailureStage) -> &'static str {
+    match stage {
+        ProviderFailureStage::Connect => "connect",
+        ProviderFailureStage::FirstChunk => "first_chunk",
+        ProviderFailureStage::MidStream => "mid_stream",
+        ProviderFailureStage::Finalize => "finalize",
+    }
 }
 
 #[async_trait]
@@ -2104,6 +2312,53 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_turn_provider_failure_policy_retries_only_transient_classes() {
+        for class in [
+            ProviderFailureClass::NetworkTransient,
+            ProviderFailureClass::RateLimit,
+            ProviderFailureClass::Provider5xx,
+            ProviderFailureClass::StreamStall,
+            ProviderFailureClass::StreamTruncated,
+        ] {
+            let error = classified_memory_provider_error(
+                "openrouter",
+                "test-model",
+                "provider_stream_item",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClassification::new(class),
+            );
+            assert!(error.retryable, "{class:?} should retry");
+            assert_eq!(
+                error
+                    .metadata
+                    .iter()
+                    .find(|(key, _)| key.as_str() == "provider")
+                    .map(|(_, value)| value.as_str()),
+                Some("openrouter")
+            );
+        }
+        for class in [
+            ProviderFailureClass::AuthExpired,
+            ProviderFailureClass::AuthOrPermission,
+            ProviderFailureClass::ModelNotFound,
+            ProviderFailureClass::ProviderRejected,
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderFailureClass::InvalidRequest,
+            ProviderFailureClass::Unknown,
+        ] {
+            let error = classified_memory_provider_error(
+                "openrouter",
+                "test-model",
+                "provider_stream_start",
+                ProviderFailureStage::Connect,
+                ProviderFailureClassification::new(class),
+            );
+            assert!(!error.retryable, "{class:?} must be terminal");
+        }
+    }
+
     #[test]
     fn memory_remember_requires_content_and_category_for_all_write_addresses() {
         let spec = memory_tool_specs()
@@ -2416,7 +2671,7 @@ mod tests {
                 .await
                 .expect_err("network errors should be returned to hook runtime");
 
-        assert!(error.contains("network unavailable"));
+        assert!(error.to_string().contains("network unavailable"));
         assert_eq!(*provider.requests.lock().expect("request lock poisoned"), 1);
     }
 }

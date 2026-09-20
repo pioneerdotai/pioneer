@@ -114,7 +114,9 @@ fn prepare_effect(
         payload: payload.unwrap_or_else(|failure| {
             NativeTerminalEffectPayload::PostTurnHookPreparationFailed { failure }
         }),
-        max_attempts: 5,
+        // Provider outages frequently outlive the old five-attempt, minute-scale
+        // window. The gateway applies a bounded schedule spanning several hours.
+        max_attempts: 8,
     }
 }
 

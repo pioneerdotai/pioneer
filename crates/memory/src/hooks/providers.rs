@@ -430,7 +430,7 @@ pub trait AgentMemoryPostTurnExtractorProvider: Send + Sync {
         &self,
         context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
-    ) -> Result<String, String>;
+    ) -> HookResult<String>;
 }
 
 #[async_trait::async_trait]

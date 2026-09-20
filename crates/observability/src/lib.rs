@@ -464,10 +464,18 @@ where
         )));
     }
     if filter.contains(EventFilter::Event) {
-        items.push(EventMapping::Event(Box::new(event_from_event(
-            event,
-            None::<&TracingContext<'_, S>>,
-        ))));
+        let mut sentry_event = event_from_event(event, None::<&TracingContext<'_, S>>);
+        if effective_event_target(event.metadata().target(), fields.log_target.as_deref())
+            == "pioneer::memory_post_turn_extractor"
+            && let Some(root_error_code) = fields.root_error_code.as_deref()
+        {
+            sentry_event.fingerprint = vec![
+                Cow::Borrowed("memory-post-turn-extractor"),
+                Cow::Owned(root_error_code.to_owned()),
+            ]
+            .into();
+        }
+        items.push(EventMapping::Event(Box::new(sentry_event)));
     }
     EventMapping::Combined(items.into())
 }
@@ -636,6 +644,7 @@ struct EventFieldVisitor {
     message: Option<String>,
     log_target: Option<String>,
     name: Option<String>,
+    root_error_code: Option<String>,
 }
 
 impl Visit for EventFieldVisitor {
@@ -644,6 +653,7 @@ impl Visit for EventFieldVisitor {
             "message" => self.message = Some(value.to_owned()),
             "log.target" => self.log_target = Some(value.to_owned()),
             "name" => self.name = Some(value.to_owned()),
+            "root_error_code" => self.root_error_code = Some(value.to_owned()),
             _ => {}
         }
     }
@@ -655,6 +665,9 @@ impl Visit for EventFieldVisitor {
                 self.log_target = Some(format!("{value:?}").trim_matches('"').to_owned())
             }
             "name" => self.name = Some(format!("{value:?}").trim_matches('"').to_owned()),
+            "root_error_code" => {
+                self.root_error_code = Some(format!("{value:?}").trim_matches('"').to_owned())
+            }
             _ => {}
         }
     }

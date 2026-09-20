@@ -28,6 +28,7 @@ pub const MAX_EFFECT_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_EFFECT_HANDLER_CHECKPOINT_BYTES: usize = 128 * 1024;
 pub const MAX_EFFECT_ATTEMPTS: u16 = 20;
 pub const MAX_PURGE_BATCH_SIZE: u64 = 1_000;
+pub const MAX_RETRYABLE_UNRESOLVED_REQUEUE_BATCH_SIZE: u64 = 100;
 const MAX_ERROR_CODE_CHARS: usize = 64;
 const MAX_ERROR_MESSAGE_CHARS: usize = 2_048;
 const COMPACTED_PAYLOAD_JSON: &str = r#"{"compacted":true}"#;
@@ -1538,6 +1539,84 @@ pub async fn mark_failed<C: ConnectionTrait>(
         .context("failed to terminalize native terminal effect")?
         .rows_affected;
     Ok(updated == 1)
+}
+
+/// Reopens a bounded set of recently exhausted post-turn obligations whose
+/// typed failure can make progress after an external provider or storage
+/// outage clears. Permanent and legacy-unclassified failures remain terminal.
+pub async fn requeue_retryable_unresolved<C: ConnectionTrait>(
+    db: &C,
+    now: DateTimeWithTimeZone,
+    completed_before: DateTimeWithTimeZone,
+    prepared_after: DateTimeWithTimeZone,
+    limit: u64,
+) -> Result<u64> {
+    let limit = std::cmp::Ord::min(limit, MAX_RETRYABLE_UNRESOLVED_REQUEUE_BATCH_SIZE);
+    if limit == 0 {
+        return Ok(0);
+    }
+    let retryable_codes = [
+        "effect_timeout",
+        "memory.post_turn_extractor.runtime_unavailable",
+        "memory.post_turn_extractor.checkpoint_load_failed",
+        "memory.post_turn_extractor.checkpoint_store_failed",
+        "memory.post_turn_extractor.manifest_failed",
+        "memory.post_turn_extractor.write_failed",
+        "memory.post_turn_extractor.provider_network_transient",
+        "memory.post_turn_extractor.provider_rate_limited",
+        "memory.post_turn_extractor.provider_5xx",
+        "memory.post_turn_extractor.provider_stream_stall",
+        "memory.post_turn_extractor.provider_stream_truncated",
+    ];
+    let effect_ids = native_terminal_effect_outbox::Entity::find()
+        .select_only()
+        .column(native_terminal_effect_outbox::Column::EffectId)
+        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
+        .filter(native_terminal_effect_outbox::Column::EffectKind.eq("post_turn_hook"))
+        .filter(native_terminal_effect_outbox::Column::LastErrorCode.is_in(retryable_codes))
+        .filter(native_terminal_effect_outbox::Column::CompletedAt.lte(completed_before))
+        .filter(native_terminal_effect_outbox::Column::PreparedAt.gte(prepared_after))
+        .order_by_asc(native_terminal_effect_outbox::Column::CompletedAt)
+        .limit(limit)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("failed to list retryable unresolved native terminal effects")?;
+    if effect_ids.is_empty() {
+        return Ok(0);
+    }
+    let updated = native_terminal_effect_outbox::Entity::update_many()
+        .col_expr(
+            native_terminal_effect_outbox::Column::Status,
+            Expr::value(STATUS_RETRY_WAIT.to_owned()),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::AttemptCount,
+            Expr::value(0_i64),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::MaxAttempts,
+            Expr::cust("MAX(max_attempts, 8)"),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::NextRunAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::CompletedAt,
+            Expr::value(Option::<DateTimeWithTimeZone>::None),
+        )
+        .col_expr(
+            native_terminal_effect_outbox::Column::UpdatedAt,
+            Expr::value(now),
+        )
+        .filter(native_terminal_effect_outbox::Column::EffectId.is_in(effect_ids))
+        .filter(native_terminal_effect_outbox::Column::Status.eq(STATUS_UNRESOLVED))
+        .exec(db)
+        .await
+        .context("failed to requeue retryable unresolved native terminal effects")?
+        .rows_affected;
+    Ok(updated)
 }
 
 pub async fn load_stats<C: ConnectionTrait>(db: &C) -> Result<NativeTerminalEffectStats> {

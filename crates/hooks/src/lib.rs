@@ -33,7 +33,7 @@ pub use contribution::{
 pub use diagnostic::{
     HookDiagnostic, HookDiagnosticPreview, HookDiagnosticRedactionPolicy, HookDiagnosticSeverity,
 };
-pub use error::{HookError, HookRegistryError, HookResult};
+pub use error::{HookError, HookErrorMetadata, HookRegistryError, HookResult};
 pub use handler::{HookCapabilities, HookHandler, HookHandlerDescriptor};
 pub use id::{
     HookActorId, HookAgentId, HookAuditEventKind, HookBackgroundJobId, HookCapability,

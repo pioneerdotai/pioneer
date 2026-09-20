@@ -407,6 +407,9 @@ const NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS: i64 = 60 * 60;
 const NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE: u64 = 256;
+const NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS: i64 = 10 * 60;
+const NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS: i64 = 60;
+const NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE: u64 = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MessageProcessorResilienceConfig {
@@ -2554,6 +2557,7 @@ impl MessageProcessor {
             let mut next_skill_upload_cleanup = 0;
             let mut next_agent_action_ledger_compaction = 0;
             let mut next_native_terminal_effect_purge = 0;
+            let mut next_native_terminal_effect_recovery = 0;
             loop {
                 let Some(this) = processor.upgrade() else {
                     break;
@@ -2707,6 +2711,48 @@ impl MessageProcessor {
                                 "agent domain action ledger compaction",
                                 &error,
                                 &mut transient_storage_poll_failed,
+                            );
+                        }
+                    }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                if now >= next_native_terminal_effect_recovery {
+                    next_native_terminal_effect_recovery =
+                        now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        retry_transient_storage_access(|| {
+                            maintenance
+                                .crud_store
+                                .requeue_retryable_unresolved_native_terminal_effects(
+                                    now,
+                                    NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE,
+                                )
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(requeued) => {
+                            if requeued > 0 {
+                                info!(
+                                    requeued,
+                                    "requeued retryable unresolved native terminal effects"
+                                );
+                            }
+                            if requeued >= NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE {
+                                next_native_terminal_effect_recovery = now;
+                            }
+                        }
+                        Err(error) => {
+                            next_native_terminal_effect_recovery =
+                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS);
+                            record_resilience_worker_error(
+                                "native terminal-effect retryable recovery",
+                                &error,
+                                ResilienceWorkerFailureImpact::Maintenance,
                             );
                         }
                     }
