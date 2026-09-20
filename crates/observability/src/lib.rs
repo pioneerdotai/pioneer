@@ -450,6 +450,13 @@ where
         fields.log_file.as_deref(),
         fields.log_line,
         fields.message.as_deref(),
+    ) || should_demote_gpui_closed_window_teardown_error(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.log_file.as_deref(),
+        fields.log_line,
+        fields.message.as_deref(),
     ) || should_demote_rathole_client_control_channel_retry(
         event.metadata().level(),
         event.metadata().target(),
@@ -576,6 +583,28 @@ fn should_demote_gpui_closed_window_activation_event(
         })
         && log_line == Some(1899)
         && message == Some("window not found")
+}
+
+fn should_demote_gpui_closed_window_teardown_error(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    log_file: Option<&str>,
+    log_line: Option<u64>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && target == "log"
+        && log_target == Some("gpui_windows::window")
+        && log_file.is_some_and(|file| {
+            file.ends_with("gpui-pre-windows-0.3.5/src/window.rs")
+                || file.ends_with(r"gpui-pre-windows-0.3.5\src\window.rs")
+        })
+        && matches!(
+            (log_line, message),
+            (Some(618), Some("Invalid window handle (0x80040102)"))
+                | (Some(619), Some("Invalid window handle. (0x80070578)"))
+        )
 }
 
 fn should_demote_rathole_client_control_channel_retry(
@@ -729,6 +758,7 @@ mod tests {
         database_metrics_target_enabled, sentry_enabled_for_environment, sentry_event_filter,
         should_demote_gpui_asset_cache_http_not_found,
         should_demote_gpui_closed_window_activation_event,
+        should_demote_gpui_closed_window_teardown_error,
         should_demote_rathole_client_control_channel_retry,
         should_demote_rmcp_transport_worker_failure,
         should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
@@ -1021,6 +1051,62 @@ mod tests {
             Some("crates/desktop/src/window.rs"),
             Some(1899),
             Some("window not found"),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_closed_window_drag_drop_teardown_error() {
+        assert!(should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+            ),
+            Some(618),
+            Some("Invalid window handle (0x80040102)"),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_closed_window_destroy_teardown_error() {
+        assert!(should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+            ),
+            Some(619),
+            Some("Invalid window handle. (0x80070578)"),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_invalid_window_handle_from_other_calls_as_event() {
+        assert!(!should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+            ),
+            Some(620),
+            Some("Invalid window handle (0x80040102)"),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_invalid_window_handle_from_other_versions_as_event() {
+        assert!(!should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.6\src\window.rs",
+            ),
+            Some(618),
+            Some("Invalid window handle (0x80040102)"),
         ));
     }
 
