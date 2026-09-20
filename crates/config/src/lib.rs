@@ -2912,7 +2912,7 @@ const fn default_gateway_telemetry_export_interval_ms() -> u64 {
 }
 
 const fn default_gateway_telemetry_export_timeout_ms() -> u64 {
-    3_000
+    15_000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3472,7 +3472,7 @@ mod tests {
             "https://telemetry.getpioneer.dev/v1/traces"
         );
         assert_eq!(telemetry.export_interval_ms, 30_000);
-        assert_eq!(telemetry.export_timeout_ms, 3_000);
+        assert_eq!(telemetry.export_timeout_ms, 15_000);
     }
 
     #[test]

@@ -18,8 +18,8 @@ use opentelemetry_sdk::trace::{
     SdkTracer, SdkTracerProvider, SpanData, SpanExporter as SdkSpanExporter,
 };
 use std::sync::{
-    OnceLock,
-    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::Duration;
 use url::{Host, Url};
@@ -140,6 +140,7 @@ pub fn init_otlp_observability_for(
         );
     }
 
+    let availability = Arc::new(ExportAvailability::default());
     let metric_exporter = MetricExporter::builder()
         .with_http()
         .with_endpoint(config.metrics_endpoint.trim())
@@ -150,6 +151,7 @@ pub fn init_otlp_observability_for(
         .context("failed to build OTLP/HTTP metrics exporter")?;
     let metric_reader = PeriodicReader::builder(ConsentGatedMetricExporter {
         inner: metric_exporter,
+        availability: availability.clone(),
     })
     .with_interval(config.export_interval)
     .build();
@@ -175,6 +177,7 @@ pub fn init_otlp_observability_for(
         .with_resource(resource)
         .with_batch_exporter(ConsentGatedSpanExporter {
             inner: trace_exporter,
+            availability,
         })
         .build();
     let meter = meter_provider.meter(target.instrumentation_name());
@@ -377,8 +380,46 @@ fn validate_endpoint(endpoint: &str, signal: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct ExportAvailability {
+    unavailable_signals: AtomicU8,
+}
+
+impl ExportAvailability {
+    fn observe(&self, signal: &'static str, signal_bit: u8, result: &OTelSdkResult) {
+        match result {
+            Err(error) => {
+                let previous = self
+                    .unavailable_signals
+                    .fetch_or(signal_bit, Ordering::AcqRel);
+                if previous == 0 {
+                    tracing::error!(
+                        target: "pioneer_observability::otlp",
+                        signal,
+                        error = %error,
+                        "OTLP exporter became unavailable after retries"
+                    );
+                }
+            }
+            Ok(()) => {
+                let previous = self
+                    .unavailable_signals
+                    .fetch_and(!signal_bit, Ordering::AcqRel);
+                if previous != 0 && previous & !signal_bit == 0 {
+                    tracing::info!(
+                        target: "pioneer_observability::otlp",
+                        signal,
+                        "OTLP exporter recovered"
+                    );
+                }
+            }
+        }
+    }
+}
+
 struct ConsentGatedMetricExporter<E> {
     inner: E,
+    availability: Arc<ExportAvailability>,
 }
 
 impl<E> PushMetricExporter for ConsentGatedMetricExporter<E>
@@ -389,7 +430,9 @@ where
         if !super::telemetry_enabled() {
             return Ok(());
         }
-        self.inner.export(metrics).await
+        let result = self.inner.export(metrics).await;
+        self.availability.observe("metrics", 0b01, &result);
+        result
     }
 
     fn force_flush(&self) -> OTelSdkResult {
@@ -412,6 +455,7 @@ where
 #[derive(Debug)]
 struct ConsentGatedSpanExporter<E> {
     inner: E,
+    availability: Arc<ExportAvailability>,
 }
 
 impl<E> SdkSpanExporter for ConsentGatedSpanExporter<E>
@@ -424,7 +468,9 @@ where
         }
         let epoch = super::telemetry_consent_snapshot().1 as i64;
         batch.retain_mut(|span| startup_span_attributes_allowed(&mut span.attributes, epoch));
-        self.inner.export(batch).await
+        let result = self.inner.export(batch).await;
+        self.availability.observe("traces", 0b10, &result);
+        result
     }
 
     fn force_flush(&self) -> OTelSdkResult {
@@ -447,11 +493,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsentGatedMetricExporter, ConsentGatedSpanExporter, OtlpTelemetryConfig,
-        otlp_retry_policy, validate_config,
+        ConsentGatedMetricExporter, ConsentGatedSpanExporter, ExportAvailability,
+        OtlpTelemetryConfig, otlp_retry_policy, validate_config,
     };
     use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
     use opentelemetry_sdk::metrics::Temporality;
     use opentelemetry_sdk::metrics::data::ResourceMetrics;
     use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
@@ -632,15 +678,18 @@ mod tests {
         let _reset = TelemetryEnabledReset;
         let metric_exports = Arc::new(AtomicUsize::new(0));
         let trace_exports = Arc::new(AtomicUsize::new(0));
+        let availability = Arc::new(ExportAvailability::default());
         let metric_exporter = ConsentGatedMetricExporter {
             inner: CountingMetricExporter {
                 exports: metric_exports.clone(),
             },
+            availability: availability.clone(),
         };
         let trace_exporter = ConsentGatedSpanExporter {
             inner: CountingSpanExporter {
                 exports: trace_exports.clone(),
             },
+            availability,
         };
         let metrics = ResourceMetrics::default();
 
@@ -655,6 +704,27 @@ mod tests {
         await_ready(trace_exporter.export(Vec::new())).expect("enabled trace export succeeds");
         assert_eq!(metric_exports.load(Ordering::Relaxed), 1);
         assert_eq!(trace_exports.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn exporter_availability_coalesces_signals_until_every_failed_signal_recovers() {
+        let availability = ExportAvailability::default();
+        let failure = Err(OTelSdkError::InternalFailure("network error".to_owned()));
+
+        availability.observe("traces", 0b10, &failure);
+        availability.observe("metrics", 0b01, &failure);
+        assert_eq!(
+            availability.unavailable_signals.load(Ordering::Acquire),
+            0b11
+        );
+
+        availability.observe("traces", 0b10, &Ok(()));
+        assert_eq!(
+            availability.unavailable_signals.load(Ordering::Acquire),
+            0b01
+        );
+        availability.observe("metrics", 0b01, &Ok(()));
+        assert_eq!(availability.unavailable_signals.load(Ordering::Acquire), 0);
     }
 }
 

@@ -215,6 +215,13 @@ where
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("rmcp::service", LevelFilter::WARN);
+    // The OTLP crate deliberately keeps the concrete reqwest failure at DEBUG
+    // and returns a redacted `network error` to the SDK. Send only that target
+    // through the Sentry mapper so the first outage event has a useful DNS,
+    // TLS, connect, or timeout breadcrumb. The formatter remains at INFO.
+    let sentry_filter = filter
+        .clone()
+        .with_target("opentelemetry-otlp", LevelFilter::DEBUG);
 
     let format_layer = tracing_subscriber::fmt::layer()
         .with_writer(make_writer)
@@ -233,7 +240,7 @@ where
 
     if sentry_enabled {
         let _ = subscriber
-            .with(sentry_tracing_layer().with_filter(filter))
+            .with(sentry_tracing_layer().with_filter(sentry_filter))
             .try_init();
     } else {
         let _ = subscriber.try_init();
@@ -405,6 +412,23 @@ where
         return EventMapping::Ignore;
     }
     let fields = tracing_event_fields(event);
+    if should_ignore_otlp_internal_event(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.name.as_deref(),
+    ) {
+        return EventMapping::Ignore;
+    }
+    if should_keep_otlp_network_diagnostic(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.name.as_deref(),
+    ) {
+        return EventMapping::Breadcrumb(breadcrumb_from_event(
+            event,
+            None::<&TracingContext<'_, S>>,
+        ));
+    }
     if should_demote_rmcp_transport_worker_failure(
         event.metadata().level(),
         event.metadata().target(),
@@ -458,6 +482,29 @@ fn sentry_event_filter(level: &tracing::Level) -> EventFilter {
 
 fn effective_event_target<'a>(target: &'a str, log_target: Option<&'a str>) -> &'a str {
     log_target.unwrap_or(target)
+}
+
+fn should_ignore_otlp_internal_event(
+    level: &tracing::Level,
+    target: &str,
+    name: Option<&str>,
+) -> bool {
+    (*level == tracing::Level::ERROR
+        && target == "opentelemetry_sdk"
+        && name == Some("BatchSpanProcessor.ExportError"))
+        || (*level == tracing::Level::DEBUG
+            && target == "opentelemetry-otlp"
+            && name != Some("HttpClient.NetworkError"))
+}
+
+fn should_keep_otlp_network_diagnostic(
+    level: &tracing::Level,
+    target: &str,
+    name: Option<&str>,
+) -> bool {
+    *level == tracing::Level::DEBUG
+        && target == "opentelemetry-otlp"
+        && name == Some("HttpClient.NetworkError")
 }
 
 fn should_demote_rmcp_transport_worker_failure(
@@ -588,6 +635,7 @@ fn tracing_event_fields(event: &tracing::Event<'_>) -> EventFieldVisitor {
 struct EventFieldVisitor {
     message: Option<String>,
     log_target: Option<String>,
+    name: Option<String>,
 }
 
 impl Visit for EventFieldVisitor {
@@ -595,6 +643,7 @@ impl Visit for EventFieldVisitor {
         match field.name() {
             "message" => self.message = Some(value.to_owned()),
             "log.target" => self.log_target = Some(value.to_owned()),
+            "name" => self.name = Some(value.to_owned()),
             _ => {}
         }
     }
@@ -605,6 +654,7 @@ impl Visit for EventFieldVisitor {
             "log.target" => {
                 self.log_target = Some(format!("{value:?}").trim_matches('"').to_owned())
             }
+            "name" => self.name = Some(format!("{value:?}").trim_matches('"').to_owned()),
             _ => {}
         }
     }
@@ -631,7 +681,8 @@ mod tests {
         should_demote_gpui_asset_cache_http_not_found,
         should_demote_rathole_client_control_channel_retry,
         should_demote_rmcp_transport_worker_failure,
-        should_demote_tantivy_reader_commit_reload_not_found,
+        should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
+        should_keep_otlp_network_diagnostic,
     };
     use sentry::integrations::tracing::EventFilter;
     use std::sync::Arc;
@@ -949,5 +1000,33 @@ mod tests {
             sentry_event_filter(&tracing::Level::INFO).bits(),
             EventFilter::Breadcrumb.bits()
         );
+    }
+
+    #[test]
+    fn replaces_repeated_otlp_sdk_export_errors_with_one_owned_outage_event() {
+        assert!(should_ignore_otlp_internal_event(
+            &tracing::Level::ERROR,
+            "opentelemetry_sdk",
+            Some("BatchSpanProcessor.ExportError"),
+        ));
+        assert!(!should_ignore_otlp_internal_event(
+            &tracing::Level::ERROR,
+            "opentelemetry_sdk",
+            Some("TracerProvider.ShutdownError"),
+        ));
+    }
+
+    #[test]
+    fn retains_only_the_detailed_otlp_network_debug_breadcrumb() {
+        assert!(should_keep_otlp_network_diagnostic(
+            &tracing::Level::DEBUG,
+            "opentelemetry-otlp",
+            Some("HttpClient.NetworkError"),
+        ));
+        assert!(should_ignore_otlp_internal_event(
+            &tracing::Level::DEBUG,
+            "opentelemetry-otlp",
+            Some("HttpClient.ExportStarted"),
+        ));
     }
 }
