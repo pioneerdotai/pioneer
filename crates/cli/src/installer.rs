@@ -146,6 +146,17 @@ struct VersionOutput {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -647,8 +658,8 @@ fn resolve_release_install_source(
         .build()
         .context("failed to initialize HTTP client")?;
 
-    let tag = resolve_release_tag(&client, &api_base, channel, version)?;
     let asset_name = gateway_asset_file_name()?;
+    let tag = resolve_release_tag(&client, &api_base, channel, version, asset_name.as_str())?;
     let temp_dir = TempDir::new().context("failed to allocate temporary download directory")?;
     let asset_path = temp_dir.path().join(asset_name.as_str());
     let checksums_path = temp_dir.path().join("SHA256SUMS");
@@ -673,29 +684,28 @@ fn resolve_release_tag(
     api_base: &str,
     channel: ReleaseChannel,
     version: Option<&str>,
+    asset_name: &str,
 ) -> Result<String> {
     if let Some(pinned_version) = version {
-        return Ok(normalize_version_tag(pinned_version));
-    }
-
-    if matches!(channel, ReleaseChannel::Stable) {
-        let url = format!("{api_base}/latest");
+        let tag = normalize_version_tag(pinned_version);
+        let url = format!("{}/tags/{tag}", api_base.trim_end_matches('/'));
         let release = client
             .get(url.as_str())
             .send()
-            .with_context(|| format!("failed to fetch latest release metadata from `{url}`"))?
+            .with_context(|| format!("failed to fetch pinned release metadata from `{url}`"))?
             .error_for_status()
-            .with_context(|| format!("release API request failed for `{url}`"))?
+            .with_context(|| format!("pinned release `{tag}` does not exist"))?
             .json::<GithubRelease>()
-            .context("failed to parse latest release metadata")?;
-        let tag = release.tag_name.trim().to_owned();
-        if tag.is_empty() {
-            bail!("latest release payload does not include `tag_name`");
+            .context("failed to parse pinned release metadata")?;
+        if !release_has_gateway_assets(&release, asset_name) {
+            bail!(
+                "pinned release `{tag}` is not ready: required assets `{asset_name}` and `SHA256SUMS` are not both published"
+            );
         }
-        return Ok(tag);
+        return normalized_release_tag(&release);
     }
 
-    let url = format!("{api_base}?per_page=100");
+    let url = format!("{}?per_page=100", api_base.trim_end_matches('/'));
     let releases = client
         .get(url.as_str())
         .send()
@@ -704,32 +714,69 @@ fn resolve_release_tag(
         .with_context(|| format!("release API request failed for `{url}`"))?
         .json::<Vec<GithubRelease>>()
         .context("failed to parse release list response")?;
+    select_ready_release_tag(channel, releases.iter(), asset_name)
+}
 
-    let needle = format!("-{}", channel.as_str());
-    if let Some(tag) = releases.into_iter().find_map(|release| {
-        let tag = release.tag_name.trim().to_owned();
-        if !tag.is_empty() && tag.contains(needle.as_str()) {
-            Some(tag)
-        } else {
-            None
+fn normalize_version_tag(raw: &str) -> String {
+    raw.trim().to_owned()
+}
+
+fn normalized_release_tag(release: &GithubRelease) -> Result<String> {
+    let tag = release.tag_name.trim();
+    if tag.is_empty() {
+        bail!("release payload does not include `tag_name`");
+    }
+    Ok(tag.to_owned())
+}
+
+fn release_has_gateway_assets(release: &GithubRelease, asset_name: &str) -> bool {
+    let has_gateway = release.assets.iter().any(|asset| asset.name == asset_name);
+    let has_checksums = release
+        .assets
+        .iter()
+        .any(|asset| asset.name == "SHA256SUMS");
+    has_gateway && has_checksums
+}
+
+fn release_matches_channel(release: &GithubRelease, channel: ReleaseChannel) -> bool {
+    if release.draft {
+        return false;
+    }
+    match channel {
+        ReleaseChannel::Stable => !release.prerelease,
+        ReleaseChannel::Beta | ReleaseChannel::Canary => {
+            let needle = format!("-{}", channel.as_str());
+            release.tag_name.trim().contains(needle.as_str())
         }
-    }) {
-        return Ok(tag);
+    }
+}
+
+fn select_ready_release_tag<'a>(
+    channel: ReleaseChannel,
+    releases: impl IntoIterator<Item = &'a GithubRelease>,
+    asset_name: &str,
+) -> Result<String> {
+    let mut matching_release_found = false;
+    for release in releases {
+        if !release_matches_channel(release, channel) {
+            continue;
+        }
+        matching_release_found = true;
+        if release_has_gateway_assets(release, asset_name) {
+            return normalized_release_tag(release);
+        }
     }
 
+    if matching_release_found {
+        bail!(
+            "no fully published `{}` release contains required assets `{asset_name}` and `SHA256SUMS`",
+            channel.as_str()
+        );
+    }
     bail!(
         "failed to find release tag for channel `{}` from release list",
         channel.as_str()
     )
-}
-
-fn normalize_version_tag(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with('v') || trimmed.starts_with('V') {
-        trimmed.to_owned()
-    } else {
-        format!("v{trimmed}")
-    }
 }
 
 fn download_release_asset(client: &Client, url: &str, destination: &Path) -> Result<()> {
@@ -1919,9 +1966,11 @@ fn unix_timestamp_secs() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadRetryPolicy, download_partial_path, download_release_asset_with_policy,
+        DownloadRetryPolicy, GithubRelease, GithubReleaseAsset, ReleaseChannel,
+        download_partial_path, download_release_asset_with_policy,
         ensure_unix_user_path_configured, expected_checksum_for_asset, force_path_update_warning,
-        is_transient_download_error, parse_start_output,
+        is_transient_download_error, normalize_version_tag, parse_start_output,
+        select_ready_release_tag,
     };
     use anyhow::Context as _;
     use reqwest::blocking::Client;
@@ -2005,6 +2054,90 @@ mod tests {
                 "pioneer-gateway-{expected_os}-{expected_arch}{expected_variant}.{expected_ext}"
             )
         );
+    }
+
+    #[test]
+    fn release_version_preserves_repository_tag_convention() {
+        assert_eq!(normalize_version_tag(" 0.53.12 "), "0.53.12");
+        assert_eq!(normalize_version_tag("v0.53.12"), "v0.53.12");
+    }
+
+    #[test]
+    fn stable_channel_skips_newer_release_until_gateway_assets_are_ready() {
+        let releases = vec![
+            release("0.53.12", false, &["desktop-update-manifest.json"]),
+            release(
+                "0.53.11",
+                false,
+                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+            ),
+        ];
+
+        let selected = select_ready_release_tag(
+            ReleaseChannel::Stable,
+            releases.iter(),
+            "pioneer-gateway-linux-x86_64.gz",
+        )
+        .expect("previous complete stable release should be selected");
+
+        assert_eq!(selected, "0.53.11");
+    }
+
+    #[test]
+    fn release_selection_requires_both_gateway_and_checksum_assets() {
+        let releases = vec![release(
+            "0.53.12",
+            false,
+            &["pioneer-gateway-linux-x86_64.gz"],
+        )];
+
+        let error = select_ready_release_tag(
+            ReleaseChannel::Stable,
+            releases.iter(),
+            "pioneer-gateway-linux-x86_64.gz",
+        )
+        .expect_err("release without checksums must remain unavailable");
+
+        assert!(format!("{error:#}").contains("no fully published"));
+    }
+
+    #[test]
+    fn stable_channel_ignores_prereleases_even_when_they_are_ready() {
+        let releases = vec![
+            release(
+                "0.54.0-beta.1",
+                true,
+                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+            ),
+            release(
+                "0.53.12",
+                false,
+                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+            ),
+        ];
+
+        let selected = select_ready_release_tag(
+            ReleaseChannel::Stable,
+            releases.iter(),
+            "pioneer-gateway-linux-x86_64.gz",
+        )
+        .expect("stable release should be selected");
+
+        assert_eq!(selected, "0.53.12");
+    }
+
+    fn release(tag_name: &str, prerelease: bool, assets: &[&str]) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag_name.to_owned(),
+            draft: false,
+            prerelease,
+            assets: assets
+                .iter()
+                .map(|name| GithubReleaseAsset {
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+        }
     }
 
     #[test]

@@ -84,8 +84,22 @@ def create_fixture(root: Path, version: str, mode: str) -> None:
         json.dumps(manifest, indent=2) + "\n",
         encoding="utf-8",
     )
+    release = {
+        "tag_name": tag,
+        "name": tag,
+        "draft": False,
+        "prerelease": False,
+        "assets": [{"name": "desktop-update-manifest.json"}],
+    }
     (root / "releases" / "latest").write_text(
-        json.dumps({"tag_name": tag, "name": tag}, indent=2) + "\n",
+        json.dumps(release, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    # Stable update discovery uses the release list so it can skip a newer
+    # release whose manifest is still being built. SimpleHTTPRequestHandler
+    # serves index.html for `/releases?per_page=100`.
+    (root / "releases" / "index.html").write_text(
+        json.dumps([release], indent=2) + "\n",
         encoding="utf-8",
     )
 

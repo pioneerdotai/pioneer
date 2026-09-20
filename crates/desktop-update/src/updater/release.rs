@@ -55,7 +55,6 @@ pub(crate) enum DesktopReleaseErrorCode {
     ReleaseRequest,
     ReleaseStatus,
     ReleaseJson,
-    EmptyTag,
     ChannelTagNotFound,
     ManifestNotPublished,
     ManifestRequest,
@@ -103,6 +102,10 @@ impl Error for DesktopReleaseError {}
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     assets: Option<Vec<GithubReleaseAsset>>,
 }
 
@@ -188,45 +191,8 @@ pub(crate) fn resolve_release_tag_with_client(
     client: &Client,
     config: &DesktopUpdateConfig,
 ) -> Result<String, DesktopReleaseError> {
-    match DesktopReleaseChannel::parse(config.channel.as_str())? {
-        DesktopReleaseChannel::Stable => fetch_latest_release_tag(client, config),
-        channel @ (DesktopReleaseChannel::Beta | DesktopReleaseChannel::Canary) => {
-            fetch_channel_release_tag(client, config, channel)
-        }
-    }
-}
-
-fn fetch_latest_release_tag(
-    client: &Client,
-    config: &DesktopUpdateConfig,
-) -> Result<String, DesktopReleaseError> {
-    let url = latest_release_url(config.release_api_base.as_str());
-    let release = client
-        .get(url.as_str())
-        .send()
-        .map_err(|error| {
-            DesktopReleaseError::new(
-                DesktopReleaseErrorCode::ReleaseRequest,
-                format!("failed to fetch latest desktop release metadata from `{url}`: {error}"),
-            )
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            DesktopReleaseError::new(
-                DesktopReleaseErrorCode::ReleaseStatus,
-                format!("latest desktop release request failed for `{url}`: {error}"),
-            )
-        })?
-        .json::<GithubRelease>()
-        .map_err(|error| {
-            DesktopReleaseError::new(
-                DesktopReleaseErrorCode::ReleaseJson,
-                format!("failed to parse latest desktop release metadata from `{url}`: {error}"),
-            )
-        })?;
-
-    ensure_manifest_asset_is_listed(&release)?;
-    normalize_non_empty_tag(release.tag_name)
+    let channel = DesktopReleaseChannel::parse(config.channel.as_str())?;
+    fetch_channel_release_tag(client, config, channel)
 }
 
 fn fetch_channel_release_tag(
@@ -289,17 +255,10 @@ fn select_channel_release_tag<'a>(
     channel: DesktopReleaseChannel,
     releases: impl IntoIterator<Item = &'a GithubRelease>,
 ) -> Result<String, DesktopReleaseError> {
-    let Some(suffix) = channel.tag_suffix() else {
-        return Err(DesktopReleaseError::new(
-            DesktopReleaseErrorCode::UnsupportedChannel,
-            "stable release channel must use latest release metadata",
-        ));
-    };
-
     let mut matched_unpublished_release = false;
     for release in releases {
         let tag = release.tag_name.trim();
-        if tag.is_empty() || !tag.contains(suffix) {
+        if tag.is_empty() || !release_matches_channel(release, channel) {
             continue;
         }
         if release_may_have_manifest_asset(release) {
@@ -309,18 +268,35 @@ fn select_channel_release_tag<'a>(
     }
 
     if matched_unpublished_release {
+        let channel_label = channel.tag_suffix().unwrap_or("stable");
         return Err(DesktopReleaseError::new(
             DesktopReleaseErrorCode::ManifestNotPublished,
             format!(
-                "desktop update manifest asset `{DESKTOP_UPDATE_MANIFEST_FILE}` is not listed on latest `{suffix}` release yet"
+                "desktop update manifest asset `{DESKTOP_UPDATE_MANIFEST_FILE}` is not listed on any `{channel_label}` release yet"
             ),
         ));
     }
 
+    let channel_label = channel.tag_suffix().unwrap_or("stable");
     Err(DesktopReleaseError::new(
         DesktopReleaseErrorCode::ChannelTagNotFound,
-        format!("failed to find desktop release tag for channel `{suffix}`"),
+        format!("failed to find desktop release tag for channel `{channel_label}`"),
     ))
+}
+
+fn release_matches_channel(release: &GithubRelease, channel: DesktopReleaseChannel) -> bool {
+    if release.draft {
+        return false;
+    }
+    match channel {
+        DesktopReleaseChannel::Stable => !release.prerelease,
+        DesktopReleaseChannel::Beta | DesktopReleaseChannel::Canary => {
+            let Some(suffix) = channel.tag_suffix() else {
+                return false;
+            };
+            release.tag_name.trim().contains(suffix)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -344,10 +320,6 @@ pub(crate) fn release_asset_download_url(
         "{}/{tag}/{asset_name}",
         config.release_download_base.trim_end_matches('/')
     )
-}
-
-pub(crate) fn latest_release_url(api_base: &str) -> String {
-    format!("{}/latest", api_base.trim_end_matches('/'))
 }
 
 pub(crate) fn release_list_url(api_base: &str) -> String {
@@ -378,23 +350,11 @@ fn select_channel_tag<'a>(
         })
 }
 
-fn normalize_non_empty_tag(tag: String) -> Result<String, DesktopReleaseError> {
-    let tag = tag.trim().to_owned();
-    if tag.is_empty() {
-        return Err(DesktopReleaseError::new(
-            DesktopReleaseErrorCode::EmptyTag,
-            "desktop release metadata does not include a non-empty tag_name",
-        ));
-    }
-
-    Ok(tag)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DESKTOP_UPDATE_MANIFEST_FILE, DesktopReleaseChannel, DesktopReleaseErrorCode,
-        GithubRelease, GithubReleaseAsset, ensure_manifest_asset_is_listed, latest_release_url,
+        GithubRelease, GithubReleaseAsset, ensure_manifest_asset_is_listed,
         release_asset_download_url, release_by_tag_api_url, release_list_url,
         release_manifest_download_url, release_may_have_manifest_asset, select_channel_release_tag,
         select_channel_tag,
@@ -412,10 +372,6 @@ mod tests {
             release_download_base: "http://localhost:2222/download/".to_owned(),
         };
 
-        assert_eq!(
-            latest_release_url(config.release_api_base.as_str()),
-            "http://localhost:1111/releases/latest"
-        );
         assert_eq!(
             release_list_url(config.release_api_base.as_str()),
             "http://localhost:1111/releases?per_page=100"
@@ -527,9 +483,45 @@ mod tests {
         assert_eq!(selected, "v1.2.3-beta.1");
     }
 
+    #[test]
+    fn stable_release_selects_previous_release_while_latest_manifest_is_missing() {
+        let releases = vec![
+            release("v1.2.3", Some(vec!["Pioneer-aarch64.app.zip"])),
+            release(
+                "v1.2.2",
+                Some(vec![
+                    "Pioneer-aarch64.app.zip",
+                    DESKTOP_UPDATE_MANIFEST_FILE,
+                ]),
+            ),
+        ];
+
+        let selected =
+            select_channel_release_tag(DesktopReleaseChannel::Stable, releases.iter()).unwrap();
+
+        assert_eq!(selected, "v1.2.2");
+    }
+
+    #[test]
+    fn stable_release_ignores_ready_prerelease() {
+        let mut prerelease = release("v1.3.0-beta.1", Some(vec![DESKTOP_UPDATE_MANIFEST_FILE]));
+        prerelease.prerelease = true;
+        let releases = vec![
+            prerelease,
+            release("v1.2.2", Some(vec![DESKTOP_UPDATE_MANIFEST_FILE])),
+        ];
+
+        let selected =
+            select_channel_release_tag(DesktopReleaseChannel::Stable, releases.iter()).unwrap();
+
+        assert_eq!(selected, "v1.2.2");
+    }
+
     fn release(tag_name: &str, assets: Option<Vec<&str>>) -> GithubRelease {
         GithubRelease {
             tag_name: tag_name.to_owned(),
+            draft: false,
+            prerelease: false,
             assets: assets.map(|assets| {
                 assets
                     .into_iter()
