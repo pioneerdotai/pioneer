@@ -30585,13 +30585,33 @@ async fn terminal_turn_completion_closes_running_execution_window() {
         .await
         .expect("tool item should persist");
 
-    processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+    let terminal_event = AgentDurableEvent::TurnCompleted {
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        recovery: None,
+    };
+    assert!(
+        processor
+            .commit_durable_agent_event(terminal_event.clone())
+            .await
+            .is_ok()
+    );
+    let replay = processor.commit_durable_agent_event(terminal_event).await;
+    assert!(
+        replay.is_ok(),
+        "a terminal event whose canonical status already committed must finish idempotently: {replay:?}"
+    );
+    let rejection = processor
+        .commit_durable_agent_event(AgentDurableEvent::TurnFailed {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
+            error: "stale failure".to_owned(),
             recovery: None,
         })
-        .await;
+        .await
+        .expect_err("a conflicting terminal replay must remain fenced");
+    assert_eq!(rejection.code(), "execution_fenced");
+    assert!(!rejection.is_retryable());
 
     let window = crud_store
         .latest_turn_execution_window(turn_id)

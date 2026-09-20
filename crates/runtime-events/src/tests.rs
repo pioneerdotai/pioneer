@@ -153,8 +153,8 @@ async fn requesting_next_event_without_ack_rejects_commit_waiter() {
     let next = tokio::spawn(async move { receiver.recv().await });
     assert!(matches!(
         publisher.await.expect("publisher task"),
-        Err(ExecutionEventHubError::CommitRejected(message))
-            if message.contains("without acknowledging")
+        Err(ExecutionEventHubError::CommitRejected(rejection))
+            if rejection.code() == "consumer_missing_ack" && rejection.is_retryable()
     ));
     next.abort();
 }
@@ -168,11 +168,14 @@ async fn commit_rejection_is_reported_to_publisher() {
         tokio::spawn(async move { hub.publish_durable_and_wait(completed("turn_1")).await })
     };
     assert!(receiver.recv().await.is_some());
-    receiver.acknowledge_last(Err("storage unavailable".to_owned()));
+    receiver.acknowledge_last(Err(crate::DurableCommitRejection::retryable(
+        "storage_unavailable",
+        "storage unavailable",
+    )));
     assert_eq!(
         publisher.await.expect("publisher task"),
         Err(ExecutionEventHubError::CommitRejected(
-            "storage unavailable".to_owned()
+            crate::DurableCommitRejection::retryable("storage_unavailable", "storage unavailable",)
         ))
     );
 }
@@ -215,7 +218,8 @@ async fn dropping_receiver_rejects_pending_ack_but_preserves_following_event_for
     drop(receiver);
     assert!(matches!(
         first.await.expect("publisher"),
-        Err(ExecutionEventHubError::CommitRejected(message)) if message.contains("dropped")
+        Err(ExecutionEventHubError::CommitRejected(rejection))
+            if rejection.code() == "consumer_dropped" && rejection.is_retryable()
     ));
 
     hub.publish_durable(completed("turn_2"))

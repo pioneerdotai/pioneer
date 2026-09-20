@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{CrudStore, PersistedThreadAccessClass};
@@ -59,6 +61,29 @@ pub(crate) struct ExecutionLeaseGuard {
     pub(crate) authorizing_principal_id: PrincipalId,
     pub(crate) admitted_policy_generation: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutionTurnNotInProgress {
+    status: TurnStatus,
+}
+
+impl ExecutionTurnNotInProgress {
+    pub(crate) fn status(self) -> TurnStatus {
+        self.status
+    }
+}
+
+impl Display for ExecutionTurnNotInProgress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "execution lease is not active (turn status: {:?})",
+            self.status
+        )
+    }
+}
+
+impl Error for ExecutionTurnNotInProgress {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecutionLeaseReprojection {
@@ -165,7 +190,10 @@ impl ExecutionLeaseRegistry {
             .await?
             .context("execution turn disappeared during lease validation")?;
         if turn.status != TurnStatus::InProgress {
-            bail!("execution lease is not active");
+            return Err(ExecutionTurnNotInProgress {
+                status: turn.status,
+            }
+            .into());
         }
         let needs_restore = !self.leases.read().await.contains_key(execution_id);
         if needs_restore {

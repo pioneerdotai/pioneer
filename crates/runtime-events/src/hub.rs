@@ -16,7 +16,60 @@ use crate::{DEFAULT_DURABLE_EVENT_CHANNEL_CAPACITY, DEFAULT_LIVE_EVENT_CHANNEL_C
 pub enum ExecutionEventHubError {
     DurableLaneClosed,
     CommitAcknowledgementDropped,
-    CommitRejected(String),
+    CommitRejected(DurableCommitRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommitRejectionKind {
+    Retryable,
+    Permanent,
+}
+
+/// A safe, low-cardinality reason why a durable projection was rejected.
+///
+/// The gateway keeps raw storage and authorization errors in its local logs;
+/// publishers only need the retry decision and a stable diagnostic code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCommitRejection {
+    kind: DurableCommitRejectionKind,
+    code: &'static str,
+    message: &'static str,
+}
+
+impl DurableCommitRejection {
+    pub const fn retryable(code: &'static str, message: &'static str) -> Self {
+        Self {
+            kind: DurableCommitRejectionKind::Retryable,
+            code,
+            message,
+        }
+    }
+
+    pub const fn permanent(code: &'static str, message: &'static str) -> Self {
+        Self {
+            kind: DurableCommitRejectionKind::Permanent,
+            code,
+            message,
+        }
+    }
+
+    pub const fn kind(&self) -> DurableCommitRejectionKind {
+        self.kind
+    }
+
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self.kind, DurableCommitRejectionKind::Retryable)
+    }
+}
+
+impl Display for DurableCommitRejection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
 }
 
 impl Display for ExecutionEventHubError {
@@ -41,7 +94,7 @@ impl Error for ExecutionEventHubError {}
 #[derive(Debug)]
 struct DurableEventEnvelope {
     event: Box<AgentDurableEvent>,
-    committed_tx: Option<oneshot::Sender<Result<(), String>>>,
+    committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     enqueued_at: Instant,
 }
 
@@ -50,16 +103,16 @@ struct DurableEventEnvelope {
 #[derive(Debug)]
 pub struct DurableEventReceiver {
     lane: Arc<DurableLane>,
-    pending_commit: Option<oneshot::Sender<Result<(), String>>>,
+    pending_commit: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     pending_enqueue_age: Option<Duration>,
 }
 
 impl DurableEventReceiver {
     pub async fn recv(&mut self) -> Option<AgentDurableEvent> {
-        self.acknowledge_last(Err(
-            "durable event consumer requested the next event without acknowledging the previous commit"
-                .to_owned(),
-        ));
+        self.acknowledge_last(Err(DurableCommitRejection::retryable(
+            "consumer_missing_ack",
+            "durable event consumer requested the next event without acknowledging the previous commit",
+        )));
         let envelope = self.lane.receiver.lock().await.recv().await?;
         self.pending_commit = envelope.committed_tx;
         self.pending_enqueue_age = Some(envelope.enqueued_at.elapsed());
@@ -72,7 +125,7 @@ impl DurableEventReceiver {
         self.pending_enqueue_age
     }
 
-    pub fn acknowledge_last(&mut self, result: Result<(), String>) {
+    pub fn acknowledge_last(&mut self, result: Result<(), DurableCommitRejection>) {
         self.pending_enqueue_age = None;
         if let Some(committed_tx) = self.pending_commit.take() {
             let _ = committed_tx.send(result);
@@ -82,9 +135,10 @@ impl DurableEventReceiver {
 
 impl Drop for DurableEventReceiver {
     fn drop(&mut self) {
-        self.acknowledge_last(Err(
-            "durable event consumer was dropped before acknowledging the commit".to_owned(),
-        ));
+        self.acknowledge_last(Err(DurableCommitRejection::retryable(
+            "consumer_dropped",
+            "durable event consumer was dropped before acknowledging the commit",
+        )));
         self.lane.receiver_claimed.store(false, Ordering::Release);
     }
 }
@@ -173,7 +227,7 @@ impl ExecutionEventHub {
     async fn publish_durable_envelope(
         &self,
         event: Box<AgentDurableEvent>,
-        committed_tx: Option<oneshot::Sender<Result<(), String>>>,
+        committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
     ) -> Result<(), ExecutionEventHubError> {
         self.flush_progress_for_durable(&event).await;
         self.flush_snapshots_for_durable(&event);

@@ -475,6 +475,45 @@ fn terminal_durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
     }
 }
 
+fn terminal_durable_event_status(event: &AgentDurableEvent) -> Option<TurnStatus> {
+    match event {
+        AgentDurableEvent::TurnCompleted { .. } => Some(TurnStatus::Completed),
+        AgentDurableEvent::TurnFailed { .. } => Some(TurnStatus::Failed),
+        AgentDurableEvent::TurnBlocked { .. } => Some(TurnStatus::Blocked),
+        AgentDurableEvent::TurnInterrupted { .. } => Some(TurnStatus::Interrupted),
+        _ => None,
+    }
+}
+
+fn classify_durable_commit_guard_error(
+    event: &AgentDurableEvent,
+    error: &anyhow::Error,
+) -> Result<bool, DurableCommitRejection> {
+    if let Some(not_in_progress) =
+        error.downcast_ref::<crate::authorization::ExecutionTurnNotInProgress>()
+        && terminal_durable_event_status(event) == Some(not_in_progress.status())
+    {
+        // The canonical terminal transaction committed, but a later cleanup
+        // step or its ACK failed. The durable publish contract is already
+        // satisfied; background reconcilers own any remaining cleanup. Do not
+        // repeat the terminal write path or weaken the fence for another
+        // event/outcome.
+        return Ok(true);
+    }
+
+    if pioneer_sqlite::is_anyhow_sqlite_transient_access(error) {
+        Err(DurableCommitRejection::retryable(
+            "storage_temporarily_unavailable",
+            "durable commit authorization could not access storage",
+        ))
+    } else {
+        Err(DurableCommitRejection::permanent(
+            "execution_fenced",
+            "durable event no longer has execution authority",
+        ))
+    }
+}
+
 fn tool_result_view_from_protocol(
     payload: pioneer_protocol::ToolResultView,
 ) -> pioneer_tools::ToolResultView {
@@ -778,30 +817,45 @@ impl MessageProcessor {
                         let terminal_enqueue_age =
                             durable_receiver.pending_enqueue_age().unwrap_or_default();
                         let projection_started = Instant::now();
-                        let (committed, listener_failed) = match AssertUnwindSafe(async {
+                        let (commit_result, listener_failed) = match AssertUnwindSafe(async {
                             if let Some(weak) = &this {
-                                let Some(this) = weak.upgrade() else { return false; };
+                                let Some(this) = weak.upgrade() else {
+                                    return Err(DurableCommitRejection::permanent(
+                                        "processor_stopped",
+                                        "gateway message processor is no longer available",
+                                    ));
+                                };
                                 let this = this.with_database_class(SqliteWriteClass::Critical);
-                                this.handle_durable_agent_event(event).await
+                                this.commit_durable_agent_event(event).await
                             } else {
                                 #[cfg(test)]
-                                { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).handle_durable_agent_event(event).await } }
+                                { unsafe { (&*(raw_this.expect("raw listener owner") as *const MessageProcessor)).commit_durable_agent_event(event).await } }
                                 #[cfg(not(test))]
-                                { false }
+                                { Err(DurableCommitRejection::permanent(
+                                    "processor_stopped",
+                                    "gateway message processor is no longer available",
+                                )) }
                             }
                         })
                         .catch_unwind()
                         .await
                         {
-                            Ok(committed) => (committed, false),
+                            Ok(commit_result) => (commit_result, false),
                             Err(_) => {
                                 warn!(
                                     thread_id = %thread_id_owned,
                                     "contained panic while projecting durable agent event"
                                 );
-                                (false, true)
+                                (
+                                    Err(DurableCommitRejection::retryable(
+                                        "listener_panicked",
+                                        "gateway durable event listener panicked",
+                                    )),
+                                    true,
+                                )
                             }
                         };
+                        let committed = commit_result.is_ok();
                         if terminal_event {
                             pioneer_observability::record_native_lifecycle_event(
                                 pioneer_observability::NativeLifecycleEventMetric {
@@ -818,11 +872,7 @@ impl MessageProcessor {
                                 },
                             );
                         }
-                        durable_receiver.acknowledge_last(if committed {
-                            Ok(())
-                        } else {
-                            Err("gateway failed to commit durable agent event".to_owned())
-                        });
+                        durable_receiver.acknowledge_last(commit_result);
                         if listener_failed {
                             pioneer_observability::record_native_lifecycle_event(
                                 pioneer_observability::NativeLifecycleEventMetric {
@@ -1214,6 +1264,13 @@ impl MessageProcessor {
         &'a self,
         event: AgentDurableEvent,
     ) -> MessageFuture<'a, bool> {
+        message_future(async move { self.commit_durable_agent_event(event).await.is_ok() })
+    }
+
+    pub(crate) fn commit_durable_agent_event<'a>(
+        &'a self,
+        event: AgentDurableEvent,
+    ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
         let startup_key = durable_event_turn_id(&event).map(str::to_owned);
         let future = match event {
             AgentDurableEvent::TurnSkillsResolved {
@@ -1226,21 +1283,36 @@ impl MessageProcessor {
                 let turn_id = durable_event_turn_id(&event).map(str::to_owned);
                 let terminal_turn_id = terminal_durable_event_turn_id(&event).map(str::to_owned);
                 let lifecycle_event = native_lifecycle_event_metric(&event);
-                if let Some(turn_id) = durable_event_turn_id(&event)
-                    && self.guard_execution_commit(turn_id).await.is_err()
-                {
-                    pioneer_observability::record_native_lifecycle_event(
-                        pioneer_observability::NativeLifecycleEventMetric {
-                            stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
-                            outcome: pioneer_observability::NativeLifecycleOutcome::Rejected,
-                            provider_class: pioneer_observability::NativeProviderClass::Api,
-                            elapsed: None,
+                let already_committed = if let Some(turn_id) = durable_event_turn_id(&event) {
+                    match self.guard_execution_commit(turn_id).await {
+                        Ok(_) => false,
+                        Err(error) => match classify_durable_commit_guard_error(&event, &error) {
+                            Ok(already_committed) => already_committed,
+                            Err(rejection) => {
+                                pioneer_observability::record_native_lifecycle_event(
+                                    pioneer_observability::NativeLifecycleEventMetric {
+                                        stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
+                                        outcome: pioneer_observability::NativeLifecycleOutcome::Rejected,
+                                        provider_class: pioneer_observability::NativeProviderClass::Api,
+                                        elapsed: None,
+                                    },
+                                );
+                                warn!(
+                                    rejection_code = rejection.code(),
+                                    retryable = rejection.is_retryable(),
+                                    error = %format!("{error:#}"),
+                                    "durable agent event failed its execution commit guard"
+                                );
+                                return Err(rejection);
+                            }
                         },
-                    );
-                    return false;
-                }
+                    }
+                } else {
+                    false
+                };
                 let commit_started = Instant::now();
-                let committed = self.persist_durable_agent_event(event.clone()).await;
+                let committed =
+                    already_committed || self.persist_durable_agent_event(event.clone()).await;
                 pioneer_observability::record_native_lifecycle_event(
                     pioneer_observability::NativeLifecycleEventMetric {
                         stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -1290,7 +1362,14 @@ impl MessageProcessor {
                             .await;
                     }
                 }
-                committed
+                if committed {
+                    Ok(())
+                } else {
+                    Err(DurableCommitRejection::retryable(
+                        "projection_failed",
+                        "gateway could not project the durable agent event",
+                    ))
+                }
             }),
         };
         message_future(pioneer_observability::turn_startup::scope_stage(
@@ -1305,10 +1384,10 @@ impl MessageProcessor {
         thread_id: String,
         turn_id: String,
         bindings: Vec<pioneer_protocol::TurnSkillBinding>,
-    ) -> MessageFuture<'a, bool> {
+    ) -> MessageFuture<'a, Result<(), DurableCommitRejection>> {
         message_future(async move {
             let commit_started = Instant::now();
-            if self.guard_execution_commit(turn_id.as_str()).await.is_err() {
+            if let Err(error) = self.guard_execution_commit(turn_id.as_str()).await {
                 pioneer_observability::record_native_lifecycle_event(
                     pioneer_observability::NativeLifecycleEventMetric {
                         stage: pioneer_observability::NativeLifecycleStage::DurableCommit,
@@ -1317,7 +1396,24 @@ impl MessageProcessor {
                         elapsed: Some(commit_started.elapsed()),
                     },
                 );
-                return false;
+                let rejection = if pioneer_sqlite::is_anyhow_sqlite_transient_access(&error) {
+                    DurableCommitRejection::retryable(
+                        "storage_temporarily_unavailable",
+                        "durable commit authorization could not access storage",
+                    )
+                } else {
+                    DurableCommitRejection::permanent(
+                        "execution_fenced",
+                        "durable event no longer has execution authority",
+                    )
+                };
+                warn!(
+                    rejection_code = rejection.code(),
+                    retryable = rejection.is_retryable(),
+                    error = %format!("{error:#}"),
+                    "turn skill event failed its execution commit guard"
+                );
+                return Err(rejection);
             }
             if let Err(error) = self
                 .reconcile_turn_runtime_snapshot_agent_overlay(
@@ -1341,7 +1437,10 @@ impl MessageProcessor {
                         elapsed: Some(commit_started.elapsed()),
                     },
                 );
-                return false;
+                return Err(DurableCommitRejection::retryable(
+                    "runtime_snapshot_projection_failed",
+                    "gateway could not reconcile the turn runtime snapshot",
+                ));
             }
             if let Err(error) = self
                 .persist_turn_skill_projection(
@@ -1365,7 +1464,10 @@ impl MessageProcessor {
                         elapsed: Some(commit_started.elapsed()),
                     },
                 );
-                return false;
+                return Err(DurableCommitRejection::retryable(
+                    "skill_projection_failed",
+                    "gateway could not persist the turn skill projection",
+                ));
             }
             pioneer_observability::record_native_lifecycle_event(
                 pioneer_observability::NativeLifecycleEventMetric {
@@ -1397,7 +1499,7 @@ impl MessageProcessor {
             self.agent_manager
                 .publish_committed(thread_id.as_str(), committed_event)
                 .await;
-            true
+            Ok(())
         })
     }
 

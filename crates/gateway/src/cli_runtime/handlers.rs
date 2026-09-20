@@ -3479,17 +3479,17 @@ impl MessageProcessor {
                         durable = durable_receiver.recv(), if durable_open => {
                             match durable {
                                 Some(event) => {
-                                    let committed = if listener_processor
+                                    let commit_result = if listener_processor
                                         .cli_runtime_instance_is_current(&listener_instance)
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            listener_processor.handle_durable_agent_event(event),
+                                            listener_processor.commit_durable_agent_event(event),
                                         )
                                         .catch_unwind()
                                         .await
                                         {
-                                            Ok(committed) => committed,
+                                            Ok(commit_result) => commit_result,
                                             Err(_) => {
                                                 warn!(
                                                     workspace_id = key.workspace_id.as_str(),
@@ -3497,7 +3497,10 @@ impl MessageProcessor {
                                                     thread_id = key.thread_id.as_str(),
                                                     "contained panic while projecting CLI runtime durable event"
                                                 );
-                                                false
+                                                Err(pioneer_runtime_events::DurableCommitRejection::retryable(
+                                                    "listener_panicked",
+                                                    "gateway CLI durable event listener panicked",
+                                                ))
                                             }
                                         }
                                     } else {
@@ -3505,13 +3508,9 @@ impl MessageProcessor {
                                             &listener_instance,
                                             "durable_projection",
                                         );
-                                        true
-                                    };
-                                    durable_receiver.acknowledge_last(if committed {
                                         Ok(())
-                                    } else {
-                                        Err("gateway failed to commit durable CLI runtime event".to_owned())
-                                    });
+                                    };
+                                    durable_receiver.acknowledge_last(commit_result);
                                 }
                                 None => durable_open = false,
                             }

@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 // Tool dispatch uses a one-second cleanup grace.  The parent Turn must wait
 // longer than that before resorting to a hard abort, otherwise dropping the
@@ -1821,16 +1821,50 @@ async fn publish_loop_durable_event(
         };
         match result {
             Ok(Ok(())) => return true,
-            Ok(Err(error)) => error!(
-                attempt,
-                error = %error,
-                "durable agent-loop event remains pending after rejected commit"
-            ),
-            Err(_) => error!(
-                attempt,
-                timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
-                "durable agent-loop event remains pending after commit attempt timed out"
-            ),
+            Ok(Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)))
+                if !rejection.is_retryable() =>
+            {
+                error!(
+                    attempt,
+                    commit_error_code = rejection.code(),
+                    error = %rejection,
+                    "durable agent-loop event was permanently rejected"
+                );
+                return false;
+            }
+            Ok(Err(error)) => {
+                // One error event identifies one continuous outage period;
+                // sparse warnings remain useful breadcrumbs without sending
+                // every retry to Sentry.
+                if attempt == 8 {
+                    error!(
+                        attempt,
+                        error = %error,
+                        "durable agent-loop event remains pending during a commit outage"
+                    );
+                } else if attempt.is_power_of_two() {
+                    warn!(
+                        attempt,
+                        error = %error,
+                        "retrying durable agent-loop event after transient commit rejection"
+                    );
+                }
+            }
+            Err(_) => {
+                if attempt == 8 {
+                    error!(
+                        attempt,
+                        timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
+                        "durable agent-loop event remains pending during a commit outage"
+                    );
+                } else if attempt.is_power_of_two() {
+                    warn!(
+                        attempt,
+                        timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
+                        "retrying durable agent-loop event after commit attempt timed out"
+                    );
+                }
+            }
         }
 
         // A terminal/checkpoint boundary cannot be converted to process-local
@@ -2000,7 +2034,75 @@ mod tests {
     use super::{
         ExecutionWindowTotalBudgetBlockKind, ExecutionWindowTotalBudgetDecision,
         TurnExecutionUsageCounters, decide_execution_window_total_budget,
+        publish_loop_durable_event,
     };
+    use pioneer_protocol::AgentDurableEvent;
+    use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
+    use std::sync::Arc;
+    use tokio::time::{Duration, timeout};
+
+    fn completed_event(turn_id: &str) -> AgentDurableEvent {
+        AgentDurableEvent::TurnCompleted {
+            thread_id: "thread_1".to_owned(),
+            turn_id: turn_id.to_owned(),
+            recovery: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_durable_commit_rejection_stops_terminal_retry() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.expect("receiver");
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("turn_permanent"), None).await
+            })
+        };
+
+        receiver.recv().await.expect("first attempt");
+        receiver.acknowledge_last(Err(DurableCommitRejection::permanent(
+            "execution_fenced",
+            "durable event no longer has execution authority",
+        )));
+
+        assert!(
+            !timeout(Duration::from_secs(1), publisher)
+                .await
+                .expect("permanent rejection should stop immediately")
+                .expect("publisher task")
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_durable_commit_rejection_preserves_event_until_ack() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.expect("receiver");
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("turn_retryable"), None).await
+            })
+        };
+
+        receiver.recv().await.expect("first attempt");
+        receiver.acknowledge_last(Err(DurableCommitRejection::retryable(
+            "storage_temporarily_unavailable",
+            "storage is temporarily unavailable",
+        )));
+        timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("retry deadline")
+            .expect("retry attempt");
+        receiver.acknowledge_last(Ok(()));
+
+        assert!(
+            timeout(Duration::from_secs(1), publisher)
+                .await
+                .expect("retry should finish")
+                .expect("publisher task")
+        );
+    }
 
     fn total_budget(
         max_windows_per_turn: u32,

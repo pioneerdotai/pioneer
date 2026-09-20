@@ -239,7 +239,7 @@ use pioneer_protocol::{
     validate_voice_streaming_audio_format,
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
-use pioneer_runtime_events::ExecutionEventHub;
+use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
 use pioneer_sqlite::{
     DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
     SqliteWriteClass, is_anyhow_sqlite_transient_access, retry_with_backoff,
