@@ -28,6 +28,12 @@
 </p>
 
 <p align="center">
+  <a href="README.md">English</a>
+  ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <img src="assets/screenshots/pioneer-main-dark.png" alt="Pioneer">
   <img src="assets/screenshots/pioneer-main-light.png" alt="Pioneer">
 </p>
