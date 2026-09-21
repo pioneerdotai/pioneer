@@ -155,35 +155,15 @@ pub(crate) async fn restored_conversation_scope_from_snapshot(
         context.conversation_thread_id.as_deref(),
     )
     .await?;
-    let mut history = restore_history_json(
+    let history = crate::compaction::frozen::restore_accepted_history_for_execution(
         store,
         &snapshot.workspace_id,
+        context.conversation_thread_id.as_deref(),
+        &snapshot.thread_id,
         &allowed,
         &snapshot.history_json,
     )
     .await?;
-    if let Some(parent) = context.conversation_thread_id.as_deref()
-        && !snapshot.history_json.trim_start().starts_with('[')
-    {
-        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
-            serde_json::from_str(&snapshot.history_json)?;
-        if store
-            .compaction_frozen_history_owner(&snapshot.workspace_id, &descriptor)
-            .await?
-            .as_deref()
-            == Some(parent)
-        {
-            crate::compaction::frozen::hydrate_accepted_own(
-                store,
-                &snapshot.workspace_id,
-                parent,
-                &snapshot.history_json,
-                &snapshot.thread_id,
-                &mut history,
-            )
-            .await?;
-        }
-    }
     Ok((context, history))
 }
 

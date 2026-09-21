@@ -10,6 +10,8 @@ pub(crate) use super::compaction_task_output as task_output;
 use crate::CrudStore;
 use anyhow::{Result, ensure};
 pub use background::{CompactionLifecycleRecovery, CompletedHistoryCheck};
+#[cfg(any(test, feature = "test-support"))]
+pub use frozen_import::{CheckpointImportGraphReadObserver, observe_checkpoint_import_graph_reads};
 pub use frozen_import::{
     EMPTY_FROZEN_IMPORT_SHA256, FROZEN_IMPORT_PAGE_BYTES, FrozenImportRecord, PreparedFrozenImport,
     frozen_import_identity,
@@ -46,10 +48,32 @@ pub use task_output::{
 #[derive(Clone, Debug)]
 pub struct CheckpointEdges {
     pub owner: String,
+    pub workspace_id: String,
+    pub thread_id: String,
     pub identity_sha256: String,
     pub previous: Option<String>,
     pub format_version: u32,
-    pub coverage: Vec<SourceRef>,
+    pub coverage: Vec<HistoricalSourceRef>,
+    /// Alternate provider-context rows that represented a covered tool item
+    /// in the immutable input manifest. These are historical aliases used only
+    /// to suppress duplicate replay; they are not additional coverage/grants.
+    pub replay_aliases: Vec<HistoricalReplayAlias>,
+}
+
+/// A source as it belonged to the operation that published a checkpoint.
+/// `source_version` is historical evidence, not a request to resolve today's
+/// canonical row at that version.
+#[derive(Clone, Debug)]
+pub struct HistoricalSourceRef {
+    pub source_thread: String,
+    pub source: SourceRef,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoricalReplayAlias {
+    pub covered: HistoricalSourceRef,
+    pub replay: HistoricalSourceRef,
+    pub tool_item_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -959,9 +983,9 @@ pub(crate) async fn compaction_operation<C: ConnectionTrait>(
         .map(OperationRecord::from))
 }
 
-/// Validate a bounded batch of exact identities after preparing its JSON
-/// outside reader capacity. An edited/deleted source or stale summary may
-/// never pass an otherwise-fitting native preflight as current history.
+/// Validate a bounded batch of directly consumed source identities. Canonical
+/// rows and task bases are exact-current; a checkpoint is current when the
+/// checkpoint object itself is published in the requested scope.
 const COMPACTION_SOURCES_CURRENT_SQL: &str = r#"
 SELECT COUNT(*) AS matched
 FROM json_each(?1) wanted
@@ -1028,30 +1052,6 @@ WHERE
   )
   OR EXISTS (
     SELECT 1
-    FROM compaction_checkpoint live_checkpoint
-    JOIN compaction_context live_context ON live_context.owner=live_checkpoint.owner
-    LEFT JOIN compaction_projection_epoch live_epoch ON live_epoch.thread_id=live_context.thread_id
-    WHERE (
-        live_checkpoint.status='applied'
-        OR (
-          live_checkpoint.status='retained'
-          AND EXISTS (
-            SELECT 1
-            FROM compaction_operation live_operation
-            WHERE live_operation.id=live_checkpoint.operation_id
-              AND live_operation.status='completed'
-          )
-        )
-      )
-      AND live_checkpoint.projection_version=COALESCE(live_epoch.version,0)
-      AND live_context.workspace_id=?2
-      AND live_context.thread_id=?3
-      AND 'checkpoint:'||live_checkpoint.owner=json_extract(wanted.value,'$.scope')
-      AND live_checkpoint.id=json_extract(wanted.value,'$.id')
-      AND live_checkpoint.identity_sha256=json_extract(wanted.value,'$.version')
-  )
-  OR EXISTS (
-    SELECT 1
     FROM task_run_conversation_snapshot basis
     JOIN thread basis_thread
       ON basis_thread.id=basis.conversation_thread_id
@@ -1067,23 +1067,23 @@ WHERE
   )
   OR EXISTS (
     SELECT 1
-    FROM compaction_checkpoint immutable_checkpoint
-    JOIN compaction_context immutable_context ON immutable_context.owner=immutable_checkpoint.owner
-    WHERE immutable_context.workspace_id=?4
-      AND immutable_context.thread_id=?5
-      AND 'checkpoint:'||immutable_checkpoint.owner=json_extract(wanted.value,'$.scope')
-      AND immutable_checkpoint.id=json_extract(wanted.value,'$.id')
-      AND immutable_checkpoint.identity_sha256=json_extract(wanted.value,'$.version')
-      AND immutable_checkpoint.format_version=1
+    FROM compaction_checkpoint published_checkpoint
+    JOIN compaction_context published_context ON published_context.owner=published_checkpoint.owner
+    WHERE published_context.workspace_id=?2
+      AND published_context.thread_id=?3
+      AND 'checkpoint:'||published_checkpoint.owner=json_extract(wanted.value,'$.scope')
+      AND published_checkpoint.id=json_extract(wanted.value,'$.id')
+      AND published_checkpoint.identity_sha256=json_extract(wanted.value,'$.version')
+      AND published_checkpoint.format_version=1
       AND (
-        immutable_checkpoint.status='applied'
+        published_checkpoint.status='applied'
         OR (
-          immutable_checkpoint.status='retained'
+          published_checkpoint.status='retained'
           AND EXISTS (
             SELECT 1
-            FROM compaction_operation immutable_operation
-            WHERE immutable_operation.id=immutable_checkpoint.operation_id
-              AND immutable_operation.status='completed'
+            FROM compaction_operation published_operation
+            WHERE published_operation.id=published_checkpoint.operation_id
+              AND published_operation.status='completed'
           )
         )
       )
@@ -1097,13 +1097,7 @@ fn compaction_sources_current_statement(
 ) -> Statement {
     sqlite_specific_sql(
         COMPACTION_SOURCES_CURRENT_SQL,
-        [
-            payload.into(),
-            workspace.into(),
-            thread.into(),
-            workspace.into(),
-            thread.into(),
-        ],
+        [payload.into(), workspace.into(), thread.into()],
     )
 }
 
@@ -1122,9 +1116,6 @@ pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
         payload.len() <= SOURCE_PAGE_BYTES,
         "source validation batch exceeds byte bound"
     );
-    // A checkpoint identity survives unrelated appends; callers expand and
-    // validate every DAG leaf immediately after this bounded identity batch.
-    // Its publication epoch is not a lifetime for the immutable checkpoint.
     let row = MatchedSourceCount::find_by_statement(compaction_sources_current_statement(
         payload, workspace, thread,
     ))
@@ -1134,9 +1125,9 @@ pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
     Ok(row.matched == sources.len() as i64)
 }
 
-/// Resolve only the storage scope of one exact current revision. Used to
-/// validate transitive checkpoint coverage before any source body is read.
-/// The caller still checks the returned thread against accepted scopes.
+/// Resolve a directly consumed source's owning thread. Checkpoint ownership is
+/// recorded on the published object; raw ownership remains an exact live-row
+/// lookup. Historical checkpoint coverage uses its saved manifest ownership.
 pub(crate) async fn compaction_reference_thread<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
@@ -1454,28 +1445,132 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
     db: &C,
     id: &str,
 ) -> Result<Option<CheckpointEdges>> {
-    use sea_orm::QuerySelect;
-    let Some((owner, identity_sha256, previous, format_version)) =
-        compaction_checkpoint::Entity::find_by_id(id)
-            .select_only()
-            .column(compaction_checkpoint::Column::Owner)
-            .column(compaction_checkpoint::Column::IdentitySha256)
-            .column(compaction_checkpoint::Column::Previous)
-            .column(compaction_checkpoint::Column::FormatVersion)
-            .into_tuple::<(String, String, Option<String>, i64)>()
-            .one(db)
-            .await?
+    let Some(row) = CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
+        "SELECT p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE p.id=? LIMIT 1",
+        [id.into()],
+    ))
+    .one(db)
+    .await?
     else {
         return Ok(None);
     };
-    let coverage = checkpoint_coverage(db, id).await?;
+    let coverage = HistoricalCoverageRow::find_by_statement(sqlite_specific_sql(
+        "SELECT DISTINCT v.source_scope,v.source_id,v.source_version,m.source_thread FROM compaction_coverage v JOIN compaction_manifest m ON m.operation_id=? AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version WHERE v.checkpoint_id=? ORDER BY v.source_scope,v.source_id,m.source_thread LIMIT ?",
+        [
+            row.operation_id.clone().into(),
+            id.into(),
+            i64::try_from(CHECKPOINT_SOURCE_LIMIT + 1)?.into(),
+        ],
+    ))
+    .all(db)
+    .await?;
+    let exact_coverage = checkpoint_coverage(db, id).await?;
+    let exact_coverage = exact_coverage
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut ownership =
+        std::collections::BTreeMap::<SourceRef, std::collections::BTreeSet<String>>::new();
+    for covered in coverage {
+        ownership
+            .entry(SourceRef {
+                scope: covered.source_scope,
+                id: covered.source_id,
+                version: covered.source_version,
+            })
+            .or_default()
+            .insert(covered.source_thread);
+    }
+    ensure!(
+        ownership
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            == exact_coverage
+            && ownership.values().all(|threads| threads.len() == 1),
+        "checkpoint coverage lost its historical manifest ownership"
+    );
+    let replay_aliases = HistoricalReplayAliasRow::find_by_statement(sqlite_specific_sql(
+        "SELECT DISTINCT m.source_thread AS source_thread,v.source_scope AS covered_scope,v.source_id AS covered_id,v.source_version AS covered_version,json_extract(f.reference_json,'$.replay_source.scope') AS replay_scope,json_extract(f.reference_json,'$.replay_source.id') AS replay_id,json_extract(f.reference_json,'$.replay_source.version') AS replay_version,json_extract(f.reference_json,'$.tool_item_id') AS tool_item_id FROM compaction_operation_projection p JOIN compaction_frozen_message f ON f.manifest_id=p.manifest_id JOIN json_each(f.reference_json,'$.sources') saved JOIN compaction_coverage v ON v.checkpoint_id=? AND json_extract(saved.value,'$.scope')=v.source_scope AND json_extract(saved.value,'$.id')=v.source_id AND json_extract(saved.value,'$.version')=v.source_version JOIN compaction_manifest m ON m.operation_id=p.operation_id AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version AND m.source_thread=json_extract(f.reference_json,'$.source_thread') WHERE p.operation_id=? AND json_type(f.reference_json,'$.replay_source')='object' ORDER BY replay_scope,replay_id,source_thread LIMIT ?",
+        [
+            id.into(),
+            row.operation_id.clone().into(),
+            i64::try_from(CHECKPOINT_SOURCE_LIMIT + 1)?.into(),
+        ],
+    ))
+    .all(db)
+    .await?;
+    ensure!(
+        replay_aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
+        "checkpoint replay aliases exceed supported quantum"
+    );
     Ok(Some(CheckpointEdges {
-        owner,
-        identity_sha256,
-        previous,
-        format_version: u32::try_from(format_version)?,
-        coverage,
+        owner: row.owner,
+        workspace_id: row.workspace_id,
+        thread_id: row.thread_id,
+        identity_sha256: row.identity_sha256,
+        previous: row.previous,
+        format_version: u32::try_from(row.format_version)?,
+        coverage: ownership
+            .into_iter()
+            .map(|(source, mut threads)| HistoricalSourceRef {
+                source_thread: threads.pop_first().expect("one historical owner"),
+                source,
+            })
+            .collect(),
+        replay_aliases: replay_aliases
+            .into_iter()
+            .map(|alias| HistoricalReplayAlias {
+                covered: HistoricalSourceRef {
+                    source_thread: alias.source_thread.clone(),
+                    source: SourceRef {
+                        scope: alias.covered_scope,
+                        id: alias.covered_id,
+                        version: alias.covered_version,
+                    },
+                },
+                replay: HistoricalSourceRef {
+                    source_thread: alias.source_thread,
+                    source: SourceRef {
+                        scope: alias.replay_scope,
+                        id: alias.replay_id,
+                        version: alias.replay_version,
+                    },
+                },
+                tool_item_id: alias.tool_item_id,
+            })
+            .collect(),
     }))
+}
+
+#[derive(FromQueryResult)]
+struct CheckpointEdgesRow {
+    owner: String,
+    workspace_id: String,
+    thread_id: String,
+    identity_sha256: String,
+    previous: Option<String>,
+    format_version: i64,
+    operation_id: String,
+}
+
+#[derive(FromQueryResult)]
+struct HistoricalCoverageRow {
+    source_scope: String,
+    source_id: String,
+    source_version: String,
+    source_thread: String,
+}
+
+#[derive(FromQueryResult)]
+struct HistoricalReplayAliasRow {
+    source_thread: String,
+    covered_scope: String,
+    covered_id: String,
+    covered_version: String,
+    replay_scope: String,
+    replay_id: String,
+    replay_version: String,
+    tool_item_id: Option<String>,
 }
 
 pub(crate) async fn compaction_checkpoint<C: ConnectionTrait>(
@@ -1683,10 +1778,25 @@ pub(crate) async fn compaction_apply(
             .one(&txn)
             .await?;
             if stopped.is_some() { txn.rollback().await?; return Ok(CommitOutcome::Cancelled); }
-            let dependency_changed = txn.query_one_raw(sqlite_specific_sql("SELECT o.id FROM compaction_operation o WHERE o.id=? AND EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value OR NOT EXISTS (SELECT 1 FROM thread t JOIN compaction_context c ON c.workspace_id=t.workspace_id WHERE t.id=wanted.key AND c.owner=o.owner))", [checkpoint.operation_id.clone()
-                        .into()]))
-            .await?;
-            if dependency_changed.is_some() { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
+            if let Some(previous) = &checkpoint.previous {
+                let previous_available = txn.query_one_raw(sqlite_specific_sql(
+                    "SELECT p.id FROM compaction_checkpoint p WHERE p.id=? AND p.owner=? AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS (SELECT 1 FROM compaction_operation committed WHERE committed.id=p.operation_id AND committed.status='completed'))) LIMIT 1",
+                    [previous.clone().into(), checkpoint.owner.clone().into()],
+                )).await?;
+                if previous_available.is_none() { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
+            }
+            // The legacy writer has no per-reference manifest. For an initial
+            // raw-only checkpoint its captured epochs still fence unasserted
+            // accepted context. Once a previous published checkpoint is the
+            // basis, that checkpoint is atomic: old covered mutations may
+            // advance a coarse thread epoch, while every newly covered raw
+            // source below is still checked by its exact assertion.
+            if checkpoint.previous.is_none() {
+                let dependency_changed = txn.query_one_raw(sqlite_specific_sql("SELECT o.id FROM compaction_operation o WHERE o.id=? AND EXISTS (SELECT 1 FROM json_each(o.snapshot,'$.source_epochs') wanted WHERE COALESCE((SELECT version FROM compaction_projection_epoch WHERE thread_id=wanted.key),0)<>wanted.value OR NOT EXISTS (SELECT 1 FROM thread t JOIN compaction_context c ON c.workspace_id=t.workspace_id WHERE t.id=wanted.key AND c.owner=o.owner))", [checkpoint.operation_id.clone()
+                            .into()]))
+                .await?;
+                if dependency_changed.is_some() { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
+            }
             for assertion in assertions {
                 let valid = match assertion.kind {
 CanonicalSource::Input => source_assertion_matches::<_,turn_input::Entity,compaction_input_revision::Entity>(
@@ -2108,51 +2218,20 @@ pub(crate) async fn compaction_reference_fragment(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("source offset overflow"))?;
         let row = SourceFragmentRow::find_by_statement(sqlite_specific_sql(
-            r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
-  AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
-  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
- UNION
- SELECT v.source_scope,v.source_id,v.source_version
- FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
- WHERE g.source_scope LIKE 'checkpoint:%'
- UNION
- SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
- FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
- LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
- WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
- LIMIT 65537
-)
-SELECT 1 AS revision,substr(root.summary,?,16384) AS fragment,length(root.summary) AS characters
-FROM compaction_checkpoint root
-WHERE root.id=? AND (SELECT COUNT(*) FROM graph)<65537
- AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
- AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_live_sources s
-   WHERE s.workspace_id=? AND s.source_scope=g.source_scope
-    AND s.source_id=g.source_id AND s.source_version=g.source_version
-  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
-    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
-  ))
- )) LIMIT 1"#,
+            r#"SELECT 1 AS revision,substr(p.summary,?,16384) AS fragment,length(p.summary) AS characters
+FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
+ AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
+ AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+  SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+LIMIT 1"#,
             [
+                offset.into(),
                 reference.id.clone().into(),
                 reference.scope.clone().into(),
                 reference.version.clone().into(),
                 workspace.into(),
                 thread.into(),
-                offset.into(),
-                reference.id.clone().into(),
-                workspace.into(),
-                workspace.into(),
             ],
         ))
         .one(&store.connection)
@@ -2222,130 +2301,15 @@ fn exact_canonical_revision(reference: &SourceRef, kind: CanonicalSource) -> Res
     Ok(revision)
 }
 
-macro_rules! non_checkpoint_graph_source_exists {
-    ($workspace:literal) => {
-        concat!(
-            r#"(
-    EXISTS (
-      SELECT 1
-      FROM compaction_source_revision context_revision
-      JOIN turn_llm_context context_source
-        ON context_source.id=context_revision.source_id
-       AND context_source.turn_id=context_revision.turn_id
-      JOIN turn context_turn ON context_turn.id=context_revision.turn_id
-      JOIN thread context_thread ON context_thread.id=context_turn.thread_id
-      WHERE context_revision.present=1
-        AND context_thread.workspace_id="#,
-            $workspace,
-            r#"
-        AND 'context:'||context_revision.turn_id=g.source_scope
-        AND context_revision.source_id=g.source_id
-        AND 'revision:'||context_revision.revision=g.source_version
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM compaction_item_revision item_revision
-      JOIN turn_item item_source
-        ON item_source.id=item_revision.source_id
-       AND item_source.turn_id=item_revision.turn_id
-      JOIN turn item_turn ON item_turn.id=item_revision.turn_id
-      JOIN thread item_thread ON item_thread.id=item_turn.thread_id
-      WHERE item_revision.present=1
-        AND item_thread.workspace_id="#,
-            $workspace,
-            r#"
-        AND 'item:'||item_revision.turn_id=g.source_scope
-        AND item_revision.source_id=g.source_id
-        AND 'item-revision:'||item_revision.revision=g.source_version
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM compaction_event_revision event_revision
-      JOIN turn_event event_source
-        ON event_source.id=event_revision.source_id
-       AND event_source.turn_id=event_revision.turn_id
-      JOIN turn event_turn ON event_turn.id=event_revision.turn_id
-      JOIN thread event_thread ON event_thread.id=event_turn.thread_id
-      WHERE event_revision.present=1
-        AND event_thread.workspace_id="#,
-            $workspace,
-            r#"
-        AND 'event:'||event_revision.turn_id=g.source_scope
-        AND event_revision.source_id=g.source_id
-        AND 'event-revision:'||event_revision.revision=g.source_version
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM compaction_input_revision input_revision
-      JOIN turn_input input_source
-        ON input_source.id=input_revision.source_id
-       AND input_source.turn_id=input_revision.turn_id
-      JOIN turn input_turn ON input_turn.id=input_revision.turn_id
-      JOIN thread input_thread ON input_thread.id=input_turn.thread_id
-      WHERE input_revision.present=1
-        AND input_thread.workspace_id="#,
-            $workspace,
-            r#"
-        AND 'input:'||input_revision.turn_id=g.source_scope
-        AND input_revision.source_id=g.source_id
-        AND 'input-revision:'||input_revision.revision=g.source_version
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM task_run_conversation_snapshot basis
-      JOIN thread basis_thread
-        ON basis_thread.id=basis.conversation_thread_id
-       AND basis_thread.workspace_id=basis.workspace_id
-      LEFT JOIN compaction_task_basis_revision basis_revision
-        ON basis_revision.run_id=basis.run_id
-      WHERE substr(ltrim(basis.history_json),1,1)='['
-        AND basis.workspace_id="#,
-            $workspace,
-            r#"
-        AND 'task-basis:'||basis.run_id=g.source_scope
-        AND basis.run_id=g.source_id
-        AND 'task-basis-revision:'||COALESCE(basis_revision.revision,1)=g.source_version
-    )
-  )"#,
-        )
-    };
-}
-
-const COMPACTION_REFERENCE_CHECKPOINT_PAYLOAD_SQL: &str = concat!(
-    r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=?1 AND 'checkpoint:'||p.owner=?2 AND p.identity_sha256=?3
-  AND p.format_version=1 AND c.workspace_id=?4 AND c.thread_id=?5
-  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
- UNION
- SELECT v.source_scope,v.source_id,v.source_version
- FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
- WHERE g.source_scope LIKE 'checkpoint:%'
- UNION
- SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
- FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
- LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
- WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
- LIMIT 65537
-)
-SELECT 1 AS revision,root.summary AS fragment,length(root.summary) AS characters
-FROM compaction_checkpoint root
-WHERE root.id=?6 AND (SELECT COUNT(*) FROM graph)<65537
- AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
- AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND "#,
-    non_checkpoint_graph_source_exists!("?7"),
-    r#") OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?8
-    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
-  ))
- )) LIMIT 1"#,
-);
+const COMPACTION_REFERENCE_CHECKPOINT_PAYLOAD_SQL: &str = r#"
+SELECT 1 AS revision,p.summary AS fragment,length(p.summary) AS characters
+FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+WHERE p.id=?1 AND 'checkpoint:'||p.owner=?2 AND p.identity_sha256=?3
+ AND p.format_version=1 AND c.workspace_id=?4 AND c.thread_id=?5
+ AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+  SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+LIMIT 1
+"#;
 
 fn compaction_reference_checkpoint_payload_statement(
     workspace: &str,
@@ -2360,9 +2324,6 @@ fn compaction_reference_checkpoint_payload_statement(
             reference.version.clone().into(),
             workspace.into(),
             thread.into(),
-            reference.id.clone().into(),
-            workspace.into(),
-            workspace.into(),
         ],
     )
 }
@@ -2674,42 +2635,16 @@ pub(crate) async fn compaction_projection_version<C: ConnectionTrait>(
         .ok_or_else(|| anyhow::anyhow!("context scope unavailable"))?;
     Ok(u64::try_from(row)?)
 }
-const COMPACTION_CHECKPOINT_SOURCE_SQL: &str = concat!(
-    r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=?1 AND c.workspace_id=?2 AND c.thread_id=?3
-  AND p.format_version=1
-  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
- UNION
- SELECT v.source_scope,v.source_id,v.source_version
- FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
- WHERE g.source_scope LIKE 'checkpoint:%'
- UNION
- SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
- FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
- LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
- WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
- LIMIT 65537
-)
-SELECT root.source_scope,root.source_id,root.source_version
-FROM graph root
-WHERE root.source_scope LIKE 'checkpoint:%' AND root.source_id=?4
- AND (SELECT COUNT(*) FROM graph)<65537
- AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
- AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND "#,
-    non_checkpoint_graph_source_exists!("?5"),
-    r#") OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?6
-    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
-  ))
- )) LIMIT 1"#,
-);
+const COMPACTION_CHECKPOINT_SOURCE_SQL: &str = r#"
+SELECT 'checkpoint:'||p.owner AS source_scope,p.id AS source_id,
+ p.identity_sha256 AS source_version
+FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
+WHERE p.id=?1 AND c.workspace_id=?2 AND c.thread_id=?3
+ AND p.format_version=1
+ AND (p.status='applied' OR (p.status='retained' AND EXISTS(
+  SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
+LIMIT 1
+"#;
 
 fn compaction_checkpoint_source_statement(
     workspace: &str,
@@ -2718,14 +2653,7 @@ fn compaction_checkpoint_source_statement(
 ) -> Statement {
     sqlite_specific_sql(
         COMPACTION_CHECKPOINT_SOURCE_SQL,
-        [
-            checkpoint.into(),
-            workspace.into(),
-            thread.into(),
-            checkpoint.into(),
-            workspace.into(),
-            workspace.into(),
-        ],
+        [checkpoint.into(), workspace.into(), thread.into()],
     )
 }
 

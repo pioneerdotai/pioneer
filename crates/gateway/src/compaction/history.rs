@@ -414,7 +414,7 @@ pub(crate) async fn load_task_line_history(
     excluded_turn: Option<&str>,
     fence: &HistoryReadFence,
 ) -> Result<Vec<ChatMessage>> {
-    let mut messages = load_line_history_inner(
+    let messages = load_line_history_inner(
         store,
         workspace,
         thread,
@@ -424,6 +424,15 @@ pub(crate) async fn load_task_line_history(
         HistorySelection::All,
     )
     .await?;
+    populate_logical_task_turns(store, workspace, thread, messages).await
+}
+
+async fn populate_logical_task_turns(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    mut messages: Vec<ChatMessage>,
+) -> Result<Vec<ChatMessage>> {
     for message in &mut messages {
         let Some(origin) = message.provenance.as_mut() else {
             continue;
@@ -454,8 +463,38 @@ pub(crate) async fn load_task_line_history(
     Ok(messages)
 }
 
+/// Load current canonical history while omitting stable source identities that
+/// are already represented by a published checkpoint. Filtering happens on
+/// metadata before payload reads, so editing a covered source neither reloads
+/// its new body nor turns it into a new tail entry.
+pub(crate) async fn load_task_line_history_excluding(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    excluded_turn: Option<&str>,
+    fence: &HistoryReadFence,
+    covered: &BTreeSet<(String, String)>,
+    covered_item_aliases: &BTreeSet<(String, String, String)>,
+) -> Result<Vec<ChatMessage>> {
+    let messages = load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        excluded_turn,
+        fence,
+        true,
+        HistorySelection::AllExcept {
+            covered,
+            covered_item_aliases,
+        },
+    )
+    .await?;
+    populate_logical_task_turns(store, workspace, thread, messages).await
+}
+
 /// Reconstruct only the supplied exact canonical leaves. Later unrelated rows
 /// may contribute metadata to discovery, but their payloads are never decoded.
+#[cfg(test)]
 pub(crate) async fn load_exact_line_history(
     store: &CrudStore,
     workspace: &str,
@@ -499,6 +538,11 @@ pub(crate) async fn load_task_output_history(
 
 enum HistorySelection<'a> {
     All,
+    AllExcept {
+        covered: &'a BTreeSet<(String, String)>,
+        covered_item_aliases: &'a BTreeSet<(String, String, String)>,
+    },
+    #[cfg(test)]
     Sources(&'a BTreeSet<SourceRef>),
     ThroughTurn(&'a str),
 }
@@ -512,10 +556,33 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
-    let (selected, through_turn) = match selection {
-        HistorySelection::All => (None, None),
-        HistorySelection::Sources(sources) => (Some(sources), None),
-        HistorySelection::ThroughTurn(turn) => (None, Some(turn)),
+    let (selected, covered, covered_item_aliases, through_turn) = match selection {
+        HistorySelection::All => (None, None, None, None),
+        HistorySelection::AllExcept {
+            covered,
+            covered_item_aliases,
+        } => (None, Some(covered), Some(covered_item_aliases), None),
+        #[cfg(test)]
+        HistorySelection::Sources(sources) => (Some(sources), None, None, None),
+        HistorySelection::ThroughTurn(turn) => (None, None, None, Some(turn)),
+    };
+    // `Sources` is test-only, so production builds otherwise have no `Some`
+    // branch from which to infer the collection behind `selected`.
+    let selected: Option<&BTreeSet<SourceRef>> = selected;
+    let covered_item_alias_index = covered_item_aliases.map(|aliases| {
+        let mut index = BTreeMap::<&str, BTreeMap<&str, BTreeSet<&str>>>::new();
+        for (source_thread, source_turn, item) in aliases {
+            index
+                .entry(source_thread)
+                .or_default()
+                .entry(source_turn)
+                .or_default()
+                .insert(item);
+        }
+        index
+    });
+    let is_covered = |source: &SourceRef| {
+        covered.is_some_and(|covered| covered.contains(&(source.scope.clone(), source.id.clone())))
     };
     let mut turns = Vec::new();
     let mut after = String::new();
@@ -570,6 +637,10 @@ async fn load_line_history_inner(
     }
     let mut events_by_turn = Vec::with_capacity(turns.len());
     for turn in &turns {
+        let covered_turn_items = covered_item_alias_index
+            .as_ref()
+            .and_then(|threads| threads.get(thread))
+            .and_then(|turns| turns.get(turn.id.as_str()));
         let mut events = metadata(
             &store,
             workspace,
@@ -580,7 +651,13 @@ async fn load_line_history_inner(
             fence,
         )
         .await?;
-        events.retain(|event| selected.is_none_or(|sources| sources.contains(&event.reference)));
+        events.retain(|event| {
+            !is_covered(&event.reference)
+                && !event.item_id.as_ref().is_some_and(|item| {
+                    covered_turn_items.is_some_and(|items| items.contains(item.as_str()))
+                })
+                && selected.is_none_or(|sources| sources.contains(&event.reference))
+        });
         for event in &mut events {
             if event.projection_kind.is_none() {
                 let payload = source_payload(&store, workspace, thread, event).await?;
@@ -667,6 +744,44 @@ async fn load_line_history_inner(
             fence,
         )
         .await?;
+        // Covered provider rows are removed before payload reads, but their
+        // durable item relationship must still suppress the corresponding UI
+        // event copy. This is metadata-only and does not make an unrelated
+        // event or item part of checkpoint coverage.
+        let context_aliases = contexts
+            .iter()
+            .filter(|row| is_covered(&row.reference))
+            .filter_map(|row| row.item_id.clone())
+            .collect::<BTreeSet<_>>();
+        if covered.is_some() {
+            let mut uncovered = Vec::with_capacity(contexts.len());
+            for row in contexts {
+                if is_covered(&row.reference) {
+                    continue;
+                }
+                if row.source_type == "tool_result_v2" {
+                    let item_covered = if let Some(item) = row.item_id.as_deref() {
+                        match store
+                            .compaction_tool_item_reference(workspace, thread, &turn.id, item)
+                            .await?
+                        {
+                            Some(reference) => is_covered(&reference),
+                            // Published checkpoint metadata records the exact
+                            // replay row as a covered alias. Without that saved
+                            // link, a missing item is not guessed to be covered.
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if item_covered {
+                        continue;
+                    }
+                }
+                uncovered.push(row);
+            }
+            contexts = uncovered;
+        }
         if let Some(selected) = selected {
             let mut exact = Vec::new();
             for row in contexts {
@@ -690,10 +805,16 @@ async fn load_line_history_inner(
             }
             contexts = exact;
         }
-        let mut aliases = contexts
-            .iter()
-            .filter_map(|row| row.item_id.clone())
+        let mut aliases = covered_item_alias_index
+            .as_ref()
+            .and_then(|threads| threads.get(thread))
+            .and_then(|turns| turns.get(turn.id.as_str()))
+            .into_iter()
+            .flat_map(|items| items.iter().copied())
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
+        aliases.extend(context_aliases);
+        aliases.extend(contexts.iter().filter_map(|row| row.item_id.clone()));
         let mut ordered = Vec::<(i64, Vec<ChatMessage>)>::new();
         let has_event_input = events.iter().any(|row| {
             matches!(
@@ -720,7 +841,10 @@ async fn load_line_history_inner(
                 fence,
             )
             .await?;
-            rows.retain(|row| selected.is_none_or(|sources| sources.contains(&row.reference)));
+            rows.retain(|row| {
+                !is_covered(&row.reference)
+                    && selected.is_none_or(|sources| sources.contains(&row.reference))
+            });
             let mut inputs = Vec::new();
             let mut sources = Vec::new();
             let mut rows = VecDeque::from(rows);

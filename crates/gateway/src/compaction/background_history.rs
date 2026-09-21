@@ -144,17 +144,18 @@ pub(crate) async fn prepare_completed_history_owned(
             mut messages,
             accepted_scopes: allowed,
             source_epochs,
+            expected_checkpoint: head,
+            checkpoint: projection_checkpoint,
             mut checkpoint_graphs,
         } = prepared;
         let version = *source_epochs
             .get(thread)
             .ok_or_else(|| anyhow::anyhow!("prepared history lost its owner epoch"))?;
-        let head = store.compaction_head(&owner).await?;
-        let basis = if let Some(head) = &head {
+        let basis = if let Some(checkpoint) = &projection_checkpoint {
             store
-                .compaction_checkpoint_source(workspace, thread, head)
+                .compaction_checkpoint_source(workspace, thread, checkpoint)
                 .await?
-                .map(|_| head.clone())
+                .map(|_| checkpoint.clone())
         } else {
             None
         };
@@ -167,6 +168,7 @@ pub(crate) async fn prepare_completed_history_owned(
                     source_thread: thread,
                     owner: &owner,
                     allowed: &allowed,
+                    allow_historical_gaps: true,
                 },
                 basis,
                 &mut messages,
@@ -183,6 +185,7 @@ pub(crate) async fn prepare_completed_history_owned(
             &mut checkpoint_graphs,
         )
         .await?;
+        super::origins::validate_message_origins(&store, workspace, &messages).await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),

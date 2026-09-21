@@ -197,9 +197,8 @@ impl CrudStore {
     pub async fn compaction_operation(&self, id: &str) -> Result<Option<OperationRecord>> {
         repositories::compaction::compaction_operation(&self.connection, id).await
     }
-    /// Validate a bounded batch of exact identities after preparing its JSON
-    /// outside reader capacity. An edited/deleted source or stale summary may
-    /// never pass an otherwise-fitting native preflight as current history.
+    /// Validate directly consumed identities. Raw sources remain exact-current;
+    /// checkpoints are validated as independently published objects.
     pub async fn compaction_sources_current(
         &self,
         workspace: &str,
@@ -214,9 +213,8 @@ impl CrudStore {
         )
         .await
     }
-    /// Resolve only the storage scope of one exact current revision. Used to
-    /// validate transitive checkpoint coverage before any source body is read.
-    /// The caller still checks the returned thread against accepted scopes.
+    /// Resolve a directly consumed source's current owner. Historical checkpoint
+    /// coverage uses the source thread saved in its publication manifest.
     pub async fn compaction_reference_thread(
         &self,
         workspace: &str,
@@ -258,15 +256,15 @@ impl CrudStore {
     ) -> Result<()> {
         repositories::compaction::compaction_save_candidate(self, checkpoint, portion).await
     }
-    /// Coverage discovery must not read summary text before source authorization.
+    /// Read bounded historical coverage metadata without loading summary text.
     pub async fn compaction_checkpoint_edges(&self, id: &str) -> Result<Option<CheckpointEdges>> {
         repositories::compaction::compaction_checkpoint_edges(&self.connection, id).await
     }
     pub async fn compaction_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
         repositories::compaction::compaction_checkpoint(&self.connection, id).await
     }
-    /// Projection fields without coverage, which callers already resolved and
-    /// authorized through `compaction_checkpoint_edges`.
+    /// Projection fields without coverage. Callers separately validate the
+    /// published root identity and accepted context boundary.
     pub async fn compaction_checkpoint_body(
         &self,
         id: &str,
@@ -712,6 +710,46 @@ impl CrudStore {
             destination,
             turn,
             ordinal,
+        )
+        .await
+    }
+    pub async fn compaction_prepare_accepted_checkpoint_import(
+        &self,
+        workspace: &str,
+        destination: &str,
+        turn: &str,
+        ordinal: u64,
+        checkpoint_thread: &str,
+        checkpoint: &SourceRef,
+    ) -> Result<PreparedFrozenImport> {
+        repositories::compaction::frozen_import::compaction_prepare_accepted_checkpoint_import(
+            self,
+            workspace,
+            destination,
+            turn,
+            ordinal,
+            checkpoint_thread,
+            checkpoint,
+        )
+        .await
+    }
+    pub async fn compaction_prepare_accepted_checkpoint_imports(
+        &self,
+        workspace: &str,
+        destination: &str,
+        turn: &str,
+        ordinals: &[u64],
+        checkpoint_thread: &str,
+        checkpoint: &SourceRef,
+    ) -> Result<Vec<PreparedFrozenImport>> {
+        repositories::compaction::frozen_import::compaction_prepare_accepted_checkpoint_imports(
+            self,
+            workspace,
+            destination,
+            turn,
+            ordinals,
+            checkpoint_thread,
+            checkpoint,
         )
         .await
     }

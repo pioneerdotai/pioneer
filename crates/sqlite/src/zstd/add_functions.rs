@@ -55,7 +55,6 @@ pub fn add_functions(db: &rusqlite::Connection) -> anyhow::Result<()> {
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
     use anyhow::Context;
     use chrono::TimeZone;
     pub use pretty_assertions::assert_eq;
@@ -99,7 +98,7 @@ pub mod tests {
         } else {
             Connection::open_in_memory().context("opening memory db")?
         };
-        add_functions(&db).context("adding functions")?;
+        crate::zstd::load(&db).context("loading zstd extension")?;
         db.execute_batch(
             "
             create table events (

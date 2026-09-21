@@ -260,6 +260,7 @@ fn prepared(manifest: &str, source: SourceRef) -> PreparedFrozenImport {
             ordinal: 0,
             proof_json: "{}".into(),
         }),
+        target_checkpoint: None,
     }
 }
 
@@ -317,18 +318,20 @@ async fn assert_matches_oracle(
 ) {
     let snapshot = db.begin_read().await.unwrap();
     let actual = accepted_import_current(&snapshot, prepared).await.unwrap();
-    let legacy = snapshot
-        .query_one_raw(
-            accepted_import_current_statement(LEGACY_ACCEPTED_IMPORT_CURRENT_SQL, prepared)
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-        .is_some();
-    assert_eq!(
-        actual, legacy,
-        "new query diverged from legacy oracle: {case}"
-    );
+    if !prepared.record.source.scope.starts_with("checkpoint:") {
+        let legacy = snapshot
+            .query_one_raw(
+                accepted_import_current_statement(LEGACY_ACCEPTED_IMPORT_CURRENT_SQL, prepared)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .is_some();
+        assert_eq!(
+            actual, legacy,
+            "new query diverged from legacy oracle: {case}"
+        );
+    }
     assert_eq!(actual, expected, "unexpected fixture result: {case}");
     snapshot.rollback().await.unwrap();
 }
@@ -621,7 +624,7 @@ async fn accepted_import_current_checks_task_basis_revision_and_legacy_json_inde
 }
 
 #[tokio::test]
-async fn accepted_import_current_checks_checkpoint_status_and_epoch_independently() {
+async fn accepted_import_current_checks_checkpoint_status_format_and_epoch_independence() {
     let fixture = fixture().await;
     let db = fixture.db();
     install_checkpoint_and_task_basis(&db).await;
@@ -690,7 +693,20 @@ async fn accepted_import_current_checks_checkpoint_status_and_epoch_independentl
     )
     .await
     .unwrap();
-    assert_matches_oracle(&db, &import, false, "mismatched checkpoint epoch").await;
+    assert_matches_oracle(
+        &db,
+        &import,
+        true,
+        "published checkpoint is independent of the current projection epoch",
+    )
+    .await;
+
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET format_version=2 WHERE id='checkpoint-source'",
+    )
+    .await
+    .unwrap();
+    assert_matches_oracle(&db, &import, false, "unsupported checkpoint format").await;
 }
 
 #[tokio::test]

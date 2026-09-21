@@ -34,8 +34,10 @@ pub struct OperationSnapshot {
     pub owner: String,
     pub expected_checkpoint: Option<String>,
     pub projection_version: u64,
-    /// Epochs captured before resolving inherited or adopted checkpoint leaves.
-    /// Appends do not change them; an edit in any dependency fences publication.
+    /// Epochs captured before resolving directly selected raw sources.
+    /// Appends do not change them; an edit in a raw dependency fences publication.
+    /// Published checkpoint inputs are immutable objects and do not inherit the
+    /// current epochs of the historical sources that they cover.
     #[serde(default)]
     pub source_epochs: std::collections::BTreeMap<String, u64>,
     pub admission: OperationAdmission,

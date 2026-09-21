@@ -70,6 +70,8 @@ struct PreparedProjection {
     descriptor: pioneer_compaction::frozen::FrozenHistoryRef,
     accepted_scopes: BTreeSet<String>,
     source_epochs: std::collections::BTreeMap<String, u64>,
+    expected_checkpoint: Option<String>,
+    checkpoint: Option<String>,
     checkpoint_graphs: super::coverage::CheckpointGraphResolver,
 }
 
@@ -202,7 +204,6 @@ fn observe_reused_projection(store: &CrudStore, workspace: &str, thread: &str) {
             edge_loads: after.edge_loads.saturating_sub(before.edge_loads),
             body_loads: after.body_loads.saturating_sub(before.body_loads),
             closure_builds: after.closure_builds.saturating_sub(before.closure_builds),
-            revalidations: after.revalidations.saturating_sub(before.revalidations),
         }
     });
 }
@@ -317,12 +318,21 @@ async fn prepare_native_projection_with_prepared(
         let version = store
             .compaction_projection_version(workspace, thread)
             .await?;
-        let head = store.compaction_head(&owner).await?;
-        let basis = if let Some(head) = &head {
+        let (head, projection_checkpoint) = match &accepted_projection {
+            Some(AcceptedProjection::Prepared(prepared)) => (
+                prepared.expected_checkpoint.clone(),
+                prepared.checkpoint.clone(),
+            ),
+            _ => {
+                let head = store.compaction_head(&owner).await?;
+                (head.clone(), head)
+            }
+        };
+        let basis = if let Some(checkpoint) = &projection_checkpoint {
             store
-                .compaction_checkpoint_source(workspace, thread, head)
+                .compaction_checkpoint_source(workspace, thread, checkpoint)
                 .await?
-                .map(|_| head.clone())
+                .map(|_| checkpoint.clone())
         } else {
             None
         };
@@ -394,17 +404,18 @@ async fn prepare_native_projection_with_prepared(
             }
             _ => super::coverage::CheckpointGraphResolver::default(),
         };
-        super::origins::resolve_message_origins_with_resolver(
+        super::origins::resolve_message_origin_locators(
             &store,
             workspace,
             thread,
             &context.turn_id,
             &authorized,
             &mut request.messages,
-            &mut checkpoint_graphs,
         )
         .await?;
         if let Some(basis) = &basis {
+            let prepared_projection =
+                matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_)));
             super::checkpoint::project_checkpoint_with_resolver(
                 &store,
                 super::checkpoint::ProjectionContext {
@@ -413,6 +424,7 @@ async fn prepare_native_projection_with_prepared(
                     source_thread: thread,
                     owner: &owner,
                     allowed: &authorized,
+                    allow_historical_gaps: prepared_projection,
                 },
                 basis,
                 &mut request.messages,
@@ -429,6 +441,7 @@ async fn prepare_native_projection_with_prepared(
             &mut checkpoint_graphs,
         )
         .await?;
+        super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }
@@ -699,7 +712,7 @@ async fn prepare_native_projection_with_prepared(
             workspace_id: workspace.into(),
             thread_id: thread.into(),
             context_thread: None,
-            unit_id: format!("checkpoint:{owner}"),
+            unit_id: format!("checkpoint:{owner}:{id}"),
             sources: vec![MessageSourceRef {
                 scope: source.scope,
                 id: source.id,
@@ -746,6 +759,8 @@ pub(super) async fn prepare_native_projection_from_history(
         messages: _,
         accepted_scopes,
         source_epochs,
+        expected_checkpoint,
+        checkpoint,
         checkpoint_graphs,
     } = prepared;
     prepare_native_projection_with_prepared(
@@ -762,6 +777,8 @@ pub(super) async fn prepare_native_projection_from_history(
             descriptor,
             accepted_scopes,
             source_epochs,
+            expected_checkpoint,
+            checkpoint,
             checkpoint_graphs,
         })),
         None,
@@ -881,15 +898,14 @@ impl pioneer_agent::compaction::controller::NativeContextController
 }
 
 /// Refresh completed history while retaining the current execution's exact
-/// input and unfinished tool rounds. Mixed checkpoints are expanded through
-/// their canonical coverage before selecting the current-turn suffix.
+/// input and unfinished tool rounds. Published checkpoints remain atomic while
+/// their saved coverage identifies current-turn units already summarized.
 async fn refresh_native_history(
     processor: &crate::message::MessageProcessor,
     store: &CrudStore,
     context: &NativeContext,
     mut request: ChatRequest,
 ) -> Result<(ChatRequest, PreparedProjection)> {
-    use pioneer_agent::compaction::composition::ScopedHistorySource;
     let prepared = processor
         .capture_current_context_basis_prepared(
             store,
@@ -904,6 +920,8 @@ async fn refresh_native_history(
         messages: mut history,
         accepted_scopes: allowed,
         source_epochs,
+        expected_checkpoint,
+        checkpoint,
         mut checkpoint_graphs,
     } = prepared;
     let is_current = |thread: &str, scope: &str| {
@@ -934,7 +952,7 @@ async fn refresh_native_history(
             .sources
             .iter()
             .find(|source| source.scope.starts_with("checkpoint:"));
-        let expanded = if let Some(checkpoint) = checkpoint {
+        if let Some(checkpoint) = checkpoint {
             let source = SourceRef {
                 scope: checkpoint.scope.clone(),
                 id: checkpoint.id.clone(),
@@ -943,60 +961,51 @@ async fn refresh_native_history(
             let leaves = checkpoint_graphs
                 .resolve(&store, &context.workspace_id, Some(&allowed), &source)
                 .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("checkpoint coverage source changed or disappeared")
-                })?
+                .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?
                 .leaves
                 .clone();
-            if !leaves
+            if leaves
                 .iter()
                 .any(|leaf| is_current(&leaf.thread, &leaf.source.scope))
             {
-                continue;
-            }
-            let checkpoints = std::collections::BTreeMap::from([(
-                ScopedHistorySource {
-                    thread: origin.thread_id.clone(),
-                    source,
-                },
-                leaves.clone(),
-            )]);
-            super::compatible::rematerialize_overlap(
-                &store,
-                &context.workspace_id,
-                &allowed,
-                &[message],
-                &checkpoints,
-                &leaves,
-            )
-            .await?
-        } else {
-            vec![message]
-        };
-        for mut message in expanded {
-            let origin = message
-                .provenance
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("current history lost provenance"))?;
-            if origin
-                .sources
-                .iter()
-                .any(|source| is_current(&origin.thread_id, &source.scope))
-            {
-                ensure!(
-                    origin
-                        .sources
-                        .iter()
-                        .all(|source| is_current(&origin.thread_id, &source.scope)),
-                    "history unit crosses the current execution boundary"
-                );
-                if origin.sources.iter().any(|source| {
-                    source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
-                }) {
-                    origin.protected_input = true;
+                let already_present = history.iter().any(|existing| {
+                    existing.provenance.as_ref().is_some_and(|origin| {
+                        origin.sources.iter().any(|candidate| {
+                            candidate.scope == checkpoint.scope
+                                && candidate.id == checkpoint.id
+                                && candidate.version == checkpoint.version
+                        })
+                    })
+                });
+                if !already_present {
+                    history.push(message);
                 }
-                history.push(message);
             }
+            continue;
+        }
+        let mut message = message;
+        let origin = message
+            .provenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("current history lost provenance"))?;
+        if origin
+            .sources
+            .iter()
+            .any(|source| is_current(&origin.thread_id, &source.scope))
+        {
+            ensure!(
+                origin
+                    .sources
+                    .iter()
+                    .all(|source| is_current(&origin.thread_id, &source.scope)),
+                "history unit crosses the current execution boundary"
+            );
+            if origin.sources.iter().any(|source| {
+                source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
+            }) {
+                origin.protected_input = true;
+            }
+            history.push(message);
         }
     }
     request.messages = history;
@@ -1004,6 +1013,8 @@ async fn refresh_native_history(
         descriptor,
         accepted_scopes: allowed,
         source_epochs,
+        expected_checkpoint,
+        checkpoint,
         checkpoint_graphs,
     };
     observe_refreshed_projection(

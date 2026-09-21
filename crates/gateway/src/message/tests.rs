@@ -64474,6 +64474,28 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         .compaction_admit(&workspace, "native-foreground", &operation)
         .await
         .unwrap();
+    store
+        .compaction_prepare_runner(
+            &operation.id,
+            &pioneer_compaction::ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    store
+        .compaction_append_manifest(
+            &operation.id,
+            &[pioneer_crud::compaction::ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "native-foreground".into(),
+                source: assertion.reference(),
+            }],
+        )
+        .await
+        .unwrap();
     let checkpoint = pioneer_compaction::Checkpoint {
         id: "native-foreground-checkpoint".into(),
         operation_id: operation.id,
@@ -64628,7 +64650,6 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         reused_work.edge_loads, 0,
         "the stage consuming PreparedProjection reloaded checkpoint edges"
     );
-    assert!(reused_work.revalidations > 0);
     let closure_builds = preparation_work.closure_builds();
     let body_loads = preparation_work.body_loads();
     let allowed = std::collections::BTreeSet::from(["native-foreground".to_owned()]);

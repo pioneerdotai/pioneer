@@ -119,6 +119,7 @@ async fn fixture() -> Fixture {
         "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('source-operation','source-owner','source-fixture','completed','{}',1)",
         "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('source-checkpoint','source-operation','source-owner',0,'source summary','source-version','{}',0,1,'applied')",
         "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('source-checkpoint','event:source-turn','event-source','event-revision:1')",
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('source-operation',0,0,0,'source-thread','event:source-turn','event-source','event-revision:1')",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -145,6 +146,31 @@ struct CanonicalCase {
     source: SourceCase,
     canonical_table: &'static str,
     revision_table: &'static str,
+}
+
+#[tokio::test]
+async fn checkpoint_edges_require_exact_unambiguous_historical_ownership() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    assert!(
+        fixture
+            .store
+            .compaction_checkpoint_edges("source-checkpoint")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.execute_unprepared("INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('source-operation',1,1,0,'foreign-thread','event:source-turn','event-source','event-revision:1')")
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .compaction_checkpoint_edges("source-checkpoint")
+            .await
+            .is_err(),
+        "equal row counts must not hide ambiguous historical ownership"
+    );
 }
 
 fn source_cases() -> [SourceCase; 6] {
@@ -737,6 +763,33 @@ async fn checkpoint_statuses_and_operation_liveness_are_independent() {
 }
 
 #[tokio::test]
+async fn published_checkpoint_ignores_historical_leaf_revision_presence_and_storage() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    let checkpoint = source_cases()[4].clone();
+    set_manifest(&db, &checkpoint, true).await;
+
+    db.execute_unprepared(
+        "UPDATE compaction_event_revision SET revision=2 WHERE source_id='event-source'",
+    )
+    .await
+    .unwrap();
+    assert_manifest_current(&db, "manifest-operation", true, "historical revision").await;
+
+    db.execute_unprepared(
+        "UPDATE compaction_event_revision SET present=0 WHERE source_id='event-source'",
+    )
+    .await
+    .unwrap();
+    assert_manifest_current(&db, "manifest-operation", true, "historical present flag").await;
+
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='event-source'")
+        .await
+        .unwrap();
+    assert_manifest_current(&db, "manifest-operation", true, "historical physical row").await;
+}
+
+#[tokio::test]
 async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() {
     let fixture = fixture().await;
     let db = fixture.db();
@@ -881,7 +934,7 @@ async fn install_projection(db: &SqliteDatabase, manifest: &str, message_json: &
 }
 
 #[tokio::test]
-async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs() {
+async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     let fixture = fixture().await;
     let db = fixture.db();
     for sql in [
@@ -890,6 +943,7 @@ async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs
         "INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('basis-mid','basis-operation','basis-owner',NULL,0,'mid','mid-version','{}',0,1,'applied')",
         "INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('basis-root','basis-operation','basis-owner','basis-mid',1,'root','basis-version','{}',0,1,'applied')",
         "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('basis-mid','event:foreign-turn','foreign-event','event-revision:1')",
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('basis-operation',0,0,0,'foreign-thread','event:foreign-turn','foreign-event','event-revision:1')",
         "UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"working_context\"},\"source_epochs\":{\"root-thread\":0,\"foreign-thread\":0}}' WHERE id='manifest-operation'",
     ] {
         db.execute_unprepared(sql).await.unwrap();
@@ -1024,13 +1078,72 @@ async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs
     assert_manifest_current(
         &db,
         "manifest-operation",
-        false,
-        "basis source epoch membership",
+        true,
+        "accepted checkpoint is independent of historical source epoch membership",
     )
     .await;
     db.execute_unprepared("UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"working_context\"},\"source_epochs\":{\"root-thread\":0,\"foreign-thread\":0}}' WHERE id='manifest-operation'")
         .await
         .unwrap();
+    let raw_basis = serde_json::json!({
+        "inherited": true,
+        "source_thread": "foreign-thread",
+        "sources": [{"scope":"event:foreign-turn","id":"foreign-event","version":"event-revision:1"}]
+    })
+    .to_string();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=length(CAST(? AS BLOB)) WHERE manifest_id='basis-storage' AND ordinal=0",
+        [raw_basis.clone().into(), raw_basis.into()],
+    ))
+    .await
+    .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "historical coverage may derive a checkpoint grant from the accepted raw leaf",
+    )
+    .await;
+    db.execute_unprepared(
+        "DELETE FROM compaction_manifest WHERE operation_id='basis-operation' AND source_id='foreign-event'",
+    )
+    .await
+    .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "missing historical ownership cannot truncate an unauthorized coverage branch",
+    )
+    .await;
+    db.execute_unprepared("INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('basis-operation',0,0,0,'foreign-thread','event:foreign-turn','foreign-event','event-revision:1')")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET previous='missing-basis-mid' WHERE id='basis-root'",
+    )
+    .await
+    .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "missing historical predecessor cannot truncate an unauthorized coverage branch",
+    )
+    .await;
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET previous='basis-mid' WHERE id='basis-root'",
+    )
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=length(CAST(? AS BLOB)) WHERE manifest_id='basis-storage' AND ordinal=0",
+        [reference.clone().into(), reference.clone().into()],
+    ))
+    .await
+    .unwrap();
     db.execute_unprepared(
         "UPDATE compaction_checkpoint SET previous='basis-root' WHERE id='basis-mid'",
     )
@@ -1040,7 +1153,7 @@ async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs
         &db,
         "manifest-operation",
         true,
-        "deduplicated checkpoint cycle with leaf",
+        "historical checkpoint cycle does not alter the accepted root",
     )
     .await;
     db.execute_unprepared("DELETE FROM compaction_coverage WHERE checkpoint_id='basis-mid'")
@@ -1049,8 +1162,8 @@ async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs
     assert_manifest_current(
         &db,
         "manifest-operation",
-        false,
-        "checkpoint cycle without canonical leaf",
+        true,
+        "accepted root does not require a canonical historical leaf",
     )
     .await;
     db.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('basis-mid','event:foreign-turn','foreign-event','event-revision:1')")
@@ -1064,7 +1177,13 @@ async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs
     )
     .await
     .unwrap();
-    assert_manifest_current(&db, "manifest-operation", false, "stale inherited leaf").await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "historical leaf revision is not root liveness",
+    )
+    .await;
     db.execute_unprepared(
         "UPDATE compaction_event_revision SET revision=1 WHERE source_id='foreign-event'",
     )
@@ -1076,14 +1195,14 @@ async fn inherited_checkpoint_basis_keeps_multilevel_dependencies_in_needed_refs
     assert_manifest_current(
         &db,
         "manifest-operation",
-        false,
-        "missing inherited intermediate",
+        true,
+        "accepted root survives a missing historical intermediate",
     )
     .await;
 }
 
 #[tokio::test]
-async fn basis_only_checkpoint_dependencies_are_required_by_needed_refs() {
+async fn checkpoint_basis_does_not_grant_direct_access_to_historical_raw_leaves() {
     let fixture = fixture().await;
     let db = fixture.db();
     for sql in [
@@ -1119,8 +1238,8 @@ async fn basis_only_checkpoint_dependencies_are_required_by_needed_refs() {
     assert_manifest_current(
         &db,
         "manifest-operation",
-        true,
-        "basis-only dependency graph",
+        false,
+        "summary coverage is not a grant to its raw leaf",
     )
     .await;
     db.execute_unprepared(
@@ -1132,7 +1251,7 @@ async fn basis_only_checkpoint_dependencies_are_required_by_needed_refs() {
         &db,
         "manifest-operation",
         false,
-        "stale basis-only checkpoint",
+        "unpublished ancestor still does not grant raw access",
     )
     .await;
     db.execute_unprepared(
@@ -1143,8 +1262,8 @@ async fn basis_only_checkpoint_dependencies_are_required_by_needed_refs() {
     assert_manifest_current(
         &db,
         "manifest-operation",
-        true,
-        "basis-only checkpoint restored",
+        false,
+        "restored ancestor still does not grant raw access",
     )
     .await;
     db.execute_unprepared(
@@ -1152,7 +1271,13 @@ async fn basis_only_checkpoint_dependencies_are_required_by_needed_refs() {
     )
     .await
     .unwrap();
-    assert_manifest_current(&db, "manifest-operation", false, "stale basis-only leaf").await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "edited historical leaf is still not directly granted",
+    )
+    .await;
     db.execute_unprepared(
         "UPDATE compaction_event_revision SET revision=1 WHERE source_id='foreign-event'",
     )
@@ -1165,7 +1290,126 @@ async fn basis_only_checkpoint_dependencies_are_required_by_needed_refs() {
         &db,
         "manifest-operation",
         false,
-        "missing basis-only checkpoint",
+        "missing historical checkpoint still does not grant raw access",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    for sql in [
+        "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','foreign-thread','atomic-target-owner',1)",
+        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('atomic-target-operation','atomic-target-owner','atomic-target','completed','{}',1)",
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('atomic-target','atomic-target-operation','atomic-target-owner',0,'target','atomic-target-version','{}',0,1,'applied')",
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('atomic-target','checkpoint:source-owner','source-checkpoint','source-version')",
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('atomic-target','event:foreign-turn','foreign-event','event-revision:1')",
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('atomic-target-operation',0,0,0,'source-thread','checkpoint:source-owner','source-checkpoint','source-version')",
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('atomic-target-operation',1,1,0,'foreign-thread','event:foreign-turn','foreign-event','event-revision:1')",
+        "UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"own_contribution\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0,\"foreign-thread\":0}}' WHERE id='manifest-operation'",
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('atomic-import-manifest','ws','root-thread','atomic-import-identity',1,1,1,'atomic-imports',1,1)",
+        "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',0,0,'checkpoint:source-owner','source-checkpoint','source-version','source-thread','{}',2)",
+        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('manifest-operation','atomic-import-manifest','atomic-import-identity','atomic-imports',1)",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    let target = SourceCase {
+        name: "atomic target",
+        thread: "foreign-thread",
+        scope: "checkpoint:atomic-target-owner",
+        id: "atomic-target",
+        version: "atomic-target-version",
+    };
+    set_manifest(&db, &target, false).await;
+    let reference = serde_json::json!({
+        "inherited": false,
+        "source_thread": "foreign-thread",
+        "context_thread": "root-thread",
+        "sources": [{
+            "scope":"checkpoint:atomic-target-owner",
+            "id":"atomic-target",
+            "version":"atomic-target-version"
+        }]
+    })
+    .to_string();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('atomic-import-manifest',0,?,length(CAST(? AS BLOB)))",
+        [reference.clone().into(), reference.into()],
+    ))
+    .await
+    .unwrap();
+
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "accepted S cannot cover the additional unaccepted X input of T",
+    )
+    .await;
+    db.execute_unprepared("INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',1,0,'event:foreign-turn','foreign-event','event-revision:1','foreign-thread','{}',2); UPDATE compaction_frozen_history SET import_count=2,next_import=2 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=2 WHERE operation_id='manifest-operation'")
+        .await
+        .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "accepted S plus accepted X authorizes T without expanding S",
+    )
+    .await;
+
+    let raw = SourceCase {
+        name: "raw source behind S",
+        thread: "source-thread",
+        scope: "event:source-turn",
+        id: "event-source",
+        version: "event-revision:1",
+    };
+    let raw_ref = SourceRef {
+        scope: raw.scope.into(),
+        id: raw.id.into(),
+        version: raw.version.into(),
+    };
+    assert!(
+        fixture
+            .store
+            .compaction_sources_current("ws", "source-thread", std::slice::from_ref(&raw_ref))
+            .await
+            .unwrap(),
+        "the raw authority check requires an existing exact-current A"
+    );
+    set_manifest(&db, &raw, false).await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "an atomic grant on S does not grant direct access to current raw A",
+    )
+    .await;
+    db.execute_unprepared("INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',2,0,'event:source-turn','event-source','event-revision:1','source-thread','{}',2); UPDATE compaction_frozen_history SET import_count=3,next_import=3 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=3 WHERE operation_id='manifest-operation'")
+        .await
+        .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "a separate exact direct grant authorizes current raw A",
+    )
+    .await;
+
+    db.execute_unprepared("DELETE FROM compaction_frozen_import_data WHERE manifest_id='atomic-import-manifest' AND ordinal=2; UPDATE compaction_frozen_history SET import_count=2,next_import=2 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=2 WHERE operation_id='manifest-operation'")
+        .await
+        .unwrap();
+    set_manifest(&db, &target, false).await;
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='event-source'")
+        .await
+        .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "deleting the historical raw leaf behind accepted S does not invalidate restored T",
     )
     .await;
 }
@@ -1221,7 +1465,7 @@ async fn manifest_lookup_checks_physically_compressed_canonical_rows() {
 }
 
 #[tokio::test]
-async fn manifest_checkpoint_dag_preserves_the_65536_65537_boundary() {
+async fn reference_only_checkpoint_validation_does_not_walk_historical_ancestry() {
     let fixture = fixture().await;
     let db = fixture.db();
     db.execute_unprepared("INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','source-thread','limit-owner',1)")
@@ -1251,9 +1495,9 @@ FROM n"#,
         .await
         .unwrap();
 
-    for (root, expected, case) in [
-        (65534_i64, true, "65536 graph rows"),
-        (65535_i64, false, "65537 graph rows"),
+    for (root, case) in [
+        (65534_i64, "65536 historical graph rows"),
+        (65535_i64, "65537 historical graph rows"),
     ] {
         db.execute_unprepared(
             "DELETE FROM compaction_manifest WHERE operation_id='manifest-operation'",
@@ -1270,7 +1514,7 @@ FROM n"#,
         ))
         .await
         .unwrap();
-        assert_manifest_current(&db, "manifest-operation", expected, case).await;
+        assert_manifest_current(&db, "manifest-operation", true, case).await;
     }
 }
 
@@ -1333,10 +1577,61 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
         "65537 accepted basis rows",
     )
     .await;
+
+    db.execute_unprepared(
+        "DELETE FROM compaction_frozen_message_data WHERE manifest_id='accepted-basis-boundary' AND ordinal=65536; \
+         UPDATE compaction_frozen_history SET message_count=65536,next_ordinal=65536 WHERE id='accepted-basis-boundary'; \
+         UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"working_context\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0}}' WHERE id='manifest-operation'; \
+         DELETE FROM compaction_manifest WHERE operation_id='manifest-operation'; \
+         INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,0,'source-thread','checkpoint:source-owner','source-checkpoint','source-version')",
+    )
+    .await
+    .unwrap();
+    let checkpoint_reference = serde_json::json!({
+        "inherited": true,
+        "source_thread": "source-thread",
+        "sources": [{
+            "scope":"checkpoint:source-owner",
+            "id":"source-checkpoint",
+            "version":"source-version"
+        }]
+    })
+    .to_string();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=length(CAST(?1 AS BLOB)) WHERE manifest_id='accepted-basis-boundary'",
+        [checkpoint_reference.clone().into()],
+    ))
+    .await
+    .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        true,
+        "65536 accepted checkpoint basis rows",
+    )
+    .await;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('accepted-basis-boundary',65536,?1,length(CAST(?1 AS BLOB)))",
+        [checkpoint_reference.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("UPDATE compaction_frozen_history SET message_count=65537,next_ordinal=65537 WHERE id='accepted-basis-boundary'")
+        .await
+        .unwrap();
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "65537 accepted checkpoint basis rows",
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn basis_coverage_preserves_the_65536_65537_boundary() {
+async fn historical_basis_coverage_does_not_grant_its_raw_leaf() {
     let fixture = fixture().await;
     let db = fixture.db();
     for sql in [
@@ -1388,7 +1683,13 @@ FROM n"#,
     };
     let within = reference(65534);
     install_projection(&db, "basis-coverage-boundary", &within).await;
-    assert_manifest_current(&db, "manifest-operation", true, "65536 basis coverage rows").await;
+    assert_manifest_current(
+        &db,
+        "manifest-operation",
+        false,
+        "65536 historical basis rows are not a raw grant",
+    )
+    .await;
 
     let over = reference(65535);
     db.execute_raw(Statement::from_sql_and_values(
@@ -1402,7 +1703,7 @@ FROM n"#,
         &db,
         "manifest-operation",
         false,
-        "65537 basis coverage rows",
+        "65537 historical basis rows are not a raw grant",
     )
     .await;
 }
@@ -1499,48 +1800,151 @@ fn assert_exact_branch_search(branch: &[&PlanNode], subjects: &[&str], column: &
     );
 }
 
-fn assert_frozen_view_plan(plan: &[PlanNode], view: &str) {
-    let branch = unique_subtree(plan, &format!("CO-ROUTINE {view}"));
-    assert_exact_branch_search(&branch, &["d"], "manifest_id", &format!("{view} data"));
-    assert_exact_branch_search(&branch, &["l"], "manifest_id", &format!("{view} layout"));
-    assert_exact_branch_search(&branch, &["s"], "manifest_id", &format!("{view} span"));
+fn frozen_view_branch<'a>(plan: &'a [PlanNode], view: &str) -> Vec<&'a PlanNode> {
+    let producer_details = [format!("CO-ROUTINE {view}"), format!("MATERIALIZE {view}")];
+    let producers = plan
+        .iter()
+        .filter(|node| producer_details.contains(&node.detail))
+        .collect::<Vec<_>>();
     assert!(
-        branch.iter().any(|node| {
+        producers.len() <= 1,
+        "expected at most one producer for {view:?}: {plan:#?}"
+    );
+    if let Some(root) = producers.first() {
+        return subtree(plan, root.id);
+    }
+
+    // SQLite may inline a view into its sole consumer. These consumers are
+    // disjoint in the production query, so their subtrees retain ownership of
+    // otherwise repeated d/l/s aliases.
+    let consumer = match view {
+        "compaction_frozen_import" => "accepted_imports",
+        "compaction_frozen_message" => "accepted_basis",
+        _ => panic!("unknown frozen view {view:?}"),
+    };
+    let consumer_details = [
+        format!("CO-ROUTINE {consumer}"),
+        format!("MATERIALIZE {consumer}"),
+    ];
+    let consumers = plan
+        .iter()
+        .filter(|node| consumer_details.contains(&node.detail))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        consumers.len(),
+        1,
+        "inlined {view:?} must have one identifiable {consumer:?} consumer: {plan:#?}"
+    );
+    subtree(plan, consumers[0].id)
+}
+
+fn unique_detail_subtree<'a>(
+    branch: &[&'a PlanNode],
+    detail: &str,
+    view: &str,
+) -> Vec<&'a PlanNode> {
+    let roots = branch
+        .iter()
+        .copied()
+        .filter(|node| node.detail == detail)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots.len(),
+        1,
+        "expected one {detail:?} branch for {view:?}: {branch:#?}"
+    );
+    let mut ids = vec![roots[0].id];
+    let mut result = vec![roots[0]];
+    let mut cursor = 0;
+    while cursor < ids.len() {
+        let parent = ids[cursor];
+        for node in branch.iter().copied() {
+            if node.parent == parent && !ids.contains(&node.id) {
+                ids.push(node.id);
+                result.push(node);
+            }
+        }
+        cursor += 1;
+    }
+    result
+}
+
+fn assert_frozen_view_plan(plan: &[PlanNode], view: &str) {
+    let view_branch = frozen_view_branch(plan, view);
+    let ordinary = unique_detail_subtree(&view_branch, "LEFT-MOST SUBQUERY", view);
+    let shared = unique_detail_subtree(&view_branch, "UNION ALL", view);
+    assert_exact_branch_search(
+        &ordinary,
+        &["d"],
+        "manifest_id",
+        &format!("ordinary {view} data"),
+    );
+    assert_exact_branch_search(
+        &ordinary,
+        &["l"],
+        "manifest_id",
+        &format!("ordinary {view} layout"),
+    );
+    assert!(
+        ordinary.iter().any(|node| {
             plan_subject(&node.detail, "SEARCH", "d")
                 && has_constraint(&node.detail, "manifest_id", "=")
                 && !has_constraint(&node.detail, "ordinal", ">")
                 && !has_constraint(&node.detail, "ordinal", "<")
         }),
-        "ordinary {view} data lookup must constrain manifest_id: {branch:#?}"
+        "ordinary {view} data lookup must not require an ordinal range: {ordinary:#?}"
     );
-    let layout_lookups = branch
-        .iter()
-        .filter(|node| {
+    assert!(
+        ordinary.iter().any(|node| {
             plan_subject(&node.detail, "SEARCH", "l")
                 && has_constraint(&node.detail, "manifest_id", "=")
                 && has_constraint(&node.detail, "kind", "=")
-        })
-        .count();
-    assert!(
-        layout_lookups >= 2,
-        "ordinary and shared {view} layout branches must both be manifest-scoped: {branch:#?}"
+        }),
+        "ordinary {view} layout must constrain manifest_id and kind: {ordinary:#?}"
+    );
+
+    assert_exact_branch_search(
+        &shared,
+        &["d"],
+        "manifest_id",
+        &format!("shared {view} data"),
+    );
+    assert_exact_branch_search(
+        &shared,
+        &["l"],
+        "manifest_id",
+        &format!("shared {view} layout"),
+    );
+    assert_exact_branch_search(
+        &shared,
+        &["s"],
+        "manifest_id",
+        &format!("shared {view} span"),
     );
     assert!(
-        branch.iter().any(|node| {
+        shared.iter().any(|node| {
+            plan_subject(&node.detail, "SEARCH", "l")
+                && has_constraint(&node.detail, "manifest_id", "=")
+                && has_constraint(&node.detail, "kind", "=")
+        }),
+        "shared {view} layout must constrain manifest_id and kind: {shared:#?}"
+    );
+    assert!(
+        shared.iter().any(|node| {
             plan_subject(&node.detail, "SEARCH", "s")
                 && has_constraint(&node.detail, "manifest_id", "=")
                 && has_constraint(&node.detail, "kind", "=")
         }),
-        "shared {view} span must constrain manifest_id and kind: {branch:#?}"
+        "shared {view} span must constrain manifest_id and kind: {shared:#?}"
     );
     assert!(
-        branch.iter().any(|node| {
+        shared.iter().any(|node| {
             plan_subject(&node.detail, "SEARCH", "d")
                 && has_constraint(&node.detail, "manifest_id", "=")
                 && has_constraint(&node.detail, "ordinal", ">")
                 && has_constraint(&node.detail, "ordinal", "<")
         }),
-        "shared-range {view} data lookup must constrain manifest and ordinal range: {branch:#?}"
+        "shared-range {view} data lookup must constrain manifest and ordinal range: {shared:#?}"
     );
 }
 
@@ -1599,6 +2003,108 @@ fn plan_recognizer_distinguishes_aliases_columns_scans_and_subtrees() {
         plan_subject(&node.detail, "SEARCH", "context_revision")
             && has_constraint(&node.detail, "source_id", "=")
     }));
+}
+
+fn synthetic_frozen_view_plan(
+    view: &str,
+    root: i64,
+    shared_has_ordinal_range: bool,
+) -> Vec<PlanNode> {
+    let shared_data = if shared_has_ordinal_range {
+        "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>? AND ordinal<?)"
+    } else {
+        "SEARCH d USING INDEX frozen_data (manifest_id=?)"
+    };
+    vec![
+        PlanNode {
+            id: root,
+            parent: 0,
+            detail: format!("MATERIALIZE {view}"),
+        },
+        PlanNode {
+            id: root + 1,
+            parent: root,
+            detail: "COMPOUND QUERY".into(),
+        },
+        PlanNode {
+            id: root + 2,
+            parent: root + 1,
+            detail: "LEFT-MOST SUBQUERY".into(),
+        },
+        PlanNode {
+            id: root + 3,
+            parent: root + 2,
+            detail: "SEARCH d USING INDEX frozen_data (manifest_id=?)".into(),
+        },
+        PlanNode {
+            id: root + 4,
+            parent: root + 2,
+            detail: "SEARCH l USING INDEX frozen_layout (manifest_id=? AND kind=?)".into(),
+        },
+        PlanNode {
+            id: root + 5,
+            parent: root + 1,
+            detail: "UNION ALL".into(),
+        },
+        PlanNode {
+            id: root + 6,
+            parent: root + 5,
+            detail: "SEARCH s USING INDEX frozen_span (manifest_id=? AND kind=?)".into(),
+        },
+        PlanNode {
+            id: root + 7,
+            parent: root + 5,
+            detail: shared_data.into(),
+        },
+        PlanNode {
+            id: root + 8,
+            parent: root + 5,
+            detail: "SEARCH l USING INDEX frozen_layout (manifest_id=? AND kind=?)".into(),
+        },
+    ]
+}
+
+#[test]
+fn frozen_plan_recognizer_never_borrows_evidence_from_another_view_or_branch() {
+    let inlined_import = synthetic_frozen_view_plan("accepted_imports", 10, true);
+    assert_frozen_view_plan(&inlined_import, "compaction_frozen_import");
+    let inlined_message = synthetic_frozen_view_plan("accepted_basis", 20, true);
+    assert_frozen_view_plan(&inlined_message, "compaction_frozen_message");
+
+    let import_only = synthetic_frozen_view_plan("compaction_frozen_import", 100, true);
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_frozen_view_plan(&import_only, "compaction_frozen_message")
+        })
+        .is_err(),
+        "a neighboring frozen view cannot satisfy a missing view"
+    );
+
+    let mut one_broken_shared = import_only.clone();
+    one_broken_shared.extend(synthetic_frozen_view_plan(
+        "compaction_frozen_message",
+        200,
+        false,
+    ));
+    assert_frozen_view_plan(&one_broken_shared, "compaction_frozen_import");
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_frozen_view_plan(&one_broken_shared, "compaction_frozen_message")
+        })
+        .is_err(),
+        "another view's ordinal range cannot repair the checked shared branch"
+    );
+
+    let mut missing_shared = synthetic_frozen_view_plan("accepted_basis", 300, true);
+    missing_shared.retain(|node| node.id < 305);
+    missing_shared.extend(import_only);
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_frozen_view_plan(&missing_shared, "compaction_frozen_message")
+        })
+        .is_err(),
+        "unrelated plan nodes cannot replace a missing checked branch"
+    );
 }
 
 async fn seed_plan_noise(db: &SqliteDatabase) {
@@ -1715,7 +2221,21 @@ async fn production_plan(compressed: bool) -> Vec<PlanNode> {
 }
 
 fn assert_production_plan(plan: &[PlanNode], compressed: bool) {
-    let current = unique_subtree(plan, "MATERIALIZE current_sources");
+    let current_roots = plan
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.detail.as_str(),
+                "MATERIALIZE current_sources" | "CO-ROUTINE current_sources"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        current_roots.len(),
+        1,
+        "expected one current_sources producer: {plan:#?}"
+    );
+    let current = subtree(plan, current_roots[0].id);
     for (revision, canonical, key) in [
         ("context_revision", "context_source", "source_id"),
         ("item_revision", "item_source", "source_id"),
@@ -2564,7 +3084,7 @@ async fn projection_and_frozen_storage_races_retry_then_revalidate() {
 }
 
 #[tokio::test]
-async fn checkpoint_dag_status_delete_and_dependency_operation_races_are_fenced() {
+async fn historical_checkpoint_mutations_retry_fence_without_staling_published_root() {
     use crate::repositories::compaction::CommitOutcome;
 
     for (operation, retained, mutation) in [
@@ -2608,8 +3128,8 @@ async fn checkpoint_dag_status_delete_and_dependency_operation_races_are_fenced(
                 .compaction_apply_runner(operation, &state, None)
                 .await
                 .unwrap(),
-            CommitOutcome::Stale,
-            "{operation} reused a proof after its checkpoint DAG changed"
+            CommitOutcome::Applied,
+            "{operation} treated historical checkpoint metadata as root liveness"
         );
     }
 }
@@ -3514,7 +4034,7 @@ async fn publication_migration_failure_rolls_back_schema_triggers_and_marker() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let connection = Database::connect("sqlite::memory:").await.unwrap();
     let migration = "m20260919_000002_compaction_publication_fence";
-    Migrator::up(&connection, Some((Migrator::migrations().len() - 1) as u32))
+    Migrator::up(&connection, Some((Migrator::migrations().len() - 2) as u32))
         .await
         .unwrap();
     connection

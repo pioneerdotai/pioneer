@@ -1,5 +1,6 @@
-//! Validate the entire retained checkpoint DAG, including accepted foreign work.
-//! A local context epoch alone cannot detect edits in another source thread.
+//! Read bounded historical checkpoint coverage. Published roots are validated
+//! as objects; their saved leaves describe boundaries and are never revalidated
+//! against today's canonical rows.
 use super::*;
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_crud::compaction::{CheckpointBody, CheckpointEdges, CheckpointMetadata};
@@ -10,6 +11,7 @@ use std::{
 
 const DEFAULT_GRAPH_CACHE_UNITS: usize = 4 * 1024;
 const DEFAULT_PAYLOAD_CACHE_BYTES: usize = 256 * 1024;
+const MAX_HISTORICAL_GRAPH_NODES: usize = 65_536;
 
 #[cfg(test)]
 static NEXT_RESOLVER_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -20,7 +22,6 @@ struct PreparationWork {
     edge_loads: std::sync::atomic::AtomicUsize,
     body_loads: std::sync::atomic::AtomicUsize,
     closure_builds: std::sync::atomic::AtomicUsize,
-    revalidations: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -128,12 +129,6 @@ impl PreparationWorkObserver {
             .closure_builds
             .load(std::sync::atomic::Ordering::SeqCst)
     }
-
-    pub(crate) fn revalidations(&self) -> usize {
-        self.work
-            .revalidations
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
 }
 
 #[cfg(test)]
@@ -142,7 +137,6 @@ pub(crate) struct PreparationWorkSnapshot {
     pub(crate) edge_loads: usize,
     pub(crate) body_loads: usize,
     pub(crate) closure_builds: usize,
-    pub(crate) revalidations: usize,
 }
 
 #[cfg(test)]
@@ -164,7 +158,6 @@ pub(crate) fn preparation_work_snapshot(
             closure_builds: work
                 .closure_builds
                 .load(std::sync::atomic::Ordering::SeqCst),
-            revalidations: work.revalidations.load(std::sync::atomic::Ordering::SeqCst),
         })
 }
 
@@ -196,24 +189,19 @@ pub(crate) fn observe_preparation_work(
     PreparationWorkObserver { key, work }
 }
 
-#[derive(Clone)]
-struct ResolvedGraphSource {
-    source: SourceRef,
-    thread: String,
-    strict_current: bool,
-}
-
 pub(crate) struct ResolvedCheckpointGraph {
     pub(crate) leaves: BTreeSet<ScopedHistorySource>,
-    pub(crate) scopes: BTreeSet<String>,
+    /// Saved transport aliases for covered tool results. They participate in
+    /// projection/filtering only, never in coverage or access grants.
+    pub(crate) replay_aliases: BTreeMap<ScopedHistorySource, ScopedHistorySource>,
+    pub(crate) replay_item_aliases: BTreeSet<(String, String, String)>,
     /// Exact checkpoint identities in this closure. Summary and operation
     /// payloads are deliberately not loaded during discovery.
     pub(crate) checkpoints: BTreeSet<SourceRef>,
-    sources: Vec<ResolvedGraphSource>,
 }
 
 pub(crate) struct PreparedCheckpointMetadata {
-    pub(crate) emergency_inputs: BTreeSet<SourceRef>,
+    pub(crate) emergency_inputs: BTreeSet<ScopedHistorySource>,
     pub(crate) coverage_domain: pioneer_compaction::CoverageDomain,
 }
 
@@ -229,9 +217,8 @@ struct CachedBody {
 
 /// Metadata reuse belongs to one context preparation. Root closures are LRU
 /// bounded by their aggregate retained entries, while selected summary bodies
-/// are independently byte-bounded. Eviction only loses optimization state.
-/// Every reuse separately revalidates exact source identities and allowed
-/// threads, so cached metadata is never an authorization or publication grant.
+/// are independently byte-bounded. A cached closure is historical boundary
+/// metadata; every reuse still rechecks the published root and accepted scope.
 pub(crate) struct CheckpointGraphResolver {
     #[cfg(test)]
     test_identity: usize,
@@ -271,6 +258,7 @@ impl Default for CheckpointGraphResolver {
 }
 
 impl CheckpointGraphResolver {
+    #[cfg(test)]
     pub(crate) fn merge(&mut self, other: Self) {
         self.edges.extend(other.edges);
         self.edges_by_id.extend(other.edges_by_id);
@@ -286,10 +274,10 @@ impl CheckpointGraphResolver {
 
     fn graph_units(graph: &ResolvedCheckpointGraph) -> usize {
         graph
-            .sources
+            .leaves
             .len()
-            .saturating_add(graph.leaves.len())
-            .saturating_add(graph.scopes.len())
+            .saturating_add(graph.replay_aliases.len())
+            .saturating_add(graph.replay_item_aliases.len())
             .saturating_add(graph.checkpoints.len())
     }
 
@@ -382,10 +370,15 @@ impl CheckpointGraphResolver {
         missing: &'static str,
     ) -> Result<CheckpointEdges> {
         self.observe_edge_load(store, workspace);
-        store
+        let edges = store
             .compaction_checkpoint_edges(id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!(missing))
+            .ok_or_else(|| anyhow::anyhow!(missing))?;
+        ensure!(
+            edges.workspace_id == workspace,
+            "checkpoint metadata belongs to another workspace"
+        );
+        Ok(edges)
     }
 
     async fn edges_for_source(
@@ -461,14 +454,17 @@ impl CheckpointGraphResolver {
     ) -> Result<Option<Arc<ResolvedCheckpointGraph>>> {
         self.observe_closure_build(store, workspace);
         let mut leaves = BTreeSet::new();
-        let mut scopes = BTreeSet::new();
+        let mut replay_aliases = BTreeMap::new();
+        let mut replay_item_aliases = BTreeSet::new();
         let mut checkpoints = BTreeSet::new();
-        let mut threads = BTreeMap::<SourceRef, String>::new();
-        let mut strict = BTreeSet::new();
         let mut done = BTreeSet::new();
         let mut visiting = BTreeSet::new();
-        let mut pending = vec![(root.clone(), false, None)];
-        while let Some((source, exiting, known_thread)) = pending.pop() {
+        let Some(root_thread) = store.compaction_reference_thread(workspace, root).await? else {
+            return Ok(None);
+        };
+        let mut pending = vec![(root.clone(), root_thread, false)];
+        let mut visited = 0usize;
+        while let Some((source, thread, exiting)) = pending.pop() {
             if exiting {
                 visiting.remove(&source);
                 done.insert(source);
@@ -477,25 +473,19 @@ impl CheckpointGraphResolver {
             if done.contains(&source) {
                 continue;
             }
-            let thread = if let Some(thread) = known_thread {
-                thread
-            } else {
-                let Some(thread) = store
-                    .compaction_reference_thread(workspace, &source)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                thread
-            };
+            visited = visited
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint graph size overflow"))?;
             ensure!(
-                allowed.is_none_or(|allowed| allowed.contains(&thread)),
-                "checkpoint coverage crosses the accepted source scope"
+                visited <= MAX_HISTORICAL_GRAPH_NODES,
+                "checkpoint historical coverage exceeds supported quantum"
             );
-            if let Some(previous) = threads.insert(source.clone(), thread.clone()) {
-                ensure!(previous == thread, "checkpoint source changed thread");
+            if source == *root {
+                ensure!(
+                    allowed.is_none_or(|allowed| allowed.contains(&thread)),
+                    "checkpoint root is outside the accepted source scope"
+                );
             }
-            scopes.insert(thread.clone());
             if !source.scope.starts_with("checkpoint:") {
                 leaves.insert(ScopedHistorySource {
                     thread,
@@ -509,83 +499,65 @@ impl CheckpointGraphResolver {
                 "cyclic checkpoint coverage"
             );
             let edges = self.edges_for_source(store, workspace, &source).await?;
+            ensure!(
+                edges.workspace_id == workspace && edges.thread_id == thread,
+                "checkpoint historical ownership changed"
+            );
             checkpoints.insert(source.clone());
-            pending.push((source, true, None));
+            for alias in edges.replay_aliases.iter().cloned() {
+                if let (Some(turn), Some(item)) = (
+                    alias.covered.source.scope.strip_prefix("item:"),
+                    alias.tool_item_id.clone(),
+                ) {
+                    replay_item_aliases.insert((
+                        alias.covered.source_thread.clone(),
+                        turn.to_owned(),
+                        item,
+                    ));
+                }
+                let replay = ScopedHistorySource {
+                    thread: alias.replay.source_thread,
+                    source: alias.replay.source,
+                };
+                let covered = ScopedHistorySource {
+                    thread: alias.covered.source_thread,
+                    source: alias.covered.source,
+                };
+                if let Some(previous) = replay_aliases.insert(replay, covered.clone()) {
+                    ensure!(previous == covered, "checkpoint replay alias is ambiguous");
+                }
+            }
+            pending.push((source, thread.clone(), true));
             if let Some(previous_id) = &edges.previous {
                 let previous_edges = self.edges_for_id(store, workspace, previous_id).await?;
                 ensure!(
                     previous_edges.owner == edges.owner
+                        && previous_edges.workspace_id == edges.workspace_id
+                        && previous_edges.thread_id == edges.thread_id
                         && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
-                    "previous checkpoint changed owner or format"
+                    "previous checkpoint changed historical ownership or format"
                 );
                 let previous = SourceRef {
                     scope: format!("checkpoint:{}", previous_edges.owner),
                     id: previous_id.clone(),
                     version: previous_edges.identity_sha256,
                 };
-                let previous_thread = store
-                    .compaction_reference_thread(workspace, &previous)
-                    .await?;
-                ensure!(
-                    previous_thread.as_deref() == Some(thread.as_str()),
-                    "previous checkpoint changed scope or publication status"
-                );
-                strict.insert(previous.clone());
-                pending.push((previous, false, previous_thread));
+                pending.push((previous, previous_edges.thread_id, false));
             }
             pending.extend(
                 edges
                     .coverage
                     .into_iter()
-                    .map(|source| (source, false, None)),
+                    .map(|covered| (covered.source, covered.source_thread, false)),
             );
         }
-        ensure!(
-            !leaves.is_empty(),
-            "checkpoint has no exact canonical coverage"
-        );
-        let sources = threads
-            .into_iter()
-            .map(|(source, thread)| ResolvedGraphSource {
-                strict_current: strict.contains(&source),
-                source,
-                thread,
-            })
-            .collect();
+        ensure!(!leaves.is_empty(), "checkpoint has no historical coverage");
         Ok(Some(Arc::new(ResolvedCheckpointGraph {
             leaves,
-            scopes,
+            replay_aliases,
+            replay_item_aliases,
             checkpoints,
-            sources,
         })))
-    }
-
-    async fn revalidate(
-        &self,
-        store: &CrudStore,
-        workspace: &str,
-        allowed: Option<&BTreeSet<String>>,
-        graph: &ResolvedCheckpointGraph,
-    ) -> Result<bool> {
-        self.observe_revalidation(store, workspace);
-        for resolved in &graph.sources {
-            let current = store
-                .compaction_reference_thread(workspace, &resolved.source)
-                .await?;
-            if resolved.strict_current {
-                ensure!(
-                    current.as_deref() == Some(resolved.thread.as_str()),
-                    "previous checkpoint changed scope or publication status"
-                );
-            } else if current.as_deref() != Some(resolved.thread.as_str()) {
-                return Ok(false);
-            }
-            ensure!(
-                allowed.is_none_or(|allowed| allowed.contains(&resolved.thread)),
-                "checkpoint coverage crosses the accepted source scope"
-            );
-        }
-        Ok(true)
     }
 
     pub(crate) async fn resolve(
@@ -597,17 +569,112 @@ impl CheckpointGraphResolver {
     ) -> Result<Option<Arc<ResolvedCheckpointGraph>>> {
         let key = (workspace.to_owned(), root.clone());
         if let Some(graph) = self.graphs.get(&key).map(|cached| cached.graph.clone()) {
+            let Some(thread) = store.compaction_reference_thread(workspace, root).await? else {
+                return Ok(None);
+            };
+            ensure!(
+                allowed.is_none_or(|allowed| allowed.contains(&thread)),
+                "checkpoint root is outside the accepted source scope"
+            );
             self.touch_graph(&key);
-            return Ok(self
-                .revalidate(store, workspace, allowed, &graph)
-                .await?
-                .then_some(graph));
+            return Ok(Some(graph));
         }
         let graph = self.discover(store, workspace, allowed, root).await?;
         if let Some(graph) = &graph {
             self.insert_graph(key, graph.clone());
         }
         Ok(graph)
+    }
+
+    /// Verify a checkpoint input against an exact immutable grant frontier.
+    /// A granted checkpoint is atomic: traversal stops at that node, so the
+    /// grant neither depends on nor exposes its historical raw descendants.
+    pub(crate) async fn authorized_by_historical_inputs(
+        &mut self,
+        store: &CrudStore,
+        workspace: &str,
+        root: &SourceRef,
+        grants: &BTreeSet<ScopedHistorySource>,
+    ) -> Result<bool> {
+        let Some(root_thread) = store.compaction_reference_thread(workspace, root).await? else {
+            return Ok(false);
+        };
+        let mut pending = vec![(root.clone(), root_thread, false)];
+        let mut done = BTreeSet::new();
+        let mut visiting = BTreeSet::new();
+        let mut used = BTreeSet::new();
+        let mut visited = 0usize;
+        while let Some((source, thread, exiting)) = pending.pop() {
+            let key = ScopedHistorySource {
+                thread: thread.clone(),
+                source: source.clone(),
+            };
+            if exiting {
+                visiting.remove(&key);
+                done.insert(key);
+                continue;
+            }
+            if done.contains(&key) {
+                continue;
+            }
+            visited = visited
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint graph size overflow"))?;
+            ensure!(
+                visited <= MAX_HISTORICAL_GRAPH_NODES,
+                "checkpoint historical coverage exceeds supported quantum"
+            );
+            if grants.contains(&key) {
+                if source.scope.starts_with("checkpoint:")
+                    && store
+                        .compaction_reference_thread(workspace, &source)
+                        .await?
+                        .as_deref()
+                        != Some(&thread)
+                {
+                    return Ok(false);
+                }
+                used.insert(key.clone());
+                done.insert(key);
+                continue;
+            }
+            if !source.scope.starts_with("checkpoint:") {
+                return Ok(false);
+            }
+            ensure!(visiting.insert(key.clone()), "cyclic checkpoint coverage");
+            let edges = self.edges_for_source(store, workspace, &source).await?;
+            ensure!(
+                edges.workspace_id == workspace && edges.thread_id == thread,
+                "checkpoint historical ownership changed"
+            );
+            pending.push((source, thread.clone(), true));
+            if let Some(previous_id) = &edges.previous {
+                let previous_edges = self.edges_for_id(store, workspace, previous_id).await?;
+                ensure!(
+                    previous_edges.owner == edges.owner
+                        && previous_edges.workspace_id == edges.workspace_id
+                        && previous_edges.thread_id == edges.thread_id
+                        && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
+                    "previous checkpoint changed historical ownership or format"
+                );
+                pending.push((
+                    SourceRef {
+                        scope: format!("checkpoint:{}", previous_edges.owner),
+                        id: previous_id.clone(),
+                        version: previous_edges.identity_sha256,
+                    },
+                    previous_edges.thread_id,
+                    false,
+                ));
+            }
+            pending.extend(
+                edges
+                    .coverage
+                    .into_iter()
+                    .map(|covered| (covered.source, covered.source_thread, false)),
+            );
+        }
+        Ok(used == *grants)
     }
 
     async fn metadata_for_source(
@@ -745,7 +812,11 @@ impl CheckpointGraphResolver {
                     edges
                         .coverage
                         .into_iter()
-                        .filter(|covered| covered.scope.starts_with("input:")),
+                        .filter(|covered| covered.source.scope.starts_with("input:"))
+                        .map(|covered| ScopedHistorySource {
+                            thread: covered.source_thread,
+                            source: covered.source,
+                        }),
                 );
             }
         }
@@ -824,9 +895,6 @@ impl CheckpointGraphResolver {
     #[cfg(not(test))]
     fn observe_closure_build(&self, _store: &CrudStore, _workspace: &str) {}
 
-    #[cfg(not(test))]
-    fn observe_revalidation(&self, _store: &CrudStore, _workspace: &str) {}
-
     #[cfg(test)]
     fn observe_edge_load(&self, store: &CrudStore, workspace: &str) {
         self.observe(store, workspace, |work| &work.edge_loads);
@@ -841,11 +909,6 @@ impl CheckpointGraphResolver {
     fn observe_closure_build(&self, store: &CrudStore, workspace: &str) {
         self.observe(store, workspace, |work| &work.closure_builds);
     }
-
-    #[cfg(test)]
-    fn observe_revalidation(&self, store: &CrudStore, workspace: &str) {
-        self.observe(store, workspace, |work| &work.revalidations);
-    }
 }
 
 #[cfg(test)]
@@ -858,6 +921,67 @@ pub(crate) async fn checkpoint_leaves(
     CheckpointGraphResolver::default()
         .resolve(store, workspace, Some(allowed), root)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("checkpoint coverage source changed or disappeared"))
+        .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))
         .map(|graph| graph.leaves.clone())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn source(id: &str) -> SourceRef {
+        SourceRef {
+            scope: "checkpoint:owner".into(),
+            id: id.into(),
+            version: format!("identity-{id}"),
+        }
+    }
+
+    fn graph(id: &str, item_aliases: usize) -> Arc<ResolvedCheckpointGraph> {
+        Arc::new(ResolvedCheckpointGraph {
+            leaves: BTreeSet::from([ScopedHistorySource {
+                thread: "thread".into(),
+                source: SourceRef {
+                    scope: "event:turn".into(),
+                    id: format!("leaf-{id}"),
+                    version: "event-revision:1".into(),
+                },
+            }]),
+            replay_aliases: BTreeMap::new(),
+            replay_item_aliases: (0..item_aliases)
+                .map(|index| ("thread".into(), "turn".into(), format!("item-{id}-{index}")))
+                .collect(),
+            checkpoints: BTreeSet::from([source(id)]),
+        })
+    }
+
+    #[test]
+    fn item_alias_units_reject_oversize_closures_and_drive_lru_eviction() {
+        let mut resolver = CheckpointGraphResolver::with_cache_limits(4, 1);
+        let first_key = ("ws".into(), source("first"));
+        let first = graph("first", 0);
+        resolver.insert_graph(first_key.clone(), first.clone());
+        assert_eq!(resolver.graph_units, 2);
+        assert!(resolver.graphs.contains_key(&first_key));
+
+        let second_key = ("ws".into(), source("second"));
+        let second = graph("second", 2);
+        resolver.insert_graph(second_key.clone(), second);
+        assert_eq!(resolver.graph_units, 4);
+        assert!(!resolver.graphs.contains_key(&first_key));
+        assert!(resolver.graphs.contains_key(&second_key));
+        assert_eq!(
+            first.leaves.len(),
+            1,
+            "eviction must not invalidate caller Arc"
+        );
+
+        let oversize_key = ("ws".into(), source("oversize"));
+        let oversize = graph("oversize", 3);
+        assert_eq!(CheckpointGraphResolver::graph_units(&oversize), 5);
+        resolver.insert_graph(oversize_key.clone(), oversize.clone());
+        assert!(!resolver.graphs.contains_key(&oversize_key));
+        assert!(resolver.graphs.contains_key(&second_key));
+        assert_eq!(oversize.replay_item_aliases.len(), 3);
+    }
 }

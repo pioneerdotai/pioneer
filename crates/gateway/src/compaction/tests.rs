@@ -2075,7 +2075,7 @@ async fn interrupted_execution_turn_fences_summary_commit_before_service_cancell
 }
 
 #[tokio::test]
-async fn stale_head_is_cas_guard_but_not_summary_basis_during_rebuild() {
+async fn expected_head_does_not_force_a_projection_basis_after_historical_edit() {
     let f = fixture("old source", vec![], true, false).await;
     let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()
     else {
@@ -2086,7 +2086,7 @@ async fn stale_head_is_cas_guard_but_not_summary_basis_during_rebuild() {
         .compaction_manifest_page("operation", false, 0, 0)
         .await
         .unwrap();
-    let mut prepared = PreparedOperation {
+    let prepared = PreparedOperation {
         owner: "owner".into(),
         execution_turn: "turn".into(),
         source_projection: None,
@@ -2102,21 +2102,28 @@ async fn stale_head_is_cas_guard_but_not_summary_basis_during_rebuild() {
     };
     let settings = CompactionSettings::default();
     let selection = &f.runner.snapshot.admission.selection;
-    // A live summary cannot silently be discarded from the same owner.
+    let admitted = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &settings,
+        selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        prepared.clone(),
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(admitted.expected_checkpoint.as_deref(), Some(head.as_str()));
     assert!(
-        admit_operation(
-            &f.store,
-            "ws",
-            "thread",
-            &settings,
-            selection,
-            None,
-            f.runner.summarizer.as_ref(),
-            prepared.clone(),
-            0
-        )
-        .await
-        .is_err()
+        f.store
+            .compaction_runner_state(&admitted.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .previous_checkpoint
+            .is_none()
     );
     f.store
         .database_connection()
@@ -2130,22 +2137,10 @@ async fn stale_head_is_cas_guard_but_not_summary_basis_during_rebuild() {
             .compaction_checkpoint_source("ws", "thread", &head)
             .await
             .unwrap()
-            .is_none()
+            .is_some(),
+        "published checkpoint was invalidated by its historical leaf edit"
     );
-    prepared.projection_version = f
-        .store
-        .compaction_projection_version("ws", "thread")
-        .await
-        .unwrap();
-    prepared.manifest[0].source = f
-        .store
-        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
-        .await
-        .unwrap()
-        .entries[0]
-        .reference
-        .clone();
-    let snapshot = admit_operation(
+    let repeated = admit_operation(
         &f.store,
         "ws",
         "thread",
@@ -2158,42 +2153,7 @@ async fn stale_head_is_cas_guard_but_not_summary_basis_during_rebuild() {
     )
     .await
     .unwrap();
-    assert_eq!(snapshot.expected_checkpoint, Some(head.clone()));
-    let state = f
-        .store
-        .compaction_runner_state(&snapshot.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(state.previous_checkpoint.is_none());
-    let runner = CompactionRunner::new(
-        f.store.clone(),
-        "ws".into(),
-        "thread".into(),
-        snapshot,
-        f.runner.summarizer.clone(),
-        Arc::new(Target(true)),
-        f.observer.clone(),
-        f.clock.clone(),
-    );
-    let CompactionExit::Applied(new_head) = runner.run(CancellationToken::new()).await.unwrap()
-    else {
-        panic!("rebuilt checkpoint missing");
-    };
-    assert_ne!(head, new_head);
-    let checkpoint = f
-        .store
-        .compaction_checkpoint(&new_head)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(checkpoint.previous.is_none());
-    assert_eq!(f.provider.calls.lock().unwrap().len(), 2);
-    let calls = f.provider.calls.lock().unwrap();
-    let input: SummaryInput = serde_json::from_str(&calls[1].messages[1].content).unwrap();
-    assert!(input.previous_summary.is_empty());
-    assert!(input.compact_units[0].text.contains("corrected source"));
-    drop(calls);
+    assert_eq!(repeated.id, admitted.id);
     assert!(
         f.store
             .compaction_checkpoint(&head)
@@ -2546,24 +2506,29 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     // immutable output/delivery path used by a real TaskRun. E's basis is then
     // captured from the parent plus that accepted delivery; it is not assembled
     // from the prepared request or granted an ad-hoc checkpoint scope.
-    f.store
-        .materialize_item_completed(
-            pioneer_protocol::ItemCompletedNotification {
-                workspace_id: "ws".into(),
-                thread_id: "context-d".into(),
-                turn_id: "turn-d".into(),
-                item: pioneer_protocol::TurnItem::AgentMessage {
-                    id: "d-own-result".into(),
-                    text: "accepted own work D".into(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
+    for (id, text) in [
+        ("d-own-covered", "accepted own work D covered"),
+        ("d-own-retained", "accepted own work D retained"),
+    ] {
+        f.store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "context-d".into(),
+                    turn_id: "turn-d".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
                 },
-            },
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .unwrap();
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
     for statement in [
         "UPDATE turn SET status='completed' WHERE id='turn-d'",
         "UPDATE task_run SET status='succeeded' WHERE id='run-d'",
@@ -2574,9 +2539,17 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     let d_output = super::frozen::capture_task_output(&f.store, "ws", &d_task_turn)
         .await
         .unwrap();
+    let d_output_references = f
+        .store
+        .compaction_frozen_history_page("ws", "context-d", &d_output.history.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(d_output_references.len(), 2);
+    let d_covered_source = d_output_references[0].sources[0].clone();
+    let d_retained_source = d_output_references[1].sources[0].clone();
     for statement in [
         "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('candidate-d','task-d','run-d','rt-d','context-d','turn-d',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('delivery-turn-d','thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('delivery-turn-d','thread','completed','conversation','system','9999-12-31T23:59:59Z','9999-12-31T23:59:59Z')",
         "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('delivery-d','ws','task-d','run-d','delivery-d','thread','origin_thread','thread','delivered',1,1,'delivery-turn-d')",
         "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('delivery-d','candidate-d','rt-d')",
     ] {
@@ -2590,7 +2563,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
                 turn_id: "delivery-turn-d".into(),
                 item: pioneer_protocol::TurnItem::AgentMessage {
                     id: pioneer_protocol::task_delivery_result_item_id("delivery-d"),
-                    text: "accepted own work D".into(),
+                    text: "accepted own work D covered\naccepted own work D retained".into(),
                     phase: Default::default(),
                     markdown: None,
                     markdown_version: None,
@@ -2608,6 +2581,64 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .entries[0]
         .reference
         .clone();
+    let covered_parent = accepted[0]
+        .provenance
+        .as_ref()
+        .unwrap()
+        .sources
+        .iter()
+        .map(|source| (source.scope.clone(), source.id.clone()))
+        .collect();
+    let logical_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let logical_tail = super::history::load_task_line_history_excluding(
+        &f.store,
+        "ws",
+        "thread",
+        None,
+        &logical_fence,
+        &covered_parent,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .unwrap();
+    let delivery_message = logical_tail
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == acknowledgement.id)
+            })
+        })
+        .expect("the uncovered Task delivery must remain in the tail");
+    assert_eq!(
+        delivery_message
+            .provenance
+            .as_ref()
+            .unwrap()
+            .logical_turn_id
+            .as_deref(),
+        Some("turn"),
+        "AllExcept must retain the command/delivery logical turn mapping"
+    );
+    let mut last_logical_turn = logical_tail;
+    super::frozen::select_task_history(
+        &mut last_logical_turn,
+        &pioneer_protocol::TaskAgentContextPolicy {
+            max_turns: Some(1),
+            ..super::frozen::default_task_context_policy()
+        },
+    )
+    .unwrap();
+    assert!(last_logical_turn.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == acknowledgement.id)
+        })
+    }));
     let delivered = f
         .store
         .compaction_delivery_output("ws", "delivery-d")
@@ -2628,6 +2659,120 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         std::collections::BTreeSet::from(["context-d".to_owned()]),
         "the delivered output grants only D's own immutable result"
     );
+    // Parent has independently summarized the first accepted output unit. The
+    // next capture must omit that payload, retain the second unit, and keep the
+    // second unit's immutable output ordinal (1) for its import proof.
+    let output_summary_owner = super::native::native_owner("ws", "thread");
+    let output_summary_selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "summary-fixture".into(),
+        model: "summary-model".into(),
+        effort: None,
+    };
+    let output_summary_epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let output_summary_operation = OperationSnapshot {
+        id: "accepted-output-prefix-operation".into(),
+        owner: output_summary_owner.clone(),
+        expected_checkpoint: None,
+        projection_version: output_summary_epoch,
+        source_epochs: std::collections::BTreeMap::from([
+            ("thread".into(), output_summary_epoch),
+            (
+                "context-d".into(),
+                f.store
+                    .compaction_projection_version("ws", "context-d")
+                    .await
+                    .unwrap(),
+            ),
+        ]),
+        admission: CompactionSettings::default()
+            .admit(&output_summary_selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![d_covered_source.clone()],
+            fingerprint: "accepted-output-prefix-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit("ws", "thread", &output_summary_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &output_summary_operation.id,
+            &ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &output_summary_operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "context-d".into(),
+                source: d_covered_source.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let output_summary = Checkpoint {
+        id: "accepted-output-prefix-checkpoint".into(),
+        operation_id: output_summary_operation.id.clone(),
+        owner: output_summary_owner.clone(),
+        previous: None,
+        coverage: vec![d_covered_source.clone()],
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nAccepted D prefix.\n"))
+            .collect(),
+        selection: output_summary_selection,
+        projection_version: output_summary_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&output_summary, 0)
+        .await
+        .unwrap();
+    for (sql, values) in [
+        (
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            vec![output_summary.id.clone().into()],
+        ),
+        (
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            vec![
+                output_summary.id.clone().into(),
+                output_summary_owner.into(),
+            ],
+        ),
+        (
+            "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+            vec![output_summary.operation_id.clone().into()],
+        ),
+    ] {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
+    let accepted_checkpoint = Some(output_summary.id.clone());
     let delivery_fence = f.store.compaction_history_read_fence().await.unwrap();
     let mut source_epochs = std::collections::BTreeMap::from([(
         "thread".into(),
@@ -2645,19 +2790,51 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
                 .unwrap(),
         );
     }
-    let accepted_output = super::delivered::AuthorizedOutputSet {
+    let mut accepted_output = super::delivered::AuthorizedOutputSet {
         workspace: "ws".into(),
         destination: "thread".into(),
+        checkpoint: accepted_checkpoint.clone(),
         fence: delivery_fence,
         authorization_revision: 0,
         source_epochs,
         branches: vec![super::delivered::AuthorizedOutputBranch {
             snapshot: delivered,
             acknowledgement: acknowledgement.clone(),
-            acknowledgements: vec![acknowledgement],
+            acknowledgements: vec![acknowledgement.clone()],
             source_threads,
         }],
     };
+    accepted_output.checkpoint = None;
+    let unfiltered_projection_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&accepted_output),
+    )
+    .await
+    .unwrap();
+    let unfiltered_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&unfiltered_projection_json).unwrap();
+    let unfiltered_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &unfiltered_projection.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        unfiltered_imports
+            .iter()
+            .filter(|record| {
+                record.source == d_covered_source || record.source == d_retained_source
+            })
+            .map(|record| record.output_ordinal)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([0, 1]),
+        "an output without checkpoint filtering retains both immutable ordinals"
+    );
+    accepted_output.checkpoint = accepted_checkpoint;
     let next_parent_projection_json = super::frozen::capture_execution_basis_with_outputs(
         &f.store,
         "ws",
@@ -2669,6 +2846,173 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     )
     .await
     .unwrap();
+    let next_parent_projection: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&next_parent_projection_json).unwrap();
+    let (import_count, _) = f
+        .store
+        .compaction_frozen_import_state("ws", "thread", &next_parent_projection.manifest_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let import_records = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &next_parent_projection.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(import_records.len() as u64, import_count);
+    let retained_import = import_records
+        .iter()
+        .find(|record| record.source == d_retained_source)
+        .expect("the uncovered second output unit retains its accepted import");
+    assert_eq!(retained_import.output_ordinal, 1);
+    assert!(
+        import_records
+            .iter()
+            .all(|record| { record.source != d_covered_source && record.output_ordinal != 0 })
+    );
+    assert!(
+        f.store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "delivery-d",
+                &acknowledgement,
+                0,
+                "context-d",
+                &d_retained_source,
+            )
+            .await
+            .is_err(),
+        "ordinal zero must not prove membership of the retained second unit"
+    );
+    let full_output_operation = OperationSnapshot {
+        id: "accepted-output-full-operation".into(),
+        owner: output_summary.owner.clone(),
+        expected_checkpoint: Some(output_summary.id.clone()),
+        projection_version: output_summary_epoch,
+        source_epochs: output_summary_operation.source_epochs.clone(),
+        admission: CompactionSettings::default()
+            .admit(&output_summary.selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![d_retained_source.clone()],
+            fingerprint: "accepted-output-full-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit("ws", "thread", &full_output_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &full_output_operation.id,
+            &ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &full_output_operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "context-d".into(),
+                source: d_retained_source.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let full_output_checkpoint = Checkpoint {
+        id: "accepted-output-full-checkpoint".into(),
+        operation_id: full_output_operation.id.clone(),
+        owner: output_summary.owner.clone(),
+        previous: Some(output_summary.id.clone()),
+        coverage: vec![d_retained_source.clone()],
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nAll accepted D output.\n"))
+            .collect(),
+        selection: output_summary.selection.clone(),
+        projection_version: output_summary_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&full_output_checkpoint, 0)
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            [full_output_checkpoint.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                full_output_checkpoint.id.clone().into(),
+                full_output_checkpoint.owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+            [full_output_checkpoint.operation_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    accepted_output.checkpoint = Some(full_output_checkpoint.id.clone());
+    let fully_covered_json = super::frozen::capture_execution_basis_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        Some("next-parent-turn"),
+        None,
+        None,
+        Some(&accepted_output),
+    )
+    .await
+    .unwrap();
+    let fully_covered: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&fully_covered_json).unwrap();
+    let fully_covered_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "thread", &fully_covered.manifest_id, 0)
+        .await
+        .unwrap();
+    assert!(
+        fully_covered_imports.iter().all(|record| {
+            record.source != d_covered_source && record.source != d_retained_source
+        })
+    );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                output_summary.id.clone().into(),
+                output_summary.owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
     for statement in [
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('context-e','ws','','agent','gpt-4','main-fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('context-e','thread','thread',1,CURRENT_TIMESTAMP)",
@@ -2682,7 +3026,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-e','task-e','ws','thread','next-parent-turn',?,CURRENT_TIMESTAMP)",
-        [next_parent_projection_json.into()],
+        [next_parent_projection_json.clone().into()],
     ))
     .await
     .unwrap();
@@ -2833,6 +3177,91 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), summarizer_calls);
 
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                full_output_checkpoint.id.clone().into(),
+                full_output_checkpoint.owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM turn_event WHERE id=?",
+            [d_retained_source.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let parent_allowed = super::frozen::accepted_history_scopes(
+        &f.store,
+        "ws",
+        "thread",
+        &next_parent_projection_json,
+    )
+    .await
+    .unwrap();
+    let (covered_own_import, _) = super::history::with_payload_batch_stats(
+        super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            None,
+            "thread",
+            &parent_allowed,
+            &next_parent_projection_json,
+        ),
+    )
+    .await;
+    let covered_own_import = covered_own_import
+        .expect("a published summary must replace its deleted accepted OWN import");
+    assert!(covered_own_import.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == full_output_checkpoint.id)
+        })
+    }));
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                output_summary.id.clone().into(),
+                output_summary.owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            None,
+            "thread",
+            &parent_allowed,
+            &next_parent_projection_json,
+        )
+        .await
+        .is_err(),
+        "the same deleted accepted OWN import remains required when it is not covered"
+    );
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=NULL WHERE owner=?",
+            [output_summary.owner.clone().into()],
+        ))
+        .await
+        .unwrap();
+
     // K does not exist when C's immutable basis is captured.
     let source = accepted[0].provenance.as_ref().unwrap().sources[0].clone();
     let source = SourceRef {
@@ -2890,6 +3319,23 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .compaction_admit("ws", "thread", &operation)
         .await
         .unwrap();
+    f.store
+        .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 1, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: source.clone(),
+            }],
+        )
+        .await
+        .unwrap();
     let checkpoint = Checkpoint {
         id: "late-working-context-checkpoint".into(),
         operation_id: operation.id.clone(),
@@ -2904,6 +3350,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         selection,
         projection_version: version,
     };
+    let covered_source_scope = checkpoint.coverage[0].scope.clone();
+    let covered_source_id = checkpoint.coverage[0].id.clone();
     f.store
         .compaction_save_candidate(&checkpoint, 0)
         .await
@@ -2917,8 +3365,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     );
 
     // Production refresh recaptures the accepted Task basis for the current
-    // execution. The new descriptor belongs to C, but still contains raw H;
-    // discovering K remains the responsibility of request preparation.
+    // execution and may replace it with the compatible WorkingContext K. K
+    // remains inherited and therefore must not receive an OWN import record.
     let execution_projection_json = super::frozen::capture_execution_basis_json(
         &f.store,
         "ws",
@@ -2951,18 +3399,23 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .await
         .unwrap();
     assert!(restored[0].provenance.as_ref().unwrap().inherited);
-    assert!(
-        restored[0]
-            .provenance
-            .as_ref()
+    assert_eq!(
+        restored[0].provenance.as_ref().unwrap().sources[0].id,
+        checkpoint.id,
+        "child recapture must preserve the WorkingContext checkpoint"
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_import_state("ws", "context-c", &execution_projection.manifest_id,)
+            .await
             .unwrap()
-            .sources
-            .iter()
-            .all(|source| !source.scope.starts_with("checkpoint:")),
-        "child recapture must leave raw H for checkpoint discovery"
+            .unwrap()
+            .0,
+        0,
+        "an inherited WorkingContext replacement must not carry OWN imports"
     );
 
-    // Exercise the same discovery/projection used by post-turn preparation.
+    // Re-projecting an already captured checkpoint is idempotent.
     let mut projected = restored.clone();
     super::checkpoint::project_accepted_checkpoints(
         &f.store,
@@ -2994,7 +3447,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     };
     let request = ChatRequest {
         model: "gpt-4".into(),
-        messages: vec![restored[0].clone(), ChatMessage::user("Continue")],
+        messages: vec![accepted[0].clone(), ChatMessage::user("Continue")],
         temperature: None,
         max_tokens: None,
         tools: None,
@@ -3114,6 +3567,72 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .await
         .is_err()
     );
+
+    // Literal verification keeps its exact-reference contract, but execution
+    // restart must select the already published compatible checkpoint before
+    // reading a covered payload. Exercise both the parent-owned Task snapshot
+    // and the later child-owned runtime snapshot after physical deletion.
+    let delete_sql = if covered_source_scope.starts_with("item:") {
+        "DELETE FROM turn_item WHERE id=?"
+    } else {
+        "DELETE FROM turn_event WHERE id=?"
+    };
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            delete_sql,
+            [covered_source_id.into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        super::frozen::restore(&f.store, "ws", &allowed, &frozen)
+            .await
+            .is_err(),
+        "literal manifest verification must not invent a deleted raw source"
+    );
+    let (recaptured_after_delete, covered_reads) =
+        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "context-c",
+            Some("turn-c"),
+            Some("turn-c"),
+            None,
+        ))
+        .await;
+    let recaptured_after_delete = recaptured_after_delete
+        .expect("WorkingContext checkpoint must replace the deleted accepted basis source");
+    assert_eq!(
+        recaptured_after_delete.messages[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources[0]
+            .id,
+        checkpoint.id
+    );
+    assert_eq!(
+        covered_reads.calls, 0,
+        "recapture must not load the covered deleted raw payload"
+    );
+    for history_json in [&parent_projection_json, &execution_projection_json] {
+        let restarted = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("thread"),
+            "context-c",
+            &allowed,
+            history_json,
+        )
+        .await
+        .expect("restart must project the published summary before raw restore");
+        assert_eq!(restarted.len(), 1);
+        let origin = restarted[0].provenance.as_ref().unwrap();
+        assert_eq!(origin.sources[0].id, checkpoint.id);
+        assert!(origin.inherited);
+    }
 }
 
 #[tokio::test]
@@ -3281,7 +3800,6 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         "one preparation reloaded immutable checkpoint edges"
     );
     assert_eq!(preparation_work.closure_builds(), first_closure_builds);
-    assert!(preparation_work.revalidations() > 0);
     let repeated_projection = resolver
         .projection_metadata(&f.store, "ws", &repeated_graph)
         .await
@@ -3476,8 +3994,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
     let projection_store = f.store.clone();
     let projection_head = checkpoint_ref.id.clone();
     let projection_owner = super::native::native_owner("ws", "thread");
-    let original_messages = raw_request.messages.clone();
-    let projected_messages = original_messages.clone();
+    let projected_messages = raw_request.messages.clone();
     let projection = tokio::spawn(async move {
         let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
         let mut messages = projected_messages;
@@ -3490,6 +4007,7 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
                 source_thread: "thread",
                 owner: &projection_owner,
                 allowed: &allowed,
+                allow_historical_gaps: true,
             },
             &projection_head,
             &mut messages,
@@ -3509,14 +4027,17 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .await
         .unwrap();
     cold_body.release();
-    let (projection_result, messages_after_rejection) = projection.await.unwrap();
-    assert!(
-        projection_result.is_err(),
-        "checkpoint projection accepted a leaf changed during cold body loading"
-    );
+    let (projection_result, messages_after_projection) = projection.await.unwrap();
+    projection_result.expect("historical leaf edits must not invalidate a published summary");
     assert_eq!(
-        messages_after_rejection, original_messages,
-        "failed checkpoint projection modified the original messages"
+        messages_after_projection[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources[0]
+            .id,
+        checkpoint_ref.id,
+        "projection did not replace the historical leaf with the durable summary"
     );
     f.store
         .database_connection()
@@ -3544,15 +4065,34 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .parse()
         .unwrap();
     assert!(changed_revision > original_revision);
+    let (captured_after_edit, covered_payload_reads) = super::history::with_payload_batch_stats(
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None),
+    )
+    .await;
+    let captured_after_edit = captured_after_edit.unwrap();
+    assert_eq!(
+        covered_payload_reads.calls, 0,
+        "foreground/background capture read a payload already covered by the published head"
+    );
+    assert_eq!(captured_after_edit.messages.len(), 1);
+    assert_eq!(
+        captured_after_edit.messages[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources[0]
+            .id,
+        checkpoint_ref.id
+    );
     assert!(
         resolver
             .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
             .await
             .unwrap()
-            .is_none(),
-        "cached graph metadata hid an edited canonical leaf"
+            .is_some(),
+        "edited historical leaf invalidated cached summary metadata"
     );
-    let stale = super::test_support::prepare_native_request(
+    let after_edit = super::test_support::prepare_native_request(
         &f.store,
         &providers,
         &settings,
@@ -3563,9 +4103,14 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         f.observer.clone(),
         f.clock.clone(),
     )
-    .await;
-    assert!(stale.err().unwrap().to_string().contains("source changed"));
-    assert!(
+    .await
+    .unwrap();
+    assert_eq!(
+        after_edit.receipt.identity.checkpoint,
+        prepared.receipt.identity.checkpoint
+    );
+    assert_eq!(after_edit.request.messages, restored.request.messages);
+    assert_eq!(
         super::coverage::checkpoint_leaves(
             &f.store,
             "ws",
@@ -3573,7 +4118,9 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             &checkpoint_ref,
         )
         .await
-        .is_err()
+        .unwrap()
+        .len(),
+        1
     );
     f.store
         .database_connection()
@@ -3606,14 +4153,31 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
             .await
             .unwrap()
-            .is_none(),
-        "restoring equal text must not revive a stale revision"
+            .is_some(),
+        "historical revision changes affected the published summary"
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_checkpoint WHERE id=?",
+            [checkpoint_ref.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
+            .await
+            .unwrap()
+            .is_none(),
+        "a cached graph invented a deleted root checkpoint"
+    );
 }
 
 #[tokio::test]
-async fn prepared_graph_revalidates_other_thread_edit_and_delete_independently() {
+async fn prepared_graph_keeps_published_roots_after_historical_edit_and_delete() {
     let f = fixture("current leaf", vec![], true, false).await;
     f.store.database_connection().execute_unprepared(
         r#"INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('source-thread','ws','','chat','fixture','fixture','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);
@@ -3888,8 +4452,8 @@ async fn prepared_graph_revalidates_other_thread_edit_and_delete_independently()
             .resolve(&f.store, "ws", Some(&allowed), &edit_root)
             .await
             .unwrap()
-            .is_none(),
-        "cached graph hid an edited canonical leaf"
+            .is_some(),
+        "published summary was invalidated by an edited historical leaf"
     );
     assert!(
         resolver
@@ -3897,7 +4461,7 @@ async fn prepared_graph_revalidates_other_thread_edit_and_delete_independently()
             .await
             .unwrap()
             .is_some(),
-        "independent delete graph was not current immediately before delete"
+        "independent published summary disappeared before historical deletion"
     );
     let source_epoch_before_delete = f
         .store
@@ -3935,8 +4499,8 @@ async fn prepared_graph_revalidates_other_thread_edit_and_delete_independently()
             .resolve(&f.store, "ws", Some(&allowed), &delete_root)
             .await
             .unwrap()
-            .is_none(),
-        "cached graph hid deletion of its current canonical leaf"
+            .is_some(),
+        "published summary was invalidated by a deleted historical leaf"
     );
 }
 
@@ -4707,6 +5271,954 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
 }
 
 #[tokio::test]
+async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_deletion() {
+    use pioneer_crud::NewTurnLlmContextEntry;
+    use pioneer_protocol::{
+        ItemCompletedNotification, PersistedActorRef, SandboxMode, ToolCallStatus,
+        ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem, UserInput,
+    };
+    use pioneer_provider::{
+        CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef,
+        ProviderCallIdentity, ProviderTermination, ProviderToolCall,
+    };
+
+    let f = fixture("unrelated history", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn WHERE id='turn'")
+        .await
+        .unwrap();
+    f.store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &turn,
+            &[UserInput::Text {
+                text: "independent new round".into(),
+                text_elements: vec![],
+            }],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("UPDATE turn SET send_mode='agent' WHERE id='turn'")
+        .await
+        .unwrap();
+    let item = TurnItem::CommandExecution {
+        id: "covered-tool".into(),
+        tool_name: "exec_command".into(),
+        arguments: serde_json::json!({"cmd":"true"}),
+        status: ToolCallStatus::Completed,
+        recovery_policy: None,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+        display: ToolDisplayPayload::Hidden,
+        storage: ToolStoragePayload::Shell {
+            stdout: Some("covered tool result".into()),
+            stderr: None,
+            aggregated_output: Some("covered tool result".into()),
+            exit_code: Some(0),
+            duration_ms: Some(1),
+            timed_out: Some(false),
+            truncated: false,
+        },
+        recovery: None,
+        command: vec!["true".into()],
+        cwd: None,
+        success: Some(true),
+        outcome: None,
+        observation: None,
+    };
+    let mut started_item = item.clone();
+    let TurnItem::CommandExecution {
+        status, success, ..
+    } = &mut started_item
+    else {
+        unreachable!()
+    };
+    *status = ToolCallStatus::InProgress;
+    *success = None;
+    f.store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: started_item,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let assistant_message = ChatMessage::assistant_tool_calls(
+        None::<String>,
+        vec![ProviderToolCall {
+            id: "covered-call".into(),
+            name: "exec_command".into(),
+            arguments: "{\"cmd\":\"true\"}".into(),
+        }],
+    );
+    let envelope = CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "covered-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: assistant_message.clone(),
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "covered-call".into(),
+            turn_item_id: "covered-tool".into(),
+            ordinal: 0,
+        }],
+    };
+    f.store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: "turn".into(),
+            item_id: Some("covered-round".into()),
+            attempt_id: None,
+            sequence: 49,
+            source: "assistant_round".into(),
+            tool_name: None,
+            payload: serde_json::to_string(&envelope).unwrap(),
+            output_policy_snapshot: "{}".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let replay_message =
+        ChatMessage::tool_result("covered-call", "exec_command", "covered tool result");
+    let replay_view = pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(&replay_message).unwrap(),
+        truncated: false,
+    };
+    f.store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: "turn".into(),
+            item_id: Some("covered-tool".into()),
+            attempt_id: None,
+            sequence: 50,
+            source: "tool_result_v2".into(),
+            tool_name: Some("exec_command".into()),
+            payload: serde_json::to_string(&replay_view).unwrap(),
+            output_policy_snapshot: "{}".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let item_source = f
+        .store
+        .compaction_tool_item_reference("ws", "thread", "turn", "covered-tool")
+        .await
+        .unwrap()
+        .unwrap();
+    let assistant_source = f
+        .store
+        .compaction_context_reference_for_item(
+            "ws",
+            "thread",
+            "turn",
+            "covered-round",
+            "assistant_round",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let replay_source = f
+        .store
+        .compaction_context_reference_for_item(
+            "ws",
+            "thread",
+            "turn",
+            "covered-tool",
+            "tool_result_v2",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let provenance = |source: &SourceRef| MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "covered-tool-unit".into(),
+        sources: vec![MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        }],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    };
+    let mut captured_assistant = assistant_message;
+    captured_assistant.provenance = Some(provenance(&assistant_source));
+    let mut captured_tool = replay_message;
+    captured_tool.provenance = Some(provenance(&item_source));
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let projection = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        &[captured_assistant, captured_tool],
+    )
+    .await
+    .unwrap();
+
+    let mut operation = f.runner.snapshot.clone();
+    operation.id = "tool-alias-operation".into();
+    operation.owner = super::native::native_owner("ws", "thread");
+    operation.expected_checkpoint = None;
+    operation.plan.fingerprint = "tool-alias-plan".into();
+    operation.plan.coverage = vec![assistant_source.clone(), item_source.clone()];
+    operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    operation.source_epochs =
+        std::collections::BTreeMap::from([("thread".into(), operation.projection_version)]);
+    f.store
+        .compaction_admit_for_turn("ws", "thread", &operation, Some("turn"))
+        .await
+        .unwrap();
+    f.store
+        .compaction_bind_source_projection(&operation.id, &projection)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 2, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &operation.id,
+            &[
+                ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: assistant_source.clone(),
+                },
+                ManifestEntry {
+                    ordinal: 1,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: item_source.clone(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: "tool-alias-checkpoint".into(),
+        operation_id: operation.id.clone(),
+        owner: operation.owner.clone(),
+        previous: None,
+        coverage: vec![assistant_source, item_source],
+        summary: "tool work is complete".into(),
+        selection: operation.admission.selection.clone(),
+        projection_version: operation.projection_version,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            [checkpoint.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [
+                checkpoint.id.clone().into(),
+                checkpoint.owner.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    let edges = f
+        .store
+        .compaction_checkpoint_edges(&checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edges.replay_aliases.len(), 1);
+    assert_eq!(edges.replay_aliases[0].replay.source, replay_source);
+
+    let mut replay_projection = ChatMessage::assistant("saved replay transport row");
+    replay_projection.provenance = Some(MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "saved-replay".into(),
+        sources: vec![MessageSourceRef {
+            scope: replay_source.scope.clone(),
+            id: replay_source.id.clone(),
+            version: replay_source.version.clone(),
+        }],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    let mut messages = vec![replay_projection];
+    super::checkpoint::project_checkpoint(
+        &f.store,
+        "ws",
+        "thread",
+        &checkpoint.owner,
+        &checkpoint.id,
+        &allowed,
+        &mut messages,
+    )
+    .await
+    .unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].provenance.as_ref().unwrap().sources[0].id,
+        checkpoint.id
+    );
+
+    // A tool item identity is scoped to its turn. Reusing it in a later turn
+    // must not let the historical alias for the covered round suppress the
+    // new canonical round or its UI event.
+    let mut second_turn = turn.clone();
+    second_turn.id = "turn-with-reused-tool-item".into();
+    f.store
+        .materialize_turn_start(
+            &thread,
+            SandboxMode::FullAccess,
+            &second_turn,
+            &[UserInput::Text {
+                text: "new round with reused item id".into(),
+                text_elements: vec![],
+            }],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn SET send_mode='agent' WHERE id='turn-with-reused-tool-item'",
+        )
+        .await
+        .unwrap();
+    let second_item = TurnItem::CommandExecution {
+        id: "covered-tool".into(),
+        tool_name: "exec_command".into(),
+        arguments: serde_json::json!({"cmd":"printf new"}),
+        status: ToolCallStatus::Completed,
+        recovery_policy: None,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+        display: ToolDisplayPayload::Hidden,
+        storage: ToolStoragePayload::Shell {
+            stdout: Some("new tool result".into()),
+            stderr: None,
+            aggregated_output: Some("new tool result".into()),
+            exit_code: Some(0),
+            duration_ms: Some(1),
+            timed_out: Some(false),
+            truncated: false,
+        },
+        recovery: None,
+        command: vec!["printf".into(), "new".into()],
+        cwd: None,
+        success: Some(true),
+        outcome: None,
+        observation: None,
+    };
+    let mut second_started_item = second_item.clone();
+    let TurnItem::CommandExecution {
+        status, success, ..
+    } = &mut second_started_item
+    else {
+        unreachable!()
+    };
+    *status = ToolCallStatus::InProgress;
+    *success = None;
+    f.store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: second_turn.id.clone(),
+                item: second_started_item,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: second_turn.id.clone(),
+                item: second_item,
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let second_assistant = ChatMessage::assistant_tool_calls(
+        None::<String>,
+        vec![ProviderToolCall {
+            id: "new-call".into(),
+            name: "exec_command".into(),
+            arguments: "{\"cmd\":\"printf new\"}".into(),
+        }],
+    );
+    let second_envelope = CanonicalProviderRoundEnvelope {
+        version: 1,
+        round_id: "new-round".into(),
+        termination: ProviderTermination::ToolCalls,
+        message: second_assistant,
+        calls: vec![ProviderCallIdentity {
+            provider_call_id: "new-call".into(),
+            turn_item_id: "covered-tool".into(),
+            ordinal: 0,
+        }],
+    };
+    f.store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: second_turn.id.clone(),
+            item_id: Some("new-round".into()),
+            attempt_id: None,
+            sequence: 49,
+            source: "assistant_round".into(),
+            tool_name: None,
+            payload: serde_json::to_string(&second_envelope).unwrap(),
+            output_policy_snapshot: "{}".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let second_replay = ChatMessage::tool_result("new-call", "exec_command", "new tool result");
+    let second_replay_view = pioneer_tools::ToolResultView::Json {
+        value: serde_json::to_value(&second_replay).unwrap(),
+        truncated: false,
+    };
+    f.store
+        .insert_turn_llm_context(NewTurnLlmContextEntry {
+            turn_id: second_turn.id.clone(),
+            item_id: Some("covered-tool".into()),
+            attempt_id: None,
+            sequence: 50,
+            source: "tool_result_v2".into(),
+            tool_name: Some("exec_command".into()),
+            payload: serde_json::to_string(&second_replay_view).unwrap(),
+            output_policy_snapshot: "{}".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_item WHERE turn_id='turn' AND item_id='covered-tool'")
+        .await
+        .unwrap();
+    let prepared =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    assert!(prepared.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == checkpoint.id)
+        })
+    }));
+    assert!(
+        prepared
+            .messages
+            .iter()
+            .all(|message| message.content != "covered tool result"),
+        "the saved replay row was parsed as a new orphan tool result"
+    );
+    assert!(
+        prepared
+            .messages
+            .iter()
+            .any(|message| message.content == "independent new round")
+    );
+    let second_assistant_position = prepared
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "new-call"))
+        })
+        .expect("new assistant round with reused item id");
+    let second_tool_position = prepared
+        .messages
+        .iter()
+        .position(|message| message.content == "new tool result")
+        .expect("new tool result with reused item id");
+    assert!(second_assistant_position < second_tool_position);
+    assert!(
+        prepared.messages[second_tool_position]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources
+            .iter()
+            .any(|source| source.scope == "item:turn-with-reused-tool-item")
+    );
+
+    let completed_event = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.item_id.as_deref() == Some("covered-tool"))
+        .expect("covered ItemCompleted event")
+        .reference;
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM turn_llm_context WHERE id=?",
+            [replay_source.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let (prepared_without_replay_row, _) = super::history::with_payload_batch_stats(
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None),
+    )
+    .await;
+    let prepared_without_replay_row = prepared_without_replay_row
+        .expect("historical replay metadata must suppress the saved UI copy");
+    assert!(prepared_without_replay_row.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == checkpoint.id)
+        })
+    }));
+    assert!(prepared_without_replay_row.messages.iter().all(|message| {
+        message.provenance.as_ref().is_none_or(|origin| {
+            origin
+                .sources
+                .iter()
+                .all(|source| source.id != completed_event.id)
+        })
+    }));
+    assert!(
+        prepared_without_replay_row
+            .messages
+            .iter()
+            .any(|message| message.content == "independent new round")
+    );
+    let second_assistant_position = prepared_without_replay_row
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "new-call"))
+        })
+        .expect("new assistant round survives removal of the old replay row");
+    let second_tool_position = prepared_without_replay_row
+        .messages
+        .iter()
+        .position(|message| message.content == "new tool result")
+        .expect("new tool result survives removal of the old replay row");
+    assert!(second_assistant_position < second_tool_position);
+}
+
+#[tokio::test]
+async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacements() {
+    use pioneer_provider::ChatMessage;
+
+    let f = fixture("unused", vec![], true, false).await;
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let threads = [
+        ("retained-before", "before"),
+        ("z-source", "A"),
+        ("retained-middle", "middle"),
+        ("a-source", "B"),
+        ("retained-after", "after"),
+        ("m-source", "C"),
+        ("retained-last", "last"),
+    ];
+    for (index, (thread, text)) in threads.iter().enumerate() {
+        f.store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{thread}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);\
+                 INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-{thread}','{thread}','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ))
+            .await
+            .unwrap();
+        f.store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: (*thread).into(),
+                    turn_id: format!("turn-{thread}"),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: format!("item-{index}"),
+                        text: (*text).into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    for thread in ["parent", "execution"] {
+        f.store
+            .database_connection()
+            .execute_unprepared(&format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{thread}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ))
+            .await
+            .unwrap();
+    }
+
+    let mut messages = Vec::<ChatMessage>::new();
+    let mut references = std::collections::BTreeMap::new();
+    for (thread, text) in threads {
+        super::history::prepare_history(&f.store, "ws", thread)
+            .await
+            .unwrap();
+        let fence = f.store.compaction_history_read_fence().await.unwrap();
+        let mut history = super::history::load_line_history(&f.store, "ws", thread, None, &fence)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        let message = &mut history[0];
+        let origin = message.provenance.as_mut().unwrap();
+        origin.context_thread = Some("execution".into());
+        origin.inherited = true;
+        references.insert(
+            text,
+            SourceRef {
+                scope: origin.sources[0].scope.clone(),
+                id: origin.sources[0].id.clone(),
+                version: origin.sources[0].version.clone(),
+            },
+        );
+        messages.push(history.remove(0));
+    }
+    let allowed = threads
+        .into_iter()
+        .map(|(thread, _)| thread.to_owned())
+        .chain(["parent".to_owned(), "execution".to_owned()])
+        .collect::<std::collections::BTreeSet<_>>();
+    let descriptor = super::frozen::capture(&f.store, "ws", "parent", &allowed, &messages)
+        .await
+        .unwrap();
+
+    async fn install(
+        fixture: &Fixture,
+        owner_thread: &str,
+        operation: &str,
+        checkpoint: &str,
+        coverage: &[(&str, SourceRef)],
+        marker: &str,
+    ) {
+        let owner = super::native::native_owner("ws", owner_thread);
+        let selection = ModelSelection {
+            transport: Transport::Api,
+            instance: "fixture".into(),
+            model: "fixture".into(),
+            effort: None,
+        };
+        let epoch = fixture
+            .store
+            .compaction_projection_version("ws", owner_thread)
+            .await
+            .unwrap();
+        let snapshot = OperationSnapshot {
+            id: operation.into(),
+            owner: owner.clone(),
+            expected_checkpoint: None,
+            projection_version: epoch,
+            source_epochs: std::collections::BTreeMap::from([(owner_thread.to_owned(), epoch)]),
+            admission: CompactionSettings::default()
+                .admit(&selection, None, 0)
+                .unwrap(),
+            plan: CompactionPlan {
+                mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+                compact: (0..coverage.len()).collect(),
+                retain: vec![],
+                coverage: coverage.iter().map(|(_, source)| source.clone()).collect(),
+                fingerprint: format!("{operation}-plan"),
+            },
+        };
+        fixture
+            .store
+            .compaction_admit("ws", owner_thread, &snapshot)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_prepare_runner(
+                operation,
+                &ModelBudget::new(None, None, None),
+                coverage.len() as u64,
+                0,
+            )
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_append_manifest(
+                operation,
+                &coverage
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, (thread, source))| ManifestEntry {
+                        ordinal: ordinal as u64,
+                        unit: ordinal as u64,
+                        reference_only: false,
+                        thread_id: (*thread).into(),
+                        source: source.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_save_candidate(
+                &Checkpoint {
+                    id: checkpoint.into(),
+                    operation_id: operation.into(),
+                    owner: owner.clone(),
+                    previous: None,
+                    coverage: coverage.iter().map(|(_, source)| source.clone()).collect(),
+                    summary: HEADINGS
+                        .iter()
+                        .map(|heading| format!("{heading}\n{marker}.\n"))
+                        .collect(),
+                    selection,
+                    projection_version: epoch,
+                    format_version: pioneer_compaction::FORMAT_VERSION,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        fixture
+            .store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+                [checkpoint.into()],
+            ))
+            .await
+            .unwrap();
+        fixture
+            .store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_context SET head=? WHERE owner=?",
+                [checkpoint.into(), owner.into()],
+            ))
+            .await
+            .unwrap();
+        fixture
+            .store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id=?",
+                [operation.into()],
+            ))
+            .await
+            .unwrap();
+    }
+
+    install(
+        &f,
+        "z-source",
+        "operation-s",
+        "checkpoint-s",
+        &[("z-source", references["A"].clone())],
+        "S(A)",
+    )
+    .await;
+    install(
+        &f,
+        "a-source",
+        "operation-t",
+        "checkpoint-t",
+        &[
+            ("z-source", references["A"].clone()),
+            ("a-source", references["B"].clone()),
+        ],
+        "T(A+B)",
+    )
+    .await;
+    install(
+        &f,
+        "m-source",
+        "operation-u",
+        "checkpoint-u",
+        &[
+            ("a-source", references["B"].clone()),
+            ("m-source", references["C"].clone()),
+        ],
+        "U(B+C)",
+    )
+    .await;
+
+    let restored = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("parent"),
+        "execution",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    let text = restored
+        .iter()
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        text.iter().filter(|text| text.contains("S(A)")).count(),
+        0,
+        "the atomically covering T checkpoint must replace S"
+    );
+    assert_eq!(
+        text.iter().filter(|text| text.contains("T(A+B)")).count(),
+        1
+    );
+    assert_eq!(
+        text.iter().filter(|text| text.contains("U(B+C)")).count(),
+        1
+    );
+    assert!(text[0].contains("before"));
+    assert!(text[1].contains("T(A+B)"));
+    assert!(text[2].contains("middle"));
+    assert!(text[3].contains("U(B+C)"));
+    assert!(text[4].contains("after"));
+    assert!(text[5].contains("last"));
+    for (restored_index, original_index) in [(0, 0), (2, 2), (4, 4), (5, 6)] {
+        assert_eq!(
+            restored[restored_index].provenance,
+            messages[original_index].provenance
+        );
+    }
+    assert!(restored[1].provenance.as_ref().unwrap().inherited);
+    assert!(restored[3].provenance.as_ref().unwrap().inherited);
+
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM turn_event WHERE id=?",
+            [references["A"].id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    let (after_covered_delete, payload_reads) = super::history::with_payload_batch_stats(
+        super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("parent"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        ),
+    )
+    .await;
+    let after_covered_delete = after_covered_delete
+        .expect("T(A+B) must replace deleted inherited A before payload restore");
+    assert_eq!(
+        after_covered_delete
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>(),
+        text
+    );
+    assert_eq!(
+        payload_reads.calls, 0,
+        "covered canonical payloads were read during frozen restore"
+    );
+
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM turn_event WHERE id=?",
+            [references["last"].id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("parent"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        )
+        .await
+        .is_err(),
+        "an uncovered deleted raw source must remain exact-current"
+    );
+}
+
+#[tokio::test]
 async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
     use pioneer_provider::ChatMessage;
@@ -4802,6 +6314,32 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             .compaction_admit("ws", "thread", &snapshot)
             .await
             .unwrap();
+        store
+            .compaction_prepare_runner(
+                &id,
+                &ModelBudget::new(None, None, None),
+                coverage.len() as u64,
+                0,
+            )
+            .await
+            .unwrap();
+        store
+            .compaction_append_manifest(
+                &id,
+                &coverage
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, source)| ManifestEntry {
+                        ordinal: ordinal as u64,
+                        unit: ordinal as u64,
+                        reference_only: false,
+                        thread_id: "thread".into(),
+                        source: source.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
         let checkpoint = Checkpoint {
             id: format!("checkpoint-{end}"),
             operation_id: id,
@@ -4845,6 +6383,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     let (_, mut next_turn) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
     next_turn.id = "new-parent-work-turn".into();
     next_turn.reply_to_turn_id = None;
+    let post_checkpoint_work = "large answer after checkpoint H ".repeat(4_000);
     let mut first = None;
     let mut at_sixty = None;
     for n in 1..=100 {
@@ -4897,6 +6436,24 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
                         item: message.clone(),
                     },
                     1,
+                )
+                .await
+                .unwrap();
+            f.store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: next_turn.id.clone(),
+                        item: pioneer_protocol::TurnItem::AgentMessage {
+                            id: "new-parent-answer".into(),
+                            text: post_checkpoint_work.clone(),
+                            phase: Default::default(),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    3,
                 )
                 .await
                 .unwrap();
@@ -4976,8 +6533,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         prepared_graph
             .resolve(&f.store, "ws", Some(&allowed), &head_source)
             .await
-            .is_err(),
-        "cached graph metadata hid a changed intermediate checkpoint"
+            .unwrap()
+            .is_some(),
+        "an intermediate checkpoint status change invalidated the published head"
     );
     f.store
         .database_connection()
@@ -5001,8 +6559,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         prepared_graph
             .resolve(&f.store, "ws", Some(&allowed), &head_source)
             .await
-            .is_err(),
-        "cached graph metadata hid a deleted intermediate checkpoint"
+            .unwrap()
+            .is_some(),
+        "deleting an ancestor invalidated the already prepared published head"
     );
     f.store
         .database_connection()
@@ -5041,13 +6600,77 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             .await
             .unwrap()
             .is_some(),
-        "restored intermediate checkpoint did not revalidate cached metadata"
+        "restoring historical metadata affected the published head"
     );
+    let accepted_fence = at_sixty.unwrap();
     let raw =
-        super::history::load_task_line_history(&f.store, "ws", "thread", None, &at_sixty.unwrap())
+        super::history::load_task_line_history(&f.store, "ws", "thread", None, &accepted_fence)
             .await
             .unwrap();
-    assert_eq!(raw.len(), 61);
+    assert_eq!(raw.len(), 62);
+    let captured_epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let accepted_outputs = super::delivered::AuthorizedOutputSet {
+        workspace: "ws".into(),
+        destination: "thread".into(),
+        branches: Vec::new(),
+        source_epochs: std::collections::BTreeMap::from([("thread".into(), captured_epoch)]),
+        fence: accepted_fence.clone(),
+        checkpoint: Some(first.clone()),
+        authorization_revision: 0,
+    };
+    let prepared_at_fence = super::frozen::capture_execution_basis_prepared_with_outputs(
+        &f.store,
+        "ws",
+        "thread",
+        None,
+        None,
+        None,
+        Some(&accepted_outputs),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        prepared_at_fence.expected_checkpoint.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        prepared_at_fence.checkpoint.as_deref(),
+        Some(first.as_str())
+    );
+    assert!(
+        prepared_at_fence.messages[0]
+            .content
+            .contains("State through 40")
+    );
+    assert!(prepared_at_fence.messages.iter().all(|message| {
+        !message.content.contains("work 61") && !message.content.contains("State through 100")
+    }));
+    let excluded_turn = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        None,
+        Some("turn"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        excluded_turn.expected_checkpoint.as_deref(),
+        Some(head.as_str()),
+        "the actual captured head remains the publication CAS target"
+    );
+    assert!(
+        excluded_turn.checkpoint.is_none(),
+        "a checkpoint crossing the excluded turn cannot become the history projection basis"
+    );
+    assert!(excluded_turn.messages.iter().all(|message| {
+        !message.content.contains("State through 100") && !message.content.contains("work 100")
+    }));
     let raw_n = raw
         .iter()
         .find(|message| message.content.contains("new work after checkpoint H"))
@@ -5066,6 +6689,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
                 source_thread: "thread",
                 owner: &owner,
                 allowed: &allowed,
+                allow_historical_gaps: false,
             },
             &head,
             &mut selected,
@@ -5128,7 +6752,7 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .unwrap();
     selection_resolver.merge(merged);
     assert!(selection_resolver.cached_graph_units() <= 256);
-    assert_eq!(selected.len(), 22);
+    assert_eq!(selected.len(), 23);
     assert!(selected[0].content.contains("State through 40"));
     assert_eq!(
         selected[0].provenance.as_ref().unwrap().sources[0].id,
@@ -5167,16 +6791,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
     )
     .await
     .unwrap();
-    let expected_replaced = raw
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != replacement_index)
-        .map(|(_, message)| message.clone())
-        .collect::<Vec<_>>();
     assert_eq!(
-        identities(&replaced),
-        identities(&expected_replaced),
-        "a covered transport copy is removed through exact original projection, preserving every other source in order"
+        replaced, selected,
+        "a transport copy already represented inside an atomic summary is not rematerialized"
     );
     let mut inherited = selected.clone();
     for message in &mut inherited {
@@ -5202,12 +6819,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         super::frozen::compose_frozen_basis(&f.store, "ws", "thread", &allowed, &inherited, &raw)
             .await
             .unwrap();
-    assert_eq!(
-        joined.len(),
-        raw.len(),
-        "overlapping summary is replaced by exact originals once"
-    );
-    assert_eq!(identities(&joined), identities(&raw));
+    assert_eq!(joined.len(), selected.len());
+    assert_eq!(identities(&joined), identities(&selected));
+    assert!(joined[0].content.contains("State through 40"));
     assert_eq!(
         joined
             .iter()
@@ -5215,8 +6829,9 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             .count(),
         1
     );
+    assert!(joined[0].provenance.as_ref().unwrap().inherited);
     assert!(
-        joined
+        joined[1..]
             .iter()
             .all(|message| !message.provenance.as_ref().unwrap().inherited)
     );
@@ -5330,6 +6945,94 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         f.provider.calls.lock().unwrap().is_empty(),
         "compatible selection needs no new generation"
     );
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_provider::ProviderRegistry;
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let native_context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "new-parent-work-turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let native_request = ChatRequest {
+        model: "gpt-4".into(),
+        messages: excluded_turn
+            .messages
+            .iter()
+            .cloned()
+            .chain(std::iter::once(ChatMessage::user("Continue")))
+            .collect(),
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let refreshed = super::native::prepare_native_projection_from_history(
+        &f.store,
+        &providers,
+        &settings,
+        &native_context,
+        native_request,
+        excluded_turn,
+        f.observer.clone(),
+        f.clock.clone(),
+    )
+    .await
+    .expect("ancestor selection alone must not make publication stale");
+    let refreshed_checkpoint = f
+        .store
+        .compaction_checkpoint(
+            refreshed
+                .receipt
+                .identity
+                .checkpoint
+                .as_deref()
+                .expect("overflow refresh must publish a checkpoint"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let refreshed_operation = f
+        .store
+        .compaction_operation(&refreshed_checkpoint.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let refreshed_snapshot: OperationSnapshot =
+        serde_json::from_str(&refreshed_operation.snapshot).unwrap();
+    assert_eq!(
+        refreshed_snapshot.expected_checkpoint.as_deref(),
+        Some(head.as_str())
+    );
+    assert!(
+        refreshed_checkpoint.previous.is_none(),
+        "the excluded H1 checkpoint must remain CAS state, not become the summary basis"
+    );
     let checkpoint_reference = SourceRef {
         scope: selected[0].provenance.as_ref().unwrap().sources[0]
             .scope
@@ -5356,14 +7059,15 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
             .compaction_reference_fragment("ws", "thread", &checkpoint_reference, 0)
             .await
             .unwrap()
-            .is_none(),
-        "checkpoint text must not be readable after a covered leaf changes"
+            .is_some(),
+        "published checkpoint text disappeared after a covered leaf changed"
     );
-    assert!(
+    assert_eq!(
         super::frozen::restore(&f.store, "ws", &allowed, &frozen)
             .await
-            .is_err(),
-        "frozen checkpoint projection must fail after a covered leaf changes"
+            .unwrap(),
+        selected,
+        "frozen checkpoint did not restore independently after a covered leaf changed"
     );
 }
 
@@ -5891,6 +7595,1005 @@ async fn compaction_compatible_input_overlap_keeps_exact_steering_rows_once() {
 }
 
 #[tokio::test]
+async fn capture_carries_foreign_own_authority_onto_late_summary() {
+    use pioneer_agent::compaction::composition::ScopedHistorySource;
+    use pioneer_compaction::runner::{RunnerState, SourceCursor};
+    use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+
+    let f = fixture("unused", vec![], true, false).await;
+    let db = f.store.database_connection();
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('own-source','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('own-source','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('own-turn','own-source','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('own-task','ws','thread','thread','thread','turn','agent','running','Own source','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('own-run','own-task','own-run',1,1,'succeeded','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('own-rt','own-task','own-run','own-source','own-turn','initial',0,1,'candidate_created',CURRENT_TIMESTAMP)",
+        "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES ('own-candidate','own-task','own-run','own-rt','own-source','own-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('own-delivery-turn','thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES ('own-delivery','ws','own-task','own-run','own-delivery','thread','origin_thread','thread','delivered',1,1,'own-delivery-turn')",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    for (id, text) in [("accepted-a", "accepted A"), ("accepted-b", "accepted B")] {
+        f.store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "own-source".into(),
+                    turn_id: "own-turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: id.into(),
+                        text: text.into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+    }
+    let task_turn = f.store.get_task_run_turn("own-rt").await.unwrap().unwrap();
+    let output = super::frozen::capture_task_output(&f.store, "ws", &task_turn)
+        .await
+        .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES ('own-delivery','own-candidate','own-rt')")
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "own-delivery-turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id("own-delivery"),
+                    text: "accepted A\naccepted B".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let acknowledgement = f
+        .store
+        .compaction_source_page("ws", "thread", "own-delivery-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let output_references = f
+        .store
+        .compaction_frozen_history_page("ws", "own-source", &output.history.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(output_references.len(), 2);
+    assert!(
+        output_references
+            .iter()
+            .all(|reference| reference.sources.len() == 1),
+        "the fixture needs two independent single-source complete units"
+    );
+    let source_a = output_references[0].sources[0].clone();
+    let source_b = output_references[1].sources[0].clone();
+    let mut output_messages = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["own-source".to_owned()]),
+        &output.history,
+    )
+    .await
+    .unwrap();
+    let mut imports = std::collections::BTreeMap::new();
+    for (ordinal, (message, source)) in output_messages
+        .iter_mut()
+        .zip([source_a.clone(), source_b.clone()])
+        .enumerate()
+    {
+        let origin = message.provenance.as_mut().unwrap();
+        origin.context_thread = Some("thread".into());
+        origin.inherited = false;
+        let prepared = f
+            .store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "own-delivery",
+                &acknowledgement,
+                ordinal as u64,
+                "own-source",
+                &source,
+            )
+            .await
+            .unwrap();
+        imports.insert(
+            ScopedHistorySource {
+                thread: "own-source".into(),
+                source,
+            },
+            vec![prepared],
+        );
+    }
+    let parent_projection = super::frozen::capture_with_imports_prepared(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into(), "own-source".into()]),
+        &output_messages,
+        &imports,
+        super::coverage::CheckpointGraphResolver::default(),
+    )
+    .await
+    .unwrap();
+    let parent_json = serde_json::to_string(&parent_projection.descriptor).unwrap();
+
+    async fn install_execution(db: &pioneer_sqlite::SqliteDatabase, id: &str, parent_json: &str) {
+        for statement in [
+            format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{id}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('{id}','thread','thread',1,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-{id}','{id}','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task-{id}','ws','thread','thread','thread','turn','agent','running','{id}','fixture')"
+            ),
+            format!(
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-{id}','task-{id}','run-{id}',1,1,'running','agent')"
+            ),
+            format!(
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-{id}','task-{id}','run-{id}','{id}','turn-{id}','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
+            ),
+        ] {
+            db.execute_unprepared(&statement).await.unwrap();
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-{id}','task-{id}','ws','thread','turn',?,CURRENT_TIMESTAMP)"),
+            [parent_json.to_owned().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    install_execution(&db, "consumer-one", &parent_json).await;
+
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "fixture".into(),
+        model: "fixture".into(),
+        effort: None,
+    };
+    let own_epoch = f
+        .store
+        .compaction_projection_version("ws", "own-source")
+        .await
+        .unwrap();
+    let summary_operation = OperationSnapshot {
+        id: "late-own-summary-operation".into(),
+        owner: super::native::native_owner("ws", "own-source"),
+        expected_checkpoint: None,
+        projection_version: own_epoch,
+        source_epochs: std::collections::BTreeMap::from([("own-source".into(), own_epoch)]),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![source_a.clone()],
+            fingerprint: "late-own-summary-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit("ws", "own-source", &summary_operation)
+        .await
+        .unwrap();
+    let budget = ModelBudget::new(None, None, None);
+    f.store
+        .compaction_prepare_runner(&summary_operation.id, &budget, 1, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &summary_operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "own-source".into(),
+                source: source_a.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let summary = Checkpoint {
+        id: "late-own-summary".into(),
+        operation_id: summary_operation.id.clone(),
+        owner: summary_operation.owner.clone(),
+        previous: None,
+        coverage: vec![source_a.clone()],
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\nAccepted A.\n"))
+            .collect(),
+        selection: selection.clone(),
+        projection_version: own_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&summary, 0)
+        .await
+        .unwrap();
+    let (kind, turn) = if let Some(turn) = source_a.scope.strip_prefix("item:") {
+        (CanonicalSource::ToolItem, turn)
+    } else if let Some(turn) = source_a.scope.strip_prefix("event:") {
+        (CanonicalSource::Event, turn)
+    } else if let Some(turn) = source_a.scope.strip_prefix("context:") {
+        (CanonicalSource::ProviderContext, turn)
+    } else if let Some(turn) = source_a.scope.strip_prefix("input:") {
+        (CanonicalSource::Input, turn)
+    } else {
+        panic!("unexpected output source")
+    };
+    let assertion = SourceAssertion {
+        revision: Some(
+            source_a
+                .version
+                .rsplit_once(':')
+                .unwrap()
+                .1
+                .parse()
+                .unwrap(),
+        ),
+        kind,
+        turn_id: turn.into(),
+        id: source_a.id.clone(),
+        payload: super::history::reference_payload(&f.store, "ws", "own-source", &source_a)
+            .await
+            .unwrap(),
+    };
+    assert_eq!(
+        f.store
+            .compaction_apply(&summary, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let summary_source = f
+        .store
+        .compaction_checkpoint_source("ws", "own-source", &summary.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A multi-level target covering both accepted ordinals must prepare its
+    // immutable evidence with one graph walk, not one walk per grant.
+    let mut batch_operation = summary_operation.clone();
+    batch_operation.id = "late-own-batch-operation".into();
+    batch_operation.expected_checkpoint = Some(summary.id.clone());
+    batch_operation.plan.coverage = vec![source_b.clone()];
+    batch_operation.plan.fingerprint = "late-own-batch-plan".into();
+    f.store
+        .compaction_admit("ws", "own-source", &batch_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(&batch_operation.id, &budget, 1, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &batch_operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "own-source".into(),
+                source: source_b.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let batch_checkpoint = Checkpoint {
+        id: "late-own-batch-checkpoint".into(),
+        operation_id: batch_operation.id.clone(),
+        owner: batch_operation.owner.clone(),
+        previous: Some(summary.id.clone()),
+        coverage: vec![source_b.clone()],
+        summary: "accepted A and B".into(),
+        selection: selection.clone(),
+        projection_version: own_epoch,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&batch_checkpoint, 0)
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET status='applied' WHERE id='late-own-batch-checkpoint'",
+    )
+    .await
+    .unwrap();
+    let batch_source = f
+        .store
+        .compaction_checkpoint_source("ws", "own-source", &batch_checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let graph_reads =
+        pioneer_crud::compaction::observe_checkpoint_import_graph_reads(&f.store, "ws");
+    let batch_imports = f
+        .store
+        .compaction_prepare_accepted_checkpoint_imports(
+            "ws",
+            "consumer-one",
+            "turn-consumer-one",
+            &[0, 1],
+            "own-source",
+            &batch_source,
+        )
+        .await
+        .unwrap();
+    assert_eq!(batch_imports.len(), 2);
+    assert_eq!(
+        graph_reads.reads(),
+        3,
+        "two grants must share the root/previous metadata traversal"
+    );
+    drop(graph_reads);
+
+    let capture = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "consumer-one",
+        Some("turn-consumer-one"),
+        Some("turn-consumer-one"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(capture.messages.len(), 2);
+    assert_eq!(
+        capture.messages[0].provenance.as_ref().unwrap().thread_id,
+        "own-source"
+    );
+    assert_eq!(
+        capture.messages[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .context_thread
+            .as_deref(),
+        Some("consumer-one")
+    );
+    assert!(!capture.messages[0].provenance.as_ref().unwrap().inherited);
+    let captured_summary = &capture.messages[0].provenance.as_ref().unwrap().sources[0];
+    assert_eq!(
+        (
+            captured_summary.scope.as_str(),
+            captured_summary.id.as_str(),
+            captured_summary.version.as_str(),
+        ),
+        (
+            summary_source.scope.as_str(),
+            summary_source.id.as_str(),
+            summary_source.version.as_str(),
+        )
+    );
+    assert!(capture.messages[1].content.contains("accepted B"));
+    let carried = f
+        .store
+        .compaction_frozen_import_page("ws", "consumer-one", &capture.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    assert_eq!(carried.len(), 2);
+    assert!(
+        carried
+            .iter()
+            .any(|record| record.source == source_a && record.message_ordinal == 0)
+    );
+    assert!(
+        carried
+            .iter()
+            .any(|record| record.source == source_b && record.message_ordinal == 1)
+    );
+    assert_eq!(
+        carried
+            .iter()
+            .map(|record| (record.source.clone(), record.output_ordinal))
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([(source_a.clone(), 0), (source_b.clone(), 1)]),
+        "checkpoint projection must preserve immutable output ordinals"
+    );
+
+    async fn publish_capture(
+        fixture: &Fixture,
+        execution: &str,
+        turn: &str,
+        id: &str,
+        capture: &super::frozen::PreparedHistory,
+    ) -> CommitOutcome {
+        let epoch = fixture
+            .store
+            .compaction_projection_version("ws", execution)
+            .await
+            .unwrap();
+        let sources = capture
+            .messages
+            .iter()
+            .flat_map(|message| {
+                let origin = message.provenance.as_ref().unwrap();
+                origin.sources.iter().map(move |source| {
+                    (
+                        origin.thread_id.clone(),
+                        SourceRef {
+                            scope: source.scope.clone(),
+                            id: source.id.clone(),
+                            version: source.version.clone(),
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let selection = ModelSelection {
+            transport: Transport::Api,
+            instance: "fixture".into(),
+            model: "fixture".into(),
+            effort: None,
+        };
+        let snapshot = OperationSnapshot {
+            id: id.into(),
+            owner: super::native::native_owner("ws", execution),
+            expected_checkpoint: capture.expected_checkpoint.clone(),
+            projection_version: epoch,
+            source_epochs: capture.source_epochs.clone(),
+            admission: CompactionSettings::default()
+                .admit(&selection, None, 0)
+                .unwrap(),
+            plan: CompactionPlan {
+                mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+                compact: (0..sources.len()).collect(),
+                retain: vec![],
+                coverage: sources.iter().map(|(_, source)| source.clone()).collect(),
+                fingerprint: format!("{id}-plan"),
+            },
+        };
+        fixture
+            .store
+            .compaction_admit_for_turn("ws", execution, &snapshot, Some(turn))
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_bind_source_projection(&snapshot.id, &capture.descriptor)
+            .await
+            .unwrap();
+        let budget = ModelBudget::new(None, None, None);
+        fixture
+            .store
+            .compaction_prepare_runner(&snapshot.id, &budget, sources.len() as u64, 0)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .compaction_append_manifest(
+                &snapshot.id,
+                &sources
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, (thread_id, source))| ManifestEntry {
+                        ordinal: ordinal as u64,
+                        unit: ordinal as u64,
+                        reference_only: false,
+                        thread_id: thread_id.clone(),
+                        source: source.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let initial =
+            RunnerState::new(snapshot.admission.deadline_ms, &budget, 1_000, None).unwrap();
+        fixture
+            .store
+            .compaction_activate_runner(&snapshot.id, &initial)
+            .await
+            .unwrap();
+        let attempt = initial.claim(1).unwrap();
+        assert!(
+            fixture
+                .store
+                .compaction_runner_transition(&snapshot.id, initial.generation, &attempt, None)
+                .await
+                .unwrap()
+        );
+        let checkpoint = Checkpoint {
+            id: format!("checkpoint-{id}"),
+            operation_id: snapshot.id.clone(),
+            owner: snapshot.owner.clone(),
+            previous: snapshot.expected_checkpoint.clone(),
+            coverage: sources.iter().map(|(_, source)| source.clone()).collect(),
+            summary: "captured accepted OWN summary".into(),
+            selection,
+            projection_version: epoch,
+            format_version: pioneer_compaction::FORMAT_VERSION,
+        };
+        let candidate = attempt
+            .candidate(
+                1,
+                checkpoint.id.clone(),
+                SourceCursor {
+                    unit: sources.len() as u64,
+                    ..Default::default()
+                },
+                true,
+                2,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .compaction_runner_transition(
+                    &snapshot.id,
+                    attempt.generation,
+                    &candidate,
+                    Some(&checkpoint)
+                )
+                .await
+                .unwrap()
+        );
+        let ready = candidate.candidate_checked(true).unwrap();
+        assert!(
+            fixture
+                .store
+                .compaction_runner_transition(&snapshot.id, candidate.generation, &ready, None)
+                .await
+                .unwrap()
+        );
+        fixture
+            .store
+            .compaction_apply_runner(&snapshot.id, &ready, None)
+            .await
+            .unwrap()
+    }
+    assert_eq!(
+        publish_capture(
+            &f,
+            "consumer-one",
+            "turn-consumer-one",
+            "consumer-one-operation",
+            &capture,
+        )
+        .await,
+        CommitOutcome::Applied
+    );
+
+    // Accept the result of the first capture itself. Install an unrelated head
+    // for the source thread so no new projection can recreate S(A); the saved
+    // checkpoint-bound evidence on message zero must survive as-is.
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "own-source".into(),
+                turn_id: "own-turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "other-chain-c".into(),
+                    text: "unrelated other-chain C".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "own-source")
+        .await
+        .unwrap();
+    let other_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let other_source =
+        super::history::load_line_history(&f.store, "ws", "own-source", None, &other_fence)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| message.content.contains("unrelated other-chain C"))
+            .unwrap()
+            .provenance
+            .unwrap()
+            .sources[0]
+            .clone();
+    let other_source = SourceRef {
+        scope: other_source.scope,
+        id: other_source.id,
+        version: other_source.version,
+    };
+    let other_epoch = f
+        .store
+        .compaction_projection_version("ws", "own-source")
+        .await
+        .unwrap();
+    let other_operation = OperationSnapshot {
+        id: "other-chain-operation".into(),
+        owner: summary_operation.owner.clone(),
+        expected_checkpoint: None,
+        projection_version: other_epoch,
+        source_epochs: std::collections::BTreeMap::from([("own-source".into(), other_epoch)]),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![other_source.clone()],
+            fingerprint: "other-chain".into(),
+        },
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_operation(id,owner,fingerprint,status,outcome,snapshot,deadline_ms) VALUES (?,?,?,'completed','applied',?,1)",
+        [
+            other_operation.id.clone().into(),
+            other_operation.owner.clone().into(),
+            other_operation.plan.fingerprint.clone().into(),
+            serde_json::to_string(&other_operation).unwrap().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,previous,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('other-chain-head',?,?,NULL,0,'unrelated C','other-chain-version',?,?,1,'applied')",
+        [
+            other_operation.id.clone().into(),
+            other_operation.owner.clone().into(),
+            serde_json::to_string(&selection).unwrap().into(),
+            i64::try_from(other_operation.projection_version)
+                .unwrap()
+                .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('other-chain-head',?,?,?)",
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('other-chain-operation',0,0,0,'own-source',?,?,?)",
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            statement,
+            [
+                other_source.scope.clone().into(),
+                other_source.id.clone().into(),
+                other_source.version.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute_unprepared("UPDATE compaction_context SET head='other-chain-head' WHERE owner=(SELECT owner FROM compaction_checkpoint WHERE id='late-own-summary')")
+        .await
+        .unwrap();
+
+    async fn install_recapture(db: &pioneer_sqlite::SqliteDatabase, id: &str, history_json: &str) {
+        for statement in [
+            format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{id}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('{id}','consumer-one','thread',2,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-{id}','{id}','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task-{id}','ws','thread','consumer-one','consumer-one','turn-consumer-one','agent','running','{id}','fixture')"
+            ),
+            format!(
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-{id}','task-{id}','run-{id}',1,1,'running','agent')"
+            ),
+            format!(
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-{id}','task-{id}','run-{id}','{id}','turn-{id}','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
+            ),
+        ] {
+            db.execute_unprepared(&statement).await.unwrap();
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run-{id}','task-{id}','ws','consumer-one','turn-consumer-one',?,CURRENT_TIMESTAMP)"),
+            [history_json.to_owned().into()],
+        ))
+        .await
+        .unwrap();
+    }
+
+    let captured_json = serde_json::to_string(&capture.descriptor).unwrap();
+    install_recapture(&db, "repeat-before-delete", &captured_json).await;
+    let repeated_before_delete = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "repeat-before-delete",
+        Some("turn-repeat-before-delete"),
+        Some("turn-repeat-before-delete"),
+        None,
+    )
+    .await
+    .expect("retained checkpoint evidence must survive a repeat capture");
+    assert_eq!(
+        repeated_before_delete.messages[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources[0]
+            .id,
+        summary.id
+    );
+    let repeated_imports = f
+        .store
+        .compaction_frozen_import_page(
+            "ws",
+            "repeat-before-delete",
+            &repeated_before_delete.descriptor.manifest_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(repeated_imports.iter().any(|record| {
+        record.source == source_a && record.message_ordinal == 0 && record.output_ordinal == 0
+    }));
+    assert_eq!(
+        publish_capture(
+            &f,
+            "repeat-before-delete",
+            "turn-repeat-before-delete",
+            "repeat-before-delete-operation",
+            &repeated_before_delete,
+        )
+        .await,
+        CommitOutcome::Applied
+    );
+
+    let delete_a = if source_a.scope.starts_with("item:") {
+        "DELETE FROM turn_item WHERE id=?"
+    } else if source_a.scope.starts_with("event:") {
+        "DELETE FROM turn_event WHERE id=?"
+    } else if source_a.scope.starts_with("context:") {
+        "DELETE FROM turn_llm_context WHERE id=?"
+    } else {
+        "DELETE FROM turn_input WHERE id=?"
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        delete_a,
+        [source_a.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    install_recapture(&db, "repeat-after-delete", &captured_json).await;
+    let (repeated_after_delete, repeated_reads) =
+        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "repeat-after-delete",
+            Some("turn-repeat-after-delete"),
+            Some("turn-repeat-after-delete"),
+            None,
+        ))
+        .await;
+    let repeated_after_delete = repeated_after_delete
+        .expect("retained S evidence must not require the deleted covered A payload");
+    assert_eq!(
+        repeated_after_delete.messages[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources[0]
+            .id,
+        summary.id
+    );
+    assert_eq!(
+        repeated_reads.calls, 0,
+        "repeat capture must not reload canonical history behind the frozen descriptor"
+    );
+    let repeated_imports = f
+        .store
+        .compaction_frozen_import_page(
+            "ws",
+            "repeat-after-delete",
+            &repeated_after_delete.descriptor.manifest_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(repeated_imports.iter().any(|record| {
+        record.source == source_a && record.message_ordinal == 0 && record.output_ordinal == 0
+    }));
+    assert_eq!(
+        publish_capture(
+            &f,
+            "repeat-after-delete",
+            "turn-repeat-after-delete",
+            "repeat-after-delete-operation",
+            &repeated_after_delete,
+        )
+        .await,
+        CommitOutcome::Applied
+    );
+    db.execute_unprepared("UPDATE compaction_context SET head='late-own-summary' WHERE owner=(SELECT owner FROM compaction_checkpoint WHERE id='late-own-summary')")
+        .await
+        .unwrap();
+    install_execution(&db, "consumer-two", &parent_json).await;
+    let (after_delete, reads) =
+        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "consumer-two",
+            Some("turn-consumer-two"),
+            Some("turn-consumer-two"),
+            None,
+        ))
+        .await;
+    let after_delete = after_delete.expect("the summary must replace deleted accepted A");
+    assert_eq!(
+        after_delete.messages[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .sources[0]
+            .id,
+        summary.id
+    );
+    assert!(after_delete.messages[1].content.contains("accepted B"));
+    assert_eq!(
+        reads.calls, 0,
+        "accepted frozen history must not reload canonical payload batches"
+    );
+
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "own-source".into(),
+                turn_id: "own-turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "unaccepted-x".into(),
+                    text: "unaccepted X".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "own-source")
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let x = super::history::load_line_history(&f.store, "ws", "own-source", None, &fence)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content.contains("unaccepted X"))
+        .unwrap()
+        .provenance
+        .unwrap()
+        .sources[0]
+        .clone();
+    let x = SourceRef {
+        scope: x.scope,
+        id: x.id,
+        version: x.version,
+    };
+    let mut wider = summary.clone();
+    wider.id = "late-own-summary-with-unaccepted-x".into();
+    wider.previous = Some(summary.id.clone());
+    wider.coverage = vec![x.clone()];
+    wider.summary = "A plus unaccepted X".into();
+    wider.operation_id = "late-own-summary-with-x-operation".into();
+    let mut wider_operation = summary_operation.clone();
+    wider_operation.id = wider.operation_id.clone();
+    wider_operation.expected_checkpoint = Some(summary.id.clone());
+    wider_operation.plan.fingerprint = "late-own-summary-with-x-plan".into();
+    wider_operation.plan.coverage = vec![x.clone()];
+    wider_operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "own-source")
+        .await
+        .unwrap();
+    wider.projection_version = wider_operation.projection_version;
+    wider_operation
+        .source_epochs
+        .insert("own-source".into(), wider_operation.projection_version);
+    f.store
+        .compaction_admit("ws", "own-source", &wider_operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(&wider_operation.id, &budget, 1, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &wider_operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "own-source".into(),
+                source: x,
+            }],
+        )
+        .await
+        .unwrap();
+    f.store.compaction_save_candidate(&wider, 0).await.unwrap();
+    db.execute_unprepared("UPDATE compaction_checkpoint SET status='applied' WHERE id='late-own-summary-with-unaccepted-x'; UPDATE compaction_context SET head='late-own-summary-with-unaccepted-x' WHERE owner=(SELECT owner FROM compaction_checkpoint WHERE id='late-own-summary-with-unaccepted-x'); UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id='late-own-summary-with-x-operation'").await.unwrap();
+    install_execution(&db, "consumer-three", &parent_json).await;
+    let bounded = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "consumer-three",
+        Some("turn-consumer-three"),
+        Some("turn-consumer-three"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded.messages[0].provenance.as_ref().unwrap().sources[0].id,
+        summary.id,
+        "the newer summary containing unaccepted X must fall back to S(A)"
+    );
+
+    let delete_b = if source_b.scope.starts_with("item:") {
+        "DELETE FROM turn_item WHERE id=?"
+    } else if source_b.scope.starts_with("event:") {
+        "DELETE FROM turn_event WHERE id=?"
+    } else if source_b.scope.starts_with("context:") {
+        "DELETE FROM turn_llm_context WHERE id=?"
+    } else {
+        "DELETE FROM turn_input WHERE id=?"
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        delete_b,
+        [source_b.id.into()],
+    ))
+    .await
+    .unwrap();
+    install_execution(&db, "consumer-four", &parent_json).await;
+    assert!(
+        super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "consumer-four",
+            Some("turn-consumer-four"),
+            Some("turn-consumer-four"),
+            None
+        )
+        .await
+        .is_err(),
+        "an uncovered deleted accepted raw source must remain an error"
+    );
+}
+
+#[tokio::test]
 async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_covering_h() {
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
     use std::collections::BTreeSet;
@@ -5914,6 +8617,23 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     snapshot.plan.fingerprint = "c-plan".into();
     f.store
         .compaction_admit("ws", "c", &snapshot)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(&snapshot.id, &ModelBudget::new(None, None, None), 1, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &snapshot.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: a_source.clone(),
+            }],
+        )
         .await
         .unwrap();
     let c = Checkpoint {
@@ -5975,21 +8695,21 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     db.execute_unprepared("INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('h-source','thread','turn',2,'fixture','{}',CURRENT_TIMESTAMP)").await.unwrap();
     let allowed = BTreeSet::from(["thread".into(), "c".into()]);
     let original = vec![h.clone(), own.clone()];
-    let mut denied = original.clone();
-    assert!(
-        super::checkpoint::project_checkpoint(
-            &f.store,
-            "ws",
-            "c",
-            "c-owner",
-            &c.id,
-            &BTreeSet::from(["c".into()]),
-            &mut denied
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(denied, original);
+    let mut root_scoped = original.clone();
+    super::checkpoint::project_checkpoint(
+        &f.store,
+        "ws",
+        "c",
+        "c-owner",
+        &c.id,
+        &BTreeSet::from(["c".into()]),
+        &mut root_scoped,
+    )
+    .await
+    .unwrap();
+    assert_eq!(root_scoped.len(), 2);
+    assert_eq!(root_scoped[0], h);
+    assert!(root_scoped[1].content.contains("C prepared work"));
     let mut projected = original.clone();
     super::checkpoint::project_checkpoint(
         &f.store,
@@ -6034,14 +8754,19 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     db.execute_unprepared("UPDATE turn_event SET payload='edited A' WHERE id='source'")
         .await
         .unwrap();
-    let mut stale = original;
-    assert!(
-        super::checkpoint::project_checkpoint(
-            &f.store, "ws", "c", "c-owner", &c.id, &allowed, &mut stale
-        )
-        .await
-        .is_err()
-    );
+    let mut after_historical_edit = original;
+    super::checkpoint::project_checkpoint(
+        &f.store,
+        "ws",
+        "c",
+        "c-owner",
+        &c.id,
+        &allowed,
+        &mut after_historical_edit,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after_historical_edit, projected);
 }
 
 #[tokio::test]
@@ -6060,6 +8785,33 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
     snapshot.plan.fingerprint = snapshot.id.clone();
     f.store
         .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &snapshot.id,
+            &ModelBudget::new(None, None, None),
+            checkpoint.coverage.len() as u64,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &snapshot.id,
+            &checkpoint
+                .coverage
+                .iter()
+                .enumerate()
+                .map(|(ordinal, source)| ManifestEntry {
+                    ordinal: ordinal as u64,
+                    unit: ordinal as u64,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: source.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
         .await
         .unwrap();
     checkpoint.id = "published-child-summary".into();
@@ -6150,6 +8902,15 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         .compaction_admit("ws", "thread", &mixed_snapshot)
         .await
         .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &mixed_snapshot.id,
+            &ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
     let mut mixed = checkpoint.clone();
     mixed.id = "published-working-summary".into();
     mixed.operation_id = mixed_snapshot.id.clone();
@@ -6160,6 +8921,19 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         version: "event-revision:1".into(),
     }];
     mixed.summary = "accepted H and completed A".into();
+    f.store
+        .compaction_append_manifest(
+            &mixed_snapshot.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: mixed.coverage[0].clone(),
+            }],
+        )
+        .await
+        .unwrap();
     f.store.compaction_save_candidate(&mixed, 0).await.unwrap();
     db.execute_unprepared(
         "UPDATE compaction_checkpoint SET status='applied' WHERE id='published-working-summary'",
@@ -6218,6 +8992,19 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         version: "event-revision:1".into(),
     }];
     later.summary = "work beyond the accepted boundary".into();
+    f.store
+        .compaction_append_manifest(
+            &later.operation_id,
+            &[ManifestEntry {
+                ordinal: 1,
+                unit: 1,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: later.coverage[0].clone(),
+            }],
+        )
+        .await
+        .unwrap();
     f.store.compaction_save_candidate(&later, 1).await.unwrap();
     db.execute_unprepared(
         "UPDATE compaction_checkpoint SET status='applied' WHERE id='later-child-summary'",
@@ -6258,6 +9045,22 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         inherited, unchanged,
         "H does not become an imported own contribution"
     );
+    let mut newer_revision = original.clone();
+    newer_revision[0].provenance.as_mut().unwrap().sources[0].version = "event-revision:2".into();
+    let outside_snapshot = newer_revision.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &f.store,
+        "ws",
+        "next-child",
+        &allowed,
+        &mut newer_revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        newer_revision, outside_snapshot,
+        "the same source ID at a later revision is outside the accepted snapshot"
+    );
     db.execute_unprepared("UPDATE turn_event SET payload='edited A' WHERE id='source'")
         .await
         .unwrap();
@@ -6272,8 +9075,8 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
     .await
     .unwrap();
     assert_eq!(
-        current, original,
-        "invalidated heads do not replace current source history"
+        current, once,
+        "an edited covered source returned beside its published summary"
     );
 }
 

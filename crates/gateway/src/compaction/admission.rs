@@ -11,8 +11,8 @@ pub(crate) struct PreparedOperation {
     pub execution_turn: String,
     pub source_projection: Option<pioneer_compaction::frozen::FrozenHistoryRef>,
     pub expected_checkpoint: Option<String>,
-    /// A stale published head still participates in CAS, but its summary must
-    /// not contaminate a rebuild from current canonical sources.
+    /// Published checkpoint selected as the atomic previous-summary input.
+    /// Historical leaf edits do not make this basis stale.
     pub summary_basis: Option<String>,
     pub operation_deadline_ms: Option<u64>,
     pub projection_version: u64,

@@ -6787,8 +6787,10 @@ where
         },
         async {
             // insert-if-absent may have accepted another immutable snapshot.
-            // Never pair it with messages assembled by the losing capture.
-            restore_task_run_conversation_snapshot_fields(
+            // Never pair it with messages assembled by the losing capture or
+            // project a newer checkpoint into the concurrent winner. This
+            // path returns the accepted manifest's literal order/count.
+            restore_task_run_conversation_snapshot_literal_fields(
                 store,
                 &persisted,
                 task_id,
@@ -6801,6 +6803,50 @@ where
         },
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_task_run_conversation_snapshot_literal_fields(
+    store: &pioneer_crud::CrudStore,
+    snapshot: &pioneer_crud::TaskRunConversationSnapshotRecord,
+    task_id: &str,
+    workspace: &str,
+    conversation_thread: &str,
+    source_turn_id: Option<&str>,
+    execution_thread_id: &str,
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    ensure_task_run_snapshot_identity_fields(
+        snapshot,
+        task_id,
+        workspace,
+        conversation_thread,
+        source_turn_id,
+    )?;
+    let allowed = crate::compaction::frozen::accepted_history_scopes(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.conversation_thread_id,
+        &snapshot.history_json,
+    )
+    .await?;
+    let mut history = crate::turn_runtime_snapshot::restore_history_json(
+        store,
+        &snapshot.workspace_id,
+        &allowed,
+        &snapshot.history_json,
+    )
+    .await
+    .context("failed to restore accepted concurrent Task snapshot")?;
+    crate::compaction::frozen::hydrate_accepted_own(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.conversation_thread_id,
+        &snapshot.history_json,
+        execution_thread_id,
+        &mut history,
+    )
+    .await?;
+    Ok(history)
 }
 
 async fn select_accepted_task_snapshot<P, R>(
@@ -6888,6 +6934,8 @@ mod prepared_snapshot_tests {
             messages,
             accepted_scopes: BTreeSet::from(["parent".to_owned()]),
             source_epochs: Default::default(),
+            expected_checkpoint: None,
+            checkpoint: None,
             checkpoint_graphs: Default::default(),
         }
     }
@@ -7032,24 +7080,16 @@ async fn restore_task_run_conversation_snapshot_fields(
         &snapshot.history_json,
     )
     .await?;
-    let mut history = crate::turn_runtime_snapshot::restore_history_json(
+    crate::compaction::frozen::restore_accepted_history_for_execution(
         store,
         &snapshot.workspace_id,
+        Some(&snapshot.conversation_thread_id),
+        execution_thread_id,
         &allowed,
         &snapshot.history_json,
     )
     .await
-    .context("failed to restore frozen Task conversation history")?;
-    crate::compaction::frozen::hydrate_accepted_own(
-        store,
-        &snapshot.workspace_id,
-        &snapshot.conversation_thread_id,
-        &snapshot.history_json,
-        execution_thread_id,
-        &mut history,
-    )
-    .await?;
-    Ok(history)
+    .context("failed to restore frozen Task conversation history")
 }
 
 fn ensure_task_run_snapshot_identity_fields(

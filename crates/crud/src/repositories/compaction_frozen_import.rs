@@ -4,8 +4,8 @@
 use super::compaction::*;
 use crate::CrudStore;
 use anyhow::{Result, ensure};
+use pioneer_compaction::SourceRef;
 use pioneer_compaction::frozen::FrozenMessageRef;
-use pioneer_compaction::{FORMAT_VERSION, SourceRef};
 use pioneer_entity::{
     compaction_delivery_output, compaction_event_revision, compaction_frozen_history,
     compaction_frozen_import, compaction_frozen_message, compaction_task_output, task_delivery,
@@ -15,7 +15,76 @@ use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, OnConflict};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+
+#[cfg(any(test, feature = "test-support"))]
+static CHECKPOINT_IMPORT_GRAPH_READS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::BTreeMap<
+            (usize, String),
+            std::sync::Weak<std::sync::atomic::AtomicUsize>,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct CheckpointImportGraphReadObserver {
+    key: (usize, String),
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl CheckpointImportGraphReadObserver {
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for CheckpointImportGraphReadObserver {
+    fn drop(&mut self) {
+        CHECKPOINT_IMPORT_GRAPH_READS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn observe_checkpoint_import_graph_reads(
+    store: &CrudStore,
+    workspace: &str,
+) -> CheckpointImportGraphReadObserver {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+    );
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let previous = CHECKPOINT_IMPORT_GRAPH_READS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone(), std::sync::Arc::downgrade(&reads));
+    assert!(previous.is_none(), "graph read observer already installed");
+    CheckpointImportGraphReadObserver { key, reads }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn observe_checkpoint_import_graph_read(store: &CrudStore, workspace: &str) {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+    );
+    if let Some(reads) = CHECKPOINT_IMPORT_GRAPH_READS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 pub const EMPTY_FROZEN_IMPORT_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -44,6 +113,11 @@ pub struct PreparedFrozenImport {
     original_json: String,
     record: FrozenImportRecord,
     accepted_basis: Option<AcceptedImportBasis>,
+    /// A forwarded immutable grant may be attached to the published checkpoint
+    /// that atomically replaces its accepted input. The stored record remains
+    /// the original grant; this private binding only authorizes its placement
+    /// in the new manifest.
+    target_checkpoint: Option<(String, SourceRef)>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,65 +298,29 @@ pub(crate) async fn compaction_prepare_frozen_import(
                 == snapshot.output.source_thread,
         "inherited or unfinished work cannot become accepted own work"
     );
-    // Prove membership through immutable checkpoint references, not summary
-    // text. Each metadata query releases its reader before graph traversal.
-    let mut pending = original.sources.clone();
-    let mut visited = BTreeSet::new();
+    // An independently published summary is the imported source, not a grant
+    // to extract arbitrary raw leaves from its historical coverage. Direct raw
+    // references remain exact-current.
     let mut found = false;
-    while let Some(reference) = pending.pop() {
-        if !visited.insert(reference.clone()) {
-            continue;
-        }
+    for reference in &original.sources {
         let thread = store
-            .compaction_reference_thread(workspace, &reference)
+            .compaction_reference_thread(workspace, reference)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("output coverage source changed"))?;
-        if &reference == source && thread == source_thread {
+            .ok_or_else(|| anyhow::anyhow!("output source changed"))?;
+        ensure!(
+            thread == original.source_thread,
+            "output source changed ownership"
+        );
+        if reference == source && thread == source_thread {
             found = true;
-            continue;
-        }
-        if let Some(owner) = reference.scope.strip_prefix("checkpoint:") {
-            let checkpoint = store
-                .compaction_checkpoint_edges(&reference.id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("output coverage checkpoint disappeared"))?;
-            ensure!(
-                checkpoint.owner == owner && checkpoint.format_version == FORMAT_VERSION,
-                "output checkpoint identity mismatch"
-            );
-            if let Some(previous) = checkpoint.previous {
-                let previous_edges = store
-                    .compaction_checkpoint_edges(&previous)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("output checkpoint ancestry is unavailable"))?;
-                ensure!(
-                    previous_edges.owner == checkpoint.owner
-                        && previous_edges.format_version == FORMAT_VERSION,
-                    "output checkpoint ancestry identity mismatch"
-                );
-                let previous = SourceRef {
-                    scope: format!("checkpoint:{}", previous_edges.owner),
-                    id: previous,
-                    version: previous_edges.identity_sha256,
-                };
-                ensure!(
-                    store
-                        .compaction_reference_thread(workspace, &previous)
-                        .await?
-                        .as_deref()
-                        == Some(thread.as_str()),
-                    "output checkpoint ancestry is unavailable"
-                );
-                pending.push(previous);
-            }
-            pending.extend(checkpoint.coverage);
         }
     }
-    ensure!(found, "source is outside the accepted own output coverage");
+    ensure!(found, "source is outside the accepted own output message");
     Ok(PreparedFrozenImport {
         workspace: workspace.into(),
         destination: destination.into(),
         accepted_basis: None,
+        target_checkpoint: None,
         output_digest: snapshot.output.history.identity_sha256,
         original_json,
         record: FrozenImportRecord {
@@ -300,9 +338,109 @@ pub(crate) async fn compaction_prepare_frozen_import(
 
 /// Forward only evidence from the exact TaskRun basis accepted by this child.
 /// Preparation reads immutable reference/import metadata outside the writer.
-/// Publication revalidates the TaskRun binding, ready digest, exact proof, target
-/// reference and live source in the same transaction as the bounded import batch.
+/// Publication revalidates the TaskRun binding, ready digest, exact proof and
+/// target reference. Direct raw forwarding also remains exact-current.
 pub(crate) async fn compaction_prepare_accepted_import(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    turn: &str,
+    ordinal: u64,
+) -> Result<PreparedFrozenImport> {
+    let prepared = prepare_accepted_import(store, workspace, destination, turn, ordinal).await?;
+    ensure!(
+        accepted_import_current(&store.connection, &prepared).await?,
+        "accepted import binding changed"
+    );
+    Ok(prepared)
+}
+
+/// Carry an immutable accepted raw grant onto the checkpoint that replaces it.
+/// This validates only the frozen TaskRun binding and saved checkpoint
+/// coverage; the covered raw row is deliberately not required to remain live.
+pub(crate) async fn compaction_prepare_accepted_checkpoint_import(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    turn: &str,
+    ordinal: u64,
+    checkpoint_thread: &str,
+    checkpoint: &SourceRef,
+) -> Result<PreparedFrozenImport> {
+    let mut prepared = compaction_prepare_accepted_checkpoint_imports(
+        store,
+        workspace,
+        destination,
+        turn,
+        std::slice::from_ref(&ordinal),
+        checkpoint_thread,
+        checkpoint,
+    )
+    .await?;
+    Ok(prepared.pop().expect("one requested import"))
+}
+
+/// Prepare every immutable grant for one checkpoint projection. Historical
+/// metadata is traversed once for the target; individual ordinals are matched
+/// against the resulting exact, scoped member set.
+pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
+    store: &CrudStore,
+    workspace: &str,
+    destination: &str,
+    turn: &str,
+    ordinals: &[u64],
+    checkpoint_thread: &str,
+    checkpoint: &SourceRef,
+) -> Result<Vec<PreparedFrozenImport>> {
+    ensure!(!ordinals.is_empty(), "checkpoint import set is empty");
+    ensure!(
+        ordinals.len() <= 65_536,
+        "checkpoint import set exceeds supported quantum"
+    );
+    let unique = ordinals
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        unique.len() == ordinals.len(),
+        "checkpoint import ordinals are duplicated"
+    );
+    let mut prepared = Vec::with_capacity(ordinals.len());
+    for ordinal in ordinals {
+        let import = prepare_accepted_import(store, workspace, destination, turn, *ordinal).await?;
+        ensure!(
+            accepted_import_binding_current(&store.connection, &import).await?,
+            "accepted checkpoint replacement binding changed"
+        );
+        prepared.push(import);
+    }
+    let wanted = prepared
+        .iter()
+        .map(|import| {
+            (
+                import.record.source_thread.clone(),
+                import.record.source.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        checkpoint_historically_contains_all(
+            store,
+            workspace,
+            checkpoint_thread,
+            checkpoint,
+            &wanted,
+        )
+        .await?,
+        "accepted checkpoint replacement binding changed"
+    );
+    for import in &mut prepared {
+        import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
+    }
+    Ok(prepared)
+}
+
+async fn prepare_accepted_import(
     store: &CrudStore,
     workspace: &str,
     destination: &str,
@@ -334,7 +472,7 @@ pub(crate) async fn compaction_prepare_accepted_import(
             .await?
             .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
     let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
-    let prepared = PreparedFrozenImport {
+    Ok(PreparedFrozenImport {
         workspace: workspace.into(),
         destination: destination.into(),
         output_digest: String::new(),
@@ -350,12 +488,8 @@ pub(crate) async fn compaction_prepare_accepted_import(
             ordinal,
             proof_json,
         }),
-    };
-    ensure!(
-        accepted_import_current(&store.connection, &prepared).await?,
-        "accepted import binding changed"
-    );
-    Ok(prepared)
+        target_checkpoint: None,
+    })
 }
 
 async fn accepted_import_current<C: ConnectionTrait>(
@@ -371,7 +505,158 @@ async fn accepted_import_current<C: ConnectionTrait>(
         .is_some())
 }
 
-// This is the existence-only expansion of the six UNION ALL branches in
+async fn accepted_import_binding_current<C: ConnectionTrait>(
+    db: &C,
+    prepared: &PreparedFrozenImport,
+) -> Result<bool> {
+    Ok(db
+        .query_one_raw(accepted_import_current_statement(
+            ACCEPTED_IMPORT_BINDING_CURRENT_SQL,
+            prepared,
+        )?)
+        .await?
+        .is_some())
+}
+
+/// Check saved coverage only. The target root and any checkpoint used as an
+/// atomic grant must still be published objects; expanded predecessors and raw
+/// leaves are historical metadata, not live source dependencies.
+async fn checkpoint_historically_contains_all(
+    store: &CrudStore,
+    workspace: &str,
+    checkpoint_thread: &str,
+    checkpoint: &SourceRef,
+    wanted: &std::collections::BTreeSet<(String, SourceRef)>,
+) -> Result<bool> {
+    if compaction_checkpoint_source(
+        &store.connection,
+        workspace,
+        checkpoint_thread,
+        &checkpoint.id,
+    )
+    .await?
+    .as_ref()
+        != Some(checkpoint)
+    {
+        anyhow::bail!("checkpoint replacement root is unavailable");
+    }
+    let mut pending = vec![(checkpoint.clone(), checkpoint_thread.to_owned(), false)];
+    let mut done = std::collections::BTreeSet::new();
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut visited = 0usize;
+    let mut found = std::collections::BTreeSet::new();
+    while let Some((source, thread, exiting)) = pending.pop() {
+        let key = (source.clone(), thread.clone());
+        if exiting {
+            visiting.remove(&key);
+            done.insert(key);
+            continue;
+        }
+        if done.contains(&key) {
+            continue;
+        }
+        visited = visited
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint graph size overflow"))?;
+        ensure!(
+            visited <= 65_536,
+            "checkpoint historical coverage exceeds supported quantum"
+        );
+        if wanted.contains(&(thread.clone(), source.clone())) {
+            if source.scope.starts_with("checkpoint:")
+                && compaction_checkpoint_source(&store.connection, workspace, &thread, &source.id)
+                    .await?
+                    .as_ref()
+                    != Some(&source)
+            {
+                return Ok(false);
+            }
+            found.insert((thread.clone(), source.clone()));
+            done.insert(key);
+            continue;
+        }
+        if !source.scope.starts_with("checkpoint:") {
+            done.insert(key);
+            continue;
+        }
+        ensure!(visiting.insert(key), "cyclic checkpoint coverage");
+        #[cfg(any(test, feature = "test-support"))]
+        observe_checkpoint_import_graph_read(store, workspace);
+        let edges = compaction_checkpoint_edges(&store.connection, &source.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint coverage node disappeared"))?;
+        ensure!(
+            edges.workspace_id == workspace
+                && edges.thread_id == thread
+                && source.scope == format!("checkpoint:{}", edges.owner)
+                && source.version == edges.identity_sha256
+                && edges.format_version == pioneer_compaction::FORMAT_VERSION,
+            "checkpoint historical ownership, identity or format changed"
+        );
+        pending.push((source, thread, true));
+        if let Some(previous) = edges.previous {
+            #[cfg(any(test, feature = "test-support"))]
+            observe_checkpoint_import_graph_read(store, workspace);
+            let previous_edges = compaction_checkpoint_edges(&store.connection, &previous)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
+            ensure!(
+                previous_edges.owner == edges.owner
+                    && previous_edges.workspace_id == edges.workspace_id
+                    && previous_edges.thread_id == edges.thread_id
+                    && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
+                "previous checkpoint changed historical ownership or format"
+            );
+            pending.push((
+                SourceRef {
+                    scope: format!("checkpoint:{}", previous_edges.owner),
+                    id: previous,
+                    version: previous_edges.identity_sha256,
+                },
+                previous_edges.thread_id,
+                false,
+            ));
+        }
+        pending.extend(
+            edges
+                .coverage
+                .into_iter()
+                .map(|covered| (covered.source, covered.source_thread, false)),
+        );
+    }
+    Ok(found == *wanted)
+}
+
+const ACCEPTED_IMPORT_BINDING_CURRENT_SQL: &str = r#"
+SELECT 1
+FROM task_run_turn execution
+JOIN task_run_conversation_snapshot snapshot
+  ON snapshot.run_id=execution.run_id AND snapshot.task_id=execution.task_id
+JOIN thread_lineage lineage
+  ON lineage.child_thread_id=execution.thread_id
+ AND lineage.parent_thread_id=snapshot.conversation_thread_id
+JOIN thread child
+  ON child.id=execution.thread_id AND child.workspace_id=snapshot.workspace_id
+JOIN compaction_frozen_history h
+  ON h.id=?
+ AND h.owner_thread=snapshot.conversation_thread_id
+ AND h.workspace_id=snapshot.workspace_id
+JOIN compaction_frozen_import i
+  ON i.manifest_id=h.id AND i.ordinal=?
+WHERE execution.thread_id=?
+  AND execution.turn_id=?
+  AND snapshot.workspace_id=?
+  AND snapshot.history_json=?
+  AND h.ready=1
+  AND h.identity_sha256=?
+  AND h.next_import=h.import_count
+  AND i.proof_json=?
+  AND h.imports_sha256=?
+  AND h.import_count=?
+LIMIT 1
+"#;
+
+// This is the existence-only expansion of the source branches in
 // compaction_live_sources. Keep each branch's predicates in sync with the view.
 const ACCEPTED_IMPORT_CURRENT_SQL: &str = r#"
 SELECT 1
@@ -464,7 +749,6 @@ WHERE execution.thread_id=?
       SELECT 1
       FROM compaction_checkpoint checkpoint
       JOIN compaction_context context ON context.owner=checkpoint.owner
-      LEFT JOIN compaction_projection_epoch epoch ON epoch.thread_id=context.thread_id
       WHERE (
           checkpoint.status='applied'
           OR (
@@ -477,12 +761,12 @@ WHERE execution.thread_id=?
             )
           )
         )
-        AND checkpoint.projection_version=COALESCE(epoch.version,0)
         AND context.workspace_id=h.workspace_id
         AND context.thread_id=i.source_thread
         AND 'checkpoint:'||checkpoint.owner=i.source_scope
         AND checkpoint.id=i.source_id
         AND checkpoint.identity_sha256=i.source_version
+        AND checkpoint.format_version=1
     )
     OR EXISTS (
       SELECT 1
@@ -561,6 +845,14 @@ pub(crate) async fn compaction_append_frozen_imports(
             .ok_or_else(|| anyhow::anyhow!("target reference is unavailable"))?;
         let target: FrozenMessageRef = serde_json::from_str(&target_json)?;
         target.validate()?;
+        let target_matches =
+            if let Some((checkpoint_thread, checkpoint)) = &prepared.target_checkpoint {
+                target.source_thread == *checkpoint_thread
+                    && target.sources.as_slice() == std::slice::from_ref(checkpoint)
+            } else {
+                target.source_thread == prepared.record.source_thread
+                    && target.sources.contains(&prepared.record.source)
+            };
         ensure!(
             !target.inherited
                 && target.complete
@@ -570,8 +862,7 @@ pub(crate) async fn compaction_append_frozen_imports(
                     .as_deref()
                     .unwrap_or(&target.source_thread)
                     == owner
-                && target.source_thread == prepared.record.source_thread
-                && target.sources.contains(&prepared.record.source),
+                && target_matches,
             "target message is not this accepted own projection"
         );
         let record = prepared.record_at(*message);
@@ -616,7 +907,36 @@ pub(crate) async fn compaction_append_frozen_imports(
             // The existing transaction holds the validated dependency snapshot
             // through insertion; exact retries below retain their prior behavior.
             let forwarded = if prepared.accepted_basis.is_some() {
-                accepted_import_current(&tx, prepared).await?
+                let binding_current =
+                    if let Some((checkpoint_thread, checkpoint)) = &prepared.target_checkpoint {
+                        accepted_import_binding_current(&tx, prepared).await?
+                            && compaction_checkpoint_source(
+                                &tx,
+                                workspace,
+                                checkpoint_thread,
+                                &checkpoint.id,
+                            )
+                            .await?
+                            .as_ref()
+                                == Some(checkpoint)
+                            // A checkpoint used as the accepted atomic grant is
+                            // a direct dependency of this write. Recheck that
+                            // object only; its historical raw coverage remains
+                            // outside the bounded writer transaction.
+                            && (!record.source.scope.starts_with("checkpoint:")
+                                || compaction_checkpoint_source(
+                                    &tx,
+                                    workspace,
+                                    &record.source_thread,
+                                    &record.source.id,
+                                )
+                                .await?
+                                .as_ref()
+                                    == Some(&record.source))
+                    } else {
+                        accepted_import_current(&tx, prepared).await?
+                    };
+                binding_current
                     && compaction_frozen_message::Entity::find_by_id((
                         manifest.to_owned(),
                         i64::try_from(record.message_ordinal)?,

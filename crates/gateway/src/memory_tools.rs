@@ -2638,7 +2638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_turn_extractor_does_not_retry_non_compatibility_errors() {
+    async fn post_turn_extractor_sanitizes_unknown_failure_without_inline_retry() {
         struct FailingProvider {
             requests: Arc<Mutex<usize>>,
         }
@@ -2671,7 +2671,29 @@ mod tests {
                 .await
                 .expect_err("network errors should be returned to hook runtime");
 
-        assert!(error.to_string().contains("network unavailable"));
+        assert_eq!(
+            error.code.as_str(),
+            "memory.post_turn_extractor.provider_unknown"
+        );
+        assert!(!error.retryable);
+        assert!(error.safe_for_user);
+        assert_eq!(
+            error
+                .metadata
+                .iter()
+                .find(|(key, _)| key.as_str() == "failure_class")
+                .map(|(_, value)| value.as_str()),
+            Some("unknown")
+        );
+        assert_eq!(
+            error
+                .metadata
+                .iter()
+                .find(|(key, _)| key.as_str() == "failure_stage")
+                .map(|(_, value)| value.as_str()),
+            Some("provider_non_stream_response")
+        );
+        assert!(!error.to_string().contains("network unavailable"));
         assert_eq!(*provider.requests.lock().expect("request lock poisoned"), 1);
     }
 }

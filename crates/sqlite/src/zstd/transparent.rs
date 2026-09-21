@@ -953,7 +953,8 @@ mod tests {
     use super::add_functions::tests::create_example_db;
     use super::*;
     use pretty_assertions::assert_eq;
-    use rand::prelude::IndexedRandom;
+    use rand::prelude::{IndexedRandom, SeedableRng};
+    use rand::{Rng, RngExt};
     use rusqlite::params;
     use rusqlite::types::ValueRef;
     use rusqlite::{Connection, Row};
@@ -1084,13 +1085,16 @@ mod tests {
         Ok(())
     }
 
-    fn get_rand_id(db: &Connection) -> anyhow::Result<i64> {
+    fn get_seeded_id(db: &Connection, rng: &mut impl Rng) -> anyhow::Result<i64> {
+        let count: i64 =
+            db.query_row("select count(*) from events", params![], |row| row.get(0))?;
+        let offset = rng.random_range(0..count);
         db.query_row(
-            "select id from events order by random() limit 1",
-            params![],
+            "select id from events order by id limit 1 offset ?",
+            params![offset],
             |r| r.get(0),
         )
-        .context("Could not get random id")
+        .context("Could not get seeded id")
     }
 
     fn insert(db: &Connection, _id: i64, _id2: i64) -> anyhow::Result<()> {
@@ -1199,63 +1203,64 @@ mod tests {
     #[test]
     fn test_many() -> anyhow::Result<()> {
         type Executor = dyn Fn(&Connection, i64, i64) -> anyhow::Result<()>;
-        let posses: Vec<&Executor> = vec![
-            &insert,
-            &update_comp_col,
-            &update_other_col,
-            &update_other_two_col,
-            &update_comp_col_and_other_two_col,
-            &update_two_rows,
-            &update_two_rows_by_compressed,
-            &delete_one,
-            &delete_where_other,
+        let operations: Vec<(&str, &Executor)> = vec![
+            ("insert", &insert),
+            ("update_comp_col", &update_comp_col),
+            ("update_other_col", &update_other_col),
+            ("update_other_two_col", &update_other_two_col),
+            (
+                "update_comp_col_and_other_two_col",
+                &update_comp_col_and_other_two_col,
+            ),
+            ("update_two_rows", &update_two_rows),
+            (
+                "update_two_rows_by_compressed",
+                &update_two_rows_by_compressed,
+            ),
+            ("delete_one", &delete_one),
+            ("delete_where_other", &delete_where_other),
         ];
 
-        let mut posses2 = vec![];
-        for _ in 0..100 {
-            posses2.push(*posses.choose(&mut rand::rng()).unwrap());
-        }
-        for compress_first in [false, true] {
-            for operations in &[&posses2] {
-                if compress_first {
-                    let (db1, db2) =
-                        get_two_dbs(Some(123)).context("Could not create databases")?;
-                    if compress_first {
-                        let done: i64 = db2.query_row(
-                            "select zstd_incremental_maintenance(9999999, 1)",
-                            params![],
-                            |r| r.get(0),
-                        )?;
+        for seed in [0, 1, 0x5eed, u64::MAX] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let (db1, db2) = get_two_dbs(Some(123)).context("Could not create databases")?;
+            let done: i64 = db2.query_row(
+                "select zstd_incremental_maintenance(9999999, 1)",
+                params![],
+                |r| r.get(0),
+            )?;
 
-                        assert_eq!(done, 0);
+            assert_eq!(done, 0);
 
-                        let uncompressed_count: i64 = db2
-                            .query_row(
-                                "select count(*) from _events_zstd where _data_dict is null",
-                                params![],
-                                |r| r.get(0),
-                            )
-                            .context("Could not query uncompressed count")?;
-                        assert_eq!(uncompressed_count, 0);
-                    }
+            let uncompressed_count: i64 = db2
+                .query_row(
+                    "select count(*) from _events_zstd where _data_dict is null",
+                    params![],
+                    |r| r.get(0),
+                )
+                .context("Could not query uncompressed count")?;
+            assert_eq!(uncompressed_count, 0);
 
-                    for operation in *operations {
-                        let id = get_rand_id(&db1)?;
-                        // Apply the same logical operation to both databases.
-                        // Choosing ids independently made the comparison itself
-                        // nondeterministic (especially for delete/update paths)
-                        // and could report compression corruption even when the
-                        // two implementations produced identical results.
-                        let id2 = get_rand_id(&db1)?;
-                        operation(&db1, id, id2)
-                            .context("Could not run operation on uncompressed db")?;
-                        operation(&db2, id, id2)
-                            .context("Could not run operation on compressed db")?;
-                    }
-
-                    check_table_rows_same(&db1, &db2)?;
-                }
+            for step in 0..100 {
+                let &(operation_name, operation) = operations
+                    .choose(&mut rng)
+                    .expect("operation corpus is non-empty");
+                let id = get_seeded_id(&db1, &mut rng)?;
+                let id2 = get_seeded_id(&db1, &mut rng)?;
+                operation(&db1, id, id2).with_context(|| {
+                    format!(
+                        "Could not run operation on uncompressed db: seed={seed}, step={step}, operation={operation_name}"
+                    )
+                })?;
+                operation(&db2, id, id2).with_context(|| {
+                    format!(
+                        "Could not run operation on compressed db: seed={seed}, step={step}, operation={operation_name}"
+                    )
+                })?;
             }
+
+            check_table_rows_same(&db1, &db2)
+                .with_context(|| format!("database mismatch after seed={seed}"))?;
         }
 
         Ok(())
@@ -1287,8 +1292,9 @@ mod tests {
             .context("Could not query uncompressed count")?;
         assert_eq!(uncompressed_count, 0);
 
-        let id = get_rand_id(&db1)?;
-        let id2 = get_rand_id(&db2)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(456);
+        let id = get_seeded_id(&db1, &mut rng)?;
+        let id2 = get_seeded_id(&db1, &mut rng)?;
         insert_both_columns(&db1, id, id2).context("Could not run operation on uncompressed db")?;
         insert_both_columns(&db2, id, id2).context("Could not run operation on compressed db")?;
 

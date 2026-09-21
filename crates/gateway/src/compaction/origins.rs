@@ -13,27 +13,28 @@ pub(crate) async fn resolve_message_origins(
     authorized_threads: &BTreeSet<String>,
     messages: &mut [ChatMessage],
 ) -> Result<()> {
-    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
-    resolve_message_origins_with_resolver(
+    resolve_message_origin_locators(
         store,
         workspace,
         current_thread,
         current_turn,
         authorized_threads,
         messages,
-        &mut checkpoint_graphs,
     )
-    .await
+    .await?;
+    validate_message_origins(store, workspace, messages).await
 }
 
-pub(super) async fn resolve_message_origins_with_resolver(
+/// Resolve trusted in-memory locators and enforce their accepted scopes, but
+/// do not yet require versioned sources to be current. The checkpoint
+/// projection must first remove historical rows covered by a published head.
+pub(super) async fn resolve_message_origin_locators(
     store: &CrudStore,
     workspace: &str,
     current_thread: &str,
     current_turn: &str,
     authorized_threads: &BTreeSet<String>,
     messages: &mut [ChatMessage],
-    checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<()> {
     for message in messages {
         let Some(origin) = &mut message.provenance else {
@@ -130,6 +131,24 @@ pub(super) async fn resolve_message_origins_with_resolver(
             });
         }
         ensure!(!resolved.is_empty(), "message has no durable source");
+        origin.sources = resolved;
+    }
+    Ok(())
+}
+
+/// Validate only sources that remain in the request after checkpoint
+/// projection. Published checkpoints validate as root objects in CRUD; direct
+/// raw and task-basis references retain exact revision/existence checks.
+pub(super) async fn validate_message_origins(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &[ChatMessage],
+) -> Result<()> {
+    for message in messages {
+        let Some(origin) = &message.provenance else {
+            continue;
+        };
+        let resolved = &origin.sources;
         for batch in resolved.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
             let sources = batch
                 .iter()
@@ -146,26 +165,6 @@ pub(super) async fn resolve_message_origins_with_resolver(
                 "working history source changed; reload its canonical projection"
             );
         }
-        for source in &resolved {
-            if source.scope.starts_with("checkpoint:") {
-                checkpoint_graphs
-                    .resolve(
-                        store,
-                        workspace,
-                        Some(authorized_threads),
-                        &pioneer_compaction::SourceRef {
-                            scope: source.scope.clone(),
-                            id: source.id.clone(),
-                            version: source.version.clone(),
-                        },
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("checkpoint coverage source changed or disappeared")
-                    })?;
-            }
-        }
-        origin.sources = resolved;
     }
     Ok(())
 }

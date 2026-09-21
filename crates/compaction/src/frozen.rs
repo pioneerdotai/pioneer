@@ -20,6 +20,8 @@ pub struct FrozenMessageRef {
     /// Exact bounded provider representation when the full original lives in a
     /// terminal tool item. The latter remains the actual coverage source.
     pub replay_source: Option<SourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_item_id: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
 }
@@ -44,6 +46,10 @@ impl FrozenMessageRef {
                 .as_ref()
                 .is_none_or(|owner| !owner.is_empty()),
             "frozen context owner is missing"
+        );
+        anyhow::ensure!(
+            self.tool_item_id.as_ref().is_none_or(|id| !id.is_empty()),
+            "frozen tool item identity is empty"
         );
         for source in self.sources.iter().chain(self.replay_source.iter()) {
             anyhow::ensure!(

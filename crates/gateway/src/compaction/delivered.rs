@@ -24,6 +24,9 @@ pub(crate) struct AuthorizedOutputBranch {
 pub(crate) struct AuthorizedOutputSet {
     pub(super) workspace: String,
     pub(super) destination: String,
+    /// Native checkpoint accepted before `fence`. A later published head must
+    /// not import sources beyond this output-selection boundary.
+    pub(super) checkpoint: Option<String>,
     pub(super) fence: HistoryReadFence,
     pub(super) authorization_revision: u64,
     pub(super) source_epochs: BTreeMap<String, u64>,
@@ -94,6 +97,9 @@ impl MessageProcessor {
         super::history::prepare_history(&store, workspace, destination).await?;
         let epoch = store
             .compaction_projection_version(workspace, destination)
+            .await?;
+        let checkpoint = store
+            .compaction_head(&super::native::native_owner(workspace, destination))
             .await?;
         let fence = store.compaction_history_read_fence().await?;
         let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
@@ -216,6 +222,7 @@ impl MessageProcessor {
         Ok(AuthorizedOutputSet {
             workspace: workspace.into(),
             destination: destination.into(),
+            checkpoint,
             fence,
             authorization_revision,
             source_epochs,

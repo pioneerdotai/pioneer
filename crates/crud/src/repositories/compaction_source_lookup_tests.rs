@@ -7,79 +7,6 @@ use std::path::{Path, PathBuf};
 
 const LEGACY_SOURCES_CURRENT_SQL: &str = "SELECT COUNT(*) AS matched FROM json_each(?) wanted WHERE EXISTS (SELECT 1 FROM compaction_live_sources s WHERE s.workspace_id=? AND s.thread_id=? AND s.source_scope=json_extract(wanted.value,'$.scope') AND s.source_id=json_extract(wanted.value,'$.id') AND s.source_version=json_extract(wanted.value,'$.version') UNION ALL SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE c.workspace_id=? AND c.thread_id=? AND 'checkpoint:'||p.owner=json_extract(wanted.value,'$.scope') AND p.id=json_extract(wanted.value,'$.id') AND p.identity_sha256=json_extract(wanted.value,'$.version') AND p.format_version=1 AND (p.status='applied' OR (p.status='retained' AND EXISTS(SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed'))))";
 
-const LEGACY_CHECKPOINT_SOURCE_SQL: &str = r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=? AND c.workspace_id=? AND c.thread_id=?
-  AND p.format_version=1
-  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
- UNION
- SELECT v.source_scope,v.source_id,v.source_version
- FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
- WHERE g.source_scope LIKE 'checkpoint:%'
- UNION
- SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
- FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
- LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
- WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
- LIMIT 65537
-)
-SELECT root.source_scope,root.source_id,root.source_version
-FROM graph root
-WHERE root.source_scope LIKE 'checkpoint:%' AND root.source_id=?
- AND (SELECT COUNT(*) FROM graph)<65537
- AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
- AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_live_sources s
-   WHERE s.source_scope=g.source_scope AND s.source_id=g.source_id AND s.source_version=g.source_version
-    AND s.workspace_id=?
-  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
-    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
-  ))
- )) LIMIT 1"#;
-
-const LEGACY_CHECKPOINT_PAYLOAD_SQL: &str = r#"WITH RECURSIVE graph(source_scope,source_id,source_version) AS (
- SELECT 'checkpoint:'||p.owner,p.id,p.identity_sha256
- FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
- WHERE p.id=? AND 'checkpoint:'||p.owner=? AND p.identity_sha256=?
-  AND p.format_version=1 AND c.workspace_id=? AND c.thread_id=?
-  AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-   SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
- UNION
- SELECT v.source_scope,v.source_id,v.source_version
- FROM graph g JOIN compaction_coverage v ON v.checkpoint_id=g.source_id
- WHERE g.source_scope LIKE 'checkpoint:%'
- UNION
- SELECT 'checkpoint:'||COALESCE(previous.owner,''),node.previous,COALESCE(previous.identity_sha256,'')
- FROM graph g JOIN compaction_checkpoint node ON node.id=g.source_id
- LEFT JOIN compaction_checkpoint previous ON previous.id=node.previous
- WHERE g.source_scope LIKE 'checkpoint:%' AND node.previous IS NOT NULL
- LIMIT 65537
-)
-SELECT 1 AS revision,root.summary AS fragment,length(root.summary) AS characters
-FROM compaction_checkpoint root
-WHERE root.id=? AND (SELECT COUNT(*) FROM graph)<65537
- AND EXISTS(SELECT 1 FROM graph leaf WHERE leaf.source_scope NOT LIKE 'checkpoint:%')
- AND NOT EXISTS(SELECT 1 FROM graph g WHERE NOT (
-  (g.source_scope NOT LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_live_sources s
-   WHERE s.workspace_id=? AND s.source_scope=g.source_scope
-    AND s.source_id=g.source_id AND s.source_version=g.source_version
-  )) OR (g.source_scope LIKE 'checkpoint:%' AND EXISTS(
-   SELECT 1 FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner
-   WHERE p.id=g.source_id AND 'checkpoint:'||p.owner=g.source_scope
-    AND p.identity_sha256=g.source_version AND p.format_version=1 AND c.workspace_id=?
-    AND (p.status='applied' OR (p.status='retained' AND EXISTS(
-     SELECT 1 FROM compaction_operation o WHERE o.id=p.operation_id AND o.status='completed')))
-  ))
- )) LIMIT 1"#;
-
 struct TestFile(PathBuf);
 
 impl Drop for TestFile {
@@ -303,40 +230,6 @@ fn legacy_sources_statement(payload: String, workspace: &str, thread: &str) -> S
     )
 }
 
-fn legacy_checkpoint_source_statement(workspace: &str, thread: &str) -> Statement {
-    sqlite_specific_sql(
-        LEGACY_CHECKPOINT_SOURCE_SQL,
-        [
-            "root-checkpoint".into(),
-            workspace.into(),
-            thread.into(),
-            "root-checkpoint".into(),
-            workspace.into(),
-            workspace.into(),
-        ],
-    )
-}
-
-fn legacy_checkpoint_payload_statement(
-    workspace: &str,
-    thread: &str,
-    reference: &SourceRef,
-) -> Statement {
-    sqlite_specific_sql(
-        LEGACY_CHECKPOINT_PAYLOAD_SQL,
-        [
-            reference.id.clone().into(),
-            reference.scope.clone().into(),
-            reference.version.clone().into(),
-            workspace.into(),
-            thread.into(),
-            reference.id.clone().into(),
-            workspace.into(),
-            workspace.into(),
-        ],
-    )
-}
-
 async fn assert_sources(
     db: &SqliteDatabase,
     workspace: &str,
@@ -361,19 +254,30 @@ async fn assert_sources(
     let actual = compaction_sources_current(&snapshot, workspace, thread, sources)
         .await
         .unwrap();
-    let legacy_matched = snapshot
-        .query_one_raw(legacy_sources_statement(payload, workspace, thread))
-        .await
-        .unwrap()
-        .unwrap()
-        .try_get::<i64>("", "matched")
-        .unwrap();
-    let legacy = legacy_matched == sources.len() as i64;
-    assert_eq!(
-        actual_matched, legacy_matched,
-        "matched count diverged from oracle: {case}"
-    );
-    assert_eq!(actual, legacy, "sources query diverged from oracle: {case}");
+    // The legacy view remains a useful oracle for unchanged raw/task-basis
+    // branches. Checkpoint validity intentionally changed and must be asserted
+    // from the published-object contract instead of oracle equality.
+    if sources
+        .iter()
+        .all(|source| !source.scope.starts_with("checkpoint:"))
+    {
+        let legacy_matched = snapshot
+            .query_one_raw(legacy_sources_statement(payload, workspace, thread))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "matched")
+            .unwrap();
+        let legacy = legacy_matched == sources.len() as i64;
+        assert_eq!(
+            actual_matched, legacy_matched,
+            "matched count diverged from raw-source oracle: {case}"
+        );
+        assert_eq!(
+            actual, legacy,
+            "sources query diverged from raw-source oracle: {case}"
+        );
+    }
     assert_eq!(actual, expected, "unexpected sources result: {case}");
     snapshot.rollback().await.unwrap();
 }
@@ -392,20 +296,6 @@ async fn assert_graph_results(
         compaction_checkpoint_source(&snapshot, workspace, thread, "root-checkpoint")
             .await
             .unwrap();
-    let legacy_source = snapshot
-        .query_one_raw(legacy_checkpoint_source_statement(workspace, thread))
-        .await
-        .unwrap()
-        .map(|row| SourceRef {
-            scope: row.try_get("", "source_scope").unwrap(),
-            id: row.try_get("", "source_id").unwrap(),
-            version: row.try_get("", "source_version").unwrap(),
-        });
-    assert_eq!(
-        actual_source, legacy_source,
-        "source oracle mismatch: {case}"
-    );
-
     let actual_payload = snapshot
         .query_one_raw(compaction_reference_checkpoint_payload_statement(
             workspace, thread, reference,
@@ -413,17 +303,6 @@ async fn assert_graph_results(
         .await
         .unwrap()
         .map(|row| row.try_get::<String>("", "fragment").unwrap());
-    let legacy_payload = snapshot
-        .query_one_raw(legacy_checkpoint_payload_statement(
-            workspace, thread, reference,
-        ))
-        .await
-        .unwrap()
-        .map(|row| row.try_get::<String>("", "fragment").unwrap());
-    assert_eq!(
-        actual_payload, legacy_payload,
-        "payload oracle mismatch: {case}"
-    );
     assert_eq!(
         actual_source.is_some(),
         expected_source,
@@ -466,7 +345,7 @@ async fn assert_all(db: &SqliteDatabase, source: &SourceRef, expected: bool, cas
         case,
     )
     .await;
-    assert_graph(db, "ws", "root-thread", &root_reference(), expected, case).await;
+    assert_graph(db, "ws", "root-thread", &root_reference(), true, case).await;
 }
 
 #[tokio::test]
@@ -571,7 +450,7 @@ async fn source_lookup_queries_match_legacy_for_all_source_types_and_identity_fi
 }
 
 #[tokio::test]
-async fn checkpoint_graph_leaf_identity_fields_match_legacy_for_all_five_leaf_types() {
+async fn published_checkpoint_is_independent_of_historical_leaf_identity_fields() {
     for branch in branches()
         .into_iter()
         .filter(|branch| branch.name != "checkpoint")
@@ -599,7 +478,7 @@ async fn checkpoint_graph_leaf_identity_fields_match_legacy_for_all_five_leaf_ty
                 "ws",
                 "root-thread",
                 &root_reference(),
-                false,
+                true,
                 &format!("{} graph wrong {field}", branch.name),
             )
             .await;
@@ -608,7 +487,7 @@ async fn checkpoint_graph_leaf_identity_fields_match_legacy_for_all_five_leaf_ty
 }
 
 #[tokio::test]
-async fn checkpoint_graph_leaf_workspace_is_independent_for_all_five_leaf_types() {
+async fn published_checkpoint_is_independent_of_historical_leaf_workspace() {
     for branch in branches()
         .into_iter()
         .filter(|branch| branch.name != "checkpoint")
@@ -650,7 +529,7 @@ async fn checkpoint_graph_leaf_workspace_is_independent_for_all_five_leaf_types(
             "ws",
             "root-thread",
             &root_reference(),
-            false,
+            true,
             &format!("{} leaf thread belongs to another workspace", branch.name),
         )
         .await;
@@ -671,7 +550,7 @@ async fn checkpoint_graph_leaf_workspace_is_independent_for_all_five_leaf_types(
 }
 
 #[tokio::test]
-async fn canonical_liveness_predicates_are_independent_in_batch_and_graph_queries() {
+async fn canonical_liveness_changes_raw_lookup_but_not_published_checkpoint_lookup() {
     for canonical in canonical_branches() {
         let fixture = fixture().await;
         let db = fixture.db();
@@ -851,7 +730,7 @@ async fn projection_epoch(db: &SqliteDatabase) -> i64 {
 }
 
 #[tokio::test]
-async fn sources_current_preserves_the_two_distinct_checkpoint_predicates() {
+async fn sources_current_treats_checkpoint_as_epoch_independent_published_object() {
     let fixture = fixture().await;
     let db = fixture.db();
     let checkpoint = branches().remove(4).source;
@@ -877,8 +756,8 @@ async fn sources_current_preserves_the_two_distinct_checkpoint_predicates() {
         "ws",
         "source-thread",
         std::slice::from_ref(&checkpoint),
-        true,
-        "live branch uses the absent-epoch fallback zero",
+        false,
+        "published checkpoint still requires format one",
     )
     .await;
     db.execute_raw(Statement::from_sql_and_values(
@@ -894,10 +773,15 @@ async fn sources_current_preserves_the_two_distinct_checkpoint_predicates() {
         "ws",
         "source-thread",
         std::slice::from_ref(&checkpoint),
-        true,
-        "live branch does not require format one",
+        false,
+        "checkpoint format is part of published identity",
     )
     .await;
+    db.execute_unprepared(
+        "UPDATE compaction_checkpoint SET format_version=1 WHERE id='source-checkpoint'",
+    )
+    .await
+    .unwrap();
     db.execute_unprepared(
         "UPDATE compaction_checkpoint SET status='retained' WHERE id='source-checkpoint'",
     )
@@ -1008,8 +892,8 @@ async fn sources_current_preserves_the_two_distinct_checkpoint_predicates() {
         "ws",
         "source-thread",
         std::slice::from_ref(&checkpoint),
-        false,
-        "format two with stale epoch",
+        true,
+        "published checkpoint survives projection epoch change",
     )
     .await;
     db.execute_unprepared(
@@ -1148,8 +1032,7 @@ fn mid_reference() -> SourceRef {
 }
 
 #[tokio::test]
-async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_leaves_match_legacy()
- {
+async fn published_root_lookup_ignores_historical_ancestry_liveness() {
     let fixture = fixture().await;
     let db = fixture.db();
     let event = canonical_branches().remove(2).branch.source;
@@ -1313,7 +1196,7 @@ async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_
         "ws",
         "root-thread",
         &root_reference(),
-        false,
+        true,
         "changed intermediate status",
     )
     .await;
@@ -1332,7 +1215,7 @@ async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_
         "ws",
         "root-thread",
         &root_reference(),
-        false,
+        true,
         "changed intermediate format",
     )
     .await;
@@ -1351,7 +1234,7 @@ async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_
         "ws",
         "root-thread",
         &root_reference(),
-        false,
+        true,
         "changed intermediate identity",
     )
     .await;
@@ -1400,7 +1283,7 @@ async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_
         "ws",
         "root-thread",
         &root_reference(),
-        false,
+        true,
         "graph without canonical leaf",
     )
     .await;
@@ -1438,7 +1321,7 @@ async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_
         "ws",
         "root-thread",
         &root_reference(),
-        false,
+        true,
         "leaf in other workspace",
     )
     .await;
@@ -1452,14 +1335,14 @@ async fn checkpoint_graph_traversal_status_identity_previous_cycles_and_foreign_
         "ws",
         "root-thread",
         &root_reference(),
-        false,
+        true,
         "missing intermediate checkpoint",
     )
     .await;
 }
 
 #[tokio::test]
-async fn checkpoint_graph_preserves_the_65536_65537_boundary() {
+async fn published_checkpoint_lookup_does_not_traverse_large_historical_graph() {
     let fixture = fixture().await;
     let db = fixture.db();
     db.execute_unprepared(
@@ -1509,8 +1392,8 @@ async fn checkpoint_graph_preserves_the_65536_65537_boundary() {
         "ws",
         "root-thread",
         &root_reference(),
-        false,
-        "65537 graph rows",
+        true,
+        "published root is independent of 65537 historical graph rows",
     )
     .await;
 }
@@ -1639,16 +1522,45 @@ async fn assert_production_plans(compressed: bool) {
         .into_iter()
         .map(|branch| branch.source)
         .collect::<Vec<_>>();
-    let plans = [
-        explain(
-            &db,
-            compaction_sources_current_statement(
-                serde_json::to_string(&sources).unwrap(),
-                "ws",
-                "source-thread",
-            ),
-        )
-        .await,
+    let source_plan = explain(
+        &db,
+        compaction_sources_current_statement(
+            serde_json::to_string(&sources).unwrap(),
+            "ws",
+            "source-thread",
+        ),
+    )
+    .await;
+    for alias in [
+        "context_revision",
+        "item_revision",
+        "event_revision",
+        "input_revision",
+    ] {
+        assert_exact_search(&source_plan, &[alias], "source_id");
+    }
+    if compressed {
+        for subjects in [
+            &["context_source", "_turn_llm_context_zstd"][..],
+            &["item_source", "_turn_item_zstd"][..],
+            &["event_source", "_turn_event_zstd"][..],
+            &["input_source", "_turn_input_zstd"][..],
+        ] {
+            assert_exact_search(&source_plan, subjects, "id");
+        }
+    } else {
+        for alias in [
+            "context_source",
+            "item_source",
+            "event_source",
+            "input_source",
+        ] {
+            assert_exact_search(&source_plan, &[alias], "id");
+        }
+    }
+    assert_exact_search(&source_plan, &["basis"], "run_id");
+
+    for plan in [
         explain(
             &db,
             compaction_checkpoint_source_statement("ws", "root-thread", "root-checkpoint"),
@@ -1663,36 +1575,21 @@ async fn assert_production_plans(compressed: bool) {
             ),
         )
         .await,
-    ];
-    for plan in plans {
-        for alias in [
-            "context_revision",
-            "item_revision",
-            "event_revision",
-            "input_revision",
-        ] {
-            assert_exact_search(&plan, &[alias], "source_id");
-        }
-        if compressed {
-            for subjects in [
-                &["context_source", "_turn_llm_context_zstd"][..],
-                &["item_source", "_turn_item_zstd"][..],
-                &["event_source", "_turn_event_zstd"][..],
-                &["input_source", "_turn_input_zstd"][..],
-            ] {
-                assert_exact_search(&plan, subjects, "id");
-            }
-        } else {
-            for alias in [
-                "context_source",
-                "item_source",
-                "event_source",
-                "input_source",
-            ] {
-                assert_exact_search(&plan, &[alias], "id");
-            }
-        }
-        assert_exact_search(&plan, &["basis"], "run_id");
+    ] {
+        assert_exact_search(&plan, &["p", "compaction_checkpoint"], "id");
+        assert!(
+            plan.iter().all(|detail| {
+                ![
+                    "context_revision",
+                    "item_revision",
+                    "event_revision",
+                    "input_revision",
+                ]
+                .iter()
+                .any(|table| detail.contains(table))
+            }),
+            "checkpoint lookup unexpectedly reads canonical leaves: {plan:#?}"
+        );
     }
 }
 

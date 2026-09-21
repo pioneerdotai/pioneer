@@ -16,35 +16,43 @@ pub struct ScopedHistorySource {
 pub struct AcceptedContextBranch<'a> {
     pub thread: &'a str,
     pub messages: &'a [ChatMessage],
-    /// Every summary reference needs an exact, version-checked leaf closure.
+    /// Every summary reference needs its saved historical leaf closure. The
+    /// versions identify publication-time records rather than today's rows.
     /// No entry means unknown coverage, never an empty summary.
     pub checkpoints: &'a BTreeMap<ScopedHistorySource, BTreeSet<ScopedHistorySource>>,
 }
 
-/// The supplied summaries are valid individually but require an exact original
-/// projection before their coverage can be composed without duplication.
-#[derive(Debug)]
-pub struct CompatibleProjectionRequired {
-    pub affected: BTreeSet<ScopedHistorySource>,
-}
-impl std::fmt::Display for CompatibleProjectionRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("overlapping history requires a compatible exact source projection")
-    }
-}
-impl std::error::Error for CompatibleProjectionRequired {}
-
 struct Unit {
     messages: Vec<(usize, ChatMessage)>,
     leaves: BTreeSet<ScopedHistorySource>,
+    identities: BTreeSet<(String, String, String)>,
     own: bool,
+    checkpoint: bool,
 }
+
+/// Two raw composite input units overlap without being identical. The Gateway
+/// can split only those canonical input rows before retrying composition; this
+/// is never used to rematerialize a summary.
+#[derive(Debug)]
+pub struct SplitRawInputsRequired {
+    pub affected: BTreeSet<ScopedHistorySource>,
+}
+
+impl std::fmt::Display for SplitRawInputsRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("overlapping raw history requires canonical input splitting")
+    }
+}
+
+impl std::error::Error for SplitRawInputsRequired {}
 
 /// H appears once; accepted own work from A/B becomes own work of C without
 /// changing the storage thread on any source. Inputs to this function are
 /// accepted runtime snapshots, not arbitrary model-supplied references.
-/// A partially overlapping summary requires the Gateway to rematerialize a
-/// compatible source projection. It is never "subtracted" from another text.
+/// Summaries are atomic. An equal checkpoint is emitted once and a summary
+/// whose historical coverage contains another whole unit may replace it.
+/// Distinct partially-overlapping summaries are both retained; their text is
+/// never split and their originals are never rematerialized for deduplication.
 pub fn compose_context(
     workspace: &str,
     destination: &str,
@@ -81,14 +89,16 @@ pub fn compose_context(
             );
             let own = unit.role == SourceRole::Own && !unit.protected_input;
             let mut leaves = BTreeSet::new();
+            let mut checkpoint = false;
             for source in &unit.sources {
                 let scoped = ScopedHistorySource {
                     thread: layout.source_threads[source].clone(),
                     source: source.clone(),
                 };
                 if source.scope.starts_with("checkpoint:") {
+                    checkpoint = true;
                     let closure = branch.checkpoints.get(&scoped).ok_or_else(|| {
-                        anyhow::anyhow!("summary requires a compatible exact source projection")
+                        anyhow::anyhow!("summary requires compatible historical coverage")
                     })?;
                     ensure!(!closure.is_empty(), "empty checkpoint coverage");
                     ensure!(
@@ -101,48 +111,77 @@ pub fn compose_context(
                     );
                     leaves.extend(closure.iter().cloned());
                 } else {
+                    let identity = (
+                        scoped.thread.clone(),
+                        scoped.source.scope.clone(),
+                        scoped.source.id.clone(),
+                    );
+                    if let Some(version) = revisions.insert(identity, scoped.source.version.clone())
+                    {
+                        ensure!(
+                            version == scoped.source.version,
+                            "accepted branches contain conflicting source revisions"
+                        );
+                    }
                     leaves.insert(scoped);
                 }
             }
-            for leaf in &leaves {
-                let identity = (
-                    leaf.thread.clone(),
-                    leaf.source.scope.clone(),
-                    leaf.source.id.clone(),
-                );
-                if let Some(version) = revisions.insert(identity, leaf.source.version.clone()) {
-                    ensure!(
-                        version == leaf.source.version,
-                        "accepted branches contain conflicting source revisions"
-                    );
-                }
-            }
+            let identities = leaves
+                .iter()
+                .map(|leaf| {
+                    (
+                        leaf.thread.clone(),
+                        leaf.source.scope.clone(),
+                        leaf.source.id.clone(),
+                    )
+                })
+                .collect::<BTreeSet<_>>();
             let mut duplicate = None;
+            let mut replaced = Vec::new();
             for (index, previous) in units.iter().enumerate() {
-                if previous.leaves.is_disjoint(&leaves) {
+                if previous.identities.is_disjoint(&identities) {
                     continue;
                 }
-                if previous.leaves != leaves {
-                    return Err(CompatibleProjectionRequired {
+                if previous.identities == identities {
+                    if checkpoint && !previous.checkpoint {
+                        replaced.push(index);
+                        continue;
+                    }
+                    duplicate = Some(index);
+                    break;
+                }
+                if checkpoint && previous.identities.is_subset(&identities) {
+                    replaced.push(index);
+                } else if previous.checkpoint && identities.is_subset(&previous.identities) {
+                    duplicate = Some(index);
+                    break;
+                } else if !checkpoint && !previous.checkpoint {
+                    return Err(SplitRawInputsRequired {
                         affected: previous.leaves.union(&leaves).cloned().collect(),
                     }
                     .into());
                 }
-                duplicate = Some(index);
-                break;
             }
             if let Some(index) = duplicate {
                 // A source inherited by one branch can be accepted own work of
-                // another. Its single projection then remains eligible in C.
-                units[index].own |= own;
+                // another. Summary ownership is not promoted: a WorkingContext
+                // result remains inherited even if another branch repeats it.
+                if !units[index].checkpoint {
+                    units[index].own |= own;
+                }
             } else {
+                for index in replaced.into_iter().rev() {
+                    units.remove(index);
+                }
                 units.push(Unit {
                     messages: indexes
                         .iter()
                         .map(|index| (branch_offset + *index, branch.messages[*index].clone()))
                         .collect(),
                     leaves,
+                    identities,
                     own,
+                    checkpoint,
                 });
             }
         }
@@ -273,8 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn compaction_composition_never_imports_future_coverage_across_fork_boundary() {
-        let history = (1..=100)
+    fn compaction_composition_treats_an_admitted_summary_as_one_unit() {
+        let mut history = (1..=100)
             .map(|i| message("parent", &i.to_string(), true))
             .collect::<Vec<_>>();
         let mut summary = message("parent", "summary-100", true);
@@ -293,49 +332,103 @@ mod tests {
         };
         let closures =
             BTreeMap::from([(reference(&summary), history.iter().map(reference).collect())]);
+        history[0].provenance.as_mut().unwrap().sources[0].version = "revision:2".into();
         let summary = [summary];
-        assert!(
-            compose_context(
-                "ws",
-                "fork",
-                &[
-                    AcceptedContextBranch {
-                        thread: "parent",
-                        messages: &history[..60],
-                        checkpoints: &closures
-                    },
-                    AcceptedContextBranch {
-                        thread: "parent",
-                        messages: &summary,
-                        checkpoints: &closures
-                    },
-                ]
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("compatible exact source projection")
-        );
+        // Snapshot/fork admission is enforced by the Gateway before this
+        // function. Once admitted, a summary is indivisible and replaces a
+        // whole raw unit contained by its historical coverage even if today's
+        // raw revision differs from the saved historical revision.
         let selected = compose_context(
             "ws",
             "fork",
-            &[AcceptedContextBranch {
-                thread: "parent",
-                messages: &history[..60],
-                checkpoints: &closures,
-            }],
+            &[
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: &history[..60],
+                    checkpoints: &closures,
+                },
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: &summary,
+                    checkpoints: &closures,
+                },
+            ],
         )
         .unwrap();
-        assert_eq!(selected.len(), 60);
+        assert_eq!(selected.len(), 1);
         assert_eq!(
             selected
-                .last()
+                .first()
                 .unwrap()
                 .provenance
                 .as_ref()
                 .unwrap()
                 .sources[0]
                 .id,
-            "60"
+            "summary-100"
+        );
+    }
+
+    #[test]
+    fn compaction_composition_keeps_distinct_partially_overlapping_summaries() {
+        let leaf = |id: &str| ScopedHistorySource {
+            thread: "parent".into(),
+            source: SourceRef {
+                scope: "event:turn".into(),
+                id: id.into(),
+                version: "event-revision:1".into(),
+            },
+        };
+        let summary = |id: &str| {
+            let mut message = message("parent", id, true);
+            message.provenance.as_mut().unwrap().sources[0].scope =
+                "checkpoint:parent-owner".into();
+            message
+        };
+        let a = summary("summary-a");
+        let b = summary("summary-b");
+        let reference = |message: &ChatMessage| {
+            let origin = message.provenance.as_ref().unwrap();
+            let source = &origin.sources[0];
+            ScopedHistorySource {
+                thread: origin.thread_id.clone(),
+                source: SourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                },
+            }
+        };
+        let closures = BTreeMap::from([
+            (reference(&a), BTreeSet::from([leaf("x"), leaf("y")])),
+            (reference(&b), BTreeSet::from([leaf("y"), leaf("z")])),
+        ]);
+
+        let composed = compose_context(
+            "ws",
+            "child",
+            &[
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: std::slice::from_ref(&a),
+                    checkpoints: &closures,
+                },
+                AcceptedContextBranch {
+                    thread: "parent",
+                    messages: std::slice::from_ref(&b),
+                    checkpoints: &closures,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(composed.len(), 2);
+        assert_eq!(
+            composed[0].provenance.as_ref().unwrap().sources[0].id,
+            "summary-a"
+        );
+        assert_eq!(
+            composed[1].provenance.as_ref().unwrap().sources[0].id,
+            "summary-b"
         );
     }
 

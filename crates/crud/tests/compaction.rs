@@ -470,6 +470,34 @@ async fn candidate_with_epochs(
     assertion: &SourceAssertion,
     source_epochs: std::collections::BTreeMap<String, u64>,
 ) -> Checkpoint {
+    candidate_fixture(store, op, expected, assertion, source_epochs, false).await
+}
+
+async fn candidate_with_manifest(
+    store: &CrudStore,
+    op: &str,
+    expected: Option<&str>,
+    assertion: &SourceAssertion,
+) -> Checkpoint {
+    candidate_fixture(
+        store,
+        op,
+        expected,
+        assertion,
+        std::collections::BTreeMap::new(),
+        true,
+    )
+    .await
+}
+
+async fn candidate_fixture(
+    store: &CrudStore,
+    op: &str,
+    expected: Option<&str>,
+    assertion: &SourceAssertion,
+    source_epochs: std::collections::BTreeMap<String, u64>,
+    prepare_manifest: bool,
+) -> Checkpoint {
     let selection = ModelSelection {
         transport: Transport::Api,
         instance: "p".into(),
@@ -498,6 +526,25 @@ async fn candidate_with_epochs(
         .compaction_admit("ws", "thread", &snapshot)
         .await
         .unwrap();
+    if prepare_manifest {
+        store
+            .compaction_prepare_runner(op, &ModelBudget::new(None, None, None), 1, 0)
+            .await
+            .unwrap();
+        store
+            .compaction_append_manifest(
+                op,
+                &[ManifestEntry {
+                    ordinal: 0,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: assertion.reference(),
+                }],
+            )
+            .await
+            .unwrap();
+    }
     let checkpoint = Checkpoint {
         id: format!("cp-{op}"),
         operation_id: op.into(),
@@ -606,6 +653,51 @@ async fn edits_competing_head_and_stop_reject_candidates_without_losing_summarie
         Some(a.id.as_str())
     );
 }
+
+#[tokio::test]
+async fn legacy_apply_ignores_coarse_epoch_changes_behind_previous_checkpoint() {
+    for delete in [false, true] {
+        let store = store().await;
+        let a = source(&store, "independent-a", 1, "A").await;
+        let s1 = candidate(&store, "independent-s1", None, &a).await;
+        assert_eq!(
+            store.compaction_apply(&s1, None, &[a]).await.unwrap(),
+            CommitOutcome::Applied
+        );
+
+        let b = source(&store, "independent-b", 2, "B").await;
+        let epoch = store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap();
+        let s2 = candidate_with_epochs(
+            &store,
+            "independent-s2",
+            Some(&s1.id),
+            &b,
+            std::collections::BTreeMap::from([("thread".into(), epoch)]),
+        )
+        .await;
+        store
+            .database_connection()
+            .execute_unprepared(if delete {
+                "DELETE FROM turn_event WHERE id='independent-a'"
+            } else {
+                "UPDATE turn_event SET payload='edited A' WHERE id='independent-a'"
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .compaction_apply(&s2, Some(&s1.id), &[b])
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+    }
+}
+
 #[tokio::test]
 async fn durable_retry_budget_and_exact_candidate_idempotency() {
     let store = store().await;
@@ -1272,7 +1364,8 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
             .compaction_checkpoint_source("ws", "thread", "runner-candidate")
             .await
             .unwrap()
-            .is_none()
+            .is_some(),
+        "published checkpoint must survive an edit to its historical leaf"
     );
     // Normal thread deletion must keep its existing cascade contract.
     store
@@ -1740,6 +1833,7 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
             protected_input: false,
             wire_sha256: "b".repeat(64),
             replay_source: None,
+            tool_item_id: None,
             tool_call_id: None,
             tool_name: None,
         })
@@ -2778,6 +2872,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         protected_input: false,
         wire_sha256: "a".repeat(64),
         replay_source: None,
+        tool_item_id: None,
         tool_call_id: None,
         tool_name: None,
     };
@@ -2915,8 +3010,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         ..own
     };
     // H is already represented by a published checkpoint S in the accepted
-    // snapshot. Later proofs must expand S for freshness without requiring the
-    // snapshot to contain its raw h leaf directly.
+    // snapshot. The checkpoint is an atomic accepted-basis source; its saved
+    // coverage is used only for boundary/grant membership.
     let s_operation = admit_import_operation(&store, "basis-s", "thread", "turn").await;
     let s_ready = ready_import_operation(&store, &s_operation, "thread", &inherited).await;
     assert_eq!(
@@ -3513,6 +3608,94 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .await
             .unwrap()
     );
+    let carried = maintenance
+        .compaction_prepare_accepted_checkpoint_import(
+            "ws",
+            "context-c",
+            "turn-c",
+            0,
+            "child",
+            &a_summary,
+        )
+        .await
+        .unwrap();
+    let summary_target = FrozenMessageRef {
+        sources: vec![a_summary.clone()],
+        wire_sha256: "d".repeat(64),
+        ..child_target.clone()
+    };
+    let projected_context = descriptor(
+        "recaptured-checkpoint-c",
+        std::slice::from_ref(&summary_target),
+    );
+    let carried_imports = vec![(0, carried)];
+    let carried_digest = frozen_import_identity(&carried_imports).unwrap();
+    maintenance
+        .compaction_begin_frozen_history_with_imports(
+            "ws",
+            "context-c",
+            &projected_context,
+            1,
+            &carried_digest,
+        )
+        .await
+        .unwrap();
+    maintenance
+        .compaction_append_frozen_history(
+            "ws",
+            "context-c",
+            &projected_context.manifest_id,
+            0,
+            std::slice::from_ref(&summary_target),
+        )
+        .await
+        .unwrap();
+    maintenance
+        .compaction_append_frozen_imports(
+            "ws",
+            "context-c",
+            &projected_context.manifest_id,
+            0,
+            &carried_imports,
+        )
+        .await
+        .unwrap();
+    assert!(
+        maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &projected_context)
+            .await
+            .unwrap()
+    );
+    let projected_capture_operation = admit_import_operation(
+        &maintenance,
+        "projected-capture-operation",
+        "context-c",
+        "turn-c",
+    )
+    .await;
+    maintenance
+        .compaction_bind_source_projection(&projected_capture_operation.id, &projected_context)
+        .await
+        .unwrap();
+    let projected_capture_ready = ready_import_operation(
+        &maintenance,
+        &projected_capture_operation,
+        "child",
+        &a_summary,
+    )
+    .await;
+    assert_eq!(
+        maintenance
+            .compaction_apply_runner(
+                &projected_capture_operation.id,
+                &projected_capture_ready,
+                None,
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Applied,
+        "a carried raw grant must authorize the exact foreign OWN summary that replaced it"
+    );
     let recaptured_operation =
         admit_import_operation(&maintenance, "recaptured-operation", "context-c", "turn-c").await;
     maintenance
@@ -3755,8 +3938,114 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             )
             .await
             .unwrap(),
-        CommitOutcome::Stale,
-        "accepted import authority must not hide an edited checkpoint leaf"
+        CommitOutcome::Applied,
+        "an edited historical leaf invalidated an accepted published checkpoint"
+    );
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='child-source'")
+        .await
+        .unwrap();
+    let carried_after_delete = maintenance
+        .compaction_prepare_accepted_checkpoint_import(
+            "ws",
+            "context-c",
+            "turn-c",
+            0,
+            "child",
+            &a_summary,
+        )
+        .await
+        .expect("carrying a grant through its summary must not read the deleted raw payload");
+    let projected_after_delete = descriptor(
+        "recaptured-checkpoint-after-delete",
+        std::slice::from_ref(&summary_target),
+    );
+    let carried_after_delete = vec![(0, carried_after_delete)];
+    let carried_after_delete_digest = frozen_import_identity(&carried_after_delete).unwrap();
+    maintenance
+        .compaction_begin_frozen_history_with_imports(
+            "ws",
+            "context-c",
+            &projected_after_delete,
+            1,
+            &carried_after_delete_digest,
+        )
+        .await
+        .unwrap();
+    maintenance
+        .compaction_append_frozen_history(
+            "ws",
+            "context-c",
+            &projected_after_delete.manifest_id,
+            0,
+            std::slice::from_ref(&summary_target),
+        )
+        .await
+        .unwrap();
+    maintenance
+        .compaction_append_frozen_imports(
+            "ws",
+            "context-c",
+            &projected_after_delete.manifest_id,
+            0,
+            &carried_after_delete,
+        )
+        .await
+        .unwrap();
+    assert!(
+        maintenance
+            .compaction_finish_frozen_history("ws", "context-c", &projected_after_delete)
+            .await
+            .unwrap()
+    );
+    let mut imported_checkpoint_deleted = projected_operation.clone();
+    imported_checkpoint_deleted.id = "deleted-imported-checkpoint".into();
+    imported_checkpoint_deleted.owner = "owner-deleted-imported-checkpoint".into();
+    imported_checkpoint_deleted.plan.fingerprint = imported_checkpoint_deleted.id.clone();
+    imported_checkpoint_deleted.projection_version = store
+        .compaction_projection_version("ws", "context-c")
+        .await
+        .unwrap();
+    imported_checkpoint_deleted.source_epochs.clear();
+    for scope in ["child", "context-c", "thread"] {
+        imported_checkpoint_deleted.source_epochs.insert(
+            scope.into(),
+            store
+                .compaction_projection_version("ws", scope)
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .compaction_admit("ws", "context-c", &imported_checkpoint_deleted)
+        .await
+        .unwrap();
+    store
+        .compaction_bind_execution_turn(&imported_checkpoint_deleted.id, "turn-c")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&imported_checkpoint_deleted.id, &projected_after_delete)
+        .await
+        .unwrap();
+    let imported_checkpoint_deleted_ready =
+        ready_import_operation(&store, &imported_checkpoint_deleted, "child", &a_summary).await;
+    assert!(
+        store
+            .compaction_manifest_sources_current(&imported_checkpoint_deleted.id)
+            .await
+            .unwrap(),
+        "a deleted historical OWN leaf invalidated its accepted later summary"
+    );
+    assert_eq!(
+        store
+            .compaction_apply_runner(
+                &imported_checkpoint_deleted.id,
+                &imported_checkpoint_deleted_ready,
+                None
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
     );
 
     assert!(
@@ -3776,7 +4065,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
 }
 
 #[tokio::test]
-async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
+async fn frozen_own_import_treats_published_summary_as_atomic_output() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     use sha2::{Digest, Sha256};
@@ -3991,12 +4280,13 @@ async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
             context_thread: None,
             source_thread: "portion-child".into(),
             unit_id: "portion-output-unit".into(),
-            sources: vec![k_source],
+            sources: vec![k_source.clone()],
             inherited: false,
             complete: true,
             protected_input: false,
             wire_sha256: "d".repeat(64),
             replay_source: None,
+            tool_item_id: None,
             tool_call_id: None,
             tool_name: None,
         };
@@ -4068,14 +4358,14 @@ async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
                 &acknowledgement,
                 0,
                 "portion-child",
-                &h,
+                &k_source,
             )
             .await
             .unwrap();
-        assert_eq!(prepared.source(), &h);
+        assert_eq!(prepared.source(), &k_source);
         let imported_message = FrozenMessageRef {
             context_thread: Some("thread".into()),
-            sources: vec![h.clone()],
+            sources: vec![k_source.clone()],
             ..output_message.clone()
         };
         let imported = descriptor(
@@ -4120,7 +4410,24 @@ async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
         )
         .await
         .unwrap();
-        let error = store
+        let prepared_again = store
+            .compaction_prepare_frozen_import(
+                "ws",
+                "thread",
+                "portion-delivery",
+                &acknowledgement,
+                0,
+                "portion-child",
+                &k_source,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared_again.source(),
+            &k_source,
+            "an unpublished predecessor invalidated an already published output summary"
+        );
+        let raw_error = store
             .compaction_prepare_frozen_import(
                 "ws",
                 "thread",
@@ -4133,15 +4440,10 @@ async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
             .await
             .unwrap_err();
         assert_eq!(
-            error.to_string(),
-            "output checkpoint ancestry is unavailable",
-            "an unpublished predecessor must not authorize output ancestry"
+            raw_error.to_string(),
+            "source is outside the accepted own output message",
+            "summary coverage granted direct access to its historical raw leaf"
         );
-        db.execute_unprepared(
-            "UPDATE compaction_checkpoint SET status='retained' WHERE id='portion-p'",
-        )
-        .await
-        .unwrap();
         db.execute_unprepared(if delete_leaf {
             "DELETE FROM turn_event WHERE id='portion-h'"
         } else {
@@ -4149,7 +4451,7 @@ async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
         })
         .await
         .unwrap();
-        let error = store
+        let prepared_after_leaf_change = store
             .compaction_prepare_frozen_import(
                 "ws",
                 "thread",
@@ -4157,15 +4459,162 @@ async fn frozen_own_import_accepts_empty_intermediate_portion_ancestry() {
                 &acknowledgement,
                 0,
                 "portion-child",
-                &h,
+                &k_source,
             )
             .await
-            .unwrap_err();
+            .unwrap();
         assert_eq!(
-            error.to_string(),
-            "output coverage source changed",
-            "a changed or deleted output leaf must remain unavailable"
+            prepared_after_leaf_change.source(),
+            &k_source,
+            "a changed or deleted historical leaf invalidated the output summary"
         );
+
+        // A later TaskRun accepts the descriptor containing S=K itself. Carry
+        // that atomic grant onto a distinct T whose historical input is K.
+        for statement in [
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-target-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','portion-target-thread','portion-target-owner',1)",
+            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('portion-target-operation','portion-target-owner','portion-target','completed','{}',1)",
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('portion-t','portion-target-operation','portion-target-owner',0,'target T','portion-t-version','{}',0,1,'applied')",
+            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) SELECT 'portion-t',source_scope,source_id,source_version FROM compaction_live_sources WHERE source_id='portion-k'",
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) SELECT 'portion-target-operation',0,0,0,'portion-child',source_scope,source_id,source_version FROM compaction_live_sources WHERE source_id='portion-k'",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-consumer','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('portion-consumer','thread','thread',1,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-consumer-turn','portion-consumer','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('portion-consumer-task','ws','thread','thread','thread','turn','agent','running','Consumer','fixture')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('portion-consumer-run','portion-consumer-task','portion-consumer-run',1,1,'running','agent')",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('portion-consumer-rt','portion-consumer-task','portion-consumer-run','portion-consumer','portion-consumer-turn','initial',0,1,'running',CURRENT_TIMESTAMP)",
+        ] {
+            db.execute_unprepared(statement).await.unwrap();
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)",
+            [serde_json::to_string(&imported).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+        let t_source = store
+            .compaction_checkpoint_source("ws", "portion-target-thread", "portion-t")
+            .await
+            .unwrap()
+            .unwrap();
+        let target_message = FrozenMessageRef {
+            logical_turn_id: None,
+            source_thread: "portion-target-thread".into(),
+            context_thread: Some("portion-consumer".into()),
+            unit_id: "portion-target-unit".into(),
+            sources: vec![t_source.clone()],
+            inherited: false,
+            complete: true,
+            protected_input: false,
+            wire_sha256: "e".repeat(64),
+            replay_source: None,
+            tool_item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+        };
+
+        async fn begin_target(
+            store: &CrudStore,
+            id: &str,
+            message: &FrozenMessageRef,
+            prepared: PreparedFrozenImport,
+        ) -> (FrozenHistoryRef, Vec<(u64, PreparedFrozenImport)>) {
+            let target = descriptor(id, std::slice::from_ref(message));
+            let imports = vec![(0, prepared)];
+            let digest = frozen_import_identity(&imports).unwrap();
+            store
+                .compaction_begin_frozen_history_with_imports(
+                    "ws",
+                    "portion-consumer",
+                    &target,
+                    1,
+                    &digest,
+                )
+                .await
+                .unwrap();
+            store
+                .compaction_append_frozen_history(
+                    "ws",
+                    "portion-consumer",
+                    &target.manifest_id,
+                    0,
+                    std::slice::from_ref(message),
+                )
+                .await
+                .unwrap();
+            (target, imports)
+        }
+
+        let unchanged = store
+            .compaction_prepare_accepted_checkpoint_import(
+                "ws",
+                "portion-consumer",
+                "portion-consumer-turn",
+                0,
+                "portion-target-thread",
+                &t_source,
+            )
+            .await
+            .expect("raw leaf mutation must not invalidate atomic S evidence");
+        let (unchanged_target, unchanged_imports) =
+            begin_target(&store, "portion-target-success", &target_message, unchanged).await;
+        store
+            .compaction_append_frozen_imports(
+                "ws",
+                "portion-consumer",
+                &unchanged_target.manifest_id,
+                0,
+                &unchanged_imports,
+            )
+            .await
+            .expect("an unchanged published S must permit the bounded append");
+
+        let raced = store
+            .compaction_prepare_accepted_checkpoint_import(
+                "ws",
+                "portion-consumer",
+                "portion-consumer-turn",
+                0,
+                "portion-target-thread",
+                &t_source,
+            )
+            .await
+            .unwrap();
+        let (raced_target, raced_imports) =
+            begin_target(&store, "portion-target-raced", &target_message, raced).await;
+        db.execute_unprepared(if delete_leaf {
+            "DELETE FROM compaction_checkpoint WHERE id='portion-k'"
+        } else {
+            "UPDATE compaction_checkpoint SET status='candidate' WHERE id='portion-k'"
+        })
+        .await
+        .unwrap();
+        assert!(
+            store
+                .compaction_append_frozen_imports(
+                    "ws",
+                    "portion-consumer",
+                    &raced_target.manifest_id,
+                    0,
+                    &raced_imports,
+                )
+                .await
+                .is_err(),
+            "writer accepted a checkpoint grant that changed after preparation"
+        );
+        let raced_state = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT next_import,(SELECT COUNT(*) FROM compaction_frozen_import i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=?",
+                [raced_target.manifest_id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raced_state.try_get::<i64>("", "next_import").unwrap(), 0);
+        assert_eq!(raced_state.try_get::<i64>("", "stored").unwrap(), 0);
     }
 }
 
@@ -4322,12 +4771,12 @@ async fn ready_operation_with_references(
 }
 
 #[tokio::test]
-async fn runner_commit_revalidates_own_checkpoint_dag_after_admission() {
+async fn runner_commit_treats_published_checkpoint_as_independent_after_admission() {
     for delete in [false, true] {
         let store = store().await;
         let mut leaf = source(&store, "checkpoint-leaf", 1, "accepted H").await;
         leaf.revision = Some(1);
-        let checkpoint = candidate(&store, "source-checkpoint", None, &leaf).await;
+        let checkpoint = candidate_with_manifest(&store, "source-checkpoint", None, &leaf).await;
         assert_eq!(
             store
                 .compaction_apply(&checkpoint, None, std::slice::from_ref(&leaf))
@@ -4338,7 +4787,7 @@ async fn runner_commit_revalidates_own_checkpoint_dag_after_admission() {
         let mut later_leaf =
             source(&store, "later-checkpoint-leaf", 2, "later accepted work").await;
         later_leaf.revision = Some(1);
-        let head = candidate(
+        let head = candidate_with_manifest(
             &store,
             "source-checkpoint-head",
             Some(&checkpoint.id),
@@ -4375,24 +4824,59 @@ async fn runner_commit_revalidates_own_checkpoint_dag_after_admission() {
             .await
             .unwrap();
         assert!(
-            !store
+            store
                 .compaction_manifest_sources_current(&operation.id)
                 .await
                 .unwrap(),
-            "own checkpoint identity must not hide a changed DAG leaf"
+            "a published checkpoint must not depend on its historical leaf"
         );
         assert_eq!(
             store
                 .compaction_apply_runner(&operation.id, &ready, None)
                 .await
                 .unwrap(),
-            CommitOutcome::Stale
+            CommitOutcome::Applied
+        );
+        let third = store
+            .compaction_checkpoint(&format!("checkpoint-{}", operation.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            third.coverage,
+            vec![checkpoint_source],
+            "S3 must record S2 as its atomic direct input"
+        );
+        let s3_edges = store
+            .compaction_checkpoint_edges(&third.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s3_edges.coverage.len(), 1);
+        assert_eq!(s3_edges.coverage[0].source.id, head.id);
+        assert_eq!(
+            store
+                .compaction_checkpoint_edges(&head.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .previous
+                .as_deref(),
+            Some(checkpoint.id.as_str())
+        );
+        assert!(
+            store
+                .compaction_checkpoint_source("ws", "thread", &third.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "S3 was not published after its predecessor's old leaf changed"
         );
     }
 }
 
 #[tokio::test]
-async fn reference_only_checkpoint_still_revalidates_its_dag() {
+async fn reference_only_checkpoint_does_not_revalidate_historical_leaves() {
     let store = store().await;
     let mut leaf = source(&store, "reference-leaf", 1, "reference H").await;
     leaf.revision = Some(1);
@@ -4439,18 +4923,18 @@ async fn reference_only_checkpoint_still_revalidates_its_dag() {
         .await
         .unwrap();
     assert!(
-        !store
+        store
             .compaction_manifest_sources_current(&operation.id)
             .await
             .unwrap(),
-        "reference-only authority must not replace checkpoint DAG freshness"
+        "reference-only published checkpoint must survive historical deletion"
     );
     assert_eq!(
         store
             .compaction_apply_runner(&operation.id, &ready, None)
             .await
             .unwrap(),
-        CommitOutcome::Stale
+        CommitOutcome::Applied
     );
 }
 
@@ -5251,6 +5735,153 @@ async fn compaction_migration_resumes_partial_ddl_and_preserves_legacy_data_on_r
 }
 
 #[tokio::test]
+async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrite() {
+    use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        let connection = Database::connect("sqlite::memory:").await.unwrap();
+        let writer = SqliteWriteExecutor::new(connection.clone());
+        let migrations = Migrator::migrations();
+        let name = "m20260920_000001_independent_compaction_summaries";
+        let before = migrations
+            .iter()
+            .position(|migration| migration.name() == name)
+            .unwrap();
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, Some(before as u32))
+            .await
+            .unwrap();
+        let store = CrudStore::new(SqliteDatabase::from_executor(connection, writer.clone()))
+            .with_maintenance_access();
+        let db = store.database_connection();
+        for sql in [
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('upgrade-ws','fixture',1,1)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('upgrade-thread','upgrade-ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('upgrade-turn','upgrade-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('upgrade-leaf','upgrade-thread','upgrade-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
+            "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('upgrade-ws','upgrade-thread','upgrade-owner',1)",
+            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('upgrade-operation','upgrade-owner','upgrade','completed','{}',1)",
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('upgrade-operation',0,0,0,'upgrade-thread','event:upgrade-turn','upgrade-leaf','event-revision:1')",
+            "INSERT INTO compaction_projection_epoch(thread_id,version) VALUES ('upgrade-thread',7) ON CONFLICT(thread_id) DO UPDATE SET version=7",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        let selection = serde_json::to_string(&ModelSelection {
+            transport: Transport::Api,
+            instance: "upgrade-instance".into(),
+            model: "upgrade-model".into(),
+            effort: None,
+        })
+        .unwrap();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('upgrade-summary','upgrade-operation','upgrade-owner',0,'saved before upgrade','stable-identity',?,0,1,'applied')",
+            [selection.into()],
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('upgrade-summary','event:upgrade-turn','upgrade-leaf','event-revision:1')")
+            .await
+            .unwrap();
+        if compressed {
+            let config = serde_json::json!({
+                "table":"turn_event",
+                "column":"payload",
+                "compression_level":3,
+                "dict_chooser":"'[nodict]'"
+            });
+            db.query_one_write_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT zstd_enable_transparent(?)",
+                [config.to_string().into()],
+            ))
+            .await
+            .unwrap();
+            let payload = b"{}";
+            let payload = pioneer_sqlite::zstd::compress_column_value(payload, 3, None).unwrap();
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE _turn_event_zstd SET payload=?,_payload_dict=-1 WHERE id='upgrade-leaf'",
+                [payload.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute_unprepared("DELETE FROM turn_event WHERE id='upgrade-leaf'")
+            .await
+            .unwrap();
+        let reference = SourceRef {
+            scope: "checkpoint:upgrade-owner".into(),
+            id: "upgrade-summary".into(),
+            version: "stable-identity".into(),
+        };
+        let live_before = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_live_sources WHERE source_id='upgrade-summary'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+        assert_eq!(live_before, 0);
+
+        writer
+            .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
+            .await
+            .unwrap();
+
+        let live_after = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM compaction_live_sources WHERE source_id='upgrade-summary'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+        assert_eq!(live_after, 1);
+        assert!(
+            store
+                .compaction_sources_current(
+                    "upgrade-ws",
+                    "upgrade-thread",
+                    std::slice::from_ref(&reference),
+                )
+                .await
+                .unwrap()
+        );
+        let checkpoint = store
+            .compaction_checkpoint("upgrade-summary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.summary, "saved before upgrade");
+        assert_eq!(
+            checkpoint.coverage,
+            vec![SourceRef {
+                scope: "event:upgrade-turn".into(),
+                id: "upgrade-leaf".into(),
+                version: "event-revision:1".into(),
+            }]
+        );
+        assert_eq!(reference.version, "stable-identity");
+        let edges = store
+            .compaction_checkpoint_edges("upgrade-summary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edges.coverage.len(), 1);
+        assert_eq!(edges.coverage[0].source_thread, "upgrade-thread");
+        assert_eq!(edges.coverage[0].source.id, "upgrade-leaf");
+    }
+}
+
+#[tokio::test]
 async fn compaction_schema_preserves_byte_checks_keys_and_creation_sequence() {
     let store = store().await;
     let db = store.database_connection();
@@ -5417,6 +6048,7 @@ fn shared_refs(count: usize) -> Vec<pioneer_compaction::frozen::FrozenMessageRef
             protected_input: false,
             wire_sha256: "a".repeat(64),
             replay_source: None,
+            tool_item_id: None,
             tool_call_id: None,
             tool_name: None,
         })
