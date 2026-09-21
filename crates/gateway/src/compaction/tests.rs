@@ -9486,6 +9486,13 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
     ] {
         writer.execute_unprepared(sql).await.unwrap();
     }
+    for sql in [
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('output-task','ws','thread','thread','thread','turn','agent','running','Output','fixture')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('output-run','output-task','output-run',1,1,'succeeded','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('output-turn','output-task','output-run','thread','turn','initial',0,1,'in_progress',CURRENT_TIMESTAMP)",
+    ] {
+        writer.execute_unprepared(sql).await.unwrap();
+    }
     let mut reader_options = ConnectOptions::new(url);
     reader_options
         .max_connections(2)
@@ -9503,7 +9510,38 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
 
     // Occupy the sole maintenance-read admission. Interactive turn history
     // preparation must still reach SQLite and complete through the same store.
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "output-message".into(),
+                    text: "completed child output".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let output_turn = store
+        .get_task_run_turn("output-turn")
+        .await
+        .unwrap()
+        .unwrap();
     let held = database.maintenance().begin_read().await.unwrap();
+    // Establish a WAL read snapshot too: saving the result must still be able
+    // to write while this independent reader remains open.
+    held.query_one_raw(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT id FROM thread LIMIT 1".to_owned(),
+    ))
+    .await
+    .unwrap();
     let interactive_read_start = observer.reads().len();
     let interactive_write_start = observer.writes().len();
     let history_json = tokio::time::timeout(
@@ -9513,6 +9551,18 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
     .await
     .expect("occupied maintenance admission must not block interactive capture")
     .unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::frozen::capture_task_output(&store, "ws", &output_turn),
+    )
+    .await
+    .expect("live child completion must bypass occupied maintenance admission")
+    .unwrap();
+    assert!(output.history.messages > 0);
+    let repeated = super::frozen::capture_task_output(&store, "ws", &output_turn)
+        .await
+        .unwrap();
+    assert_eq!(output.history.manifest_id, repeated.history.manifest_id);
     let mut runtime = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
         "thread",
         "ws",
@@ -9633,9 +9683,25 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
         }
     )));
 
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::frozen::capture_task_output(&maintenance_store, "ws", &output_turn)
+        )
+        .await
+        .is_err()
+    );
     drop(held);
     let maintenance_read_start = observer.reads().len();
     let maintenance_write_start = observer.writes().len();
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::frozen::capture_task_output(&maintenance_store, "ws", &output_turn),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.history.manifest_id, recovered.history.manifest_id);
     let background_json = tokio::time::timeout(
         Duration::from_secs(5),
         super::frozen::capture_execution_basis_json(

@@ -146,7 +146,7 @@ impl TaskScheduler {
             .filter(|run| run.retry_of_run_id.is_none())
             .filter(|run| run.ready_at.is_none_or(|ready_at| ready_at <= now))
         {
-            if self.process_queued_run(run).await? {
+            if self.process_queued_run(&self.store, run).await? {
                 created = created.saturating_add(1);
             }
         }
@@ -154,12 +154,17 @@ impl TaskScheduler {
         Ok(created)
     }
 
-    pub(crate) async fn process_queued_run_once(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
-        // This boundary is used only for the freshly committed immediate run.
+    pub(crate) async fn process_queued_run_once(
+        &self,
+        store: &Arc<CrudStore>,
+        run: TaskRun,
+    ) -> TaskRuntimeResult<bool> {
+        // Inherit the request handle for this freshly committed immediate run.
+        // Scheduled/background dispatch continues to use the scheduler store.
         // Do not queue the caller behind an unrelated global due sweep. A
         // concurrent scheduler wake is safe: claim_task_run_for_dispatch is
         // the per-run CAS and exactly one contender can own the dispatch.
-        self.process_queued_run(run).await
+        self.process_queued_run(store, run).await
     }
 
     async fn load_due_task_actor_contract(
@@ -546,7 +551,7 @@ impl TaskScheduler {
         let created_count = runs.len();
         for run in runs {
             let _ = self
-                .dispatch_run(task_response.task.workspace_id.clone(), run)
+                .dispatch_run(&self.store, task_response.task.workspace_id.clone(), run)
                 .await?;
         }
         Ok(created_count)
@@ -725,12 +730,16 @@ impl TaskScheduler {
         self.store
             .upsert_task_occurrence_contract(&occurrence, now)
             .await?;
-        self.dispatch_run(task_response.task.workspace_id, run)
+        self.dispatch_run(&self.store, task_response.task.workspace_id, run)
             .await
     }
 
-    async fn process_queued_run(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
-        let Some(task_response) = self.store.get_task(run.task_id.as_str()).await? else {
+    async fn process_queued_run(
+        &self,
+        store: &Arc<CrudStore>,
+        run: TaskRun,
+    ) -> TaskRuntimeResult<bool> {
+        let Some(task_response) = store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
         if is_terminal_task(task_response.task.status)
@@ -744,7 +753,7 @@ impl TaskScheduler {
         if self.executors.get(run.executor_kind).await.is_none() {
             return Ok(false);
         }
-        self.store
+        store
             .get_task_occurrence_contract_by_run(run.id.as_str())
             .await?
             .with_context(|| {
@@ -753,7 +762,7 @@ impl TaskScheduler {
                     run.id
                 )
             })?;
-        self.dispatch_run(task_response.task.workspace_id, run)
+        self.dispatch_run(store, task_response.task.workspace_id, run)
             .await
     }
 
@@ -777,13 +786,17 @@ impl TaskScheduler {
         active_without_queued < max_parallel_runs
     }
 
-    async fn dispatch_run(&self, workspace_id: String, run: TaskRun) -> TaskRuntimeResult<bool> {
+    async fn dispatch_run(
+        &self,
+        store: &Arc<CrudStore>,
+        workspace_id: String,
+        run: TaskRun,
+    ) -> TaskRuntimeResult<bool> {
         let Some(executor) = self.executors.get(run.executor_kind).await else {
             return Ok(false);
         };
         let claimed_at = now_timestamp_secs();
-        let Some(run) = self
-            .store
+        let Some(run) = store
             .claim_task_run_for_dispatch(run.id.as_str(), claimed_at)
             .await?
         else {
@@ -797,8 +810,7 @@ impl TaskScheduler {
         };
         let worker_id = format!("task-worker-{}", generate_id(ID_LEN));
         let lease_until = claimed_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
-        let Some(execution) = self
-            .store
+        let Some(execution) = store
             .claim_task_run_execution_for_dispatch(
                 run.id.as_str(),
                 run.executor_kind,
@@ -822,7 +834,7 @@ impl TaskScheduler {
             worker_id,
         };
         let handle = TaskExecutionHandle::new(
-            self.store.clone(),
+            store.clone(),
             self.event_bus.clone(),
             run.task_id.clone(),
             run.id.clone(),

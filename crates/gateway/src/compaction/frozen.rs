@@ -363,7 +363,8 @@ pub(crate) async fn capture_task_output(
     workspace: &str,
     turn: &pioneer_protocol::TaskRunTurn,
 ) -> Result<pioneer_crud::compaction::TaskOutputSnapshot> {
-    let store = store.with_maintenance_access();
+    // Preserve the caller's scope: live completion is request work, while
+    // recovery callers already carry maintenance reads/critical writes.
     if let Some(snapshot) = store.compaction_task_output(workspace, &turn.id).await? {
         ensure!(
             snapshot.task_id == turn.task_id
@@ -380,13 +381,13 @@ pub(crate) async fn capture_task_output(
     // snapshot and in the recipient's context; C composes H + own A + own B.
     // In particular, do not hydrate/revalidate all of H's imported sources or
     // project a compaction checkpoint on the terminal delivery path.
-    super::history::prepare_history(&store, workspace, &turn.thread_id).await?;
+    super::history::prepare_history(store, workspace, &turn.thread_id).await?;
     let epoch = store
         .compaction_projection_version(workspace, &turn.thread_id)
         .await?;
     let fence = store.compaction_history_read_fence().await?;
     let messages = super::history::load_task_output_history(
-        &store,
+        store,
         workspace,
         &turn.thread_id,
         &turn.turn_id,
@@ -394,7 +395,7 @@ pub(crate) async fn capture_task_output(
     )
     .await?;
     let history = capture(
-        &store,
+        store,
         workspace,
         &turn.thread_id,
         &BTreeSet::from([turn.thread_id.clone()]),

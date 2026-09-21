@@ -4080,7 +4080,7 @@ impl TaskService {
     async fn process_queued_run_once(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
         let scheduler = self.scheduler.read().await.as_ref().and_then(Weak::upgrade);
         if let Some(scheduler) = scheduler {
-            scheduler.process_queued_run_once(run).await
+            scheduler.process_queued_run_once(&self.store, run).await
         } else {
             Ok(false)
         }

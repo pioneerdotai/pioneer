@@ -1446,7 +1446,7 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
     id: &str,
 ) -> Result<Option<CheckpointEdges>> {
     let Some(row) = CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
-        "SELECT p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner WHERE p.id=? LIMIT 1",
+        "SELECT p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id,projection.manifest_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner LEFT JOIN compaction_operation_projection projection ON projection.operation_id=p.operation_id WHERE p.id=? LIMIT 1",
         [id.into()],
     ))
     .one(db)
@@ -1489,20 +1489,7 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
             && ownership.values().all(|threads| threads.len() == 1),
         "checkpoint coverage lost its historical manifest ownership"
     );
-    let replay_aliases = HistoricalReplayAliasRow::find_by_statement(sqlite_specific_sql(
-        "SELECT DISTINCT m.source_thread AS source_thread,v.source_scope AS covered_scope,v.source_id AS covered_id,v.source_version AS covered_version,json_extract(f.reference_json,'$.replay_source.scope') AS replay_scope,json_extract(f.reference_json,'$.replay_source.id') AS replay_id,json_extract(f.reference_json,'$.replay_source.version') AS replay_version,json_extract(f.reference_json,'$.tool_item_id') AS tool_item_id FROM compaction_operation_projection p JOIN compaction_frozen_message f ON f.manifest_id=p.manifest_id JOIN json_each(f.reference_json,'$.sources') saved JOIN compaction_coverage v ON v.checkpoint_id=? AND json_extract(saved.value,'$.scope')=v.source_scope AND json_extract(saved.value,'$.id')=v.source_id AND json_extract(saved.value,'$.version')=v.source_version JOIN compaction_manifest m ON m.operation_id=p.operation_id AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version AND m.source_thread=json_extract(f.reference_json,'$.source_thread') WHERE p.operation_id=? AND json_type(f.reference_json,'$.replay_source')='object' ORDER BY replay_scope,replay_id,source_thread LIMIT ?",
-        [
-            id.into(),
-            row.operation_id.clone().into(),
-            i64::try_from(CHECKPOINT_SOURCE_LIMIT + 1)?.into(),
-        ],
-    ))
-    .all(db)
-    .await?;
-    ensure!(
-        replay_aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
-        "checkpoint replay aliases exceed supported quantum"
-    );
+    let replay_aliases = checkpoint_replay_aliases(db, id, &row).await?;
     Ok(Some(CheckpointEdges {
         owner: row.owner,
         workspace_id: row.workspace_id,
@@ -1542,6 +1529,108 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
     }))
 }
 
+// Published operation projections and their logical frozen messages are immutable.
+// Storage sharing may change between pages, but preserves each logical ordinal.
+// No write transaction or reader snapshot spans these pages: every query releases
+// database capacity before the next page is prepared. Existing callers supply the
+// scoped database, so request and background reads retain their scheduling class.
+async fn checkpoint_replay_aliases<C: ConnectionTrait>(
+    db: &C,
+    checkpoint: &str,
+    checkpoint_row: &CheckpointEdgesRow,
+) -> Result<Vec<HistoricalReplayAliasRow>> {
+    let Some(manifest) = checkpoint_row.manifest_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut aliases = std::collections::BTreeSet::new();
+    let mut start = 0_i64;
+    loop {
+        let sizes = db
+            .query_all_raw(checkpoint_replay_page_sizes_statement(manifest, start))
+            .await?;
+        if sizes.is_empty() {
+            break;
+        }
+        let mut end = start;
+        let mut bytes = 0_usize;
+        for size in sizes {
+            let ordinal: i64 = size.try_get("", "ordinal")?;
+            let size: i64 = size.try_get("", "bytes")?;
+            ensure!(
+                (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
+                "invalid frozen reference size"
+            );
+            if bytes + size as usize > SOURCE_PAGE_BYTES {
+                break;
+            }
+            ensure!(ordinal == end, "frozen history ordinal gap");
+            bytes += size as usize;
+            end = ordinal
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
+        }
+        ensure!(end > start, "frozen replay page made no progress");
+        let page =
+            HistoricalReplayAliasRow::find_by_statement(checkpoint_replay_alias_page_statement(
+                checkpoint,
+                &checkpoint_row.operation_id,
+                manifest,
+                start,
+                end,
+            ))
+            .all(db)
+            .await?;
+        aliases.extend(page);
+        ensure!(
+            aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
+            "checkpoint replay aliases exceed supported quantum"
+        );
+        start = end;
+    }
+    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+    aliases.sort_by(|left, right| {
+        (&left.replay_scope, &left.replay_id, &left.source_thread).cmp(&(
+            &right.replay_scope,
+            &right.replay_id,
+            &right.source_thread,
+        ))
+    });
+    Ok(aliases)
+}
+
+pub(super) fn checkpoint_replay_page_sizes_statement(manifest: &str, start: i64) -> Statement {
+    sqlite_specific_sql(
+        "SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
+        [
+            manifest.into(),
+            start.into(),
+            (SOURCE_PAGE_ROWS as i64).into(),
+        ],
+    )
+}
+
+pub(super) fn checkpoint_replay_alias_page_statement(
+    checkpoint: &str,
+    operation: &str,
+    manifest: &str,
+    start: i64,
+    end: i64,
+) -> Statement {
+    // Bind the manifest directly: a join through operation_projection alone lets
+    // SQLite scan both UNION ALL branches of the frozen-message view globally.
+    sqlite_specific_sql(
+        "SELECT DISTINCT m.source_thread AS source_thread,v.source_scope AS covered_scope,v.source_id AS covered_id,v.source_version AS covered_version,json_extract(f.reference_json,'$.replay_source.scope') AS replay_scope,json_extract(f.reference_json,'$.replay_source.id') AS replay_id,json_extract(f.reference_json,'$.replay_source.version') AS replay_version,json_extract(f.reference_json,'$.tool_item_id') AS tool_item_id FROM compaction_operation_projection p JOIN compaction_frozen_message f ON f.manifest_id=p.manifest_id JOIN json_each(f.reference_json,'$.sources') saved JOIN compaction_coverage v ON v.checkpoint_id=? AND json_extract(saved.value,'$.scope')=v.source_scope AND json_extract(saved.value,'$.id')=v.source_id AND json_extract(saved.value,'$.version')=v.source_version JOIN compaction_manifest m ON m.operation_id=p.operation_id AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version AND m.source_thread=json_extract(f.reference_json,'$.source_thread') WHERE p.operation_id=? AND f.manifest_id=? AND f.ordinal>=? AND f.ordinal<? AND json_type(f.reference_json,'$.replay_source')='object' ORDER BY replay_scope,replay_id,source_thread LIMIT ?",
+        [
+            checkpoint.into(),
+            operation.into(),
+            manifest.into(),
+            start.into(),
+            end.into(),
+            ((CHECKPOINT_SOURCE_LIMIT + 1) as i64).into(),
+        ],
+    )
+}
+
 #[derive(FromQueryResult)]
 struct CheckpointEdgesRow {
     owner: String,
@@ -1551,6 +1640,7 @@ struct CheckpointEdgesRow {
     previous: Option<String>,
     format_version: i64,
     operation_id: String,
+    manifest_id: Option<String>,
 }
 
 #[derive(FromQueryResult)]
@@ -1561,7 +1651,7 @@ struct HistoricalCoverageRow {
     source_thread: String,
 }
 
-#[derive(FromQueryResult)]
+#[derive(FromQueryResult, PartialEq, Eq, PartialOrd, Ord)]
 struct HistoricalReplayAliasRow {
     source_thread: String,
     covered_scope: String,

@@ -7842,3 +7842,102 @@ async fn role_owned_task_observation_budget_clamps_list_and_event_pages() {
     assert_eq!(events.events.len(), 1);
     assert!(events.has_more);
 }
+
+#[derive(Default)]
+struct DispatchDatabaseObserver {
+    reads: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadClass>>,
+    writes: std::sync::Mutex<Vec<pioneer_sqlite::SqliteWriteClass>>,
+}
+
+impl pioneer_sqlite::SqliteReadObserver for DispatchDatabaseObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+        if let pioneer_sqlite::SqliteReadEvent::OperationFinished { class, .. } = event {
+            self.reads.lock().unwrap().push(class);
+        }
+    }
+}
+impl pioneer_sqlite::SqliteWriteObserver for DispatchDatabaseObserver {
+    fn observe(&self, event: pioneer_sqlite::SqliteWriteEvent) {
+        if let pioneer_sqlite::SqliteWriteEvent::Acquired { class, .. } = event {
+            self.writes.lock().unwrap().push(class);
+        }
+    }
+}
+impl DispatchDatabaseObserver {
+    fn assert_scope(
+        &self,
+        read: pioneer_sqlite::SqliteReadClass,
+        write: pioneer_sqlite::SqliteWriteClass,
+    ) {
+        let reads = std::mem::take(&mut *self.reads.lock().unwrap());
+        let writes = std::mem::take(&mut *self.writes.lock().unwrap());
+        assert!(
+            !reads.is_empty() && reads.iter().all(|class| *class == read),
+            "unexpected read classes: {reads:?}"
+        );
+        assert!(
+            !writes.is_empty() && writes.iter().all(|class| *class == write),
+            "unexpected write classes: {writes:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn immediate_dispatch_inherits_request_scope_and_scheduler_keeps_maintenance_scope() {
+    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteWriteClass, SqliteWriteExecutor};
+    let connection = Database::connect("sqlite::memory:").await.unwrap();
+    Migrator::up(&connection, None).await.unwrap();
+    seed_task_test_workspace(&connection).await;
+    let observer = Arc::new(DispatchDatabaseObserver::default());
+    let database = SqliteDatabase::from_executor_with_read_observer(
+        connection.clone(),
+        SqliteWriteExecutor::with_observer(connection, observer.clone()),
+        observer.clone(),
+    );
+    let runtime = TaskRuntime::new(Arc::new(CrudStore::new(database)));
+    runtime
+        .register_executor(Arc::new(CompletingSystemExecutor))
+        .await;
+    for (service, read, write) in [
+        (
+            runtime.service(),
+            SqliteReadClass::Interactive,
+            SqliteWriteClass::Interactive,
+        ),
+        (
+            runtime.maintenance_service(),
+            SqliteReadClass::Maintenance,
+            SqliteWriteClass::Maintenance,
+        ),
+        (
+            runtime.background_control_service(),
+            SqliteReadClass::Maintenance,
+            SqliteWriteClass::Critical,
+        ),
+    ] {
+        let result = service
+            .create_task(
+                TaskCreateContext::default(),
+                create_params(TaskTriggerSpec::Immediate),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.run.unwrap().status, TaskRunStatus::Succeeded);
+        observer.assert_scope(read, write);
+    }
+    runtime
+        .service()
+        .create_task(
+            TaskCreateContext::default(),
+            create_params(TaskTriggerSpec::ScheduledAt {
+                scheduled_at: 4_000_000_000,
+                timezone: Some("UTC".to_owned()),
+                catch_up_policy: None,
+            }),
+        )
+        .await
+        .unwrap();
+    observer.assert_scope(SqliteReadClass::Interactive, SqliteWriteClass::Interactive);
+    assert_eq!(runtime.process_due_once(4_000_000_000).await.unwrap(), 1);
+    observer.assert_scope(SqliteReadClass::Maintenance, SqliteWriteClass::Maintenance);
+}

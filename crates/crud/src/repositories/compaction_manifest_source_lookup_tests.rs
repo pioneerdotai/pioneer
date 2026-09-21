@@ -1,5 +1,8 @@
 use super::*;
 use crate::CrudStore;
+use crate::repositories::compaction::{
+    checkpoint_replay_alias_page_statement, checkpoint_replay_page_sizes_statement,
+};
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState, SourceCursor};
 use pioneer_compaction::{ModelSelection, Transport};
@@ -4126,4 +4129,106 @@ async fn rolled_back_domain_mutation_rolls_back_publication_fence_bump() {
         .try_get("", "payload")
         .unwrap();
     assert_eq!(payload, "{}");
+}
+
+// Exercise the actual UNION ALL view, including a shared storage layout.
+#[tokio::test]
+async fn checkpoint_replay_queries_seek_only_the_requested_manifest() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    seed_plan_noise(&db).await;
+    for mut statement in [
+        checkpoint_replay_page_sizes_statement("plan-manifest", 0),
+        checkpoint_replay_alias_page_statement(
+            "source-checkpoint",
+            "manifest-operation",
+            "plan-manifest",
+            0,
+            128,
+        ),
+    ] {
+        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        let details: Vec<String> = db
+            .query_all_raw(statement)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get("", "detail").unwrap())
+            .collect();
+        for alias in ["d", "s"] {
+            assert!(
+                !details
+                    .iter()
+                    .any(|line| line.starts_with(&format!("SCAN {alias} "))
+                        || line == &format!("SCAN {alias}")),
+                "global frozen-history scan: {details:#?}"
+            );
+            assert!(
+                details
+                    .iter()
+                    .any(|line| line.starts_with(&format!("SEARCH {alias} "))
+                        && line.contains("manifest_id=?")),
+                "missing manifest seek: {details:#?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_replay_aliases_survive_pages_and_shared_storage_without_duplicates() {
+    let fixture = fixture().await;
+    let db = fixture.db();
+    let count = SOURCE_PAGE_ROWS as i64 * 2 + 2;
+    db.execute_raw(sqlite_specific_sql(
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('aliases','ws','source-thread','identity',?,?,0,'imports',0,1)",
+        [count.into(), count.into()],
+    )).await.unwrap();
+    db.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','aliases','identity','imports',0)").await.unwrap();
+    for ordinal in 0..count {
+        // Short references cross the row quantum; longer units also cross
+        // the byte quantum. Duplicate aliases straddle both boundaries.
+        let reference = serde_json::json!({
+            "source_thread": "source-thread",
+            "sources": [{"scope":"event:source-turn","id":"event-source","version":"event-revision:1"}],
+            "replay_source": {"scope":"item:source-turn","id": if ordinal == count - 1 { "last" } else { "first" },"version":"item-revision:1"},
+            "tool_item_id": "tool",
+            "unit_id": if ordinal < SOURCE_PAGE_ROWS as i64 + 1 { "unit".to_owned() } else { "unit".repeat(1024) },
+            "inherited": false, "complete": true, "protected_input": false,
+            "wire_sha256": "a".repeat(64), "tool_call_id": null, "tool_name": null
+        }).to_string();
+        serde_json::from_str::<pioneer_compaction::frozen::FrozenMessageRef>(&reference)
+            .unwrap()
+            .validate()
+            .unwrap();
+        db.execute_raw(sqlite_specific_sql("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('aliases',?,?,?)", [ordinal.into(), reference.clone().into(), (reference.len() as i64).into()])).await.unwrap();
+    }
+    for shared in [false, true] {
+        if shared {
+            for sql in [
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) SELECT 'alias-storage',workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready FROM compaction_frozen_history WHERE id='aliases'",
+                "INSERT INTO compaction_frozen_message_data SELECT 'alias-storage',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='aliases'",
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('aliases',0,1,0)",
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) SELECT 'aliases',0,0,message_count,'alias-storage' FROM compaction_frozen_history WHERE id='aliases'",
+                "DELETE FROM compaction_frozen_message_data WHERE manifest_id='aliases'",
+            ] {
+                db.execute_unprepared(sql).await.unwrap();
+            }
+        }
+        let edges = fixture
+            .store
+            .compaction_checkpoint_edges("source-checkpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edges.replay_aliases.len(), 2);
+        assert_eq!(edges.replay_aliases[0].replay.source.id, "first");
+        assert_eq!(edges.replay_aliases[1].replay.source.id, "last");
+        assert!(
+            edges
+                .replay_aliases
+                .iter()
+                .all(|alias| alias.covered.source.id == "event-source"
+                    && alias.covered.source_thread == "source-thread")
+        );
+    }
 }
