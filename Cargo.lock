@@ -109,9 +109,9 @@ dependencies = [
 
 [[package]]
 name = "aegis"
-version = "0.9.16"
+version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4542662923e93dc727bc364f885f6cf24adb4dc60d6fcce0e8d397d214179e14"
+checksum = "9b7625dcdad9eb85ada009248ef077245f179e6e1a7feba44e7317188c4c3e59"
 dependencies = [
  "cc",
  "softaes",
@@ -4372,7 +4372,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
+source = "git+https://github.com/longbridge/gpui-kit#0b3e53d37fb9077aefde38502ff78ea062e57dd0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4409,7 +4409,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
+source = "git+https://github.com/longbridge/gpui-kit#0b3e53d37fb9077aefde38502ff78ea062e57dd0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4452,7 +4452,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
+source = "git+https://github.com/longbridge/gpui-kit#0b3e53d37fb9077aefde38502ff78ea062e57dd0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -4463,7 +4463,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
+source = "git+https://github.com/longbridge/gpui-kit#0b3e53d37fb9077aefde38502ff78ea062e57dd0"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -4476,7 +4476,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.6.4"
-source = "git+https://github.com/longbridge/gpui-kit#cfc37e6ff13f70a4bc368740625e351cc5c2db21"
+source = "git+https://github.com/longbridge/gpui-kit#0b3e53d37fb9077aefde38502ff78ea062e57dd0"
 dependencies = [
  "anyhow",
  "gpui-pre",
@@ -4489,9 +4489,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a9ca98fdcad06276de623c2f48ebd710f1e7724eebef2f2673c583e85dc8335"
+checksum = "a0437c0b83e636a92bd1a39fa1d05fb632ae671289537497b35871ffbe231b84"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4518,7 +4518,6 @@ dependencies = [
  "gpui-pre-sum-tree",
  "gpui-pre-util",
  "gpui-pre-util-macros",
- "gpui-pre-ztracing",
  "heapless",
  "image",
  "inventory",
@@ -4526,6 +4525,8 @@ dependencies = [
  "log",
  "lyon",
  "num_cpus",
+ "objc2-core-foundation",
+ "objc2-core-video",
  "parking",
  "parking_lot",
  "pin-project",
@@ -4547,7 +4548,6 @@ dependencies = [
  "strum 0.28.0",
  "taffy",
  "thiserror 2.0.20",
- "tracing",
  "ttf-parser",
  "url",
  "usvg 0.46.0",
@@ -4561,9 +4561,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-apple"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fc4da82c5c2dbb25443655cfbc4305a2e2d1380bc0b815e80664fdfbf4cfdb"
+checksum = "3af534f0746eb9e014114bcc0ee00dc250c4b8d75df2e437180c403aa65649c1"
 dependencies = [
  "anyhow",
  "block",
@@ -4575,7 +4575,6 @@ dependencies = [
  "etagere",
  "foreign-types 0.5.0",
  "gpui-pre",
- "gpui-pre-collections",
  "image",
  "log",
  "metal",
@@ -4586,9 +4585,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-collections"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "626a09f683ff6f3b2f708341bdcea9d479af5b14a6a2fccec9cff935ec0751b7"
+checksum = "15e7a65204039187d1f4b3d4c2e0233eeac54d4acb0b13f9dc1a3b5adad26c1f"
 dependencies = [
  "gpui-pre-util",
  "indexmap 2.14.2",
@@ -4597,9 +4596,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-derive-refineable"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d06116a2b857588f6ea7bfb447b3554ba985e780b5995ae47780252da152f3"
+checksum = "79dfb4a05f3cd9893d7768dbf5dba1bbbe99cab7394e89b360ccb3b2bcb6b34e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4608,9 +4607,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-http-client"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0d2071c582c1a0f71b8c7c00607a3b9cd18f81fb3510d41845db3447b2a11c9"
+checksum = "cfd5a7542c77887a5aff997d78c95884119c8463409569b63fcf060956da1682"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4629,9 +4628,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-linux"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b427589681ec1fed27951fd82edc70a7e288bb2487ede26dbbd07c2ce23d4f"
+checksum = "aab655cda1d6dcd549ac869e8678babc84cf573ab6794a1fe1a39c6c70c60b48"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -4676,15 +4675,14 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-macos"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "806eac0cb5c0eebc0b032c6450c11d283264f9ac05754dda83fc80d0b86b4ee8"
+checksum = "951d17e41a72067ad2d35c60e08a62e8ad7fa9400b41c802e26cfb459f6c05da"
 dependencies = [
  "accesskit",
  "accesskit_macos",
  "anyhow",
  "async-task",
- "block",
  "block2 0.6.2",
  "cocoa 0.26.1",
  "core-foundation 0.10.1",
@@ -4698,17 +4696,17 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-apple",
  "gpui-pre-collections",
- "gpui-pre-media",
  "gpui-pre-util",
  "image",
  "itertools 0.14.0",
  "libc",
  "log",
  "mach2 0.5.0",
- "metal",
  "objc",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-core-graphics",
+ "objc2-core-media",
  "objc2-foundation 0.3.2",
  "objc2-screen-capture-kit",
  "objc2-user-notifications",
@@ -4724,9 +4722,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-macros"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c06139051bf1db51949bfbb4ee338208bd64b4c35340d8c1a6a8200744e28fe1"
+checksum = "6324092b40ea8ec7c327a4a28427e366a489b4d5d23b5d1bd0243fc2f4ca7a9e"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-crate",
@@ -4736,25 +4734,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-pre-media"
-version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "500acb13f818ff234021c1b9eae8592b0cbe017a64e26908c736b7421b1c6213"
-dependencies = [
- "anyhow",
- "bindgen 0.72.1",
- "core-foundation 0.10.1",
- "core-video",
- "foreign-types 0.5.0",
- "metal",
- "objc",
-]
-
-[[package]]
 name = "gpui-pre-perf"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0973bbb02bf46940ac0861d9dce0fc03a3109634172b69108d1bc13fa29d76c"
+checksum = "b94bff26ccd8105f6206144f8dab16a2dc02e7a68f39dada02cdf492f0afd940"
 dependencies = [
  "gpui-pre-collections",
  "serde",
@@ -4763,9 +4746,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-platform"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b613512e29f1e7b825bfa7e50a447388ff1347044350a475e4c98a892a985c8d"
+checksum = "8423d1e0a693d2f9f16c0326bb01b5e81ec0531854d596a18476934ac6880478"
 dependencies = [
  "console_error_panic_hook",
  "gpui-pre",
@@ -4777,9 +4760,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-refineable"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "428f23703ead5601618ffea73c137897b98a94ce8d30e257f22be947732dfbf9"
+checksum = "93b4b0a8d296a3ee5beb1136bc48f8167a6028eb1e243b56851dcd8c9fc6d7a1"
 dependencies = [
  "gpui-pre-derive-refineable",
 ]
@@ -4836,9 +4819,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-scheduler"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dd1b7ff2e7bf43302ae982cd786a22c16c52e16682e67b66cfbe2cb2bc3a72d"
+checksum = "ff7b10b3d2fc3fda24847a04436eca9531612c8414874a37ddc005f20e521e12"
 dependencies = [
  "async-task",
  "backtrace",
@@ -4853,9 +4836,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-shared-string"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "424a4dd6a570473d57acf1df2bfb9f3028d4b568abcaeb9252e0f13047b50c03"
+checksum = "fe17f81bd98a0253140ea79f7f76442d7499bd8d17db302861af8e46c11d38df"
 dependencies = [
  "schemars 1.2.2",
  "serde",
@@ -4864,9 +4847,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-sum-tree"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4855718e82630d29198b515d2b027361ef63dd19b6021cefe945789dcff82372"
+checksum = "0a6d35e998a51d24248dad731de1f09d386cbbf46a04edde3b67f469b2ce3f16"
 dependencies = [
  "gpui-pre-ztracing",
  "heapless",
@@ -4877,9 +4860,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-util"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e973148165346c0f9b3f5072b321d7c2f33807c93daea67fe298c005c0e0c2a8"
+checksum = "6a026a30c578930d20974fd8c3d77de36223ac7ba193bd4259e7238929bc8806"
 dependencies = [
  "anyhow",
  "log",
@@ -4888,9 +4871,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-util-macros"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f71f6212d3772a70988c7d64627c7284dec73c17992ac4f9f0cdfdd46cbb677"
+checksum = "5cbf79627a6afc626d4e887dad9d2d92bb069413e8cc692ba3e90bff219eb7a9"
 dependencies = [
  "gpui-pre-perf",
  "quote",
@@ -4899,9 +4882,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-web"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f0daada903f106be946d87e25f5bc85ad6cf60d6d82cb8f8aed945417a9c1a3"
+checksum = "34be433b9fcb370b1fe9a1c7fe911f0eb6058791ef8167dcf6c5a5deb624975c"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -4928,9 +4911,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-wgpu"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "640b666a16ddf9504e2eb3e7a997acb2b2adfaa7859925bdd36fc3acfd8f30a7"
+checksum = "05515b32799b1767d69300921c1b562cd53104965211a0e8905acdc7aa18e693"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4955,9 +4938,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-windows"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c12c7d84ec422feb2f064117d572447998381e5c219fcad69fe19f10d0b7aaea"
+checksum = "27662e65bfcf4445d2cccfad91f1570ec07f4b1b5de98400a9f207fd19c464cf"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -4984,9 +4967,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-zlog"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98352858fac3d4d05b46d6014ad04bad313652a691d4e21dc55fa96fb4acb7cf"
+checksum = "f3a5af0b734a391a84872eb770b3ee9830091ec2487b79d06371fe14eefb2b5d"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4996,9 +4979,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-ztracing"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d63a3c7276875b4d7e6d3961e92a138e9233e86a591bf318f2e54df4ad58102"
+checksum = "a24cb19f78c5bc3aab8ddf1e8e0bd6b402fbcb9c7f112f64ddbedef8f8768a59"
 dependencies = [
  "gpui-pre-zlog",
  "gpui-pre-ztracing-macro",
@@ -5008,9 +4991,9 @@ dependencies = [
 
 [[package]]
 name = "gpui-pre-ztracing-macro"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84e2a5ff79002223edfcfa76c6f9f79f4f60f6ec545ccc27832f12bd46348b39"
+checksum = "a1bb25850ad31b88bbdef454afb93ec4cdb81f5e200ba5b3f1a0368111780d2c"
 
 [[package]]
 name = "granit-parser"
@@ -5412,9 +5395,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.9"
+version = "0.27.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
+checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
 dependencies = [
  "http",
  "hyper",
@@ -8070,8 +8053,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74b7c5390f477482f001bc354d6571a70db7e4f8d5288e860c45521fbce11394"
 dependencies = [
  "block2 0.6.2",
+ "dispatch2",
  "objc2 0.6.4",
  "objc2-core-graphics",
+ "objc2-core-media",
  "objc2-foundation 0.3.2",
 ]
 
@@ -8643,9 +8628,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pest"
-version = "2.9.1"
+version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d45aeb61b4bf818e12d4205f2466f8c4748f85f4fce0146d1c03d69d753f0ad"
+checksum = "45d3aca230fad2e6f6317ca0a72724338c4960cb97168a85cdee66df4a9a21a8"
 dependencies = [
  "memchr",
  "ucd-trie",
@@ -8653,9 +8638,9 @@ dependencies = [
 
 [[package]]
 name = "pest_derive"
-version = "2.9.1"
+version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89cc5a242e25ed4e7704d0be240f2cfbe20a8c27e7e252d94835be93d92dc39f"
+checksum = "284b60557f2c4a2e72ad3f2d34d42685a2fa4a6a61d0d2a10c0ae2a5e916c2cf"
 dependencies = [
  "pest",
  "pest_generator",
@@ -8663,9 +8648,9 @@ dependencies = [
 
 [[package]]
 name = "pest_generator"
-version = "2.9.1"
+version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7abf21475cc3820fe4b2ca2dc2142902f67a02189f3b5b3a229f4febc01a43e5"
+checksum = "1d9d1f08a115309ee99268cf85e5228e0e56aa9caf8841ec12866b6be07c3109"
 dependencies = [
  "pest",
  "pest_meta",
@@ -8676,9 +8661,9 @@ dependencies = [
 
 [[package]]
 name = "pest_meta"
-version = "2.9.1"
+version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adba4db388f687393c18c51348d44a41d870ca9df71a2c98172ea3035dc6936e"
+checksum = "ed93ba1a9ffcca32130a5188701c81c0c49cf00d4b7c5007d5148951d743adcb"
 dependencies = [
  "pest",
 ]
@@ -8860,7 +8845,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pioneer-agent"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8890,7 +8875,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-app-updater"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "libc",
@@ -8905,7 +8890,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-artifacts"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8930,7 +8915,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -8955,7 +8940,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-agent-runtime"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8977,7 +8962,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-cli-mcp-bridge"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "async-trait",
  "libc",
@@ -8991,7 +8976,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9024,7 +9009,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-client-ffi"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9043,7 +9028,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-compaction"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9056,7 +9041,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-config"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "config",
@@ -9067,7 +9052,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-crud"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9089,7 +9074,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -9138,7 +9123,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-administration"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9152,7 +9137,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-agents-doc"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9163,7 +9148,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-foundation"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9171,7 +9156,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-mcp"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -9183,7 +9168,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-onboarding"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9196,7 +9181,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-providers"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9207,7 +9192,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-settings"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9223,7 +9208,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-skills"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "chrono",
  "gpui-kit",
@@ -9235,7 +9220,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-task-notifications"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9247,7 +9232,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-thread"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9271,7 +9256,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-update"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -9288,7 +9273,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-desktop-workspaces"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "gpui-kit",
  "pioneer-client",
@@ -9301,7 +9286,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-entity"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "sea-orm",
  "serde",
@@ -9309,7 +9294,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-gateway"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9379,7 +9364,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-hooks"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "async-trait",
  "futures-timer",
@@ -9394,7 +9379,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-keystore"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "db-keystore",
  "keyring-core",
@@ -9407,7 +9392,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-mcp"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9429,7 +9414,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-memory"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9453,7 +9438,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-migration"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9471,7 +9456,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-observability"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -9488,7 +9473,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-promt"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9507,7 +9492,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-protocol"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -9522,7 +9507,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-provider"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9554,7 +9539,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-runtime-events"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "pioneer-protocol",
  "serde_json",
@@ -9564,7 +9549,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-skills"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "hex",
@@ -9582,7 +9567,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-sqlite"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9609,7 +9594,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tasks"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9631,7 +9616,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tools"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9670,7 +9655,7 @@ dependencies = [
 
 [[package]]
 name = "pioneer-tunnel"
-version = "0.53.13"
+version = "0.53.14"
 dependencies = [
  "anyhow",
  "pioneer-config",
@@ -11690,9 +11675,9 @@ dependencies = [
 
 [[package]]
 name = "sentry"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a88b65feb368d9dde5d531a2b59b25016e36fd6e4978432371a3ee77746ca2"
+checksum = "9fa951f4e644464ebfd2347a7ab03b0828c512d2448a76262cad2607b343dff4"
 dependencies = [
  "cfg_aliases 0.2.2",
  "httpdate",
@@ -11710,9 +11695,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-anyhow"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34e4c4b2e5bf7bb63f8223eb4f6d24f64e2c18b4d01fdeb3d561a951e057425b"
+checksum = "5ae34326bd95495e0db3c34c8888655684630cfe7609a73e863f0a7f4be5efdf"
 dependencies = [
  "anyhow",
  "sentry-backtrace",
@@ -11721,9 +11706,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-backtrace"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c51511d67ed670266a93afeaa26a08019b04ad1420cb9191da30f2338d22c48"
+checksum = "f4f27cf048aa63ccd5bc94c29989133eabb82e9c6bf7441b58e9d4a95837a105"
 dependencies = [
  "backtrace",
  "regex",
@@ -11732,9 +11717,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-contexts"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b757ac1f335856e8d7f5062a1fd9bc07a05a7eb3cc48247db79bf2618a490bd"
+checksum = "c5ed680585dbdacdf9859c2b4dc53358ff02bd256766882e22e343836db36b22"
 dependencies = [
  "hostname",
  "libc",
@@ -11746,11 +11731,11 @@ dependencies = [
 
 [[package]]
 name = "sentry-core"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d889520a375e5b93efb0a66def1630d21d168b0251eb55b286b03fa940ccfc84"
+checksum = "c3ed398494bb8fc412a11a182c1883a10ae147587b8f6314abd222d1d626f31b"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.3",
  "sentry-types",
  "serde",
  "serde_json",
@@ -11759,9 +11744,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-panic"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e0fe456a7380e9df875a1ef4df1e468d35b19b9051599845fab9d8f0c71c4ae"
+checksum = "b7153e68642b761ed3aa62c022795c11b2facc728b2db7484084492373c944f9"
 dependencies = [
  "sentry-backtrace",
  "sentry-core",
@@ -11769,9 +11754,9 @@ dependencies = [
 
 [[package]]
 name = "sentry-tracing"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77796d14eedbef22c2fe78e9c69fb09f14c7ad607e624d48dce92eedc17a136e"
+checksum = "e7e7db1aefdf623f4e48e21ec9e4af535024187aeafb2a4cc7e29d035def5a13"
 dependencies = [
  "bitflags 2.13.2",
  "sentry-backtrace",
@@ -11782,13 +11767,13 @@ dependencies = [
 
 [[package]]
 name = "sentry-types"
-version = "0.49.2"
+version = "0.49.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc71f5ca55942d9b2901af95d5df5c5d65c164134c22a83682cac3d0b6c7ef2d"
+checksum = "1c18bf7b159bdfc7c8f97816f476b4947a1937fb6bea9d38d3479e58631614ac"
 dependencies = [
  "debugid",
  "hex",
- "rand 0.9.5",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
