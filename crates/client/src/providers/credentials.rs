@@ -7,6 +7,7 @@ use std::{
 #[derive(Clone)]
 pub enum ProviderCredentialTarget {
     Api(String),
+    ApiBaseUrl(String),
     Runtime(String),
 }
 pub struct ProviderCredentialLease {
@@ -153,6 +154,17 @@ impl ClientCore {
                                     .into_iter()
                                     .find(|p| &p.name == provider)
                                     .map(|p| p.proxy_url)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("provider_credential_unavailable")
+                                    })
+                            }),
+                        ProviderCredentialTarget::ApiBaseUrl(provider) => sender
+                            .provider_list(super::list::provider_list_params(&request.workspace))
+                            .and_then(|r| {
+                                r.providers
+                                    .into_iter()
+                                    .find(|p| &p.name == provider)
+                                    .map(|p| p.base_url)
                                     .ok_or_else(|| {
                                         anyhow::anyhow!("provider_credential_unavailable")
                                     })

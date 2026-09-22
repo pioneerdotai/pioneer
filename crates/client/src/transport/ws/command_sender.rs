@@ -1956,13 +1956,26 @@ where
         "proxy_url",
         methods::PROVIDER_CONFIGURE,
     )?;
+    require_optional_non_empty_field(
+        params.base_url.as_deref(),
+        "base_url",
+        methods::PROVIDER_CONFIGURE,
+    )?;
     require_condition(
-        params.api_key.is_some() || params.proxy_url.is_some() || params.clear_proxy,
+        params.api_key.is_some()
+            || params.proxy_url.is_some()
+            || params.clear_proxy
+            || params.base_url.is_some()
+            || params.clear_base_url,
         "at least one field is required for provider/configure",
     )?;
     require_condition(
         !(params.proxy_url.is_some() && params.clear_proxy),
         "`proxy_url` and `clear_proxy` cannot both be set for provider/configure",
+    )?;
+    require_condition(
+        !(params.base_url.is_some() && params.clear_base_url),
+        "`base_url` and `clear_base_url` cannot both be set for provider/configure",
     )?;
 
     send_json_rpc_request_typed(

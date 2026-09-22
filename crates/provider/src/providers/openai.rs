@@ -418,15 +418,16 @@ impl OpenAiProvider {
         )
     }
 
-    fn with_base_url_timeout_policy_and_authority(
+    pub(crate) fn with_base_url_timeout_policy_and_authority(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         timeout_policy: ProviderTimeoutPolicy,
         authority_fingerprint: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into().trim().trim_end_matches('/').to_owned();
         Self {
             api_key: api_key.into(),
-            base_url: base_url.into(),
+            base_url,
             authority_fingerprint: authority_fingerprint.into(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),

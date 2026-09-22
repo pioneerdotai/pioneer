@@ -155,6 +155,8 @@ pub fn plan_provider_configure(
     api_key: Option<String>,
     proxy_url: Option<String>,
     clear_proxy: bool,
+    base_url: Option<String>,
+    clear_base_url: bool,
 ) -> ProviderConfigurePlan {
     let Some(connection_id) = available_connection_id(gateway_connected, connection_id) else {
         return ProviderConfigurePlan::Unavailable(
@@ -177,6 +179,8 @@ pub fn plan_provider_configure(
             api_key,
             proxy_url,
             clear_proxy,
+            base_url,
+            clear_base_url,
         },
     })
 }
@@ -332,6 +336,8 @@ mod tests {
             Some("sk-test".to_owned()),
             Some("socks5://127.0.0.1:1080".to_owned()),
             false,
+            Some("https://api.example.com/v1".to_owned()),
+            false,
         );
 
         let ProviderConfigurePlan::Send(request) = plan else {
@@ -347,6 +353,11 @@ mod tests {
             Some("socks5://127.0.0.1:1080")
         );
         assert!(!request.params.clear_proxy);
+        assert_eq!(
+            request.params.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert!(!request.params.clear_base_url);
 
         let plan = plan_provider_configure(
             true,
@@ -354,6 +365,8 @@ mod tests {
             Some("workspace".to_owned()),
             "OpenRouter".to_owned(),
             None,
+            None,
+            true,
             None,
             true,
         );
@@ -364,6 +377,8 @@ mod tests {
         assert!(request.params.api_key.is_none());
         assert!(request.params.proxy_url.is_none());
         assert!(request.params.clear_proxy);
+        assert!(request.params.base_url.is_none());
+        assert!(request.params.clear_base_url);
     }
 
     #[test]

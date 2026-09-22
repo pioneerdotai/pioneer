@@ -110,8 +110,9 @@ use pioneer_protocol::{
     MemorySensitivity, PersistedActorRef, PrincipalId, PromptManifest, PromptManifestDiagnostic,
     PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
     PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
-    ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
+    PromptManifestProfile, ProviderConfigureParams, ProviderConfigureResponse,
+    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
+    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
     ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
     ProviderSetApiKeyResponse, ProviderTransportKind, PublicError, PublicErrorCode,
     PublicErrorStage, PublicTaskAgendaResponse, PublicTaskDeliveriesResponse, RecoveryAction,
@@ -6521,6 +6522,122 @@ async fn provider_api_key_handlers_use_keystore_without_settings_write() {
             .expect("provider/delete_api_key openai payload");
     assert_eq!(delete_openai_payload.provider, "openai");
     assert!(delete_openai_payload.deleted);
+}
+
+#[tokio::test]
+async fn provider_configure_and_list_round_trips_custom_base_url() {
+    let (
+        processor,
+        _secret_store,
+        mut rx,
+        connection_id,
+        _workspace_manager,
+        workspace_id,
+        _settings_path,
+    ) = setup_provider_api_key_processor("provider_configure_base_url").await;
+    let request_context =
+        registered_request_context(&processor, connection_id, "provider/test").await;
+
+    let configure_req_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "cfg_1"))
+            .expect("valid request id");
+    processor
+        .provider_configure(
+            &request_context,
+            configure_req_id.clone(),
+            ProviderConfigureParams {
+                workspace_id: workspace_id.clone(),
+                provider: "OpenAI".to_owned(),
+                api_key: Some("sk-openai-custom".to_owned()),
+                proxy_url: None,
+                clear_proxy: false,
+                base_url: Some("https://api.custom-ai.com/v1".to_owned()),
+                clear_base_url: false,
+            },
+        )
+        .await;
+    let cfg_resp = recv_response_by_id(&mut rx, configure_req_id.as_str()).await;
+    let cfg_payload: ProviderConfigureResponse =
+        serde_json::from_value(cfg_resp.result).expect("configure response payload");
+    assert_eq!(cfg_payload.provider, "openai");
+    assert!(cfg_payload.api_key_updated);
+    assert!(cfg_payload.base_url_updated);
+    assert!(!cfg_payload.base_url_deleted);
+    assert_eq!(
+        cfg_payload.base_url.as_deref(),
+        Some("https://api.custom-ai.com/v1")
+    );
+
+    let list_req_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "list_1"))
+            .expect("valid request id");
+    processor
+        .provider_list(
+            &request_context,
+            list_req_id.clone(),
+            ProviderListParams {
+                workspace_id: workspace_id.clone(),
+            },
+        )
+        .await;
+    let list_resp = recv_response_by_id(&mut rx, list_req_id.as_str()).await;
+    let list_payload: ProviderListResponse =
+        serde_json::from_value(list_resp.result).expect("provider/list payload");
+    let openai_summary = list_payload
+        .providers
+        .iter()
+        .find(|p| p.name == "openai")
+        .expect("openai provider should be in list");
+    assert_eq!(
+        openai_summary.base_url.as_deref(),
+        Some("https://api.custom-ai.com/v1")
+    );
+
+    let clear_req_id =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "cfg_2"))
+            .expect("valid request id");
+    processor
+        .provider_configure(
+            &request_context,
+            clear_req_id.clone(),
+            ProviderConfigureParams {
+                workspace_id: workspace_id.clone(),
+                provider: "openai".to_owned(),
+                api_key: None,
+                proxy_url: None,
+                clear_proxy: false,
+                base_url: None,
+                clear_base_url: true,
+            },
+        )
+        .await;
+    let clear_resp = recv_response_by_id(&mut rx, clear_req_id.as_str()).await;
+    let clear_payload: ProviderConfigureResponse =
+        serde_json::from_value(clear_resp.result).expect("clear response payload");
+    assert!(clear_payload.base_url_deleted);
+    assert!(clear_payload.base_url.is_none());
+
+    let list_req_id2 =
+        pioneer_protocol::RequestId::new(generate_test_request_id("provider", "list_2"))
+            .expect("valid request id");
+    processor
+        .provider_list(
+            &request_context,
+            list_req_id2.clone(),
+            ProviderListParams {
+                workspace_id: workspace_id.clone(),
+            },
+        )
+        .await;
+    let list_resp2 = recv_response_by_id(&mut rx, list_req_id2.as_str()).await;
+    let list_payload2: ProviderListResponse =
+        serde_json::from_value(list_resp2.result).expect("provider/list payload");
+    let openai_summary2 = list_payload2
+        .providers
+        .iter()
+        .find(|p| p.name == "openai")
+        .expect("openai provider should be in list");
+    assert!(openai_summary2.base_url.is_none());
 }
 
 #[tokio::test]

@@ -5,6 +5,94 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Returns the built-in endpoint used when a provider has no custom override.
+/// Providers whose endpoint is environment-driven or otherwise not a stable
+/// preset return `None`.
+pub fn default_provider_base_url(provider_name: &str) -> Option<&'static str> {
+    match provider_name.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some("https://api.openai.com/v1"),
+        "anthropic" => Some("https://api.anthropic.com"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "deepseek" => Some("https://api.deepseek.com"),
+        "gemini" | "google" | "google-gemini" => {
+            Some("https://generativelanguage.googleapis.com/v1beta")
+        }
+        "ollama" => Some("http://localhost:11434"),
+        "telnyx" => Some("https://api.telnyx.com/v2/ai"),
+        "copilot" | "github-copilot" => Some("https://api.githubcopilot.com"),
+        "glm" | "zhipu" | "bigmodel" | "glm-global" | "zhipu-global" | "glm-cn" | "zhipu-cn" => {
+            Some("https://open.bigmodel.cn/api/paas/v4")
+        }
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "xai" | "grok" => Some("https://api.x.ai"),
+        "together" | "together-ai" => Some("https://api.together.xyz"),
+        "fireworks" | "fireworks-ai" => Some("https://api.fireworks.ai/inference/v1"),
+        "novita" => Some("https://api.novita.ai/openai"),
+        "perplexity" => Some("https://api.perplexity.ai"),
+        "cohere" => Some("https://api.cohere.com/compatibility"),
+        "venice" => Some("https://api.venice.ai"),
+        "cerebras" => Some("https://api.cerebras.ai/v1"),
+        "sambanova" => Some("https://api.sambanova.ai/v1"),
+        "hyperbolic" => Some("https://api.hyperbolic.xyz/v1"),
+        "deepinfra" | "deep-infra" => Some("https://api.deepinfra.com/v1/openai"),
+        "huggingface" | "hf" => Some("https://router.huggingface.co/v1"),
+        "ai21" | "ai21-labs" => Some("https://api.ai21.com/studio/v1"),
+        "reka" => Some("https://api.reka.ai/v1"),
+        "baseten" => Some("https://inference.baseten.co/v1"),
+        "nscale" => Some("https://inference.api.nscale.com/v1"),
+        "anyscale" => Some("https://api.endpoints.anyscale.com/v1"),
+        "nebius" => Some("https://api.studio.nebius.ai/v1"),
+        "friendli" | "friendliai" => Some("https://api.friendli.ai/serverless/v1"),
+        "lepton" | "lepton-ai" => Some("https://llama3-1-405b.lepton.run/api/v1"),
+        "siliconflow" | "silicon-flow" => Some("https://api.siliconflow.cn/v1"),
+        "aihubmix" => Some("https://aihubmix.com/v1"),
+        "astrai" => Some("https://as-trai.com/v1"),
+        "stepfun" | "step" => Some("https://api.stepfun.com/v1"),
+        "baichuan" => Some("https://api.baichuan-ai.com/v1"),
+        "yi" | "01ai" | "lingyiwanwu" => Some("https://api.lingyiwanwu.com/v1"),
+        "hunyuan" | "tencent" => Some("https://api.hunyuan.cloud.tencent.com/v1"),
+        "ovhcloud" | "ovh" => Some("https://api.ai.cloud.ovh.net/v1"),
+        "nvidia" | "nvidia-nim" => Some("https://integrate.api.nvidia.com/v1"),
+        "synthetic" => Some("https://api.synthetic.new/openai/v1"),
+        "doubao" | "volcengine" | "ark" => Some("https://ark.cn-beijing.volces.com/api/v3"),
+        "qianfan" | "baidu" => Some("https://aip.baidubce.com"),
+        "lmstudio" | "lm-studio" => Some("http://localhost:1234/v1"),
+        "llamacpp" | "llama.cpp" => Some("http://localhost:8080/v1"),
+        "sglang" => Some("http://localhost:30000/v1"),
+        "vllm" => Some("http://localhost:8000/v1"),
+        "osaurus" => Some("http://localhost:1337/v1"),
+        "litellm" | "lite-llm" => Some("http://localhost:4000/v1"),
+        "custom" | "compatible" | "openai-compatible" => Some("http://localhost:8000/v1"),
+        "local" | "bedrock" | "aws-bedrock" | "azure_openai" | "azure-openai" | "azure" => None,
+        _ => None,
+    }
+}
+
+/// Returns whether the provider uses a configured base URL at runtime.
+pub fn provider_supports_base_url_override(provider_name: &str) -> bool {
+    let provider_name = provider_name.trim().to_ascii_lowercase();
+    default_provider_base_url(&provider_name).is_some()
+        && !matches!(
+            provider_name.as_str(),
+            "deepseek"
+                | "gemini"
+                | "google"
+                | "google-gemini"
+                | "ollama"
+                | "telnyx"
+                | "copilot"
+                | "github-copilot"
+                | "glm"
+                | "zhipu"
+                | "bigmodel"
+                | "glm-global"
+                | "zhipu-global"
+                | "glm-cn"
+                | "zhipu-cn"
+        )
+}
+
 // --- Provider list ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -26,6 +114,8 @@ pub struct ProviderSummary {
     pub api_key_configured: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -154,6 +244,10 @@ pub struct ProviderConfigureParams {
     pub proxy_url: Option<String>,
     #[serde(default)]
     pub clear_proxy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub clear_base_url: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -167,6 +261,12 @@ pub struct ProviderConfigureResponse {
     pub proxy_deleted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub base_url_updated: bool,
+    #[serde(default)]
+    pub base_url_deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -335,5 +435,39 @@ mod tests {
                 "trusted field leaked into schema: {trusted_field}"
             );
         }
+    }
+
+    #[test]
+    fn provider_summary_and_configure_round_trip_base_url() {
+        let summary: ProviderSummary = serde_json::from_value(json!({
+            "name": "openai",
+            "base_url": "https://api.example.com/v1"
+        }))
+        .expect("summary should decode");
+        assert_eq!(
+            summary.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+
+        let configure: ProviderConfigureParams = serde_json::from_value(json!({
+            "workspace_id": "ws_default",
+            "provider": "openai",
+            "base_url": "https://api.example.com/v1",
+            "clear_base_url": false
+        }))
+        .expect("configure params should decode");
+        assert_eq!(
+            configure.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert!(!configure.clear_base_url);
+
+        let legacy_configure: ProviderConfigureParams = serde_json::from_value(json!({
+            "workspace_id": "ws_default",
+            "provider": "openai"
+        }))
+        .expect("legacy configure params should decode");
+        assert!(legacy_configure.base_url.is_none());
+        assert!(!legacy_configure.clear_base_url);
     }
 }

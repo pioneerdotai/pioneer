@@ -92,6 +92,14 @@ pub fn canonical_provider_id(raw: &str) -> String {
     )
 }
 
+pub fn default_provider_base_url(provider_id: &str) -> Option<&'static str> {
+    pioneer_protocol::default_provider_base_url(provider_id)
+}
+
+pub fn provider_supports_base_url_override(provider_id: &str) -> bool {
+    pioneer_protocol::provider_supports_base_url_override(provider_id)
+}
+
 pub fn provider_catalog_entry(provider_id: &str) -> Option<&'static ProviderCatalogEntry> {
     let canonical = canonical_provider_id(provider_id);
     PROVIDER_CATALOG

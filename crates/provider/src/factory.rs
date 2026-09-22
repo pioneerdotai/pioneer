@@ -46,11 +46,12 @@ pub fn create_provider_with_timeout_policy_and_proxy(
     )
 }
 
-pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_authority(
+pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
     provider_name: &str,
     api_key: &str,
     timeout_policy: ProviderTimeoutPolicy,
     proxy_url: Option<&str>,
+    base_url: Option<&str>,
     authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
     let proxy_url = proxy_url.map(crate::http::validate_proxy_url).transpose()?;
@@ -59,36 +60,100 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_authority(
             provider_name,
             api_key,
             timeout_policy,
+            base_url,
             authority_fingerprint,
         )
     })
+}
+
+pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_authority(
+    provider_name: &str,
+    api_key: &str,
+    timeout_policy: ProviderTimeoutPolicy,
+    proxy_url: Option<&str>,
+    authority_fingerprint: &str,
+) -> Result<Box<dyn Provider>> {
+    create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+        provider_name,
+        api_key,
+        timeout_policy,
+        proxy_url,
+        None,
+        authority_fingerprint,
+    )
+}
+
+/// Returns the authoritative built-in default base URL for the given provider,
+/// or `None` if the provider has no static URL endpoint.
+pub fn default_provider_base_url(provider_name: &str) -> Option<&'static str> {
+    pioneer_protocol::default_provider_base_url(provider_name)
 }
 
 fn create_provider_with_timeout_policy_inner(
     provider_name: &str,
     api_key: &str,
     timeout_policy: ProviderTimeoutPolicy,
+    base_url: Option<&str>,
     authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
-    let compat = |name: &str, base_url: &str, api_key: &str| {
-        compat(name, base_url, api_key).with_timeout_policy(timeout_policy)
+    let compat = |name: &str, api_key: &str| {
+        let default_url = default_provider_base_url(name).unwrap_or("http://localhost:8000/v1");
+        let effective_base_url = base_url.unwrap_or(default_url);
+        compat_provider(name, effective_base_url, api_key).with_timeout_policy(timeout_policy)
     };
 
     match provider_name {
         // ── Primary providers with custom implementations ────────────────
-        "openrouter" => Ok(Box::new(OpenRouterProvider::with_timeout_policy(
-            api_key,
-            timeout_policy,
-        ))),
-        "anthropic" => Ok(Box::new(AnthropicProvider::with_timeout_policy(
-            api_key,
-            timeout_policy,
-        ))),
-        "openai" => Ok(Box::new(OpenAiProvider::with_timeout_policy_and_authority(
-            api_key,
-            timeout_policy,
-            authority_fingerprint,
-        ))),
+        "openrouter" => {
+            if let Some(base_url) = base_url {
+                Ok(Box::new(
+                    OpenRouterProvider::with_base_url_and_timeout_policy(
+                        api_key,
+                        base_url,
+                        timeout_policy,
+                    ),
+                ))
+            } else {
+                Ok(Box::new(OpenRouterProvider::with_timeout_policy(
+                    api_key,
+                    timeout_policy,
+                )))
+            }
+        }
+        "anthropic" => {
+            if let Some(base_url) = base_url {
+                Ok(Box::new(
+                    AnthropicProvider::with_base_url_and_timeout_policy(
+                        api_key,
+                        base_url,
+                        timeout_policy,
+                    ),
+                ))
+            } else {
+                Ok(Box::new(AnthropicProvider::with_timeout_policy(
+                    api_key,
+                    timeout_policy,
+                )))
+            }
+        }
+        "openai" => {
+            if let Some(base_url) = base_url {
+                Ok(Box::new(
+                    OpenAiProvider::with_base_url_timeout_policy_and_authority(
+                        api_key,
+                        base_url,
+                        timeout_policy,
+                        authority_fingerprint,
+                    ),
+                ))
+            } else {
+                Ok(Box::new(OpenAiProvider::with_timeout_policy_and_authority(
+                    api_key,
+                    timeout_policy,
+                    authority_fingerprint,
+                )))
+            }
+        }
         "local" => Ok(Box::new(LocalProvider::new())),
         "gemini" | "google" | "google-gemini" => Ok(Box::new(GeminiProvider::with_timeout_policy(
             api_key,
@@ -132,207 +197,62 @@ fn create_provider_with_timeout_policy_inner(
         }
 
         // ── OpenAI-compatible providers ─────────────────────────────────
-        "groq" => Ok(Box::new(compat(
-            "groq",
-            "https://api.groq.com/openai/v1",
-            api_key,
-        ))),
-        "mistral" => Ok(Box::new(compat(
-            "mistral",
-            "https://api.mistral.ai/v1",
-            api_key,
-        ))),
-        "xai" | "grok" => Ok(Box::new(compat("xai", "https://api.x.ai", api_key))),
+        "groq" => Ok(Box::new(compat("groq", api_key))),
+        "mistral" => Ok(Box::new(compat("mistral", api_key))),
+        "xai" | "grok" => Ok(Box::new(compat("xai", api_key))),
         "deepseek" => Ok(Box::new(
             DeepSeekProvider::with_timeout_policy(api_key, timeout_policy)
                 .with_input_capabilities(compat_input_capabilities()),
         )),
-        "together" | "together-ai" => Ok(Box::new(compat(
-            "together",
-            "https://api.together.xyz",
-            api_key,
-        ))),
-        "fireworks" | "fireworks-ai" => Ok(Box::new(compat(
-            "fireworks",
-            "https://api.fireworks.ai/inference/v1",
-            api_key,
-        ))),
-        "novita" => Ok(Box::new(compat(
-            "novita",
-            "https://api.novita.ai/openai",
-            api_key,
-        ))),
-        "perplexity" => Ok(Box::new(compat(
-            "perplexity",
-            "https://api.perplexity.ai",
-            api_key,
-        ))),
-        "cohere" => Ok(Box::new(compat(
-            "cohere",
-            "https://api.cohere.com/compatibility",
-            api_key,
-        ))),
-        "venice" => Ok(Box::new(compat("venice", "https://api.venice.ai", api_key))),
-        "cerebras" => Ok(Box::new(compat(
-            "cerebras",
-            "https://api.cerebras.ai/v1",
-            api_key,
-        ))),
-        "sambanova" => Ok(Box::new(compat(
-            "sambanova",
-            "https://api.sambanova.ai/v1",
-            api_key,
-        ))),
-        "hyperbolic" => Ok(Box::new(compat(
-            "hyperbolic",
-            "https://api.hyperbolic.xyz/v1",
-            api_key,
-        ))),
-        "deepinfra" | "deep-infra" => Ok(Box::new(compat(
-            "deepinfra",
-            "https://api.deepinfra.com/v1/openai",
-            api_key,
-        ))),
-        "huggingface" | "hf" => Ok(Box::new(compat(
-            "huggingface",
-            "https://router.huggingface.co/v1",
-            api_key,
-        ))),
-        "ai21" | "ai21-labs" => Ok(Box::new(compat(
-            "ai21",
-            "https://api.ai21.com/studio/v1",
-            api_key,
-        ))),
-        "reka" => Ok(Box::new(compat("reka", "https://api.reka.ai/v1", api_key))),
-        "baseten" => Ok(Box::new(compat(
-            "baseten",
-            "https://inference.baseten.co/v1",
-            api_key,
-        ))),
-        "nscale" => Ok(Box::new(compat(
-            "nscale",
-            "https://inference.api.nscale.com/v1",
-            api_key,
-        ))),
-        "anyscale" => Ok(Box::new(compat(
-            "anyscale",
-            "https://api.endpoints.anyscale.com/v1",
-            api_key,
-        ))),
-        "nebius" => Ok(Box::new(compat(
-            "nebius",
-            "https://api.studio.nebius.ai/v1",
-            api_key,
-        ))),
-        "friendli" | "friendliai" => Ok(Box::new(compat(
-            "friendli",
-            "https://api.friendli.ai/serverless/v1",
-            api_key,
-        ))),
-        "lepton" | "lepton-ai" => Ok(Box::new(compat(
-            "lepton",
-            "https://llama3-1-405b.lepton.run/api/v1",
-            api_key,
-        ))),
-        "siliconflow" | "silicon-flow" => Ok(Box::new(compat(
-            "siliconflow",
-            "https://api.siliconflow.cn/v1",
-            api_key,
-        ))),
-        "aihubmix" => Ok(Box::new(compat(
-            "aihubmix",
-            "https://aihubmix.com/v1",
-            api_key,
-        ))),
-        "astrai" => Ok(Box::new(compat(
-            "astrai",
-            "https://as-trai.com/v1",
-            api_key,
-        ))),
-        "stepfun" | "step" => Ok(Box::new(compat(
-            "stepfun",
-            "https://api.stepfun.com/v1",
-            api_key,
-        ))),
-        "baichuan" => Ok(Box::new(compat(
-            "baichuan",
-            "https://api.baichuan-ai.com/v1",
-            api_key,
-        ))),
-        "yi" | "01ai" | "lingyiwanwu" => Ok(Box::new(compat(
-            "yi",
-            "https://api.lingyiwanwu.com/v1",
-            api_key,
-        ))),
-        "hunyuan" | "tencent" => Ok(Box::new(compat(
-            "hunyuan",
-            "https://api.hunyuan.cloud.tencent.com/v1",
-            api_key,
-        ))),
-        "ovhcloud" | "ovh" => Ok(Box::new(compat(
-            "ovhcloud",
-            "https://api.ai.cloud.ovh.net/v1",
-            api_key,
-        ))),
-        "nvidia" | "nvidia-nim" => Ok(Box::new(compat(
-            "nvidia",
-            "https://integrate.api.nvidia.com/v1",
-            api_key,
-        ))),
-        "synthetic" => Ok(Box::new(compat(
-            "synthetic",
-            "https://api.synthetic.new/openai/v1",
-            api_key,
-        ))),
-        "doubao" | "volcengine" | "ark" => Ok(Box::new(compat(
-            "doubao",
-            "https://ark.cn-beijing.volces.com/api/v3",
-            api_key,
-        ))),
-        "qianfan" | "baidu" => Ok(Box::new(compat(
-            "qianfan",
-            "https://aip.baidubce.com",
-            api_key,
-        ))),
+        "together" | "together-ai" => Ok(Box::new(compat("together", api_key))),
+        "fireworks" | "fireworks-ai" => Ok(Box::new(compat("fireworks", api_key))),
+        "novita" => Ok(Box::new(compat("novita", api_key))),
+        "perplexity" => Ok(Box::new(compat("perplexity", api_key))),
+        "cohere" => Ok(Box::new(compat("cohere", api_key))),
+        "venice" => Ok(Box::new(compat("venice", api_key))),
+        "cerebras" => Ok(Box::new(compat("cerebras", api_key))),
+        "sambanova" => Ok(Box::new(compat("sambanova", api_key))),
+        "hyperbolic" => Ok(Box::new(compat("hyperbolic", api_key))),
+        "deepinfra" | "deep-infra" => Ok(Box::new(compat("deepinfra", api_key))),
+        "huggingface" | "hf" => Ok(Box::new(compat("huggingface", api_key))),
+        "ai21" | "ai21-labs" => Ok(Box::new(compat("ai21", api_key))),
+        "reka" => Ok(Box::new(compat("reka", api_key))),
+        "baseten" => Ok(Box::new(compat("baseten", api_key))),
+        "nscale" => Ok(Box::new(compat("nscale", api_key))),
+        "anyscale" => Ok(Box::new(compat("anyscale", api_key))),
+        "nebius" => Ok(Box::new(compat("nebius", api_key))),
+        "friendli" | "friendliai" => Ok(Box::new(compat("friendli", api_key))),
+        "lepton" | "lepton-ai" => Ok(Box::new(compat("lepton", api_key))),
+        "siliconflow" | "silicon-flow" => Ok(Box::new(compat("siliconflow", api_key))),
+        "aihubmix" => Ok(Box::new(compat("aihubmix", api_key))),
+        "astrai" => Ok(Box::new(compat("astrai", api_key))),
+        "stepfun" | "step" => Ok(Box::new(compat("stepfun", api_key))),
+        "baichuan" => Ok(Box::new(compat("baichuan", api_key))),
+        "yi" | "01ai" | "lingyiwanwu" => Ok(Box::new(compat("yi", api_key))),
+        "hunyuan" | "tencent" => Ok(Box::new(compat("hunyuan", api_key))),
+        "ovhcloud" | "ovh" => Ok(Box::new(compat("ovhcloud", api_key))),
+        "nvidia" | "nvidia-nim" => Ok(Box::new(compat("nvidia", api_key))),
+        "synthetic" => Ok(Box::new(compat("synthetic", api_key))),
+        "doubao" | "volcengine" | "ark" => Ok(Box::new(compat("doubao", api_key))),
+        "qianfan" | "baidu" => Ok(Box::new(compat("qianfan", api_key))),
 
         // ── Local inference servers ─────────────────────────────────────
-        "lmstudio" | "lm-studio" => Ok(Box::new(compat(
-            "lmstudio",
-            "http://localhost:1234/v1",
-            api_key,
-        ))),
-        "llamacpp" | "llama.cpp" => Ok(Box::new(compat(
-            "llamacpp",
-            "http://localhost:8080/v1",
-            api_key,
-        ))),
-        "sglang" => Ok(Box::new(compat(
-            "sglang",
-            "http://localhost:30000/v1",
-            api_key,
-        ))),
-        "vllm" => Ok(Box::new(compat(
-            "vllm",
-            "http://localhost:8000/v1",
-            api_key,
-        ))),
-        "osaurus" => Ok(Box::new(compat(
-            "osaurus",
-            "http://localhost:1337/v1",
-            api_key,
-        ))),
-        "litellm" | "lite-llm" => Ok(Box::new(compat(
-            "litellm",
-            "http://localhost:4000/v1",
-            api_key,
-        ))),
+        "lmstudio" | "lm-studio" => Ok(Box::new(compat("lmstudio", api_key))),
+        "llamacpp" | "llama.cpp" => Ok(Box::new(compat("llamacpp", api_key))),
+        "sglang" => Ok(Box::new(compat("sglang", api_key))),
+        "vllm" => Ok(Box::new(compat("vllm", api_key))),
+        "osaurus" => Ok(Box::new(compat("osaurus", api_key))),
+        "litellm" | "lite-llm" => Ok(Box::new(compat("litellm", api_key))),
+        "custom" | "compatible" | "openai-compatible" => {
+            Ok(Box::new(compat(provider_name, api_key)))
+        }
 
         _ => bail!("unknown provider: {provider_name}"),
     }
 }
 
 /// Shorthand to create an OpenAI-compatible provider with Bearer auth.
-fn compat(name: &str, base_url: &str, api_key: &str) -> OpenAiCompatibleProvider {
+fn compat_provider(name: &str, base_url: &str, api_key: &str) -> OpenAiCompatibleProvider {
     OpenAiCompatibleProvider::new(name, base_url, api_key, AuthStyle::Bearer)
         .with_input_capabilities(compat_input_capabilities())
 }
@@ -719,5 +639,32 @@ mod tests {
                 "openai-compatible provider `{alias}` must expose full OpenAI-compatible input contract"
             );
         }
+    }
+
+    #[test]
+    fn factory_supports_custom_base_url_for_openai_and_compatible() {
+        let custom_openai =
+            create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                "openai",
+                "sk-custom",
+                ProviderTimeoutPolicy::default(),
+                None,
+                Some("https://api.example.com/v1/"),
+                "fp-test-1",
+            )
+            .expect("create custom openai provider");
+        assert_eq!(custom_openai.name(), "openai");
+
+        let custom_compat =
+            create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                "custom",
+                "sk-custom",
+                ProviderTimeoutPolicy::default(),
+                None,
+                Some("https://custom.endpoint.com/v1"),
+                "fp-test-2",
+            )
+            .expect("create custom-compatible provider");
+        assert_eq!(custom_compat.name(), "custom");
     }
 }

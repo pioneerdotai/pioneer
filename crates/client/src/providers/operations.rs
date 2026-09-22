@@ -552,6 +552,8 @@ mod tests {
             api_key: Some("synthetic-form-value".into()),
             proxy_url: None,
             clear_proxy: false,
+            base_url: None,
+            clear_base_url: false,
         })
     }
     #[test]
