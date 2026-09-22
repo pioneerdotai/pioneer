@@ -10258,6 +10258,56 @@ impl CrudStore {
             .transpose()
     }
 
+    pub async fn delete_incomplete_thread_episodic_index_job(&self, job_id: &str) -> Result<bool> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_incomplete_index_job(
+                    &self.connection,
+                    job_id.as_str(),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_thread_episodic_index_job_if_suppressed(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+    ) -> Result<bool> {
+        let workspace_id = workspace_id.to_owned();
+        let job_id = job_id.to_owned();
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.clone();
+            let job_id = job_id.clone();
+            async move {
+                let transaction = self.connection.begin().await.context(
+                    "failed to begin suppressed thread episodic job cleanup transaction",
+                )?;
+                let deleted = match thread_episodic_repository::delete_index_job_if_suppressed(
+                    &transaction,
+                    workspace_id.as_str(),
+                    job_id.as_str(),
+                )
+                .await
+                {
+                    Ok(deleted) => deleted,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
+                transaction.commit().await.context(
+                    "failed to commit suppressed thread episodic job cleanup transaction",
+                )?;
+                Ok(deleted)
+            }
+        })
+        .await
+    }
+
     pub async fn list_thread_episodic_refill_workspace_ids(&self) -> Result<Vec<String>> {
         thread_episodic_repository::list_refill_workspace_ids(&self.connection).await
     }
@@ -10275,6 +10325,19 @@ impl CrudStore {
         thread_episodic_repository::list_refill_threads_for_workspace(
             &self.connection,
             workspace_id,
+        )
+        .await
+    }
+
+    pub async fn list_thread_episodic_refill_threads_for_workspace_and_event_ids(
+        &self,
+        workspace_id: &str,
+        event_ids: &[&str],
+    ) -> Result<Vec<ThreadEpisodicRefillThread>> {
+        thread_episodic_repository::list_refill_threads_for_workspace_and_event_ids(
+            &self.connection,
+            workspace_id,
+            event_ids,
         )
         .await
     }
@@ -10491,6 +10554,26 @@ impl CrudStore {
         thread_episodic_repository::list_canceled_index_jobs_for_workspace(
             &self.connection,
             workspace_id,
+            limit,
+        )
+        .await?
+        .into_iter()
+        .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
+        .collect()
+    }
+
+    pub async fn list_canceled_thread_episodic_index_jobs_for_workspace_threads_after_id(
+        &self,
+        workspace_id: &str,
+        thread_ids: &[String],
+        after_id: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<ThreadEpisodicIndexJobRecord>> {
+        thread_episodic_repository::list_canceled_index_jobs_for_workspace_threads_after_id(
+            &self.connection,
+            workspace_id,
+            thread_ids,
+            after_id,
             limit,
         )
         .await?
@@ -30839,7 +30922,7 @@ mod tests {
     use crate::repositories::{
         cli_runtime_binding, native_terminal_effect_outbox, read_model_repair,
         recovery_terminalization_outbox, thread, thread_episodic as thread_episodic_repository,
-        turn, turn_finalization,
+        turn, turn_event, turn_finalization,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -50896,6 +50979,129 @@ mod tests {
         assert_eq!(fetched.turns.len(), 1);
         assert_eq!(fetched.turns[0].id, latest_task_run_turn.id);
         assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
+    }
+
+    #[tokio::test]
+    async fn thread_history_decodes_legacy_cli_runtime_codex_manifest_without_losing_events() {
+        let (store, thread, mut turn) = test_store_with_started_turn(
+            "ws_legacy_cli_manifest",
+            "thread_legacy_cli_manifest",
+            "turn_legacy_cli_manifest",
+        )
+        .await;
+        let timestamp = 1_700_000_000;
+        let before_item = TurnItem::UserMessage {
+            id: "item_before_legacy_manifest".to_owned(),
+            text: "before".to_owned(),
+            attachments: Vec::new(),
+        };
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: before_item.clone(),
+                },
+                timestamp + 1,
+            )
+            .await
+            .expect("event before legacy manifest should persist");
+
+        turn.status = TurnStatus::Completed;
+        turn.prompt_manifest = Some(PromptManifest {
+            compiler_version: "legacy-fixture".to_owned(),
+            profile: PromptManifestProfile::CliRuntime,
+            section_ids: Vec::new(),
+            fingerprint_stable: "stable".to_owned(),
+            fingerprint_dynamic: "dynamic".to_owned(),
+            fingerprint_full: "full".to_owned(),
+            diagnostics: Vec::new(),
+            hook_sources: Vec::new(),
+        });
+        store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn: turn.clone(),
+                },
+                timestamp + 2,
+            )
+            .await
+            .expect("terminal event should persist");
+
+        let terminal_row = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn.id.clone()))
+            .filter(
+                pioneer_entity::turn_event::Column::EventType
+                    .eq(pioneer_protocol::constants::events::TURN_COMPLETED),
+            )
+            .one(&store.connection)
+            .await
+            .expect("terminal event lookup should succeed")
+            .expect("terminal event should exist");
+        let mut legacy_json: serde_json::Value =
+            serde_json::from_str(terminal_row.payload.as_str()).expect("canonical payload JSON");
+        legacy_json["payload"]["turn"]["prompt_manifest"]["profile"] =
+            serde_json::json!("cli_runtime_codex");
+        let legacy_json = serde_json::to_string(&legacy_json).expect("legacy fixture JSON");
+        assert!(legacy_json.contains(r#""cli_runtime_codex""#));
+        pioneer_entity::turn_event::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event::Column::Payload,
+                Expr::value(legacy_json),
+            )
+            .filter(pioneer_entity::turn_event::Column::Id.eq(terminal_row.id))
+            .exec(&store.connection)
+            .await
+            .expect("legacy fixture should replace stored event JSON");
+
+        let after_item = TurnItem::UserMessage {
+            id: "item_after_legacy_manifest".to_owned(),
+            text: "after".to_owned(),
+            attachments: Vec::new(),
+        };
+        turn_event::append_event(
+            &store.connection,
+            &CanonicalTurnEventPayload::ItemUpdated(ItemUpdatedNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                item: after_item.clone(),
+            }),
+            unix_to_datetime(timestamp + 3),
+        )
+        .await
+        .expect("event after legacy manifest should persist");
+
+        let history = store
+            .get_thread_history(thread.id.as_str(), None)
+            .await
+            .expect("legacy nested TurnEventPayload should decode")
+            .expect("thread history should remain present");
+        assert_eq!(
+            history
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(matches!(
+            &history.events[1].payload,
+            ThreadHistoryEventPayload::ItemCompleted { item, .. } if item == &before_item
+        ));
+        assert!(matches!(
+            &history.events[2].payload,
+            ThreadHistoryEventPayload::TurnCompleted { turn, .. }
+                if turn.prompt_manifest.as_ref().map(|manifest| manifest.profile)
+                    == Some(PromptManifestProfile::CliRuntime)
+        ));
+        assert!(matches!(
+            &history.events[3].payload,
+            ThreadHistoryEventPayload::ItemUpdated { item, .. } if item == &after_item
+        ));
     }
 
     #[tokio::test]

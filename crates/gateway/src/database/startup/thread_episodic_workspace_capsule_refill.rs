@@ -22,8 +22,9 @@ use pioneer_crud::{
     ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
     ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
     ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
-    ThreadEpisodicItemIndexedUpdate, find_projection_meta, list_projection_meta_by_key_prefix,
-    update_projection_meta_status, upsert_projection_meta_with_config,
+    ThreadEpisodicItemIndexedUpdate, ThreadEpisodicRefillThread, find_projection_meta,
+    list_projection_meta_by_key_prefix, update_projection_meta_status,
+    upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
     MemvidThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
@@ -51,11 +52,21 @@ const REFILL_ENQUEUE_BATCH_SIZE: u64 = 1024;
 const REFILL_EXECUTOR_MAX_BATCHES: u64 = 100_000;
 const REFILL_JOB_CLAIM_LIMIT: u64 = 1;
 const REFILL_RECOVERY_SCAN_LIMIT: u64 = 100_000;
+const REFILL_SUPPRESSED_JOB_CLEANUP_BATCH_SIZE: u64 = 2;
 const REFILL_LOCK_FILE_NAME: &str = ".thread_episodic_workspace_capsule_refill.lock";
 const REFILL_INDEX_ERROR_MAX_CHARS: usize = 512;
 const LEGACY_REFILL_WORKSPACE_ID: &str = "__default__";
 const LEGACY_INVALID_SKETCH_TRACK_ERROR: &str =
     "Sketch track is invalid: Invalid sketch track magic";
+const LEGACY_CODEX_HISTORY_REPAIR_KEY: &str = "thread_episodic_legacy_codex_history_repair";
+const LEGACY_CODEX_HISTORY_REPAIR_VERSION: i64 = 1;
+const LEGACY_CODEX_HISTORY_EVENT_IDS: [&str; 5] = [
+    "iD29bLEWPIWWmkFdnhR9l",
+    "E56hLwPhkBzQvqcDXDMXb",
+    "EKEW7xq6vNTRLW2qvSyKc",
+    "FffKis1DqCa7jF1cgCMK7",
+    "wDGPml0HENyU79tmZQiV5",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillStatusEvent {
@@ -277,10 +288,12 @@ pub(crate) struct ThreadEpisodicWorkspaceCapsuleRefillSummary {
     pub(crate) incomplete_jobs: u64,
     pub(crate) interrupted_jobs_requeued: u64,
     pub(crate) legacy_retryable_jobs_requeued: usize,
+    pub(crate) suppressed_canceled_jobs_deleted: usize,
 }
 
 pub(super) async fn run(
     crud_store: Arc<CrudStore>,
+    indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     workspace_vector_search_configs: BTreeMap<String, GatewayThreadEpisodicVectorSearchConfig>,
@@ -347,6 +360,7 @@ pub(super) async fn run(
         );
         run_workspace(
             crud_store.clone(),
+            indexing_enabled,
             thread_episodic_storage_root.clone(),
             workspace_id,
             workspace_vector_search_config,
@@ -367,6 +381,7 @@ pub(super) async fn run(
 
 pub(super) async fn run_workspace(
     crud_store: Arc<CrudStore>,
+    indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -379,7 +394,7 @@ pub(super) async fn run_workspace(
     cancellation: CancellationToken,
 ) {
     let crud_store = Arc::new(crud_store.with_maintenance_access());
-    if cancellation.is_cancelled() {
+    if cancellation.is_cancelled() || !indexing_enabled {
         return;
     }
     if workspace_vector_search_config.enabled
@@ -721,26 +736,15 @@ async fn refill_once_with_projection_resolver_and_config(
     interrupted_before_unix: Option<i64>,
 ) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
     let db = crud_store.database_connection();
-    if projection_target.requires_embedding_provider() {
-        let provider = resolve_refill_embedding_provider_for_target(
-            workspace_id,
-            &projection_target,
-            embedding_provider_resolver.as_ref(),
-        )
-        .await?;
-        projection_target =
-            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
-                provider.as_ref(),
-            )?;
-        embedding_provider_resolver = Some(Arc::new(
-            FixedThreadEpisodicIndexEmbeddingProviderResolver::new(Some(provider)),
-        )
-            as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>);
-    }
-
-    if refill_is_current_for_workspace_target(crud_store.as_ref(), workspace_id, &projection_target)
-        .await?
-    {
+    let mut refill_current = refill_is_current_for_workspace_target(
+        crud_store.as_ref(),
+        workspace_id,
+        &projection_target,
+    )
+    .await?;
+    let mut legacy_repair_threads =
+        legacy_codex_history_repair_threads(crud_store.as_ref(), workspace_id).await?;
+    if refill_current && legacy_repair_threads.is_empty() {
         return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
             skipped: true,
             ..Default::default()
@@ -756,30 +760,111 @@ async fn refill_once_with_projection_resolver_and_config(
         });
     };
 
-    if refill_is_current_for_workspace_target(crud_store.as_ref(), workspace_id, &projection_target)
-        .await?
-    {
+    refill_current = refill_is_current_for_workspace_target(
+        crud_store.as_ref(),
+        workspace_id,
+        &projection_target,
+    )
+    .await?;
+    legacy_repair_threads =
+        legacy_codex_history_repair_threads(crud_store.as_ref(), workspace_id).await?;
+    if refill_current && legacy_repair_threads.is_empty() {
         return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
             skipped: true,
             ..Default::default()
         });
     }
 
+    if !legacy_repair_threads.is_empty() {
+        mark_legacy_codex_history_repair(
+            crud_store.as_ref(),
+            workspace_id,
+            PROJECTION_META_STATUS_BACKFILLING,
+            legacy_repair_threads.len(),
+            None,
+        )
+        .await?;
+        notify_refill_status(
+            refill_status_sender,
+            workspace_id,
+            GatewayThreadEpisodicVectorRefillStatus::Running,
+        );
+    }
+
+    if projection_target.requires_embedding_provider() {
+        let resolved_provider = resolve_refill_embedding_provider_for_target(
+            workspace_id,
+            &projection_target,
+            embedding_provider_resolver.as_ref(),
+        )
+        .await
+        .and_then(|provider| {
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+                provider.as_ref(),
+            )
+            .map(|resolved_target| (provider, resolved_target))
+        });
+        let (provider, resolved_target) = match resolved_provider {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if !legacy_repair_threads.is_empty() {
+                    mark_legacy_codex_history_repair(
+                        crud_store.as_ref(),
+                        workspace_id,
+                        PROJECTION_META_STATUS_FAILED,
+                        legacy_repair_threads.len(),
+                        Some(format!("{error:#}")),
+                    )
+                    .await?;
+                    notify_refill_status(
+                        refill_status_sender,
+                        workspace_id,
+                        GatewayThreadEpisodicVectorRefillStatus::Failed,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        projection_target = resolved_target;
+        embedding_provider_resolver = Some(Arc::new(
+            FixedThreadEpisodicIndexEmbeddingProviderResolver::new(Some(provider)),
+        )
+            as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>);
+        refill_current = refill_is_current_for_workspace_target(
+            crud_store.as_ref(),
+            workspace_id,
+            &projection_target,
+        )
+        .await?;
+        if refill_current && legacy_repair_threads.is_empty() {
+            return Ok(ThreadEpisodicWorkspaceCapsuleRefillSummary {
+                skipped: true,
+                ..Default::default()
+            });
+        }
+    }
+
     let existing_meta =
         find_refill_projection_meta_for_workspace(crud_store.as_ref(), workspace_id).await?;
-    let resume_existing = refill_can_resume_existing_projection(
-        crud_store.as_ref(),
-        workspace_id,
-        existing_meta.as_ref(),
-        &projection_target,
-    )
-    .await?;
+    let resume_existing = if refill_current {
+        false
+    } else {
+        refill_can_resume_existing_projection(
+            crud_store.as_ref(),
+            workspace_id,
+            existing_meta.as_ref(),
+            &projection_target,
+        )
+        .await?
+    };
 
-    notify_refill_status(
-        refill_status_sender,
-        workspace_id,
-        GatewayThreadEpisodicVectorRefillStatus::Running,
-    );
+    if legacy_repair_threads.is_empty() {
+        notify_refill_status(
+            refill_status_sender,
+            workspace_id,
+            GatewayThreadEpisodicVectorRefillStatus::Running,
+        );
+    }
 
     if let Err(error) = preflight_refill_embedding_resolver(
         workspace_id,
@@ -788,7 +873,19 @@ async fn refill_once_with_projection_resolver_and_config(
     )
     .await
     {
-        if resume_existing {
+        if !legacy_repair_threads.is_empty() {
+            mark_legacy_codex_history_repair(
+                crud_store.as_ref(),
+                workspace_id,
+                PROJECTION_META_STATUS_FAILED,
+                legacy_repair_threads.len(),
+                Some(format!("{error:#}")),
+            )
+            .await?;
+        }
+        if refill_current {
+            // The existing projection remains valid; only the additive repair failed.
+        } else if resume_existing {
             mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
         } else {
             mark_refill_preparation_failed(&db, workspace_id, &error, &projection_target).await?;
@@ -801,7 +898,15 @@ async fn refill_once_with_projection_resolver_and_config(
         return Err(error);
     }
 
-    let prepared = if resume_existing {
+    let prepared = if refill_current {
+        prepare_legacy_codex_history_repair(
+            crud_store.clone(),
+            workspace_id,
+            legacy_repair_threads.clone(),
+            interrupted_before_unix,
+        )
+        .await
+    } else if resume_existing {
         prepare_resumed_refill(
             crud_store.clone(),
             workspace_id,
@@ -820,10 +925,38 @@ async fn refill_once_with_projection_resolver_and_config(
         .await
     };
 
+    let prepared = match prepared {
+        Ok(mut summary) if !legacy_repair_threads.is_empty() => {
+            cleanup_suppressed_canceled_repair_jobs(
+                crud_store.as_ref(),
+                workspace_id,
+                legacy_repair_threads.as_slice(),
+            )
+            .await
+            .map(|deleted| {
+                summary.suppressed_canceled_jobs_deleted = deleted;
+                summary
+            })
+        }
+        other => other,
+    };
+
     let mut summary = match prepared {
         Ok(summary) => summary,
         Err(error) => {
-            if resume_existing {
+            if !legacy_repair_threads.is_empty() {
+                mark_legacy_codex_history_repair(
+                    crud_store.as_ref(),
+                    workspace_id,
+                    PROJECTION_META_STATUS_FAILED,
+                    legacy_repair_threads.len(),
+                    Some(format!("{error:#}")),
+                )
+                .await?;
+            }
+            if refill_current {
+                // Preserve the valid projection marker so recall can keep using it.
+            } else if resume_existing {
                 mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
             } else {
                 mark_refill_preparation_failed(&db, workspace_id, &error, &projection_target)
@@ -838,9 +971,11 @@ async fn refill_once_with_projection_resolver_and_config(
         }
     };
 
-    mark_refill_backfilling(&db, workspace_id, &summary, &projection_target).await?;
+    if !refill_current {
+        mark_refill_backfilling(&db, workspace_id, &summary, &projection_target).await?;
+    }
     let result = execute_refill_jobs(
-        crud_store,
+        crud_store.clone(),
         thread_episodic_storage_root,
         workspace_id,
         embedding_provider_resolver,
@@ -851,7 +986,19 @@ async fn refill_once_with_projection_resolver_and_config(
 
     match result {
         Ok(()) => {
-            mark_refill_complete(&db, workspace_id, &summary, &projection_target).await?;
+            if !refill_current {
+                mark_refill_complete(&db, workspace_id, &summary, &projection_target).await?;
+            }
+            if !legacy_repair_threads.is_empty() {
+                mark_legacy_codex_history_repair(
+                    crud_store.as_ref(),
+                    workspace_id,
+                    PROJECTION_META_STATUS_COMPLETE,
+                    legacy_repair_threads.len(),
+                    None,
+                )
+                .await?;
+            }
             notify_refill_status(
                 refill_status_sender,
                 workspace_id,
@@ -860,7 +1007,19 @@ async fn refill_once_with_projection_resolver_and_config(
             Ok(summary)
         }
         Err(error) => {
-            mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
+            if !legacy_repair_threads.is_empty() {
+                mark_legacy_codex_history_repair(
+                    crud_store.as_ref(),
+                    workspace_id,
+                    PROJECTION_META_STATUS_FAILED,
+                    legacy_repair_threads.len(),
+                    Some(format!("{error:#}")),
+                )
+                .await?;
+            }
+            if !refill_current {
+                mark_refill_failed(&db, workspace_id, &error, &projection_target).await?;
+            }
             notify_refill_status(
                 refill_status_sender,
                 workspace_id,
@@ -1022,6 +1181,76 @@ pub(crate) fn refill_projection_key_for_workspace(workspace_id: &str) -> Result<
     ))
 }
 
+fn legacy_codex_history_repair_key_for_workspace(workspace_id: &str) -> Result<String> {
+    let workspace_key_hash = pioneer_crud::thread_episodic_key_hash("workspace", workspace_id)
+        .with_context(|| {
+            format!("failed to hash workspace id `{workspace_id}` for legacy history repair")
+        })?;
+    Ok(format!(
+        "{LEGACY_CODEX_HISTORY_REPAIR_KEY}:{workspace_key_hash}"
+    ))
+}
+
+async fn legacy_codex_history_repair_is_complete(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+) -> Result<bool> {
+    let key = legacy_codex_history_repair_key_for_workspace(workspace_id)?;
+    Ok(
+        find_projection_meta(&crud_store.database_connection(), key.as_str())
+            .await?
+            .is_some_and(|meta| {
+                meta.projection_version == LEGACY_CODEX_HISTORY_REPAIR_VERSION
+                    && meta.status == PROJECTION_META_STATUS_COMPLETE
+            }),
+    )
+}
+
+async fn mark_legacy_codex_history_repair(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    status: &str,
+    source_thread_count: usize,
+    last_error: Option<String>,
+) -> Result<()> {
+    let now = now_datetime();
+    upsert_projection_meta_with_config(
+        &crud_store.database_connection(),
+        ProjectionMetaRecord {
+            projection_key: legacy_codex_history_repair_key_for_workspace(workspace_id)?,
+            projection_version: LEGACY_CODEX_HISTORY_REPAIR_VERSION,
+            status: status.to_owned(),
+            source_thread_count: i64::try_from(source_thread_count).unwrap_or(i64::MAX),
+            source_turn_count: 0,
+            source_turn_item_count: 0,
+            source_turn_event_count: 0,
+            last_error,
+            backfill_started_at: Some(now),
+            backfilled_at: (status == PROJECTION_META_STATUS_COMPLETE).then_some(now),
+            created_at: now,
+            updated_at: now,
+        },
+        ProjectionMetaConfigRecord::default(),
+    )
+    .await
+}
+
+async fn legacy_codex_history_repair_threads(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+) -> Result<Vec<ThreadEpisodicRefillThread>> {
+    if legacy_codex_history_repair_is_complete(crud_store, workspace_id).await? {
+        return Ok(Vec::new());
+    }
+    crud_store
+        .list_thread_episodic_refill_threads_for_workspace_and_event_ids(
+            workspace_id,
+            &LEGACY_CODEX_HISTORY_EVENT_IDS,
+        )
+        .await
+        .context("failed to resolve legacy Codex history repair threads")
+}
+
 fn refill_lock_file_name_for_workspace(workspace_id: &str) -> Result<String> {
     if workspace_id == LEGACY_REFILL_WORKSPACE_ID {
         return Ok(REFILL_LOCK_FILE_NAME.to_owned());
@@ -1127,6 +1356,23 @@ pub(crate) async fn refill_status_for_workspace_target(
         && !projection_target.matches_projection_meta_selection(&marker)
     {
         return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required);
+    }
+
+    let repair_key = legacy_codex_history_repair_key_for_workspace(workspace_id)?;
+    if let Some(repair) =
+        find_projection_meta(&crud_store.database_connection(), repair_key.as_str()).await?
+        && repair.projection_version == LEGACY_CODEX_HISTORY_REPAIR_VERSION
+    {
+        match repair.status.as_str() {
+            PROJECTION_META_STATUS_PENDING | PROJECTION_META_STATUS_BACKFILLING => {
+                return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running);
+            }
+            PROJECTION_META_STATUS_FAILED => {
+                return Ok(pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed);
+            }
+            PROJECTION_META_STATUS_COMPLETE => {}
+            _ => {}
+        }
     }
 
     let status = match meta.status.as_str() {
@@ -1275,6 +1521,86 @@ async fn prepare_resumed_refill(
             .await?;
     enqueue_refill_jobs(crud_store.as_ref(), workspace_id, now_unix, &mut summary).await?;
     Ok(summary)
+}
+
+async fn prepare_legacy_codex_history_repair(
+    crud_store: Arc<CrudStore>,
+    workspace_id: &str,
+    threads: Vec<ThreadEpisodicRefillThread>,
+    interrupted_before_unix: Option<i64>,
+) -> Result<ThreadEpisodicWorkspaceCapsuleRefillSummary> {
+    let now_unix = chrono::Utc::now().timestamp();
+    let mut summary = ThreadEpisodicWorkspaceCapsuleRefillSummary {
+        resumed: true,
+        ..Default::default()
+    };
+    rebuild_refill_threads_from_history(crud_store.clone(), threads, now_unix, &mut summary)
+        .await?;
+    populate_refill_source_counts(crud_store.as_ref(), workspace_id, &mut summary).await?;
+    if let Some(interrupted_before_unix) = interrupted_before_unix {
+        summary.interrupted_jobs_requeued = crud_store
+            .requeue_running_thread_episodic_index_jobs_for_workspace(
+                workspace_id,
+                interrupted_before_unix,
+                now_unix,
+            )
+            .await
+            .context("failed to requeue interrupted legacy Codex history repair jobs")?;
+    }
+    enqueue_refill_jobs(crud_store.as_ref(), workspace_id, now_unix, &mut summary).await?;
+    Ok(summary)
+}
+
+async fn cleanup_suppressed_canceled_repair_jobs(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    threads: &[ThreadEpisodicRefillThread],
+) -> Result<usize> {
+    let thread_ids = threads
+        .iter()
+        .filter(|thread| thread.workspace_id == workspace_id)
+        .map(|thread| thread.thread_id.clone())
+        .collect::<Vec<_>>();
+    if thread_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut deleted = 0usize;
+    let mut after_id = None;
+    loop {
+        let jobs = crud_store
+            .list_canceled_thread_episodic_index_jobs_for_workspace_threads_after_id(
+                workspace_id,
+                thread_ids.as_slice(),
+                after_id.as_deref(),
+                REFILL_SUPPRESSED_JOB_CLEANUP_BATCH_SIZE,
+            )
+            .await
+            .context("failed to list canceled legacy repair jobs for suppression cleanup")?;
+        let Some(last_job_id) = jobs.last().map(|job| job.id.clone()) else {
+            break;
+        };
+        let batch_len = jobs.len();
+        for job in jobs {
+            if crud_store
+                .delete_thread_episodic_index_job_if_suppressed(workspace_id, job.id.as_str())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reconcile suppressed legacy repair job `{}`",
+                        job.id
+                    )
+                })?
+            {
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        after_id = Some(last_job_id);
+        if batch_len < REFILL_SUPPRESSED_JOB_CLEANUP_BATCH_SIZE as usize {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
 async fn populate_refill_source_counts(
@@ -1430,7 +1756,17 @@ async fn rebuild_refill_items_from_history(
         .list_thread_episodic_refill_threads_for_workspace(workspace_id)
         .await
         .context("failed to list thread episodic source threads for workspace refill")?;
+    rebuild_refill_threads_from_history(crud_store, threads, now_unix, summary).await
+}
+
+async fn rebuild_refill_threads_from_history(
+    crud_store: Arc<CrudStore>,
+    threads: Vec<ThreadEpisodicRefillThread>,
+    now_unix: i64,
+    summary: &mut ThreadEpisodicWorkspaceCapsuleRefillSummary,
+) -> Result<()> {
     let ingestor = StoreThreadEpisodicIngestor::with_config(crud_store, true);
+    let mut first_error = None;
     for thread in threads {
         match ingestor
             .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
@@ -1453,12 +1789,22 @@ async fn rebuild_refill_items_from_history(
             }
             Err(error) => {
                 summary.source_threads_failed = summary.source_threads_failed.saturating_add(1);
+                let error_display = format!("{error:#}");
+                if first_error.is_none() {
+                    first_error = Some(error.context("failed to rebuild one source thread"));
+                }
                 warn!(
-                    error = %format!("{error:#}"),
-                    "thread episodic workspace refill skipped one source thread"
+                    error = %error_display,
+                    "thread episodic workspace refill failed to rebuild one source thread"
                 );
             }
         }
+    }
+    if let Some(error) = first_error {
+        bail!(
+            "thread episodic workspace refill failed to rebuild {} source threads: {error:#}",
+            summary.source_threads_failed
+        );
     }
     Ok(())
 }
@@ -2646,6 +2992,7 @@ mod tests {
         ThreadEpisodicThreadReindexRequest,
     };
     use crate::workspace::WorkspaceManager;
+    use async_trait::async_trait;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
         NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord,
@@ -2659,19 +3006,24 @@ mod tests {
     use pioneer_entity::{
         thread_episodic_exclusions, thread_episodic_index_jobs, thread_episodic_items,
     };
-    use pioneer_memory::ThreadEpisodicEmbeddingError;
+    use pioneer_memory::{
+        ThreadEpisodicEmbeddingError, ThreadEpisodicExactSourceTarget,
+        ThreadEpisodicMemvidSearchRequest, ThreadEpisodicMemvidSearchSegment,
+        ThreadEpisodicSearchProfile, ThreadEpisodicSearchProfileKind,
+    };
     use pioneer_protocol::{
-        ItemCompletedNotification, ItemUpdatedNotification, SandboxMode, TaskExecutorKind,
-        TaskStatus, TaskTriggerKind, TaskTurnItem, Thread,
+        ItemCompletedNotification, ItemUpdatedNotification, PromptManifestProfile, SandboxMode,
+        TaskExecutorKind, TaskStatus, TaskTriggerKind, TaskTurnItem, Thread,
         ThreadEpisodicSourceActorRole as ProtocolThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceContext, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnItem, TurnItemType, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
     use pioneer_sqlite::SqliteDatabase;
     use sea_orm::{
-        ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait,
-        IntoActiveModel, Set, Statement,
+        ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
+        EntityTrait, IntoActiveModel, QueryFilter, Set, Statement,
     };
+    use sha2::{Digest, Sha256};
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2804,6 +3156,71 @@ mod tests {
                 return Err(error);
             }
             Ok(self.embedding.clone())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FirstProviderResolution {
+        Error,
+        None,
+        MismatchedIdentity,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DurableRepairSuppression {
+        Exclusion,
+        Deleted,
+        None,
+    }
+
+    struct RecoveringThreadEpisodicEmbeddingProviderResolver {
+        first: FirstProviderResolution,
+        provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+        calls: AtomicUsize,
+    }
+
+    impl RecoveringThreadEpisodicEmbeddingProviderResolver {
+        fn new(
+            first: FirstProviderResolution,
+            provider: Arc<dyn ThreadEpisodicEmbeddingProvider>,
+        ) -> Self {
+            Self {
+                first,
+                provider,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ThreadEpisodicIndexEmbeddingProviderResolver
+        for RecoveringThreadEpisodicEmbeddingProviderResolver
+    {
+        async fn resolve_active_embedding_provider(
+            &self,
+            _workspace_id: &str,
+        ) -> std::result::Result<
+            Option<Arc<dyn ThreadEpisodicEmbeddingProvider>>,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return match self.first {
+                    FirstProviderResolution::Error => {
+                        Err(ThreadEpisodicIndexResolutionError::retryable(
+                            "first repair provider resolution failed",
+                        ))
+                    }
+                    FirstProviderResolution::None => Ok(None),
+                    FirstProviderResolution::MismatchedIdentity => Ok(Some(Arc::new(
+                        StaticThreadEpisodicEmbeddingProvider::with_identity(
+                            "openrouter",
+                            "mismatched-model",
+                            vec![0.1, 0.2, 0.3],
+                        ),
+                    ))),
+                };
+            }
+            Ok(Some(self.provider.clone()))
         }
     }
 
@@ -3094,13 +3511,26 @@ mod tests {
         let _guard = try_acquire_refill_lock(temp_dir.path())
             .expect("lock acquisition should not error")
             .expect("first lock should be acquired");
+        let (status_sender, mut status_receiver) = tokio::sync::broadcast::channel(4);
 
-        let summary = refill_once(crud_store.clone(), temp_dir.path())
-            .await
-            .expect("contended refill should skip without error");
+        let summary = refill_once_with_projection_resolver(
+            crud_store.clone(),
+            temp_dir.path(),
+            LEGACY_REFILL_WORKSPACE_ID,
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+            None,
+            Some(&status_sender),
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await
+        .expect("contended refill should skip without error");
 
         assert!(summary.skipped);
         assert!(summary.lock_contended);
+        assert!(matches!(
+            status_receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         assert!(
             find_projection_meta(
                 &crud_store.database_connection(),
@@ -4899,7 +5329,7 @@ mod tests {
 
     #[tokio::test]
     async fn thread_episodic_vector_model_same_config_does_not_rebuild() {
-        let (crud_store, temp_dir, _workspace_id) = setup_store().await;
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let config = vector_search_config(
             GatewayThreadEpisodicVectorProviderConfig::OpenAi,
             "text-embedding-3-small",
@@ -4919,18 +5349,74 @@ mod tests {
             &target,
         )
         .await;
-
-        let summary = refill_once_for_vector_search_config(
-            crud_store,
-            temp_dir.path(),
-            &config,
+        let marker_before =
+            find_refill_projection_meta_for_workspace(crud_store.as_ref(), workspace_id.as_str())
+                .await
+                .expect("refill marker snapshot should succeed");
+        let capsules_before = crud_store
+            .list_all_thread_episodic_capsules_for_workspace(workspace_id.as_str())
+            .await
+            .expect("capsule snapshot should succeed");
+        let incomplete_jobs_before = crud_store
+            .count_incomplete_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+            .await
+            .expect("incomplete job snapshot should succeed");
+        let canceled_jobs_before = crud_store
+            .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+            .await
+            .expect("canceled job snapshot should succeed");
+        let resolver = Arc::new(FixedThreadEpisodicIndexEmbeddingProviderResolver::new(
             Some(embedding_provider.clone()),
+        )) as Arc<dyn ThreadEpisodicIndexEmbeddingProviderResolver>;
+        let (status_sender, mut status_receiver) = tokio::sync::broadcast::channel(4);
+
+        let summary = refill_once_with_projection_resolver(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &config,
+            ),
+            Some(resolver),
+            Some(&status_sender),
+            Some(chrono::Utc::now().timestamp()),
         )
         .await
         .expect("same vector config should skip");
 
         assert!(summary.skipped);
         assert_eq!(embedding_provider.calls(), 0);
+        assert!(matches!(
+            status_receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            find_refill_projection_meta_for_workspace(crud_store.as_ref(), workspace_id.as_str(),)
+                .await
+                .expect("refill marker verification should succeed"),
+            marker_before
+        );
+        assert_eq!(
+            crud_store
+                .list_all_thread_episodic_capsules_for_workspace(workspace_id.as_str())
+                .await
+                .expect("capsule verification should succeed"),
+            capsules_before
+        );
+        assert_eq!(
+            crud_store
+                .count_incomplete_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("incomplete job verification should succeed"),
+            incomplete_jobs_before
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("canceled job verification should succeed"),
+            canceled_jobs_before
+        );
     }
 
     #[tokio::test]
@@ -5539,6 +6025,418 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_codex_history_failed_resume_reconciles_legacy_and_seven_task_summaries_once() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("mixed resume provider target");
+
+        let healthy_thread_id = "thread_mixed_resume_healthy";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            healthy_thread_id,
+            "turn_mixed_resume_healthy",
+            "item_mixed_resume_healthy",
+            "healthy mixed-resume frame remains indexed once",
+        )
+        .await;
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("healthy baseline projection should complete");
+        assert_eq!(embedding_provider.calls(), 1);
+        let healthy_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), healthy_thread_id, 10)
+            .await
+            .expect("healthy mixed-resume item list")
+            .remove(0);
+        let healthy_job = crud_store
+            .find_thread_episodic_index_job_by_item(healthy_item.id.as_str())
+            .await
+            .expect("healthy mixed-resume job lookup")
+            .expect("healthy mixed-resume job should exist");
+
+        let task_thread_id = "thread_mixed_resume_tasks";
+        let mut canonical_task_updates = Vec::new();
+        let mut expected_task_text = std::collections::BTreeMap::new();
+        for index in 0..7 {
+            let turn_id = format!("turn_mixed_resume_task_{index}");
+            let item_id = format!("item_mixed_resume_task_{index}");
+            let title = format!("Mixed resume task {index}");
+            let preview = format!("Mixed resume preview {index}");
+            let make_item = |status| TurnItem::Task {
+                item: TaskTurnItem {
+                    id: item_id.clone(),
+                    task_id: format!("task_mixed_resume_{index}"),
+                    created_by_turn_id: None,
+                    run_id: Some(format!("run_mixed_resume_{index}")),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: title.clone(),
+                    status,
+                    attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    progress_preview: None,
+                    result_preview: Some(preview.clone()),
+                    error_preview: None,
+                    started_at: Some(1_700_060_000),
+                    created_at: 1_700_060_000,
+                    updated_at: 1_700_060_001,
+                },
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                task_thread_id,
+                turn_id.as_str(),
+                make_item(if index == 6 {
+                    TaskStatus::Scheduled
+                } else {
+                    TaskStatus::Running
+                }),
+                1_700_060_000 + index,
+            )
+            .await;
+            canonical_task_updates.push((turn_id, make_item(TaskStatus::Completed)));
+            expected_task_text.insert(item_id, format!("{title}: {preview} (completed)"));
+        }
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: task_thread_id.to_owned(),
+                history_event_limit: None,
+                item_scan_limit: 100,
+                now_unix: 1_700_060_020,
+            })
+            .await
+            .expect("historical mixed-resume tasks should prepare");
+        for (index, (turn_id, item)) in canonical_task_updates.into_iter().enumerate() {
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: task_thread_id.to_owned(),
+                        turn_id,
+                        item,
+                    },
+                    1_700_060_100 + index as i64,
+                )
+                .await
+                .expect("canonical mixed-resume task should update");
+        }
+        let stale_task_jobs = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_060_200,
+                20,
+            )
+            .await
+            .expect("stale mixed-resume task jobs should claim");
+        assert_eq!(stale_task_jobs.len(), 7);
+        for job in &stale_task_jobs {
+            assert_eq!(
+                crud_store
+                    .fail_thread_episodic_index_attempt_without_source_validation(
+                        job.id.as_str(),
+                        job.attempt_count,
+                        ThreadEpisodicIndexJobFailureUpdate {
+                            retryable: false,
+                            next_run_at_unix: None,
+                            last_error: Some(
+                                "thread episodic source text hash changed before indexing"
+                                    .to_owned(),
+                            ),
+                            capacity_error: false,
+                            last_attempt_latency_ms: Some(1),
+                        },
+                        1_700_060_201,
+                    )
+                    .await
+                    .expect("mixed-resume hash mismatch should persist"),
+                ThreadEpisodicIndexAttemptOutcome::Applied
+            );
+        }
+
+        let mut expected_legacy = Vec::new();
+        for (index, event_id) in LEGACY_CODEX_HISTORY_EVENT_IDS.iter().enumerate() {
+            let thread_id = format!("thread_mixed_resume_legacy_{index}");
+            let turn_id = format!("turn_mixed_resume_legacy_{index}");
+            let item_id = format!("item_mixed_resume_legacy_{index}");
+            let text = format!("mixed resume legacy payload {index}");
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                TurnItem::UserMessage {
+                    id: item_id.clone(),
+                    text: text.clone(),
+                    attachments: Vec::new(),
+                },
+                1_700_060_300 + index as i64,
+            )
+            .await;
+            attach_prompt_profile_history_event(
+                crud_store.as_ref(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                event_id,
+                "cli_runtime_codex",
+            )
+            .await;
+            expected_legacy.push((thread_id, item_id, text));
+        }
+        mark_refill_marker_with_workspace_target(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &target,
+        )
+        .await;
+
+        let resumed = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("mixed Failed refill should reconcile the whole workspace once");
+        assert!(resumed.resumed);
+        assert_eq!(resumed.source_threads_reindexed, 7);
+        assert_eq!(resumed.completed_jobs, 12);
+        assert_eq!(embedding_provider.calls(), 13);
+
+        let healthy_item_after = crud_store
+            .find_thread_episodic_item(healthy_item.id.as_str())
+            .await
+            .expect("healthy item lookup after mixed resume")
+            .expect("healthy item should remain after mixed resume");
+        let healthy_job_after = crud_store
+            .find_thread_episodic_index_job_by_item(healthy_item.id.as_str())
+            .await
+            .expect("healthy job lookup after mixed resume")
+            .expect("healthy job should remain after mixed resume");
+        assert_eq!(healthy_item_after.frame_id, healthy_item.frame_id);
+        assert_eq!(healthy_item_after.frame_uri, healthy_item.frame_uri);
+        assert_eq!(
+            healthy_item_after.source_text_hash,
+            healthy_item.source_text_hash
+        );
+        assert_eq!(healthy_job_after.id, healthy_job.id);
+        assert_eq!(
+            healthy_job_after.status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+        assert_eq!(healthy_job_after.attempt_count, healthy_job.attempt_count);
+        assert_eq!(healthy_job_after.completed_at, healthy_job.completed_at);
+
+        let task_items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), task_thread_id, 20)
+            .await
+            .expect("mixed-resume task items should list");
+        assert_eq!(task_items.len(), 14);
+        assert_eq!(
+            task_items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Superseded)
+                .count(),
+            7
+        );
+        let active_task_items = task_items
+            .iter()
+            .filter(|item| item.status == ThreadEpisodicItemStatus::Active)
+            .collect::<Vec<_>>();
+        assert_eq!(active_task_items.len(), 7);
+        for item in active_task_items {
+            let text = expected_task_text
+                .get(item.item_id.as_str())
+                .expect("mixed-resume canonical task text");
+            assert_eq!(item.source_text_hash, expected_source_text_hash(text));
+            assert!(item.frame_id.is_some());
+            assert!(item.frame_uri.is_some());
+            assert_capsule_contains_payload(crud_store.as_ref(), item, text).await;
+        }
+        let task_jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), task_thread_id, 20)
+            .await
+            .expect("mixed-resume task jobs should list");
+        assert_eq!(task_jobs.len(), 14);
+        assert_eq!(
+            task_jobs
+                .iter()
+                .filter(|job| job.status == ThreadEpisodicIndexJobStatus::Completed)
+                .count(),
+            7
+        );
+        assert_eq!(
+            task_jobs
+                .iter()
+                .filter(|job| job.status == ThreadEpisodicIndexJobStatus::Canceled)
+                .count(),
+            7
+        );
+
+        for (thread_id, item_id, text) in &expected_legacy {
+            let item = crud_store
+                .list_thread_episodic_items_for_thread(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    10,
+                )
+                .await
+                .expect("mixed-resume legacy item should list")
+                .remove(0);
+            assert_eq!(item.item_id, *item_id);
+            assert_eq!(item.status, ThreadEpisodicItemStatus::Active);
+            assert_eq!(item.source_text_hash, expected_source_text_hash(text));
+            assert_capsule_contains_payload(crud_store.as_ref(), &item, text).await;
+            let jobs = crud_store
+                .list_thread_episodic_index_jobs_for_thread(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    10,
+                )
+                .await
+                .expect("mixed-resume legacy jobs should list");
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
+        }
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("mixed-resume main marker should be complete")
+        );
+        let repair_key = legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+            .expect("mixed-resume repair key");
+        assert_eq!(
+            find_projection_meta(&crud_store.database_connection(), repair_key.as_str())
+                .await
+                .expect("mixed-resume repair marker lookup")
+                .expect("mixed-resume repair marker should exist")
+                .status,
+            PROJECTION_META_STATUS_COMPLETE
+        );
+
+        let provider_calls_after_resume = embedding_provider.calls();
+        let repeated = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("completed mixed repair should be idempotent");
+        assert!(repeated.skipped);
+        assert_eq!(repeated.executor_batches, 0);
+        assert_eq!(embedding_provider.calls(), provider_calls_after_resume);
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(
+                    workspace_id.as_str(),
+                    task_thread_id,
+                    20,
+                )
+                .await
+                .expect("mixed-resume task jobs should remain stable"),
+            task_jobs
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_index_job_by_item(healthy_item.id.as_str())
+                .await
+                .expect("healthy job lookup after idempotent repeat")
+                .expect("healthy job should remain after idempotent repeat"),
+            healthy_job_after
+        );
+
+        let terminal_thread_id = "thread_mixed_resume_terminal";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            terminal_thread_id,
+            "turn_mixed_resume_terminal",
+            "item_mixed_resume_terminal",
+            "independent terminal failure must block mixed resume",
+        )
+        .await;
+        let terminal_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), terminal_thread_id, 10)
+            .await
+            .expect("terminal control item should list")
+            .remove(0);
+        let terminal_job = crud_store
+            .find_thread_episodic_index_job_by_item(terminal_item.id.as_str())
+            .await
+            .expect("terminal control job lookup")
+            .expect("terminal control job should exist");
+        crud_store
+            .cancel_thread_episodic_index_job(
+                terminal_job.id.as_str(),
+                Some("independent genuine terminal error".to_owned()),
+                1_700_060_500,
+            )
+            .await
+            .expect("terminal control cancellation should persist")
+            .expect("terminal control job should be canceled");
+        mark_refill_marker_with_workspace_target(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &target,
+        )
+        .await;
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect_err("independent genuine terminal failure must still block Complete");
+        assert_eq!(embedding_provider.calls(), provider_calls_after_resume);
+        let terminal_job_after = crud_store
+            .find_thread_episodic_index_job(terminal_job.id.as_str())
+            .await
+            .expect("terminal control job lookup after failed resume")
+            .expect("terminal control job should remain");
+        assert_eq!(
+            terminal_job_after.status,
+            ThreadEpisodicIndexJobStatus::Canceled
+        );
+        assert_eq!(
+            terminal_job_after.last_error.as_deref(),
+            Some("independent genuine terminal error")
+        );
+    }
+
+    #[tokio::test]
     async fn thread_episodic_fresh_and_resume_preserve_exclusion_and_user_tombstone() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let thread_id = "thread_refill_preserved_controls";
@@ -5961,30 +6859,1726 @@ mod tests {
         assert_eq!(meta.status, PROJECTION_META_STATUS_COMPLETE);
     }
 
-    async fn setup_store() -> (Arc<CrudStore>, TempDir, String) {
-        let connection = Database::connect("sqlite::memory:")
-            .await
-            .expect("must connect sqlite memory");
-        Migrator::up(&connection, None)
-            .await
-            .expect("migrations must succeed");
-        bootstrap(&connection)
-            .await
-            .expect("gateway bootstrap should create default workspace");
-        let workspace_manager = WorkspaceManager::new(connection.clone());
-        let workspace_id = workspace_manager
-            .list_workspaces()
-            .await
-            .expect("workspace list should succeed")
-            .into_iter()
-            .find(|workspace| workspace.is_active && workspace.is_current)
-            .expect("current workspace should exist")
-            .id;
-        (
-            Arc::new(CrudStore::new(connection)),
-            TempDir::new().expect("temp dir"),
-            workspace_id,
+    #[tokio::test]
+    async fn legacy_codex_history_repair_bypasses_complete_and_is_idempotent_and_scoped() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        let healthy_thread = "thread_legacy_repair_healthy";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            healthy_thread,
+            "turn_legacy_repair_healthy",
+            "item_legacy_repair_healthy",
+            "healthy data remains indexed once",
         )
+        .await;
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect("baseline projection should complete");
+        let healthy_before = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), healthy_thread, 10)
+            .await
+            .expect("healthy item should list")
+            .into_iter()
+            .next()
+            .expect("healthy item should exist");
+
+        let other_workspace_id = "workspace_legacy_repair_other";
+        let now = fixed_datetime_from_unix(1_700_000_000);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(other_workspace_id.to_owned()),
+            name: Set("Other Workspace".to_owned()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("other workspace should insert");
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            other_workspace_id,
+            "thread_legacy_repair_other",
+            "turn_legacy_repair_other",
+            "item_legacy_repair_other",
+            "other workspace remains untouched",
+        )
+        .await;
+        let other_before = crud_store
+            .list_thread_episodic_items_for_thread(
+                other_workspace_id,
+                "thread_legacy_repair_other",
+                10,
+            )
+            .await
+            .expect("other workspace item should list");
+
+        let mut expected = Vec::new();
+        for (index, event_id) in LEGACY_CODEX_HISTORY_EVENT_IDS.iter().enumerate() {
+            let thread_id = format!("thread_legacy_repair_{index}");
+            let turn_id = format!("turn_legacy_repair_{index}");
+            let item_id = format!("item_legacy_repair_{index}");
+            let text = format!("legacy repair payload {index}");
+            let item = if index % 2 == 0 {
+                TurnItem::UserMessage {
+                    id: item_id.clone(),
+                    text: text.clone(),
+                    attachments: Vec::new(),
+                }
+            } else {
+                TurnItem::AgentMessage {
+                    id: item_id.clone(),
+                    text: text.clone(),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                }
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                item,
+                1_700_000_100 + index as i64,
+            )
+            .await;
+            attach_prompt_profile_history_event(
+                crud_store.as_ref(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                event_id,
+                "cli_runtime_codex",
+            )
+            .await;
+            expected.push((thread_id, turn_id, item_id, text, index % 2 == 0));
+        }
+
+        mark_legacy_codex_history_repair(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_BACKFILLING,
+            5,
+            None,
+        )
+        .await
+        .expect("running repair marker should persist");
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("running repair status should resolve"),
+            GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+
+        let summary = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect("old Complete marker must not block the legacy repair");
+        assert!(summary.resumed);
+        assert_eq!(summary.source_threads_reindexed, 5);
+        assert_eq!(summary.source_threads_failed, 0);
+        assert_eq!(summary.completed_jobs, 5);
+
+        for (thread_id, turn_id, item_id, text, is_user) in &expected {
+            let history = crud_store
+                .get_thread_history(thread_id.as_str(), None)
+                .await
+                .expect("legacy thread history should decode")
+                .expect("legacy thread should exist");
+            assert!(history.events.iter().any(|event| matches!(
+                &event.payload,
+                pioneer_protocol::ThreadHistoryEventPayload::TurnStarted { turn, .. }
+                    if turn.prompt_manifest.as_ref().map(|manifest| manifest.profile)
+                        == Some(PromptManifestProfile::CliRuntime)
+            )));
+            let items = crud_store
+                .list_thread_episodic_items_for_thread(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    10,
+                )
+                .await
+                .expect("repaired items should list");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].turn_id, *turn_id);
+            assert_eq!(items[0].item_id, *item_id);
+            assert_eq!(items[0].source_text_hash, expected_source_text_hash(text));
+            assert_eq!(
+                items[0].source_actor_role,
+                if *is_user {
+                    ThreadEpisodicSourceActorRole::User
+                } else {
+                    ThreadEpisodicSourceActorRole::Assistant
+                }
+            );
+            assert_eq!(items[0].status, ThreadEpisodicItemStatus::Active);
+            assert!(items[0].frame_uri.is_some());
+            assert_capsule_contains_payload(crud_store.as_ref(), &items[0], text).await;
+            let jobs = crud_store
+                .list_thread_episodic_index_jobs_for_thread(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    10,
+                )
+                .await
+                .expect("repaired jobs should list");
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
+        }
+
+        let repair_key = legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+            .expect("repair key should build");
+        let repair_meta =
+            find_projection_meta(&crud_store.database_connection(), repair_key.as_str())
+                .await
+                .expect("repair marker lookup")
+                .expect("repair marker should exist");
+        assert_eq!(repair_meta.status, PROJECTION_META_STATUS_COMPLETE);
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("completed repair status should resolve"),
+            GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+        mark_legacy_codex_history_repair(
+            crud_store.as_ref(),
+            other_workspace_id,
+            PROJECTION_META_STATUS_FAILED,
+            1,
+            Some("other workspace failure".to_owned()),
+        )
+        .await
+        .expect("other workspace repair marker should persist");
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("other workspace marker must not leak"),
+            GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+
+        let forgotten = &expected[0];
+        let forgotten_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), forgotten.0.as_str(), 10)
+            .await
+            .expect("forgotten item should list")
+            .into_iter()
+            .next()
+            .expect("forgotten item should exist");
+        crud_store
+            .tombstone_thread_episodic_items_for_item(
+                workspace_id.as_str(),
+                forgotten.0.as_str(),
+                forgotten.1.as_str(),
+                forgotten.2.as_str(),
+                1_700_001_000,
+            )
+            .await
+            .expect("item tombstone should persist");
+        crud_store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: forgotten.0.clone(),
+                    index_item_id: forgotten_item.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".to_owned(),
+                },
+                1_700_001_000,
+            )
+            .await
+            .expect("exclusion should persist");
+        update_projection_meta_status(
+            &crud_store.database_connection(),
+            repair_key.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            Some("simulate restart before repair completion"),
+            now_datetime(),
+        )
+        .await
+        .expect("repair marker should reset for idempotency test");
+
+        let rerun = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            None,
+        )
+        .await
+        .expect("repair rerun should remain idempotent");
+        assert_eq!(rerun.completed_jobs, 0);
+        for (thread_id, ..) in &expected {
+            assert_eq!(
+                crud_store
+                    .list_thread_episodic_index_jobs_for_thread(
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        10,
+                    )
+                    .await
+                    .expect("idempotent repair jobs should list")
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(forgotten_item.id.as_str())
+                .await
+                .expect("forgotten item lookup")
+                .expect("forgotten item remains durable")
+                .status,
+            ThreadEpisodicItemStatus::Deleted
+        );
+        assert!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    workspace_id.as_str(),
+                    forgotten.0.as_str(),
+                    forgotten_item.id.as_str(),
+                )
+                .await
+                .expect("exclusion lookup")
+                .is_some()
+        );
+        let healthy_after = crud_store
+            .find_thread_episodic_item(healthy_before.id.as_str())
+            .await
+            .expect("healthy lookup")
+            .expect("healthy item remains");
+        assert_eq!(healthy_after.frame_uri, healthy_before.frame_uri);
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_items_for_thread(
+                    other_workspace_id,
+                    "thread_legacy_repair_other",
+                    10,
+                )
+                .await
+                .expect("other workspace item should remain"),
+            other_before
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_preserves_exclusions_and_tombstones_before_indexing() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("repair provider target");
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("empty baseline projection should complete");
+
+        let fixtures = [
+            (
+                "thread_repair_excluded_without_job",
+                "turn_repair_excluded_without_job",
+                "item_repair_excluded_without_job",
+                "excluded pending repair item without a job",
+            ),
+            (
+                "thread_repair_excluded_with_job",
+                "turn_repair_excluded_with_job",
+                "item_repair_excluded_with_job",
+                "excluded pending repair item with a job",
+            ),
+            (
+                "thread_repair_tombstoned",
+                "turn_repair_tombstoned",
+                "item_repair_tombstoned",
+                "tombstoned repair item",
+            ),
+        ];
+        let mut seeded_items = Vec::new();
+        for (index, (thread_id, turn_id, item_id, text)) in fixtures.iter().enumerate() {
+            ingest_materialized_user_item(
+                crud_store.clone(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                text,
+            )
+            .await;
+            attach_prompt_profile_history_event(
+                crud_store.as_ref(),
+                thread_id,
+                turn_id,
+                LEGACY_CODEX_HISTORY_EVENT_IDS[index],
+                "cli_runtime_codex",
+            )
+            .await;
+            let item = crud_store
+                .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+                .await
+                .expect("seeded repair item should list")
+                .remove(0);
+            assert_eq!(item.status, ThreadEpisodicItemStatus::PendingIndex);
+            seeded_items.push(item);
+        }
+
+        let no_job_item = &seeded_items[0];
+        let no_job = crud_store
+            .find_thread_episodic_index_job_by_item(no_job_item.id.as_str())
+            .await
+            .expect("excluded job lookup")
+            .expect("ingestion should have created the excluded job");
+        assert!(
+            crud_store
+                .delete_incomplete_thread_episodic_index_job(no_job.id.as_str())
+                .await
+                .expect("excluded job should be removed for no-job fixture")
+        );
+        for (item, (thread_id, ..)) in seeded_items.iter().take(2).zip(fixtures.iter()) {
+            crud_store
+                .exclude_thread_episodic_item(
+                    NewThreadEpisodicExclusionRecord {
+                        id: None,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: (*thread_id).to_owned(),
+                        index_item_id: item.id.clone(),
+                        reason: ThreadEpisodicExclusionReason::UserRequested,
+                        created_by: "test".to_owned(),
+                    },
+                    1_700_006_000,
+                )
+                .await
+                .expect("repair exclusion should persist");
+        }
+        crud_store
+            .tombstone_thread_episodic_items_for_item(
+                workspace_id.as_str(),
+                fixtures[2].0,
+                fixtures[2].1,
+                fixtures[2].2,
+                1_700_006_001,
+            )
+            .await
+            .expect("repair tombstone should persist");
+
+        let allowed = (
+            "thread_repair_allowed",
+            "turn_repair_allowed",
+            "item_repair_allowed",
+            "allowed repair payload reaches the capsule",
+        );
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            allowed.0,
+            allowed.1,
+            TurnItem::UserMessage {
+                id: allowed.2.to_owned(),
+                text: allowed.3.to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_006_002,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            allowed.0,
+            allowed.1,
+            LEGACY_CODEX_HISTORY_EVENT_IDS[3],
+            "cli_runtime_codex",
+        )
+        .await;
+
+        let summary = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("repair should skip user-suppressed items and index the allowed item");
+        assert_eq!(summary.source_threads_failed, 0);
+        assert_eq!(summary.completed_jobs, 1);
+        assert_eq!(embedding_provider.calls(), 1);
+
+        for (index, (item, (_thread_id, ..))) in
+            seeded_items.iter().zip(fixtures.iter()).enumerate()
+        {
+            let durable = crud_store
+                .find_thread_episodic_item(item.id.as_str())
+                .await
+                .expect("suppressed item lookup")
+                .expect("suppressed item should remain durable");
+            assert_eq!(
+                durable.status,
+                if index == 2 {
+                    ThreadEpisodicItemStatus::Deleted
+                } else {
+                    ThreadEpisodicItemStatus::Excluded
+                }
+            );
+            assert!(durable.frame_uri.is_none());
+            if index == 0 {
+                assert!(
+                    crud_store
+                        .find_thread_episodic_index_job_by_item(item.id.as_str())
+                        .await
+                        .expect("excluded no-job fixture lookup")
+                        .is_none()
+                );
+            } else {
+                assert_preserved_suppressed_repair_job(crud_store.as_ref(), item, index == 2).await;
+            }
+        }
+        for item in seeded_items.iter().take(2) {
+            assert!(
+                crud_store
+                    .find_thread_episodic_exclusion_by_item(
+                        workspace_id.as_str(),
+                        item.thread_id.as_str(),
+                        item.id.as_str(),
+                    )
+                    .await
+                    .expect("repair exclusion lookup")
+                    .is_some()
+            );
+        }
+
+        let allowed_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), allowed.0, 10)
+            .await
+            .expect("allowed repair item should list")
+            .remove(0);
+        assert_eq!(allowed_item.status, ThreadEpisodicItemStatus::Active);
+        assert_eq!(
+            allowed_item.source_text_hash,
+            expected_source_text_hash(allowed.3)
+        );
+        assert_capsule_contains_payload(crud_store.as_ref(), &allowed_item, allowed.3).await;
+        let allowed_jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), allowed.0, 10)
+            .await
+            .expect("allowed repair jobs should list");
+        assert_eq!(allowed_jobs.len(), 1);
+        assert_eq!(
+            allowed_jobs[0].status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+
+        let repair_key = legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+            .expect("repair key should build");
+        update_projection_meta_status(
+            &crud_store.database_connection(),
+            repair_key.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            Some("repeat suppression repair"),
+            now_datetime(),
+        )
+        .await
+        .expect("repair marker should reset for idempotency test");
+        let rerun = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("repeated suppression repair should complete");
+        assert_eq!(rerun.completed_jobs, 0);
+        assert_eq!(embedding_provider.calls(), 1);
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), allowed.0, 10,)
+                .await
+                .expect("idempotent allowed jobs should list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_preserves_suppressed_canceled_jobs_in_bounded_batches() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("repair provider target");
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("empty baseline projection should complete");
+
+        let mut suppressed_items = Vec::new();
+        for (index, suppression) in [
+            DurableRepairSuppression::Exclusion,
+            DurableRepairSuppression::Deleted,
+            DurableRepairSuppression::Exclusion,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let thread_id = format!("thread_canceled_suppressed_{index}");
+            let turn_id = format!("turn_canceled_suppressed_{index}");
+            let item_id = format!("item_canceled_suppressed_{index}");
+            suppressed_items.push(
+                seed_canceled_legacy_repair_item(
+                    crud_store.clone(),
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    item_id.as_str(),
+                    LEGACY_CODEX_HISTORY_EVENT_IDS[index],
+                    suppression,
+                )
+                .await,
+            );
+        }
+        let other_workspace_id = "workspace_canceled_suppression_other";
+        let now = fixed_datetime_from_unix(1_700_008_100);
+        pioneer_entity::workspace::Entity::insert(pioneer_entity::workspace::ActiveModel {
+            id: Set(other_workspace_id.to_owned()),
+            name: Set("Canceled Suppression Other".to_owned()),
+            is_active: Set(true),
+            is_current: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+        })
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("other workspace should insert");
+        let other_thread_id = "thread_canceled_suppressed_other_workspace";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            other_workspace_id,
+            other_thread_id,
+            "turn_canceled_suppressed_other",
+            "item_canceled_suppressed_other",
+            "other workspace canceled exclusion remains untouched",
+        )
+        .await;
+        let other_item = crud_store
+            .list_thread_episodic_items_for_thread(other_workspace_id, other_thread_id, 10)
+            .await
+            .expect("other workspace suppressed item list")
+            .remove(0);
+        let other_job = crud_store
+            .find_thread_episodic_index_job_by_item(other_item.id.as_str())
+            .await
+            .expect("other workspace canceled job lookup")
+            .expect("other workspace canceled job should exist");
+        crud_store
+            .cancel_thread_episodic_index_job(
+                other_job.id.as_str(),
+                Some("other workspace terminal fixture".to_owned()),
+                1_700_008_101,
+            )
+            .await
+            .expect("other workspace job cancellation")
+            .expect("other workspace canceled job should remain");
+        crud_store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: other_workspace_id.to_owned(),
+                    thread_id: other_item.thread_id.clone(),
+                    index_item_id: other_item.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".to_owned(),
+                },
+                1_700_008_102,
+            )
+            .await
+            .expect("other workspace exclusion should persist");
+        let other_item_before = crud_store
+            .find_thread_episodic_item(other_item.id.as_str())
+            .await
+            .expect("other workspace item snapshot lookup")
+            .expect("other workspace item snapshot should exist");
+        let other_job_before = crud_store
+            .find_thread_episodic_index_job(other_job.id.as_str())
+            .await
+            .expect("other workspace job snapshot lookup")
+            .expect("other workspace job snapshot should exist");
+        let other_exclusion_before = crud_store
+            .find_thread_episodic_exclusion_by_item(
+                other_workspace_id,
+                other_item.thread_id.as_str(),
+                other_item.id.as_str(),
+            )
+            .await
+            .expect("other workspace exclusion snapshot lookup")
+            .expect("other workspace exclusion snapshot should exist");
+
+        let expected_thread_ids = (0..3)
+            .map(|index| format!("thread_canceled_suppressed_{index}"))
+            .collect::<Vec<_>>();
+        for (event_id, expected_thread_id) in LEGACY_CODEX_HISTORY_EVENT_IDS
+            .iter()
+            .take(3)
+            .zip(expected_thread_ids.iter())
+        {
+            let event = pioneer_entity::turn_event::Entity::find_by_id(*event_id)
+                .one(&crud_store.database_connection())
+                .await
+                .expect("repair event lookup should succeed")
+                .expect("repair event should exist");
+            assert_eq!(&event.thread_id, expected_thread_id);
+        }
+        let repair_threads =
+            legacy_codex_history_repair_threads(crud_store.as_ref(), workspace_id.as_str())
+                .await
+                .expect("repair threads should resolve before cleanup");
+        assert_eq!(
+            repair_threads
+                .iter()
+                .map(|thread| thread.thread_id.clone())
+                .collect::<Vec<_>>(),
+            expected_thread_ids
+        );
+        assert!(
+            repair_threads
+                .iter()
+                .all(|thread| thread.workspace_id == workspace_id)
+        );
+        for thread_id in &expected_thread_ids {
+            let thread = pioneer_entity::thread::Entity::find_by_id(thread_id.clone())
+                .one(&crud_store.database_connection())
+                .await
+                .expect("source thread ownership lookup should succeed")
+                .expect("source repair thread should exist");
+            assert_eq!(thread.workspace_id, workspace_id);
+        }
+        assert!(
+            !expected_thread_ids
+                .iter()
+                .any(|thread_id| thread_id == other_thread_id)
+        );
+        let other_thread = pioneer_entity::thread::Entity::find_by_id(other_thread_id)
+            .one(&crud_store.database_connection())
+            .await
+            .expect("other workspace thread ownership lookup should succeed")
+            .expect("other workspace thread should exist");
+        assert_eq!(other_thread.workspace_id, other_workspace_id);
+
+        let summary = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("suppressed canceled jobs should not block additive repair");
+        assert_eq!(summary.suppressed_canceled_jobs_deleted, 0);
+        assert!(suppressed_items.len() > REFILL_SUPPRESSED_JOB_CLEANUP_BATCH_SIZE as usize);
+        assert_eq!(summary.executor_batches, 0);
+        assert_eq!(summary.completed_jobs, 0);
+        assert_eq!(embedding_provider.calls(), 0);
+        let mut suppressed_jobs_after_repair = Vec::new();
+        for (index, item) in suppressed_items.iter().enumerate() {
+            let job = assert_preserved_suppressed_repair_job(
+                crud_store.as_ref(),
+                item,
+                item.thread_id == "thread_canceled_suppressed_1",
+            )
+            .await;
+            suppressed_jobs_after_repair.push(job);
+            let durable = crud_store
+                .find_thread_episodic_item(item.id.as_str())
+                .await
+                .expect("suppressed item lookup")
+                .expect("suppressed item should remain");
+            if index == 1 {
+                assert_eq!(durable.status, ThreadEpisodicItemStatus::Deleted);
+                assert!(durable.deleted_at.is_some());
+            } else {
+                assert!(
+                    crud_store
+                        .find_thread_episodic_exclusion_by_item(
+                            workspace_id.as_str(),
+                            item.thread_id.as_str(),
+                            item.id.as_str(),
+                        )
+                        .await
+                        .expect("durable exclusion lookup")
+                        .is_some()
+                );
+            }
+        }
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(other_item.id.as_str())
+                .await
+                .expect("other workspace item lookup after repair")
+                .expect("other workspace item should remain"),
+            other_item_before
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_index_job(other_job.id.as_str())
+                .await
+                .expect("other workspace job lookup after repair")
+                .expect("other workspace job should remain"),
+            other_job_before
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    other_workspace_id,
+                    other_item.thread_id.as_str(),
+                    other_item.id.as_str(),
+                )
+                .await
+                .expect("other workspace exclusion lookup after repair")
+                .expect("other workspace exclusion should remain"),
+            other_exclusion_before
+        );
+
+        let mut suppressed_items_after_repair = Vec::new();
+        let mut exclusions_after_repair = Vec::new();
+        for item in &suppressed_items {
+            suppressed_items_after_repair.push(
+                crud_store
+                    .find_thread_episodic_item(item.id.as_str())
+                    .await
+                    .expect("suppressed item snapshot lookup")
+                    .expect("suppressed item snapshot should exist"),
+            );
+            exclusions_after_repair.push(
+                crud_store
+                    .find_thread_episodic_exclusion_by_item(
+                        workspace_id.as_str(),
+                        item.thread_id.as_str(),
+                        item.id.as_str(),
+                    )
+                    .await
+                    .expect("suppressed exclusion snapshot lookup"),
+            );
+        }
+
+        let completed_rerun = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("completed canceled suppression repair should skip");
+        assert!(completed_rerun.skipped);
+        assert_eq!(completed_rerun.executor_batches, 0);
+        assert_eq!(completed_rerun.completed_jobs, 0);
+        assert_eq!(completed_rerun.suppressed_canceled_jobs_deleted, 0);
+        assert_eq!(embedding_provider.calls(), 0);
+        assert!(
+            legacy_codex_history_repair_is_complete(crud_store.as_ref(), workspace_id.as_str())
+                .await
+                .expect("completed rerun repair marker should resolve")
+        );
+        for ((item, item_before), exclusion_before) in suppressed_items
+            .iter()
+            .zip(suppressed_items_after_repair.iter())
+            .zip(exclusions_after_repair.iter())
+        {
+            let job = assert_preserved_suppressed_repair_job(
+                crud_store.as_ref(),
+                item,
+                item.thread_id == "thread_canceled_suppressed_1",
+            )
+            .await;
+            assert_eq!(
+                &job,
+                suppressed_jobs_after_repair
+                    .iter()
+                    .find(|previous| previous.index_item_id == item.id)
+                    .expect("original durable job snapshot"),
+            );
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_item(item.id.as_str())
+                    .await
+                    .expect("completed rerun suppressed item lookup")
+                    .expect("completed rerun suppressed item should exist"),
+                item_before.clone()
+            );
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_exclusion_by_item(
+                        workspace_id.as_str(),
+                        item.thread_id.as_str(),
+                        item.id.as_str(),
+                    )
+                    .await
+                    .expect("completed rerun suppressed exclusion lookup"),
+                exclusion_before.clone()
+            );
+        }
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(other_item.id.as_str())
+                .await
+                .expect("other workspace item lookup after completed rerun")
+                .expect("other workspace item should survive completed rerun"),
+            other_item_before
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_index_job(other_job.id.as_str())
+                .await
+                .expect("other workspace job lookup after completed rerun")
+                .expect("other workspace job should survive completed rerun"),
+            other_job_before
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    other_workspace_id,
+                    other_item.thread_id.as_str(),
+                    other_item.id.as_str(),
+                )
+                .await
+                .expect("other workspace exclusion lookup after completed rerun")
+                .expect("other workspace exclusion should survive completed rerun"),
+            other_exclusion_before
+        );
+
+        let repair_key = legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+            .expect("repair key");
+        update_projection_meta_status(
+            &crud_store.database_connection(),
+            repair_key.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            Some("repeat canceled suppression repair"),
+            now_datetime(),
+        )
+        .await
+        .expect("repair marker reset");
+        let failed_resume = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("failed canceled suppression repair should resume idempotently");
+        assert!(!failed_resume.skipped);
+        assert_eq!(failed_resume.suppressed_canceled_jobs_deleted, 0);
+        assert_eq!(failed_resume.refill_jobs_enqueued, 0);
+        assert_eq!(failed_resume.executor_batches, 0);
+        assert_eq!(failed_resume.completed_jobs, 0);
+        assert_eq!(embedding_provider.calls(), 0);
+        for ((item, item_before), exclusion_before) in suppressed_items
+            .iter()
+            .zip(suppressed_items_after_repair.iter())
+            .zip(exclusions_after_repair.iter())
+        {
+            let job = assert_preserved_suppressed_repair_job(
+                crud_store.as_ref(),
+                item,
+                item.thread_id == "thread_canceled_suppressed_1",
+            )
+            .await;
+            assert_eq!(
+                &job,
+                suppressed_jobs_after_repair
+                    .iter()
+                    .find(|previous| previous.index_item_id == item.id)
+                    .expect("original durable job snapshot"),
+            );
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_item(item.id.as_str())
+                    .await
+                    .expect("failed resume suppressed item lookup")
+                    .expect("failed resume suppressed item should exist"),
+                item_before.clone()
+            );
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_exclusion_by_item(
+                        workspace_id.as_str(),
+                        item.thread_id.as_str(),
+                        item.id.as_str(),
+                    )
+                    .await
+                    .expect("failed resume suppressed exclusion lookup"),
+                exclusion_before.clone()
+            );
+        }
+        assert!(
+            legacy_codex_history_repair_is_complete(crud_store.as_ref(), workspace_id.as_str())
+                .await
+                .expect("failed resume repair completion should resolve")
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(other_item.id.as_str())
+                .await
+                .expect("other workspace item lookup after repeated repair")
+                .expect("other workspace item should survive repeated repair"),
+            other_item_before
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_index_job(other_job.id.as_str())
+                .await
+                .expect("other workspace job lookup after repeated repair")
+                .expect("other workspace job should survive repeated repair"),
+            other_job_before
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    other_workspace_id,
+                    other_item.thread_id.as_str(),
+                    other_item.id.as_str(),
+                )
+                .await
+                .expect("other workspace exclusion lookup after repeated repair")
+                .expect("other workspace exclusion should survive repeated repair"),
+            other_exclusion_before
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_failed_resume_preserves_suppressed_canceled_job() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_canceled_resume_healthy",
+            "turn_canceled_resume_healthy",
+            "item_canceled_resume_healthy",
+            "healthy data survives canceled suppression resume",
+        )
+        .await;
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect("healthy baseline should complete");
+        let healthy = crud_store
+            .list_thread_episodic_items_for_thread(
+                workspace_id.as_str(),
+                "thread_canceled_resume_healthy",
+                10,
+            )
+            .await
+            .expect("healthy item list")
+            .remove(0);
+        update_projection_meta_status(
+            &crud_store.database_connection(),
+            refill_projection_key_for_workspace(workspace_id.as_str())
+                .expect("refill key")
+                .as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            Some("historical failed refill"),
+            now_datetime(),
+        )
+        .await
+        .expect("failed main marker should persist");
+        let suppressed = seed_canceled_legacy_repair_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_canceled_resume_suppressed",
+            "turn_canceled_resume_suppressed",
+            "item_canceled_resume_suppressed",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            DurableRepairSuppression::Exclusion,
+        )
+        .await;
+
+        let summary = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            None,
+        )
+        .await
+        .expect("failed refill should resume past suppressed canceled job");
+        assert!(summary.resumed);
+        assert_eq!(summary.suppressed_canceled_jobs_deleted, 0);
+        assert_preserved_suppressed_repair_job(crud_store.as_ref(), &suppressed, false).await;
+        assert!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    workspace_id.as_str(),
+                    suppressed.thread_id.as_str(),
+                    suppressed.id.as_str(),
+                )
+                .await
+                .expect("resume exclusion lookup")
+                .is_some()
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(healthy.id.as_str())
+                .await
+                .expect("healthy lookup")
+                .expect("healthy item should remain")
+                .frame_uri,
+            healthy.frame_uri
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_keeps_real_canceled_failure_terminal() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            None,
+        )
+        .await
+        .expect("empty baseline should complete");
+        let allowed = seed_canceled_legacy_repair_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_canceled_allowed",
+            "turn_canceled_allowed",
+            "item_canceled_allowed",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            DurableRepairSuppression::None,
+        )
+        .await;
+
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+            None,
+        )
+        .await
+        .expect_err("allowed canceled job must remain a real terminal failure");
+        let job = crud_store
+            .find_thread_episodic_index_job_by_item(allowed.id.as_str())
+            .await
+            .expect("allowed canceled job lookup")
+            .expect("allowed canceled job should remain");
+        assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(job.last_error.as_deref(), Some("genuine terminal fixture"));
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_resumes_failed_refill_without_rebuilding_healthy_data() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_failed_repair_healthy",
+            "turn_failed_repair_healthy",
+            "item_failed_repair_healthy",
+            "healthy failed-resume baseline",
+        )
+        .await;
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect("baseline should complete");
+        let healthy = crud_store
+            .list_thread_episodic_items_for_thread(
+                workspace_id.as_str(),
+                "thread_failed_repair_healthy",
+                10,
+            )
+            .await
+            .expect("healthy item list")
+            .remove(0);
+        let healthy_job = crud_store
+            .find_thread_episodic_index_job_by_item(healthy.id.as_str())
+            .await
+            .expect("healthy job lookup")
+            .expect("healthy completed job should exist");
+        let projection_key =
+            refill_projection_key_for_workspace(workspace_id.as_str()).expect("projection key");
+        update_projection_meta_status(
+            &crud_store.database_connection(),
+            projection_key.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            Some("historical refill failure"),
+            now_datetime(),
+        )
+        .await
+        .expect("failed marker should persist");
+
+        for (index, event_id) in LEGACY_CODEX_HISTORY_EVENT_IDS.iter().enumerate() {
+            let thread_id = format!("thread_failed_repair_{index}");
+            let turn_id = format!("turn_failed_repair_{index}");
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                TurnItem::UserMessage {
+                    id: format!("item_failed_repair_{index}"),
+                    text: format!("failed refill payload {index}"),
+                    attachments: Vec::new(),
+                },
+                1_700_002_000 + index as i64,
+            )
+            .await;
+            attach_prompt_profile_history_event(
+                crud_store.as_ref(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                event_id,
+                "cli_runtime_codex",
+            )
+            .await;
+        }
+
+        let summary = refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            None,
+        )
+        .await
+        .expect("Failed refill should resume and repair historical threads");
+        assert!(summary.resumed);
+        assert_eq!(summary.source_threads_reindexed, 6);
+        assert_eq!(summary.completed_jobs, 5);
+        assert_eq!(summary.item_rows_deleted, 0);
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(healthy.id.as_str())
+                .await
+                .expect("healthy lookup")
+                .expect("healthy item should remain")
+                .frame_uri,
+            healthy.frame_uri
+        );
+        let healthy_job_after = crud_store
+            .find_thread_episodic_index_job_by_item(healthy.id.as_str())
+            .await
+            .expect("healthy job lookup after resume")
+            .expect("healthy completed job should remain");
+        assert_eq!(healthy_job_after.id, healthy_job.id);
+        assert_eq!(
+            healthy_job_after.status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+        assert_eq!(healthy_job_after.attempt_count, healthy_job.attempt_count);
+        assert_eq!(healthy_job_after.completed_at, healthy_job.completed_at);
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_keeps_unknown_profiles_failed_and_visible() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect("baseline marker should complete");
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_unknown_legacy_profile",
+            "turn_unknown_legacy_profile",
+            TurnItem::UserMessage {
+                id: "item_unknown_legacy_profile".to_owned(),
+                text: "unknown profiles must remain errors".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_003_000,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            "thread_unknown_legacy_profile",
+            "turn_unknown_legacy_profile",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            "genuinely_unknown_profile",
+        )
+        .await;
+
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect_err("unknown profile must keep repair failed");
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("main marker should remain readable")
+        );
+        let repair_meta = find_projection_meta(
+            &crud_store.database_connection(),
+            legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+                .expect("repair key")
+                .as_str(),
+        )
+        .await
+        .expect("repair marker query")
+        .expect("failed repair marker should exist");
+        assert_eq!(repair_meta.status, PROJECTION_META_STATUS_FAILED);
+        assert!(
+            repair_meta
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown variant"))
+        );
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("failed repair status should resolve"),
+            GatewayThreadEpisodicVectorRefillStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_records_first_provider_resolution_failure_and_recovers() {
+        assert_legacy_repair_first_provider_resolution_failure(
+            FirstProviderResolution::Error,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_replaces_stale_running_status_when_first_resolve_fails() {
+        assert_legacy_repair_first_provider_resolution_failure(
+            FirstProviderResolution::Error,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_rejects_missing_and_mismatched_first_provider() {
+        assert_legacy_repair_first_provider_resolution_failure(
+            FirstProviderResolution::None,
+            false,
+        )
+        .await;
+        assert_legacy_repair_first_provider_resolution_failure(
+            FirstProviderResolution::MismatchedIdentity,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn completed_or_unneeded_legacy_repair_does_not_resolve_provider_or_create_failure() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("provider target");
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("baseline vector projection should complete");
+        let resolver = Arc::new(RecoveringThreadEpisodicEmbeddingProviderResolver::new(
+            FirstProviderResolution::Error,
+            embedding_provider.clone(),
+        ));
+
+        let unneeded = refill_once_with_projection_resolver(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(resolver.clone()),
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await
+        .expect("current projection without affected threads should skip");
+        assert!(unneeded.skipped);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            find_projection_meta(
+                &crud_store.database_connection(),
+                legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+                    .expect("repair key")
+                    .as_str(),
+            )
+            .await
+            .expect("unneeded repair marker query")
+            .is_none()
+        );
+
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_completed_repair_provider_skip",
+            "turn_completed_repair_provider_skip",
+            TurnItem::UserMessage {
+                id: "item_completed_repair_provider_skip".to_owned(),
+                text: "completed repair does not resolve provider".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_007_100,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            "thread_completed_repair_provider_skip",
+            "turn_completed_repair_provider_skip",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            "cli_runtime_codex",
+        )
+        .await;
+        mark_legacy_codex_history_repair(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_COMPLETE,
+            1,
+            None,
+        )
+        .await
+        .expect("completed repair marker should persist");
+        let completed = refill_once_with_projection_resolver(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target,
+            Some(resolver.clone()),
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await
+        .expect("completed repair should skip before provider resolution");
+        assert!(completed.skipped);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_requeues_only_interrupted_running_jobs() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only();
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+        )
+        .await
+        .expect("baseline projection should complete");
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_interrupted_legacy_repair",
+            "turn_interrupted_legacy_repair",
+            TurnItem::UserMessage {
+                id: "item_interrupted_legacy_repair".to_owned(),
+                text: "interrupted repair resumes durably".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_004_000,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            "thread_interrupted_legacy_repair",
+            "turn_interrupted_legacy_repair",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            "cli_runtime_codex",
+        )
+        .await;
+        let repair_threads =
+            legacy_codex_history_repair_threads(crud_store.as_ref(), workspace_id.as_str())
+                .await
+                .expect("repair threads should resolve");
+        mark_legacy_codex_history_repair(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_BACKFILLING,
+            repair_threads.len(),
+            None,
+        )
+        .await
+        .expect("unfinished repair marker should persist");
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("unfinished repair status should resolve"),
+            GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        prepare_legacy_codex_history_repair(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            repair_threads,
+            None,
+        )
+        .await
+        .expect("first repair preparation should create a job");
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                chrono::Utc::now().timestamp().saturating_add(1),
+                10,
+            )
+            .await
+            .expect("repair job should be claimed before interruption");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, ThreadEpisodicIndexJobStatus::Running);
+        let restart_cutoff = claimed[0].updated_at.timestamp();
+
+        let summary = refill_once_with_projection_resolver_and_config(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            None,
+            None,
+            ThreadEpisodicIndexExecutorConfig::default(),
+            Some(restart_cutoff),
+        )
+        .await
+        .expect("restart should resume interrupted additive repair");
+        assert_eq!(summary.interrupted_jobs_requeued, 1);
+        assert_eq!(summary.completed_jobs, 1);
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(
+                workspace_id.as_str(),
+                "thread_interrupted_legacy_repair",
+                10,
+            )
+            .await
+            .expect("restarted repair jobs should list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
+        assert!(
+            legacy_codex_history_repair_is_complete(crud_store.as_ref(), workspace_id.as_str(),)
+                .await
+                .expect("repair completion marker should resolve")
+        );
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("completed restart status"),
+            GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_does_not_requeue_live_running_job() {
+        let (crud_store, _temp_dir, workspace_id) = setup_store().await;
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_live_legacy_repair",
+            "turn_live_legacy_repair",
+            TurnItem::UserMessage {
+                id: "item_live_legacy_repair".to_owned(),
+                text: "live executor claim remains owned".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_005_000,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            "thread_live_legacy_repair",
+            "turn_live_legacy_repair",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            "cli_runtime_codex",
+        )
+        .await;
+        let repair_threads =
+            legacy_codex_history_repair_threads(crud_store.as_ref(), workspace_id.as_str())
+                .await
+                .expect("live repair threads should resolve");
+        prepare_legacy_codex_history_repair(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            repair_threads.clone(),
+            None,
+        )
+        .await
+        .expect("live repair preparation should create a job");
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                chrono::Utc::now().timestamp().saturating_add(2),
+                10,
+            )
+            .await
+            .expect("live repair job should claim");
+        assert_eq!(claimed.len(), 1);
+        let live_claimed_at = claimed[0].updated_at.timestamp();
+
+        let summary = prepare_legacy_codex_history_repair(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            repair_threads,
+            Some(live_claimed_at.saturating_sub(1)),
+        )
+        .await
+        .expect("live claim preparation should remain restart-safe");
+        assert_eq!(summary.interrupted_jobs_requeued, 0);
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(
+                workspace_id.as_str(),
+                "thread_live_legacy_repair",
+                10,
+            )
+            .await
+            .expect("live repair jobs should list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(jobs[0].attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_history_repair_does_not_run_when_indexing_is_disabled() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_disabled_legacy_repair",
+            "turn_disabled_legacy_repair",
+            TurnItem::UserMessage {
+                id: "item_disabled_legacy_repair".to_owned(),
+                text: "disabled indexing remains disabled".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_004_000,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            "thread_disabled_legacy_repair",
+            "turn_disabled_legacy_repair",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            "cli_runtime_codex",
+        )
+        .await;
+
+        run_workspace(
+            crud_store.clone(),
+            false,
+            temp_dir.path().to_path_buf(),
+            workspace_id.clone(),
+            GatewayThreadEpisodicVectorSearchConfig::default(),
+            GatewayThreadEpisodicVectorSearchConfig::default(),
+            BTreeMap::new(),
+            Arc::new(ProviderRegistry::new(|_| String::new())),
+            temp_dir.path().join("runtime"),
+            None,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            crud_store
+                .list_thread_episodic_items_for_thread(
+                    workspace_id.as_str(),
+                    "thread_disabled_legacy_repair",
+                    10,
+                )
+                .await
+                .expect("disabled repair item query")
+                .is_empty()
+        );
+        assert!(
+            find_projection_meta(
+                &crud_store.database_connection(),
+                legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+                    .expect("repair key")
+                    .as_str(),
+            )
+            .await
+            .expect("disabled repair marker query")
+            .is_none()
+        );
     }
 
     async fn setup_concurrent_store() -> (Arc<CrudStore>, TempDir, String) {
@@ -6028,6 +8622,342 @@ mod tests {
             temp_dir,
             workspace_id,
         )
+    }
+
+    async fn mark_existing_refill_failed(crud_store: &CrudStore, workspace_id: &str) {
+        let projection_key = refill_projection_key_for_workspace(workspace_id)
+            .expect("workspace refill key should build");
+        assert!(
+            update_projection_meta_status(
+                &crud_store.database_connection(),
+                projection_key.as_str(),
+                PROJECTION_META_STATUS_FAILED,
+                Some("injected interruption after durable refill state"),
+                now_datetime(),
+            )
+            .await
+            .expect("existing refill marker status should update"),
+            "existing refill marker should remain available for resume"
+        );
+    }
+
+    async fn setup_store() -> (Arc<CrudStore>, TempDir, String) {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect sqlite memory");
+        Migrator::up(&connection, None)
+            .await
+            .expect("migrations must succeed");
+        bootstrap(&connection)
+            .await
+            .expect("gateway bootstrap should create default workspace");
+        let workspace_manager = WorkspaceManager::new(connection.clone());
+        let workspace_id = workspace_manager
+            .list_workspaces()
+            .await
+            .expect("workspace list should succeed")
+            .into_iter()
+            .find(|workspace| workspace.is_active && workspace.is_current)
+            .expect("current workspace should exist")
+            .id;
+        (
+            Arc::new(CrudStore::new(connection)),
+            TempDir::new().expect("temp dir"),
+            workspace_id,
+        )
+    }
+
+    async fn assert_legacy_repair_first_provider_resolution_failure(
+        first: FirstProviderResolution,
+        preexisting_backfilling_marker: bool,
+    ) {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+            0.1, 0.2, 0.3,
+        ]));
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("provider target");
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_first_resolve_healthy",
+            "turn_first_resolve_healthy",
+            "item_first_resolve_healthy",
+            "healthy frame survives first resolver failure",
+        )
+        .await;
+        refill_once_with_workspace_projection(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(embedding_provider.clone()),
+        )
+        .await
+        .expect("healthy vector baseline should complete");
+        let healthy = crud_store
+            .list_thread_episodic_items_for_thread(
+                workspace_id.as_str(),
+                "thread_first_resolve_healthy",
+                10,
+            )
+            .await
+            .expect("healthy item list")
+            .remove(0);
+
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_first_resolve_repair",
+            "turn_first_resolve_repair",
+            TurnItem::UserMessage {
+                id: "item_first_resolve_repair".to_owned(),
+                text: "provider recovery repairs this payload".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_007_000,
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            "thread_first_resolve_repair",
+            "turn_first_resolve_repair",
+            LEGACY_CODEX_HISTORY_EVENT_IDS[0],
+            "cli_runtime_codex",
+        )
+        .await;
+        if preexisting_backfilling_marker {
+            mark_legacy_codex_history_repair(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                PROJECTION_META_STATUS_BACKFILLING,
+                1,
+                None,
+            )
+            .await
+            .expect("stale running repair marker should persist");
+        }
+
+        let resolver = Arc::new(RecoveringThreadEpisodicEmbeddingProviderResolver::new(
+            first,
+            embedding_provider.clone(),
+        ));
+        let (status_sender, mut status_receiver) = tokio::sync::broadcast::channel(8);
+        refill_once_with_projection_resolver(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(resolver.clone()),
+            Some(&status_sender),
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await
+        .expect_err("first provider resolution must fail the necessary repair");
+        assert_eq!(
+            status_receiver
+                .try_recv()
+                .expect("repair should publish Running before provider resolution")
+                .status,
+            GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(
+            status_receiver
+                .try_recv()
+                .expect("repair should publish Failed after provider resolution")
+                .status,
+            GatewayThreadEpisodicVectorRefillStatus::Failed
+        );
+        let repair_meta = find_projection_meta(
+            &crud_store.database_connection(),
+            legacy_codex_history_repair_key_for_workspace(workspace_id.as_str())
+                .expect("repair key")
+                .as_str(),
+        )
+        .await
+        .expect("repair marker query")
+        .expect("failed repair marker should exist");
+        assert_eq!(repair_meta.status, PROJECTION_META_STATUS_FAILED);
+        assert!(repair_meta.last_error.is_some());
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("failed provider repair status"),
+            GatewayThreadEpisodicVectorRefillStatus::Failed
+        );
+        assert!(
+            refill_is_current_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("main marker should remain complete")
+        );
+        assert_eq!(
+            crud_store
+                .find_thread_episodic_item(healthy.id.as_str())
+                .await
+                .expect("healthy item lookup")
+                .expect("healthy item should remain")
+                .frame_uri,
+            healthy.frame_uri
+        );
+
+        let resumed = refill_once_with_projection_resolver(
+            crud_store.clone(),
+            temp_dir.path(),
+            workspace_id.as_str(),
+            target.clone(),
+            Some(resolver),
+            None,
+            Some(chrono::Utc::now().timestamp()),
+        )
+        .await
+        .expect("restored provider should complete the repair");
+        assert_eq!(resumed.completed_jobs, 1);
+        assert_eq!(
+            refill_status_for_workspace_target(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                &target,
+            )
+            .await
+            .expect("recovered provider repair status"),
+            GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+    }
+
+    async fn assert_preserved_suppressed_repair_job(
+        crud_store: &CrudStore,
+        item: &pioneer_crud::ThreadEpisodicItemRecord,
+        deleted: bool,
+    ) -> pioneer_crud::ThreadEpisodicIndexJobRecord {
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(
+                item.workspace_id.as_str(),
+                item.thread_id.as_str(),
+                10,
+            )
+            .await
+            .expect("suppressed repair jobs should list");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "repair must retain exactly the original lifecycle job"
+        );
+        let job = jobs.into_iter().next().expect("durable lifecycle job");
+        assert_eq!(job.index_item_id, item.id);
+        assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(
+            job.attempt_count, 0,
+            "suppressed jobs must never reach a worker"
+        );
+        assert_eq!(
+            job.last_error.as_deref(),
+            Some(if deleted {
+                pioneer_crud::THREAD_EPISODIC_USER_DELETED_ERROR
+            } else {
+                pioneer_crud::THREAD_EPISODIC_USER_EXCLUDED_ERROR
+            })
+        );
+        job
+    }
+
+    async fn seed_canceled_legacy_repair_item(
+        crud_store: Arc<CrudStore>,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        event_id: &str,
+        suppression: DurableRepairSuppression,
+    ) -> pioneer_crud::ThreadEpisodicItemRecord {
+        let text = format!("durable canceled repair payload {item_id}");
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            text.as_str(),
+        )
+        .await;
+        attach_prompt_profile_history_event(
+            crud_store.as_ref(),
+            thread_id,
+            turn_id,
+            event_id,
+            "cli_runtime_codex",
+        )
+        .await;
+        let item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id, thread_id, 10)
+            .await
+            .expect("canceled repair item should list")
+            .remove(0);
+        let job = crud_store
+            .find_thread_episodic_index_job_by_item(item.id.as_str())
+            .await
+            .expect("canceled repair job lookup")
+            .expect("ingestion should create canceled repair job");
+        crud_store
+            .cancel_thread_episodic_index_job(
+                job.id.as_str(),
+                Some("genuine terminal fixture".to_owned()),
+                1_700_008_000,
+            )
+            .await
+            .expect("canceled repair job should persist")
+            .expect("canceled repair job should remain present");
+        match suppression {
+            DurableRepairSuppression::Exclusion => {
+                crud_store
+                    .exclude_thread_episodic_item(
+                        NewThreadEpisodicExclusionRecord {
+                            id: None,
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            index_item_id: item.id.clone(),
+                            reason: ThreadEpisodicExclusionReason::UserRequested,
+                            created_by: "test".to_owned(),
+                        },
+                        1_700_008_001,
+                    )
+                    .await
+                    .expect("canceled repair exclusion should persist");
+            }
+            DurableRepairSuppression::Deleted => {
+                crud_store
+                    .tombstone_thread_episodic_items_for_item(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        1_700_008_001,
+                    )
+                    .await
+                    .expect("canceled repair tombstone should persist");
+            }
+            DurableRepairSuppression::None => {}
+        }
+        // Persist the pre-reconciliation legacy outcome after the modern user APIs.
+        crud_store
+            .cancel_thread_episodic_index_job(
+                job.id.as_str(),
+                Some("genuine terminal fixture".to_owned()),
+                1_700_008_002,
+            )
+            .await
+            .expect("legacy cancellation should persist")
+            .expect("legacy canceled job should remain");
+        item
     }
 
     async fn mark_refill_marker(crud_store: &CrudStore, status: &str, version: i64) {
@@ -6104,23 +9034,6 @@ mod tests {
         .expect("marker should upsert");
     }
 
-    async fn mark_existing_refill_failed(crud_store: &CrudStore, workspace_id: &str) {
-        let projection_key = refill_projection_key_for_workspace(workspace_id)
-            .expect("workspace refill key should build");
-        assert!(
-            update_projection_meta_status(
-                &crud_store.database_connection(),
-                projection_key.as_str(),
-                PROJECTION_META_STATUS_FAILED,
-                Some("injected interruption after durable refill state"),
-                now_datetime(),
-            )
-            .await
-            .expect("existing refill marker status should update"),
-            "existing refill marker should remain available for resume"
-        );
-    }
-
     fn assert_manual_smoke_path_is_not_production(path: &Path, label: &str) {
         if std::env::var_os("PIONEER_THREAD_EPISODIC_VECTOR_REFILL_SMOKE_ALLOW_ANY_PATH").is_some()
         {
@@ -6157,6 +9070,110 @@ mod tests {
             embedding_normalized: true,
             use_search_instructions: false,
         }
+    }
+
+    async fn attach_prompt_profile_history_event(
+        crud_store: &CrudStore,
+        thread_id: &str,
+        turn_id: &str,
+        event_id: &str,
+        profile: &str,
+    ) {
+        let started = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::ThreadId.eq(thread_id.to_owned()))
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .filter(
+                pioneer_entity::turn_event::Column::EventType
+                    .eq(pioneer_protocol::constants::events::TURN_STARTED),
+            )
+            .one(&crud_store.database_connection())
+            .await
+            .expect("turn-start event lookup should succeed")
+            .expect("turn-start event should exist");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(started.payload.as_str()).expect("turn-start payload JSON");
+        payload["payload"]["turn"]["prompt_manifest"] = serde_json::json!({
+            "compiler_version": "legacy-fixture",
+            "profile": profile,
+            "section_ids": [],
+            "fingerprint_stable": "stable",
+            "fingerprint_dynamic": "dynamic",
+            "fingerprint_full": "full",
+            "diagnostics": [],
+            "hook_sources": []
+        });
+        let payload = serde_json::to_string(&payload).expect("history fixture should serialize");
+        assert!(payload.contains(profile));
+        pioneer_entity::turn_event::Entity::insert(pioneer_entity::turn_event::ActiveModel {
+            id: Set(event_id.to_owned()),
+            thread_id: Set(thread_id.to_owned()),
+            turn_id: Set(turn_id.to_owned()),
+            sequence: Set(started.sequence + 2),
+            event_type: Set(pioneer_protocol::constants::events::TURN_STARTED.to_owned()),
+            payload: Set(payload),
+            created_at: Set(fixed_datetime_from_unix(1_700_000_003)),
+            idempotency_key: Set(None),
+        })
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("historical prompt profile event should insert");
+    }
+
+    fn expected_source_text_hash(text: &str) -> String {
+        hex::encode(Sha256::digest(text.trim().as_bytes()))
+    }
+
+    async fn assert_capsule_contains_payload(
+        crud_store: &CrudStore,
+        item: &pioneer_crud::ThreadEpisodicItemRecord,
+        expected_text: &str,
+    ) {
+        let capsule_id = item
+            .capsule_id
+            .as_deref()
+            .expect("indexed item should carry capsule id");
+        let capsule = crud_store
+            .find_thread_episodic_capsule(capsule_id)
+            .await
+            .expect("capsule lookup should succeed")
+            .expect("indexed capsule should exist");
+        let output = MemvidThreadEpisodicBackend::new()
+            .search(ThreadEpisodicMemvidSearchRequest {
+                workspace_id: item.workspace_id.clone(),
+                thread_id: item.thread_id.clone(),
+                query: expected_text.to_owned(),
+                scope: None,
+                profile: ThreadEpisodicSearchProfile::for_kind(
+                    ThreadEpisodicSearchProfileKind::ExactReference,
+                ),
+                segments: vec![ThreadEpisodicMemvidSearchSegment {
+                    capsule_id: capsule.id,
+                    capsule_ref: capsule.capsule_ref,
+                    storage_uri: capsule.storage_uri,
+                    segment_index: capsule.segment_index,
+                }],
+                exact_source: Some(ThreadEpisodicExactSourceTarget {
+                    turn_id: Some(item.turn_id.clone()),
+                    item_id: Some(item.item_id.clone()),
+                    index_item_id: Some(item.id.clone()),
+                }),
+            })
+            .await
+            .expect("capsule payload should be searchable");
+        let hit = output
+            .hits
+            .iter()
+            .find(|hit| hit.hit.index_item_id == item.id)
+            .expect("capsule should contain the repaired item");
+        let rendered_metadata = hit
+            .hit
+            .text
+            .strip_prefix(expected_text)
+            .expect("capsule document should start with the canonical source payload");
+        assert!(
+            rendered_metadata.starts_with("\ntitle: "),
+            "capsule source payload should be followed by rendered frame metadata"
+        );
     }
 
     async fn ingest_materialized_user_item(

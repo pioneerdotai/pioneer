@@ -7778,6 +7778,7 @@ impl MessageProcessor {
                 );
             if changes.thread_episodic_vector_projection_changed
                 && thread_episodic_settings.enabled
+                && thread_episodic_settings.indexing_enabled
                 && vector_refill_startable
             {
                 if let Some(workspace_id) = changes
@@ -7792,6 +7793,8 @@ impl MessageProcessor {
                         );
                     crate::database::startup::spawn_thread_episodic_workspace_capsule_refill_for_workspace(
                         self.crud_store.clone(),
+                        workspace_thread_episodic_settings.enabled
+                            && workspace_thread_episodic_settings.indexing_enabled,
                         self.thread_episodic_storage_root.clone(),
                         workspace_id.to_owned(),
                         workspace_thread_episodic_settings.vector_search,
@@ -7807,6 +7810,8 @@ impl MessageProcessor {
                 } else {
                     crate::database::startup::spawn_thread_episodic_workspace_capsule_refill(
                         self.crud_store.clone(),
+                        thread_episodic_settings.enabled
+                            && thread_episodic_settings.indexing_enabled,
                         self.thread_episodic_storage_root.clone(),
                         thread_episodic_settings.vector_search.clone(),
                         workspace_vector_search_configs,

@@ -5173,7 +5173,7 @@ mod tests {
         ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot,
         ToolOutputSummary, ToolStoragePayload, Turn, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
-    use sea_orm::{Database, EntityTrait};
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement};
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -11813,6 +11813,155 @@ mod tests {
                 .all(|capsule| capsule.capacity_exceeded_at.is_none()
                     && capsule.write_state != ThreadEpisodicCapsuleWriteState::Full)
         );
+    }
+
+    #[tokio::test]
+    async fn index_executor_preserves_suppressed_claims_after_legacy_repair_merge() {
+        for deleted in [false, true] {
+            let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+            let thread_id = "thread_legacy_suppressed_claim";
+            let turn_id = "turn_legacy_suppressed_claim";
+            let item_id = "item_legacy_suppressed_claim";
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                TurnItem::UserMessage {
+                    id: item_id.to_owned(),
+                    text: "suppressed source stays private".to_owned(),
+                    attachments: Vec::new(),
+                },
+                1_700_070_000,
+            )
+            .await;
+            StoreThreadEpisodicIngestor::new(crud_store.clone())
+                .reconcile_canonical_source_occurrence(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    1_700_070_001,
+                )
+                .await
+                .expect("canonical projection should enqueue");
+            let claim = crud_store
+                .claim_due_thread_episodic_index_jobs_for_workspace(
+                    workspace_id.as_str(),
+                    1_700_070_002,
+                    1,
+                )
+                .await
+                .expect("job should claim")
+                .pop()
+                .expect("claimed job");
+            if deleted {
+                crud_store
+                    .tombstone_thread_episodic_items_for_item(
+                        workspace_id.as_str(),
+                        thread_id,
+                        turn_id,
+                        item_id,
+                        1_700_070_003,
+                    )
+                    .await
+                    .expect("user deletion should cancel the claim");
+            } else {
+                crud_store
+                    .exclude_thread_episodic_item(
+                        NewThreadEpisodicExclusionRecord {
+                            id: None,
+                            workspace_id: workspace_id.clone(),
+                            thread_id: thread_id.to_owned(),
+                            index_item_id: claim.index_item_id.clone(),
+                            reason: ThreadEpisodicExclusionReason::UserRequested,
+                            created_by: "test".to_owned(),
+                        },
+                        1_700_070_003,
+                    )
+                    .await
+                    .expect("user exclusion should cancel the claim");
+            }
+            let before_job = crud_store
+                .find_thread_episodic_index_job(claim.id.as_str())
+                .await
+                .expect("job lookup")
+                .expect("cancellation remains durable");
+            let before_item = crud_store
+                .find_thread_episodic_item(claim.index_item_id.as_str())
+                .await
+                .expect("item lookup")
+                .expect("suppressed item remains durable");
+            crud_store.database_connection().execute_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "CREATE TRIGGER forbid_suppressed_job_deletion BEFORE DELETE ON thread_episodic_index_jobs BEGIN SELECT RAISE(FAIL, 'durable user outcome must not be deleted'); END".to_owned(),
+            )).await.expect("deletion guard should install");
+            let temp_dir = TempDir::new().expect("temp dir");
+            let base_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider> =
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    crud_store.clone(),
+                    thread_episodic_storage_uri_from_path(temp_dir.path()),
+                ));
+            let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
+                0.1, 0.2, 0.3,
+            ]));
+            let payload_provider = Arc::new(VectorThreadEpisodicIndexPayloadProvider::new(
+                base_provider,
+                embedding_provider.clone(),
+            ));
+            let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+            let executor = ThreadEpisodicIndexExecutor::new(
+                crud_store.clone(),
+                backend.clone(),
+                payload_provider,
+            );
+            let outcome = executor
+                .process_claimed_job(
+                    claim.clone(),
+                    1_700_070_004,
+                    ThreadEpisodicIndexExecutorConfig::default(),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                ThreadEpisodicIndexJobProcessOutcome::StaleAttempt
+            ));
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_index_job(claim.id.as_str())
+                    .await
+                    .expect("durable job lookup")
+                    .expect("job must remain"),
+                before_job
+            );
+            assert_eq!(
+                crud_store
+                    .find_thread_episodic_item(claim.index_item_id.as_str())
+                    .await
+                    .expect("durable item lookup")
+                    .expect("item must remain"),
+                before_item
+            );
+            assert_eq!(before_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+            assert_eq!(
+                before_job.last_error.as_deref(),
+                Some(if deleted {
+                    THREAD_EPISODIC_USER_DELETED_ERROR
+                } else {
+                    THREAD_EPISODIC_USER_EXCLUDED_ERROR
+                })
+            );
+            assert_eq!(
+                executor
+                    .run_once(1_700_070_100)
+                    .await
+                    .expect("subsequent scan")
+                    .claimed,
+                0
+            );
+            assert_eq!(embedding_provider.calls(), 0);
+            assert!(backend.requests().await.is_empty());
+        }
     }
 
     #[tokio::test]

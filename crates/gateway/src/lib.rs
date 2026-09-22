@@ -824,6 +824,8 @@ async fn run_gateway_until_shutdown_inner(
     let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
+    let startup_thread_episodic_indexing_enabled =
+        config.gateway.thread_episodic.enabled && config.gateway.thread_episodic.indexing_enabled;
     let telemetry_shutdown_timeout =
         Duration::from_millis(config.gateway.telemetry.export_timeout_ms);
     services_prepare_stage.succeed();
@@ -1032,6 +1034,7 @@ async fn run_gateway_until_shutdown_inner(
                         _ = cancellation.cancelled() => return,
                         result = database::startup::run(
                             post_crud_store.clone(),
+                            startup_thread_episodic_indexing_enabled,
                             post_thread_episodic_storage_root,
                             startup_thread_episodic_vector_search_config,
                             post_workspace_vector_search_configs,

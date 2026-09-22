@@ -278,6 +278,7 @@ impl Drop for ThreadEpisodicWorkspaceRefillLease {
 
 pub(crate) async fn run(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -295,6 +296,7 @@ pub(crate) async fn run(
             cancellation,
             run_inner(
                 crud_store,
+                thread_episodic_indexing_enabled,
                 thread_episodic_storage_root,
                 thread_episodic_vector_search_config,
                 thread_episodic_workspace_vector_search_configs,
@@ -309,6 +311,7 @@ pub(crate) async fn run(
 
 async fn run_inner(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -373,6 +376,7 @@ async fn run_inner(
     let refill_cancellation = maintenance_cancellation();
     run_thread_episodic_workspace_capsule_refill(
         crud_store,
+        thread_episodic_indexing_enabled,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
         thread_episodic_workspace_vector_search_configs,
@@ -402,6 +406,7 @@ async fn run_inner(
 
 pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -418,6 +423,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
         .spawn_global_settings_refill(move |cancellation| async move {
             run_thread_episodic_workspace_capsule_refill(
                 crud_store,
+                thread_episodic_indexing_enabled,
                 thread_episodic_storage_root,
                 thread_episodic_vector_search_config,
                 thread_episodic_workspace_vector_search_configs,
@@ -436,6 +442,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
 
 pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -460,6 +467,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace
         let _refill_lease = refill_lease;
         run_thread_episodic_workspace_capsule_refill_for_workspace(
             crud_store,
+            thread_episodic_indexing_enabled,
             thread_episodic_storage_root,
             workspace_id,
             workspace_vector_search_config,
@@ -476,6 +484,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace
 
 async fn run_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -492,6 +501,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
 ) {
     thread_episodic_workspace_capsule_refill::run(
         crud_store,
+        thread_episodic_indexing_enabled,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
         thread_episodic_workspace_vector_search_configs,
@@ -508,6 +518,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
 
 async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -523,6 +534,7 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
 ) {
     thread_episodic_workspace_capsule_refill::run_workspace(
         crud_store,
+        thread_episodic_indexing_enabled,
         thread_episodic_storage_root,
         workspace_id,
         workspace_vector_search_config,

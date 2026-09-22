@@ -2353,6 +2353,7 @@ pub enum PromptManifestProfile {
     AssistantFull,
     AssistantMinimal,
     AssistantNone,
+    #[serde(alias = "cli_runtime_codex")]
     CliRuntime,
 }
 
@@ -4782,6 +4783,41 @@ pub struct ContextCompressedNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prompt_manifest_profile_accepts_legacy_cli_runtime_codex_but_serializes_canonically() {
+        let legacy: PromptManifestProfile = serde_json::from_value(json!("cli_runtime_codex"))
+            .expect("legacy Codex CLI profile should deserialize");
+        let current: PromptManifestProfile = serde_json::from_value(json!("cli_runtime"))
+            .expect("current CLI profile should deserialize");
+
+        assert_eq!(legacy, PromptManifestProfile::CliRuntime);
+        assert_eq!(current, PromptManifestProfile::CliRuntime);
+        assert_eq!(
+            serde_json::to_value(legacy).expect("CLI profile should serialize"),
+            json!("cli_runtime")
+        );
+
+        for (wire, profile) in [
+            ("assistant_full", PromptManifestProfile::AssistantFull),
+            ("assistant_minimal", PromptManifestProfile::AssistantMinimal),
+            ("assistant_none", PromptManifestProfile::AssistantNone),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<PromptManifestProfile>(json!(wire))
+                    .expect("supported assistant profile should deserialize"),
+                profile
+            );
+            assert_eq!(
+                serde_json::to_value(profile).expect("assistant profile should serialize"),
+                json!(wire)
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<PromptManifestProfile>(json!("cli_runtime_unknown")).is_err()
+        );
+    }
 
     #[test]
     fn turn_permission_mode_uses_snake_case_wire_values() {
