@@ -99,6 +99,9 @@ pub(crate) struct IdentityAuthorizationStore {
     pub(crate) settings_request: u64,
     pub(crate) settings_notifications: [u64; 3],
     pub(crate) settings_request_notifications: [u64; 3],
+    // Replayed onto a response only while its workspace has no loaded snapshot yet.
+    pub(crate) settings_request_vector_refill_notifications:
+        Vec<pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification>,
     pub(crate) settings_request_connection: Option<u64>,
     pub(crate) settings_request_workspace: Option<String>,
 }
@@ -176,6 +179,7 @@ impl IdentityAuthorizationStore {
             .settings_request
             .checked_add(1)
             .expect("settings generation exhausted");
+        self.settings_request_vector_refill_notifications.clear();
         self.settings = super::settings_store::GatewaySettingsStore::default();
     }
 }
