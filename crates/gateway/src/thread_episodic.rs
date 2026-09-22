@@ -9,19 +9,20 @@ use pioneer_config::{
 use pioneer_crud::{
     CrudStore, NewThreadEpisodicEmbeddingArtifactRecord, NewThreadEpisodicExclusionRecord,
     NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
-    NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
-    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, ThreadEpisodicCapsuleCapacityUpdate,
-    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
-    ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
-    ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobCompletionUpdate,
-    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
-    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
-    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicRepairStatus,
+    NewThreadEpisodicRecallEventRecord, THREAD_EPISODIC_USER_DELETED_ERROR,
+    THREAD_EPISODIC_USER_EXCLUDED_ERROR, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus,
+    ThreadEpisodicCapsuleWriteState, ThreadEpisodicExclusionReason, ThreadEpisodicExclusionRecord,
+    ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexAttemptOutcome,
+    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
+    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
+    ThreadEpisodicItemRecord, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
+    ThreadEpisodicRepairStatus,
     ThreadEpisodicSourceActorRole as StoreThreadEpisodicSourceActorRole,
-    ThreadEpisodicSourceRuntimeKind, ThreadEpisodicThreadDirectoryRecord,
-    ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, thread_episodic_item_uri,
-    thread_episodic_thread_uri_prefix,
+    ThreadEpisodicSourceReconcileOutcome, ThreadEpisodicSourceRuntimeKind,
+    ThreadEpisodicThreadDirectoryRecord, ThreadEpisodicThreadDirectoryStatus,
+    ThreadEpisodicThreadDirectoryVisibility, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
+    thread_episodic_item_uri, thread_episodic_thread_uri_prefix,
 };
 use pioneer_memory::{
     ThreadEpisodicEmbeddingError, ThreadEpisodicEmbeddingProvider,
@@ -52,8 +53,6 @@ use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 
 const THREAD_EPISODIC_INDEX_ERROR_MAX_CHARS: usize = 512;
-const THREAD_EPISODIC_GRAPH_ENRICHMENT_DISABLED_REASON: &str =
-    "thread_episodic_graph_enrichment_not_supported";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicCommittedItem {
@@ -281,18 +280,21 @@ pub(crate) struct ThreadEpisodicResolvedIndexRequest {
     pub request: ThreadEpisodicMemvidIndexRequest,
     pub segment_index: i64,
     pub embedding_artifact_id: Option<String>,
+    pub source_payload: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadEpisodicIndexResolutionFailureKind {
     Retryable,
     NonRetryable,
+    SourceChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ThreadEpisodicIndexResolutionError {
     pub kind: ThreadEpisodicIndexResolutionFailureKind,
     pub message: String,
+    pub source_payload: Option<String>,
 }
 
 impl ThreadEpisodicIndexResolutionError {
@@ -300,6 +302,7 @@ impl ThreadEpisodicIndexResolutionError {
         Self {
             kind: ThreadEpisodicIndexResolutionFailureKind::Retryable,
             message: message.into(),
+            source_payload: None,
         }
     }
 
@@ -307,7 +310,21 @@ impl ThreadEpisodicIndexResolutionError {
         Self {
             kind: ThreadEpisodicIndexResolutionFailureKind::NonRetryable,
             message: message.into(),
+            source_payload: None,
         }
+    }
+
+    pub(crate) fn source_changed(message: impl Into<String>) -> Self {
+        Self {
+            kind: ThreadEpisodicIndexResolutionFailureKind::SourceChanged,
+            message: message.into(),
+            source_payload: None,
+        }
+    }
+
+    fn with_source_payload(mut self, source_payload: &str) -> Self {
+        self.source_payload = Some(source_payload.to_owned());
+        self
     }
 }
 
@@ -740,7 +757,9 @@ impl ThreadEpisodicIndexPayloadProvider for VectorThreadEpisodicIndexPayloadProv
     ) -> std::result::Result<ThreadEpisodicResolvedIndexRequest, ThreadEpisodicIndexResolutionError>
     {
         let mut resolved = self.inner.resolve_index_request(job).await?;
-        attach_embedding_to_resolved_request(&mut resolved, self.embedding_provider.as_ref())?;
+        let source_payload = resolved.source_payload.clone();
+        attach_embedding_to_resolved_request(&mut resolved, self.embedding_provider.as_ref())
+            .map_err(|error| error.with_source_payload(source_payload.as_str()))?;
         Ok(resolved)
     }
 }
@@ -753,10 +772,12 @@ impl ThreadEpisodicIndexPayloadProvider for RuntimeVectorThreadEpisodicIndexPayl
     ) -> std::result::Result<ThreadEpisodicResolvedIndexRequest, ThreadEpisodicIndexResolutionError>
     {
         let mut resolved = self.inner.resolve_index_request(job).await?;
+        let source_payload = resolved.source_payload.clone();
         let Some(embedding_provider) = self
             .embedding_provider_resolver
             .resolve_active_embedding_provider(job.workspace_id.as_str())
-            .await?
+            .await
+            .map_err(|error| error.with_source_payload(source_payload.as_str()))?
         else {
             return Ok(resolved);
         };
@@ -765,7 +786,8 @@ impl ThreadEpisodicIndexPayloadProvider for RuntimeVectorThreadEpisodicIndexPayl
             &mut resolved,
             embedding_provider.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|error| error.with_source_payload(source_payload.as_str()))?;
         Ok(resolved)
     }
 }
@@ -956,6 +978,25 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
                     "thread episodic item missing for index job",
                 )
             })?;
+        if self
+            .crud_store
+            .thread_episodic_source_occurrence_is_excluded(
+                item.workspace_id.as_str(),
+                item.thread_id.as_str(),
+                item.turn_id.as_str(),
+                item.item_id.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                ThreadEpisodicIndexResolutionError::retryable(format!(
+                    "failed to check thread episodic exclusion: {error}"
+                ))
+            })?
+        {
+            return Err(ThreadEpisodicIndexResolutionError::source_changed(
+                "thread episodic item is excluded from indexing",
+            ));
+        }
         if !matches!(
             item.status,
             ThreadEpisodicItemStatus::PendingIndex | ThreadEpisodicItemStatus::Failed
@@ -965,30 +1006,14 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
             ));
         }
 
-        let source_text = match self.resolve_item_source_text(&item).await {
-            Ok(source_text) => source_text,
+        let (source_text, source_payload) = match self.resolve_item_source_text(&item).await {
+            Ok(source) => source,
             Err(error) => {
-                if matches!(
-                    error.kind,
-                    ThreadEpisodicIndexResolutionFailureKind::NonRetryable
-                ) {
-                    let _ = self
-                        .crud_store
-                        .mark_thread_episodic_item_failed(
-                            item.id.as_str(),
-                            chrono::Utc::now().timestamp(),
-                        )
-                        .await;
-                }
                 return Err(error);
             }
         };
         if source_text_hash(source_text.as_str()) != item.source_text_hash {
-            let _ = self
-                .crud_store
-                .mark_thread_episodic_item_failed(item.id.as_str(), chrono::Utc::now().timestamp())
-                .await;
-            return Err(ThreadEpisodicIndexResolutionError::non_retryable(
+            return Err(ThreadEpisodicIndexResolutionError::source_changed(
                 "thread episodic source text hash changed before indexing",
             ));
         }
@@ -1007,6 +1032,7 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
                 ThreadEpisodicIndexResolutionError::retryable(format!(
                     "failed to resolve thread episodic active segment: {error}"
                 ))
+                .with_source_payload(source_payload.as_str())
             })?;
         let frame_uri = thread_episodic_item_uri(
             item.workspace_id.as_str(),
@@ -1019,11 +1045,13 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
             ThreadEpisodicIndexResolutionError::non_retryable(format!(
                 "failed to build thread episodic frame uri: {error}"
             ))
+            .with_source_payload(source_payload.as_str())
         })?;
         let source_context_json = serde_json::to_string(&item.source_context).map_err(|error| {
             ThreadEpisodicIndexResolutionError::non_retryable(format!(
                 "failed to serialize thread episodic source context: {error}"
             ))
+            .with_source_payload(source_payload.as_str())
         })?;
         let request = ThreadEpisodicMemvidIndexRequest {
             storage_uri: capsule.storage_uri,
@@ -1051,6 +1079,7 @@ impl ThreadEpisodicIndexPayloadProvider for StoreThreadEpisodicIndexPayloadProvi
             request,
             segment_index: capsule.segment_index,
             embedding_artifact_id: None,
+            source_payload,
         })
     }
 }
@@ -1059,14 +1088,19 @@ impl StoreThreadEpisodicIndexPayloadProvider {
     async fn resolve_item_source_text(
         &self,
         index_item: &ThreadEpisodicItemRecord,
-    ) -> std::result::Result<String, ThreadEpisodicIndexResolutionError> {
-        let item = self
+    ) -> std::result::Result<(String, String), ThreadEpisodicIndexResolutionError> {
+        let canonical = self
             .crud_store
-            .get_turn_item(index_item.turn_id.as_str(), index_item.item_id.as_str())
+            .get_thread_episodic_canonical_item(
+                index_item.workspace_id.as_str(),
+                index_item.thread_id.as_str(),
+                index_item.turn_id.as_str(),
+                index_item.item_id.as_str(),
+            )
             .await
             .map_err(|error| thread_item_events_resolution_error(error))?
             .ok_or_else(|| {
-                ThreadEpisodicIndexResolutionError::retryable(
+                ThreadEpisodicIndexResolutionError::source_changed(
                     "canonical thread item is missing for thread episodic indexing",
                 )
             })?;
@@ -1075,15 +1109,17 @@ impl StoreThreadEpisodicIndexPayloadProvider {
             thread_id: index_item.thread_id.clone(),
             turn_id: index_item.turn_id.clone(),
             item_id: index_item.item_id.clone(),
-            item_type: item.item_type(),
-            source_actor_role: committed_item_source_actor_role(&item),
-            source_context: committed_item_source_context(&item),
-            item,
+            item_type: canonical.item.item_type(),
+            source_actor_role: committed_item_source_actor_role(&canonical.item),
+            source_context: committed_item_source_context(&canonical.item),
+            item: canonical.item,
         };
         match select_committed_item_source(&committed) {
-            ThreadEpisodicSourceSelection::Indexable(source) => Ok(source.text.trim().to_owned()),
+            ThreadEpisodicSourceSelection::Indexable(source) => {
+                Ok((source.text.trim().to_owned(), canonical.source_payload))
+            }
             ThreadEpisodicSourceSelection::Rejected { reason } => {
-                Err(ThreadEpisodicIndexResolutionError::non_retryable(format!(
+                Err(ThreadEpisodicIndexResolutionError::source_changed(format!(
                     "canonical thread item is no longer indexable: {}",
                     reason.as_str()
                 )))
@@ -2577,7 +2613,7 @@ impl ThreadEpisodicRecallService {
         item: &ThreadEpisodicItemRecord,
     ) -> std::result::Result<String, String> {
         let provider = StoreThreadEpisodicIndexPayloadProvider::new(self.crud_store.clone(), "");
-        let source_text = provider
+        let (source_text, _source_payload) = provider
             .resolve_item_source_text(item)
             .await
             .map_err(|error| error.message)?;
@@ -3099,6 +3135,21 @@ pub(crate) struct ThreadEpisodicIndexExecutor {
     backend: Arc<dyn ThreadEpisodicMemvidBackend>,
     payload_provider: Arc<dyn ThreadEpisodicIndexPayloadProvider>,
     config: StdRwLock<ThreadEpisodicIndexExecutorConfig>,
+    #[cfg(test)]
+    primary_persistence_faults:
+        AsyncMutex<std::collections::VecDeque<ThreadEpisodicPrimaryPersistenceFault>>,
+    #[cfg(test)]
+    fallback_persistence_faults: AsyncMutex<std::collections::VecDeque<String>>,
+    #[cfg(test)]
+    reconciliation_transition_faults: AsyncMutex<std::collections::VecDeque<String>>,
+    #[cfg(test)]
+    targeted_reconciliation_faults: AsyncMutex<std::collections::VecDeque<String>>,
+}
+
+#[cfg(test)]
+struct ThreadEpisodicPrimaryPersistenceFault {
+    message: String,
+    source_update: Option<(pioneer_protocol::ItemUpdatedNotification, i64)>,
 }
 
 impl ThreadEpisodicIndexExecutor {
@@ -3114,6 +3165,123 @@ impl ThreadEpisodicIndexExecutor {
             backend,
             payload_provider,
             config: StdRwLock::new(ThreadEpisodicIndexExecutorConfig::default()),
+            #[cfg(test)]
+            primary_persistence_faults: AsyncMutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            fallback_persistence_faults: AsyncMutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            reconciliation_transition_faults: AsyncMutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            targeted_reconciliation_faults: AsyncMutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    #[cfg(test)]
+    async fn inject_primary_persistence_failure(
+        &self,
+        message: impl Into<String>,
+        source_update: Option<(pioneer_protocol::ItemUpdatedNotification, i64)>,
+    ) {
+        self.primary_persistence_faults.lock().await.push_back(
+            ThreadEpisodicPrimaryPersistenceFault {
+                message: message.into(),
+                source_update,
+            },
+        );
+    }
+
+    async fn take_primary_persistence_failure(&self) -> Option<anyhow::Error> {
+        #[cfg(test)]
+        {
+            let fault = self.primary_persistence_faults.lock().await.pop_front()?;
+            if let Some((update, now_unix)) = fault.source_update {
+                if let Err(error) = self
+                    .crud_store
+                    .materialize_item_snapshot_updated(update, now_unix)
+                    .await
+                {
+                    return Some(anyhow::anyhow!(
+                        "failed to apply injected source update before persistence failure: {error:#}"
+                    ));
+                }
+            }
+            return Some(anyhow::anyhow!(fault.message));
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    async fn inject_fallback_persistence_failure(&self, message: impl Into<String>) {
+        self.fallback_persistence_faults
+            .lock()
+            .await
+            .push_back(message.into());
+    }
+
+    async fn take_fallback_persistence_failure(&self) -> Option<anyhow::Error> {
+        #[cfg(test)]
+        {
+            return self
+                .fallback_persistence_faults
+                .lock()
+                .await
+                .pop_front()
+                .map(anyhow::Error::msg);
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    async fn inject_reconciliation_transition_failure(&self, message: impl Into<String>) {
+        self.reconciliation_transition_faults
+            .lock()
+            .await
+            .push_back(message.into());
+    }
+
+    async fn take_reconciliation_transition_failure(&self) -> Option<anyhow::Error> {
+        #[cfg(test)]
+        {
+            return self
+                .reconciliation_transition_faults
+                .lock()
+                .await
+                .pop_front()
+                .map(anyhow::Error::msg);
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    async fn inject_targeted_reconciliation_failure(&self, message: impl Into<String>) {
+        self.targeted_reconciliation_faults
+            .lock()
+            .await
+            .push_back(message.into());
+    }
+
+    async fn take_targeted_reconciliation_failure(&self) -> Option<anyhow::Error> {
+        #[cfg(test)]
+        {
+            return self
+                .targeted_reconciliation_faults
+                .lock()
+                .await
+                .pop_front()
+                .map(anyhow::Error::msg);
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 
@@ -3239,8 +3407,10 @@ impl ThreadEpisodicIndexExecutor {
             claimed: jobs.len(),
             ..ThreadEpisodicIndexExecutorRunSummary::default()
         };
+        let mut unpersisted_errors = Vec::new();
 
         for job in jobs {
+            let job_id = job.id.clone();
             match self.process_claimed_job(job, now_unix, config).await {
                 ThreadEpisodicIndexJobProcessOutcome::Completed => {
                     summary.completed += 1;
@@ -3251,9 +3421,27 @@ impl ThreadEpisodicIndexExecutor {
                 ThreadEpisodicIndexJobProcessOutcome::TerminalFailure => {
                     summary.failed_terminal += 1;
                 }
+                ThreadEpisodicIndexJobProcessOutcome::StaleAttempt => {}
+                ThreadEpisodicIndexJobProcessOutcome::Requeued => {}
+                ThreadEpisodicIndexJobProcessOutcome::RetryablePersistenceFailure => {
+                    summary.failed_retryable += 1;
+                }
+                ThreadEpisodicIndexJobProcessOutcome::TerminalPersistenceFailure => {
+                    summary.failed_terminal += 1;
+                }
+                ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error) => {
+                    unpersisted_errors.push(format!("job `{job_id}`: {error:#}"));
+                }
             }
         }
 
+        if !unpersisted_errors.is_empty() {
+            anyhow::bail!(
+                "thread episodic executor could not durably finish {} claimed job(s): {}",
+                unpersisted_errors.len(),
+                unpersisted_errors.join("; ")
+            );
+        }
         Ok(summary)
     }
 
@@ -3267,6 +3455,11 @@ impl ThreadEpisodicIndexExecutor {
         let resolved = match self.payload_provider.resolve_index_request(&job).await {
             Ok(resolved) => resolved,
             Err(error) => {
+                if error.kind == ThreadEpisodicIndexResolutionFailureKind::SourceChanged {
+                    return self
+                        .reconcile_and_release_claim(&job, now_unix, config, attempt_started_at)
+                        .await;
+                }
                 return self
                     .record_resolution_failure(&job, error, now_unix, config, attempt_started_at)
                     .await;
@@ -3275,8 +3468,15 @@ impl ThreadEpisodicIndexExecutor {
 
         match self.backend.index_item(resolved.request.clone()).await {
             Ok(output) => {
-                self.complete_successful_index(&job, resolved, output, now_unix, attempt_started_at)
-                    .await
+                self.complete_successful_index(
+                    &job,
+                    resolved,
+                    output,
+                    now_unix,
+                    config,
+                    attempt_started_at,
+                )
+                .await
             }
             Err(error)
                 if matches!(
@@ -3295,8 +3495,15 @@ impl ThreadEpisodicIndexExecutor {
                 .await
             }
             Err(error) => {
-                self.record_backend_failure(&job, error, now_unix, config, attempt_started_at)
-                    .await
+                self.record_backend_failure(
+                    &job,
+                    resolved,
+                    error,
+                    now_unix,
+                    config,
+                    attempt_started_at,
+                )
+                .await
             }
         }
     }
@@ -3307,19 +3514,13 @@ impl ThreadEpisodicIndexExecutor {
         resolved: ThreadEpisodicResolvedIndexRequest,
         output: ThreadEpisodicMemvidIndexOutput,
         now_unix: i64,
+        config: ThreadEpisodicIndexExecutorConfig,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
         let indexed_capsule_id = resolved.request.capsule_id.clone();
+        let source_payload = resolved.source_payload.clone();
         let output_stats = output.stats.clone();
         let frame_uri = output.frame_uri;
-        self.update_capsule_capacity(
-            indexed_capsule_id.as_str(),
-            &output_stats,
-            None,
-            false,
-            now_unix,
-        )
-        .await;
         let item_update = ThreadEpisodicItemIndexedUpdate {
             capsule_id: resolved.request.capsule_id.clone(),
             capsule_ref: resolved.request.capsule_ref.clone(),
@@ -3328,28 +3529,6 @@ impl ThreadEpisodicIndexExecutor {
             frame_uri: frame_uri.clone(),
             embedding_artifact_id: resolved.embedding_artifact_id.clone(),
         };
-        if let Err(error) = self
-            .crud_store
-            .mark_thread_episodic_item_indexed(job.index_item_id.as_str(), item_update, now_unix)
-            .await
-        {
-            tracing::warn!(
-                job_id = %job.id,
-                index_item_id = %job.index_item_id,
-                error = %error,
-                "failed to persist thread episodic item frame mapping"
-            );
-            return self
-                .persist_failure(
-                    job,
-                    false,
-                    false,
-                    Some(format!("failed to persist item frame mapping: {error}")),
-                    now_unix,
-                    attempt_started_at,
-                )
-                .await;
-        }
         let update = ThreadEpisodicIndexJobCompletionUpdate {
             capsule_id: resolved.request.capsule_id,
             capsule_ref: resolved.request.capsule_ref,
@@ -3359,12 +3538,25 @@ impl ThreadEpisodicIndexExecutor {
         };
         match self
             .crud_store
-            .complete_thread_episodic_index_job(job.id.as_str(), update, now_unix)
+            .complete_thread_episodic_index_attempt(
+                job.id.as_str(),
+                job.attempt_count,
+                resolved.source_payload.as_str(),
+                item_update,
+                update,
+                now_unix,
+            )
             .await
         {
-            Ok(_) => {
-                self.refresh_thread_directory_after_index(job, now_unix)
-                    .await;
+            Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
+                self.update_capsule_capacity(
+                    indexed_capsule_id.as_str(),
+                    &output_stats,
+                    None,
+                    false,
+                    now_unix,
+                )
+                .await;
                 self.rotate_capsule_if_near_capacity(
                     indexed_capsule_id.as_str(),
                     &output_stats,
@@ -3373,76 +3565,179 @@ impl ThreadEpisodicIndexExecutor {
                 .await;
                 ThreadEpisodicIndexJobProcessOutcome::Completed
             }
+            Ok(ThreadEpisodicIndexAttemptOutcome::StaleAttempt) => {
+                tracing::debug!(
+                    job_id = %job.id,
+                    attempt_count = job.attempt_count,
+                    "discarded result from an obsolete thread episodic index attempt"
+                );
+                ThreadEpisodicIndexJobProcessOutcome::StaleAttempt
+            }
+            Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged)
+            | Ok(ThreadEpisodicIndexAttemptOutcome::Excluded) => {
+                self.reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
+                    .await
+            }
             Err(error) => {
                 tracing::warn!(
                     job_id = %job.id,
                     error = %error,
                     "failed to complete thread episodic index job after backend success"
                 );
+                let outcome = self
+                    .persist_failure(
+                        job,
+                        job.attempt_count < config.max_attempts,
+                        false,
+                        Some(format!("failed to complete index job: {error}")),
+                        Some(source_payload.as_str()),
+                        now_unix,
+                        attempt_started_at,
+                    )
+                    .await;
+                if matches!(&outcome, ThreadEpisodicIndexJobProcessOutcome::Requeued) {
+                    return self
+                        .reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
+                        .await;
+                }
+                outcome
+            }
+        }
+    }
+
+    async fn reconcile_job_source(
+        &self,
+        job: &ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+    ) -> Result<Option<ThreadEpisodicSourceReconcileOutcome>> {
+        let Some(item) = self
+            .crud_store
+            .find_thread_episodic_item(job.index_item_id.as_str())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let outcome = StoreThreadEpisodicIngestor::with_config(self.crud_store.clone(), true)
+            .reconcile_canonical_source_occurrence(
+                item.workspace_id.as_str(),
+                item.thread_id.as_str(),
+                item.turn_id.as_str(),
+                item.item_id.as_str(),
+                now_unix,
+            )
+            .await?;
+        Ok(Some(outcome))
+    }
+
+    async fn reconcile_and_release_claim(
+        &self,
+        job: &ThreadEpisodicIndexJobRecord,
+        now_unix: i64,
+        config: ThreadEpisodicIndexExecutorConfig,
+        attempt_started_at: Instant,
+    ) -> ThreadEpisodicIndexJobProcessOutcome {
+        let reconciliation = self.reconcile_job_source(job, now_unix).await;
+        if reconciliation.is_ok()
+            && let Some(error) = self.take_reconciliation_transition_failure().await
+        {
+            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
+                error.context("failed to persist the claim transition after source reconciliation"),
+            );
+        }
+        match reconciliation {
+            Ok(Some(ThreadEpisodicSourceReconcileOutcome::PreservedExclusion)) => self
+                .crud_store
+                .cancel_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    THREAD_EPISODIC_USER_EXCLUDED_ERROR,
+                    now_unix,
+                )
+                .await
+                .map(|_| ThreadEpisodicIndexJobProcessOutcome::StaleAttempt)
+                .unwrap_or_else(|error| {
+                    ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error.context(
+                        "failed to cancel excluded thread episodic claim after reconciliation",
+                    ))
+                }),
+            Ok(Some(ThreadEpisodicSourceReconcileOutcome::PreservedDeletion)) => self
+                .crud_store
+                .cancel_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    THREAD_EPISODIC_USER_DELETED_ERROR,
+                    now_unix,
+                )
+                .await
+                .map(|_| ThreadEpisodicIndexJobProcessOutcome::StaleAttempt)
+                .unwrap_or_else(|error| {
+                    ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error.context(
+                        "failed to cancel deleted thread episodic claim after reconciliation",
+                    ))
+                }),
+            Ok(Some(ThreadEpisodicSourceReconcileOutcome::Current))
+                if job.attempt_count >= config.max_attempts =>
+            {
                 self.persist_failure(
                     job,
                     false,
                     false,
-                    Some(format!("failed to complete index job: {error}")),
+                    Some(
+                        "thread episodic source changed repeatedly while resolving the same claim"
+                            .to_owned(),
+                    ),
+                    None,
                     now_unix,
                     attempt_started_at,
                 )
                 .await
             }
-        }
-    }
-
-    async fn refresh_thread_directory_after_index(
-        &self,
-        job: &ThreadEpisodicIndexJobRecord,
-        now_unix: i64,
-    ) {
-        let indexed_item_count = match self
-            .crud_store
-            .count_active_thread_episodic_items_for_thread(
-                job.workspace_id.as_str(),
-                job.thread_id.as_str(),
-            )
-            .await
-        {
-            Ok(count) => count,
-            Err(error) => {
-                tracing::warn!(
-                    thread_id = %job.thread_id,
-                    error = %error,
-                    "failed to count thread episodic items for directory refresh"
-                );
-                return;
+            Ok(None) => {
+                self.persist_failure(
+                    job,
+                    false,
+                    false,
+                    Some(
+                        "thread episodic index item disappeared during source reconciliation"
+                            .to_owned(),
+                    ),
+                    None,
+                    now_unix,
+                    attempt_started_at,
+                )
+                .await
             }
-        };
-        if let Err(error) = self
-            .crud_store
-            .upsert_thread_episodic_thread_directory_entry(
-                NewThreadEpisodicThreadDirectoryRecord {
-                    id: None,
-                    workspace_id: job.workspace_id.clone(),
-                    thread_id: job.thread_id.clone(),
-                    title: None,
-                    summary_hash: None,
-                    summary_ref: None,
-                    thread_created_at: None,
-                    thread_updated_at: Some(fixed_datetime_from_unix(now_unix)),
-                    last_indexed_at: Some(fixed_datetime_from_unix(now_unix)),
-                    indexed_item_count,
-                    task_affinity_json: None,
-                    project_affinity_json: None,
-                    visibility: ThreadEpisodicThreadDirectoryVisibility::Visible,
-                    status: ThreadEpisodicThreadDirectoryStatus::Active,
-                },
-                now_unix,
-            )
-            .await
-        {
-            tracing::warn!(
-                thread_id = %job.thread_id,
-                error = %error,
-                "failed to refresh thread episodic directory after indexing"
-            );
+            Ok(_) => match self
+                .crud_store
+                .requeue_thread_episodic_index_attempt(job.id.as_str(), job.attempt_count, now_unix)
+                .await
+            {
+                Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
+                    ThreadEpisodicIndexJobProcessOutcome::Requeued
+                }
+                Ok(_) => ThreadEpisodicIndexJobProcessOutcome::StaleAttempt,
+                Err(error) => {
+                    tracing::warn!(job_id = %job.id, error = %error, "failed to release reconciled thread episodic claim");
+                    ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(error.context(
+                        "failed to requeue current thread episodic claim after reconciliation",
+                    ))
+                }
+            },
+            Err(error) => {
+                let retryable = job.attempt_count < config.max_attempts;
+                self.persist_failure(
+                    job,
+                    retryable,
+                    false,
+                    Some(format!(
+                        "failed to reconcile changed thread episodic source: {error:#}"
+                    )),
+                    None,
+                    now_unix,
+                    attempt_started_at,
+                )
+                .await
+            }
         }
     }
 
@@ -3452,33 +3747,49 @@ impl ThreadEpisodicIndexExecutor {
         resolved: ThreadEpisodicResolvedIndexRequest,
         error: ThreadEpisodicMemvidError,
         now_unix: i64,
-        _config: ThreadEpisodicIndexExecutorConfig,
+        config: ThreadEpisodicIndexExecutorConfig,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
         let sanitized_error = sanitize_thread_episodic_index_error(error.message.as_str());
-        self.update_capsule_capacity(
-            resolved.request.capsule_id.as_str(),
-            &ThreadEpisodicMemvidStats::default(),
-            Some(sanitized_error.clone()),
-            true,
-            now_unix,
-        )
-        .await;
-        self.rotate_capsule_after_capacity_event(
-            resolved.request.capsule_id.as_str(),
-            now_unix,
-            "capacity_exceeded",
-        )
-        .await;
-        self.persist_failure(
-            job,
-            true,
-            true,
-            Some(sanitized_error),
-            now_unix,
-            attempt_started_at,
-        )
-        .await
+        let capsule_id = resolved.request.capsule_id.clone();
+        let retryable = job.attempt_count < config.max_attempts;
+        let outcome = self
+            .persist_failure(
+                job,
+                retryable,
+                true,
+                Some(sanitized_error.clone()),
+                Some(resolved.source_payload.as_str()),
+                now_unix,
+                attempt_started_at,
+            )
+            .await;
+        if matches!(&outcome, ThreadEpisodicIndexJobProcessOutcome::Requeued) {
+            return self
+                .reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
+                .await;
+        }
+        if matches!(
+            &outcome,
+            ThreadEpisodicIndexJobProcessOutcome::RetryableFailure
+                | ThreadEpisodicIndexJobProcessOutcome::TerminalFailure
+        ) {
+            self.update_capsule_capacity(
+                capsule_id.as_str(),
+                &ThreadEpisodicMemvidStats::default(),
+                Some(sanitized_error),
+                true,
+                now_unix,
+            )
+            .await;
+            self.rotate_capsule_after_capacity_event(
+                capsule_id.as_str(),
+                now_unix,
+                "capacity_exceeded",
+            )
+            .await;
+        }
+        outcome
     }
 
     async fn record_resolution_failure(
@@ -3489,24 +3800,36 @@ impl ThreadEpisodicIndexExecutor {
         config: ThreadEpisodicIndexExecutorConfig,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
-        let retryable = matches!(
-            error.kind,
-            ThreadEpisodicIndexResolutionFailureKind::Retryable
-        ) && job.attempt_count < config.max_attempts;
-        self.persist_failure(
-            job,
-            retryable,
-            false,
-            Some(error.message),
-            now_unix,
-            attempt_started_at,
-        )
-        .await
+        let ThreadEpisodicIndexResolutionError {
+            kind,
+            message,
+            source_payload,
+        } = error;
+        let retryable = matches!(kind, ThreadEpisodicIndexResolutionFailureKind::Retryable)
+            && job.attempt_count < config.max_attempts;
+        let outcome = self
+            .persist_failure(
+                job,
+                retryable,
+                false,
+                Some(message),
+                source_payload.as_deref(),
+                now_unix,
+                attempt_started_at,
+            )
+            .await;
+        if matches!(&outcome, ThreadEpisodicIndexJobProcessOutcome::Requeued) {
+            return self
+                .reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
+                .await;
+        }
+        outcome
     }
 
     async fn record_backend_failure(
         &self,
         job: &ThreadEpisodicIndexJobRecord,
+        resolved: ThreadEpisodicResolvedIndexRequest,
         error: ThreadEpisodicMemvidError,
         now_unix: i64,
         config: ThreadEpisodicIndexExecutorConfig,
@@ -3521,15 +3844,23 @@ impl ThreadEpisodicIndexExecutor {
             error.kind,
             ThreadEpisodicMemvidFailureKind::CapacityExceeded
         );
-        self.persist_failure(
-            job,
-            retryable,
-            capacity_error,
-            Some(error.message),
-            now_unix,
-            attempt_started_at,
-        )
-        .await
+        let outcome = self
+            .persist_failure(
+                job,
+                retryable,
+                capacity_error,
+                Some(error.message),
+                Some(resolved.source_payload.as_str()),
+                now_unix,
+                attempt_started_at,
+            )
+            .await;
+        if matches!(&outcome, ThreadEpisodicIndexJobProcessOutcome::Requeued) {
+            return self
+                .reconcile_and_release_claim(job, now_unix, config, attempt_started_at)
+                .await;
+        }
+        outcome
     }
 
     async fn persist_failure(
@@ -3538,6 +3869,7 @@ impl ThreadEpisodicIndexExecutor {
         retryable: bool,
         capacity_error: bool,
         error_message: Option<String>,
+        expected_source_payload: Option<&str>,
         now_unix: i64,
         attempt_started_at: Instant,
     ) -> ThreadEpisodicIndexJobProcessOutcome {
@@ -3555,16 +3887,123 @@ impl ThreadEpisodicIndexExecutor {
             capacity_error,
             last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
         };
-        if let Err(error) = self
-            .crud_store
-            .fail_thread_episodic_index_job(job.id.as_str(), update, now_unix)
-            .await
-        {
-            tracing::warn!(
-                job_id = %job.id,
-                error = %error,
-                "failed to persist thread episodic index job failure"
-            );
+        let injected_persistence_error = self.take_primary_persistence_failure().await;
+        let persisted = if let Some(error) = injected_persistence_error {
+            Err(error)
+        } else if let Some(expected_source_payload) = expected_source_payload {
+            self.crud_store
+                .fail_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    expected_source_payload,
+                    update,
+                    now_unix,
+                )
+                .await
+        } else {
+            self.crud_store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    update,
+                    now_unix,
+                )
+                .await
+        };
+        let outcome = match persisted {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    error = %error,
+                    "failed to persist thread episodic index attempt failure"
+                );
+                let primary_persistence_error = format!("{error:#}");
+                let persistence_error = sanitize_thread_episodic_index_error(
+                    format!(
+                        "failed to persist thread episodic attempt result: {primary_persistence_error}; original result: {}",
+                        sanitized_error.as_deref().unwrap_or("unknown index attempt failure")
+                    )
+                    .as_str(),
+                );
+                let recovery_update = ThreadEpisodicIndexJobFailureUpdate {
+                    retryable,
+                    next_run_at_unix: retryable.then(|| self.next_retry_at(job, now_unix)),
+                    last_error: Some(persistence_error),
+                    capacity_error: false,
+                    last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
+                };
+                let recovered =
+                    if let Some(fallback_error) = self.take_fallback_persistence_failure().await {
+                        Err(fallback_error)
+                    } else {
+                        self.crud_store
+                            .recover_thread_episodic_index_attempt_after_persistence_error(
+                                job.id.as_str(),
+                                job.attempt_count,
+                                recovery_update,
+                                now_unix,
+                            )
+                            .await
+                    };
+                match recovered {
+                    Ok(ThreadEpisodicIndexAttemptOutcome::Applied) => {
+                        if let Some(reconcile_error) =
+                            self.take_targeted_reconciliation_failure().await
+                        {
+                            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
+                                reconcile_error.context(format!(
+                                    "recorded persistence failure after primary write error `{primary_persistence_error}`, but targeted source reconciliation could not start"
+                                )),
+                            );
+                        }
+                        if let Err(reconcile_error) = self.reconcile_job_source(job, now_unix).await
+                        {
+                            return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
+                                anyhow::anyhow!(
+                                    "recorded persistence failure after primary write error `{primary_persistence_error}`, but targeted source reconciliation failed: {reconcile_error:#}"
+                                ),
+                            );
+                        }
+                        return if retryable {
+                            ThreadEpisodicIndexJobProcessOutcome::RetryablePersistenceFailure
+                        } else {
+                            ThreadEpisodicIndexJobProcessOutcome::TerminalPersistenceFailure
+                        };
+                    }
+                    Ok(ThreadEpisodicIndexAttemptOutcome::StaleAttempt) => {
+                        return ThreadEpisodicIndexJobProcessOutcome::StaleAttempt;
+                    }
+                    Ok(ThreadEpisodicIndexAttemptOutcome::SourceChanged)
+                    | Ok(ThreadEpisodicIndexAttemptOutcome::Excluded) => {
+                        return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
+                            anyhow::anyhow!(
+                                "persistence recovery returned an unexpected source outcome after primary write error `{primary_persistence_error}`"
+                            ),
+                        );
+                    }
+                    Err(recovery_error) => {
+                        return ThreadEpisodicIndexJobProcessOutcome::PersistenceFailure(
+                            anyhow::anyhow!(
+                                "primary attempt-result write failed: {primary_persistence_error}; fallback persistence write also failed: {recovery_error:#}; original result: {}",
+                                sanitized_error
+                                    .as_deref()
+                                    .unwrap_or("unknown index attempt failure")
+                            ),
+                        );
+                    }
+                }
+            }
+        };
+        match outcome {
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt => {
+                return ThreadEpisodicIndexJobProcessOutcome::StaleAttempt;
+            }
+            ThreadEpisodicIndexAttemptOutcome::SourceChanged
+            | ThreadEpisodicIndexAttemptOutcome::Excluded => {
+                return ThreadEpisodicIndexJobProcessOutcome::Requeued;
+            }
+            ThreadEpisodicIndexAttemptOutcome::Applied => {}
         }
         if !retryable {
             tracing::error!(
@@ -3583,10 +4022,6 @@ impl ThreadEpisodicIndexExecutor {
                 error = sanitized_error.as_deref().unwrap_or("unknown thread episodic index failure"),
                 "thread episodic index job failed terminally"
             );
-            let _ = self
-                .crud_store
-                .mark_thread_episodic_item_failed(job.index_item_id.as_str(), now_unix)
-                .await;
         }
         if retryable {
             ThreadEpisodicIndexJobProcessOutcome::RetryableFailure
@@ -3696,11 +4131,16 @@ impl ThreadEpisodicIndexExecutor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum ThreadEpisodicIndexJobProcessOutcome {
     Completed,
     RetryableFailure,
     TerminalFailure,
+    StaleAttempt,
+    Requeued,
+    RetryablePersistenceFailure,
+    TerminalPersistenceFailure,
+    PersistenceFailure(anyhow::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3732,6 +4172,157 @@ pub(crate) struct StoreThreadEpisodicIngestor {
 }
 
 impl StoreThreadEpisodicIngestor {
+    /// Reconciles one source occurrence. Expensive preparation happens before
+    /// each bounded maintenance write; the serialized payload is revalidated
+    /// by CrudStore in the committing transaction.
+    pub(crate) async fn reconcile_canonical_source_occurrence(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicSourceReconcileOutcome> {
+        Ok(self
+            .reconcile_canonical_source_occurrence_with_disposition(
+                workspace_id,
+                thread_id,
+                turn_id,
+                item_id,
+                now_unix,
+            )
+            .await?
+            .0)
+    }
+
+    async fn reconcile_canonical_source_occurrence_with_disposition(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        now_unix: i64,
+    ) -> Result<(
+        ThreadEpisodicSourceReconcileOutcome,
+        Option<ThreadEpisodicIngestionSkipReason>,
+    )> {
+        const MAX_SOURCE_CHANGES: usize = 3;
+        const MAX_VERSION_QUANTA: usize = 4_096;
+        for _ in 0..MAX_SOURCE_CHANGES {
+            let canonical = self
+                .crud_store
+                .get_thread_episodic_canonical_item(workspace_id, thread_id, turn_id, item_id)
+                .await?;
+            let Some(canonical) = canonical else {
+                for _ in 0..MAX_VERSION_QUANTA {
+                    match self
+                        .crud_store
+                        .retire_thread_episodic_source_occurrence(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            item_id,
+                            None,
+                            now_unix,
+                        )
+                        .await?
+                    {
+                        ThreadEpisodicSourceReconcileOutcome::MoreWork => continue,
+                        ThreadEpisodicSourceReconcileOutcome::SourceChanged => break,
+                        outcome => {
+                            return Ok((
+                                outcome,
+                                Some(ThreadEpisodicIngestionSkipReason::UnsupportedSourceContext),
+                            ));
+                        }
+                    }
+                }
+                continue;
+            };
+            let Some(committed) = committed_item_ingestion_input_from_parts(
+                workspace_id,
+                thread_id,
+                turn_id,
+                canonical.item,
+            ) else {
+                anyhow::bail!("canonical thread episodic source identity is invalid");
+            };
+            let (source, skip_reason) = match select_committed_item_source(&committed) {
+                ThreadEpisodicSourceSelection::Indexable(source) => (Some(source), None),
+                ThreadEpisodicSourceSelection::Rejected { reason } => (None, Some(reason)),
+            };
+            if source.is_none() {
+                for _ in 0..MAX_VERSION_QUANTA {
+                    match self
+                        .crud_store
+                        .retire_thread_episodic_source_occurrence(
+                            workspace_id,
+                            thread_id,
+                            turn_id,
+                            item_id,
+                            Some(canonical.source_payload.as_str()),
+                            now_unix,
+                        )
+                        .await?
+                    {
+                        ThreadEpisodicSourceReconcileOutcome::MoreWork => continue,
+                        ThreadEpisodicSourceReconcileOutcome::SourceChanged => break,
+                        outcome => return Ok((outcome, skip_reason)),
+                    }
+                }
+                continue;
+            }
+            let source = source.expect("checked indexable source");
+            let source_text = source.text.trim();
+            let source_text_hash = source_text_hash(source_text);
+            let projection_group_id = self
+                .projection_group_id(&committed, source_text_hash.as_str())
+                .await;
+            let prepared = NewThreadEpisodicItemRecord {
+                id: None,
+                workspace_id: committed.workspace_id.clone(),
+                thread_id: committed.thread_id.clone(),
+                turn_id: committed.turn_id.clone(),
+                item_id: committed.item_id.clone(),
+                source_actor_role: store_source_actor_role(source.source_actor_role),
+                source_runtime_kind: store_source_runtime_kind(committed.item_type),
+                source_context: source.source_context,
+                visibility: ThreadEpisodicItemVisibility::UserVisible,
+                status: ThreadEpisodicItemStatus::PendingIndex,
+                text_hash: item_text_hash(&committed, source_text),
+                source_text_hash,
+                projection_group_id,
+                language_hint: None,
+                token_estimate: estimate_tokens(source_text),
+                capsule_id: None,
+                capsule_ref: None,
+                segment_index: None,
+                frame_id: None,
+                frame_uri: None,
+                indexed_at: None,
+                deleted_at: None,
+            };
+            for _ in 0..MAX_VERSION_QUANTA {
+                match self
+                    .crud_store
+                    .reconcile_thread_episodic_source_version(
+                        canonical.source_payload.as_str(),
+                        prepared.clone(),
+                        now_unix,
+                    )
+                    .await?
+                {
+                    ThreadEpisodicSourceReconcileOutcome::MoreWork => continue,
+                    ThreadEpisodicSourceReconcileOutcome::SourceChanged => break,
+                    outcome => return Ok((outcome, None)),
+                }
+            }
+        }
+        anyhow::bail!(
+            "canonical thread episodic source changed repeatedly during occurrence reconciliation"
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn new(crud_store: Arc<CrudStore>) -> Self {
         Self::with_config(crud_store, true)
@@ -3739,7 +4330,7 @@ impl StoreThreadEpisodicIngestor {
 
     pub(crate) fn with_config(crud_store: Arc<CrudStore>, enabled: bool) -> Self {
         Self {
-            crud_store,
+            crud_store: Arc::new(crud_store.with_maintenance_access()),
             enabled,
         }
     }
@@ -3866,7 +4457,7 @@ impl StoreThreadEpisodicIngestor {
             );
         }
 
-        let mut latest_items: BTreeMap<(String, String), TurnItem> = BTreeMap::new();
+        let mut latest_items: BTreeSet<(String, String)> = BTreeSet::new();
         for event in history.events {
             match event.payload {
                 ThreadHistoryEventPayload::ItemCompleted {
@@ -3881,37 +4472,163 @@ impl StoreThreadEpisodicIngestor {
                     turn_id,
                     item,
                 } if workspace_id == request.workspace_id && thread_id == request.thread_id => {
-                    latest_items.insert((turn_id, item.item_id().to_owned()), item);
+                    latest_items.insert((turn_id, item.item_id().to_owned()));
                 }
                 _ => {}
             }
         }
 
         summary.source_items_seen = latest_items.len();
-        for ((turn_id, item_id), item) in latest_items {
-            let Some(committed) = committed_item_ingestion_input_from_parts(
-                request.workspace_id.as_str(),
-                request.thread_id.as_str(),
-                turn_id.as_str(),
-                item,
-            ) else {
-                summary.source_items_skipped += 1;
-                summary
-                    .diagnostics
-                    .push(format!("source_item_invalid:{turn_id}:{item_id}"));
-                continue;
-            };
-            match self.ingest_committed_item(committed).await? {
-                ThreadEpisodicIngestionOutcome::Accepted => {
-                    summary.source_items_reingested += 1;
-                }
-                ThreadEpisodicIngestionOutcome::Skipped { reason } => {
+        for (turn_id, item_id) in latest_items {
+            let mut reconciled = false;
+            // Each CrudStore call applies at most one bounded version quantum.
+            // The larger outer bound also covers a few concurrent source changes.
+            for _ in 0..12_291 {
+                let canonical = self
+                    .crud_store
+                    .get_thread_episodic_canonical_item(
+                        request.workspace_id.as_str(),
+                        request.thread_id.as_str(),
+                        turn_id.as_str(),
+                        item_id.as_str(),
+                    )
+                    .await?;
+                let Some(canonical) = canonical else {
+                    let outcome = self
+                        .crud_store
+                        .retire_thread_episodic_source_occurrence(
+                            request.workspace_id.as_str(),
+                            request.thread_id.as_str(),
+                            turn_id.as_str(),
+                            item_id.as_str(),
+                            None,
+                            request.now_unix,
+                        )
+                        .await?;
+                    if matches!(
+                        outcome,
+                        ThreadEpisodicSourceReconcileOutcome::SourceChanged
+                            | ThreadEpisodicSourceReconcileOutcome::MoreWork
+                    ) {
+                        continue;
+                    }
                     summary.source_items_skipped += 1;
-                    summary.diagnostics.push(format!(
-                        "source_item_skipped:{turn_id}:{item_id}:{}",
-                        reason.as_str()
-                    ));
+                    summary
+                        .diagnostics
+                        .push(format!("source_item_missing:{turn_id}:{item_id}"));
+                    reconciled = true;
+                    break;
+                };
+                let Some(committed) = committed_item_ingestion_input_from_parts(
+                    request.workspace_id.as_str(),
+                    request.thread_id.as_str(),
+                    turn_id.as_str(),
+                    canonical.item,
+                ) else {
+                    summary.source_items_skipped += 1;
+                    summary
+                        .diagnostics
+                        .push(format!("source_item_invalid:{turn_id}:{item_id}"));
+                    reconciled = true;
+                    break;
+                };
+                let source = match select_committed_item_source(&committed) {
+                    ThreadEpisodicSourceSelection::Indexable(source) => source,
+                    ThreadEpisodicSourceSelection::Rejected { reason } => {
+                        let outcome = self
+                            .crud_store
+                            .retire_thread_episodic_source_occurrence(
+                                request.workspace_id.as_str(),
+                                request.thread_id.as_str(),
+                                turn_id.as_str(),
+                                item_id.as_str(),
+                                Some(canonical.source_payload.as_str()),
+                                request.now_unix,
+                            )
+                            .await?;
+                        if matches!(
+                            outcome,
+                            ThreadEpisodicSourceReconcileOutcome::SourceChanged
+                                | ThreadEpisodicSourceReconcileOutcome::MoreWork
+                        ) {
+                            continue;
+                        }
+                        summary.source_items_skipped += 1;
+                        summary.diagnostics.push(format!(
+                            "source_item_skipped:{turn_id}:{item_id}:{}",
+                            reason.as_str()
+                        ));
+                        reconciled = true;
+                        break;
+                    }
+                };
+                let source_text = source.text.trim();
+                let source_text_hash = source_text_hash(source_text);
+                let projection_group_id = self
+                    .projection_group_id(&committed, source_text_hash.as_str())
+                    .await;
+                let outcome = self
+                    .crud_store
+                    .reconcile_thread_episodic_source_version(
+                        canonical.source_payload.as_str(),
+                        NewThreadEpisodicItemRecord {
+                            id: None,
+                            workspace_id: committed.workspace_id.clone(),
+                            thread_id: committed.thread_id.clone(),
+                            turn_id: committed.turn_id.clone(),
+                            item_id: committed.item_id.clone(),
+                            source_actor_role: store_source_actor_role(source.source_actor_role),
+                            source_runtime_kind: store_source_runtime_kind(committed.item_type),
+                            source_context: source.source_context,
+                            visibility: ThreadEpisodicItemVisibility::UserVisible,
+                            status: ThreadEpisodicItemStatus::PendingIndex,
+                            text_hash: item_text_hash(&committed, source_text),
+                            source_text_hash,
+                            projection_group_id,
+                            language_hint: None,
+                            token_estimate: estimate_tokens(source_text),
+                            capsule_id: None,
+                            capsule_ref: None,
+                            segment_index: None,
+                            frame_id: None,
+                            frame_uri: None,
+                            indexed_at: None,
+                            deleted_at: None,
+                        },
+                        request.now_unix,
+                    )
+                    .await?;
+                if outcome == ThreadEpisodicSourceReconcileOutcome::SourceChanged {
+                    continue;
                 }
+                match outcome {
+                    ThreadEpisodicSourceReconcileOutcome::Current => {
+                        summary.source_items_reingested += 1;
+                    }
+                    ThreadEpisodicSourceReconcileOutcome::PreservedDeletion => {
+                        summary.source_items_skipped += 1;
+                        summary.diagnostics.push(format!(
+                            "source_item_skipped:{turn_id}:{item_id}:preserved_deletion"
+                        ));
+                    }
+                    ThreadEpisodicSourceReconcileOutcome::PreservedExclusion => {
+                        summary.source_items_skipped += 1;
+                        summary.diagnostics.push(format!(
+                            "source_item_skipped:{turn_id}:{item_id}:preserved_exclusion"
+                        ));
+                    }
+                    ThreadEpisodicSourceReconcileOutcome::SourceChanged => unreachable!(),
+                    ThreadEpisodicSourceReconcileOutcome::MoreWork => continue,
+                }
+                reconciled = true;
+                break;
+            }
+            if !reconciled {
+                anyhow::bail!(
+                    "canonical thread episodic source changed repeatedly during reconciliation for `{}/{}`",
+                    turn_id,
+                    item_id
+                );
             }
         }
 
@@ -3936,6 +4653,18 @@ impl StoreThreadEpisodicIngestor {
         summary.items_scanned = items.len();
         for item in items {
             if !thread_episodic_item_requires_index_job(&item) {
+                continue;
+            }
+            if self
+                .crud_store
+                .thread_episodic_source_occurrence_is_excluded(
+                    item.workspace_id.as_str(),
+                    item.thread_id.as_str(),
+                    item.turn_id.as_str(),
+                    item.item_id.as_str(),
+                )
+                .await?
+            {
                 continue;
             }
             if self
@@ -3983,89 +4712,20 @@ impl ThreadEpisodicIngestor for StoreThreadEpisodicIngestor {
                 reason: ThreadEpisodicIngestionSkipReason::IngestionNotConfigured,
             });
         }
-        let source = match select_committed_item_source(&item) {
-            ThreadEpisodicSourceSelection::Indexable(source) => source,
-            ThreadEpisodicSourceSelection::Rejected { reason } => {
-                return Ok(ThreadEpisodicIngestionOutcome::Skipped { reason });
-            }
-        };
-        let source_text = source.text.trim();
-        if source_text.is_empty() {
-            return Ok(ThreadEpisodicIngestionOutcome::Skipped {
-                reason: ThreadEpisodicIngestionSkipReason::EmptyText,
-            });
-        }
-
         let now_unix = chrono::Utc::now().timestamp();
-        let source_text_hash = source_text_hash(source_text);
-        let projection_group_id = self
-            .projection_group_id(&item, source_text_hash.as_str())
-            .await;
-        let text_hash = item_text_hash(&item, source_text);
-        let item_record = self
-            .crud_store
-            .upsert_thread_episodic_item(
-                NewThreadEpisodicItemRecord {
-                    id: None,
-                    workspace_id: item.workspace_id.clone(),
-                    thread_id: item.thread_id.clone(),
-                    turn_id: item.turn_id.clone(),
-                    item_id: item.item_id.clone(),
-                    source_actor_role: store_source_actor_role(source.source_actor_role),
-                    source_runtime_kind: store_source_runtime_kind(item.item_type),
-                    source_context: source.source_context.clone(),
-                    visibility: ThreadEpisodicItemVisibility::UserVisible,
-                    status: ThreadEpisodicItemStatus::PendingIndex,
-                    text_hash,
-                    source_text_hash,
-                    projection_group_id,
-                    language_hint: None,
-                    token_estimate: estimate_tokens(source_text),
-                    capsule_id: None,
-                    capsule_ref: None,
-                    segment_index: None,
-                    frame_id: None,
-                    frame_uri: None,
-                    indexed_at: None,
-                    deleted_at: None,
-                },
+        let (_, skip_reason) = self
+            .reconcile_canonical_source_occurrence_with_disposition(
+                item.workspace_id.as_str(),
+                item.thread_id.as_str(),
+                item.turn_id.as_str(),
+                item.item_id.as_str(),
                 now_unix,
             )
             .await?;
-
-        if item_record.status == ThreadEpisodicItemStatus::PendingIndex
-            && item_record.indexed_at.is_none()
-        {
-            tracing::debug!(
-                workspace_id = %item.workspace_id,
-                thread_id = %item.thread_id,
-                index_item_id = %item_record.id,
-                graph_enrichment_state = "not_supported",
-                graph_enrichment_reason = THREAD_EPISODIC_GRAPH_ENRICHMENT_DISABLED_REASON,
-                "thread episodic index job queued without graph enrichment"
-            );
-            self.crud_store
-                .insert_thread_episodic_index_job_if_absent(
-                    NewThreadEpisodicIndexJobRecord {
-                        id: None,
-                        workspace_id: item.workspace_id.clone(),
-                        thread_id: item.thread_id.clone(),
-                        index_item_id: item_record.id,
-                        capsule_id: None,
-                        capsule_ref: None,
-                        segment_index: None,
-                        frame_uri: None,
-                        status: ThreadEpisodicIndexJobStatus::Queued,
-                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
-                        next_run_at: fixed_datetime_from_unix(now_unix),
-                        last_error: None,
-                    },
-                    now_unix,
-                )
-                .await?;
-        }
-
-        Ok(ThreadEpisodicIngestionOutcome::Accepted)
+        Ok(match skip_reason {
+            Some(reason) => ThreadEpisodicIngestionOutcome::Skipped { reason },
+            None => ThreadEpisodicIngestionOutcome::Accepted,
+        })
     }
 }
 
@@ -4123,7 +4783,7 @@ fn sha256_hex(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-fn source_text_hash(text: &str) -> String {
+pub(crate) fn source_text_hash(text: &str) -> String {
     sha256_hex(normalize_for_thread_episodic_hash(text).as_str())
 }
 
@@ -4488,7 +5148,12 @@ mod tests {
     use crate::bootstrap::bootstrap;
     use crate::workspace::WorkspaceManager;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::{CrudStore, ThreadEpisodicCapsuleWriteState, ThreadEpisodicIndexJobStatus};
+    use pioneer_crud::{
+        CrudStore, NewThreadEpisodicExclusionRecord, NewThreadEpisodicThreadDirectoryRecord,
+        THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, ThreadEpisodicCapsuleWriteState,
+        ThreadEpisodicExclusionReason, ThreadEpisodicIndexJobStatus,
+        ThreadEpisodicThreadDirectorySelection,
+    };
     use pioneer_entity::turn;
     use pioneer_memory::{
         InMemoryMemoryBackend, MemoryOperationContext, MemoryService, MemoryServiceConfig,
@@ -4501,9 +5166,9 @@ mod tests {
         thread_episodic_storage_uri_from_path,
     };
     use pioneer_protocol::{
-        ItemCompletedNotification, MemoryCategory, MemoryForgetParams, MemoryForgetTarget,
-        MemoryRememberParams, MemoryScope, MemoryScopeKind, MemorySensitivity, SandboxMode,
-        TaskExecutorKind, TaskTriggerKind, Thread, ThreadEpisodicAdaptiveStrategy,
+        ItemCompletedNotification, ItemUpdatedNotification, MemoryCategory, MemoryForgetParams,
+        MemoryForgetTarget, MemoryRememberParams, MemoryScope, MemoryScopeKind, MemorySensitivity,
+        SandboxMode, TaskExecutorKind, TaskTriggerKind, Thread, ThreadEpisodicAdaptiveStrategy,
         ThreadEpisodicSearchMode, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolOutputPolicySnapshot,
         ToolOutputSummary, ToolStoragePayload, Turn, TurnKind, TurnOrigin, TurnStatus, UserInput,
@@ -4622,6 +5287,39 @@ mod tests {
         search_requests: Mutex<Vec<ThreadEpisodicMemvidSearchRequest>>,
         ask_requests: Mutex<Vec<FakeThreadEpisodicAskRequest>>,
         scoped_search_hits: Mutex<BTreeMap<String, Vec<ThreadEpisodicRankedSearchHit>>>,
+        source_update_during_index: Mutex<Option<(Arc<CrudStore>, ItemUpdatedNotification, i64)>>,
+        exclusion_during_index:
+            Mutex<Option<(Arc<CrudStore>, NewThreadEpisodicExclusionRecord, i64)>>,
+    }
+
+    struct RestoreSourceAfterResolutionMismatchProvider {
+        inner: StoreThreadEpisodicIndexPayloadProvider,
+        crud_store: Arc<CrudStore>,
+        restore: Mutex<Option<(ItemUpdatedNotification, i64)>>,
+    }
+
+    #[async_trait]
+    impl ThreadEpisodicIndexPayloadProvider for RestoreSourceAfterResolutionMismatchProvider {
+        async fn resolve_index_request(
+            &self,
+            job: &ThreadEpisodicIndexJobRecord,
+        ) -> std::result::Result<
+            ThreadEpisodicResolvedIndexRequest,
+            ThreadEpisodicIndexResolutionError,
+        > {
+            let result = self.inner.resolve_index_request(job).await;
+            if result.as_ref().is_err_and(|error| {
+                error.kind == ThreadEpisodicIndexResolutionFailureKind::SourceChanged
+            }) {
+                if let Some((update, now_unix)) = self.restore.lock().await.take() {
+                    self.crud_store
+                        .materialize_item_snapshot_updated(update, now_unix)
+                        .await
+                        .expect("test source restoration should materialize");
+                }
+            }
+            result
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -4649,6 +5347,8 @@ mod tests {
                 search_requests: Mutex::new(Vec::new()),
                 ask_requests: Mutex::new(Vec::new()),
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
+                source_update_during_index: Mutex::new(None),
+                exclusion_during_index: Mutex::new(None),
             }
         }
 
@@ -4668,6 +5368,8 @@ mod tests {
                 search_requests: Mutex::new(Vec::new()),
                 ask_requests: Mutex::new(Vec::new()),
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
+                source_update_during_index: Mutex::new(None),
+                exclusion_during_index: Mutex::new(None),
             }
         }
 
@@ -4687,6 +5389,8 @@ mod tests {
                 search_requests: Mutex::new(Vec::new()),
                 ask_requests: Mutex::new(Vec::new()),
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
+                source_update_during_index: Mutex::new(None),
+                exclusion_during_index: Mutex::new(None),
             }
         }
 
@@ -4709,7 +5413,27 @@ mod tests {
                 search_requests: Mutex::new(Vec::new()),
                 ask_requests: Mutex::new(Vec::new()),
                 scoped_search_hits: Mutex::new(BTreeMap::new()),
+                source_update_during_index: Mutex::new(None),
+                exclusion_during_index: Mutex::new(None),
             }
+        }
+
+        async fn update_source_during_next_index(
+            &self,
+            crud_store: Arc<CrudStore>,
+            update: ItemUpdatedNotification,
+            now_unix: i64,
+        ) {
+            *self.source_update_during_index.lock().await = Some((crud_store, update, now_unix));
+        }
+
+        async fn exclude_during_next_index(
+            &self,
+            crud_store: Arc<CrudStore>,
+            exclusion: NewThreadEpisodicExclusionRecord,
+            now_unix: i64,
+        ) {
+            *self.exclusion_during_index.lock().await = Some((crud_store, exclusion, now_unix));
         }
 
         async fn requests(&self) -> Vec<ThreadEpisodicMemvidIndexRequest> {
@@ -4745,6 +5469,22 @@ mod tests {
         ) -> std::result::Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>
         {
             self.requests.lock().await.push(request.clone());
+            if let Some((crud_store, update, now_unix)) =
+                self.source_update_during_index.lock().await.take()
+            {
+                crud_store
+                    .materialize_item_snapshot_updated(update, now_unix)
+                    .await
+                    .expect("test source update during indexing should materialize");
+            }
+            if let Some((crud_store, exclusion, now_unix)) =
+                self.exclusion_during_index.lock().await.take()
+            {
+                crud_store
+                    .exclude_thread_episodic_item(exclusion, now_unix)
+                    .await
+                    .expect("test exclusion during indexing should persist");
+            }
             let Some(outcome) = self.outcomes.lock().await.pop_front() else {
                 return Ok(ThreadEpisodicMemvidIndexOutput {
                     frame_id: 99,
@@ -5285,6 +6025,2461 @@ mod tests {
                 .await
                 .expect("job lookup should succeed")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_reindex_uses_canonical_task_summaries_for_all_discovered_items() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_reindex_canonical_task_summaries";
+        let mut expected = BTreeMap::new();
+        for index in 0..7 {
+            let turn_id = format!("turn_reindex_task_{index}");
+            let item_id = format!("item_reindex_task_{index}");
+            let title = format!("Task title {index}");
+            let preview = format!("Task preview {index}");
+            let task_item = |status| TurnItem::Task {
+                item: TaskTurnItem {
+                    id: item_id.clone(),
+                    task_id: format!("task_{index}"),
+                    created_by_turn_id: None,
+                    run_id: Some(format!("run_{index}")),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: title.clone(),
+                    status,
+                    attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    progress_preview: None,
+                    result_preview: Some(preview.clone()),
+                    error_preview: None,
+                    started_at: Some(1_700_000_000),
+                    created_at: 1_700_000_000,
+                    updated_at: 1_700_000_001,
+                },
+            };
+            let historical_status = if index == 6 {
+                TaskStatus::Scheduled
+            } else {
+                TaskStatus::Running
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id.as_str(),
+                task_item(historical_status),
+                1_700_000_000 + index,
+            )
+            .await;
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.clone(),
+                        item: task_item(TaskStatus::Completed),
+                    },
+                    1_700_000_100 + index,
+                )
+                .await
+                .expect("canonical task snapshot should update without a history event");
+            expected.insert(item_id, format!("{title}: {preview} (completed)"));
+        }
+
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        let summary = ingestor
+            .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                history_event_limit: None,
+                item_scan_limit: 100,
+                now_unix: 1_700_001_000,
+            })
+            .await
+            .expect("canonical task summaries should reconcile");
+        assert_eq!(summary.source_items_seen, 7);
+        assert_eq!(summary.source_items_reingested, 7);
+
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 100)
+            .await
+            .expect("reconciled task projections should list");
+        assert_eq!(items.len(), 7);
+        let provider = StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            "file:///tmp/pioneer-thread-episodic-canonical-task-test".to_owned(),
+        );
+        for item in items {
+            let expected_text = expected
+                .get(item.item_id.as_str())
+                .expect("each current task projection should be expected");
+            assert_eq!(item.source_text_hash, source_text_hash(expected_text));
+            let job = crud_store
+                .find_thread_episodic_index_job_by_item(item.id.as_str())
+                .await
+                .expect("task job lookup should succeed")
+                .expect("each current task projection should have a job");
+            let resolved = provider
+                .resolve_index_request(&job)
+                .await
+                .expect("current task payload should pass source hash validation");
+            assert_eq!(&resolved.request.text, expected_text);
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_reindex_reconciles_failed_source_version_and_rejects_late_worker() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_reindex_changed_source";
+        let turn_id = "turn_reindex_changed_source";
+        let item_id = "item_reindex_changed_source";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "historical source text".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_000_000,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                history_event_limit: None,
+                item_scan_limit: 10,
+                now_unix: 1_700_000_010,
+            })
+            .await
+            .expect("historical source should initially reindex");
+        let old_item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("old item should list")
+            .into_iter()
+            .next()
+            .expect("old item should exist");
+        let old_job = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_000_020,
+                1,
+            )
+            .await
+            .expect("old job should claim")
+            .into_iter()
+            .next()
+            .expect("old job should be running");
+
+        let current_text = "canonical source text after enqueue";
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: current_text.to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_000_030,
+            )
+            .await
+            .expect("canonical source should update after enqueue");
+        let payload_provider = StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            "file:///tmp/pioneer-thread-episodic-resume-test".to_owned(),
+        );
+        let resolution_error = payload_provider
+            .resolve_index_request(&old_job)
+            .await
+            .expect_err("old source hash must be rejected after the canonical update");
+        assert_eq!(
+            resolution_error.message,
+            "thread episodic source text hash changed before indexing"
+        );
+        crud_store
+            .fail_thread_episodic_index_job(
+                old_job.id.as_str(),
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some(resolution_error.message),
+                    capacity_error: false,
+                    last_attempt_latency_ms: Some(1),
+                },
+                1_700_000_035,
+            )
+            .await
+            .expect("old source mismatch should become terminal");
+        ingestor
+            .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                history_event_limit: None,
+                item_scan_limit: 10,
+                now_unix: 1_700_000_040,
+            })
+            .await
+            .expect("changed source should reconcile without manual cleanup");
+
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("reconciled items should list");
+        assert_eq!(items.len(), 2);
+        let stale = items
+            .iter()
+            .find(|item| item.id == old_item.id)
+            .expect("stale item should remain as lifecycle history");
+        assert_eq!(stale.status, ThreadEpisodicItemStatus::Superseded);
+        let current = items
+            .iter()
+            .find(|item| item.id != old_item.id)
+            .expect("current item should be created");
+        assert_eq!(current.status, ThreadEpisodicItemStatus::PendingIndex);
+        assert_eq!(current.source_text_hash, source_text_hash(current_text));
+        let retired_job = crud_store
+            .find_thread_episodic_index_job(old_job.id.as_str())
+            .await
+            .expect("retired job lookup should succeed")
+            .expect("retired job should remain");
+        assert_eq!(retired_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(
+            retired_job.last_error.as_deref(),
+            Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR)
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("blocking canceled jobs should count"),
+            0
+        );
+
+        assert!(
+            crud_store
+                .mark_thread_episodic_item_indexed(
+                    old_item.id.as_str(),
+                    ThreadEpisodicItemIndexedUpdate {
+                        capsule_id: "late_capsule".to_owned(),
+                        capsule_ref: "late_capsule_ref".to_owned(),
+                        segment_index: 1,
+                        frame_id: 99,
+                        frame_uri: "late_frame".to_owned(),
+                        embedding_artifact_id: None,
+                    },
+                    1_700_000_050,
+                )
+                .await
+                .expect("late item transition should be handled")
+                .is_none()
+        );
+        assert!(
+            crud_store
+                .complete_thread_episodic_index_job(
+                    old_job.id.as_str(),
+                    ThreadEpisodicIndexJobCompletionUpdate {
+                        capsule_id: "late_capsule".to_owned(),
+                        capsule_ref: "late_capsule_ref".to_owned(),
+                        segment_index: 1,
+                        frame_uri: "late_frame".to_owned(),
+                        last_attempt_latency_ms: Some(1),
+                    },
+                    1_700_000_050,
+                )
+                .await
+                .expect("late job transition should be handled")
+                .is_none()
+        );
+
+        ingestor
+            .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                history_event_limit: None,
+                item_scan_limit: 10,
+                now_unix: 1_700_000_060,
+            })
+            .await
+            .expect("repeat reconciliation should be idempotent");
+        let repeated = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("repeated items should list");
+        assert_eq!(repeated.len(), 2);
+        assert_eq!(
+            repeated
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::PendingIndex)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_attempt_token_rejects_delayed_a_result_after_a_b_a() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_attempt_a_b_a";
+        let turn_id = "turn_attempt_a_b_a";
+        let item_id = "item_attempt_a_b_a";
+        let materialize = |text: &str| TurnItem::UserMessage {
+            id: item_id.to_owned(),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            materialize("version A"),
+            1_700_010_000,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_010_001,
+            )
+            .await
+            .expect("version A should reconcile");
+        let w1 = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_010_002,
+                1,
+            )
+            .await
+            .expect("W1 claim should succeed")
+            .pop()
+            .expect("W1 should claim A");
+
+        for (text, now) in [("version B", 1_700_010_003), ("version A", 1_700_010_005)] {
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item: materialize(text),
+                    },
+                    now,
+                )
+                .await
+                .expect("canonical source should update");
+            ingestor
+                .reconcile_canonical_source_occurrence(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    now + 1,
+                )
+                .await
+                .expect("source version should reconcile");
+        }
+        let w2 = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_010_007,
+                10,
+            )
+            .await
+            .expect("W2 claim should succeed")
+            .into_iter()
+            .find(|job| job.id == w1.id)
+            .expect("restored A should reuse and reclaim its durable job");
+        assert!(w2.attempt_count > w1.attempt_count);
+        let source_payload = crud_store
+            .get_thread_episodic_canonical_item(workspace_id.as_str(), thread_id, turn_id, item_id)
+            .await
+            .expect("canonical source lookup should succeed")
+            .expect("canonical source should exist")
+            .source_payload;
+
+        let stale_success = crud_store
+            .complete_thread_episodic_index_attempt(
+                w1.id.as_str(),
+                w1.attempt_count,
+                source_payload.as_str(),
+                ThreadEpisodicItemIndexedUpdate {
+                    capsule_id: "stale-capsule".to_owned(),
+                    capsule_ref: "stale-capsule-ref".to_owned(),
+                    segment_index: 0,
+                    frame_id: 66,
+                    frame_uri: "mv2://attempt/stale-a".to_owned(),
+                    embedding_artifact_id: None,
+                },
+                ThreadEpisodicIndexJobCompletionUpdate {
+                    capsule_id: "stale-capsule".to_owned(),
+                    capsule_ref: "stale-capsule-ref".to_owned(),
+                    segment_index: 0,
+                    frame_uri: "mv2://attempt/stale-a".to_owned(),
+                    last_attempt_latency_ms: Some(10),
+                },
+                1_700_010_008,
+            )
+            .await
+            .expect("stale W1 success should be handled");
+        assert_eq!(
+            stale_success,
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+
+        let stale_failure = crud_store
+            .fail_thread_episodic_index_attempt(
+                w1.id.as_str(),
+                w1.attempt_count,
+                source_payload.as_str(),
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some("delayed W1 failure".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: Some(10),
+                },
+                1_700_010_009,
+            )
+            .await
+            .expect("stale W1 failure should be handled");
+        assert_eq!(
+            stale_failure,
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+
+        let item_update = ThreadEpisodicItemIndexedUpdate {
+            capsule_id: "capsule-a".to_owned(),
+            capsule_ref: "capsule-ref-a".to_owned(),
+            segment_index: 0,
+            frame_id: 77,
+            frame_uri: "mv2://attempt/a".to_owned(),
+            embedding_artifact_id: None,
+        };
+        let applied = crud_store
+            .complete_thread_episodic_index_attempt(
+                w2.id.as_str(),
+                w2.attempt_count,
+                source_payload.as_str(),
+                item_update,
+                ThreadEpisodicIndexJobCompletionUpdate {
+                    capsule_id: "capsule-a".to_owned(),
+                    capsule_ref: "capsule-ref-a".to_owned(),
+                    segment_index: 0,
+                    frame_uri: "mv2://attempt/a".to_owned(),
+                    last_attempt_latency_ms: Some(1),
+                },
+                1_700_010_010,
+            )
+            .await
+            .expect("W2 completion should commit");
+        assert_eq!(applied, ThreadEpisodicIndexAttemptOutcome::Applied);
+        let job = crud_store
+            .find_thread_episodic_index_job(w2.id.as_str())
+            .await
+            .expect("job lookup should succeed")
+            .expect("job should remain");
+        assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Completed);
+        let item = crud_store
+            .find_thread_episodic_item(w2.index_item_id.as_str())
+            .await
+            .expect("item lookup should succeed")
+            .expect("item should remain");
+        assert_eq!(item.status, ThreadEpisodicItemStatus::Active);
+        assert_eq!(item.frame_id, Some(77));
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_executor_reconciles_source_changed_during_backend_call() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_source_changes_during_backend";
+        let turn_id = "turn_source_changes_during_backend";
+        let item_id = "item_source_changes_during_backend";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "version before backend".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_015_000,
+        )
+        .await;
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_015_001,
+            )
+            .await
+            .expect("initial source should reconcile");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        backend
+            .update_source_during_next_index(
+                crud_store.clone(),
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "version changed during backend".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_015_002,
+            )
+            .await;
+        let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            "file:///tmp/pioneer-thread-episodic-during-backend".to_owned(),
+        ));
+        let executor =
+            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
+        let first = executor
+            .run_once(1_700_015_003)
+            .await
+            .expect("first attempt should reconcile");
+        assert_eq!(first.claimed, 1);
+        assert_eq!(first.completed, 0);
+        let second = executor
+            .run_once(1_700_015_004)
+            .await
+            .expect("current version should index");
+        assert_eq!(second.completed, 1);
+        let requests = backend.requests().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].text, "version before backend");
+        assert_eq!(requests[1].text, "version changed during backend");
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("versions should list");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Active)
+                .count(),
+            1
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Superseded)
+                .count(),
+            1
+        );
+        let active = items
+            .iter()
+            .find(|item| item.status == ThreadEpisodicItemStatus::Active)
+            .unwrap();
+        assert_eq!(
+            active.source_text_hash,
+            source_text_hash("version changed during backend")
+        );
+        assert_eq!(active.frame_id, Some(99));
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_executor_reconciles_source_changed_before_backend_failure_commit() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_source_changes_before_failure_commit";
+        let turn_id = "turn_source_changes_before_failure_commit";
+        let item_id = "item_source_changes_before_failure_commit";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "failure version A".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_015_100,
+        )
+        .await;
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_015_101,
+            )
+            .await
+            .expect("initial source should reconcile");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
+            ThreadEpisodicMemvidError::non_retryable("failure belonging to A"),
+        )]));
+        backend
+            .update_source_during_next_index(
+                crud_store.clone(),
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "failure version B".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_015_102,
+            )
+            .await;
+        let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            "file:///tmp/pioneer-thread-episodic-before-failure-commit".to_owned(),
+        ));
+        let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
+        let first = executor
+            .run_once(1_700_015_103)
+            .await
+            .expect("stale failure should reconcile");
+        assert_eq!(first.failed_terminal, 0);
+        let second = executor
+            .run_once(1_700_015_104)
+            .await
+            .expect("version B should index");
+        assert_eq!(second.completed, 1);
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("blocking failures should count"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_executor_reconciles_source_changed_after_enqueue() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_source_changes_after_enqueue";
+        let turn_id = "turn_source_changes_after_enqueue";
+        let item_id = "item_source_changes_after_enqueue";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "enqueued version".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_016_000,
+        )
+        .await;
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_016_001,
+            )
+            .await
+            .expect("initial source should enqueue");
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "current version".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_016_002,
+            )
+            .await
+            .expect("source should change after enqueue");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let provider = Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            "file:///tmp/pioneer-thread-episodic-after-enqueue".to_owned(),
+        ));
+        let executor =
+            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
+        let first = executor
+            .run_once(1_700_016_003)
+            .await
+            .expect("mismatch should reconcile");
+        assert_eq!(first.claimed, 1);
+        assert_eq!(first.failed_terminal, 0);
+        assert!(
+            backend.requests().await.is_empty(),
+            "stale payload must not reach backend"
+        );
+        let second = executor
+            .run_once(1_700_016_004)
+            .await
+            .expect("current source should index");
+        assert_eq!(second.completed, 1);
+        let requests = backend.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].text, "current version");
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_executor_requeues_same_claim_when_source_returns_a_before_reconcile() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_source_a_b_a_during_resolution";
+        let turn_id = "turn_source_a_b_a_during_resolution";
+        let item_id = "item_source_a_b_a_during_resolution";
+        let item = |text: &str| TurnItem::UserMessage {
+            id: item_id.to_owned(),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            item("version A"),
+            1_700_016_100,
+        )
+        .await;
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_016_101,
+            )
+            .await
+            .expect("version A should enqueue");
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: item("version B"),
+                },
+                1_700_016_102,
+            )
+            .await
+            .expect("resolver should observe version B");
+
+        let provider = Arc::new(RestoreSourceAfterResolutionMismatchProvider {
+            inner: StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-thread-episodic-resolution-a-b-a".to_owned(),
+            ),
+            crud_store: crud_store.clone(),
+            restore: Mutex::new(Some((
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: item("version A"),
+                },
+                1_700_016_103,
+            ))),
+        });
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let executor =
+            ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend.clone(), provider);
+
+        let first = executor
+            .run_once(1_700_016_104)
+            .await
+            .expect("source restoration should release the original claim");
+        assert_eq!(first.claimed, 1);
+        assert_eq!(first.completed, 0);
+        let queued = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("job should list");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].status, ThreadEpisodicIndexJobStatus::Queued);
+
+        let second = executor
+            .run_once(1_700_016_105)
+            .await
+            .expect("restored version A should index");
+        assert_eq!(second.completed, 1);
+        let requests = backend.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].text, "version A");
+        let completed = crud_store
+            .find_thread_episodic_index_job(queued[0].id.as_str())
+            .await
+            .expect("job lookup should succeed")
+            .expect("job should remain");
+        assert_eq!(completed.status, ThreadEpisodicIndexJobStatus::Completed);
+        assert!(completed.attempt_count > queued[0].attempt_count);
+    }
+
+    #[tokio::test]
+    async fn ordinary_ingest_restores_completed_superseded_source_without_reindexing() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_ingest_restore_completed";
+        let turn_id = "turn_ingest_restore_completed";
+        let item_id = "item_ingest_restore_completed";
+        let source_item = |text: &str| TurnItem::UserMessage {
+            id: item_id.to_owned(),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            source_item("version A"),
+            1_700_016_120,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("version A"),
+                )
+                .expect("version A event should be valid"),
+            )
+            .await
+            .expect("ordinary ingest should enqueue version A");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-thread-episodic-ingest-restore-completed".to_owned(),
+            )),
+        );
+        let claim_now = chrono::Utc::now().timestamp().saturating_add(60);
+        assert_eq!(
+            executor
+                .run_once(claim_now)
+                .await
+                .expect("version A should index")
+                .completed,
+            1
+        );
+        let version_a = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("version A should list")
+            .pop()
+            .expect("version A should exist");
+        let version_a_job = crud_store
+            .find_thread_episodic_index_job_by_item(version_a.id.as_str())
+            .await
+            .expect("version A job lookup should succeed")
+            .expect("version A job should exist");
+
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: source_item("version B"),
+                },
+                1_700_016_122,
+            )
+            .await
+            .expect("canonical source should become B");
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("delayed version A event"),
+                )
+                .expect("delayed event should be valid"),
+            )
+            .await
+            .expect("ordinary ingest must select canonical version B");
+        assert_eq!(
+            executor
+                .run_once(claim_now.saturating_add(1))
+                .await
+                .expect("version B should index")
+                .completed,
+            1
+        );
+
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: source_item("version A"),
+                },
+                1_700_016_124,
+            )
+            .await
+            .expect("canonical source should return to A");
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("stale version B event"),
+                )
+                .expect("stale event should be valid"),
+            )
+            .await
+            .expect("ordinary ingest should restore canonical version A");
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("another stale event"),
+                )
+                .expect("repeated stale event should be valid"),
+            )
+            .await
+            .expect("repeated ordinary ingest should be idempotent");
+
+        let versions = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("restored versions should list");
+        assert_eq!(versions.len(), 2);
+        let restored_a = versions
+            .iter()
+            .find(|item| item.source_text_hash == source_text_hash("version A"))
+            .expect("version A should remain unique");
+        let retired_b = versions
+            .iter()
+            .find(|item| item.source_text_hash == source_text_hash("version B"))
+            .expect("version B should remain unique");
+        assert_eq!(restored_a.id, version_a.id);
+        assert_eq!(restored_a.status, ThreadEpisodicItemStatus::Active);
+        assert!(restored_a.frame_id.is_some());
+        assert_eq!(retired_b.status, ThreadEpisodicItemStatus::Superseded);
+        let restored_a_job = crud_store
+            .find_thread_episodic_index_job_by_item(restored_a.id.as_str())
+            .await
+            .expect("restored version A job lookup should succeed")
+            .expect("restored version A job should remain");
+        assert_eq!(
+            restored_a_job.status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+        assert_eq!(restored_a_job.attempt_count, version_a_job.attempt_count);
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10,)
+                .await
+                .expect("completed source jobs should list")
+                .len(),
+            2
+        );
+        assert_eq!(backend.requests().await.len(), 2);
+        assert_eq!(
+            executor
+                .run_once(claim_now.saturating_add(2))
+                .await
+                .expect("restored completed version must not reindex")
+                .claimed,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_ingest_requeues_unfinished_superseded_source_on_return() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_ingest_restore_unfinished";
+        let turn_id = "turn_ingest_restore_unfinished";
+        let item_id = "item_ingest_restore_unfinished";
+        let source_item = |text: &str| TurnItem::UserMessage {
+            id: item_id.to_owned(),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            source_item("unfinished A"),
+            1_700_016_140,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("unfinished A"),
+                )
+                .expect("version A event should be valid"),
+            )
+            .await
+            .expect("ordinary ingest should enqueue unfinished A");
+        let version_a = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("unfinished A should list")
+            .pop()
+            .expect("unfinished A should exist");
+        let original_a_job = crud_store
+            .find_thread_episodic_index_job_by_item(version_a.id.as_str())
+            .await
+            .expect("unfinished A job lookup should succeed")
+            .expect("unfinished A job should exist");
+
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: source_item("processed B"),
+                },
+                1_700_016_141,
+            )
+            .await
+            .expect("canonical source should become B");
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("delayed unfinished A"),
+                )
+                .expect("delayed A event should be valid"),
+            )
+            .await
+            .expect("ordinary ingest should reconcile canonical B");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-thread-episodic-ingest-restore-unfinished".to_owned(),
+            )),
+        );
+        let claim_now = chrono::Utc::now().timestamp().saturating_add(60);
+        assert_eq!(
+            executor
+                .run_once(claim_now)
+                .await
+                .expect("version B should finish")
+                .completed,
+            1
+        );
+
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: source_item("unfinished A"),
+                },
+                1_700_016_143,
+            )
+            .await
+            .expect("canonical source should return to unfinished A");
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("stale processed B"),
+                )
+                .expect("stale B event should be valid"),
+            )
+            .await
+            .expect("ordinary ingest should requeue canonical A");
+        let restored_a = crud_store
+            .find_thread_episodic_item(version_a.id.as_str())
+            .await
+            .expect("restored A lookup should succeed")
+            .expect("restored A should remain");
+        assert_eq!(restored_a.status, ThreadEpisodicItemStatus::PendingIndex);
+        let restored_a_job = crud_store
+            .find_thread_episodic_index_job_by_item(version_a.id.as_str())
+            .await
+            .expect("restored A job lookup should succeed")
+            .expect("restored A job should remain");
+        assert_eq!(restored_a_job.id, original_a_job.id);
+        assert_eq!(restored_a_job.status, ThreadEpisodicIndexJobStatus::Queued);
+        assert_eq!(
+            executor
+                .run_once(claim_now.saturating_add(1))
+                .await
+                .expect("restored unfinished A should index")
+                .completed,
+            1
+        );
+        let completed_a_job = crud_store
+            .find_thread_episodic_index_job_by_item(version_a.id.as_str())
+            .await
+            .expect("completed restored A job lookup should succeed")
+            .expect("completed restored A job should remain");
+        assert_eq!(
+            completed_a_job.status,
+            ThreadEpisodicIndexJobStatus::Completed
+        );
+        assert!(completed_a_job.attempt_count > original_a_job.attempt_count);
+        ingestor
+            .ingest_committed_item(
+                committed_item_ingestion_input_from_parts(
+                    workspace_id.as_str(),
+                    thread_id,
+                    turn_id,
+                    source_item("late B after A completed"),
+                )
+                .expect("late B event should be valid"),
+            )
+            .await
+            .expect("repeat ingest should preserve completed A");
+        let versions = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("source versions should list");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            versions
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Active)
+                .count(),
+            1
+        );
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10,)
+                .await
+                .expect("unfinished source jobs should list")
+                .len(),
+            2
+        );
+        assert_eq!(backend.requests().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_exclusion_during_backend_rejects_result_and_stops_reindexing() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_excluded_during_backend";
+        let turn_id = "turn_excluded_during_backend";
+        let item_id = "item_excluded_during_backend";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "exclude while backend is working".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_016_200,
+        )
+        .await;
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_016_201,
+            )
+            .await
+            .expect("source should enqueue");
+        let projection = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("projection should list")
+            .pop()
+            .expect("projection should exist");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        backend
+            .exclude_during_next_index(
+                crud_store.clone(),
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    index_item_id: projection.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".to_owned(),
+                },
+                1_700_016_202,
+            )
+            .await;
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-thread-episodic-exclusion-race".to_owned(),
+            )),
+        );
+
+        let first = executor
+            .run_once(1_700_016_203)
+            .await
+            .expect("excluded result should be discarded");
+        assert_eq!(first.completed, 0);
+        let second = executor
+            .run_once(1_700_016_204)
+            .await
+            .expect("excluded source should not be claimed again");
+        assert_eq!(second.claimed, 0);
+        assert_eq!(backend.requests().await.len(), 1);
+        let excluded = crud_store
+            .find_thread_episodic_item(projection.id.as_str())
+            .await
+            .expect("excluded projection lookup should succeed")
+            .expect("excluded projection should remain");
+        assert_eq!(excluded.status, ThreadEpisodicItemStatus::Excluded);
+        assert!(excluded.frame_id.is_none());
+        assert!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    workspace_id.as_str(),
+                    thread_id,
+                    projection.id.as_str(),
+                )
+                .await
+                .expect("exclusion lookup should succeed")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_executor_retires_stably_missing_source_without_retry_loop() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_thread_episodic_item_with_state(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_missing_canonical_source",
+            "turn_missing_canonical_source",
+            "item_missing_canonical_source",
+            "orphan projection text",
+            ThreadEpisodicItemStatus::PendingIndex,
+            ThreadEpisodicItemVisibility::UserVisible,
+        )
+        .await;
+        let job = crud_store
+            .insert_thread_episodic_index_job_if_absent(
+                NewThreadEpisodicIndexJobRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: item.thread_id.clone(),
+                    index_item_id: item.id.clone(),
+                    capsule_id: None,
+                    capsule_ref: None,
+                    segment_index: None,
+                    frame_uri: None,
+                    status: ThreadEpisodicIndexJobStatus::Queued,
+                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
+                    next_run_at: fixed_datetime_from_unix(1_700_016_300),
+                    last_error: None,
+                },
+                1_700_016_300,
+            )
+            .await
+            .expect("orphan job should insert");
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-thread-episodic-missing-source".to_owned(),
+            )),
+        );
+
+        let summary = executor
+            .run_once(1_700_016_301)
+            .await
+            .expect("missing source should retire");
+        assert_eq!(summary.claimed, 1);
+        assert_eq!(summary.failed_retryable, 0);
+        assert_eq!(backend.requests().await.len(), 0);
+        let retired_item = crud_store
+            .find_thread_episodic_item(item.id.as_str())
+            .await
+            .expect("retired item lookup should succeed")
+            .expect("retired item should remain");
+        assert_eq!(retired_item.status, ThreadEpisodicItemStatus::Superseded);
+        let retired_job = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("retired job lookup should succeed")
+            .expect("retired job should remain");
+        assert_eq!(retired_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(
+            retired_job.last_error.as_deref(),
+            Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR)
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("automatic retirement must not block refill"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_reconcile_recovers_only_proven_legacy_hash_mismatch() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_legacy_hash_returned";
+        let turn_id = "turn_legacy_hash_returned";
+        let item_id = "item_legacy_hash_returned";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "version A".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_019_000,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_019_001,
+            )
+            .await
+            .expect("version A should reconcile");
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_019_002,
+                1,
+            )
+            .await
+            .expect("legacy job should claim")
+            .pop()
+            .expect("legacy job should exist");
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                claimed.id.as_str(),
+                claimed.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some(
+                        pioneer_crud::THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR.to_owned(),
+                    ),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                1_700_019_003,
+            )
+            .await
+            .expect("legacy mismatch should persist");
+
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_019_004,
+            )
+            .await
+            .expect("returned version A should recover");
+        let recovered = crud_store
+            .find_thread_episodic_index_job(claimed.id.as_str())
+            .await
+            .expect("recovered job lookup should succeed")
+            .expect("recovered job should remain");
+        assert_eq!(recovered.status, ThreadEpisodicIndexJobStatus::Queued);
+        assert_eq!(recovered.attempt_count, claimed.attempt_count);
+
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                "file:///tmp/pioneer-thread-episodic-legacy-return".to_owned(),
+            )),
+        );
+        let summary = executor
+            .run_once(1_700_019_005)
+            .await
+            .expect("recovered legacy mismatch should execute");
+        assert_eq!(summary.completed, 1);
+        assert_eq!(backend.requests().await.len(), 1);
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_019_006,
+            )
+            .await
+            .expect("repeat reconciliation should be idempotent");
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("jobs should list");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, ThreadEpisodicIndexJobStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_exclusion_reclassifies_old_canceled_error_for_refill() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_excluded_old_cancel",
+            "turn_excluded_old_cancel",
+            "item_excluded_old_cancel",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            item.thread_id.as_str(),
+            item.id.as_str(),
+            1_700_019_100,
+        )
+        .await;
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_019_101,
+                1,
+            )
+            .await
+            .expect("job should claim")
+            .pop()
+            .expect("job should exist");
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                job.id.as_str(),
+                claimed.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some("real old provider failure".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                1_700_019_102,
+            )
+            .await
+            .expect("old terminal failure should persist");
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("terminal count should succeed"),
+            1
+        );
+        crud_store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: item.thread_id.clone(),
+                    index_item_id: item.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "test".to_owned(),
+                },
+                1_700_019_103,
+            )
+            .await
+            .expect("exclusion should persist");
+        let canceled = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("excluded job lookup should succeed")
+            .expect("excluded job should remain");
+        assert_eq!(canceled.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(
+            canceled.last_error.as_deref(),
+            Some(THREAD_EPISODIC_USER_EXCLUDED_ERROR)
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("excluded terminal count should succeed"),
+            0
+        );
+        assert!(
+            crud_store
+                .claim_due_thread_episodic_index_jobs_for_workspace(
+                    workspace_id.as_str(),
+                    1_700_019_104,
+                    10,
+                )
+                .await
+                .expect("excluded claim scan should succeed")
+                .is_empty()
+        );
+
+        let other = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_unrelated_terminal_cancel",
+            "turn_unrelated_terminal_cancel",
+            "item_unrelated_terminal_cancel",
+        )
+        .await;
+        let other_job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            other.thread_id.as_str(),
+            other.id.as_str(),
+            1_700_019_105,
+        )
+        .await;
+        let other_claim = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_019_106,
+                1,
+            )
+            .await
+            .expect("unrelated job should claim")
+            .pop()
+            .expect("unrelated job should exist");
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                other_job.id.as_str(),
+                other_claim.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some("independent terminal provider failure".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                1_700_019_107,
+            )
+            .await
+            .expect("unrelated terminal failure should persist");
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                other.thread_id.as_str(),
+                other.turn_id.as_str(),
+                other.item_id.as_str(),
+                1_700_019_108,
+            )
+            .await
+            .expect("unrelated source reconciliation should succeed");
+        let unrelated_terminal = crud_store
+            .find_thread_episodic_index_job(other_job.id.as_str())
+            .await
+            .expect("unrelated job lookup should succeed")
+            .expect("unrelated job should remain");
+        assert_eq!(
+            unrelated_terminal.status,
+            ThreadEpisodicIndexJobStatus::Canceled
+        );
+        assert_eq!(
+            unrelated_terminal.last_error.as_deref(),
+            Some("independent terminal provider failure")
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("unrelated terminal count should succeed"),
+            1,
+            "excluding one occurrence must not hide another occurrence's real error"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_persistence_recovery_obeys_backoff_limit_and_attempt_token() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_persistence_recovery",
+            "turn_persistence_recovery",
+            "item_persistence_recovery",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            item.thread_id.as_str(),
+            item.id.as_str(),
+            1_700_019_200,
+        )
+        .await;
+        let first = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_019_201,
+                1,
+            )
+            .await
+            .expect("first attempt should claim")
+            .pop()
+            .expect("first attempt should exist");
+        assert_eq!(
+            crud_store
+                .recover_thread_episodic_index_attempt_after_persistence_error(
+                    job.id.as_str(),
+                    first.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: true,
+                        next_run_at_unix: Some(1_700_019_300),
+                        last_error: Some("completion persistence failed".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None,
+                    },
+                    1_700_019_202,
+                )
+                .await
+                .expect("claim should be released"),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        assert!(
+            crud_store
+                .claim_due_thread_episodic_index_jobs_for_workspace(
+                    workspace_id.as_str(),
+                    1_700_019_299,
+                    1,
+                )
+                .await
+                .expect("early claim scan should succeed")
+                .is_empty()
+        );
+        let second = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_019_300,
+                1,
+            )
+            .await
+            .expect("second attempt should claim")
+            .pop()
+            .expect("second attempt should exist");
+        assert!(second.attempt_count > first.attempt_count);
+        let terminal_update = ThreadEpisodicIndexJobFailureUpdate {
+            retryable: false,
+            next_run_at_unix: None,
+            last_error: Some("failure persistence failed at retry limit".to_owned()),
+            capacity_error: false,
+            last_attempt_latency_ms: None,
+        };
+        assert_eq!(
+            crud_store
+                .recover_thread_episodic_index_attempt_after_persistence_error(
+                    job.id.as_str(),
+                    first.attempt_count,
+                    terminal_update.clone(),
+                    1_700_019_301,
+                )
+                .await
+                .expect("late first attempt should be rejected"),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        assert_eq!(
+            crud_store
+                .recover_thread_episodic_index_attempt_after_persistence_error(
+                    job.id.as_str(),
+                    second.attempt_count,
+                    terminal_update,
+                    1_700_019_302,
+                )
+                .await
+                .expect("current attempt should terminate"),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        let terminal = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("terminal job lookup should succeed")
+            .expect("terminal job should remain");
+        assert_eq!(terminal.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(terminal.attempt_count, second.attempt_count);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_user_tombstone_is_not_reclassified_as_superseded() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_user_tombstone_reconcile";
+        let turn_id = "turn_user_tombstone_reconcile";
+        let item_id = "item_user_tombstone_reconcile";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "before deletion".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_020_000,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_020_001,
+            )
+            .await
+            .expect("initial source should reconcile");
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "automatically superseding version".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_020_002,
+            )
+            .await
+            .expect("source should change before user deletion");
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_020_003,
+            )
+            .await
+            .expect("old source should become automatically superseded");
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_020_004,
+                1,
+            )
+            .await
+            .expect("current projection should claim before tombstone")
+            .pop()
+            .expect("current projection job should exist");
+        crud_store
+            .tombstone_thread_episodic_items_for_item(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_020_005,
+            )
+            .await
+            .expect("user tombstone should commit");
+        let exclusion = NewThreadEpisodicExclusionRecord {
+            id: None,
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            index_item_id: claimed.index_item_id.clone(),
+            reason: ThreadEpisodicExclusionReason::UserRequested,
+            created_by: "tombstone-provenance-test".to_owned(),
+        };
+        crud_store
+            .exclude_thread_episodic_item(exclusion.clone(), 1_700_020_006)
+            .await
+            .expect("exclusion after tombstone should persist without reclassifying deletion");
+        crud_store
+            .exclude_thread_episodic_item(exclusion, 1_700_020_007)
+            .await
+            .expect("repeated exclusion should be idempotent");
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "after deletion".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_020_008,
+            )
+            .await
+            .expect("canonical source may become indexable again");
+        let outcome = ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_020_009,
+            )
+            .await
+            .expect("tombstone reconciliation should finish");
+        assert_eq!(
+            outcome,
+            ThreadEpisodicSourceReconcileOutcome::PreservedDeletion
+        );
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("items should list");
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.status == ThreadEpisodicItemStatus::Deleted)
+        );
+        for item in items {
+            let job = crud_store
+                .find_thread_episodic_index_job_by_item(item.id.as_str())
+                .await
+                .expect("job lookup should succeed")
+                .expect("job should remain");
+            assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Canceled);
+            assert_eq!(
+                job.last_error.as_deref(),
+                Some(pioneer_crud::THREAD_EPISODIC_USER_DELETED_ERROR)
+            );
+        }
+        assert!(
+            crud_store
+                .claim_due_thread_episodic_index_jobs_for_workspace(
+                    workspace_id.as_str(),
+                    1_700_020_010,
+                    10,
+                )
+                .await
+                .expect("deleted occurrence claim scan should succeed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_claim_recovers_legacy_active_item_running_job_boundary() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_active_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_partial_completion",
+            "turn_partial_completion",
+            "item_partial_completion",
+            "already indexed",
+        )
+        .await;
+        let job = crud_store
+            .insert_thread_episodic_index_job_if_absent(
+                NewThreadEpisodicIndexJobRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: item.thread_id.clone(),
+                    index_item_id: item.id.clone(),
+                    capsule_id: None,
+                    capsule_ref: None,
+                    segment_index: None,
+                    frame_uri: None,
+                    status: ThreadEpisodicIndexJobStatus::Queued,
+                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
+                    next_run_at: fixed_datetime_from_unix(1_700_025_000),
+                    last_error: None,
+                },
+                1_700_025_000,
+            )
+            .await
+            .expect("legacy partial job should insert");
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_025_001,
+                1,
+            )
+            .await
+            .expect("claim scan should recover partial completion");
+        assert!(
+            claimed.is_empty(),
+            "recovered projection must not be indexed twice"
+        );
+        let recovered = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("job lookup should succeed")
+            .expect("job should remain");
+        assert_eq!(recovered.status, ThreadEpisodicIndexJobStatus::Completed);
+        assert_eq!(recovered.capsule_id, item.capsule_id);
+        assert_eq!(recovered.frame_uri, item.frame_uri);
+        let directory = crud_store
+            .list_thread_episodic_thread_directory_entries_for_workspace(workspace_id.as_str(), 10)
+            .await
+            .expect("recovered thread directory should list");
+        assert_eq!(directory.len(), 1);
+        assert_eq!(directory[0].thread_id, item.thread_id);
+        assert_eq!(directory[0].indexed_item_count, 1);
+        let selectable = crud_store
+            .list_selectable_thread_episodic_thread_directory_entries(
+                ThreadEpisodicThreadDirectorySelection {
+                    workspace_id: workspace_id.clone(),
+                    query_text: None,
+                    task_affinity_json: None,
+                    project_affinity_json: None,
+                    exclude_thread_ids: Vec::new(),
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("recovered directory should be selectable");
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].thread_id, item.thread_id);
+        let repeated = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_025_002,
+                1,
+            )
+            .await
+            .expect("repeat claim scan should succeed");
+        assert!(repeated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_many_source_versions_reconcile_in_bounded_quanta() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_many_source_versions";
+        let turn_id = "turn_many_source_versions";
+        let item_id = "item_many_source_versions";
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: "canonical version".to_owned(),
+                attachments: Vec::new(),
+            },
+            1_700_026_000,
+        )
+        .await;
+        for index in 0..70 {
+            crud_store
+                .upsert_thread_episodic_item(
+                    NewThreadEpisodicItemRecord {
+                        id: None,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        source_actor_role: StoreThreadEpisodicSourceActorRole::User,
+                        source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
+                        source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                        visibility: ThreadEpisodicItemVisibility::UserVisible,
+                        status: ThreadEpisodicItemStatus::PendingIndex,
+                        text_hash: format!("{index:064x}"),
+                        source_text_hash: format!("{:064x}", index + 100),
+                        projection_group_id: format!("many-version-{index}"),
+                        language_hint: None,
+                        token_estimate: 1,
+                        capsule_id: None,
+                        capsule_ref: None,
+                        segment_index: None,
+                        frame_id: None,
+                        frame_uri: None,
+                        indexed_at: None,
+                        deleted_at: None,
+                    },
+                    1_700_026_001 + index,
+                )
+                .await
+                .expect("historical source version should insert");
+        }
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_026_100,
+            )
+            .await
+            .expect("all bounded version quanta should converge");
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                1_700_026_101,
+            )
+            .await
+            .expect("repeat reconciliation should be idempotent");
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 100)
+            .await
+            .expect("versions should list");
+        assert_eq!(items.len(), 71);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::PendingIndex)
+                .count(),
+            1
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Superseded)
+                .count(),
+            70
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_retirement_repairs_legacy_exclusion_and_deletion_in_quanta() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let thread_id = "thread_legacy_lifecycle_retirement";
+        let turn_id = "turn_legacy_lifecycle_retirement";
+        let item_id = "item_legacy_lifecycle_retirement";
+        let mut versions = Vec::new();
+        for index in 0..40 {
+            let item = crud_store
+                .upsert_thread_episodic_item(
+                    NewThreadEpisodicItemRecord {
+                        id: None,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.to_owned(),
+                        source_actor_role: StoreThreadEpisodicSourceActorRole::User,
+                        source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
+                        source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                        visibility: ThreadEpisodicItemVisibility::UserVisible,
+                        status: ThreadEpisodicItemStatus::Excluded,
+                        text_hash: format!("{index:064x}"),
+                        source_text_hash: format!("{:064x}", index + 100),
+                        projection_group_id: format!("legacy-excluded-{index}"),
+                        language_hint: None,
+                        token_estimate: 1,
+                        capsule_id: None,
+                        capsule_ref: None,
+                        segment_index: None,
+                        frame_id: None,
+                        frame_uri: None,
+                        indexed_at: None,
+                        deleted_at: None,
+                    },
+                    1_700_062_000 + index,
+                )
+                .await
+                .expect("legacy excluded version should insert");
+            versions.push(item);
+        }
+        crud_store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    index_item_id: versions[0].id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "legacy-fixture".to_owned(),
+                },
+                1_700_062_050,
+            )
+            .await
+            .expect("legacy exclusion anchor should insert before stale jobs");
+        for (index, item) in versions.iter().enumerate() {
+            crud_store
+                .insert_thread_episodic_index_job_if_absent(
+                    NewThreadEpisodicIndexJobRecord {
+                        id: None,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        index_item_id: item.id.clone(),
+                        capsule_id: None,
+                        capsule_ref: None,
+                        segment_index: None,
+                        frame_uri: None,
+                        status: if index == 39 {
+                            ThreadEpisodicIndexJobStatus::Completed
+                        } else {
+                            ThreadEpisodicIndexJobStatus::Canceled
+                        },
+                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
+                        next_run_at: fixed_datetime_from_unix(1_700_062_060 + index as i64),
+                        last_error: if index == 39 {
+                            Some("completed job diagnostic".to_owned())
+                        } else {
+                            (index != 0).then(|| {
+                                pioneer_crud::THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR
+                                    .to_owned()
+                            })
+                        },
+                    },
+                    1_700_062_060 + index as i64,
+                )
+                .await
+                .expect("legacy excluded job should insert");
+        }
+        let mut unrelated_jobs = Vec::new();
+        for index in 0..96 {
+            let unrelated_thread_id = format!("thread_unrelated_lifecycle_{index}");
+            let unrelated_turn_id = format!("turn_unrelated_lifecycle_{index}");
+            let unrelated_item_id = format!("item_unrelated_lifecycle_{index}");
+            let unrelated = seed_thread_episodic_item_with_state(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                unrelated_thread_id.as_str(),
+                unrelated_turn_id.as_str(),
+                unrelated_item_id.as_str(),
+                "unrelated terminal source",
+                ThreadEpisodicItemStatus::Failed,
+                ThreadEpisodicItemVisibility::UserVisible,
+            )
+            .await;
+            let job = crud_store
+                .insert_thread_episodic_index_job_if_absent(
+                    NewThreadEpisodicIndexJobRecord {
+                        id: None,
+                        workspace_id: workspace_id.clone(),
+                        thread_id: unrelated.thread_id.clone(),
+                        index_item_id: unrelated.id,
+                        capsule_id: None,
+                        capsule_ref: None,
+                        segment_index: None,
+                        frame_uri: None,
+                        status: ThreadEpisodicIndexJobStatus::Canceled,
+                        graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
+                        next_run_at: fixed_datetime_from_unix(1_700_062_100 + index),
+                        last_error: Some("independent terminal provider failure".to_owned()),
+                    },
+                    1_700_062_100 + index,
+                )
+                .await
+                .expect("unrelated terminal job should insert");
+            unrelated_jobs.push(job.id);
+        }
+        let first = crud_store
+            .retire_thread_episodic_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                None,
+                1_700_062_200,
+            )
+            .await
+            .expect("first exclusion repair quantum should succeed");
+        assert_eq!(first, ThreadEpisodicSourceReconcileOutcome::MoreWork);
+        let second = crud_store
+            .retire_thread_episodic_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                None,
+                1_700_062_201,
+            )
+            .await
+            .expect("second exclusion repair quantum should succeed");
+        assert_eq!(
+            second,
+            ThreadEpisodicSourceReconcileOutcome::PreservedExclusion
+        );
+        let repeated = crud_store
+            .retire_thread_episodic_source_occurrence(
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                item_id,
+                None,
+                1_700_062_202,
+            )
+            .await
+            .expect("completed exclusion repair should remain idempotent");
+        assert_eq!(
+            repeated,
+            ThreadEpisodicSourceReconcileOutcome::PreservedExclusion
+        );
+        for (index, item) in versions.iter().enumerate() {
+            let job = crud_store
+                .find_thread_episodic_index_job_by_item(item.id.as_str())
+                .await
+                .expect("repaired exclusion job lookup should succeed")
+                .expect("repaired exclusion job should remain");
+            if index == 39 {
+                assert_eq!(job.status, ThreadEpisodicIndexJobStatus::Completed);
+                assert_eq!(job.last_error.as_deref(), Some("completed job diagnostic"));
+            } else {
+                assert_eq!(
+                    job.last_error.as_deref(),
+                    Some(THREAD_EPISODIC_USER_EXCLUDED_ERROR)
+                );
+            }
+        }
+        for job_id in &unrelated_jobs {
+            let job = crud_store
+                .find_thread_episodic_index_job(job_id.as_str())
+                .await
+                .expect("unrelated job lookup should succeed")
+                .expect("unrelated job should remain");
+            assert_eq!(
+                job.last_error.as_deref(),
+                Some("independent terminal provider failure")
+            );
+        }
+
+        let task_thread = "thread_legacy_excluded_task_without_preview";
+        let task_turn = "turn_legacy_excluded_task_without_preview";
+        let mut task = TaskTurnItem {
+            id: "item_legacy_excluded_task_without_preview".to_owned(),
+            task_id: "task_legacy_excluded_without_preview".to_owned(),
+            created_by_turn_id: None,
+            run_id: Some("run_legacy_excluded_without_preview".to_owned()),
+            parent_task_id: None,
+            root_task_id: None,
+            title: "Legacy excluded task".to_owned(),
+            status: TaskStatus::Completed,
+            attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+            trigger_kind: TaskTriggerKind::Immediate,
+            executor_kind: TaskExecutorKind::Agent,
+            child_thread_id: None,
+            child_turn_id: None,
+            agent_role: None,
+            depth: 0,
+            max_depth: 3,
+            next_fire_at: None,
+            progress_preview: None,
+            result_preview: Some("old indexable preview".to_owned()),
+            error_preview: None,
+            started_at: Some(1),
+            created_at: 1,
+            updated_at: 2,
+        };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            task_thread,
+            task_turn,
+            TurnItem::Task { item: task.clone() },
+            1_700_062_250,
+        )
+        .await;
+        let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
+        ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                task_thread,
+                task_turn,
+                task.id.as_str(),
+                1_700_062_251,
+            )
+            .await
+            .expect("indexable task preview should reconcile");
+        let task_projection = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), task_thread, 10)
+            .await
+            .expect("task projection should list")
+            .pop()
+            .expect("task projection should exist");
+        crud_store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: task_thread.to_owned(),
+                    index_item_id: task_projection.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "legacy-task-fixture".to_owned(),
+                },
+                1_700_062_252,
+            )
+            .await
+            .expect("task exclusion anchor should insert");
+        let task_job = crud_store
+            .find_thread_episodic_index_job_by_item(task_projection.id.as_str())
+            .await
+            .expect("task job lookup should succeed")
+            .expect("task job should exist");
+        crud_store
+            .cancel_thread_episodic_index_job(
+                task_job.id.as_str(),
+                Some("legacy task provider failure".to_owned()),
+                1_700_062_253,
+            )
+            .await
+            .expect("legacy task error should persist")
+            .expect("legacy task job should remain");
+        task.result_preview = None;
+        task.updated_at = 3;
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: task_thread.to_owned(),
+                    turn_id: task_turn.to_owned(),
+                    item: TurnItem::Task { item: task.clone() },
+                },
+                1_700_062_254,
+            )
+            .await
+            .expect("non-indexable task update should persist");
+        let task_outcome = ingestor
+            .reconcile_canonical_source_occurrence(
+                workspace_id.as_str(),
+                task_thread,
+                task_turn,
+                task.id.as_str(),
+                1_700_062_255,
+            )
+            .await
+            .expect("non-indexable excluded task should retire cleanly");
+        assert_eq!(
+            task_outcome,
+            ThreadEpisodicSourceReconcileOutcome::PreservedExclusion
+        );
+        let task_job = crud_store
+            .find_thread_episodic_index_job(task_job.id.as_str())
+            .await
+            .expect("repaired task job lookup should succeed")
+            .expect("repaired task job should remain");
+        assert_eq!(
+            task_job.last_error.as_deref(),
+            Some(THREAD_EPISODIC_USER_EXCLUDED_ERROR)
+        );
+
+        let deleted = crud_store
+            .upsert_thread_episodic_item(
+                NewThreadEpisodicItemRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: "thread_legacy_deleted_retirement".to_owned(),
+                    turn_id: "turn_legacy_deleted_retirement".to_owned(),
+                    item_id: "item_legacy_deleted_retirement".to_owned(),
+                    source_actor_role: StoreThreadEpisodicSourceActorRole::User,
+                    source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
+                    source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                    visibility: ThreadEpisodicItemVisibility::UserVisible,
+                    status: ThreadEpisodicItemStatus::Deleted,
+                    text_hash: "d".repeat(64),
+                    source_text_hash: "e".repeat(64),
+                    projection_group_id: "legacy-deleted".to_owned(),
+                    language_hint: None,
+                    token_estimate: 1,
+                    capsule_id: None,
+                    capsule_ref: None,
+                    segment_index: None,
+                    frame_id: None,
+                    frame_uri: None,
+                    indexed_at: None,
+                    deleted_at: Some(fixed_datetime_from_unix(1_700_062_300)),
+                },
+                1_700_062_300,
+            )
+            .await
+            .expect("legacy deleted projection should insert");
+        crud_store
+            .insert_thread_episodic_index_job_if_absent(
+                NewThreadEpisodicIndexJobRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: deleted.thread_id.clone(),
+                    index_item_id: deleted.id.clone(),
+                    capsule_id: None,
+                    capsule_ref: None,
+                    segment_index: None,
+                    frame_uri: None,
+                    status: ThreadEpisodicIndexJobStatus::Canceled,
+                    graph_enrichment_state: ThreadEpisodicGraphEnrichmentState::NotSupported,
+                    next_run_at: fixed_datetime_from_unix(1_700_062_301),
+                    last_error: Some("legacy terminal error before tombstone repair".to_owned()),
+                },
+                1_700_062_301,
+            )
+            .await
+            .expect("legacy deleted job should insert");
+        let deleted_outcome = crud_store
+            .retire_thread_episodic_source_occurrence(
+                workspace_id.as_str(),
+                deleted.thread_id.as_str(),
+                deleted.turn_id.as_str(),
+                deleted.item_id.as_str(),
+                None,
+                1_700_062_302,
+            )
+            .await
+            .expect("legacy deletion repair should succeed");
+        assert_eq!(
+            deleted_outcome,
+            ThreadEpisodicSourceReconcileOutcome::PreservedDeletion
+        );
+        let deleted_job = crud_store
+            .find_thread_episodic_index_job_by_item(deleted.id.as_str())
+            .await
+            .expect("deleted job lookup should succeed")
+            .expect("deleted job should remain");
+        assert_eq!(
+            deleted_job.last_error.as_deref(),
+            Some(pioneer_crud::THREAD_EPISODIC_USER_DELETED_ERROR)
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("repaired user lifecycle jobs should not block refill"),
+            unrelated_jobs.len() as u64,
+            "independent terminal failures must remain visible after bounded repair"
         );
     }
 
@@ -6540,8 +9735,14 @@ mod tests {
         assert!(output.hits.is_empty());
         assert!(output.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == ThreadEpisodicRecallDiagnosticCode::SuppressedByBoundary
-                && diagnostic.message.contains("explicit exclusion")
+                && diagnostic.message.contains("status is not active")
         }));
+        let excluded_item = crud_store
+            .find_thread_episodic_item(item.id.as_str())
+            .await
+            .expect("excluded projection lookup should succeed")
+            .expect("excluded projection should remain stored");
+        assert_eq!(excluded_item.status, ThreadEpisodicItemStatus::Excluded);
         let source_item = crud_store
             .get_turn_item(turn_id, item_id)
             .await
@@ -6810,6 +10011,7 @@ mod tests {
     struct StaticThreadEpisodicIndexPayloadProvider {
         request: ThreadEpisodicMemvidIndexRequest,
         segment_index: i64,
+        source_payload: String,
     }
 
     struct StaticThreadEpisodicEmbeddingProvider {
@@ -6910,8 +10112,32 @@ mod tests {
                 request: self.request.clone(),
                 segment_index: self.segment_index,
                 embedding_artifact_id: None,
+                source_payload: self.source_payload.clone(),
             })
         }
+    }
+
+    async fn static_index_payload_provider(
+        crud_store: &CrudStore,
+        item: &ThreadEpisodicItemRecord,
+        request: ThreadEpisodicMemvidIndexRequest,
+        segment_index: i64,
+    ) -> Arc<StaticThreadEpisodicIndexPayloadProvider> {
+        let canonical = crud_store
+            .get_thread_episodic_canonical_item(
+                item.workspace_id.as_str(),
+                item.thread_id.as_str(),
+                item.turn_id.as_str(),
+                item.item_id.as_str(),
+            )
+            .await
+            .expect("canonical item lookup should succeed")
+            .expect("canonical item should exist");
+        Arc::new(StaticThreadEpisodicIndexPayloadProvider {
+            request,
+            segment_index,
+            source_payload: canonical.source_payload,
+        })
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6977,10 +10203,7 @@ mod tests {
             "mv2://pioneer/thread_episodic/test/capsules/capsule_vector_payload",
             item.id.as_str(),
         );
-        let inner = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-            request,
-            segment_index: 3,
-        });
+        let inner = static_index_payload_provider(crud_store.as_ref(), &item, request, 3).await;
         let embedding_provider = Arc::new(StaticThreadEpisodicEmbeddingProvider::new(vec![
             0.1, 0.2, 0.3,
         ]));
@@ -7029,10 +10252,7 @@ mod tests {
             item.id.as_str(),
         );
         let provider = VectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request,
-                segment_index: 3,
-            }),
+            static_index_payload_provider(crud_store.as_ref(), &item, request, 3).await,
             Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
                 ThreadEpisodicEmbeddingError::retryable_provider_failure(
                     "test",
@@ -7080,10 +10300,7 @@ mod tests {
             item.id.as_str(),
         );
         let provider = VectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request,
-                segment_index: 3,
-            }),
+            static_index_payload_provider(crud_store.as_ref(), &item, request, 3).await,
             Arc::new(StaticThreadEpisodicEmbeddingProvider::with_error(
                 ThreadEpisodicEmbeddingError::missing_key("test", "test-embedding"),
             )),
@@ -7214,7 +10431,40 @@ mod tests {
         turn_id: &str,
         item_id: &str,
     ) -> ThreadEpisodicItemRecord {
-        let source_text_hash = "b".repeat(64);
+        let canonical_item = TurnItem::UserMessage {
+            id: item_id.to_owned(),
+            text: format!("canonical source for {item_id}"),
+            attachments: Vec::new(),
+        };
+        materialize_thread_with_item(
+            crud_store,
+            workspace_id,
+            thread_id,
+            turn_id,
+            canonical_item.clone(),
+            1_700_000_000,
+        )
+        .await;
+        let committed = ThreadEpisodicCommittedItem {
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+            item_type: canonical_item.item_type(),
+            source_actor_role: committed_item_source_actor_role(&canonical_item),
+            source_context: committed_item_source_context(&canonical_item),
+            item: canonical_item,
+        };
+        let source = match select_committed_item_source(&committed) {
+            ThreadEpisodicSourceSelection::Indexable(source) => source,
+            ThreadEpisodicSourceSelection::Rejected { reason } => {
+                panic!("test canonical item should be indexable: {reason:?}")
+            }
+        };
+        let source_text_hash = source_text_hash(source.text.as_str());
+        let text_hash = item_text_hash(&committed, source.text.as_str());
+        let source_actor_role = store_source_actor_role(source.source_actor_role);
+        let source_context = source.source_context;
         crud_store
             .upsert_thread_episodic_item(
                 NewThreadEpisodicItemRecord {
@@ -7223,12 +10473,12 @@ mod tests {
                     thread_id: thread_id.to_owned(),
                     turn_id: turn_id.to_owned(),
                     item_id: item_id.to_owned(),
-                    source_actor_role: StoreThreadEpisodicSourceActorRole::User,
+                    source_actor_role,
                     source_runtime_kind: ThreadEpisodicSourceRuntimeKind::UserTurn,
-                    source_context: ThreadEpisodicSourceContext::UserVisibleThreadItem,
+                    source_context,
                     visibility: ThreadEpisodicItemVisibility::UserVisible,
                     status: ThreadEpisodicItemStatus::PendingIndex,
-                    text_hash: "a".repeat(64),
+                    text_hash,
                     projection_group_id: occurrence_projection_group_id(
                         workspace_id,
                         thread_id,
@@ -7429,10 +10679,7 @@ mod tests {
                 },
             },
         )]));
-        let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-            request,
-            segment_index: 1,
-        });
+        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -7517,10 +10764,7 @@ mod tests {
         ]));
         resolver.set_active_provider(Some(embedding_provider.clone()));
         let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request,
-                segment_index: 1,
-            }),
+            static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await,
             resolver,
             crud_store.clone(),
         ));
@@ -7609,28 +10853,34 @@ mod tests {
         ]));
         resolver.set_active_provider(Some(embedding_provider.clone()));
         let parent_provider = RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request: static_index_request(
+            static_index_payload_provider(
+                crud_store.as_ref(),
+                &parent_item,
+                static_index_request(
                     "file:///tmp/thread-embedding-parent.mv2".to_owned(),
                     "capsule_embedding_parent",
                     "mv2://pioneer/thread_episodic/test/capsules/capsule_embedding_parent",
                     parent_item.id.as_str(),
                 ),
-                segment_index: 1,
-            }),
+                1,
+            )
+            .await,
             resolver.clone(),
             crud_store.clone(),
         );
         let child_provider = RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request: static_index_request(
+            static_index_payload_provider(
+                crud_store.as_ref(),
+                &child_item,
+                static_index_request(
                     "file:///tmp/thread-embedding-child.mv2".to_owned(),
                     "capsule_embedding_child",
                     "mv2://pioneer/thread_episodic/test/capsules/capsule_embedding_child",
                     child_item.id.as_str(),
                 ),
-                segment_index: 2,
-            }),
+                2,
+            )
+            .await,
             resolver,
             crud_store.clone(),
         );
@@ -7699,10 +10949,7 @@ mod tests {
         ));
         resolver.set_active_provider(Some(embedding_provider.clone()));
         let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request,
-                segment_index: 1,
-            }),
+            static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await,
             resolver,
             crud_store.clone(),
         ));
@@ -7772,10 +11019,7 @@ mod tests {
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
         let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
         let provider = Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-            Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-                request,
-                segment_index: 1,
-            }),
+            static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await,
             resolver,
             crud_store.clone(),
         ));
@@ -7988,17 +11232,27 @@ mod tests {
                 "why did you implement it this way?",
             ),
         ] {
+            let canonical_item = TurnItem::UserMessage {
+                id: item_id.to_owned(),
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                canonical_item.clone(),
+                1_700_000_000,
+            )
+            .await;
             ingestor
                 .ingest_committed_item(
                     committed_item_ingestion_input_from_parts(
                         workspace_id.as_str(),
                         thread_id,
                         turn_id,
-                        TurnItem::UserMessage {
-                            id: item_id.to_owned(),
-                            text: text.to_owned(),
-                            attachments: Vec::new(),
-                        },
+                        canonical_item,
                     )
                     .expect("committed item should be valid"),
                 )
@@ -8047,6 +11301,15 @@ mod tests {
             text: "this user message should be indexable immediately".to_owned(),
             attachments: Vec::new(),
         };
+        materialize_thread_with_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            item.clone(),
+            1_700_000_000,
+        )
+        .await;
         let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
         ingestor
             .ingest_committed_item(ThreadEpisodicCommittedItem {
@@ -8068,6 +11331,11 @@ mod tests {
             .expect("jobs should be readable");
         assert_eq!(jobs.len(), 1);
         let job = &jobs[0];
+        let projected_item = crud_store
+            .find_thread_episodic_item(job.index_item_id.as_str())
+            .await
+            .expect("projected item lookup should succeed")
+            .expect("projected item should exist");
         let request = static_index_request(
             "file:///tmp/thread-ingestor-due-second.mv2".to_owned(),
             "capsule_due_second",
@@ -8082,10 +11350,8 @@ mod tests {
                 embedding_identity: None,
             },
         )]));
-        let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-            request,
-            segment_index: 1,
-        });
+        let provider =
+            static_index_payload_provider(crud_store.as_ref(), &projected_item, request, 1).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -8135,6 +11401,7 @@ mod tests {
                 item.id.as_str(),
             ),
             segment_index: 1,
+            source_payload: String::new(),
         });
         let executor = ThreadEpisodicIndexExecutor::new(crud_store, backend, provider);
 
@@ -8185,10 +11452,7 @@ mod tests {
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
             ThreadEpisodicMemvidError::retryable("temporary backend failure\nwith detail"),
         )]));
-        let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-            request,
-            segment_index: 1,
-        });
+        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -8274,10 +11538,7 @@ mod tests {
         let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
             ThreadEpisodicMemvidError::non_retryable("bad source state"),
         )]));
-        let provider = Arc::new(StaticThreadEpisodicIndexPayloadProvider {
-            request,
-            segment_index: 1,
-        });
+        let provider = static_index_payload_provider(crud_store.as_ref(), &item, request, 1).await;
         let executor = ThreadEpisodicIndexExecutor::new(crud_store.clone(), backend, provider);
 
         let summary = executor
@@ -8298,6 +11559,448 @@ mod tests {
             .expect("item read")
             .expect("item exists");
         assert_eq!(stored_item.status, ThreadEpisodicItemStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn index_executor_persistence_fallback_backs_off_without_accepting_capacity_outcome() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        let item = seed_pending_thread_episodic_item(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            "thread_capacity_persistence_fallback",
+            "turn_capacity_persistence_fallback",
+            "item_capacity_persistence_fallback",
+        )
+        .await;
+        let job = seed_thread_episodic_job(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            item.thread_id.as_str(),
+            item.id.as_str(),
+            1_700_060_000,
+        )
+        .await;
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
+            ThreadEpisodicMemvidError::capacity_exceeded("workspace capsule full"),
+        )]));
+        let temp_dir = TempDir::new().expect("temp dir");
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                thread_episodic_storage_uri_from_path(temp_dir.path()),
+            )),
+        );
+        executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            max_attempts: 2,
+            retry_base_delay_secs: 30,
+            retry_max_delay_secs: 30,
+            ..ThreadEpisodicIndexExecutorConfig::default()
+        });
+        executor
+            .inject_primary_persistence_failure("injected primary failure persistence error", None)
+            .await;
+
+        let first = executor
+            .run_once(1_700_060_001)
+            .await
+            .expect("fallback should release the first claim");
+        assert_eq!(first.failed_retryable, 1);
+        assert_eq!(backend.requests().await.len(), 1);
+        let failed = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("failed job lookup should succeed")
+            .expect("failed job should remain");
+        assert_eq!(failed.status, ThreadEpisodicIndexJobStatus::Failed);
+        assert_eq!(failed.next_run_at, fixed_datetime_from_unix(1_700_060_031));
+        assert_eq!(failed.capacity_error_count, 0);
+        assert!(failed.last_error.as_deref().is_some_and(|error| {
+            error.contains("injected primary failure persistence error")
+                && error.contains("workspace capsule full")
+        }));
+        let capsules = crud_store
+            .list_thread_episodic_workspace_capsules(workspace_id.as_str(), 10)
+            .await
+            .expect("capsules should list");
+        assert_eq!(capsules.len(), 1);
+        assert_ne!(
+            capsules[0].write_state,
+            ThreadEpisodicCapsuleWriteState::Full
+        );
+        assert!(capsules[0].capacity_exceeded_at.is_none());
+
+        executor
+            .run_once(1_700_060_030)
+            .await
+            .expect("backoff scan should succeed");
+        assert_eq!(backend.requests().await.len(), 1);
+        let second = executor
+            .run_once(1_700_060_031)
+            .await
+            .expect("second attempt should complete");
+        assert_eq!(second.completed, 1);
+        assert_eq!(backend.requests().await.len(), 2);
+        assert_eq!(
+            crud_store
+                .recover_thread_episodic_index_attempt_after_persistence_error(
+                    job.id.as_str(),
+                    failed.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: false,
+                        next_run_at_unix: None,
+                        last_error: Some("late first attempt".to_owned()),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None,
+                    },
+                    1_700_060_032,
+                )
+                .await
+                .expect("late attempt check should succeed"),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+
+        let (changed_store, changed_workspace) = setup_thread_episodic_store().await;
+        let changed_item = seed_pending_thread_episodic_item(
+            changed_store.as_ref(),
+            changed_workspace.as_str(),
+            "thread_capacity_persistence_source_change",
+            "turn_capacity_persistence_source_change",
+            "item_capacity_persistence_source_change",
+        )
+        .await;
+        let changed_job = seed_thread_episodic_job(
+            changed_store.as_ref(),
+            changed_workspace.as_str(),
+            changed_item.thread_id.as_str(),
+            changed_item.id.as_str(),
+            1_700_060_100,
+        )
+        .await;
+        let changed_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
+            ThreadEpisodicMemvidError::capacity_exceeded("stale capacity result"),
+        )]));
+        let changed_temp_dir = TempDir::new().expect("changed temp dir");
+        let changed_executor = ThreadEpisodicIndexExecutor::new(
+            changed_store.clone(),
+            changed_backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                changed_store.clone(),
+                thread_episodic_storage_uri_from_path(changed_temp_dir.path()),
+            )),
+        );
+        changed_executor
+            .inject_primary_persistence_failure(
+                "injected failure before source reconciliation",
+                Some((
+                    ItemUpdatedNotification {
+                        workspace_id: changed_workspace.clone(),
+                        thread_id: changed_item.thread_id.clone(),
+                        turn_id: changed_item.turn_id.clone(),
+                        item: TurnItem::UserMessage {
+                            id: changed_item.item_id.clone(),
+                            text: "canonical source changed between persistence transactions"
+                                .to_owned(),
+                            attachments: Vec::new(),
+                        },
+                    },
+                    1_700_060_102,
+                )),
+            )
+            .await;
+        changed_executor
+            .run_once(1_700_060_101)
+            .await
+            .expect("changed source fallback should remain recoverable");
+        assert_eq!(changed_backend.requests().await.len(), 1);
+        let old_job = changed_store
+            .find_thread_episodic_index_job(changed_job.id.as_str())
+            .await
+            .expect("old job lookup should succeed")
+            .expect("old job should remain");
+        assert_eq!(old_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(
+            old_job.last_error.as_deref(),
+            Some(THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR)
+        );
+        let changed_items = changed_store
+            .list_thread_episodic_items_for_thread(
+                changed_workspace.as_str(),
+                changed_item.thread_id.as_str(),
+                10,
+            )
+            .await
+            .expect("changed source versions should list");
+        assert_eq!(
+            changed_items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::PendingIndex)
+                .count(),
+            1
+        );
+        let changed_capsules = changed_store
+            .list_thread_episodic_workspace_capsules(changed_workspace.as_str(), 10)
+            .await
+            .expect("changed capsules should list");
+        assert!(
+            changed_capsules
+                .iter()
+                .all(|capsule| capsule.capacity_exceeded_at.is_none()
+                    && capsule.write_state != ThreadEpisodicCapsuleWriteState::Full)
+        );
+
+        let (terminal_store, terminal_workspace) = setup_thread_episodic_store().await;
+        let terminal_item = seed_pending_thread_episodic_item(
+            terminal_store.as_ref(),
+            terminal_workspace.as_str(),
+            "thread_capacity_persistence_terminal",
+            "turn_capacity_persistence_terminal",
+            "item_capacity_persistence_terminal",
+        )
+        .await;
+        let terminal_job = seed_thread_episodic_job(
+            terminal_store.as_ref(),
+            terminal_workspace.as_str(),
+            terminal_item.thread_id.as_str(),
+            terminal_item.id.as_str(),
+            1_700_060_200,
+        )
+        .await;
+        let terminal_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
+            ThreadEpisodicMemvidError::capacity_exceeded("terminal stale capacity result"),
+        )]));
+        let terminal_temp_dir = TempDir::new().expect("terminal temp dir");
+        let terminal_executor = ThreadEpisodicIndexExecutor::new(
+            terminal_store.clone(),
+            terminal_backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                terminal_store.clone(),
+                thread_episodic_storage_uri_from_path(terminal_temp_dir.path()),
+            )),
+        );
+        terminal_executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+            max_attempts: 1,
+            ..ThreadEpisodicIndexExecutorConfig::default()
+        });
+        terminal_executor
+            .inject_primary_persistence_failure("terminal persistence failure", None)
+            .await;
+        let terminal = terminal_executor
+            .run_once(1_700_060_201)
+            .await
+            .expect("terminal fallback should persist");
+        assert_eq!(terminal.failed_terminal, 1);
+        let terminal_job = terminal_store
+            .find_thread_episodic_index_job(terminal_job.id.as_str())
+            .await
+            .expect("terminal job lookup should succeed")
+            .expect("terminal job should remain");
+        assert_eq!(terminal_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert!(terminal_job.next_run_at <= fixed_datetime_from_unix(1_700_060_201));
+        terminal_executor
+            .run_once(1_700_060_300)
+            .await
+            .expect("terminal rescan should succeed");
+        assert_eq!(terminal_backend.requests().await.len(), 1);
+        let terminal_capsules = terminal_store
+            .list_thread_episodic_workspace_capsules(terminal_workspace.as_str(), 10)
+            .await
+            .expect("terminal capsules should list");
+        assert!(
+            terminal_capsules
+                .iter()
+                .all(|capsule| capsule.capacity_exceeded_at.is_none()
+                    && capsule.write_state != ThreadEpisodicCapsuleWriteState::Full)
+        );
+    }
+
+    #[tokio::test]
+    async fn index_executor_reports_unpersisted_failures_after_finishing_claimed_batch() {
+        let (crud_store, workspace_id) = setup_thread_episodic_store().await;
+        for suffix in ["a", "b"] {
+            let thread_id = format!("thread_unpersisted_batch_{suffix}");
+            let turn_id = format!("turn_unpersisted_batch_{suffix}");
+            let item_id = format!("item_unpersisted_batch_{suffix}");
+            let item = seed_pending_thread_episodic_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                item_id.as_str(),
+            )
+            .await;
+            seed_thread_episodic_job(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                item.thread_id.as_str(),
+                item.id.as_str(),
+                1_700_061_000,
+            )
+            .await;
+        }
+        let backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![
+            Err(ThreadEpisodicMemvidError::retryable(
+                "first backend failure",
+            )),
+            Err(ThreadEpisodicMemvidError::retryable(
+                "second backend failure",
+            )),
+        ]));
+        let temp_dir = TempDir::new().expect("temp dir");
+        let executor = ThreadEpisodicIndexExecutor::new(
+            crud_store.clone(),
+            backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                crud_store.clone(),
+                thread_episodic_storage_uri_from_path(temp_dir.path()),
+            )),
+        );
+        executor
+            .inject_primary_persistence_failure("primary persistence unavailable", None)
+            .await;
+        executor
+            .inject_fallback_persistence_failure("fallback persistence unavailable")
+            .await;
+
+        let error = executor
+            .run_once(1_700_061_001)
+            .await
+            .expect_err("unpersisted claimed result must be returned to the caller");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("primary persistence unavailable"));
+        assert!(rendered.contains("fallback persistence unavailable"));
+        assert_eq!(backend.requests().await.len(), 2);
+        let mut statuses = Vec::new();
+        for thread_id in ["thread_unpersisted_batch_a", "thread_unpersisted_batch_b"] {
+            statuses.extend(
+                crud_store
+                    .list_thread_episodic_index_jobs_for_thread(
+                        workspace_id.as_str(),
+                        thread_id,
+                        10,
+                    )
+                    .await
+                    .expect("batch jobs should list")
+                    .into_iter()
+                    .map(|job| job.status),
+            );
+        }
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == ThreadEpisodicIndexJobStatus::Running)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == ThreadEpisodicIndexJobStatus::Failed)
+                .count(),
+            1,
+            "the second already-claimed job must still be processed"
+        );
+
+        let (target_store, target_workspace) = setup_thread_episodic_store().await;
+        let target_item = seed_pending_thread_episodic_item(
+            target_store.as_ref(),
+            target_workspace.as_str(),
+            "thread_target_reconcile_failure",
+            "turn_target_reconcile_failure",
+            "item_target_reconcile_failure",
+        )
+        .await;
+        let target_job = seed_thread_episodic_job(
+            target_store.as_ref(),
+            target_workspace.as_str(),
+            target_item.thread_id.as_str(),
+            target_item.id.as_str(),
+            1_700_061_100,
+        )
+        .await;
+        let target_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(vec![Err(
+            ThreadEpisodicMemvidError::retryable("target backend failure"),
+        )]));
+        let target_temp = TempDir::new().expect("target temp dir");
+        let target_executor = ThreadEpisodicIndexExecutor::new(
+            target_store.clone(),
+            target_backend,
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                target_store.clone(),
+                thread_episodic_storage_uri_from_path(target_temp.path()),
+            )),
+        );
+        target_executor
+            .inject_primary_persistence_failure("target primary persistence failure", None)
+            .await;
+        target_executor
+            .inject_targeted_reconciliation_failure("targeted reconciliation unavailable")
+            .await;
+        let target_error = target_executor
+            .run_once(1_700_061_101)
+            .await
+            .expect_err("failed mandatory targeted reconciliation must surface");
+        assert!(format!("{target_error:#}").contains("targeted reconciliation unavailable"));
+        let target_job = target_store
+            .find_thread_episodic_index_job(target_job.id.as_str())
+            .await
+            .expect("target job lookup should succeed")
+            .expect("target job should remain");
+        assert_eq!(target_job.status, ThreadEpisodicIndexJobStatus::Failed);
+
+        let (transition_store, transition_workspace) = setup_thread_episodic_store().await;
+        let transition_item = seed_pending_thread_episodic_item(
+            transition_store.as_ref(),
+            transition_workspace.as_str(),
+            "thread_reconciliation_transition_failure",
+            "turn_reconciliation_transition_failure",
+            "item_reconciliation_transition_failure",
+        )
+        .await;
+        seed_thread_episodic_job(
+            transition_store.as_ref(),
+            transition_workspace.as_str(),
+            transition_item.thread_id.as_str(),
+            transition_item.id.as_str(),
+            1_700_061_200,
+        )
+        .await;
+        transition_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: transition_workspace.clone(),
+                    thread_id: transition_item.thread_id.clone(),
+                    turn_id: transition_item.turn_id.clone(),
+                    item: TurnItem::UserMessage {
+                        id: transition_item.item_id.clone(),
+                        text: "changed before resolver".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_061_201,
+            )
+            .await
+            .expect("source update should persist");
+        let transition_backend = Arc::new(FakeThreadEpisodicMemvidBackend::new(Vec::new()));
+        let transition_temp = TempDir::new().expect("transition temp dir");
+        let transition_executor = ThreadEpisodicIndexExecutor::new(
+            transition_store.clone(),
+            transition_backend.clone(),
+            Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                transition_store,
+                thread_episodic_storage_uri_from_path(transition_temp.path()),
+            )),
+        );
+        transition_executor
+            .inject_reconciliation_transition_failure("requeue transition unavailable")
+            .await;
+        let transition_error = transition_executor
+            .run_once(1_700_061_202)
+            .await
+            .expect_err("failed post-reconciliation transition must surface");
+        assert!(format!("{transition_error:#}").contains("requeue transition unavailable"));
+        assert!(transition_backend.requests().await.is_empty());
     }
 
     #[tokio::test]
@@ -8896,6 +12599,7 @@ mod tests {
             diagnostics: String,
             direct_thread_prompt: String,
             active_synthesis_prompt: String,
+            applied_exclusions: usize,
         }
 
         async fn run_eval_fixture(fixture: EvalFixture) -> EvalRunOutput {
@@ -8928,6 +12632,15 @@ mod tests {
                 }
                 items.push((item_fixture.clone(), item));
             }
+            let applied_exclusions = crud_store
+                .list_thread_episodic_exclusions_for_thread(
+                    workspace_id.as_str(),
+                    thread_id.as_str(),
+                    100,
+                )
+                .await
+                .expect("eval exclusions should list")
+                .len();
 
             let hits = items
                 .iter()
@@ -8983,6 +12696,7 @@ mod tests {
                 diagnostics,
                 direct_thread_prompt,
                 active_synthesis_prompt,
+                applied_exclusions,
             }
         }
 
@@ -9449,12 +13163,13 @@ mod tests {
                         "DELETED THREAD ITEM MUST NEVER SURFACE",
                         "EXPLICITLY EXCLUDED ITEM MUST NEVER SURFACE",
                     ])
-                    .expect_diagnostics(vec!["status is not active", "explicit exclusion"]),
+                    .expect_diagnostics(vec!["status is not active"]),
             )
             .await;
 
             assert!(result.recall.hits.is_empty());
             assert!(result.direct_thread_prompt.is_empty());
+            assert_eq!(result.applied_exclusions, 1);
         }
 
         #[tokio::test]

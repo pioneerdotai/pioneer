@@ -2847,6 +2847,58 @@ fn thread_episodic_committed_item(
     }
 }
 
+async fn materialize_thread_episodic_ingest_turn(
+    crud_store: &CrudStore,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    let timestamp = 1_700_000_000;
+    crud_store
+        .materialize_turn_start(
+            &Thread {
+                workspace_id: workspace_id.to_owned(),
+                id: thread_id.to_owned(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: ThreadMode::Agent,
+                model: "test-model".to_owned(),
+                model_provider: "test-provider".to_owned(),
+                reasoning_effort: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+                status: ThreadStatus::Active,
+                origin_kind: ThreadOriginKind::User,
+                sidebar_visibility: ThreadSidebarVisibility::Visible,
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: Vec::new(),
+            },
+            SandboxMode::FullAccess,
+            &Turn {
+                id: turn_id.to_owned(),
+                status: TurnStatus::Completed,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: Vec::new(),
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: default_test_permission_profile(),
+            },
+            &[],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .expect("thread episodic ingest turn should materialize");
+}
+
 #[test]
 fn resilience_worker_pool_timeout_is_transient_storage_backpressure() {
     let error = anyhow::anyhow!(
@@ -29598,6 +29650,13 @@ async fn thread_episodic_store_ingestor_creates_items_and_jobs_idempotently() {
     let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
     let thread_id = "thr_thread_episodic_ingest";
     let turn_id = "turn_thread_episodic_ingest";
+    materialize_thread_episodic_ingest_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
 
     for item in [
         TurnItem::UserMessage {
@@ -29613,6 +29672,18 @@ async fn thread_episodic_store_ingestor_creates_items_and_jobs_idempotently() {
             markdown_version: None,
         },
     ] {
+        crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: item.clone(),
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("canonical thread episodic item should materialize");
         let committed =
             thread_episodic_committed_item(workspace_id.as_str(), thread_id, turn_id, item.clone());
         assert_eq!(
@@ -29661,6 +29732,13 @@ async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
     let ingestor = StoreThreadEpisodicIngestor::new(crud_store.clone());
     let thread_id = "thr_thread_episodic_summaries";
     let turn_id = "turn_thread_episodic_summaries";
+    materialize_thread_episodic_ingest_turn(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        turn_id,
+    )
+    .await;
 
     let visible_tool = thread_episodic_committed_item(
         workspace_id.as_str(),
@@ -29748,6 +29826,21 @@ async fn thread_episodic_store_ingestor_indexes_visible_task_summaries_only() {
             observation: None,
         },
     );
+
+    for committed in [&visible_tool, &visible_task, &raw_tool] {
+        crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: committed.item.clone(),
+                },
+                1_700_000_001,
+            )
+            .await
+            .expect("canonical thread episodic summary source should materialize");
+    }
 
     assert_eq!(
         ingestor

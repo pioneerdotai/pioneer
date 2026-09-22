@@ -1353,24 +1353,28 @@ pub use crate::thread_episodic::{
     NewThreadEpisodicCapsuleRecord, NewThreadEpisodicEmbeddingArtifactRecord,
     NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
     NewThreadEpisodicRecallEventRecord, NewThreadEpisodicThreadDirectoryRecord,
-    THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID, THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES,
-    ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleCapacityUpdate,
-    ThreadEpisodicCapsuleRecord, ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
+    THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR,
+    THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR, THREAD_EPISODIC_USER_DELETED_ERROR,
+    THREAD_EPISODIC_USER_EXCLUDED_ERROR, THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID,
+    THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES, ThreadEpisodicActiveWriteSegmentRequest,
+    ThreadEpisodicCanonicalItem, ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleRecord,
+    ThreadEpisodicCapsuleStatus, ThreadEpisodicCapsuleWriteState,
     ThreadEpisodicEmbeddingArtifactRecord, ThreadEpisodicExclusionReason,
     ThreadEpisodicExclusionRecord, ThreadEpisodicGraphEnrichmentState,
-    ThreadEpisodicIndexJobCompletionUpdate, ThreadEpisodicIndexJobFailureUpdate,
-    ThreadEpisodicIndexJobRecord, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate,
-    ThreadEpisodicItemRecord, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
-    ThreadEpisodicRecallEventRecord, ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread,
-    ThreadEpisodicRepairStatus, ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
-    ThreadEpisodicThreadDirectoryRecord, ThreadEpisodicThreadDirectorySelection,
-    ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
-    ThreadEpisodicWorkspaceActiveWriteSegmentRequest, deterministic_thread_episodic_capsule_id,
-    deterministic_thread_episodic_workspace_capsule_id, thread_episodic_capsule_ref,
-    thread_episodic_capsule_storage_uri, thread_episodic_frame_uri, thread_episodic_item_uri,
-    thread_episodic_key_hash, thread_episodic_thread_uri_prefix, thread_episodic_turn_uri_prefix,
-    thread_episodic_workspace_capsule_ref, thread_episodic_workspace_capsule_storage_uri,
-    thread_episodic_workspace_uri_prefix,
+    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
+    ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
+    ThreadEpisodicIndexJobStatus, ThreadEpisodicItemIndexedUpdate, ThreadEpisodicItemRecord,
+    ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility, ThreadEpisodicRecallEventRecord,
+    ThreadEpisodicRefillSourceCounts, ThreadEpisodicRefillThread, ThreadEpisodicRepairStatus,
+    ThreadEpisodicSourceActorRole, ThreadEpisodicSourceReconcileOutcome,
+    ThreadEpisodicSourceRuntimeKind, ThreadEpisodicThreadDirectoryRecord,
+    ThreadEpisodicThreadDirectorySelection, ThreadEpisodicThreadDirectoryStatus,
+    ThreadEpisodicThreadDirectoryVisibility, ThreadEpisodicWorkspaceActiveWriteSegmentRequest,
+    deterministic_thread_episodic_capsule_id, deterministic_thread_episodic_workspace_capsule_id,
+    thread_episodic_capsule_ref, thread_episodic_capsule_storage_uri, thread_episodic_frame_uri,
+    thread_episodic_item_uri, thread_episodic_key_hash, thread_episodic_thread_uri_prefix,
+    thread_episodic_turn_uri_prefix, thread_episodic_workspace_capsule_ref,
+    thread_episodic_workspace_capsule_storage_uri, thread_episodic_workspace_uri_prefix,
 };
 use crate::util::{optional_typed_json_from_db, typed_json_from_db, unix_to_datetime};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
@@ -9619,6 +9623,23 @@ impl CrudStore {
         .await
     }
 
+    pub async fn delete_rebuildable_thread_episodic_items_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<u64> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            async move {
+                thread_episodic_repository::delete_rebuildable_items_for_workspace(
+                    &self.connection,
+                    workspace_id.as_str(),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
     pub async fn delete_all_thread_episodic_exclusions(&self) -> Result<u64> {
         self.run_serialized_write(|| async move {
             thread_episodic_repository::delete_all_exclusions(&self.connection).await
@@ -10019,6 +10040,147 @@ impl CrudStore {
         .await
     }
 
+    pub async fn reconcile_thread_episodic_source_version(
+        &self,
+        expected_source_payload: &str,
+        item: NewThreadEpisodicItemRecord,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicSourceReconcileOutcome> {
+        self.run_serialized_write(|| {
+            let expected_source_payload = expected_source_payload.to_owned();
+            let item = item.clone();
+            async move {
+                let transaction =
+                    self.connection.begin().await.context(
+                        "failed to begin thread episodic source reconciliation transaction",
+                    )?;
+                let outcome: ThreadEpisodicSourceReconcileOutcome = async {
+                    let Some(thread_model) =
+                        thread::find_thread_by_id(&transaction, item.thread_id.as_str()).await?
+                    else {
+                        return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                    };
+                    if thread_model.workspace_id != item.workspace_id {
+                        anyhow::bail!(
+                            "thread episodic source workspace changed during reconciliation"
+                        );
+                    }
+                    if turn::find_turn_by_thread_and_id(
+                        &transaction,
+                        item.thread_id.as_str(),
+                        item.turn_id.as_str(),
+                    )
+                    .await?
+                    .is_none()
+                    {
+                        return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                    }
+                    let Some(source) = turn::find_turn_item(
+                        &transaction,
+                        item.turn_id.as_str(),
+                        item.item_id.as_str(),
+                    )
+                    .await?
+                    else {
+                        return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                    };
+                    if source.payload != expected_source_payload {
+                        return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                    }
+                    thread_episodic_repository::reconcile_item_source_version(
+                        &transaction,
+                        item,
+                        unix_to_datetime(now_unix),
+                    )
+                    .await
+                }
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic source reconciliation")?;
+                Ok(outcome)
+            }
+        })
+        .await
+    }
+
+    pub async fn retire_thread_episodic_source_occurrence(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        expected_source_payload: Option<&str>,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicSourceReconcileOutcome> {
+        self.run_serialized_write(|| {
+            let workspace_id = workspace_id.to_owned();
+            let thread_id = thread_id.to_owned();
+            let turn_id = turn_id.to_owned();
+            let item_id = item_id.to_owned();
+            let expected_source_payload = expected_source_payload.map(str::to_owned);
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread episodic source retirement transaction")?;
+                let outcome: ThreadEpisodicSourceReconcileOutcome = async {
+                    match thread::find_thread_by_id(&transaction, thread_id.as_str()).await? {
+                        Some(thread_model) if thread_model.workspace_id != workspace_id => {
+                            anyhow::bail!(
+                                "thread episodic retirement source workspace ownership mismatch"
+                            );
+                        }
+                        None if expected_source_payload.is_some() => {
+                            return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                        }
+                        _ => {}
+                    }
+                    match turn::find_turn_by_id(&transaction, turn_id.as_str()).await? {
+                        Some(turn_model) if turn_model.thread_id != thread_id => {
+                            anyhow::bail!(
+                                "thread episodic retirement source turn ownership mismatch"
+                            );
+                        }
+                        None if expected_source_payload.is_some() => {
+                            return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                        }
+                        _ => {}
+                    }
+                    let current =
+                        turn::find_turn_item(&transaction, turn_id.as_str(), item_id.as_str())
+                            .await?;
+                    let source_is_stable = match (&expected_source_payload, current.as_ref()) {
+                        (Some(expected), Some(current)) => current.payload == *expected,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !source_is_stable {
+                        return Ok(ThreadEpisodicSourceReconcileOutcome::SourceChanged);
+                    }
+                    thread_episodic_repository::retire_source_occurrence(
+                        &transaction,
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        turn_id.as_str(),
+                        item_id.as_str(),
+                        unix_to_datetime(now_unix),
+                    )
+                    .await
+                }
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic source retirement")?;
+                Ok(outcome)
+            }
+        })
+        .await
+    }
+
     pub async fn find_thread_episodic_item_by_source_identity(
         &self,
         workspace_id: &str,
@@ -10173,6 +10335,17 @@ impl CrudStore {
             let now = unix_to_datetime(now_unix);
             let mut enqueued = 0usize;
             for item in items {
+                if thread_episodic_repository::source_occurrence_is_excluded(
+                    &self.connection,
+                    item.workspace_id.as_str(),
+                    item.thread_id.as_str(),
+                    item.turn_id.as_str(),
+                    item.item_id.as_str(),
+                )
+                .await?
+                {
+                    continue;
+                }
                 if thread_episodic_repository::find_index_job_by_index_item(
                     &self.connection,
                     item.id.as_str(),
@@ -10227,6 +10400,17 @@ impl CrudStore {
                 let now = unix_to_datetime(now_unix);
                 let mut enqueued = 0usize;
                 for item in items {
+                    if thread_episodic_repository::source_occurrence_is_excluded(
+                        &self.connection,
+                        item.workspace_id.as_str(),
+                        item.thread_id.as_str(),
+                        item.turn_id.as_str(),
+                        item.item_id.as_str(),
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     if thread_episodic_repository::find_index_job_by_index_item(
                         &self.connection,
                         item.id.as_str(),
@@ -10278,6 +10462,14 @@ impl CrudStore {
             workspace_id,
         )
         .await
+    }
+
+    pub async fn thread_episodic_index_job_exists_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<bool> {
+        thread_episodic_repository::index_job_exists_for_workspace(&self.connection, workspace_id)
+            .await
     }
 
     pub async fn count_canceled_thread_episodic_index_jobs_for_workspace(
@@ -10456,13 +10648,22 @@ impl CrudStore {
                     .await?;
             let mut claimed = Vec::with_capacity(rows.len());
             for row in rows {
-                if let Some(row) = thread_episodic_repository::mark_index_job_running(
-                    &self.connection,
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread episodic index claim transaction")?;
+                let claimed_row = thread_episodic_repository::mark_index_job_running(
+                    &transaction,
                     row.id.as_str(),
                     now,
                 )
-                .await?
-                {
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic index claim transaction")?;
+                if let Some(row) = claimed_row {
                     claimed.push(
                         crate::thread_episodic::thread_episodic_index_job_record_from_model(row)?,
                     );
@@ -10492,13 +10693,19 @@ impl CrudStore {
                 .await?;
                 let mut claimed = Vec::with_capacity(rows.len());
                 for row in rows {
-                    if let Some(row) = thread_episodic_repository::mark_index_job_running(
-                        &self.connection,
+                    let transaction = self.connection.begin().await.context(
+                        "failed to begin workspace thread episodic index claim transaction",
+                    )?;
+                    let claimed_row = thread_episodic_repository::mark_index_job_running(
+                        &transaction,
                         row.id.as_str(),
                         now,
                     )
-                    .await?
-                    {
+                    .await?;
+                    transaction.commit().await.context(
+                        "failed to commit workspace thread episodic index claim transaction",
+                    )?;
+                    if let Some(row) = claimed_row {
                         claimed.push(
                             crate::thread_episodic::thread_episodic_index_job_record_from_model(
                                 row,
@@ -10536,6 +10743,45 @@ impl CrudStore {
         .await
     }
 
+    pub async fn complete_thread_episodic_index_attempt(
+        &self,
+        job_id: &str,
+        expected_attempt_count: i64,
+        expected_source_payload: &str,
+        item_update: ThreadEpisodicItemIndexedUpdate,
+        job_update: ThreadEpisodicIndexJobCompletionUpdate,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            let expected_source_payload = expected_source_payload.to_owned();
+            let item_update = item_update.clone();
+            let job_update = job_update.clone();
+            async move {
+                let transaction =
+                    self.connection.begin().await.context(
+                        "failed to begin thread episodic attempt completion transaction",
+                    )?;
+                let outcome = thread_episodic_repository::complete_index_attempt(
+                    &transaction,
+                    job_id.as_str(),
+                    expected_attempt_count,
+                    expected_source_payload.as_str(),
+                    item_update,
+                    job_update,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic attempt completion")?;
+                Ok(outcome)
+            }
+        })
+        .await
+    }
+
     pub async fn fail_thread_episodic_index_job(
         &self,
         job_id: &str,
@@ -10555,6 +10801,154 @@ impl CrudStore {
                 .await?
                 .map(crate::thread_episodic::thread_episodic_index_job_record_from_model)
                 .transpose()
+            }
+        })
+        .await
+    }
+
+    pub async fn fail_thread_episodic_index_attempt(
+        &self,
+        job_id: &str,
+        expected_attempt_count: i64,
+        expected_source_payload: &str,
+        update: ThreadEpisodicIndexJobFailureUpdate,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            let expected_source_payload = expected_source_payload.to_owned();
+            let update = update.clone();
+            async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread episodic attempt failure transaction")?;
+                let outcome = thread_episodic_repository::fail_index_attempt(
+                    &transaction,
+                    job_id.as_str(),
+                    expected_attempt_count,
+                    expected_source_payload.as_str(),
+                    update,
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic attempt failure")?;
+                Ok(outcome)
+            }
+        })
+        .await
+    }
+
+    pub async fn requeue_thread_episodic_index_attempt(
+        &self,
+        job_id: &str,
+        expected_attempt_count: i64,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            async move {
+                thread_episodic_repository::requeue_index_attempt(
+                    &self.connection,
+                    job_id.as_str(),
+                    expected_attempt_count,
+                    unix_to_datetime(now_unix),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    pub async fn cancel_thread_episodic_index_attempt(
+        &self,
+        job_id: &str,
+        expected_attempt_count: i64,
+        last_error: &str,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            let last_error = last_error.to_owned();
+            async move {
+                thread_episodic_repository::cancel_index_attempt(
+                    &self.connection,
+                    job_id.as_str(),
+                    expected_attempt_count,
+                    last_error.as_str(),
+                    unix_to_datetime(now_unix),
+                )
+                .await
+            }
+        })
+        .await
+    }
+
+    pub async fn fail_thread_episodic_index_attempt_without_source_validation(
+        &self,
+        job_id: &str,
+        expected_attempt_count: i64,
+        update: ThreadEpisodicIndexJobFailureUpdate,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            let update = update.clone();
+            async move {
+                let transaction = self.connection.begin().await.context(
+                    "failed to begin thread episodic reconciliation failure transaction",
+                )?;
+                let outcome =
+                    thread_episodic_repository::fail_index_attempt_without_source_validation(
+                        &transaction,
+                        job_id.as_str(),
+                        expected_attempt_count,
+                        update,
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                transaction.commit().await.context(
+                    "failed to commit thread episodic reconciliation failure transaction",
+                )?;
+                Ok(outcome)
+            }
+        })
+        .await
+    }
+
+    pub async fn recover_thread_episodic_index_attempt_after_persistence_error(
+        &self,
+        job_id: &str,
+        expected_attempt_count: i64,
+        update: ThreadEpisodicIndexJobFailureUpdate,
+        now_unix: i64,
+    ) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+        self.run_serialized_write(|| {
+            let job_id = job_id.to_owned();
+            let update = update.clone();
+            async move {
+                let transaction =
+                    self.connection.begin().await.context(
+                        "failed to begin thread episodic persistence recovery transaction",
+                    )?;
+                let outcome =
+                    thread_episodic_repository::recover_index_attempt_after_persistence_error(
+                        &transaction,
+                        job_id.as_str(),
+                        expected_attempt_count,
+                        update,
+                        unix_to_datetime(now_unix),
+                    )
+                    .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic persistence recovery transaction")?;
+                Ok(outcome)
             }
         })
         .await
@@ -10638,18 +11032,27 @@ impl CrudStore {
         now_unix: i64,
     ) -> Result<Vec<ThreadEpisodicItemRecord>> {
         self.run_serialized_write(|| async move {
-            thread_episodic_repository::mark_items_deleted_by_source_item(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin thread episodic item tombstone transaction")?;
+            let rows = thread_episodic_repository::mark_items_deleted_by_source_item(
+                &transaction,
                 workspace_id,
                 thread_id,
                 turn_id,
                 item_id,
                 unix_to_datetime(now_unix),
             )
-            .await?
-            .into_iter()
-            .map(crate::thread_episodic::thread_episodic_item_record_from_model)
-            .collect()
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit thread episodic item tombstone")?;
+            rows.into_iter()
+                .map(crate::thread_episodic::thread_episodic_item_record_from_model)
+                .collect()
         })
         .await
     }
@@ -10661,16 +11064,25 @@ impl CrudStore {
         now_unix: i64,
     ) -> Result<Vec<ThreadEpisodicItemRecord>> {
         self.run_serialized_write(|| async move {
-            thread_episodic_repository::mark_items_deleted_for_thread(
-                &self.connection,
+            let transaction = self
+                .connection
+                .begin()
+                .await
+                .context("failed to begin thread episodic thread tombstone transaction")?;
+            let rows = thread_episodic_repository::mark_items_deleted_for_thread(
+                &transaction,
                 workspace_id,
                 thread_id,
                 unix_to_datetime(now_unix),
             )
-            .await?
-            .into_iter()
-            .map(crate::thread_episodic::thread_episodic_item_record_from_model)
-            .collect()
+            .await?;
+            transaction
+                .commit()
+                .await
+                .context("failed to commit thread episodic thread tombstone")?;
+            rows.into_iter()
+                .map(crate::thread_episodic::thread_episodic_item_record_from_model)
+                .collect()
         })
         .await
     }
@@ -10692,6 +11104,23 @@ impl CrudStore {
         .transpose()
     }
 
+    pub async fn thread_episodic_source_occurrence_is_excluded(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<bool> {
+        thread_episodic_repository::source_occurrence_is_excluded(
+            &self.connection,
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+        )
+        .await
+    }
+
     pub async fn exclude_thread_episodic_item(
         &self,
         exclusion: NewThreadEpisodicExclusionRecord,
@@ -10700,12 +11129,27 @@ impl CrudStore {
         self.run_serialized_write(|| {
             let exclusion = exclusion.clone();
             async move {
+                let transaction = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin thread episodic exclusion transaction")?;
                 let row = thread_episodic_repository::insert_exclusion_if_absent(
-                    &self.connection,
+                    &transaction,
                     exclusion,
                     unix_to_datetime(now_unix),
                 )
                 .await?;
+                thread_episodic_repository::apply_exclusion_to_item(
+                    &transaction,
+                    row.index_item_id.as_str(),
+                    unix_to_datetime(now_unix),
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .context("failed to commit thread episodic exclusion")?;
                 crate::thread_episodic::thread_episodic_exclusion_record_from_model(row)
             }
         })
@@ -16781,6 +17225,39 @@ impl CrudStore {
                 format!("failed to decode turn_item payload for turn `{turn_id}` item `{item_id}`")
             })?;
         Ok(Some(parsed))
+    }
+
+    pub async fn get_thread_episodic_canonical_item(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ThreadEpisodicCanonicalItem>> {
+        let Some((actual_thread_id, actual_workspace_id)) = self.get_turn_location(turn_id).await?
+        else {
+            return Ok(None);
+        };
+        if actual_thread_id != thread_id || actual_workspace_id != workspace_id {
+            anyhow::bail!(
+                "canonical thread episodic source ownership mismatch for `{workspace_id}/{thread_id}/{turn_id}/{item_id}`"
+            );
+        }
+        let Some(model) = turn::find_turn_item(&self.connection, turn_id, item_id).await? else {
+            return Ok(None);
+        };
+        let item = serde_json::from_str::<TurnItem>(model.payload.as_str()).with_context(|| {
+            format!("failed to decode canonical thread episodic turn item `{turn_id}/{item_id}`")
+        })?;
+        if item.item_id() != item_id {
+            anyhow::bail!(
+                "canonical thread episodic source item identity mismatch for `{turn_id}/{item_id}`"
+            );
+        }
+        Ok(Some(ThreadEpisodicCanonicalItem {
+            item,
+            source_payload: model.payload,
+        }))
     }
 
     pub async fn get_turn_items_by_ids(
@@ -30361,7 +30838,8 @@ mod tests {
     use crate::convention::ATTEMPT_STATUS_COMPLETED;
     use crate::repositories::{
         cli_runtime_binding, native_terminal_effect_outbox, read_model_repair,
-        recovery_terminalization_outbox, thread, turn, turn_finalization,
+        recovery_terminalization_outbox, thread, thread_episodic as thread_episodic_repository,
+        turn, turn_finalization,
     };
     use crate::util::unix_to_datetime;
     use migration::{Migrator, MigratorTrait};
@@ -30407,7 +30885,7 @@ mod tests {
     use sea_orm::sea_query::Expr;
     use sea_orm::{
         ColumnTrait, ConnectionTrait, Database, DatabaseBackend, EntityTrait, PaginatorTrait,
-        QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+        QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, Statement, TransactionTrait,
     };
     use std::collections::BTreeMap;
     use std::sync::{
@@ -36064,6 +36542,58 @@ mod tests {
             .await
             .expect("admin list should succeed");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_lifecycle_repair_plan_scopes_jobs_to_source_occurrence() {
+        let store = test_store_with_workspace("ws_thread_episodic_repair_plan").await;
+        for query in [
+            thread_episodic_repository::excluded_source_versions_needing_repair(
+                "ws_thread_episodic_repair_plan",
+                "thread_target",
+                "turn_target",
+                "item_target",
+            ),
+            thread_episodic_repository::deleted_source_versions_needing_repair(
+                "ws_thread_episodic_repair_plan",
+                "thread_target",
+                "turn_target",
+                "item_target",
+            ),
+        ] {
+            let statement = query.limit(32).build(DatabaseBackend::Sqlite);
+            let plan = store
+                .database_connection()
+                .query_all_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    format!("EXPLAIN QUERY PLAN {}", statement.sql),
+                    statement
+                        .values
+                        .expect("repair query should bind occurrence values"),
+                ))
+                .await
+                .expect("repair query plan should resolve")
+                .into_iter()
+                .map(|row| {
+                    row.try_get::<String>("", "detail")
+                        .expect("query plan should expose detail")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("thread_episodic_index_jobs")
+                        && detail.contains("idx_thread_episodic_index_jobs_item")
+                        && detail.starts_with("SEARCH ")
+                }),
+                "repair must probe jobs by the occurrence item ids: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| {
+                    detail.starts_with("SCAN ") && detail.contains("thread_episodic_index_jobs")
+                }),
+                "repair must not materialize a global job scan: {plan:#?}"
+            );
+        }
     }
 
     #[tokio::test]

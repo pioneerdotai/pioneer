@@ -16,15 +16,14 @@ use pioneer_config::{
     GatewayThreadEpisodicVectorProviderConfig, GatewayThreadEpisodicVectorSearchConfig,
 };
 use pioneer_crud::{
-    CrudStore, NewThreadEpisodicThreadDirectoryRecord, PROJECTION_META_STATUS_BACKFILLING,
-    PROJECTION_META_STATUS_COMPLETE, PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING,
-    ProjectionMetaConfigRecord, ProjectionMetaRecord, ThreadEpisodicCapsuleCapacityUpdate,
-    ThreadEpisodicCapsuleWriteState, ThreadEpisodicIndexJobCompletionUpdate,
+    CrudStore, PROJECTION_META_STATUS_BACKFILLING, PROJECTION_META_STATUS_COMPLETE,
+    PROJECTION_META_STATUS_FAILED, PROJECTION_META_STATUS_PENDING, ProjectionMetaConfigRecord,
+    ProjectionMetaRecord, THREAD_EPISODIC_USER_DELETED_ERROR, THREAD_EPISODIC_USER_EXCLUDED_ERROR,
+    ThreadEpisodicCapsuleCapacityUpdate, ThreadEpisodicCapsuleWriteState,
+    ThreadEpisodicIndexAttemptOutcome, ThreadEpisodicIndexJobCompletionUpdate,
     ThreadEpisodicIndexJobFailureUpdate, ThreadEpisodicIndexJobRecord,
-    ThreadEpisodicItemIndexedUpdate, ThreadEpisodicThreadDirectoryStatus,
-    ThreadEpisodicThreadDirectoryVisibility, find_projection_meta,
-    list_projection_meta_by_key_prefix, update_projection_meta_status,
-    upsert_projection_meta_with_config,
+    ThreadEpisodicItemIndexedUpdate, find_projection_meta, list_projection_meta_by_key_prefix,
+    update_projection_meta_status, upsert_projection_meta_with_config,
 };
 use pioneer_memory::{
     MemvidThreadEpisodicBackend, ThreadEpisodicEmbeddingProvider, ThreadEpisodicMemvidBackend,
@@ -1205,7 +1204,13 @@ async fn refill_can_resume_existing_projection(
         .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id)
         .await
         .context("failed to count terminal thread episodic refill jobs")?;
-    Ok(canceled > 0 || meta.source_turn_item_count > 0)
+    if canceled > 0 || meta.source_turn_item_count > 0 {
+        return Ok(true);
+    }
+    crud_store
+        .thread_episodic_index_job_exists_for_workspace(workspace_id)
+        .await
+        .context("failed to check durable thread episodic refill jobs")
 }
 
 async fn prepare_fresh_refill(
@@ -1241,6 +1246,8 @@ async fn prepare_resumed_refill(
         resumed: true,
         ..Default::default()
     };
+    rebuild_refill_items_from_history(crud_store.clone(), workspace_id, now_unix, &mut summary)
+        .await?;
     populate_refill_source_counts(crud_store.as_ref(), workspace_id, &mut summary).await?;
     if let Some(existing_meta) = existing_meta {
         summary.source_thread_count = summary
@@ -1398,14 +1405,10 @@ async fn cleanup_derived_artifacts(
         .delete_thread_episodic_capsules_for_workspace(workspace_id)
         .await
         .context("failed to delete thread episodic capsule rows")?;
-    summary.exclusion_rows_deleted = crud_store
-        .delete_thread_episodic_exclusions_for_workspace(workspace_id)
-        .await
-        .context("failed to delete thread episodic exclusion rows")?;
     summary.item_rows_deleted = crud_store
-        .delete_thread_episodic_items_for_workspace(workspace_id)
+        .delete_rebuildable_thread_episodic_items_for_workspace(workspace_id)
         .await
-        .context("failed to delete thread episodic item rows")?;
+        .context("failed to delete rebuildable thread episodic item rows")?;
     summary.index_jobs_deleted = crud_store
         .delete_thread_episodic_index_jobs_for_workspace(workspace_id)
         .await
@@ -1560,48 +1563,18 @@ async fn execute_refill_jobs(
         }
 
         summary.executor_batches = summary.executor_batches.saturating_add(1);
-        for job in jobs {
-            let attempt_started_at = Instant::now();
-            match payload_provider.resolve_index_request(&job).await {
-                Ok(resolved) => {
-                    execute_resolved_refill_job(
-                        crud_store.as_ref(),
-                        &backend,
-                        job,
-                        resolved,
-                        now_unix,
-                        config,
-                        attempt_started_at,
-                        summary,
-                    )
-                    .await?;
-                }
-                Err(error) => {
-                    let retryable = matches!(
-                        error.kind,
-                        ThreadEpisodicIndexResolutionFailureKind::Retryable
-                    ) && job.attempt_count < config.max_attempts;
-                    persist_refill_job_failure(
-                        crud_store.as_ref(),
-                        &job,
-                        retryable,
-                        false,
-                        Some(error.message),
-                        now_unix,
-                        attempt_started_at,
-                        config,
-                    )
-                    .await?;
-                    if retryable {
-                        summary.failed_retryable_jobs =
-                            summary.failed_retryable_jobs.saturating_add(1);
-                    } else {
-                        summary.failed_terminal_jobs =
-                            summary.failed_terminal_jobs.saturating_add(1);
-                    }
-                }
-            }
-        }
+        execute_claimed_refill_batch(
+            crud_store.clone(),
+            &backend,
+            payload_provider.as_ref(),
+            jobs,
+            now_unix,
+            config,
+            summary,
+            #[cfg(test)]
+            None,
+        )
+        .await?;
     }
 
     summary.incomplete_jobs = crud_store
@@ -1629,8 +1602,171 @@ async fn execute_refill_jobs(
     Ok(())
 }
 
+async fn execute_claimed_refill_batch(
+    crud_store: Arc<CrudStore>,
+    backend: &MemvidThreadEpisodicBackend,
+    payload_provider: &dyn ThreadEpisodicIndexPayloadProvider,
+    jobs: Vec<ThreadEpisodicIndexJobRecord>,
+    now_unix: i64,
+    config: ThreadEpisodicIndexExecutorConfig,
+    summary: &mut ThreadEpisodicWorkspaceCapsuleRefillSummary,
+    #[cfg(test)] fail_before_processing_job_id: Option<&str>,
+) -> Result<()> {
+    let mut batch_errors = Vec::new();
+    for job in jobs {
+        let job_id = job.id.clone();
+        #[cfg(test)]
+        let result = if fail_before_processing_job_id == Some(job_id.as_str()) {
+            persist_refill_reconciliation_error(
+                crud_store.clone(),
+                &job,
+                now_unix,
+                config,
+                anyhow!("injected refill source reconciliation failure"),
+                Some("injected primary reconciliation persistence failure"),
+                Some("injected fallback reconciliation persistence failure"),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            execute_claimed_refill_job(
+                crud_store.clone(),
+                backend,
+                payload_provider,
+                job,
+                now_unix,
+                config,
+                summary,
+            )
+            .await
+        };
+        #[cfg(not(test))]
+        let result = execute_claimed_refill_job(
+            crud_store.clone(),
+            backend,
+            payload_provider,
+            job,
+            now_unix,
+            config,
+            summary,
+        )
+        .await;
+        if let Err(error) = result {
+            batch_errors.push(format!("job `{job_id}`: {error:#}"));
+        }
+    }
+    if !batch_errors.is_empty() {
+        bail!(
+            "thread episodic refill could not durably finish {} claimed job(s): {}",
+            batch_errors.len(),
+            batch_errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
+async fn execute_claimed_refill_job(
+    crud_store: Arc<CrudStore>,
+    backend: &MemvidThreadEpisodicBackend,
+    payload_provider: &dyn ThreadEpisodicIndexPayloadProvider,
+    job: ThreadEpisodicIndexJobRecord,
+    now_unix: i64,
+    config: ThreadEpisodicIndexExecutorConfig,
+    summary: &mut ThreadEpisodicWorkspaceCapsuleRefillSummary,
+) -> Result<()> {
+    let attempt_started_at = Instant::now();
+    match payload_provider.resolve_index_request(&job).await {
+        Ok(resolved) => {
+            execute_resolved_refill_job(
+                crud_store,
+                backend,
+                job,
+                resolved,
+                now_unix,
+                config,
+                attempt_started_at,
+                summary,
+            )
+            .await
+        }
+        Err(error) if error.kind == ThreadEpisodicIndexResolutionFailureKind::SourceChanged => {
+            reconcile_and_release_refill_claim(crud_store, &job, now_unix, config)
+                .await
+                .map(|_| ())
+        }
+        Err(error) => {
+            let ThreadEpisodicIndexResolutionError {
+                kind,
+                message,
+                source_payload,
+            } = error;
+            let retryable = matches!(kind, ThreadEpisodicIndexResolutionFailureKind::Retryable)
+                && job.attempt_count < config.max_attempts;
+            let original_error_message = message.clone();
+            let persisted = match persist_refill_job_failure(
+                crud_store.as_ref(),
+                &job,
+                retryable,
+                false,
+                Some(message),
+                source_payload.as_deref(),
+                now_unix,
+                attempt_started_at,
+                config,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let (outcome, recovered_retryable) =
+                        release_refill_claim_after_persistence_error(
+                            crud_store,
+                            &job,
+                            now_unix,
+                            config,
+                            retryable,
+                            &error,
+                            Some(original_error_message.as_str()),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to recover refill claim after resolution persistence error: {error:#}"
+                            )
+                        })?;
+                    if outcome == ThreadEpisodicIndexAttemptOutcome::Applied {
+                        if recovered_retryable {
+                            summary.failed_retryable_jobs =
+                                summary.failed_retryable_jobs.saturating_add(1);
+                        } else {
+                            summary.failed_terminal_jobs =
+                                summary.failed_terminal_jobs.saturating_add(1);
+                        }
+                    }
+                    return Ok(());
+                }
+            };
+            match persisted {
+                ThreadEpisodicIndexAttemptOutcome::Applied => {}
+                ThreadEpisodicIndexAttemptOutcome::SourceChanged
+                | ThreadEpisodicIndexAttemptOutcome::Excluded => {
+                    reconcile_and_release_refill_claim(crud_store, &job, now_unix, config).await?;
+                    return Ok(());
+                }
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt => return Ok(()),
+            }
+            if retryable {
+                summary.failed_retryable_jobs = summary.failed_retryable_jobs.saturating_add(1);
+            } else {
+                summary.failed_terminal_jobs = summary.failed_terminal_jobs.saturating_add(1);
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn execute_resolved_refill_job(
-    crud_store: &CrudStore,
+    crud_store: Arc<CrudStore>,
     backend: &MemvidThreadEpisodicBackend,
     job: ThreadEpisodicIndexJobRecord,
     resolved: ThreadEpisodicResolvedIndexRequest,
@@ -1643,17 +1779,57 @@ async fn execute_resolved_refill_job(
         Ok(output) => {
             let capsule_id = resolved.request.capsule_id.clone();
             let output_stats = output.stats.clone();
-            persist_successful_refill_item(
-                crud_store,
+            let persisted = match persist_successful_refill_item(
+                crud_store.as_ref(),
                 &job,
                 resolved,
                 output,
                 now_unix,
                 attempt_started_at,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let (outcome, retryable) = release_refill_claim_after_persistence_error(
+                        crud_store.clone(),
+                        &job,
+                        now_unix,
+                        config,
+                        job.attempt_count < config.max_attempts,
+                        &error,
+                        Some("backend index succeeded"),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to recover refill claim after success persistence error: {error:#}"
+                        )
+                    })?;
+                    if outcome == ThreadEpisodicIndexAttemptOutcome::Applied {
+                        if retryable {
+                            summary.failed_retryable_jobs =
+                                summary.failed_retryable_jobs.saturating_add(1);
+                        } else {
+                            summary.failed_terminal_jobs =
+                                summary.failed_terminal_jobs.saturating_add(1);
+                        }
+                    }
+                    return Ok(());
+                }
+            };
+            match persisted {
+                ThreadEpisodicIndexAttemptOutcome::Applied => {}
+                ThreadEpisodicIndexAttemptOutcome::SourceChanged
+                | ThreadEpisodicIndexAttemptOutcome::Excluded => {
+                    reconcile_and_release_refill_claim(crud_store.clone(), &job, now_unix, config)
+                        .await?;
+                    return Ok(());
+                }
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt => return Ok(()),
+            }
             update_refill_capsule_capacity(
-                crud_store,
+                crud_store.as_ref(),
                 capsule_id.as_str(),
                 &output_stats,
                 None,
@@ -1664,7 +1840,7 @@ async fn execute_resolved_refill_job(
             .await;
             if memvid_stats_reach_capacity_threshold(&output_stats, config.near_capacity_percent) {
                 rotate_refill_capsule_after_capacity_event(
-                    crud_store,
+                    crud_store.as_ref(),
                     capsule_id.as_str(),
                     now_unix,
                     "near_capacity",
@@ -1683,36 +1859,80 @@ async fn execute_resolved_refill_job(
                 error.kind,
                 ThreadEpisodicMemvidFailureKind::CapacityExceeded
             );
-            if capacity_error {
-                update_refill_capsule_capacity(
-                    crud_store,
-                    resolved.request.capsule_id.as_str(),
-                    &ThreadEpisodicMemvidStats::default(),
-                    Some(error.message.clone()),
-                    true,
-                    now_unix,
-                    config,
-                )
-                .await;
-                rotate_refill_capsule_after_capacity_event(
-                    crud_store,
-                    resolved.request.capsule_id.as_str(),
-                    now_unix,
-                    "capacity_exceeded",
-                )
-                .await;
-            }
-            persist_refill_job_failure(
-                crud_store,
+            let capsule_id = resolved.request.capsule_id.clone();
+            let error_message = error.message;
+            let persisted = match persist_refill_job_failure(
+                crud_store.as_ref(),
                 &job,
                 retryable,
                 capacity_error,
-                Some(error.message),
+                Some(error_message.clone()),
+                Some(resolved.source_payload.as_str()),
                 now_unix,
                 attempt_started_at,
                 config,
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let (outcome, retryable) = release_refill_claim_after_persistence_error(
+                        crud_store.clone(),
+                        &job,
+                        now_unix,
+                        config,
+                        retryable,
+                        &error,
+                        Some(error_message.as_str()),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to recover refill claim after backend persistence error: {error:#}"
+                        )
+                    })?;
+                    if outcome == ThreadEpisodicIndexAttemptOutcome::Applied {
+                        if retryable {
+                            summary.failed_retryable_jobs =
+                                summary.failed_retryable_jobs.saturating_add(1);
+                        } else {
+                            summary.failed_terminal_jobs =
+                                summary.failed_terminal_jobs.saturating_add(1);
+                        }
+                    }
+                    return Ok(());
+                }
+            };
+            match persisted {
+                ThreadEpisodicIndexAttemptOutcome::Applied => {
+                    if capacity_error {
+                        update_refill_capsule_capacity(
+                            crud_store.as_ref(),
+                            capsule_id.as_str(),
+                            &ThreadEpisodicMemvidStats::default(),
+                            Some(error_message),
+                            true,
+                            now_unix,
+                            config,
+                        )
+                        .await;
+                        rotate_refill_capsule_after_capacity_event(
+                            crud_store.as_ref(),
+                            capsule_id.as_str(),
+                            now_unix,
+                            "capacity_exceeded",
+                        )
+                        .await;
+                    }
+                }
+                ThreadEpisodicIndexAttemptOutcome::SourceChanged
+                | ThreadEpisodicIndexAttemptOutcome::Excluded => {
+                    reconcile_and_release_refill_claim(crud_store.clone(), &job, now_unix, config)
+                        .await?;
+                    return Ok(());
+                }
+                ThreadEpisodicIndexAttemptOutcome::StaleAttempt => return Ok(()),
+            }
             if retryable {
                 summary.failed_retryable_jobs = summary.failed_retryable_jobs.saturating_add(1);
             } else {
@@ -1724,6 +1944,257 @@ async fn execute_resolved_refill_job(
     Ok(())
 }
 
+async fn reconcile_refill_job_source(
+    crud_store: Arc<CrudStore>,
+    job: &ThreadEpisodicIndexJobRecord,
+    now_unix: i64,
+) -> Result<Option<pioneer_crud::ThreadEpisodicSourceReconcileOutcome>> {
+    let Some(item) = crud_store
+        .find_thread_episodic_item(job.index_item_id.as_str())
+        .await?
+    else {
+        return Ok(None);
+    };
+    let outcome = StoreThreadEpisodicIngestor::with_config(crud_store, true)
+        .reconcile_canonical_source_occurrence(
+            item.workspace_id.as_str(),
+            item.thread_id.as_str(),
+            item.turn_id.as_str(),
+            item.item_id.as_str(),
+            now_unix,
+        )
+        .await?;
+    Ok(Some(outcome))
+}
+
+async fn release_refill_claim_after_persistence_error(
+    crud_store: Arc<CrudStore>,
+    job: &ThreadEpisodicIndexJobRecord,
+    now_unix: i64,
+    config: ThreadEpisodicIndexExecutorConfig,
+    retryable: bool,
+    persistence_error: &anyhow::Error,
+    original_result: Option<&str>,
+) -> Result<(ThreadEpisodicIndexAttemptOutcome, bool)> {
+    let retryable = retryable && job.attempt_count < config.max_attempts;
+    let update = ThreadEpisodicIndexJobFailureUpdate {
+        retryable,
+        next_run_at_unix: retryable.then(|| next_refill_retry_at(job, now_unix, config)),
+        last_error: Some(sanitize_refill_index_error(
+            format!(
+                "failed to persist thread episodic attempt result: {persistence_error:#}; original result: {}",
+                original_result.unwrap_or("unknown index attempt result")
+            )
+            .as_str(),
+        )),
+        capacity_error: false,
+        last_attempt_latency_ms: None,
+    };
+    let outcome = crud_store
+        .recover_thread_episodic_index_attempt_after_persistence_error(
+            job.id.as_str(),
+            job.attempt_count,
+            update,
+            now_unix,
+        )
+        .await
+        .context("failed to conditionally recover refill claim after persistence error")?;
+    if outcome == ThreadEpisodicIndexAttemptOutcome::Applied {
+        reconcile_refill_job_source(crud_store, job, now_unix)
+            .await
+            .context("failed to reconcile source after recording refill persistence failure")?;
+    }
+    Ok((outcome, retryable))
+}
+
+async fn reconcile_and_release_refill_claim(
+    crud_store: Arc<CrudStore>,
+    job: &ThreadEpisodicIndexJobRecord,
+    now_unix: i64,
+    config: ThreadEpisodicIndexExecutorConfig,
+) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+    match reconcile_refill_job_source(crud_store.clone(), job, now_unix).await {
+        Ok(Some(pioneer_crud::ThreadEpisodicSourceReconcileOutcome::PreservedExclusion)) => {
+            crud_store
+                .cancel_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    THREAD_EPISODIC_USER_EXCLUDED_ERROR,
+                    now_unix,
+                )
+                .await
+        }
+        Ok(Some(pioneer_crud::ThreadEpisodicSourceReconcileOutcome::PreservedDeletion)) => {
+            crud_store
+                .cancel_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    THREAD_EPISODIC_USER_DELETED_ERROR,
+                    now_unix,
+                )
+                .await
+        }
+        Ok(Some(pioneer_crud::ThreadEpisodicSourceReconcileOutcome::Current))
+            if job.attempt_count >= config.max_attempts =>
+        {
+            crud_store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: false,
+                        next_run_at_unix: None,
+                        last_error: Some(
+                            "thread episodic source changed repeatedly while resolving the same claim"
+                                .to_owned(),
+                        ),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None,
+                    },
+                    now_unix,
+                )
+                .await
+        }
+        Ok(None) => {
+            crud_store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: false,
+                        next_run_at_unix: None,
+                        last_error: Some(
+                            "thread episodic index item disappeared during source reconciliation"
+                                .to_owned(),
+                        ),
+                        capacity_error: false,
+                        last_attempt_latency_ms: None,
+                    },
+                    now_unix,
+                )
+                .await
+        }
+        Ok(_) => {
+            crud_store
+                .requeue_thread_episodic_index_attempt(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    now_unix,
+                )
+                .await
+        }
+        Err(error) => {
+            persist_refill_reconciliation_error(
+                crud_store,
+                job,
+                now_unix,
+                config,
+                error,
+                #[cfg(test)]
+                None,
+                #[cfg(test)]
+                None,
+            )
+            .await
+        }
+    }
+}
+
+async fn persist_refill_reconciliation_error(
+    crud_store: Arc<CrudStore>,
+    job: &ThreadEpisodicIndexJobRecord,
+    now_unix: i64,
+    config: ThreadEpisodicIndexExecutorConfig,
+    reconciliation_error: anyhow::Error,
+    #[cfg(test)] injected_primary_error: Option<&str>,
+    #[cfg(test)] injected_fallback_error: Option<&str>,
+) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+    let retryable = job.attempt_count < config.max_attempts;
+    let next_run_at_unix = retryable.then(|| next_refill_retry_at(job, now_unix, config));
+    let reconciliation_error = format!("{reconciliation_error:#}");
+    let update = ThreadEpisodicIndexJobFailureUpdate {
+        retryable,
+        next_run_at_unix,
+        last_error: Some(sanitize_refill_index_error(
+            format!("failed to reconcile changed thread episodic source: {reconciliation_error}")
+                .as_str(),
+        )),
+        capacity_error: false,
+        last_attempt_latency_ms: None,
+    };
+    let primary = {
+        #[cfg(test)]
+        if let Some(error) = injected_primary_error {
+            Err(anyhow::anyhow!(error.to_owned()))
+        } else {
+            crud_store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    update,
+                    now_unix,
+                )
+                .await
+        }
+        #[cfg(not(test))]
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                job.id.as_str(),
+                job.attempt_count,
+                update,
+                now_unix,
+            )
+            .await
+    };
+    match primary {
+        Ok(outcome) => Ok(outcome),
+        Err(persist_error) => {
+            let persist_error = format!("{persist_error:#}");
+            let recovery_update = ThreadEpisodicIndexJobFailureUpdate {
+                retryable,
+                next_run_at_unix,
+                last_error: Some(sanitize_refill_index_error(
+                    format!(
+                        "failed to reconcile changed thread episodic source: {reconciliation_error}; failed to persist reconciliation outcome: {persist_error}"
+                    )
+                    .as_str(),
+                )),
+                capacity_error: false,
+                last_attempt_latency_ms: None,
+            };
+            let recovered = {
+                #[cfg(test)]
+                if let Some(error) = injected_fallback_error {
+                    Err(anyhow::anyhow!(error.to_owned()))
+                } else {
+                    crud_store
+                        .recover_thread_episodic_index_attempt_after_persistence_error(
+                            job.id.as_str(),
+                            job.attempt_count,
+                            recovery_update,
+                            now_unix,
+                        )
+                        .await
+                }
+                #[cfg(not(test))]
+                crud_store
+                    .recover_thread_episodic_index_attempt_after_persistence_error(
+                        job.id.as_str(),
+                        job.attempt_count,
+                        recovery_update,
+                        now_unix,
+                    )
+                    .await
+            };
+            recovered.with_context(|| {
+                format!(
+                    "failed to persist thread episodic reconciliation error after primary persistence failure `{persist_error}`; original reconciliation error: {reconciliation_error}"
+                )
+            })
+        }
+    }
+}
+
 async fn persist_successful_refill_item(
     crud_store: &CrudStore,
     job: &ThreadEpisodicIndexJobRecord,
@@ -1731,10 +2202,12 @@ async fn persist_successful_refill_item(
     output: ThreadEpisodicMemvidIndexOutput,
     now_unix: i64,
     attempt_started_at: Instant,
-) -> Result<()> {
-    crud_store
-        .mark_thread_episodic_item_indexed(
-            job.index_item_id.as_str(),
+) -> Result<ThreadEpisodicIndexAttemptOutcome> {
+    let outcome = crud_store
+        .complete_thread_episodic_index_attempt(
+            job.id.as_str(),
+            job.attempt_count,
+            resolved.source_payload.as_str(),
             ThreadEpisodicItemIndexedUpdate {
                 capsule_id: resolved.request.capsule_id.clone(),
                 capsule_ref: resolved.request.capsule_ref.clone(),
@@ -1743,18 +2216,6 @@ async fn persist_successful_refill_item(
                 frame_uri: output.frame_uri.clone(),
                 embedding_artifact_id: resolved.embedding_artifact_id.clone(),
             },
-            now_unix,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to persist thread episodic item `{}` frame mapping",
-                job.index_item_id
-            )
-        })?;
-    crud_store
-        .complete_thread_episodic_index_job(
-            job.id.as_str(),
             ThreadEpisodicIndexJobCompletionUpdate {
                 capsule_id: resolved.request.capsule_id,
                 capsule_ref: resolved.request.capsule_ref,
@@ -1767,19 +2228,11 @@ async fn persist_successful_refill_item(
         .await
         .with_context(|| {
             format!(
-                "failed to mark thread episodic refill job `{}` completed",
+                "failed to commit thread episodic refill attempt `{}`",
                 job.id
             )
         })?;
-    refresh_refill_thread_directory(
-        crud_store,
-        job.workspace_id.as_str(),
-        job.thread_id.as_str(),
-        now_unix,
-    )
-    .await?;
-
-    Ok(())
+    Ok(outcome)
 }
 
 async fn persist_refill_job_failure(
@@ -1788,10 +2241,11 @@ async fn persist_refill_job_failure(
     retryable: bool,
     capacity_error: bool,
     error_message: Option<String>,
+    expected_source_payload: Option<&str>,
     now_unix: i64,
     attempt_started_at: Instant,
     config: ThreadEpisodicIndexExecutorConfig,
-) -> Result<()> {
+) -> Result<ThreadEpisodicIndexAttemptOutcome> {
     let next_run_at_unix = if retryable && capacity_error {
         Some(now_unix)
     } else {
@@ -1799,39 +2253,44 @@ async fn persist_refill_job_failure(
     };
     let sanitized_error =
         error_message.map(|message| sanitize_refill_index_error(message.as_str()));
-    crud_store
-        .fail_thread_episodic_index_job(
-            job.id.as_str(),
-            ThreadEpisodicIndexJobFailureUpdate {
-                retryable,
-                next_run_at_unix,
-                last_error: sanitized_error,
-                capacity_error,
-                last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
-            },
-            now_unix,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to persist thread episodic refill job `{}` failure",
-                job.id
-            )
-        })?;
-
-    if !retryable {
+    let update = ThreadEpisodicIndexJobFailureUpdate {
+        retryable,
+        next_run_at_unix,
+        last_error: sanitized_error,
+        capacity_error,
+        last_attempt_latency_ms: Some(elapsed_ms(attempt_started_at)),
+    };
+    let persisted = if let Some(expected_source_payload) = expected_source_payload {
         crud_store
-            .mark_thread_episodic_item_failed(job.index_item_id.as_str(), now_unix)
+            .fail_thread_episodic_index_attempt(
+                job.id.as_str(),
+                job.attempt_count,
+                expected_source_payload,
+                update,
+                now_unix,
+            )
             .await
-            .with_context(|| {
-                format!(
-                    "failed to mark thread episodic refill item `{}` failed",
-                    job.index_item_id
-                )
-            })?;
+    } else {
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                job.id.as_str(),
+                job.attempt_count,
+                update,
+                now_unix,
+            )
+            .await
+    };
+    let outcome = persisted.with_context(|| {
+        format!(
+            "failed to persist thread episodic refill job `{}` failure",
+            job.id
+        )
+    })?;
+    if outcome == ThreadEpisodicIndexAttemptOutcome::StaleAttempt {
+        return Ok(outcome);
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 async fn update_refill_capsule_capacity(
@@ -1905,45 +2364,6 @@ async fn rotate_refill_capsule_after_capacity_event(
             );
         }
     }
-}
-
-async fn refresh_refill_thread_directory(
-    crud_store: &CrudStore,
-    workspace_id: &str,
-    thread_id: &str,
-    now_unix: i64,
-) -> Result<()> {
-    let indexed_item_count = crud_store
-        .count_active_thread_episodic_items_for_thread(workspace_id, thread_id)
-        .await
-        .with_context(|| {
-            format!("failed to count thread episodic items for refill thread `{thread_id}`")
-        })?;
-    crud_store
-        .upsert_thread_episodic_thread_directory_entry(
-            NewThreadEpisodicThreadDirectoryRecord {
-                id: None,
-                workspace_id: workspace_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                title: None,
-                summary_hash: None,
-                summary_ref: None,
-                thread_created_at: None,
-                thread_updated_at: Some(fixed_datetime_from_unix(now_unix)),
-                last_indexed_at: Some(fixed_datetime_from_unix(now_unix)),
-                indexed_item_count,
-                task_affinity_json: None,
-                project_affinity_json: None,
-                visibility: ThreadEpisodicThreadDirectoryVisibility::Visible,
-                status: ThreadEpisodicThreadDirectoryStatus::Active,
-            },
-            now_unix,
-        )
-        .await
-        .with_context(|| {
-            format!("failed to refresh thread episodic refill directory for thread `{thread_id}`")
-        })?;
-    Ok(())
 }
 
 fn next_refill_retry_at(
@@ -2223,24 +2643,35 @@ mod tests {
     use crate::bootstrap::bootstrap;
     use crate::thread_episodic::{
         StoreThreadEpisodicIngestor, ThreadEpisodicCommittedItem, ThreadEpisodicIngestor,
+        ThreadEpisodicThreadReindexRequest,
     };
     use crate::workspace::WorkspaceManager;
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::{
-        NewThreadEpisodicIndexJobRecord, NewThreadEpisodicItemRecord,
+        NewThreadEpisodicExclusionRecord, NewThreadEpisodicIndexJobRecord,
+        NewThreadEpisodicItemRecord, NewThreadEpisodicThreadDirectoryRecord,
         ThreadEpisodicActiveWriteSegmentRequest, ThreadEpisodicCapsuleStatus,
-        ThreadEpisodicGraphEnrichmentState, ThreadEpisodicIndexJobStatus, ThreadEpisodicItemStatus,
-        ThreadEpisodicItemVisibility, ThreadEpisodicSourceActorRole,
-        ThreadEpisodicSourceRuntimeKind,
+        ThreadEpisodicExclusionReason, ThreadEpisodicGraphEnrichmentState,
+        ThreadEpisodicIndexJobStatus, ThreadEpisodicItemStatus, ThreadEpisodicItemVisibility,
+        ThreadEpisodicSourceActorRole, ThreadEpisodicSourceRuntimeKind,
+        ThreadEpisodicThreadDirectoryStatus, ThreadEpisodicThreadDirectoryVisibility,
+    };
+    use pioneer_entity::{
+        thread_episodic_exclusions, thread_episodic_index_jobs, thread_episodic_items,
     };
     use pioneer_memory::ThreadEpisodicEmbeddingError;
     use pioneer_protocol::{
-        ItemCompletedNotification, SandboxMode, Thread,
+        ItemCompletedNotification, ItemUpdatedNotification, SandboxMode, TaskExecutorKind,
+        TaskStatus, TaskTriggerKind, TaskTurnItem, Thread,
         ThreadEpisodicSourceActorRole as ProtocolThreadEpisodicSourceActorRole,
         ThreadEpisodicSourceContext, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility,
         ThreadStatus, Turn, TurnItem, TurnItemType, TurnKind, TurnOrigin, TurnStatus, UserInput,
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use pioneer_sqlite::SqliteDatabase;
+    use sea_orm::{
+        ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait,
+        IntoActiveModel, Set, Statement,
+    };
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2425,6 +2856,59 @@ mod tests {
                 .expect("scripted embedding responses lock")
                 .pop_front()
                 .unwrap_or_else(|| Ok(self.fallback_embedding.clone()))
+        }
+    }
+
+    struct BlockingFirstFailureEmbeddingProvider {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl BlockingFirstFailureEmbeddingProvider {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ThreadEpisodicEmbeddingProvider for BlockingFirstFailureEmbeddingProvider {
+        fn provider_id(&self) -> &str {
+            "openai"
+        }
+
+        fn model(&self) -> &str {
+            "text-embedding-3-small"
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn normalized(&self) -> bool {
+            true
+        }
+
+        fn embed_text(
+            &self,
+            _text: &str,
+        ) -> std::result::Result<Vec<f32>, ThreadEpisodicEmbeddingError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.started
+                    .send(())
+                    .expect("embedding test should announce its first call");
+                self.release
+                    .lock()
+                    .expect("embedding release lock")
+                    .recv()
+                    .expect("embedding test should release its first call");
+                return Err(ThreadEpisodicEmbeddingError::retryable_provider_failure(
+                    "openai",
+                    "text-embedding-3-small",
+                    "controlled provider failure for stale source",
+                ));
+            }
+            Ok(vec![0.1, 0.2, 0.3])
         }
     }
 
@@ -3247,6 +3731,511 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("rate limited"))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn thread_episodic_vector_refill_reconciles_source_changed_during_provider_failure() {
+        let (crud_store, temp_dir, workspace_id) = setup_concurrent_store().await;
+        let thread_id = "thread_vector_provider_source_change";
+        let turn_id = "turn_vector_provider_source_change";
+        let item_id = "item_vector_provider_source_change";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            item_id,
+            "provider version A",
+        )
+        .await;
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let embedding_provider = Arc::new(BlockingFirstFailureEmbeddingProvider {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            calls: AtomicUsize::new(0),
+        });
+        let target = ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_embedding_provider(
+            embedding_provider.as_ref(),
+        )
+        .expect("test provider target");
+        let refill_store = crud_store.clone();
+        let refill_workspace_id = workspace_id.clone();
+        let refill_root = temp_dir.path().to_path_buf();
+        let refill_target = target.clone();
+        let refill_provider = embedding_provider.clone();
+        let refill = tokio::spawn(async move {
+            refill_once_with_test_executor_config(
+                refill_store,
+                refill_root.as_path(),
+                refill_workspace_id.as_str(),
+                refill_target,
+                refill_provider,
+                immediate_retry_config(5),
+            )
+            .await
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .expect("provider-start waiter should join")
+            .expect("provider should start");
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "provider version B".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_020_100,
+            )
+            .await
+            .expect("canonical source should change during embedding");
+        release_tx
+            .send(())
+            .expect("provider failure should be released");
+
+        let summary = refill
+            .await
+            .expect("refill task should join")
+            .expect("refill should reconcile and finish");
+        assert_eq!(embedding_provider.calls(), 2);
+        assert_eq!(summary.failed_terminal_jobs, 0);
+        assert_eq!(summary.completed_jobs, 1);
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("source versions should list");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.status == ThreadEpisodicItemStatus::Active)
+                .count(),
+            1
+        );
+        let active = items
+            .iter()
+            .find(|item| item.status == ThreadEpisodicItemStatus::Active)
+            .expect("current source should be active");
+        assert_eq!(
+            active.source_text_hash,
+            crate::thread_episodic::source_text_hash("provider version B")
+        );
+        assert!(active.embedding_artifact_id.is_some());
+        assert!(
+            refill_is_current_for_target(crud_store.as_ref(), &target)
+                .await
+                .expect("reconciled vector marker should be current")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_refill_success_commit_rechecks_source_after_resolution() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_refill_atomic_source_check";
+        let turn_id = "turn_refill_atomic_source_check";
+        let item_id = "item_refill_atomic_source_check";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            turn_id,
+            item_id,
+            "refill resolved version A",
+        )
+        .await;
+        let job = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                chrono::Utc::now().timestamp().saturating_add(10),
+                1,
+            )
+            .await
+            .expect("refill job should claim")
+            .pop()
+            .expect("refill job should exist");
+        let payload_provider = StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            thread_episodic_storage_uri_from_path(temp_dir.path()),
+        );
+        let resolved = payload_provider
+            .resolve_index_request(&job)
+            .await
+            .expect("version A should resolve");
+        crud_store
+            .materialize_item_snapshot_updated(
+                ItemUpdatedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::UserMessage {
+                        id: item_id.to_owned(),
+                        text: "refill current version B".to_owned(),
+                        attachments: Vec::new(),
+                    },
+                },
+                1_700_020_201,
+            )
+            .await
+            .expect("canonical source should change after resolution");
+        let outcome = persist_successful_refill_item(
+            crud_store.as_ref(),
+            &job,
+            resolved.clone(),
+            ThreadEpisodicMemvidIndexOutput {
+                frame_id: 501,
+                frame_uri: resolved.request.frame_uri.clone(),
+                embedding_identity: None,
+                stats: ThreadEpisodicMemvidStats::default(),
+            },
+            1_700_020_202,
+            Instant::now(),
+        )
+        .await
+        .expect("stale refill success should be rejected cleanly");
+        assert_eq!(outcome, ThreadEpisodicIndexAttemptOutcome::SourceChanged);
+        let stale = crud_store
+            .find_thread_episodic_item(job.index_item_id.as_str())
+            .await
+            .expect("stale item lookup should succeed")
+            .expect("stale item should remain");
+        assert_ne!(stale.status, ThreadEpisodicItemStatus::Active);
+        assert!(stale.frame_id.is_none());
+
+        reconcile_and_release_refill_claim(
+            crud_store.clone(),
+            &job,
+            1_700_020_203,
+            immediate_retry_config(5),
+        )
+        .await
+        .expect("current source should reconcile");
+        let versions = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("source versions should list");
+        assert!(versions.iter().any(|item| {
+            item.status == ThreadEpisodicItemStatus::PendingIndex
+                && item.source_text_hash
+                    == crate::thread_episodic::source_text_hash("refill current version B")
+        }));
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_refill_reconciliation_persistence_recovery_is_bounded() {
+        let config = ThreadEpisodicIndexExecutorConfig {
+            retry_base_delay_secs: 11,
+            retry_max_delay_secs: 60,
+            max_attempts: 3,
+            ..ThreadEpisodicIndexExecutorConfig::default()
+        };
+
+        let (retry_store, _retry_temp, retry_workspace) = setup_store().await;
+        ingest_materialized_user_item(
+            retry_store.clone(),
+            retry_workspace.as_str(),
+            "thread_refill_reconcile_retry",
+            "turn_refill_reconcile_retry",
+            "item_refill_reconcile_retry",
+            "retry reconciliation persistence",
+        )
+        .await;
+        let retry_now = chrono::Utc::now().timestamp().saturating_add(60);
+        let retry_job = retry_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                retry_workspace.as_str(),
+                retry_now,
+                1,
+            )
+            .await
+            .expect("retry job should claim")
+            .pop()
+            .expect("retry job should exist");
+        let retry_outcome = persist_refill_reconciliation_error(
+            retry_store.clone(),
+            &retry_job,
+            retry_now,
+            config,
+            anyhow::anyhow!("controlled reconciliation failure"),
+            Some("controlled primary persistence failure"),
+            None,
+        )
+        .await
+        .expect("fallback should durably record the retryable reconciliation failure");
+        assert_eq!(retry_outcome, ThreadEpisodicIndexAttemptOutcome::Applied);
+        let stored_retry = retry_store
+            .find_thread_episodic_index_job(retry_job.id.as_str())
+            .await
+            .expect("retry job lookup should succeed")
+            .expect("retry job should remain");
+        assert_eq!(stored_retry.status, ThreadEpisodicIndexJobStatus::Failed);
+        assert_eq!(stored_retry.attempt_count, retry_job.attempt_count);
+        assert_eq!(
+            stored_retry.next_run_at,
+            fixed_datetime_from_unix(next_refill_retry_at(&retry_job, retry_now, config))
+        );
+        assert!(
+            stored_retry
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("controlled reconciliation failure")
+                    && error.contains("controlled primary persistence failure"))
+        );
+
+        let (terminal_store, _terminal_temp, terminal_workspace) = setup_store().await;
+        ingest_materialized_user_item(
+            terminal_store.clone(),
+            terminal_workspace.as_str(),
+            "thread_refill_reconcile_terminal",
+            "turn_refill_reconcile_terminal",
+            "item_refill_reconcile_terminal",
+            "terminal reconciliation persistence",
+        )
+        .await;
+        let terminal_now = chrono::Utc::now().timestamp().saturating_add(60);
+        let terminal_job = terminal_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                terminal_workspace.as_str(),
+                terminal_now,
+                1,
+            )
+            .await
+            .expect("terminal job should claim")
+            .pop()
+            .expect("terminal job should exist");
+        let terminal_config = ThreadEpisodicIndexExecutorConfig {
+            max_attempts: terminal_job.attempt_count,
+            ..config
+        };
+        let terminal_outcome = persist_refill_reconciliation_error(
+            terminal_store.clone(),
+            &terminal_job,
+            terminal_now,
+            terminal_config,
+            anyhow::anyhow!("terminal reconciliation failure"),
+            Some("terminal primary persistence failure"),
+            None,
+        )
+        .await
+        .expect("fallback should durably record the terminal reconciliation failure");
+        assert_eq!(terminal_outcome, ThreadEpisodicIndexAttemptOutcome::Applied);
+        let stored_terminal = terminal_store
+            .find_thread_episodic_index_job(terminal_job.id.as_str())
+            .await
+            .expect("terminal job lookup should succeed")
+            .expect("terminal job should remain");
+        assert_eq!(
+            stored_terminal.status,
+            ThreadEpisodicIndexJobStatus::Canceled
+        );
+        assert!(stored_terminal.next_run_at <= fixed_datetime_from_unix(terminal_now));
+
+        let (failed_store, _failed_temp, failed_workspace) = setup_store().await;
+        ingest_materialized_user_item(
+            failed_store.clone(),
+            failed_workspace.as_str(),
+            "thread_refill_reconcile_unpersisted",
+            "turn_refill_reconcile_unpersisted",
+            "item_refill_reconcile_unpersisted",
+            "unpersisted reconciliation failure",
+        )
+        .await;
+        let failed_now = chrono::Utc::now().timestamp().saturating_add(60);
+        let failed_job = failed_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                failed_workspace.as_str(),
+                failed_now,
+                1,
+            )
+            .await
+            .expect("unpersisted job should claim")
+            .pop()
+            .expect("unpersisted job should exist");
+        let error = persist_refill_reconciliation_error(
+            failed_store.clone(),
+            &failed_job,
+            failed_now,
+            config,
+            anyhow::anyhow!("unpersisted reconciliation failure"),
+            Some("unavailable primary persistence"),
+            Some("unavailable fallback persistence"),
+        )
+        .await
+        .expect_err("failure of both persistence paths must surface");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("unpersisted reconciliation failure"));
+        assert!(rendered.contains("unavailable primary persistence"));
+        assert!(rendered.contains("unavailable fallback persistence"));
+        let still_running = failed_store
+            .find_thread_episodic_index_job(failed_job.id.as_str())
+            .await
+            .expect("unpersisted job lookup should succeed")
+            .expect("unpersisted job should remain");
+        assert_eq!(still_running.status, ThreadEpisodicIndexJobStatus::Running);
+
+        failed_store
+            .requeue_thread_episodic_index_attempt(
+                failed_job.id.as_str(),
+                failed_job.attempt_count,
+                failed_now.saturating_add(1),
+            )
+            .await
+            .expect("old claim should requeue for stale-attempt coverage");
+        let new_claim = failed_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                failed_workspace.as_str(),
+                failed_now.saturating_add(2),
+                1,
+            )
+            .await
+            .expect("new attempt should claim")
+            .pop()
+            .expect("new attempt should exist");
+        assert!(new_claim.attempt_count > failed_job.attempt_count);
+        let stale_outcome = persist_refill_reconciliation_error(
+            failed_store.clone(),
+            &failed_job,
+            failed_now.saturating_add(3),
+            config,
+            anyhow::anyhow!("late old reconciliation failure"),
+            Some("late primary persistence failure"),
+            None,
+        )
+        .await
+        .expect("old attempt should be rejected without changing the new claim");
+        assert_eq!(
+            stale_outcome,
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        let preserved_claim = failed_store
+            .find_thread_episodic_index_job(failed_job.id.as_str())
+            .await
+            .expect("new claim lookup should succeed")
+            .expect("new claim should remain");
+        assert_eq!(
+            preserved_claim.status,
+            ThreadEpisodicIndexJobStatus::Running
+        );
+        assert_eq!(preserved_claim.attempt_count, new_claim.attempt_count);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_refill_finishes_claimed_batch_before_returning_error() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        for suffix in ["a", "b"] {
+            let thread_id = format!("thread_refill_claimed_batch_{suffix}");
+            let turn_id = format!("turn_refill_claimed_batch_{suffix}");
+            let item_id = format!("item_refill_claimed_batch_{suffix}");
+            let text = format!("claimed batch source {suffix}");
+            ingest_materialized_user_item(
+                crud_store.clone(),
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                item_id.as_str(),
+                text.as_str(),
+            )
+            .await;
+        }
+        let now_unix = chrono::Utc::now().timestamp().saturating_add(60);
+        let jobs = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(workspace_id.as_str(), now_unix, 2)
+            .await
+            .expect("two refill jobs should claim");
+        assert_eq!(jobs.len(), 2);
+        let failed_claim = jobs[0].clone();
+        let completed_claim = jobs[1].clone();
+        let backend = MemvidThreadEpisodicBackend::new();
+        let payload_provider = StoreThreadEpisodicIndexPayloadProvider::new(
+            crud_store.clone(),
+            thread_episodic_storage_uri_from_path(temp_dir.path()),
+        );
+        let mut summary = ThreadEpisodicWorkspaceCapsuleRefillSummary::default();
+        let error = execute_claimed_refill_batch(
+            crud_store.clone(),
+            &backend,
+            &payload_provider,
+            jobs,
+            now_unix,
+            ThreadEpisodicIndexExecutorConfig::default(),
+            &mut summary,
+            Some(failed_claim.id.as_str()),
+        )
+        .await
+        .expect_err("the injected unpersisted transition must fail the refill batch");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(failed_claim.id.as_str()));
+        assert!(rendered.contains("injected refill source reconciliation failure"));
+        assert!(rendered.contains("injected primary reconciliation persistence failure"));
+        assert!(rendered.contains("injected fallback reconciliation persistence failure"));
+        assert_eq!(summary.completed_jobs, 1);
+
+        let first = crud_store
+            .find_thread_episodic_index_job(failed_claim.id.as_str())
+            .await
+            .expect("failed claim lookup should succeed")
+            .expect("failed claim should remain");
+        assert_eq!(first.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(first.attempt_count, failed_claim.attempt_count);
+        let second = crud_store
+            .find_thread_episodic_index_job(completed_claim.id.as_str())
+            .await
+            .expect("completed claim lookup should succeed")
+            .expect("completed claim should remain");
+        assert_eq!(second.status, ThreadEpisodicIndexJobStatus::Completed);
+        let second_item = crud_store
+            .find_thread_episodic_item(completed_claim.index_item_id.as_str())
+            .await
+            .expect("completed item lookup should succeed")
+            .expect("completed item should remain");
+        assert_eq!(second_item.status, ThreadEpisodicItemStatus::Active);
+
+        assert_eq!(
+            crud_store
+                .requeue_thread_episodic_index_attempt(
+                    failed_claim.id.as_str(),
+                    failed_claim.attempt_count,
+                    now_unix.saturating_add(1),
+                )
+                .await
+                .expect("owned failed claim should requeue"),
+            ThreadEpisodicIndexAttemptOutcome::Applied
+        );
+        let new_claim = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                now_unix.saturating_add(2),
+                1,
+            )
+            .await
+            .expect("requeued job should claim again")
+            .pop()
+            .expect("new claim should exist");
+        assert!(new_claim.attempt_count > failed_claim.attempt_count);
+        assert_eq!(
+            crud_store
+                .cancel_thread_episodic_index_attempt(
+                    failed_claim.id.as_str(),
+                    failed_claim.attempt_count,
+                    "late cleanup from obsolete refill batch",
+                    now_unix.saturating_add(3),
+                )
+                .await
+                .expect("late cleanup should be rejected cleanly"),
+            ThreadEpisodicIndexAttemptOutcome::StaleAttempt
+        );
+        let preserved = crud_store
+            .find_thread_episodic_index_job(new_claim.id.as_str())
+            .await
+            .expect("new claim lookup should succeed")
+            .expect("new claim should remain");
+        assert_eq!(preserved.status, ThreadEpisodicIndexJobStatus::Running);
+        assert_eq!(preserved.attempt_count, new_claim.attempt_count);
     }
 
     #[tokio::test]
@@ -4294,6 +5283,621 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_episodic_fresh_refill_indexes_all_seven_canonical_task_summaries() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_refill_seven_tasks";
+        let mut expected = std::collections::BTreeMap::new();
+        for index in 0..7 {
+            let turn_id = format!("turn_refill_task_{index}");
+            let item_id = format!("item_refill_task_{index}");
+            let title = format!("Refill task title {index}");
+            let preview = format!("Refill task preview {index}");
+            let task = |status| TurnItem::Task {
+                item: TaskTurnItem {
+                    id: item_id.clone(),
+                    task_id: format!("task_refill_{index}"),
+                    created_by_turn_id: None,
+                    run_id: Some(format!("run_refill_{index}")),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: title.clone(),
+                    status,
+                    attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    progress_preview: None,
+                    result_preview: Some(preview.clone()),
+                    error_preview: None,
+                    started_at: Some(1_700_030_000),
+                    created_at: 1_700_030_000,
+                    updated_at: 1_700_030_001,
+                },
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id.as_str(),
+                task(if index == 6 {
+                    TaskStatus::Scheduled
+                } else {
+                    TaskStatus::Running
+                }),
+                1_700_030_000 + index,
+            )
+            .await;
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.clone(),
+                        item: task(TaskStatus::Completed),
+                    },
+                    1_700_030_100 + index,
+                )
+                .await
+                .expect("canonical completed task should update");
+            expected.insert(item_id, format!("{title}: {preview} (completed)"));
+        }
+
+        let summary = refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("fresh seven-task refill should complete");
+        assert_eq!(summary.completed_jobs, 7);
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 20)
+            .await
+            .expect("task items should list");
+        assert_eq!(items.len(), 7);
+        let jobs = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 20)
+            .await
+            .expect("task jobs should list");
+        assert_eq!(jobs.len(), 7);
+        assert!(
+            jobs.iter()
+                .all(|job| job.status == ThreadEpisodicIndexJobStatus::Completed)
+        );
+        for item in items {
+            let text = expected
+                .get(item.item_id.as_str())
+                .expect("expected task text");
+            assert_eq!(item.status, ThreadEpisodicItemStatus::Active);
+            assert_eq!(
+                item.source_text_hash,
+                crate::thread_episodic::source_text_hash(text)
+            );
+            assert!(item.frame_id.is_some());
+            assert!(item.frame_uri.is_some());
+        }
+        let meta = find_projection_meta(
+            &crud_store.database_connection(),
+            refill_projection_key_for_workspace(workspace_id.as_str())
+                .unwrap()
+                .as_str(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(meta.status, PROJECTION_META_STATUS_COMPLETE);
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_failed_refill_resumes_seven_hash_mismatches_idempotently() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_resume_seven_hash_mismatches";
+        let mut canonical_updates = Vec::new();
+        for index in 0..7 {
+            let turn_id = format!("turn_resume_task_{index}");
+            let item_id = format!("item_resume_task_{index}");
+            let make_item = |status| TurnItem::Task {
+                item: TaskTurnItem {
+                    id: item_id.clone(),
+                    task_id: format!("task_resume_{index}"),
+                    created_by_turn_id: None,
+                    run_id: Some(format!("run_resume_{index}")),
+                    parent_task_id: None,
+                    root_task_id: None,
+                    title: format!("Resume task {index}"),
+                    status,
+                    attachment: pioneer_protocol::TaskAttachmentMode::Attached,
+                    trigger_kind: TaskTriggerKind::Immediate,
+                    executor_kind: TaskExecutorKind::Agent,
+                    child_thread_id: None,
+                    child_turn_id: None,
+                    agent_role: None,
+                    depth: 0,
+                    max_depth: 3,
+                    next_fire_at: None,
+                    progress_preview: None,
+                    result_preview: Some(format!("Resume preview {index}")),
+                    error_preview: None,
+                    started_at: Some(1_700_040_000),
+                    created_at: 1_700_040_000,
+                    updated_at: 1_700_040_001,
+                },
+            };
+            materialize_thread_with_item(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id.as_str(),
+                make_item(if index == 6 {
+                    TaskStatus::Scheduled
+                } else {
+                    TaskStatus::Running
+                }),
+                1_700_040_000 + index,
+            )
+            .await;
+            canonical_updates.push((turn_id, make_item(TaskStatus::Completed)));
+        }
+        StoreThreadEpisodicIngestor::new(crud_store.clone())
+            .reindex_thread_from_history(ThreadEpisodicThreadReindexRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                history_event_limit: None,
+                item_scan_limit: 100,
+                now_unix: 1_700_040_020,
+            })
+            .await
+            .expect("historical projections should prepare");
+        for (index, (turn_id, item)) in canonical_updates.into_iter().enumerate() {
+            crud_store
+                .materialize_item_snapshot_updated(
+                    ItemUpdatedNotification {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id,
+                        item,
+                    },
+                    1_700_040_100 + index as i64,
+                )
+                .await
+                .expect("canonical completed task should update");
+        }
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                1_700_040_200,
+                20,
+            )
+            .await
+            .expect("stale jobs should claim");
+        assert_eq!(claimed.len(), 7);
+        for job in &claimed {
+            let outcome = crud_store
+                .fail_thread_episodic_index_attempt_without_source_validation(
+                    job.id.as_str(),
+                    job.attempt_count,
+                    ThreadEpisodicIndexJobFailureUpdate {
+                        retryable: false,
+                        next_run_at_unix: None,
+                        last_error: Some(
+                            "thread episodic source text hash changed before indexing".to_owned(),
+                        ),
+                        capacity_error: false,
+                        last_attempt_latency_ms: Some(1),
+                    },
+                    1_700_040_201,
+                )
+                .await
+                .expect("terminal hash mismatch should persist");
+            assert_eq!(outcome, ThreadEpisodicIndexAttemptOutcome::Applied);
+        }
+        mark_refill_marker_with_workspace_target(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        )
+        .await;
+
+        let resumed = refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("failed refill should resume without row cleanup");
+        assert!(resumed.resumed);
+        let jobs_after_resume = crud_store
+            .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 30)
+            .await
+            .expect("jobs should list after resume");
+        assert_eq!(
+            jobs_after_resume
+                .iter()
+                .filter(|job| job.status == ThreadEpisodicIndexJobStatus::Completed)
+                .count(),
+            7
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("only blocking canceled jobs should count"),
+            0
+        );
+        let job_count = jobs_after_resume.len();
+        let repeated = refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("successful refill should be idempotent");
+        assert!(repeated.skipped);
+        assert_eq!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 30,)
+                .await
+                .expect("jobs should list after repeat")
+                .len(),
+            job_count
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_fresh_and_resume_preserve_exclusion_and_user_tombstone() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_refill_preserved_controls";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_refill_excluded",
+            "item_refill_excluded",
+            "excluded source",
+        )
+        .await;
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_refill_deleted",
+            "item_refill_deleted",
+            "deleted source",
+        )
+        .await;
+        let items = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("control items should list");
+        let excluded = items
+            .iter()
+            .find(|item| item.item_id == "item_refill_excluded")
+            .unwrap();
+        crud_store
+            .exclude_thread_episodic_item(
+                NewThreadEpisodicExclusionRecord {
+                    id: None,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    index_item_id: excluded.id.clone(),
+                    reason: ThreadEpisodicExclusionReason::UserRequested,
+                    created_by: "refill-control-test".to_owned(),
+                },
+                1_700_045_000,
+            )
+            .await
+            .expect("exclusion should insert");
+        crud_store
+            .tombstone_thread_episodic_items_for_item(
+                workspace_id.as_str(),
+                thread_id,
+                "turn_refill_deleted",
+                "item_refill_deleted",
+                1_700_045_001,
+            )
+            .await
+            .expect("user deletion should persist");
+
+        refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("fresh refill should preserve control-plane decisions");
+        mark_existing_refill_failed(crud_store.as_ref(), workspace_id.as_str()).await;
+        refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("resume should preserve control-plane decisions");
+
+        let preserved = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("preserved items should list");
+        assert_eq!(preserved.len(), 2);
+        let deleted = preserved
+            .iter()
+            .find(|item| item.item_id == "item_refill_deleted")
+            .unwrap();
+        assert_eq!(deleted.status, ThreadEpisodicItemStatus::Deleted);
+        assert!(
+            crud_store
+                .find_thread_episodic_exclusion_by_item(
+                    workspace_id.as_str(),
+                    thread_id,
+                    excluded.id.as_str(),
+                )
+                .await
+                .expect("exclusion lookup should succeed")
+                .is_some()
+        );
+        assert!(
+            crud_store
+                .list_thread_episodic_index_jobs_for_thread(workspace_id.as_str(), thread_id, 10,)
+                .await
+                .expect("control jobs should list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_resume_ignores_preexisting_canceled_error_after_user_exclusion() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_resume_excluded_canceled";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_resume_excluded_canceled",
+            "item_resume_excluded_canceled",
+            "excluded source with an old canceled job",
+        )
+        .await;
+        let item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("item should list")
+            .pop()
+            .expect("item should exist");
+        let claim_time = chrono::Utc::now().timestamp().saturating_add(60);
+        let claimed = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                claim_time,
+                1,
+            )
+            .await
+            .expect("old job should claim")
+            .pop()
+            .expect("old job should exist");
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                claimed.id.as_str(),
+                claimed.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some(
+                        pioneer_crud::THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR.to_owned(),
+                    ),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                claim_time.saturating_add(1),
+            )
+            .await
+            .expect("old mismatch should persist");
+        let fixture_db = crud_store.database_connection();
+        thread_episodic_exclusions::ActiveModel {
+            id: Set("legacy_refill_exclusion".to_owned()),
+            workspace_id: Set(workspace_id.clone()),
+            thread_id: Set(thread_id.to_owned()),
+            index_item_id: Set(item.id.clone()),
+            reason: Set("user_requested".to_owned()),
+            created_by: Set("legacy-fixture".to_owned()),
+            created_at: Set(fixed_datetime_from_unix(claim_time.saturating_add(2))),
+        }
+        .insert(&fixture_db)
+        .await
+        .expect(
+            "legacy exclusion row should be inserted without applying current lifecycle repair",
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("legacy terminal count should succeed"),
+            1,
+            "the fixture must begin with an exclusion row and an unreconciled terminal reason"
+        );
+        mark_refill_marker_with_workspace_target(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        )
+        .await;
+
+        refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("resume should not treat an explicitly excluded occurrence as failed work");
+
+        let stored_item = crud_store
+            .find_thread_episodic_item(item.id.as_str())
+            .await
+            .expect("excluded item lookup should succeed")
+            .expect("excluded item should remain");
+        assert_eq!(stored_item.status, ThreadEpisodicItemStatus::Excluded);
+        assert!(stored_item.frame_id.is_none());
+        let stored_job = crud_store
+            .find_thread_episodic_index_job(claimed.id.as_str())
+            .await
+            .expect("excluded job lookup should succeed")
+            .expect("excluded job should remain");
+        assert_eq!(stored_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(stored_job.attempt_count, claimed.attempt_count);
+        assert_eq!(
+            stored_job.last_error.as_deref(),
+            Some(pioneer_crud::THREAD_EPISODIC_USER_EXCLUDED_ERROR)
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("excluded canceled job should not block refill"),
+            0
+        );
+
+        mark_existing_refill_failed(crud_store.as_ref(), workspace_id.as_str()).await;
+        let repeated = refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("reconciled legacy exclusion should remain idempotent");
+        assert_eq!(repeated.refill_jobs_enqueued, 0);
+
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            "thread_resume_independent_terminal",
+            "turn_resume_independent_terminal",
+            "item_resume_independent_terminal",
+            "independent source with a real terminal error",
+        )
+        .await;
+        let independent_claim = crud_store
+            .claim_due_thread_episodic_index_jobs_for_workspace(
+                workspace_id.as_str(),
+                chrono::Utc::now().timestamp().saturating_add(60),
+                1,
+            )
+            .await
+            .expect("independent job should claim")
+            .pop()
+            .expect("independent job should exist");
+        crud_store
+            .fail_thread_episodic_index_attempt_without_source_validation(
+                independent_claim.id.as_str(),
+                independent_claim.attempt_count,
+                ThreadEpisodicIndexJobFailureUpdate {
+                    retryable: false,
+                    next_run_at_unix: None,
+                    last_error: Some("independent terminal provider failure".to_owned()),
+                    capacity_error: false,
+                    last_attempt_latency_ms: None,
+                },
+                chrono::Utc::now().timestamp().saturating_add(61),
+            )
+            .await
+            .expect("independent terminal error should persist");
+        mark_existing_refill_failed(crud_store.as_ref(), workspace_id.as_str()).await;
+        refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect_err("an unrelated genuine terminal error must still fail resume");
+    }
+
+    #[tokio::test]
+    async fn thread_episodic_resume_repairs_preexisting_legacy_deleted_job() {
+        let (crud_store, temp_dir, workspace_id) = setup_store().await;
+        let thread_id = "thread_resume_legacy_deleted";
+        ingest_materialized_user_item(
+            crud_store.clone(),
+            workspace_id.as_str(),
+            thread_id,
+            "turn_resume_legacy_deleted",
+            "item_resume_legacy_deleted",
+            "legacy user deletion remains authoritative",
+        )
+        .await;
+        let item = crud_store
+            .list_thread_episodic_items_for_thread(workspace_id.as_str(), thread_id, 10)
+            .await
+            .expect("legacy deleted item should list")
+            .pop()
+            .expect("legacy deleted item should exist");
+        let job = crud_store
+            .find_thread_episodic_index_job_by_item(item.id.as_str())
+            .await
+            .expect("legacy deleted job lookup should succeed")
+            .expect("legacy deleted job should exist");
+        let fixture_time = chrono::Utc::now().timestamp().saturating_add(20);
+        let fixture_db = crud_store.database_connection();
+        let item_row = thread_episodic_items::Entity::find_by_id(item.id.clone())
+            .one(&fixture_db)
+            .await
+            .expect("legacy deleted item row lookup should succeed")
+            .expect("legacy deleted item row should exist");
+        let mut deleted_item = item_row.into_active_model();
+        deleted_item.status = Set("deleted".to_owned());
+        deleted_item.deleted_at = Set(Some(fixed_datetime_from_unix(fixture_time)));
+        deleted_item.updated_at = Set(fixed_datetime_from_unix(fixture_time));
+        deleted_item
+            .update(&fixture_db)
+            .await
+            .expect("legacy deleted item state should be seeded directly");
+        let job_row = thread_episodic_index_jobs::Entity::find_by_id(job.id.clone())
+            .one(&fixture_db)
+            .await
+            .expect("legacy deleted job row lookup should succeed")
+            .expect("legacy deleted job row should exist");
+        let mut legacy_job = job_row.into_active_model();
+        legacy_job.status = Set("canceled".to_owned());
+        legacy_job.last_error = Set(Some(
+            "legacy provider failure before tombstone repair".to_owned(),
+        ));
+        legacy_job.completed_at = Set(Some(fixed_datetime_from_unix(fixture_time)));
+        legacy_job.updated_at = Set(fixed_datetime_from_unix(fixture_time));
+        legacy_job
+            .update(&fixture_db)
+            .await
+            .expect("legacy deleted job state should be seeded directly");
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("legacy deletion terminal count should succeed"),
+            1
+        );
+        mark_refill_marker_with_workspace_target(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            PROJECTION_META_STATUS_FAILED,
+            THREAD_EPISODIC_WORKSPACE_CAPSULE_REFILL_VERSION,
+            &ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        )
+        .await;
+
+        refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("resume should repair a durable legacy user-deletion outcome");
+        let repaired_item = crud_store
+            .find_thread_episodic_item(item.id.as_str())
+            .await
+            .expect("repaired deleted item lookup should succeed")
+            .expect("repaired deleted item should remain");
+        assert_eq!(repaired_item.status, ThreadEpisodicItemStatus::Deleted);
+        let repaired_job = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("repaired deleted job lookup should succeed")
+            .expect("repaired deleted job should remain");
+        assert_eq!(repaired_job.status, ThreadEpisodicIndexJobStatus::Canceled);
+        assert_eq!(
+            repaired_job.last_error.as_deref(),
+            Some(pioneer_crud::THREAD_EPISODIC_USER_DELETED_ERROR)
+        );
+        assert_eq!(
+            crud_store
+                .count_canceled_thread_episodic_index_jobs_for_workspace(workspace_id.as_str())
+                .await
+                .expect("repaired deletion should not block refill"),
+            0
+        );
+
+        mark_existing_refill_failed(crud_store.as_ref(), workspace_id.as_str()).await;
+        let repeated = refill_once(crud_store.clone(), temp_dir.path())
+            .await
+            .expect("repaired legacy deletion should remain idempotent");
+        assert_eq!(repeated.refill_jobs_enqueued, 0);
+        let repeated_job = crud_store
+            .find_thread_episodic_index_job(job.id.as_str())
+            .await
+            .expect("repeated deleted job lookup should succeed")
+            .expect("repeated deleted job should remain");
+        assert_eq!(repeated_job.attempt_count, repaired_job.attempt_count);
+    }
+
+    #[tokio::test]
     async fn thread_episodic_workspace_refill_deletes_orphan_derived_items_before_rebuild() {
         let (crud_store, temp_dir, workspace_id) = setup_store().await;
         let orphan_item = crud_store
@@ -4383,6 +5987,49 @@ mod tests {
         )
     }
 
+    async fn setup_concurrent_store() -> (Arc<CrudStore>, TempDir, String) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let database_path = temp_dir.path().join("gateway.sqlite");
+        let mut writer_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=rwc", database_path.display()));
+        writer_options.max_connections(1).sqlx_logging(false);
+        let writer = Database::connect(writer_options)
+            .await
+            .expect("must connect test writer");
+        Migrator::up(&writer, None)
+            .await
+            .expect("migrations must succeed");
+        bootstrap(&writer)
+            .await
+            .expect("gateway bootstrap should create default workspace");
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .expect("test database should enable WAL");
+        let workspace_id = WorkspaceManager::new(writer.clone())
+            .list_workspaces()
+            .await
+            .expect("workspace list should succeed")
+            .into_iter()
+            .find(|workspace| workspace.is_active && workspace.is_current)
+            .expect("current workspace should exist")
+            .id;
+        let mut reader_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=ro", database_path.display()));
+        reader_options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|options| options.pragma("query_only", "ON"));
+        let reader = Database::connect(reader_options)
+            .await
+            .expect("must connect test reader");
+        (
+            Arc::new(CrudStore::new(SqliteDatabase::new(reader, writer))),
+            temp_dir,
+            workspace_id,
+        )
+    }
+
     async fn mark_refill_marker(crud_store: &CrudStore, status: &str, version: i64) {
         mark_refill_marker_with_target(
             crud_store,
@@ -4455,6 +6102,23 @@ mod tests {
         )
         .await
         .expect("marker should upsert");
+    }
+
+    async fn mark_existing_refill_failed(crud_store: &CrudStore, workspace_id: &str) {
+        let projection_key = refill_projection_key_for_workspace(workspace_id)
+            .expect("workspace refill key should build");
+        assert!(
+            update_projection_meta_status(
+                &crud_store.database_connection(),
+                projection_key.as_str(),
+                PROJECTION_META_STATUS_FAILED,
+                Some("injected interruption after durable refill state"),
+                now_datetime(),
+            )
+            .await
+            .expect("existing refill marker status should update"),
+            "existing refill marker should remain available for resume"
+        );
     }
 
     fn assert_manual_smoke_path_is_not_production(path: &Path, label: &str) {

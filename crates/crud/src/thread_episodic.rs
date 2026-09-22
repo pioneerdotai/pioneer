@@ -5,6 +5,12 @@ use std::mem::size_of;
 
 pub const THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID: &str = "__workspace__";
 pub const THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES: i64 = 50 * 1024 * 1024;
+pub const THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR: &str =
+    "thread episodic source version superseded during reconciliation";
+pub const THREAD_EPISODIC_USER_DELETED_ERROR: &str = "thread episodic source deleted by user";
+pub const THREAD_EPISODIC_USER_EXCLUDED_ERROR: &str = "thread episodic source excluded by user";
+pub const THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR: &str =
+    "thread episodic source text hash changed before indexing";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadEpisodicCapsuleWriteState {
@@ -58,6 +64,9 @@ pub enum ThreadEpisodicItemStatus {
     PendingIndex,
     Active,
     Excluded,
+    /// Automatically retired because the canonical source moved to another version.
+    /// Unlike `Deleted`, this state may be restored by source reconciliation.
+    Superseded,
     Deleted,
     Failed,
 }
@@ -248,6 +257,29 @@ pub struct NewThreadEpisodicItemRecord {
     pub frame_uri: Option<String>,
     pub indexed_at: Option<DateTimeWithTimeZone>,
     pub deleted_at: Option<DateTimeWithTimeZone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEpisodicCanonicalItem {
+    pub item: pioneer_protocol::TurnItem,
+    pub source_payload: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadEpisodicSourceReconcileOutcome {
+    Current,
+    MoreWork,
+    PreservedDeletion,
+    PreservedExclusion,
+    SourceChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadEpisodicIndexAttemptOutcome {
+    Applied,
+    StaleAttempt,
+    SourceChanged,
+    Excluded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -946,6 +978,7 @@ pub(crate) fn item_status_to_db(status: ThreadEpisodicItemStatus) -> &'static st
         ThreadEpisodicItemStatus::PendingIndex => "pending_index",
         ThreadEpisodicItemStatus::Active => "active",
         ThreadEpisodicItemStatus::Excluded => "excluded",
+        ThreadEpisodicItemStatus::Superseded => "superseded",
         ThreadEpisodicItemStatus::Deleted => "deleted",
         ThreadEpisodicItemStatus::Failed => "failed",
     }
@@ -956,6 +989,7 @@ pub(crate) fn item_status_from_db(value: &str) -> Result<ThreadEpisodicItemStatu
         "pending_index" => Ok(ThreadEpisodicItemStatus::PendingIndex),
         "active" => Ok(ThreadEpisodicItemStatus::Active),
         "excluded" => Ok(ThreadEpisodicItemStatus::Excluded),
+        "superseded" => Ok(ThreadEpisodicItemStatus::Superseded),
         "deleted" => Ok(ThreadEpisodicItemStatus::Deleted),
         "failed" => Ok(ThreadEpisodicItemStatus::Failed),
         other => bail!("unknown thread episodic item status `{other}`"),
