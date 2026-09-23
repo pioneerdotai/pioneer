@@ -10,7 +10,7 @@ use gpui_kit::component::{
     theme::{Theme, ThemeMode},
 };
 use gpui_kit::component::{
-    Root, WindowExt,
+    WindowExt,
     resizable::{h_resizable, resizable_panel},
     theme::ActiveTheme,
     v_flex,
@@ -818,7 +818,7 @@ impl DesktopShellView {
     }
 }
 impl Render for DesktopShellView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.onboarding.is_none() {
             return div().into_any_element();
         }
@@ -854,9 +854,6 @@ impl Render for DesktopShellView {
         } else {
             screen.into_any_element()
         };
-        let sheets = Root::render_sheet_layer(window, cx);
-        let dialogs = Root::render_dialog_layer(window, cx);
-        let notifications = Root::render_notification_layer(window, cx);
         div()
             .size_full()
             .track_focus(&self.action_region)
@@ -891,9 +888,6 @@ impl Render for DesktopShellView {
                         .child(body),
                 ),
             )
-            .children(sheets)
-            .children(dialogs)
-            .children(notifications)
             .into_any_element()
     }
 }

@@ -227,21 +227,6 @@ fn fetch_channel_release_tag(
     select_channel_release_tag(channel, releases.iter())
 }
 
-fn ensure_manifest_asset_is_listed(release: &GithubRelease) -> Result<(), DesktopReleaseError> {
-    if release_may_have_manifest_asset(release) {
-        return Ok(());
-    }
-
-    Err(DesktopReleaseError::new(
-        DesktopReleaseErrorCode::ManifestNotPublished,
-        format!(
-            "desktop update manifest asset `{}` is not listed on release `{}` yet",
-            DESKTOP_UPDATE_MANIFEST_FILE,
-            release.tag_name.trim()
-        ),
-    ))
-}
-
 fn release_may_have_manifest_asset(release: &GithubRelease) -> bool {
     match &release.assets {
         Some(assets) => assets
@@ -354,10 +339,9 @@ fn select_channel_tag<'a>(
 mod tests {
     use super::{
         DESKTOP_UPDATE_MANIFEST_FILE, DesktopReleaseChannel, DesktopReleaseErrorCode,
-        GithubRelease, GithubReleaseAsset, ensure_manifest_asset_is_listed,
-        release_asset_download_url, release_by_tag_api_url, release_list_url,
-        release_manifest_download_url, release_may_have_manifest_asset, select_channel_release_tag,
-        select_channel_tag,
+        GithubRelease, GithubReleaseAsset, release_asset_download_url, release_by_tag_api_url,
+        release_list_url, release_manifest_download_url, release_may_have_manifest_asset,
+        select_channel_release_tag, select_channel_tag,
     };
     use crate::updater::state::DesktopUpdateConfig;
 
@@ -426,14 +410,18 @@ mod tests {
         let release = release("v1.2.3", None);
 
         assert!(release_may_have_manifest_asset(&release));
-        assert!(ensure_manifest_asset_is_listed(&release).is_ok());
+        assert_eq!(
+            select_channel_release_tag(DesktopReleaseChannel::Stable, [&release]).unwrap(),
+            "v1.2.3"
+        );
     }
 
     #[test]
     fn release_with_assets_requires_manifest_asset() {
         let release = release("v1.2.3", Some(vec!["Pioneer-aarch64.app.zip"]));
 
-        let error = ensure_manifest_asset_is_listed(&release).unwrap_err();
+        let error =
+            select_channel_release_tag(DesktopReleaseChannel::Stable, [&release]).unwrap_err();
 
         assert_eq!(error.code(), DesktopReleaseErrorCode::ManifestNotPublished);
     }
