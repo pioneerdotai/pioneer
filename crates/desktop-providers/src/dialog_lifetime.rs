@@ -93,10 +93,8 @@ mod tests {
         input: Entity<InputState>,
     }
     impl Render for Host {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            gpui_kit::div()
-                .child(Input::new(&self.input))
-                .children(Root::render_dialog_layer(window, cx))
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui_kit::div().child(Input::new(&self.input))
         }
     }
     #[gpui_kit::test]

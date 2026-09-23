@@ -659,14 +659,11 @@ mod tests {
     impl gpui_kit::Render for SwitcherHost {
         fn render(
             &mut self,
-            window: &mut gpui_kit::Window,
+            _: &mut gpui_kit::Window,
             cx: &mut gpui_kit::Context<Self>,
         ) -> impl gpui_kit::IntoElement {
             use gpui_kit::ParentElement;
-            let dialogs = gpui_kit::component::Root::render_dialog_layer(window, cx);
-            gpui_kit::div()
-                .child(self.owner.read(cx).gateway_switcher_surface())
-                .children(dialogs)
+            gpui_kit::div().child(self.owner.read(cx).gateway_switcher_surface())
         }
     }
     #[gpui_kit::test]

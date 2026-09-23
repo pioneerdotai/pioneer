@@ -148,9 +148,9 @@ edges = ["pioneer-client", "pioneer-desktop-foundation"]
 "TUI-39" = { kind = "Entity", owner = "SettingsView", symbol = "SettingsView", file = "desktop-settings/src/screen.rs" }
 "TUI-40" = { kind = "RenderOnce", owner = "SettingsView", symbol = "DeviceActivationForm", file = "desktop-settings/src/device_activation_form.rs" }
 "TUI-41" = { kind = "Entity", owner = "SettingsView", symbol = "ProgressIndicatorView", file = "desktop-settings/src/progress.rs" }
-"TUI-42" = { kind = "Behavior", owner = "Root", symbol = "Root::render_dialog_layer", file = "desktop/src/desktop_shell.rs" }
+"TUI-42" = { kind = "Behavior", owner = "Root", symbol = "Root::new", file = "desktop/src/client_runtime/mod.rs" }
 "TUI-43" = { kind = "Behavior", owner = "Root", symbol = "Popover", file = "desktop-thread/src/model_picker.rs" }
-"TUI-44" = { kind = "Behavior", owner = "Root", symbol = "Root::render_notification_layer", file = "desktop/src/desktop_shell.rs" }
+"TUI-44" = { kind = "Behavior", owner = "Root", symbol = "gpui_kit::init", file = "desktop/src/main.rs" }
 "TUI-45" = { kind = "RenderOnce", owner = "OnboardingView", symbol = "OnboardingSurface", file = "desktop-onboarding/src/lib.rs" }
 "TUI-46" = { kind = "RenderOnce", owner = "owning feature", symbol = "AvatarSurface", file = "desktop-foundation/src/avatar.rs" }
 "TUI-47" = { kind = "Behavior", owner = "OnboardingView", symbol = "Popover", file = "desktop-onboarding/src/switcher.rs" }
