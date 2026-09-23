@@ -9,8 +9,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 
 use crate::convention::{
@@ -22,6 +22,15 @@ use crate::convention::{
 use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const DB_ID_LEN: usize = 21;
+pub const TURN_MESSAGE_GUARD_PAGE_ROWS: usize = 128;
+pub const TURN_MESSAGE_GUARD_PAGE_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct TurnMessageGuard {
+    pub id: String,
+    pub message_revision: i64,
+    pub message_deleted_at: Option<DateTimeWithTimeZone>,
+}
 
 /// Metadata only: no command arguments, tool output or provider prompt.
 pub struct PostTurnToolSummary {
@@ -243,6 +252,45 @@ pub async fn find_turns_by_thread_and_ids<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to query turns by thread and ids")
+}
+
+pub async fn find_turn_message_guards_by_thread_and_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_ids: &[String],
+) -> Result<Vec<TurnMessageGuard>> {
+    anyhow::ensure!(
+        turn_ids.len() <= TURN_MESSAGE_GUARD_PAGE_ROWS,
+        "turn message guard page exceeds row bound"
+    );
+    let encoded_bytes = turn_ids
+        .iter()
+        .try_fold(2_usize, |bytes, id| -> Result<usize> {
+            anyhow::ensure!(
+                id.len().saturating_add(3) <= TURN_MESSAGE_GUARD_PAGE_BYTES,
+                "one turn message guard id exceeds byte bound"
+            );
+            Ok(bytes.saturating_add(id.len()).saturating_add(1))
+        })?;
+    anyhow::ensure!(
+        encoded_bytes <= TURN_MESSAGE_GUARD_PAGE_BYTES,
+        "turn message guard page exceeds byte bound"
+    );
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
+        .column(turn::Column::MessageRevision)
+        .column(turn::Column::MessageDeletedAt)
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Id.is_in(turn_ids.iter().cloned()))
+        .into_model::<TurnMessageGuard>()
+        .all(db)
+        .await
+        .context("failed to query bounded turn message guards")
 }
 
 pub async fn has_in_progress_conversation_turn<C: ConnectionTrait>(

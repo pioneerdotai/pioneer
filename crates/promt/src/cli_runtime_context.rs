@@ -8,7 +8,6 @@ use std::path::Path;
 
 const PIONEER_CONTEXT_MAX_CHARS: usize = 4_000;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 6_000;
-const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
 const SELECTED_SKILLS_CONTEXT_MAX_CHARS: usize = 2_000;
 const SELECTED_CAPABILITIES_CONTEXT_MAX_CHARS: usize = 4_000;
 const CURRENT_PERMISSIONS_CONTEXT_MAX_CHARS: usize = 1_500;
@@ -110,7 +109,11 @@ fn cli_runtime_context_sections(input: &CliRuntimeContextInput) -> Vec<PromptRun
         builtin_section(
             PromptRuntimeBuiltInSectionId::ThreadContext,
             optional_text(input.thread_context.as_ref()),
-            Some(THREAD_CONTEXT_MAX_CHARS),
+            // Conversation history reaches this compiler only after Gateway's
+            // accepted-history selection and compaction projection. Applying a
+            // second character cap here can split assistant/tool rounds and
+            // silently discard the accepted child basis.
+            None,
             input
                 .thread_context
                 .as_ref()

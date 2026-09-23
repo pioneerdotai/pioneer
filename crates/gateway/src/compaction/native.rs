@@ -1,6 +1,7 @@
 //! Native request preparation. This function owns admission and the service
 //! operation; callers retain the turn control scope through reconciliation.
 use super::*;
+use anyhow::Context as _;
 use pioneer_agent::compaction::{
     controller::{
         NativeContext, NativeHistoryCheckMetadata, NativeInputReceipt, NativePreparedRequest,
@@ -442,6 +443,26 @@ async fn prepare_native_projection_with_prepared(
         )
         .await?;
         super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
+        if request.messages.iter().any(|message| {
+            message.content_parts.iter().any(|part| match part {
+                pioneer_provider::MessageContentPart::File { file } => {
+                    matches!(&file.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                }
+                pioneer_provider::MessageContentPart::Image { image } => {
+                    matches!(&image.source, pioneer_provider::AttachmentDataSource::Reference { reference } if reference.starts_with("pioneer-artifact:"))
+                }
+                pioneer_provider::MessageContentPart::Text { .. }
+                | pioneer_provider::MessageContentPart::Audio { .. }
+                | pioneer_provider::MessageContentPart::Video { .. } => false,
+            })
+        }) {
+            let processor = processor.context(
+                "native historical artifacts require the authoritative Gateway resolver",
+            )?;
+            request.messages = processor
+                .materialize_historical_artifacts(workspace, request.messages)
+                .await?;
+        }
         if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_))) {
             observe_reused_projection(store, workspace, thread);
         }

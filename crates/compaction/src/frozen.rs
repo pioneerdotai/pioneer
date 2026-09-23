@@ -3,6 +3,14 @@
 use crate::SourceRef;
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrozenEventInputRole {
+    Authoritative,
+    Deleted,
+    InputCopy,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenMessageRef {
@@ -13,6 +21,11 @@ pub struct FrozenMessageRef {
     pub context_thread: Option<String>,
     pub unit_id: String,
     pub sources: Vec<SourceRef>,
+    /// Exact event-input relationship captured while this source revision was
+    /// still available. Unlike the mutable projection cache, this evidence is
+    /// part of the immutable manifest reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_input_role: Option<FrozenEventInputRole>,
     pub inherited: bool,
     pub complete: bool,
     pub protected_input: bool,
@@ -36,6 +49,11 @@ impl FrozenMessageRef {
         anyhow::ensure!(
             !self.source_thread.is_empty() && !self.unit_id.is_empty() && !self.sources.is_empty(),
             "frozen message identity is missing"
+        );
+        anyhow::ensure!(
+            self.event_input_role.is_none()
+                || (self.sources.len() == 1 && self.sources[0].scope.starts_with("event:")),
+            "frozen event-input evidence does not name one event source"
         );
         anyhow::ensure!(
             self.wire_sha256.len() == 64 && self.wire_sha256.bytes().all(|c| c.is_ascii_hexdigit()),
@@ -94,6 +112,7 @@ mod tests {
         );
         let mut value: FrozenMessageRef = serde_json::from_str(&previous).unwrap();
         assert!(value.logical_turn_id.is_none());
+        assert!(value.event_input_role.is_none());
         value.validate().unwrap();
         assert_eq!(serde_json::to_string(&value).unwrap(), previous);
         value.logical_turn_id = Some("command-turn".into());

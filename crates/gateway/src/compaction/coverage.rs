@@ -195,6 +195,7 @@ pub(crate) struct ResolvedCheckpointGraph {
     /// projection/filtering only, never in coverage or access grants.
     pub(crate) replay_aliases: BTreeMap<ScopedHistorySource, ScopedHistorySource>,
     pub(crate) replay_item_aliases: BTreeSet<(String, String, String)>,
+    pub(crate) event_input_evidence: BTreeMap<ScopedHistorySource, String>,
     /// Exact checkpoint identities in this closure. Summary and operation
     /// payloads are deliberately not loaded during discovery.
     pub(crate) checkpoints: BTreeSet<SourceRef>,
@@ -278,6 +279,7 @@ impl CheckpointGraphResolver {
             .len()
             .saturating_add(graph.replay_aliases.len())
             .saturating_add(graph.replay_item_aliases.len())
+            .saturating_add(graph.event_input_evidence.len())
             .saturating_add(graph.checkpoints.len())
     }
 
@@ -456,6 +458,7 @@ impl CheckpointGraphResolver {
         let mut leaves = BTreeSet::new();
         let mut replay_aliases = BTreeMap::new();
         let mut replay_item_aliases = BTreeSet::new();
+        let mut event_input_evidence = BTreeMap::new();
         let mut checkpoints = BTreeSet::new();
         let mut done = BTreeSet::new();
         let mut visiting = BTreeSet::new();
@@ -527,6 +530,18 @@ impl CheckpointGraphResolver {
                     ensure!(previous == covered, "checkpoint replay alias is ambiguous");
                 }
             }
+            for evidence in edges.event_input_evidence {
+                let source = ScopedHistorySource {
+                    thread: evidence.source.source_thread,
+                    source: evidence.source.source,
+                };
+                if let Some(previous) = event_input_evidence.insert(source, evidence.role.clone()) {
+                    ensure!(
+                        previous == evidence.role,
+                        "checkpoint event-input evidence is ambiguous"
+                    );
+                }
+            }
             pending.push((source, thread.clone(), true));
             if let Some(previous_id) = &edges.previous {
                 let previous_edges = self.edges_for_id(store, workspace, previous_id).await?;
@@ -556,6 +571,7 @@ impl CheckpointGraphResolver {
             leaves,
             replay_aliases,
             replay_item_aliases,
+            event_input_evidence,
             checkpoints,
         })))
     }
@@ -951,6 +967,7 @@ mod cache_tests {
             replay_item_aliases: (0..item_aliases)
                 .map(|index| ("thread".into(), "turn".into(), format!("item-{id}-{index}")))
                 .collect(),
+            event_input_evidence: BTreeMap::new(),
             checkpoints: BTreeSet::from([source(id)]),
         })
     }

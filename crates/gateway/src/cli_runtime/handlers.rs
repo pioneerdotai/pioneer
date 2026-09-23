@@ -5604,6 +5604,50 @@ impl MessageProcessor {
                 return false;
             }
         }
+        if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            let completed_context = async {
+                let (_, completed_turn) = self
+                    .crud_store
+                    .get_turn(
+                        turn_binding.thread_id.as_str(),
+                        turn_binding.turn_id.as_str(),
+                    )
+                    .await?
+                    .context("completed CLI turn disappeared before continuity capture")?;
+                let sent_basis =
+                    crate::cli_runtime::thread_binding::sent_context_basis_from_input_mapping(
+                        turn_binding.input_mapping_json.as_str(),
+                    )?
+                    .context(
+                        "completed CLI turn has no proof for the context sent to its provider",
+                    )?;
+                crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+                    self.crud_store.as_ref(),
+                    turn_binding.continuation_thread_id.as_str(),
+                    turn_binding.native_thread_id.as_str(),
+                    crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                        turn_id: completed_turn.id,
+                        message_revision: completed_turn.message_revision,
+                        message_deleted: completed_turn.message_deleted,
+                    },
+                    sent_basis,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = completed_context {
+                // The provider turn is already accepted. Leave its start-only
+                // receipt non-current so the next turn bootstraps rather than
+                // claiming continuity without a canonical proof.
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to record completed CLI runtime context; next turn will bootstrap"
+                );
+            }
+        }
         let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         for snapshot in projected.snapshot {
             if !event_hub.publish_snapshot(snapshot) {

@@ -2,12 +2,14 @@
 //! capacity before decoding. A shared fence can freeze several related lines.
 use super::*;
 
+use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_crud::{
     CanonicalTurnEventPayload as Event,
     compaction::{HistoryReadFence, PagedSource, SourceRecord},
 };
 use pioneer_provider::{
-    CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceRef, Role,
+    AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
+    MessageAttachment, MessageContentPart, MessageProvenance, MessageSourceRef, Role,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -213,6 +215,61 @@ pub(crate) async fn prepare_references(
         .await
 }
 
+/// Resolve retained exact event relationship metadata in bounded batches without
+/// touching raw payloads or requiring the covered event to remain live.
+pub(crate) async fn historical_event_projections(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    references: impl IntoIterator<Item = SourceRef>,
+) -> Result<Vec<pioneer_crud::compaction::HistoricalEventProjection>> {
+    let references = references
+        .into_iter()
+        .filter(|source| source.scope.starts_with("event:"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut projections = Vec::new();
+    let mut start = 0;
+    while start < references.len() {
+        let mut end = start;
+        let mut bytes = 2_usize;
+        while end < references.len()
+            && end - start < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
+        {
+            let encoded = serde_json::to_vec(&references[end])?;
+            let separator = usize::from(end > start);
+            ensure!(
+                encoded.len().saturating_add(2) <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+                "historical event projection reference exceeds metadata bound"
+            );
+            if end > start
+                && bytes
+                    .saturating_add(separator)
+                    .saturating_add(encoded.len())
+                    > pioneer_crud::compaction::SOURCE_PAGE_BYTES
+            {
+                break;
+            }
+            bytes = bytes
+                .saturating_add(separator)
+                .saturating_add(encoded.len());
+            end += 1;
+        }
+        projections.extend(
+            store
+                .compaction_historical_event_projections(workspace, thread, &references[start..end])
+                .await?,
+        );
+        start = end;
+    }
+    Ok(projections)
+}
+
+fn source_turn(source: &SourceRef) -> Option<&str> {
+    source.scope.split_once(':').map(|(_, turn)| turn)
+}
+
 async fn metadata(
     store: &CrudStore,
     workspace: &str,
@@ -280,8 +337,58 @@ fn origin(
     }
 }
 pub(crate) fn input_message(inputs: &[pioneer_protocol::UserInput]) -> Result<ChatMessage> {
-    // Historical attachments remain typed original references. Current-turn
-    // attachment materialization is owned by the native request compiler.
+    let mut text = Vec::new();
+    let mut parts = Vec::new();
+    for input in inputs {
+        match input {
+            pioneer_protocol::UserInput::Text { text: value, .. } => text.push(value.clone()),
+            pioneer_protocol::UserInput::Image { url } => parts.push(MessageContentPart::image(
+                historical_url_attachment(url, "image/*"),
+            )),
+            pioneer_protocol::UserInput::LocalImage { path } => parts.push(
+                MessageContentPart::image(historical_path_attachment(path, "image/*")),
+            ),
+            pioneer_protocol::UserInput::File { url } => parts.push(MessageContentPart::file(
+                historical_url_attachment(url, "application/octet-stream"),
+            )),
+            pioneer_protocol::UserInput::LocalFile { path } => {
+                parts.push(MessageContentPart::file(historical_path_attachment(
+                    path,
+                    "application/octet-stream",
+                )))
+            }
+            pioneer_protocol::UserInput::Audio { url } => parts.push(MessageContentPart::audio(
+                historical_url_attachment(url, "audio/*"),
+            )),
+            pioneer_protocol::UserInput::LocalAudio { path } => parts.push(
+                MessageContentPart::audio(historical_path_attachment(path, "audio/*")),
+            ),
+            pioneer_protocol::UserInput::Video { url } => parts.push(MessageContentPart::video(
+                historical_url_attachment(url, "video/*"),
+            )),
+            pioneer_protocol::UserInput::LocalVideo { path } => parts.push(
+                MessageContentPart::video(historical_path_attachment(path, "video/*")),
+            ),
+            // Exact artifact kind and version are captured by the durable
+            // UserMessage attachment event, not inferred from this launch ID.
+            reference @ (pioneer_protocol::UserInput::Artifact { .. }
+            | pioneer_protocol::UserInput::Mention { .. }) => text.push(format!(
+                "Historical input reference: {}",
+                serde_json::to_string(reference)?
+            )),
+        }
+    }
+    let mut message = ChatMessage::user(text.join("\n"));
+    message.content_parts = parts;
+    Ok(message)
+}
+
+/// Wire-compatible renderer for reference-based manifests captured before
+/// historical media became typed content parts. Frozen restore uses this only
+/// as a digest-checked compatibility candidate; execution projection continues
+/// to use [`input_message`] and therefore never derives attachment authority
+/// from this display text.
+pub(crate) fn legacy_input_message(inputs: &[pioneer_protocol::UserInput]) -> Result<ChatMessage> {
     let mut text = Vec::new();
     for input in inputs {
         match input {
@@ -293,6 +400,116 @@ pub(crate) fn input_message(inputs: &[pioneer_protocol::UserInput]) -> Result<Ch
         }
     }
     Ok(ChatMessage::user(text.join("\n")))
+}
+
+fn historical_url_attachment(url: &str, mime_type: &str) -> MessageAttachment {
+    MessageAttachment::from_url(url.to_owned(), historical_media_mime(url, mime_type))
+}
+
+fn historical_path_attachment(path: &str, mime_type: &str) -> MessageAttachment {
+    MessageAttachment::from_path(path.to_owned(), historical_media_mime(path, mime_type))
+}
+
+fn historical_media_mime(location: &str, fallback: &str) -> String {
+    if let Some(data_mime) = location
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(';').map(|(mime, _)| mime))
+        .filter(|mime| !mime.trim().is_empty())
+    {
+        return data_mime.to_owned();
+    }
+    let kind = match fallback {
+        "image/*" => pioneer_provider::InputContentType::Image,
+        "audio/*" => pioneer_provider::InputContentType::Audio,
+        "video/*" => pioneer_provider::InputContentType::Video,
+        _ => pioneer_provider::InputContentType::File,
+    };
+    pioneer_provider::infer_mime_from_reference(location, kind)
+}
+
+fn historical_user_attachment_part(
+    attachment: pioneer_protocol::UserMessageAttachment,
+) -> Option<MessageContentPart> {
+    use pioneer_protocol::UserMessageAttachment as Attachment;
+    Some(match attachment {
+        Attachment::Image { url } => {
+            MessageContentPart::image(historical_url_attachment(url.as_str(), "image/*"))
+        }
+        Attachment::LocalImage { path } => {
+            MessageContentPart::image(historical_path_attachment(path.as_str(), "image/*"))
+        }
+        Attachment::File { url } => MessageContentPart::file(historical_url_attachment(
+            url.as_str(),
+            "application/octet-stream",
+        )),
+        Attachment::LocalFile { path } => MessageContentPart::file(historical_path_attachment(
+            path.as_str(),
+            "application/octet-stream",
+        )),
+        Attachment::Audio { url } => {
+            MessageContentPart::audio(historical_url_attachment(url.as_str(), "audio/*"))
+        }
+        Attachment::LocalAudio { path } => {
+            MessageContentPart::audio(historical_path_attachment(path.as_str(), "audio/*"))
+        }
+        Attachment::Video { url } => {
+            MessageContentPart::video(historical_url_attachment(url.as_str(), "video/*"))
+        }
+        Attachment::LocalVideo { path } => {
+            MessageContentPart::video(historical_path_attachment(path.as_str(), "video/*"))
+        }
+        Attachment::Artifact { artifact } => historical_artifact_part(artifact),
+        Attachment::Skill { .. }
+        | Attachment::SkillPack { .. }
+        | Attachment::McpServer { .. }
+        | Attachment::McpTool { .. } => return None,
+    })
+}
+
+fn immutable_artifact_reference(
+    artifact_id: &str,
+    version_id: Option<&str>,
+    name: Option<String>,
+    mime_type: Option<String>,
+    workspace_id: Option<&str>,
+) -> MessageAttachment {
+    MessageAttachment {
+        mime_type: mime_type.unwrap_or_else(|| "application/octet-stream".to_owned()),
+        name,
+        size_bytes: None,
+        sha256: None,
+        source: AttachmentDataSource::Reference {
+            reference: format!("pioneer-artifact:{artifact_id}"),
+        },
+        artifact: Some(AttachmentArtifactContext {
+            workspace_id: workspace_id.unwrap_or_default().to_owned(),
+            artifact_id: artifact_id.to_owned(),
+            artifact_version_id: version_id.map(str::to_owned),
+        }),
+    }
+}
+
+fn historical_artifact_part(artifact: pioneer_protocol::ArtifactRef) -> MessageContentPart {
+    let is_image = matches!(
+        artifact.kind,
+        pioneer_protocol::ArtifactKind::Image
+            | pioneer_protocol::ArtifactKind::GeneratedImage
+            | pioneer_protocol::ArtifactKind::Screenshot
+    );
+    let mut attachment = immutable_artifact_reference(
+        artifact.artifact_id.as_str(),
+        artifact.version_id.as_deref(),
+        Some(artifact.display_name),
+        artifact.mime_type,
+        None,
+    );
+    attachment.size_bytes = artifact.size_bytes;
+    attachment.sha256 = artifact.sha256;
+    if is_image {
+        MessageContentPart::Image { image: attachment }
+    } else {
+        MessageContentPart::File { file: attachment }
+    }
 }
 struct Round {
     sequence: i64,
@@ -467,14 +684,19 @@ async fn populate_logical_task_turns(
 /// are already represented by a published checkpoint. Filtering happens on
 /// metadata before payload reads, so editing a covered source neither reloads
 /// its new body nor turns it into a new tail entry.
+pub(crate) struct HistoryCoverageSelection<'a> {
+    pub(crate) sources: &'a BTreeSet<ScopedHistorySource>,
+    pub(crate) item_aliases: &'a BTreeSet<(String, String, String)>,
+    pub(crate) event_input_evidence: &'a BTreeMap<ScopedHistorySource, String>,
+}
+
 pub(crate) async fn load_task_line_history_excluding(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
     excluded_turn: Option<&str>,
     fence: &HistoryReadFence,
-    covered: &BTreeSet<(String, String)>,
-    covered_item_aliases: &BTreeSet<(String, String, String)>,
+    coverage: HistoryCoverageSelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
     let messages = load_line_history_inner(
         store,
@@ -484,8 +706,9 @@ pub(crate) async fn load_task_line_history_excluding(
         fence,
         true,
         HistorySelection::AllExcept {
-            covered,
-            covered_item_aliases,
+            covered: coverage.sources,
+            covered_item_aliases: coverage.item_aliases,
+            covered_event_input_evidence: coverage.event_input_evidence,
         },
     )
     .await?;
@@ -539,8 +762,9 @@ pub(crate) async fn load_task_output_history(
 enum HistorySelection<'a> {
     All,
     AllExcept {
-        covered: &'a BTreeSet<(String, String)>,
+        covered: &'a BTreeSet<ScopedHistorySource>,
         covered_item_aliases: &'a BTreeSet<(String, String, String)>,
+        covered_event_input_evidence: &'a BTreeMap<ScopedHistorySource, String>,
     },
     #[cfg(test)]
     Sources(&'a BTreeSet<SourceRef>),
@@ -556,19 +780,34 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
-    let (selected, covered, covered_item_aliases, through_turn) = match selection {
-        HistorySelection::All => (None, None, None, None),
-        HistorySelection::AllExcept {
-            covered,
-            covered_item_aliases,
-        } => (None, Some(covered), Some(covered_item_aliases), None),
-        #[cfg(test)]
-        HistorySelection::Sources(sources) => (Some(sources), None, None, None),
-        HistorySelection::ThroughTurn(turn) => (None, None, None, Some(turn)),
-    };
+    let (selected, covered, covered_item_aliases, covered_event_input_evidence, through_turn) =
+        match selection {
+            HistorySelection::All => (None, None, None, None, None),
+            HistorySelection::AllExcept {
+                covered,
+                covered_item_aliases,
+                covered_event_input_evidence,
+            } => (
+                None,
+                Some(covered),
+                Some(covered_item_aliases),
+                Some(covered_event_input_evidence),
+                None,
+            ),
+            #[cfg(test)]
+            HistorySelection::Sources(sources) => (Some(sources), None, None, None, None),
+            HistorySelection::ThroughTurn(turn) => (None, None, None, None, Some(turn)),
+        };
     // `Sources` is test-only, so production builds otherwise have no `Some`
     // branch from which to infer the collection behind `selected`.
     let selected: Option<&BTreeSet<SourceRef>> = selected;
+    let covered_identities = covered.map(|covered| {
+        covered
+            .iter()
+            .filter(|source| source.thread == thread)
+            .map(|source| (source.source.scope.clone(), source.source.id.clone()))
+            .collect::<BTreeSet<_>>()
+    });
     let covered_item_alias_index = covered_item_aliases.map(|aliases| {
         let mut index = BTreeMap::<&str, BTreeMap<&str, BTreeSet<&str>>>::new();
         for (source_thread, source_turn, item) in aliases {
@@ -582,8 +821,66 @@ async fn load_line_history_inner(
         index
     });
     let is_covered = |source: &SourceRef| {
-        covered.is_some_and(|covered| covered.contains(&(source.scope.clone(), source.id.clone())))
+        covered_identities
+            .as_ref()
+            .is_some_and(|covered| covered.contains(&(source.scope.clone(), source.id.clone())))
     };
+    // A checkpoint may replace an event-input while leaving its UI copy in the
+    // uncovered tail. Preserve the exact, captured relationship before raw
+    // filtering. The revision table retains the last decoded exact revision
+    // after the covered event body is physically removed.
+    let covered_event_projections = if let Some(covered) = covered {
+        historical_event_projections(
+            store,
+            workspace,
+            thread,
+            covered
+                .iter()
+                .filter(|source| source.thread == thread)
+                .map(|source| source.source.clone()),
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let mut covered_event_input_turns = covered_event_input_evidence
+        .into_iter()
+        .flat_map(|evidence| evidence.iter())
+        .filter(|(source, role)| {
+            source.thread == thread && matches!(role.as_str(), "authoritative" | "deleted")
+        })
+        .filter_map(|(source, _)| source_turn(&source.source).map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    covered_event_input_turns.extend(
+        covered_event_projections
+            .iter()
+            .filter(|projection| {
+                matches!(
+                    projection.projection_kind.as_str(),
+                    "input" | "input_revision" | "input_deleted"
+                )
+            })
+            .filter_map(|projection| source_turn(&projection.reference).map(str::to_owned))
+            .collect::<BTreeSet<_>>(),
+    );
+    let mut covered_authoritative_event_input_turns = covered_event_input_evidence
+        .into_iter()
+        .flat_map(|evidence| evidence.iter())
+        .filter(|(source, role)| source.thread == thread && role.as_str() == "authoritative")
+        .filter_map(|(source, _)| source_turn(&source.source).map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    covered_authoritative_event_input_turns.extend(
+        covered_event_projections
+            .iter()
+            .filter(|projection| {
+                matches!(
+                    projection.projection_kind.as_str(),
+                    "input" | "input_revision"
+                )
+            })
+            .filter_map(|projection| source_turn(&projection.reference).map(str::to_owned))
+            .collect::<BTreeSet<_>>(),
+    );
     let mut turns = Vec::new();
     let mut after = String::new();
     loop {
@@ -651,6 +948,21 @@ async fn load_line_history_inner(
             fence,
         )
         .await?;
+        let mut has_event_input = covered_event_input_turns.contains(&turn.id)
+            || events.iter().any(|row| {
+                matches!(
+                    row.projection_kind.as_deref(),
+                    Some("input" | "input_revision" | "input_deleted")
+                )
+            });
+        let mut has_authoritative_event_input = covered_authoritative_event_input_turns
+            .contains(&turn.id)
+            || events.iter().any(|row| {
+                matches!(
+                    row.projection_kind.as_deref(),
+                    Some("input" | "input_revision")
+                )
+            });
         events.retain(|event| {
             !is_covered(&event.reference)
                 && !event.item_id.as_ref().is_some_and(|item| {
@@ -682,10 +994,24 @@ async fn load_line_history_inner(
                 event.incomplete = true;
             }
         }
-        events_by_turn.push(events);
+        has_event_input |= events.iter().any(|row| {
+            matches!(
+                row.projection_kind.as_deref(),
+                Some("input" | "input_revision" | "input_deleted")
+            )
+        });
+        has_authoritative_event_input |= events.iter().any(|row| {
+            matches!(
+                row.projection_kind.as_deref(),
+                Some("input" | "input_revision")
+            )
+        });
+        events_by_turn.push((events, has_event_input, has_authoritative_event_input));
     }
     let mut history = Vec::new();
-    for (turn, events) in turns.into_iter().zip(events_by_turn) {
+    for (turn, (events, has_event_input, has_authoritative_event_input)) in
+        turns.into_iter().zip(events_by_turn)
+    {
         // A later terminal transition cannot expose the pending portion of an
         // active parent's already captured snapshot. Use only events below its
         // fence; mutable turn.status is not a historical boundary.
@@ -816,12 +1142,6 @@ async fn load_line_history_inner(
         aliases.extend(context_aliases);
         aliases.extend(contexts.iter().filter_map(|row| row.item_id.clone()));
         let mut ordered = Vec::<(i64, Vec<ChatMessage>)>::new();
-        let has_event_input = events.iter().any(|row| {
-            matches!(
-                row.projection_kind.as_deref(),
-                Some("input" | "input_revision" | "input_deleted")
-            )
-        });
         let use_input_rows = if let Some(selected) = selected {
             selected
                 .iter()
@@ -1057,7 +1377,12 @@ async fn load_line_history_inner(
                             && event.turn_id() == turn.id,
                         "canonical event scope mismatch"
                     );
-                    let Some(mut message) = event_message(event)? else {
+                    let Some(mut message) = event_message_with_input_copy_policy(
+                        event,
+                        (use_input_rows || has_authoritative_event_input)
+                            && row.projection_kind.as_deref() == Some("input_copy"),
+                    )?
+                    else {
                         continue;
                     };
                     message.provenance = Some(origin(
@@ -1125,8 +1450,77 @@ pub(crate) fn provider_observation(payload: &str) -> Result<ChatMessage> {
     )))
 }
 
-/// The same canonical renderer is used by cold loading and frozen references.
+/// Current canonical event renderer. Frozen restore also retains explicit
+/// digest-checked compatibility candidates for older manifests.
 pub(crate) fn event_message(event: Event) -> Result<Option<ChatMessage>> {
+    event_message_with_input_copy_policy(event, false)
+}
+
+pub(crate) fn event_message_suppressing_input_copy_media(
+    event: Event,
+) -> Result<Option<ChatMessage>> {
+    event_message_with_input_copy_policy(event, true)
+}
+
+/// Wire-compatible renderer for frozen manifests written before typed
+/// historical media. It is deliberately kept separate from the execution
+/// renderer so metadata text can prove an old digest without becoming the
+/// source of attachment authority.
+pub(crate) fn legacy_event_message(event: Event) -> Result<Option<ChatMessage>> {
+    Ok(Some(match event {
+        Event::TurnStarted(value) if !value.input.is_empty() => legacy_input_message(&value.input)?,
+        Event::TurnMessageEdited(value) if !value.input.is_empty() => {
+            legacy_input_message(&value.input)?
+        }
+        Event::TurnStarted(_) | Event::TurnMessageEdited(_) => return Ok(None),
+        Event::TurnMessageDeleted(_) => return Ok(None),
+        Event::ItemCompleted(value) => match value.item {
+            pioneer_protocol::TurnItem::UserMessage { attachments, .. } => {
+                if attachments.is_empty() {
+                    return Ok(None);
+                }
+                ChatMessage::user(format!(
+                    "Historical attachment references (metadata only; content is not reattached):\n{}",
+                    serde_json::to_string(&attachments)?,
+                ))
+            }
+            pioneer_protocol::TurnItem::AgentMessage { text, .. } => ChatMessage::assistant(text),
+            pioneer_protocol::TurnItem::Reasoning {
+                summary, content, ..
+            } => ChatMessage::assistant(format!(
+                "Reasoning recorded for a previous response:\n{}",
+                content
+                    .into_iter()
+                    .chain(summary)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+            item => ChatMessage::user(format!(
+                "Recorded historical event:\n{}",
+                serde_json::to_string(&item)?
+            )),
+        },
+        Event::TurnCompleted(value) => {
+            ChatMessage::user(format!("Historical turn status: {:?}", value.turn.status))
+        }
+        Event::TurnFailed(value) => ChatMessage::user(format!(
+            "Historical turn {:?}: {:?}",
+            value.turn.status, value.turn.error
+        )),
+        Event::TurnBlocked(value) => {
+            ChatMessage::user(format!("Historical turn blocked: {:?}", value.turn.error))
+        }
+        other => ChatMessage::user(format!(
+            "Recorded historical status; not a successful model response:\n{}",
+            serde_json::to_string(&other)?
+        )),
+    }))
+}
+
+fn event_message_with_input_copy_policy(
+    event: Event,
+    suppress_non_artifact_input_copy_media: bool,
+) -> Result<Option<ChatMessage>> {
     Ok(Some(match event {
         Event::TurnStarted(value) if !value.input.is_empty() => input_message(&value.input)?,
         Event::TurnMessageEdited(value) if !value.input.is_empty() => input_message(&value.input)?,
@@ -1137,12 +1531,49 @@ pub(crate) fn event_message(event: Event) -> Result<Option<ChatMessage>> {
                 if attachments.is_empty() {
                     return Ok(None);
                 }
-                // Keep the resolved version recorded with the original message.
-                // Do not look up today's current artifact or repeat the user text.
-                ChatMessage::user(format!(
-                    "Historical attachment references (metadata only; content is not reattached):\n{}",
-                    serde_json::to_string(&attachments)?,
-                ))
+                // Artifact entries retain their accepted version as typed
+                // canonical content. Materialization is deferred to the
+                // request-owned resolver; authority is never reconstructed by
+                // parsing a display string.
+                let mut message = ChatMessage::user(String::new());
+                let mut capability_metadata = Vec::new();
+                for attachment in attachments {
+                    if suppress_non_artifact_input_copy_media
+                        && matches!(
+                            &attachment,
+                            pioneer_protocol::UserMessageAttachment::Image { .. }
+                                | pioneer_protocol::UserMessageAttachment::LocalImage { .. }
+                                | pioneer_protocol::UserMessageAttachment::File { .. }
+                                | pioneer_protocol::UserMessageAttachment::LocalFile { .. }
+                                | pioneer_protocol::UserMessageAttachment::Audio { .. }
+                                | pioneer_protocol::UserMessageAttachment::LocalAudio { .. }
+                                | pioneer_protocol::UserMessageAttachment::Video { .. }
+                                | pioneer_protocol::UserMessageAttachment::LocalVideo { .. }
+                        )
+                    {
+                        // The canonical input row is the authoritative copy of
+                        // ordinary media. The linked input_copy event remains
+                        // authoritative for ArtifactRef versions and capability
+                        // metadata, but must not duplicate the same persisted
+                        // UserInput in provider history.
+                        continue;
+                    }
+                    if let Some(part) = historical_user_attachment_part(attachment.clone()) {
+                        message.content_parts.push(part);
+                    } else {
+                        capability_metadata.push(attachment);
+                    }
+                }
+                if !capability_metadata.is_empty() {
+                    message.content = format!(
+                        "Historical capability references (metadata only; not active capabilities):\n{}",
+                        serde_json::to_string(&capability_metadata)?,
+                    );
+                }
+                if message.content_parts.is_empty() && message.content.is_empty() {
+                    return Ok(None);
+                }
+                message
             }
             pioneer_protocol::TurnItem::AgentMessage { text, .. } => ChatMessage::assistant(text),
             pioneer_protocol::TurnItem::Reasoning {

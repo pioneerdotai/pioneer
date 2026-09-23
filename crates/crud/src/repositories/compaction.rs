@@ -20,7 +20,10 @@ pub use history::{
     AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
     event_projection_metadata,
 };
-use pioneer_compaction::{Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef};
+use pioneer_compaction::{
+    Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef,
+    frozen::{FrozenEventInputRole, FrozenMessageRef},
+};
 use pioneer_entity::{
     compaction_checkpoint, compaction_context, compaction_coverage, compaction_event_revision,
     compaction_execution_stop, compaction_input_revision, compaction_item_revision,
@@ -58,6 +61,9 @@ pub struct CheckpointEdges {
     /// in the immutable input manifest. These are historical aliases used only
     /// to suppress duplicate replay; they are not additional coverage/grants.
     pub replay_aliases: Vec<HistoricalReplayAlias>,
+    /// Event-input relationships captured in the immutable source projection
+    /// of the operation that published this checkpoint.
+    pub event_input_evidence: Vec<HistoricalEventInputEvidence>,
 }
 
 /// A source as it belonged to the operation that published a checkpoint.
@@ -74,6 +80,12 @@ pub struct HistoricalReplayAlias {
     pub covered: HistoricalSourceRef,
     pub replay: HistoricalSourceRef,
     pub tool_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistoricalEventInputEvidence {
+    pub source: HistoricalSourceRef,
+    pub role: String,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +182,15 @@ pub struct SourceRecord {
     pub sequence: i64,
     pub payload: Option<String>,
     pub incomplete: bool,
+}
+
+/// Projection metadata retained for the exact event revision that was last
+/// decoded. This does not imply that the covered raw event is still present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoricalEventProjection {
+    pub reference: SourceRef,
+    pub item_id: Option<String>,
+    pub projection_kind: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1034,6 +1055,15 @@ WHERE
       AND 'event:'||event_revision.turn_id=json_extract(wanted.value,'$.scope')
       AND event_revision.source_id=json_extract(wanted.value,'$.id')
       AND 'event-revision:'||event_revision.revision=json_extract(wanted.value,'$.version')
+      AND (
+        event_source.event_type NOT IN ('turn/started', 'turn/message/edited')
+        OR NOT EXISTS (
+          SELECT 1 FROM turn_event later_input
+          WHERE later_input.turn_id=event_source.turn_id
+            AND later_input.sequence>event_source.sequence
+            AND later_input.event_type IN ('turn/message/edited', 'turn/message/deleted')
+        )
+      )
   )
   OR EXISTS (
     SELECT 1
@@ -1049,6 +1079,8 @@ WHERE
       AND 'input:'||input_revision.turn_id=json_extract(wanted.value,'$.scope')
       AND input_revision.source_id=json_extract(wanted.value,'$.id')
       AND 'input-revision:'||input_revision.revision=json_extract(wanted.value,'$.version')
+      AND input_turn.message_revision=0
+      AND input_turn.message_deleted_at IS NULL
   )
   OR EXISTS (
     SELECT 1
@@ -1123,6 +1155,69 @@ pub(crate) async fn compaction_sources_current<C: ConnectionTrait>(
     .await?
     .ok_or_else(|| anyhow::anyhow!("source validation missing"))?;
     Ok(row.matched == sources.len() as i64)
+}
+
+#[derive(FromQueryResult)]
+struct HistoricalEventProjectionRow {
+    source_id: String,
+    turn_id: String,
+    source_version: String,
+    item_id: Option<String>,
+    projection_kind: String,
+}
+
+/// Read only the durable relationship metadata for exact captured revisions.
+/// `present` and the raw `turn_event` row are intentionally not consulted: a
+/// published checkpoint remains authoritative after its covered payload is
+/// edited or removed.
+pub(crate) async fn compaction_historical_event_projections<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    sources: &[SourceRef],
+) -> Result<Vec<HistoricalEventProjection>> {
+    ensure!(
+        sources.len() <= SOURCE_PAGE_ROWS as usize,
+        "event projection metadata batch exceeds row bound"
+    );
+    ensure!(
+        sources
+            .iter()
+            .all(|source| source.scope.starts_with("event:")),
+        "event projection metadata received a non-event source"
+    );
+    let payload = serde_json::to_string(sources)?;
+    ensure!(
+        payload.len() <= SOURCE_PAGE_BYTES,
+        "event projection metadata batch exceeds byte bound"
+    );
+    let rows = HistoricalEventProjectionRow::find_by_statement(sqlite_specific_sql(
+        "SELECT r.source_id,r.turn_id,'event-revision:'||r.projection_revision AS source_version,r.item_id,r.projection_kind \
+         FROM json_each(?) w \
+         JOIN compaction_event_revision r \
+           ON 'event:'||r.turn_id=json_extract(w.value,'$.scope') \
+          AND r.source_id=json_extract(w.value,'$.id') \
+          AND 'event-revision:'||r.projection_revision=json_extract(w.value,'$.version') \
+          AND r.projection_kind IS NOT NULL \
+         JOIN turn t ON t.id=r.turn_id AND t.thread_id=? \
+         JOIN thread h ON h.id=t.thread_id AND h.workspace_id=? \
+         ORDER BY CAST(w.key AS INTEGER)",
+        [payload.into(), thread.into(), workspace.into()],
+    ))
+    .all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| HistoricalEventProjection {
+            reference: SourceRef {
+                scope: format!("event:{}", row.turn_id),
+                id: row.source_id,
+                version: row.source_version,
+            },
+            item_id: row.item_id,
+            projection_kind: row.projection_kind,
+        })
+        .collect())
 }
 
 /// Resolve a directly consumed source's owning thread. Checkpoint ownership is
@@ -1441,8 +1536,8 @@ async fn checkpoint_coverage<C: ConnectionTrait>(db: &C, id: &str) -> Result<Vec
 }
 
 /// Coverage discovery must not read summary text before source authorization.
-pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn compaction_checkpoint_edges(
+    db: &pioneer_sqlite::SqliteDatabase,
     id: &str,
 ) -> Result<Option<CheckpointEdges>> {
     let Some(row) = CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
@@ -1489,7 +1584,8 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
             && ownership.values().all(|threads| threads.len() == 1),
         "checkpoint coverage lost its historical manifest ownership"
     );
-    let replay_aliases = checkpoint_replay_aliases(db, id, &row).await?;
+    let (replay_aliases, event_input_evidence) =
+        checkpoint_projection_metadata(db, &row, &ownership).await?;
     Ok(Some(CheckpointEdges {
         owner: row.owner,
         workspace_id: row.workspace_id,
@@ -1526,109 +1622,21 @@ pub(crate) async fn compaction_checkpoint_edges<C: ConnectionTrait>(
                 tool_item_id: alias.tool_item_id,
             })
             .collect(),
+        event_input_evidence: event_input_evidence
+            .into_iter()
+            .map(|evidence| HistoricalEventInputEvidence {
+                source: HistoricalSourceRef {
+                    source_thread: evidence.source_thread,
+                    source: SourceRef {
+                        scope: evidence.source_scope,
+                        id: evidence.source_id,
+                        version: evidence.source_version,
+                    },
+                },
+                role: evidence.role,
+            })
+            .collect(),
     }))
-}
-
-// Published operation projections and their logical frozen messages are immutable.
-// Storage sharing may change between pages, but preserves each logical ordinal.
-// No write transaction or reader snapshot spans these pages: every query releases
-// database capacity before the next page is prepared. Existing callers supply the
-// scoped database, so request and background reads retain their scheduling class.
-async fn checkpoint_replay_aliases<C: ConnectionTrait>(
-    db: &C,
-    checkpoint: &str,
-    checkpoint_row: &CheckpointEdgesRow,
-) -> Result<Vec<HistoricalReplayAliasRow>> {
-    let Some(manifest) = checkpoint_row.manifest_id.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let mut aliases = std::collections::BTreeSet::new();
-    let mut start = 0_i64;
-    loop {
-        let sizes = db
-            .query_all_raw(checkpoint_replay_page_sizes_statement(manifest, start))
-            .await?;
-        if sizes.is_empty() {
-            break;
-        }
-        let mut end = start;
-        let mut bytes = 0_usize;
-        for size in sizes {
-            let ordinal: i64 = size.try_get("", "ordinal")?;
-            let size: i64 = size.try_get("", "bytes")?;
-            ensure!(
-                (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
-                "invalid frozen reference size"
-            );
-            if bytes + size as usize > SOURCE_PAGE_BYTES {
-                break;
-            }
-            ensure!(ordinal == end, "frozen history ordinal gap");
-            bytes += size as usize;
-            end = ordinal
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
-        }
-        ensure!(end > start, "frozen replay page made no progress");
-        let page =
-            HistoricalReplayAliasRow::find_by_statement(checkpoint_replay_alias_page_statement(
-                checkpoint,
-                &checkpoint_row.operation_id,
-                manifest,
-                start,
-                end,
-            ))
-            .all(db)
-            .await?;
-        aliases.extend(page);
-        ensure!(
-            aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
-            "checkpoint replay aliases exceed supported quantum"
-        );
-        start = end;
-    }
-    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
-    aliases.sort_by(|left, right| {
-        (&left.replay_scope, &left.replay_id, &left.source_thread).cmp(&(
-            &right.replay_scope,
-            &right.replay_id,
-            &right.source_thread,
-        ))
-    });
-    Ok(aliases)
-}
-
-pub(super) fn checkpoint_replay_page_sizes_statement(manifest: &str, start: i64) -> Statement {
-    sqlite_specific_sql(
-        "SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id=? AND ordinal>=? ORDER BY ordinal LIMIT ?",
-        [
-            manifest.into(),
-            start.into(),
-            (SOURCE_PAGE_ROWS as i64).into(),
-        ],
-    )
-}
-
-pub(super) fn checkpoint_replay_alias_page_statement(
-    checkpoint: &str,
-    operation: &str,
-    manifest: &str,
-    start: i64,
-    end: i64,
-) -> Statement {
-    // Bind the manifest directly: a join through operation_projection alone lets
-    // SQLite scan both UNION ALL branches of the frozen-message view globally.
-    sqlite_specific_sql(
-        "SELECT DISTINCT m.source_thread AS source_thread,v.source_scope AS covered_scope,v.source_id AS covered_id,v.source_version AS covered_version,json_extract(f.reference_json,'$.replay_source.scope') AS replay_scope,json_extract(f.reference_json,'$.replay_source.id') AS replay_id,json_extract(f.reference_json,'$.replay_source.version') AS replay_version,json_extract(f.reference_json,'$.tool_item_id') AS tool_item_id FROM compaction_operation_projection p JOIN compaction_frozen_message f ON f.manifest_id=p.manifest_id JOIN json_each(f.reference_json,'$.sources') saved JOIN compaction_coverage v ON v.checkpoint_id=? AND json_extract(saved.value,'$.scope')=v.source_scope AND json_extract(saved.value,'$.id')=v.source_id AND json_extract(saved.value,'$.version')=v.source_version JOIN compaction_manifest m ON m.operation_id=p.operation_id AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version AND m.source_thread=json_extract(f.reference_json,'$.source_thread') WHERE p.operation_id=? AND f.manifest_id=? AND f.ordinal>=? AND f.ordinal<? AND json_type(f.reference_json,'$.replay_source')='object' ORDER BY replay_scope,replay_id,source_thread LIMIT ?",
-        [
-            checkpoint.into(),
-            operation.into(),
-            manifest.into(),
-            start.into(),
-            end.into(),
-            ((CHECKPOINT_SOURCE_LIMIT + 1) as i64).into(),
-        ],
-    )
 }
 
 #[derive(FromQueryResult)]
@@ -1651,7 +1659,7 @@ struct HistoricalCoverageRow {
     source_thread: String,
 }
 
-#[derive(FromQueryResult, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct HistoricalReplayAliasRow {
     source_thread: String,
     covered_scope: String,
@@ -1661,6 +1669,474 @@ struct HistoricalReplayAliasRow {
     replay_id: String,
     replay_version: String,
     tool_item_id: Option<String>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct HistoricalEventInputEvidenceRow {
+    source_thread: String,
+    source_scope: String,
+    source_id: String,
+    source_version: String,
+    role: String,
+}
+
+// Published operation projections and their logical frozen messages are immutable.
+// Storage sharing may change between pages, but preserves each logical ordinal. The page
+// statements reproduce the logical view's active-layout choice while binding the requested
+// manifest and ordinal range directly on both physical data branches. No transaction or
+// query stream spans pages: reader capacity is released before references are decoded and
+// the next page is requested.
+async fn checkpoint_projection_metadata(
+    db: &pioneer_sqlite::SqliteDatabase,
+    checkpoint_row: &CheckpointEdgesRow,
+    ownership: &std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
+) -> Result<(
+    Vec<HistoricalReplayAliasRow>,
+    Vec<HistoricalEventInputEvidenceRow>,
+)> {
+    let Some(manifest) = checkpoint_row.manifest_id.as_deref() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut aliases = std::collections::BTreeSet::new();
+    let mut evidence = std::collections::BTreeSet::new();
+    let mut start = 0_i64;
+    loop {
+        let sizes = db
+            .query_all_raw(checkpoint_projection_page_sizes_statement(manifest, start))
+            .await?;
+        if sizes.is_empty() {
+            break;
+        }
+        let mut end = start;
+        let mut bytes = 0_usize;
+        for size in sizes {
+            let ordinal: i64 = size.try_get("", "ordinal")?;
+            let size: i64 = size.try_get("", "bytes")?;
+            ensure!(
+                (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
+                "invalid frozen reference size"
+            );
+            if bytes + size as usize > SOURCE_PAGE_BYTES {
+                break;
+            }
+            ensure!(ordinal == end, "frozen history ordinal gap");
+            bytes += size as usize;
+            end = ordinal
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
+        }
+        ensure!(
+            end > start,
+            "frozen projection metadata page made no progress"
+        );
+        let rows = db
+            .query_all_raw(checkpoint_projection_page_statement(manifest, start, end))
+            .await?;
+        #[cfg(test)]
+        checkpoint_projection_page_test_pause(db, manifest).await;
+        ensure!(
+            rows.len() <= SOURCE_PAGE_ROWS as usize,
+            "frozen projection metadata page exceeds row quantum"
+        );
+        let mut loaded_bytes = 0_usize;
+        let mut expected = start;
+        for row in rows {
+            let ordinal: i64 = row.try_get("", "ordinal")?;
+            let json: String = row.try_get("", "reference_json")?;
+            let row_bytes: i64 = row.try_get("", "bytes")?;
+            ensure!(ordinal == expected, "frozen history ordinal gap");
+            ensure!(
+                row_bytes >= 0 && json.len() <= row_bytes as usize,
+                "invalid frozen reference size"
+            );
+            loaded_bytes = loaded_bytes
+                .checked_add(row_bytes as usize)
+                .ok_or_else(|| anyhow::anyhow!("frozen reference byte count overflow"))?;
+            ensure!(
+                loaded_bytes <= SOURCE_PAGE_BYTES,
+                "frozen projection metadata page exceeds byte quantum"
+            );
+            expected += 1;
+
+            // Decode only after the bounded query has released its reader reservation.
+            let reference: FrozenMessageRef = serde_json::from_str(&json)?;
+            reference.validate()?;
+            if let Some(replay) = reference.replay_source.as_ref() {
+                for covered in &reference.sources {
+                    if ownership.get(covered).is_some_and(|threads| {
+                        threads.len() == 1 && threads.contains(&reference.source_thread)
+                    }) {
+                        aliases.insert(HistoricalReplayAliasRow {
+                            source_thread: reference.source_thread.clone(),
+                            covered_scope: covered.scope.clone(),
+                            covered_id: covered.id.clone(),
+                            covered_version: covered.version.clone(),
+                            replay_scope: replay.scope.clone(),
+                            replay_id: replay.id.clone(),
+                            replay_version: replay.version.clone(),
+                            tool_item_id: reference.tool_item_id.clone(),
+                        });
+                    }
+                }
+            }
+            if reference.sources.len() == 1
+                && let Some(role) = reference.event_input_role
+            {
+                let source = &reference.sources[0];
+                if ownership.get(source).is_some_and(|threads| {
+                    threads.len() == 1 && threads.contains(&reference.source_thread)
+                }) {
+                    evidence.insert(HistoricalEventInputEvidenceRow {
+                        source_thread: reference.source_thread.clone(),
+                        source_scope: source.scope.clone(),
+                        source_id: source.id.clone(),
+                        source_version: source.version.clone(),
+                        role: match role {
+                            FrozenEventInputRole::Authoritative => "authoritative",
+                            FrozenEventInputRole::Deleted => "deleted",
+                            FrozenEventInputRole::InputCopy => "input_copy",
+                        }
+                        .to_owned(),
+                    });
+                }
+            }
+        }
+        ensure!(
+            expected == end,
+            "frozen projection metadata page is incomplete"
+        );
+        ensure!(
+            aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
+            "checkpoint replay aliases exceed supported quantum"
+        );
+        ensure!(
+            evidence.len() <= CHECKPOINT_SOURCE_LIMIT,
+            "checkpoint event-input evidence exceeds supported quantum"
+        );
+        #[cfg(test)]
+        record_checkpoint_projection_page_test_read(
+            db,
+            manifest,
+            start,
+            end,
+            usize::try_from(end - start)?,
+            loaded_bytes,
+        );
+        start = end;
+    }
+    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+    aliases.sort_by(|left, right| {
+        (&left.replay_scope, &left.replay_id, &left.source_thread).cmp(&(
+            &right.replay_scope,
+            &right.replay_id,
+            &right.source_thread,
+        ))
+    });
+    let mut evidence = evidence.into_iter().collect::<Vec<_>>();
+    evidence.sort_by(|left, right| {
+        (
+            &left.source_scope,
+            &left.source_id,
+            &left.source_thread,
+            &left.source_version,
+            &left.role,
+        )
+            .cmp(&(
+                &right.source_scope,
+                &right.source_id,
+                &right.source_thread,
+                &right.source_version,
+                &right.role,
+            ))
+    });
+    Ok((aliases, evidence))
+}
+
+#[cfg(test)]
+struct CheckpointProjectionPageTestPause {
+    token: std::sync::Arc<()>,
+    reached: Option<tokio::sync::oneshot::Sender<()>>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CheckpointProjectionPageTestRead {
+    pub(super) start: i64,
+    pub(super) end: i64,
+    pub(super) rows: usize,
+    pub(super) bytes: usize,
+}
+
+#[cfg(test)]
+pub(super) struct CheckpointProjectionPageTestObserver {
+    key: (usize, String),
+    token: std::sync::Arc<()>,
+    _database: pioneer_sqlite::SqliteDatabase,
+    reads: std::sync::Arc<std::sync::Mutex<Vec<CheckpointProjectionPageTestRead>>>,
+}
+
+#[cfg(test)]
+impl CheckpointProjectionPageTestObserver {
+    pub(super) fn reads(&self) -> Vec<CheckpointProjectionPageTestRead> {
+        self.reads
+            .lock()
+            .expect("projection read lock poisoned")
+            .clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for CheckpointProjectionPageTestObserver {
+    fn drop(&mut self) {
+        let mut observers = checkpoint_projection_page_test_observers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observers
+            .get(&self.key)
+            .is_some_and(|(token, _)| std::sync::Arc::ptr_eq(token, &self.token))
+        {
+            observers.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn observe_checkpoint_projection_page_test_reads(
+    database: &pioneer_sqlite::SqliteDatabase,
+    manifest: &str,
+) -> CheckpointProjectionPageTestObserver {
+    let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let key = (database.runtime_identity(), manifest.to_owned());
+    let token = std::sync::Arc::new(());
+    let mut observers = checkpoint_projection_page_test_observers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if observers.contains_key(&key) {
+        drop(observers);
+        panic!("projection read observer already armed");
+    }
+    observers.insert(
+        key.clone(),
+        (token.clone(), std::sync::Arc::downgrade(&reads)),
+    );
+    drop(observers);
+    CheckpointProjectionPageTestObserver {
+        key,
+        token,
+        _database: database.clone(),
+        reads,
+    }
+}
+
+#[cfg(test)]
+type CheckpointProjectionPageTestObservers = std::sync::Mutex<
+    std::collections::HashMap<
+        (usize, String),
+        (
+            std::sync::Arc<()>,
+            std::sync::Weak<std::sync::Mutex<Vec<CheckpointProjectionPageTestRead>>>,
+        ),
+    >,
+>;
+
+#[cfg(test)]
+fn checkpoint_projection_page_test_observers() -> &'static CheckpointProjectionPageTestObservers {
+    use std::sync::OnceLock;
+    static OBSERVERS: OnceLock<CheckpointProjectionPageTestObservers> = OnceLock::new();
+    OBSERVERS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn record_checkpoint_projection_page_test_read(
+    database: &pioneer_sqlite::SqliteDatabase,
+    manifest: &str,
+    start: i64,
+    end: i64,
+    rows: usize,
+    bytes: usize,
+) {
+    let key = (database.runtime_identity(), manifest.to_owned());
+    let observer = checkpoint_projection_page_test_observers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .and_then(|(_, observer)| std::sync::Weak::upgrade(observer));
+    if let Some(observer) = observer {
+        observer
+            .lock()
+            .expect("projection read lock poisoned")
+            .push(CheckpointProjectionPageTestRead {
+                start,
+                end,
+                rows,
+                bytes,
+            });
+    }
+}
+
+#[cfg(test)]
+pub(super) struct CheckpointProjectionPageTestHook {
+    key: (usize, String),
+    token: std::sync::Arc<()>,
+    _database: pioneer_sqlite::SqliteDatabase,
+    reached: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl CheckpointProjectionPageTestHook {
+    pub(super) async fn reached(&mut self) {
+        let reached = self
+            .reached
+            .take()
+            .expect("projection hook already awaited");
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+            .await
+            .expect("projection page hook was not reached before the diagnostic deadline")
+            .expect("projection lookup ended before reaching the page hook");
+    }
+
+    pub(super) fn release(mut self) {
+        self.release
+            .take()
+            .expect("projection page hook already released")
+            .send(())
+            .expect("projection lookup ended before page-hook release");
+    }
+}
+
+#[cfg(test)]
+impl Drop for CheckpointProjectionPageTestHook {
+    fn drop(&mut self) {
+        let mut hooks = checkpoint_projection_page_test_hooks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hooks
+            .get(&self.key)
+            .is_some_and(|hook| std::sync::Arc::ptr_eq(&hook.token, &self.token))
+        {
+            hooks.remove(&self.key);
+        }
+        // Dropping `release` also frees a participant that already took this
+        // registration and is waiting at the barrier.
+    }
+}
+
+#[cfg(test)]
+pub(super) fn arm_checkpoint_projection_page_test_hook(
+    database: &pioneer_sqlite::SqliteDatabase,
+    manifest: &str,
+) -> CheckpointProjectionPageTestHook {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let key = (database.runtime_identity(), manifest.to_owned());
+    let token = std::sync::Arc::new(());
+    let mut hooks = checkpoint_projection_page_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if hooks.contains_key(&key) {
+        drop(hooks);
+        panic!("projection page hook already armed");
+    }
+    hooks.insert(
+        key.clone(),
+        CheckpointProjectionPageTestPause {
+            token: token.clone(),
+            reached: Some(reached_tx),
+            release: release_rx,
+        },
+    );
+    drop(hooks);
+    CheckpointProjectionPageTestHook {
+        key,
+        token,
+        _database: database.clone(),
+        reached: Some(reached_rx),
+        release: Some(release_tx),
+    }
+}
+
+#[cfg(test)]
+fn checkpoint_projection_page_test_hooks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(usize, String), CheckpointProjectionPageTestPause>,
+> {
+    use std::sync::{Mutex, OnceLock};
+    static HOOKS: OnceLock<
+        Mutex<std::collections::HashMap<(usize, String), CheckpointProjectionPageTestPause>>,
+    > = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(super) async fn checkpoint_projection_page_test_pause(
+    database: &pioneer_sqlite::SqliteDatabase,
+    manifest: &str,
+) {
+    let key = (database.runtime_identity(), manifest.to_owned());
+    let pause = checkpoint_projection_page_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+    if let Some(mut pause) = pause {
+        if let Some(reached) = pause.reached.take() {
+            let _ = reached.send(());
+        }
+        let _ = pause.release.await;
+    }
+}
+
+pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: i64) -> Statement {
+    sqlite_specific_sql(
+        "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
+         WHERE d.manifest_id=? AND d.ordinal>=? \
+           AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
+                           WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
+         UNION ALL \
+         SELECT d.ordinal,d.bytes FROM compaction_frozen_span s \
+         JOIN compaction_frozen_message_data d \
+           ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
+         JOIN compaction_frozen_layout l \
+           ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
+         WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
+         ORDER BY ordinal LIMIT ?",
+        [
+            manifest.into(),
+            start.into(),
+            manifest.into(),
+            start.into(),
+            (SOURCE_PAGE_ROWS as i64).into(),
+        ],
+    )
+}
+
+pub(super) fn checkpoint_projection_page_statement(
+    manifest: &str,
+    start: i64,
+    end: i64,
+) -> Statement {
+    sqlite_specific_sql(
+        "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
+         WHERE d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
+           AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
+                           WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
+         UNION ALL \
+         SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_span s \
+         JOIN compaction_frozen_message_data d \
+           ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
+         JOIN compaction_frozen_layout l \
+           ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
+         WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
+         ORDER BY ordinal",
+        [
+            manifest.into(),
+            start.into(),
+            end.into(),
+            manifest.into(),
+            start.into(),
+            end.into(),
+        ],
+    )
 }
 
 pub(crate) async fn compaction_checkpoint<C: ConnectionTrait>(

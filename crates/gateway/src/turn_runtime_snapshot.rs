@@ -145,6 +145,18 @@ pub(crate) async fn restored_conversation_scope_from_snapshot(
     store: &CrudStore,
     snapshot: &TurnRuntimeSnapshotRecord,
 ) -> Result<(AgentTurnHookRuntimeContext, Vec<ChatMessage>)> {
+    let (context, projection) =
+        restored_conversation_scope_projection_from_snapshot(store, snapshot).await?;
+    Ok((context, projection.messages))
+}
+
+pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
+    store: &CrudStore,
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<(
+    AgentTurnHookRuntimeContext,
+    crate::compaction::frozen::RestoredAcceptedHistory,
+)> {
     let context: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
     let allowed = crate::compaction::frozen::execution_history_scopes(

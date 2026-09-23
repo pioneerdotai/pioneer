@@ -165,6 +165,7 @@ async fn check_composer_runtime_can_switch_cli_native_cli_without_blocking_histo
     assert_eq!(first_starts.len(), 1, "the first CLI turn must dispatch");
     complete_recorded_cli_task_turn(
         &processor,
+        cli.as_ref(),
         &cli_manager,
         &workspace,
         "codex",
@@ -223,6 +224,17 @@ async fn check_composer_runtime_can_switch_cli_native_cli_without_blocking_histo
         2,
         "CLI dispatch after a native turn must not be blocked by history capture"
     );
+    let last_provider_input = last_starts[1].input.to_string();
+    let first_cli = last_provider_input
+        .find("first CLI runtime completed")
+        .expect("CLI result accepted by the parent must reach the later CLI provider request");
+    let native = last_provider_input
+        .find("native runtime completed")
+        .expect("intervening native result must reach the later CLI provider request");
+    let current = last_provider_input
+        .find("execute runtime_switch_cli_last")
+        .expect("current CLI question must reach the provider request");
+    assert!(first_cli < native && native < current);
     assert_eq!(
         store
             .get_task_run(last_run.as_str())
@@ -249,6 +261,7 @@ async fn check_composer_runtime_can_switch_cli_native_cli_without_blocking_histo
     );
     complete_recorded_cli_task_turn(
         &processor,
+        cli.as_ref(),
         &cli_manager,
         &workspace,
         "codex",
@@ -266,14 +279,14 @@ async fn check_composer_runtime_can_switch_cli_native_cli_without_blocking_histo
 }
 
 #[test]
-fn composer_history_failure_belongs_to_materialized_child() {
+fn composer_history_failure_stays_in_task_without_rejecting_parent() {
     run_standard_stack_message_test(
         "Composer child history failure",
-        check_composer_history_failure_belongs_to_materialized_child(),
+        check_composer_history_failure_stays_in_task_without_rejecting_parent(),
     );
 }
 
-async fn check_composer_history_failure_belongs_to_materialized_child() {
+async fn check_composer_history_failure_stays_in_task_without_rejecting_parent() {
     for backend in [
         None,
         Some(("codex", CLIAgentRuntimeKind::Codex, "gpt-5")),
@@ -468,27 +481,53 @@ async fn check_composer_history_failure_belongs_to_materialized_child() {
                 );
                 break;
             }
-            timeout(Duration::from_secs(15), async {
-                loop {
-                    if let Some((_, child)) = store
+            if backend.is_some() {
+                // CLI history is an admission input: an invalid accepted basis
+                // must fail the TaskRun before a child Turn or provider session
+                // is materialized. The parent Composer message stays accepted.
+                assert_eq!(
+                    wait_for_run_status(store.clone(), &run_id, TaskRunStatus::Failed).await,
+                    TaskRunStatus::Failed,
+                );
+                assert!(
+                    store
                         .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
                         .await
                         .unwrap()
-                        && child.status != TurnStatus::InProgress
-                    {
-                        assert_eq!(child.status, TurnStatus::Blocked);
-                        break;
+                        .is_none(),
+                    "failed CLI history admission must not leave a child Turn ghost"
+                );
+                let failed_run = store.get_task_run(&run_id).await.unwrap().unwrap();
+                let error = failed_run.error.expect("failed CLI TaskRun needs a reason");
+                assert_eq!(error.code, "task_executor_start_failed");
+                assert!(
+                    error
+                        .message
+                        .contains("injected history preparation failure")
+                );
+            } else {
+                timeout(Duration::from_secs(15), async {
+                    loop {
+                        if let Some((_, child)) = store
+                            .get_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                            .await
+                            .unwrap()
+                            && child.status != TurnStatus::InProgress
+                        {
+                            assert_eq!(child.status, TurnStatus::Blocked);
+                            break;
+                        }
+                        sleep(Duration::from_millis(25)).await;
                     }
-                    sleep(Duration::from_millis(25)).await;
-                }
-            })
-            .await
-            .expect("history failure must close the materialized child");
-            assert_eq!(
-                wait_for_run_status(store.clone(), &run_id, TaskRunStatus::Blocked).await,
-                TaskRunStatus::Blocked,
-                "the Task run must become terminal after its child is blocked"
-            );
+                })
+                .await
+                .expect("native history failure must close the materialized child");
+                assert_eq!(
+                    wait_for_run_status(store.clone(), &run_id, TaskRunStatus::Blocked).await,
+                    TaskRunStatus::Blocked,
+                    "the native Task run must become terminal after its child is blocked"
+                );
+            }
             assert!(
                 store
                     .get_task_run_conversation_snapshot(&run_id)

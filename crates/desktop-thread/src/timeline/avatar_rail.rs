@@ -74,12 +74,16 @@ impl TimelineView {
                     shows_running_dino: false,
                     author,
                 } => {
-                    let revision = super::timeline_agent_execution_author(author.as_ref())
+                    let runtime_revision =
+                        super::timeline_cli_runtime_execution_author(author.as_ref())
+                            .and_then(|author| author.avatar_revision.as_deref());
+                    let agent_revision = super::timeline_agent_execution_author(author.as_ref())
                         .and_then(|author| super::timeline_agent_presentation(Some(author)))
                         .map_or(
                             Some(pioneer_client::timeline::types::PIONEER_AGENT_AVATAR_REVISION),
                             timeline_agent_default_avatar_revision,
                         );
+                    let revision = runtime_revision.or(agent_revision);
                     (None, revision.map(str::to_owned))
                 }
                 _ => (None, None),
@@ -166,7 +170,9 @@ impl TimelineView {
                         ),
                     },
                     TimelineAvatarSource::Agent { author, .. } => {
-                        super::timeline_agent_execution_author(author.as_ref()).map_or_else(
+                        let presented = super::timeline_cli_runtime_execution_author(author.as_ref())
+                            .or_else(|| super::timeline_agent_execution_author(author.as_ref()));
+                        presented.map_or_else(
                             || TimelineAvatarVisual::Agent {
                                 display_name: t!("chat.composer.mode.agent_label").to_string(),
                                 cached_path: self
@@ -266,6 +272,16 @@ impl TimelineView {
         &self,
         author: &pioneer_client::timeline::types::TurnAuthorSnapshot,
     ) -> TimelineAvatarVisual {
+        if let Some(runtime_author) = super::timeline_cli_runtime_execution_author(Some(author)) {
+            return TimelineAvatarVisual::Agent {
+                display_name: runtime_author.display_name.trim().to_owned(),
+                cached_path: runtime_author
+                    .avatar_revision
+                    .as_deref()
+                    .and_then(|revision| self.member_avatar_state.agent_cached_image_path(revision))
+                    .map(Path::to_path_buf),
+            };
+        }
         let Some(agent) = super::timeline_agent_presentation(Some(author)) else {
             return TimelineAvatarVisual::Agent {
                 display_name: t!("chat.composer.mode.agent_label").to_string(),

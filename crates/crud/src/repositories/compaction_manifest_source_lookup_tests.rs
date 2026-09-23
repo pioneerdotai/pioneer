@@ -1,13 +1,17 @@
 use super::*;
 use crate::CrudStore;
 use crate::repositories::compaction::{
-    checkpoint_replay_alias_page_statement, checkpoint_replay_page_sizes_statement,
+    arm_checkpoint_projection_page_test_hook, checkpoint_projection_page_sizes_statement,
+    checkpoint_projection_page_statement, checkpoint_projection_page_test_pause,
+    observe_checkpoint_projection_page_test_reads,
 };
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState, SourceCursor};
 use pioneer_compaction::{ModelSelection, Transport};
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait, Value,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1801,6 +1805,147 @@ fn assert_exact_branch_search(branch: &[&PlanNode], subjects: &[&str], column: &
                 .any(|subject| plan_subject(&node.detail, "SCAN", subject))),
         "unexpected scan for {label} ({subjects:?}): {branch:#?}"
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProjectionPageBounds {
+    Sizes { start: i64 },
+    Data { start: i64, end: i64 },
+}
+
+fn assert_projection_page_statement(
+    statement: &Statement,
+    manifest: &str,
+    bounds: ProjectionPageBounds,
+) {
+    let (sql, expected_values) = match bounds {
+        ProjectionPageBounds::Sizes { start } => (
+            "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
+             WHERE d.manifest_id=? AND d.ordinal>=? \
+               AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
+                               WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
+             UNION ALL \
+             SELECT d.ordinal,d.bytes FROM compaction_frozen_span s \
+             JOIN compaction_frozen_message_data d \
+               ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
+             JOIN compaction_frozen_layout l \
+               ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
+             WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
+             ORDER BY ordinal LIMIT ?",
+            vec![
+                Value::from(manifest),
+                Value::from(start),
+                Value::from(manifest),
+                Value::from(start),
+                Value::from(SOURCE_PAGE_ROWS as i64),
+            ],
+        ),
+        ProjectionPageBounds::Data { start, end } => (
+            "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
+             WHERE d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
+               AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
+                               WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
+             UNION ALL \
+             SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_span s \
+             JOIN compaction_frozen_message_data d \
+               ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
+             JOIN compaction_frozen_layout l \
+               ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
+             WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
+             ORDER BY ordinal",
+            vec![
+                Value::from(manifest),
+                Value::from(start),
+                Value::from(end),
+                Value::from(manifest),
+                Value::from(start),
+                Value::from(end),
+            ],
+        ),
+    };
+    assert_eq!(statement.sql, sql, "production page SQL lost its bounds");
+    assert_eq!(
+        statement
+            .values
+            .as_ref()
+            .expect("projection page statement must bind its scope")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        expected_values,
+        "production page SQL bound the wrong manifest or ordinal range"
+    );
+}
+
+fn assert_data_search_page_bounds(branch: &[&PlanNode], bounds: ProjectionPageBounds, label: &str) {
+    let searches = branch
+        .iter()
+        .filter(|node| {
+            plan_subject(&node.detail, "SEARCH", "d")
+                && has_constraint(&node.detail, "manifest_id", "=")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        searches.len(),
+        1,
+        "expected one manifest-scoped data lookup for {label}: {branch:#?}"
+    );
+    let detail = &searches[0].detail;
+    assert!(
+        has_constraint(detail, "ordinal", ">"),
+        "{label} data lookup lost its lower page boundary: {detail}"
+    );
+    if matches!(bounds, ProjectionPageBounds::Data { .. }) {
+        assert!(
+            has_constraint(detail, "ordinal", "<"),
+            "{label} data lookup lost its upper page boundary: {detail}"
+        );
+    }
+}
+
+fn projection_page_branches(plan: &[PlanNode]) -> (Vec<&PlanNode>, Vec<&PlanNode>) {
+    let compound = plan
+        .iter()
+        .filter(|node| node.detail == "LEFT-MOST SUBQUERY")
+        .count();
+    if compound == 1 {
+        let plan = plan.iter().collect::<Vec<_>>();
+        return (
+            unique_detail_subtree(&plan, "LEFT-MOST SUBQUERY", "projection page"),
+            unique_detail_subtree(&plan, "UNION ALL", "projection page"),
+        );
+    }
+    assert_eq!(
+        compound, 0,
+        "ambiguous projection-page compound plan: {plan:#?}"
+    );
+    let merged = unique_subtree(plan, "MERGE (UNION ALL)");
+    (
+        unique_detail_subtree(&merged, "LEFT", "projection page merge"),
+        unique_detail_subtree(&merged, "RIGHT", "projection page merge"),
+    )
+}
+
+fn assert_projection_page_plan(plan: &[PlanNode], bounds: ProjectionPageBounds) {
+    let (ordinary, shared) = projection_page_branches(plan);
+    assert_exact_branch_search(&ordinary, &["d"], "manifest_id", "ordinary message data");
+    assert_exact_branch_search(&shared, &["d"], "manifest_id", "shared message data");
+    assert_exact_branch_search(&shared, &["s"], "manifest_id", "shared message span");
+    assert!(
+        shared.iter().any(|node| {
+            plan_subject(&node.detail, "SEARCH", "s")
+                && has_constraint(&node.detail, "manifest_id", "=")
+                && has_constraint(&node.detail, "kind", "=")
+        }),
+        "shared span lookup must constrain manifest and kind: {shared:#?}"
+    );
+
+    assert_data_search_page_bounds(&ordinary, bounds, "ordinary");
+    // Shared storage already has a span range. This assertion is deliberately
+    // scoped to its data node; the exact production statement/binds prove that
+    // the requested page range was also supplied rather than borrowing the
+    // span's range as page evidence.
+    assert_data_search_page_bounds(&shared, bounds, "shared");
 }
 
 fn frozen_view_branch<'a>(plan: &'a [PlanNode], view: &str) -> Vec<&'a PlanNode> {
@@ -4131,104 +4276,443 @@ async fn rolled_back_domain_mutation_rolls_back_publication_fence_bump() {
     assert_eq!(payload, "{}");
 }
 
-// Exercise the actual UNION ALL view, including a shared storage layout.
 #[tokio::test]
-async fn checkpoint_replay_queries_seek_only_the_requested_manifest() {
+async fn checkpoint_projection_metadata_queries_seek_one_manifest_and_ordinal_page() {
     let fixture = fixture().await;
     let db = fixture.db();
     seed_plan_noise(&db).await;
-    for mut statement in [
-        checkpoint_replay_page_sizes_statement("plan-manifest", 0),
-        checkpoint_replay_alias_page_statement(
-            "source-checkpoint",
-            "manifest-operation",
-            "plan-manifest",
-            0,
-            128,
+    for (mut statement, bounds) in [
+        (
+            checkpoint_projection_page_sizes_statement("plan-manifest", 7),
+            ProjectionPageBounds::Sizes { start: 7 },
+        ),
+        (
+            checkpoint_projection_page_statement("plan-manifest", 7, 128),
+            ProjectionPageBounds::Data { start: 7, end: 128 },
         ),
     ] {
+        assert_projection_page_statement(&statement, "plan-manifest", bounds);
         statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
-        let details: Vec<String> = db
+        let plan = db
             .query_all_raw(statement)
             .await
             .unwrap()
             .into_iter()
-            .map(|row| row.try_get("", "detail").unwrap())
-            .collect();
-        for alias in ["d", "s"] {
-            assert!(
-                !details
-                    .iter()
-                    .any(|line| line.starts_with(&format!("SCAN {alias} "))
-                        || line == &format!("SCAN {alias}")),
-                "global frozen-history scan: {details:#?}"
-            );
-            assert!(
-                details
-                    .iter()
-                    .any(|line| line.starts_with(&format!("SEARCH {alias} "))
-                        && line.contains("manifest_id=?")),
-                "missing manifest seek: {details:#?}"
-            );
+            .map(|row| PlanNode {
+                id: row.try_get("", "id").unwrap(),
+                parent: row.try_get("", "parent").unwrap(),
+                detail: row.try_get("", "detail").unwrap(),
+            })
+            .collect::<Vec<_>>();
+        assert_projection_page_plan(&plan, bounds);
+    }
+}
+
+#[test]
+fn projection_page_plan_checks_do_not_borrow_missing_bounds_from_other_nodes() {
+    let ordinary_manifest_only = synthetic_frozen_view_plan("projection-page", 100, true);
+    assert!(
+        std::panic::catch_unwind(|| assert_projection_page_plan(
+            &ordinary_manifest_only,
+            ProjectionPageBounds::Data { start: 7, end: 128 }
+        ))
+        .is_err(),
+        "a manifest-only ordinary SEARCH must fail even when shared is fully bounded"
+    );
+
+    let mut missing_lower = synthetic_frozen_view_plan("projection-page", 200, true);
+    missing_lower
+        .iter_mut()
+        .find(|node| node.id == 203)
+        .unwrap()
+        .detail =
+        "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>? AND ordinal<?)".into();
+    missing_lower
+        .iter_mut()
+        .find(|node| node.id == 207)
+        .unwrap()
+        .detail = "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal<?)".into();
+    assert!(
+        std::panic::catch_unwind(|| assert_projection_page_plan(
+            &missing_lower,
+            ProjectionPageBounds::Data { start: 7, end: 128 }
+        ))
+        .is_err(),
+        "a data page missing its lower boundary must be rejected"
+    );
+
+    let mut missing_upper = synthetic_frozen_view_plan("projection-page", 300, true);
+    missing_upper
+        .iter_mut()
+        .find(|node| node.id == 303)
+        .unwrap()
+        .detail =
+        "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>? AND ordinal<?)".into();
+    missing_upper
+        .iter_mut()
+        .find(|node| node.id == 307)
+        .unwrap()
+        .detail = "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>?)".into();
+    assert!(
+        std::panic::catch_unwind(|| assert_projection_page_plan(
+            &missing_upper,
+            ProjectionPageBounds::Data { start: 7, end: 128 }
+        ))
+        .is_err(),
+        "a data page missing its upper boundary must be rejected"
+    );
+
+    let mut neighboring_range = synthetic_frozen_view_plan("projection-page", 400, true);
+    neighboring_range.push(PlanNode {
+        id: 409,
+        parent: 402,
+        detail: "SEARCH other USING INDEX unrelated (ordinal>? AND ordinal<?)".into(),
+    });
+    assert!(
+        std::panic::catch_unwind(|| assert_projection_page_plan(
+            &neighboring_range,
+            ProjectionPageBounds::Data { start: 7, end: 128 }
+        ))
+        .is_err(),
+        "ranges in shared or unrelated nodes must not satisfy ordinary data lookup"
+    );
+
+    let missing_size_bound = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id=? ORDER BY ordinal LIMIT ?",
+        [
+            Value::from("plan-manifest"),
+            Value::from(SOURCE_PAGE_ROWS as i64),
+        ],
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_projection_page_statement(
+            &missing_size_bound,
+            "plan-manifest",
+            ProjectionPageBounds::Sizes { start: 7 }
+        ))
+        .is_err()
+    );
+    let missing_data_upper = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT ordinal,reference_json,bytes FROM compaction_frozen_message WHERE manifest_id=? AND ordinal>=? ORDER BY ordinal",
+        [Value::from("plan-manifest"), Value::from(7_i64)],
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_projection_page_statement(
+            &missing_data_upper,
+            "plan-manifest",
+            ProjectionPageBounds::Data { start: 7, end: 128 }
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn projection_page_plan_recognizes_bounded_compound_and_merge_forms() {
+    let mut compound = synthetic_frozen_view_plan("projection-page", 500, true);
+    compound
+        .iter_mut()
+        .find(|node| node.id == 503)
+        .unwrap()
+        .detail =
+        "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>? AND ordinal<?)".into();
+    let merged = vec![
+        PlanNode {
+            id: 600,
+            parent: 0,
+            detail: "MERGE (UNION ALL)".into(),
+        },
+        PlanNode {
+            id: 601,
+            parent: 600,
+            detail: "LEFT".into(),
+        },
+        PlanNode {
+            id: 602,
+            parent: 601,
+            detail: "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>? AND ordinal<?)"
+                .into(),
+        },
+        PlanNode {
+            id: 603,
+            parent: 601,
+            detail: "SEARCH l USING INDEX frozen_layout (manifest_id=? AND kind=?)".into(),
+        },
+        PlanNode {
+            id: 604,
+            parent: 600,
+            detail: "RIGHT".into(),
+        },
+        PlanNode {
+            id: 605,
+            parent: 604,
+            detail: "SEARCH s USING INDEX frozen_span (manifest_id=? AND kind=?)".into(),
+        },
+        PlanNode {
+            id: 606,
+            parent: 604,
+            detail: "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>? AND ordinal<?)"
+                .into(),
+        },
+        PlanNode {
+            id: 607,
+            parent: 604,
+            detail: "SEARCH l USING INDEX frozen_layout (manifest_id=? AND kind=?)".into(),
+        },
+    ];
+
+    for plan in [&compound, &merged] {
+        assert_projection_page_plan(plan, ProjectionPageBounds::Sizes { start: 7 });
+        assert_projection_page_plan(plan, ProjectionPageBounds::Data { start: 7, end: 128 });
+    }
+}
+
+struct AbortJoinOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortJoinOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        self.handle.as_mut().expect("lookup task already consumed")
+    }
+
+    async fn finish(mut self, diagnostic: &'static str) -> T {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), self.handle())
+            .await
+            .expect(diagnostic)
+            .expect("projection lookup task panicked");
+        self.handle.take();
+        result
+    }
+}
+
+impl<T> Drop for AbortJoinOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
 
 #[tokio::test]
-async fn checkpoint_replay_aliases_survive_pages_and_shared_storage_without_duplicates() {
+async fn checkpoint_projection_page_hook_is_token_owned_and_cancellation_safe() {
+    let primary_fixture = fixture().await;
+    let db = primary_fixture.db();
+
+    let dropped = arm_checkpoint_projection_page_test_hook(&db, "drop-before-capture");
+    drop(dropped);
+    drop(arm_checkpoint_projection_page_test_hook(
+        &db,
+        "drop-before-capture",
+    ));
+
+    let secondary_fixture = fixture().await;
+    let other_db = secondary_fixture.db();
+    let first_database = arm_checkpoint_projection_page_test_hook(&db, "same-manifest");
+    let second_database = arm_checkpoint_projection_page_test_hook(&other_db, "same-manifest");
+    drop(first_database);
+    drop(second_database);
+
+    let mut duplicate_owner = arm_checkpoint_projection_page_test_hook(&db, "duplicate");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arm_checkpoint_projection_page_test_hook(&db, "duplicate")
+        }))
+        .is_err(),
+        "duplicate arm must fail without replacing the first registration"
+    );
+    let duplicate_db = db.clone();
+    let mut duplicate_participant = AbortJoinOnDrop::new(tokio::spawn(async move {
+        checkpoint_projection_page_test_pause(&duplicate_db, "duplicate").await;
+    }));
+    tokio::select! {
+        () = duplicate_owner.reached() => {}
+        result = duplicate_participant.handle() => {
+            panic!("duplicate owner registration disappeared before its barrier: {result:?}");
+        }
+    }
+    drop(duplicate_owner);
+    duplicate_participant
+        .finish("participant was not released when its hook owner was dropped")
+        .await;
+
+    let mut old = arm_checkpoint_projection_page_test_hook(&db, "token-reuse");
+    let old_db = db.clone();
+    let mut old_participant = AbortJoinOnDrop::new(tokio::spawn(async move {
+        checkpoint_projection_page_test_pause(&old_db, "token-reuse").await;
+    }));
+    tokio::select! {
+        () = old.reached() => {}
+        result = old_participant.handle() => {
+            panic!("old participant ended before reaching its barrier: {result:?}");
+        }
+    }
+    let mut replacement = arm_checkpoint_projection_page_test_hook(&db, "token-reuse");
+    drop(old);
+    let replacement_db = db.clone();
+    let mut replacement_participant = AbortJoinOnDrop::new(tokio::spawn(async move {
+        checkpoint_projection_page_test_pause(&replacement_db, "token-reuse").await;
+    }));
+    tokio::select! {
+        () = replacement.reached() => {}
+        result = replacement_participant.handle() => {
+            panic!("old handle removed the replacement registration: {result:?}");
+        }
+    }
+    drop(replacement);
+    old_participant
+        .finish("old participant remained blocked after owner drop")
+        .await;
+    replacement_participant
+        .finish("replacement participant remained blocked after owner drop")
+        .await;
+
+    let waiting = arm_checkpoint_projection_page_test_hook(&db, "early-error");
+    let store = primary_fixture.store.clone();
+    let mut failed_participant = AbortJoinOnDrop::new(tokio::spawn(async move {
+        store
+            .compaction_checkpoint_edges("checkpoint-that-does-not-exist")
+            .await
+    }));
+    let missing = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        failed_participant.handle(),
+    )
+    .await
+    .expect("lookup that ended before the hook did not terminate before the diagnostic deadline")
+    .expect("early-error participant panicked")
+    .expect("early-error lookup returned a database error");
+    assert!(
+        missing.is_none(),
+        "missing checkpoint unexpectedly reached the hook"
+    );
+    drop(waiting);
+    drop(arm_checkpoint_projection_page_test_hook(&db, "early-error"));
+}
+
+#[tokio::test]
+async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_reader() {
     let fixture = fixture().await;
     let db = fixture.db();
     let count = SOURCE_PAGE_ROWS as i64 * 2 + 2;
     db.execute_raw(sqlite_specific_sql(
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('aliases','ws','source-thread','identity',?,?,0,'imports',0,1)",
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('projection-pages','ws','source-thread','identity',?,?,0,'imports',0,1)",
         [count.into(), count.into()],
-    )).await.unwrap();
-    db.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','aliases','identity','imports',0)").await.unwrap();
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','projection-pages','identity','imports',0)")
+        .await
+        .unwrap();
     for ordinal in 0..count {
-        // Short references cross the row quantum; longer units also cross
-        // the byte quantum. Duplicate aliases straddle both boundaries.
         let reference = serde_json::json!({
             "source_thread": "source-thread",
+            "unit_id": if ordinal < SOURCE_PAGE_ROWS as i64 + 1 { "unit".to_owned() } else { "unit".repeat(2048) },
             "sources": [{"scope":"event:source-turn","id":"event-source","version":"event-revision:1"}],
-            "replay_source": {"scope":"item:source-turn","id": if ordinal == count - 1 { "last" } else { "first" },"version":"item-revision:1"},
+            "event_input_role": "authoritative",
+            "inherited": false,
+            "complete": true,
+            "protected_input": false,
+            "wire_sha256": "a".repeat(64),
+            "replay_source": {
+                "scope":"item:source-turn",
+                "id": if ordinal == count - 1 { "last" } else { "first" },
+                "version":"item-revision:1"
+            },
             "tool_item_id": "tool",
-            "unit_id": if ordinal < SOURCE_PAGE_ROWS as i64 + 1 { "unit".to_owned() } else { "unit".repeat(1024) },
-            "inherited": false, "complete": true, "protected_input": false,
-            "wire_sha256": "a".repeat(64), "tool_call_id": null, "tool_name": null
-        }).to_string();
+            "tool_call_id": null,
+            "tool_name": null
+        })
+        .to_string();
         serde_json::from_str::<pioneer_compaction::frozen::FrozenMessageRef>(&reference)
             .unwrap()
             .validate()
             .unwrap();
-        db.execute_raw(sqlite_specific_sql("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('aliases',?,?,?)", [ordinal.into(), reference.clone().into(), (reference.len() as i64).into()])).await.unwrap();
+        db.execute_raw(sqlite_specific_sql(
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('projection-pages',?,?,?)",
+            [ordinal.into(), reference.clone().into(), (reference.len() as i64).into()],
+        ))
+        .await
+        .unwrap();
     }
+
     for shared in [false, true] {
-        if shared {
+        let observer = observe_checkpoint_projection_page_test_reads(&db, "projection-pages");
+        let mut hook = arm_checkpoint_projection_page_test_hook(&db, "projection-pages");
+        let store = fixture.store.clone();
+        let mut lookup = AbortJoinOnDrop::new(tokio::spawn(async move {
+            store.compaction_checkpoint_edges("source-checkpoint").await
+        }));
+        tokio::select! {
+            () = hook.reached() => {}
+            result = lookup.handle() => {
+                panic!("projection lookup ended before the page barrier: {result:?}");
+            }
+        }
+        let unrelated: i64 = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM thread".to_owned(),
+            )),
+        )
+        .await
+        .expect("unrelated read remained blocked after the page query completed")
+        .expect("unrelated read failed while projection lookup was paused")
+        .expect("a completed metadata page must release the sole reader")
+        .try_get("", "n")
+        .unwrap();
+        assert!(unrelated > 0);
+        hook.release();
+        let edges = lookup
+            .finish("projection lookup did not finish after page-hook release")
+            .await
+            .expect("projection metadata lookup failed")
+            .expect("source checkpoint disappeared");
+        assert_eq!(edges.replay_aliases.len(), 2);
+        assert_eq!(edges.replay_aliases[0].replay.source.id, "first");
+        assert_eq!(edges.replay_aliases[1].replay.source.id, "last");
+        assert_eq!(edges.event_input_evidence.len(), 1);
+        assert!(edges.event_input_evidence.iter().all(|item| {
+            item.source.source.id == "event-source" && item.source.source_thread == "source-thread"
+        }));
+        assert_eq!(edges.coverage.len(), 1);
+        let reads = observer.reads();
+        assert!(
+            reads.len() >= 3,
+            "expected several bounded pages: {reads:?}"
+        );
+        assert_eq!(reads.first().unwrap().start, 0);
+        assert_eq!(reads.last().unwrap().end, count);
+        assert!(reads.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(reads.iter().all(|page| {
+            page.rows <= SOURCE_PAGE_ROWS as usize && page.bytes <= SOURCE_PAGE_BYTES
+        }));
+        assert!(
+            reads[..reads.len() - 1]
+                .iter()
+                .any(|page| page.rows < SOURCE_PAGE_ROWS as usize),
+            "long references must exercise the byte quantum before the row quantum: {reads:?}"
+        );
+        drop(observer);
+
+        if !shared {
             for sql in [
-                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) SELECT 'alias-storage',workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready FROM compaction_frozen_history WHERE id='aliases'",
-                "INSERT INTO compaction_frozen_message_data SELECT 'alias-storage',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='aliases'",
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('aliases',0,1,0)",
-                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) SELECT 'aliases',0,0,message_count,'alias-storage' FROM compaction_frozen_history WHERE id='aliases'",
-                "DELETE FROM compaction_frozen_message_data WHERE manifest_id='aliases'",
+                "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) SELECT 'projection-storage',workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready FROM compaction_frozen_history WHERE id='projection-pages'",
+                "INSERT INTO compaction_frozen_message_data SELECT 'projection-storage',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='projection-pages'",
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('projection-pages',0,1,0)",
+                "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) SELECT 'projection-pages',0,0,message_count,'projection-storage' FROM compaction_frozen_history WHERE id='projection-pages'",
+                "DELETE FROM compaction_frozen_message_data WHERE manifest_id='projection-pages'",
             ] {
                 db.execute_unprepared(sql).await.unwrap();
             }
         }
-        let edges = fixture
-            .store
-            .compaction_checkpoint_edges("source-checkpoint")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(edges.replay_aliases.len(), 2);
-        assert_eq!(edges.replay_aliases[0].replay.source.id, "first");
-        assert_eq!(edges.replay_aliases[1].replay.source.id, "last");
-        assert!(
-            edges
-                .replay_aliases
-                .iter()
-                .all(|alias| alias.covered.source.id == "event-source"
-                    && alias.covered.source_thread == "source-thread")
-        );
     }
 }

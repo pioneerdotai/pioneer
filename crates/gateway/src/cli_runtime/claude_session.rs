@@ -2184,6 +2184,11 @@ impl ClaudeStreamClient {
         input: JsonValue,
         timeout: Duration,
     ) -> Result<()> {
+        // Materialize the exact Claude content before acknowledging the turn.
+        // In particular, LocalImage paths become base64 here and can be much
+        // larger than the generic JSON mapping that named the path.
+        let provider_request =
+            claude_provider_user_request(self.expected_provider_session_id, input)?;
         if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
             self.send_control_request(json!({ "subtype": "set_model", "model": model }), timeout)
                 .await?;
@@ -2231,14 +2236,7 @@ impl ClaudeStreamClient {
         }))
         .await;
 
-        let prompt = claude_prompt_from_input(input)?;
-        self.write_json_line(json!({
-            "type": "user",
-            "message": { "role": "user", "content": prompt },
-            "parent_tool_use_id": null,
-            "session_id": self.expected_provider_session_id.to_string(),
-        }))
-        .await
+        self.write_json_line(provider_request).await
     }
 
     async fn send_control_request(
@@ -3596,6 +3594,26 @@ fn claude_prompt_from_input(input: JsonValue) -> Result<JsonValue> {
         }
     }
     Ok(JsonValue::Array(content))
+}
+
+fn claude_provider_user_request(
+    provider_session_id: uuid::Uuid,
+    input: JsonValue,
+) -> Result<JsonValue> {
+    let prompt = claude_prompt_from_input(input)?;
+    let request = json!({
+        "type": "user",
+        "message": { "role": "user", "content": prompt },
+        "parent_tool_use_id": null,
+        "session_id": provider_session_id.to_string(),
+    });
+    let request_bytes = serde_json::to_vec(&request)?.len().saturating_add(1);
+    anyhow::ensure!(
+        request_bytes <= crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES,
+        "Claude turn request requires {request_bytes} bytes after attachment materialization, exceeding the {}-byte request frame",
+        crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES
+    );
+    Ok(request)
 }
 
 fn push_claude_text_block(content: &mut Vec<JsonValue>, text: impl Into<String>) {
@@ -5575,6 +5593,25 @@ done
                     },
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn claude_provider_frame_limit_counts_materialized_base64_image() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let image_path = temp_dir.path().join("oversized.png");
+        let file = std::fs::File::create(&image_path).expect("create image");
+        file.set_len(7 * 1024 * 1024).expect("size image");
+
+        let error = claude_provider_user_request(
+            uuid::Uuid::nil(),
+            json!([{ "type": "localImage", "path": image_path.to_string_lossy() }]),
+        )
+        .expect_err("base64-expanded Claude request must be rejected before provider write");
+
+        assert!(
+            format!("{error:#}").contains("after attachment materialization"),
+            "request boundary should report the runtime-specific payload"
         );
     }
 

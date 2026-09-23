@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use pioneer_entity::{
     cli_runtime_native_event, cli_runtime_pending_request, thread_cli_runtime_binding,
     turn_cli_runtime_attempt, turn_cli_runtime_binding, turn_cli_runtime_execution_segment,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
@@ -123,6 +123,7 @@ pub struct CliRuntimeProviderSessionBinding {
 pub struct PrepareClaudeProviderSessionBinding {
     pub thread_binding: NewCliRuntimeThreadBinding,
     pub proposed_provider_session_id: String,
+    pub force_new: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,6 +596,38 @@ pub async fn find_thread_binding<C: ConnectionTrait>(
         .transpose()
 }
 
+pub async fn update_thread_resume_cursor<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    expected_native_thread_id: &str,
+    resume_cursor_json: String,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<CliRuntimeThreadBindingRecord> {
+    let result = thread_cli_runtime_binding::Entity::update_many()
+        .col_expr(
+            thread_cli_runtime_binding::Column::ResumeCursorJson,
+            Expr::value(resume_cursor_json),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(thread_cli_runtime_binding::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(
+            thread_cli_runtime_binding::Column::NativeThreadId
+                .eq(expected_native_thread_id.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to update CLI runtime context receipt")?;
+    if result.rows_affected != 1 {
+        bail!("CLI runtime thread changed before context receipt commit");
+    }
+    find_thread_binding(db, thread_id)
+        .await?
+        .context("CLI runtime thread binding disappeared after context receipt commit")
+}
+
 /// Atomically load or create the durable Claude provider UUID before a
 /// provider process can be spawned. The caller supplies a freshly generated
 /// candidate, but an existing binding always wins.
@@ -612,6 +645,32 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
         .context("failed to query Claude provider session binding")?
     {
         validate_claude_binding_identity(&model, &request.thread_binding)?;
+        if request.force_new {
+            let proposed_provider_session_id = request.proposed_provider_session_id;
+            let mut active: thread_cli_runtime_binding::ActiveModel = model.into();
+            active.native_thread_id = Set(proposed_provider_session_id.clone());
+            active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
+            active.native_root_thread_id = Set(None);
+            active.native_cwd = Set(request.thread_binding.native_cwd);
+            active.native_model = Set(request.thread_binding.native_model);
+            active.resume_cursor_json = Set(request.thread_binding.resume_cursor_json);
+            active.provider_session_id = Set(Some(proposed_provider_session_id));
+            active.provider_session_lifecycle_state = Set(Some(
+                CliRuntimeProviderSessionLifecycle::Prepared
+                    .as_str()
+                    .to_owned(),
+            ));
+            active.provider_session_last_verified_process_generation = Set(None);
+            active.updated_at = Set(request.thread_binding.updated_at);
+            let binding = active
+                .update(db)
+                .await
+                .context("failed to replace stale Claude provider session binding")?;
+            return Ok(PreparedClaudeProviderSessionBinding {
+                binding: thread_binding_record_from_model(binding)?,
+                mode: PreparedClaudeProviderSessionMode::New,
+            });
+        }
         let existing = provider_session_binding_from_model(&model)?;
         if let Some(existing) = existing {
             if existing.lifecycle == CliRuntimeProviderSessionLifecycle::Invalid {

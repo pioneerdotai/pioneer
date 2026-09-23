@@ -151,8 +151,14 @@ fn resolve_timeline_author_presentation(
 }
 
 fn timeline_agent_label(author: Option<&TurnAuthorSnapshot>) -> Option<String> {
-    let author = timeline_agent_execution_author(author)?;
-    timeline_agent_presentation(Some(author))?;
+    let author = author?;
+    let is_agent_execution = timeline_agent_execution_author(Some(author))
+        .and_then(|author| timeline_agent_presentation(Some(author)))
+        .is_some();
+    let is_cli_runtime_executor = timeline_cli_runtime_execution_author(Some(author)).is_some();
+    if !is_agent_execution && !is_cli_runtime_executor {
+        return None;
+    }
     let display_name = author.display_name.trim();
     let nickname = author.nickname.trim();
     match (display_name.is_empty(), nickname.is_empty()) {
@@ -161,6 +167,20 @@ fn timeline_agent_label(author: Option<&TurnAuthorSnapshot>) -> Option<String> {
         (false, true) => Some(display_name.to_owned()),
         (false, false) => Some(format!("{display_name} · @{nickname}")),
     }
+}
+
+pub(super) fn timeline_cli_runtime_execution_author(
+    author: Option<&TurnAuthorSnapshot>,
+) -> Option<&TurnAuthorSnapshot> {
+    author.filter(|author| {
+        matches!(&author.actor, PersistedActorRef::System)
+            && matches!(
+                author.avatar_revision.as_deref(),
+                Some(pioneer_client::timeline::types::CODEX_AGENT_AVATAR_REVISION)
+                    | Some(pioneer_client::timeline::types::CLAUDE_AGENT_AVATAR_REVISION)
+            )
+            && author.agent.is_none()
+    })
 }
 
 pub(super) fn timeline_agent_execution_author(
@@ -518,6 +538,30 @@ mod author_presentation_tests {
             agent: None,
         };
         assert_eq!(timeline_agent_label(Some(&author)), None);
+
+        let runtime_author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::System,
+            display_name: "Codex CLI".to_owned(),
+            nickname: "codex".to_owned(),
+            avatar_revision: Some(
+                pioneer_client::timeline::types::CODEX_AGENT_AVATAR_REVISION.to_owned(),
+            ),
+            agent: None,
+        };
+        assert_eq!(
+            timeline_agent_label(Some(&runtime_author)),
+            Some("Codex CLI · @codex".to_owned()),
+            "the row consumer must display the actual foreground CLI executor"
+        );
+        let ordinary_system = TurnAuthorSnapshot {
+            avatar_revision: Some("unrelated-system-avatar".to_owned()),
+            ..runtime_author.clone()
+        };
+        assert_eq!(
+            timeline_agent_label(Some(&ordinary_system)),
+            None,
+            "arbitrary System authors must not become runtime agents"
+        );
 
         author.agent = Some(pioneer_client::timeline::types::AgentPresentationSnapshot {
             agent_identity_id: AgentIdentityId::new("A0000000000000000000A")

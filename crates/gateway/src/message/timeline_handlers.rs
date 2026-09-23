@@ -1787,6 +1787,11 @@ impl MessageProcessor {
             .iter()
             .map(|response| (response.turn_id.as_str(), response))
             .collect::<HashMap<_, _>>();
+        let executions_by_turn = pioneer_crud::load_turn_executions_for_turns(&database, turn_ids)
+            .await?
+            .into_iter()
+            .map(|execution| (execution.turn_id.clone(), execution))
+            .collect::<HashMap<_, _>>();
         let direct_authors_by_turn = turn_ids
             .iter()
             .filter_map(|turn_id| {
@@ -1825,6 +1830,10 @@ impl MessageProcessor {
         )
         .await?;
         let mut authors = HashMap::new();
+        let mut cli_authors_by_source: HashMap<
+            (String, String),
+            Option<pioneer_protocol::TurnAuthorSnapshot>,
+        > = HashMap::new();
         for turn_id in turn_ids {
             let author = if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
                 projected_by_execution
@@ -1838,6 +1847,63 @@ impl MessageProcessor {
                     .get(*execution_id)
                     .map(|projected| projected.author.clone())
                     .or_else(|| direct_authors_by_turn.get(turn_id.as_str()).cloned())
+            } else if let Some(execution) = executions_by_turn.get(turn_id)
+                && execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                && let Some(runtime_id) = execution.executor_key.as_deref()
+            {
+                let source_key = (execution.workspace_id.clone(), runtime_id.to_owned());
+                if let Some(author) = cli_authors_by_source.get(&source_key) {
+                    author.clone()
+                } else {
+                    let author = if let Some(identity) =
+                        pioneer_crud::load_agent_identity_by_source(
+                            &database,
+                            execution.workspace_id.as_str(),
+                            pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE,
+                            runtime_id,
+                        )
+                        .await?
+                    {
+                        pioneer_crud::load_current_agent_presentation_snapshot(
+                            &database,
+                            identity.id.as_str(),
+                            identity.source_revision,
+                            identity.source_fingerprint.as_str(),
+                        )
+                        .await?
+                        .map(|presentation| {
+                            let runtime_marker = presentation
+                                .role_label
+                                .as_deref()
+                                .unwrap_or(presentation.nickname.as_str());
+                            let runtime_avatar_revision =
+                                if runtime_marker.eq_ignore_ascii_case("codex") {
+                                    Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
+                                } else if runtime_marker.eq_ignore_ascii_case("claude") {
+                                    Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
+                                } else {
+                                    presentation.avatar_revision.clone()
+                                };
+                            pioneer_protocol::TurnAuthorSnapshot {
+                                // Foreground CLI turns have a real runtime executor but no
+                                // AgentExecution. Keep that distinction explicit instead of
+                                // attaching the response to a completed Task execution.
+                                actor: pioneer_protocol::PersistedActorRef::System,
+                                display_name: presentation.display_name,
+                                nickname: presentation.nickname,
+                                // Reserved runtime avatar revisions are the existing
+                                // cross-client presentation discriminator for a real
+                                // CLI executor without an AgentExecution association.
+                                avatar_revision: runtime_avatar_revision,
+                                agent: None,
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    cli_authors_by_source.insert(source_key, author.clone());
+                    author
+                }
             } else {
                 None
             };

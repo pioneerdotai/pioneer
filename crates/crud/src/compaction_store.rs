@@ -2,9 +2,9 @@
 use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
     CommitOutcome, CompactionLifecycleRecovery, CompletedHistoryCheck, DeliveredTaskOutputPage,
-    FrozenImportRecord, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
-    ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport, RunnerPlanRecord,
-    SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
+    FrozenImportRecord, HistoricalEventProjection, HistoryCausalBoundary, HistoryReadFence,
+    HistoryTurnBoundary, ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport,
+    RunnerPlanRecord, SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -206,6 +206,20 @@ impl CrudStore {
         sources: &[SourceRef],
     ) -> Result<bool> {
         repositories::compaction::compaction_sources_current(
+            &self.connection,
+            workspace,
+            thread,
+            sources,
+        )
+        .await
+    }
+    pub async fn compaction_historical_event_projections(
+        &self,
+        workspace: &str,
+        thread: &str,
+        sources: &[SourceRef],
+    ) -> Result<Vec<HistoricalEventProjection>> {
+        repositories::compaction::compaction_historical_event_projections(
             &self.connection,
             workspace,
             thread,

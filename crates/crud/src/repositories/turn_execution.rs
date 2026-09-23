@@ -114,6 +114,28 @@ pub struct TurnExecutionRecord {
     pub updated_at: DateTimeWithTimeZone,
 }
 
+const TURN_EXECUTION_BATCH_LIMIT: usize = 200;
+
+pub async fn load_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: &[String],
+) -> Result<Vec<TurnExecutionRecord>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if turn_ids.len() > TURN_EXECUTION_BATCH_LIMIT {
+        bail!("Turn execution batch exceeds its bounded limit");
+    }
+    turn_execution::Entity::find()
+        .filter(turn_execution::Column::TurnId.is_in(turn_ids.iter().cloned()))
+        .all(db)
+        .await
+        .context("failed to batch-load Turn executions")?
+        .into_iter()
+        .map(record_from_model)
+        .collect()
+}
+
 pub async fn insert_immutable<C: ConnectionTrait>(
     db: &C,
     execution: NewTurnExecution,

@@ -609,6 +609,10 @@ struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
+    provider_history: TokioMutex<HashMap<String, Vec<String>>>,
+    next_native_thread_id: TokioMutex<Option<String>>,
+    launch_native_thread_id: TokioMutex<Option<String>>,
+    native_thread_sequence: AtomicUsize,
     next_native_turn_id: TokioMutex<Option<String>>,
     responses: TokioMutex<Vec<(JsonValue, JsonValue)>>,
     response_errors: TokioMutex<Vec<(JsonValue, i64, String, Option<JsonValue>)>>,
@@ -648,8 +652,30 @@ impl RecordingCliRuntimeSession {
         *self.next_native_turn_id.lock().await = Some(native_turn_id.into());
     }
 
+    async fn set_next_native_thread_id(&self, native_thread_id: impl Into<String>) {
+        *self.next_native_thread_id.lock().await = Some(native_thread_id.into());
+    }
+
     async fn enable_projected_mcp_metadata(&self, crud_store: Arc<CrudStore>) {
         *self.projected_mcp_store.lock().await = Some(crud_store);
+    }
+
+    async fn record_provider_assistant_message(&self, native_thread_id: &str, text: &str) {
+        self.provider_history
+            .lock()
+            .await
+            .entry(native_thread_id.to_owned())
+            .or_default()
+            .push(format!("assistant:{text}"));
+    }
+
+    async fn provider_conversation(&self, native_thread_id: &str) -> Vec<String> {
+        self.provider_history
+            .lock()
+            .await
+            .get(native_thread_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -671,13 +697,25 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
     ) -> anyhow::Result<CLIAgentRuntimeThreadOpenSnapshot> {
         self.record_event("native_thread_start").await;
         self.thread_starts.lock().await.push(params.clone());
+        let explicit_native_thread_id = self.next_native_thread_id.lock().await.take();
+        let launched_native_thread_id = self.launch_native_thread_id.lock().await.clone();
+        let native_thread_id = explicit_native_thread_id
+            .or(launched_native_thread_id)
+            .unwrap_or_else(|| {
+                let sequence = self.native_thread_sequence.fetch_add(1, Ordering::SeqCst);
+                if sequence == 0 {
+                    "native_thread_default".to_owned()
+                } else {
+                    format!("native_thread_default_{}", sequence + 1)
+                }
+            });
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            native_thread_id: "native_thread_default".to_owned(),
+            native_thread_id: native_thread_id.clone(),
             cwd: Some(params.cwd.clone()),
             model: params.model.clone(),
             raw: json!({
                 "thread": {
-                    "id": "native_thread_default",
+                    "id": native_thread_id,
                     "cwd": params.cwd,
                     "model": params.model
                 }
@@ -714,6 +752,12 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         params: CLIAgentRuntimeTurnStartParams,
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeTurnStartSnapshot> {
+        self.provider_history
+            .lock()
+            .await
+            .entry(params.native_thread_id.clone())
+            .or_default()
+            .push(format!("user:{}", params.input));
         self.turn_starts.lock().await.push(params.clone());
         let native_turn_id = self
             .next_native_turn_id
@@ -924,6 +968,10 @@ impl CLIAgentRuntimeSessionFactory for StaticCliRuntimeSessionFactory {
         if let Some(launch_specs) = self.launch_specs.as_ref() {
             launch_specs.lock().await.push(launch_spec.clone());
         }
+        *self.session.launch_native_thread_id.lock().await = launch_spec
+            .continuation
+            .claude_provider_session_id()
+            .map(|id| id.to_string());
         Ok(self.session.clone())
     }
 }
@@ -3134,6 +3182,8 @@ struct CaptureSummaryProvider {
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     calls: AtomicUsize,
+    native_attachments: bool,
+    valid_summary_completion: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3485,7 +3535,19 @@ impl CaptureSummaryProvider {
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
+            native_attachments: false,
+            valid_summary_completion: false,
         }
+    }
+
+    fn with_native_attachments(mut self) -> Self {
+        self.native_attachments = true;
+        self
+    }
+
+    fn with_valid_summary_completion(mut self) -> Self {
+        self.valid_summary_completion = true;
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -3588,17 +3650,55 @@ impl Provider for CaptureSummaryProvider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
+        let mut input_types = ProviderInputCapabilities::fallback_for_all_file_types();
+        if self.native_attachments {
+            input_types.file = pioneer_provider::InputTypeSupport::native_inline_only();
+            input_types.image = pioneer_provider::InputTypeSupport::native_inline_only();
+        }
         ProviderCapabilities {
             streaming: false,
-            vision: false,
+            vision: self.native_attachments,
             tool_calling: false,
             embeddings: false,
             transcription: false,
-            input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
+            input_types,
         }
     }
 
     async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let is_summary_request = self.valid_summary_completion
+            && request.messages.first().is_some_and(|message| {
+                message.content == pioneer_compaction::summary::INSTRUCTIONS
+            });
+        let summary_mentions = if is_summary_request {
+            let input = request
+                .messages
+                .last()
+                .map_or("", |message| message.content.as_str());
+            ["codex", "claude"]
+                .into_iter()
+                .flat_map(|runtime| {
+                    [
+                        format!("execute native detached work with {runtime}"),
+                        format!("{runtime} native result"),
+                        format!("{runtime} manual answer 1"),
+                        format!("{runtime} manual answer 2"),
+                        format!("historical-{runtime}.png"),
+                        format!("historical-{runtime}.txt"),
+                        format!("mcp-tool:workspace:history:{runtime}"),
+                    ]
+                })
+                .filter(|marker| input.contains(marker))
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            String::new()
+        };
+        let summary_mentions = if is_summary_request && summary_mentions.is_empty() {
+            "No completed work was selected.".to_owned()
+        } else {
+            summary_mentions
+        };
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requests
             .lock()
@@ -3612,7 +3712,18 @@ impl Provider for CaptureSummaryProvider {
             self.release_first.notified().await;
         }
         Ok(ChatResponse {
-            text: self.text.clone(),
+            text: if is_summary_request {
+                format!(
+                    "## Goal and constraints\nContinue the accepted child conversation.\n\
+                     ## Decisions and rationale\nKeep the accepted boundary.\n\
+                     ## Completed work and results\n{summary_mentions}\n\
+                     ## Failed attempts and unknowns\nNo additional result is known.\n\
+                     ## Current work and next step\nAnswer the next child question.\n\
+                     ## Source references\nUse the accepted projection references."
+                )
+            } else {
+                self.text.clone()
+            },
             usage: None,
             reasoning_content: None,
             provider_replay_state: None,
@@ -6916,16 +7027,37 @@ fn detached_cli_task_create_params(
 
 async fn complete_recorded_cli_task_turn(
     processor: &Arc<MessageProcessor>,
+    cli: &RecordingCliRuntimeSession,
     manager: &Arc<CLIAgentRuntimeManager>,
     workspace_id: &str,
     runtime_id: &str,
-    parent_thread_id: &str,
+    _parent_thread_id: &str,
     native_thread_id: &str,
     native_turn_id: &str,
     result_text: &str,
 ) {
-    let key = CLIAgentRuntimeSessionKey::new(workspace_id, runtime_id, parent_thread_id)
-        .expect("native Task session key should build");
+    cli.record_provider_assistant_message(native_thread_id, result_text)
+        .await;
+    let continuation = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(binding) = processor
+                .crud_store
+                .get_cli_runtime_turn_binding_by_native_turn(runtime_id, native_turn_id)
+                .await
+                .expect("native Task binding lookup should succeed")
+            {
+                break binding;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native Task binding must become durable after provider start");
+    let continuation_thread_id = continuation.continuation_thread_id.clone();
+    let pioneer_turn_id = continuation.turn_id.clone();
+    let key =
+        CLIAgentRuntimeSessionKey::new(workspace_id, runtime_id, continuation_thread_id.as_str())
+            .expect("native Task session key should build");
     let handle = manager
         .existing_session(&key)
         .await
@@ -6969,6 +7101,34 @@ async fn complete_recorded_cli_task_turn(
             }),
         )
         .await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let binding = processor
+                .crud_store
+                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                .await
+                .expect("completed provider conversation binding should load")
+                .expect("completed provider conversation binding should exist");
+            assert_eq!(
+                binding.native_thread_id, native_thread_id,
+                "completion must not switch provider conversations"
+            );
+            if crate::cli_runtime::thread_binding::completed_context_basis_from_binding(&binding)
+                .expect("completed context receipt should decode")
+                .is_some_and(|basis| {
+                    basis
+                        .delivered_turns
+                        .iter()
+                        .any(|turn| turn.turn_id == pioneer_turn_id)
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider completion must publish its exact continuity receipt before the next turn");
 }
 
 async fn sync_test_cli_runtime_identities(processor: &MessageProcessor) -> anyhow::Result<()> {
@@ -7057,6 +7217,16 @@ async fn create_task_for_test(
     mut params: TaskCreateParams,
 ) -> anyhow::Result<pioneer_protocol::TaskCreateResponse> {
     ensure_task_create_parent_turn_for_test(processor, &params).await?;
+    let root_thread_id = if let Some(parent_thread_id) = params.created_by_thread_id.as_deref() {
+        processor
+            .crud_store
+            .get_task_thread_lineage(parent_thread_id)
+            .await?
+            .map(|lineage| lineage.root_thread_id)
+            .unwrap_or_else(|| parent_thread_id.to_owned())
+    } else {
+        String::new()
+    };
     let cli_runtime_id = params
         .metadata
         .as_ref()
@@ -7072,13 +7242,13 @@ async fn create_task_for_test(
         && params.launch.is_none()
         && let Some(cli_runtime_id) = cli_runtime_id
     {
-        let root_thread_id = params
-            .created_by_thread_id
-            .as_deref()
-            .context("test Agent Task requires an exact root thread")?;
+        anyhow::ensure!(
+            !root_thread_id.is_empty(),
+            "test Agent Task requires an exact root thread"
+        );
         let root_thread = processor
             .crud_store
-            .get_thread_by_id(root_thread_id)
+            .get_thread_by_id(root_thread_id.as_str())
             .await?
             .context("test Agent Task root thread is missing")?;
         params.launch = Some(
@@ -7104,13 +7274,13 @@ async fn create_task_for_test(
     let principal = authenticated_test_superuser();
     context.actor_id = Some(principal.principal_id.to_string());
     if params.executor_kind == pioneer_protocol::TaskExecutorKind::Agent {
-        let root_thread_id = params
-            .created_by_thread_id
-            .as_deref()
-            .context("test Agent Task requires an exact root thread")?;
+        anyhow::ensure!(
+            !root_thread_id.is_empty(),
+            "test Agent Task requires an exact root thread"
+        );
         let root_thread = processor
             .crud_store
-            .get_thread_by_id(root_thread_id)
+            .get_thread_by_id(root_thread_id.as_str())
             .await?
             .context("test Agent Task root thread is missing")?;
         let task_model_provider = params
@@ -7148,7 +7318,7 @@ async fn create_task_for_test(
             resolved_launch.as_ref().map(|(_, profile)| profile.clone());
         let mut request = crate::authorization::ExecutionAdmissionRequest::for_task(
             &params,
-            root_thread_id,
+            root_thread_id.as_str(),
             root_thread.model_provider.as_str(),
             root_thread.model.as_str(),
             None,
@@ -7239,6 +7409,37 @@ async fn create_task_for_test(
     )
     .await
     .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+async fn open_persisted_child_for_test(
+    processor: &Arc<MessageProcessor>,
+    connection: ConnectionId,
+    rx: &mut mpsc::Receiver<Message>,
+    workspace_id: &str,
+    child_thread_id: &str,
+    request_id: &str,
+) {
+    let request_id = generate_test_request_id("openchild", request_id);
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "thread/start",
+                "params": {
+                    "thread_id": child_thread_id,
+                    "workspace_id": workspace_id
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(rx, request_id.as_str()).await;
+    let opened: ThreadStartResponse = serde_json::from_value(response.result)
+        .expect("persisted child should open through the authorized thread/start path");
+    assert_eq!(opened.thread.id, child_thread_id);
+    assert!(processor.thread_manager.has_thread(child_thread_id).await);
 }
 
 async fn ensure_task_create_parent_turn_for_test(
@@ -7349,6 +7550,28 @@ async fn seed_completed_task_parent_with_history(
     parent_turn_id: &str,
     history: &str,
 ) {
+    seed_completed_task_parent_with_inputs(
+        processor,
+        workspace_id,
+        parent_thread_id,
+        parent_turn_id,
+        history,
+        vec![UserInput::Text {
+            text: history.to_owned(),
+            text_elements: Vec::new(),
+        }],
+    )
+    .await;
+}
+
+async fn seed_completed_task_parent_with_inputs(
+    processor: &Arc<MessageProcessor>,
+    workspace_id: &str,
+    parent_thread_id: &str,
+    parent_turn_id: &str,
+    preview: &str,
+    inputs: Vec<UserInput>,
+) {
     ensure_test_superuser_execution_authority(processor.crud_store.as_ref()).await;
     let principal = authenticated_test_superuser();
     let principal_actor =
@@ -7368,7 +7591,7 @@ async fn seed_completed_task_parent_with_history(
                 workspace_id: workspace_id.to_owned(),
                 id: parent_thread_id.to_owned(),
                 name: Some("Native Task parent".to_owned()),
-                preview: history.to_owned(),
+                preview: preview.to_owned(),
                 preview_author: Some(preview_author.clone()),
                 mode: ThreadMode::Agent,
                 model: "test-model".to_owned(),
@@ -7390,7 +7613,7 @@ async fn seed_completed_task_parent_with_history(
                 status: TurnStatus::InProgress,
                 turn_kind: TurnKind::Conversation,
                 origin: TurnOrigin::User,
-                mode: Default::default(),
+                mode: ThreadMode::Message,
                 author: Some(preview_author),
                 reply_to_turn_id: None,
                 mentions: Vec::new(),
@@ -7403,10 +7626,7 @@ async fn seed_completed_task_parent_with_history(
                     pioneer_protocol::TurnPermissionProfileSource::Composer,
                 ),
             },
-            &[UserInput::Text {
-                text: history.to_owned(),
-                text_elements: Vec::new(),
-            }],
+            inputs.as_slice(),
             principal_actor,
         )
         .await
@@ -7422,7 +7642,7 @@ async fn seed_completed_task_parent_with_history(
                     status: TurnStatus::Completed,
                     turn_kind: TurnKind::Conversation,
                     origin: TurnOrigin::User,
-                    mode: Default::default(),
+                    mode: ThreadMode::Message,
                     author: None,
                     reply_to_turn_id: None,
                     mentions: Vec::new(),
@@ -11746,18 +11966,19 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn followup_history_preserves_recorded_artifact_metadata_without_live_reattachment() {
+async fn followup_history_preserves_typed_recorded_artifact_version() {
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider = Arc::new(CaptureSummaryProvider::new("artifact answer"));
+    let capture_provider =
+        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
-    let processor = MessageProcessor::new(
+    let processor = Arc::new(MessageProcessor::new(
         thread_manager,
         provider_registry,
         session_manager,
@@ -11766,7 +11987,13 @@ async fn followup_history_preserves_recorded_artifact_metadata_without_live_reat
         test_gateway_secrets(),
         test_summary_config(),
         test_tool_loop_config(),
-    );
+    ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
     let thread = start_thread_for_artifact_test(
         &processor,
         connection_id,
@@ -11809,7 +12036,26 @@ async fn followup_history_preserves_recorded_artifact_metadata_without_live_reat
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let _first_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    let first_status = wait_for_turn_status(
+        processor.crud_store.clone(),
+        thread.thread.id.as_str(),
+        first_turn_id,
+        TurnStatus::Completed,
+    )
+    .await;
+    let first_persisted = processor
+        .crud_store
+        .get_turn(thread.thread.id.as_str(), first_turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(
+        first_status,
+        TurnStatus::Completed,
+        "the initial accepted artifact turn failed: {:?}",
+        first_persisted.error
+    );
 
     let second_turn_id = "turn_artifact_followup_02";
     let second_request_id = generate_test_request_id("turnartifact", "followup2");
@@ -11830,7 +12076,17 @@ async fn followup_history_preserves_recorded_artifact_metadata_without_live_reat
         )
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
-    let _second_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
+    assert_eq!(
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            second_turn_id,
+            TurnStatus::Completed,
+        )
+        .await,
+        TurnStatus::Completed,
+        "the native artifact follow-up must complete"
+    );
 
     let requests = capture_provider.snapshot_requests();
     assert_eq!(requests.len(), 2);
@@ -11838,12 +12094,8 @@ async fn followup_history_preserves_recorded_artifact_metadata_without_live_reat
     let artifact_history_message = second_request
         .messages
         .iter()
-        .find(|message| {
-            message
-                .content
-                .starts_with("Historical attachment references")
-        })
-        .expect("the recorded attachment metadata must survive in canonical history");
+        .find(|message| !message.content_parts.is_empty())
+        .expect("the recorded attachment must survive as typed canonical history");
     let input_reference = second_request
         .messages
         .iter()
@@ -11860,19 +12112,113 @@ async fn followup_history_preserves_recorded_artifact_metadata_without_live_reat
         })
     );
     assert!(
-        artifact_history_message
-            .content
-            .contains(&artifact.artifact_id)
+        matches!(
+            artifact_history_message.content_parts.as_slice(),
+            [pioneer_provider::MessageContentPart::File { file }]
+                if file.name.as_deref() == Some("car.jpg")
+                    && matches!(&file.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
+                        if base64_data == "aGVsbG8gYXJ0aWZhY3Q=")
+                    && file.artifact.as_ref().is_some_and(|accepted| {
+                        accepted.artifact_id == artifact.artifact_id
+                            && accepted.artifact_version_id == artifact.version_id
+                    })
+        ),
+        "historical accepted artifact parts: {:?}",
+        artifact_history_message.content_parts
     );
-    assert!(
-        artifact_history_message
-            .content
-            .contains(artifact.version_id.as_deref().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn followup_history_rejects_unavailable_accepted_artifact_before_provider() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let capture_provider =
+        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
+    let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+        "openai",
+        capture_provider.clone(),
+    ));
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        provider_registry,
+        session_manager,
+        workspace_manager,
+        crud_store,
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
+    let thread = start_thread_for_artifact_test(
+        &processor,
+        connection_id,
+        &mut rx,
+        workspace_id.as_str(),
+        "thr_unavailable_artifact_followup",
+    )
+    .await;
+    let artifact = ingest_user_test_artifact_for_thread(
+        &processor,
+        workspace_id.as_str(),
+        Some(thread.thread.id.as_str()),
+        "accepted-car.jpg",
+    )
+    .await;
+
+    let first_turn_id = "turn_unavailable_artifact_01";
+    let first_request_id = generate_test_request_id("unavailableartifact", "first");
+    processor
+        .process_request_for_connection(
+            connection_id,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": first_request_id.clone(),
+                "method": "turn/start",
+                "params": {
+                    "thread_id": thread.thread.id,
+                    "turn_id": first_turn_id,
+                    "input": [
+                        { "type": "text", "text": "Remember this exact artifact" },
+                        {
+                            "type": "artifact",
+                            "artifactId": artifact.artifact_id.clone(),
+                            "versionId": artifact.version_id.clone()
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
+    let first_status = wait_for_turn_status(
+        processor.crud_store.clone(),
+        thread.thread.id.as_str(),
+        first_turn_id,
+        TurnStatus::Completed,
+    )
+    .await;
+    let first_persisted = processor
+        .crud_store
+        .get_turn(thread.thread.id.as_str(), first_turn_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_eq!(
+        first_status,
+        TurnStatus::Completed,
+        "the initial accepted artifact turn failed: {:?}",
+        first_persisted.error
     );
-    assert!(artifact_history_message.content.contains("car.jpg"));
-    assert!(artifact_history_message.content.contains("text/plain"));
-    assert!(!artifact_history_message.content.contains("hello artifact"));
-    assert!(artifact_history_message.content_parts.is_empty());
 
     processor
         .artifact_service
@@ -11880,43 +12226,64 @@ async fn followup_history_preserves_recorded_artifact_metadata_without_live_reat
         .await
         .expect("test artifact delete should succeed");
 
-    let third_turn_id = "turn_artifact_followup_03";
-    let third_request_id = generate_test_request_id("turnartifact", "followup3");
+    let second_turn_id = "turn_unavailable_artifact_02";
+    let second_request_id = generate_test_request_id("unavailableartifact", "second");
     processor
         .process_request_for_connection(
             connection_id,
             &json!({
                 "jsonrpc": "2.0",
-                "id": third_request_id.clone(),
+                "id": second_request_id.clone(),
                 "method": "turn/start",
                 "params": {
                     "thread_id": thread.thread.id,
-                    "turn_id": third_turn_id,
+                    "turn_id": second_turn_id,
                     "input": [{ "type": "text", "text": "А теперь без файла?" }]
                 }
             })
             .to_string(),
         )
         .await;
-    let _third_response = recv_response_by_id(&mut rx, third_request_id.as_str()).await;
-    let _third_completed = recv_notification_by_method(&mut rx, events::TURN_COMPLETED).await;
-
-    let requests = capture_provider.snapshot_requests();
-    assert_eq!(requests.len(), 3);
-    let third_request = &requests[2];
-    assert!(
-        third_request
-            .messages
-            .iter()
-            .any(|message| message.content == artifact_history_message.content),
-        "deleting the live artifact must not rewrite its recorded historical metadata"
+    let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
+    let second_status = wait_for_turn_status(
+        processor.crud_store.clone(),
+        thread.thread.id.as_str(),
+        second_turn_id,
+        TurnStatus::Blocked,
+    )
+    .await;
+    let failed = processor
+        .crud_store
+        .get_turn(thread.thread.id.as_str(), second_turn_id)
+        .await
+        .expect("blocked artifact follow-up should remain queryable")
+        .expect("blocked artifact follow-up should be persisted")
+        .1;
+    assert_eq!(
+        second_status,
+        TurnStatus::Blocked,
+        "an unavailable accepted artifact version must block before provider delivery: {:?}",
+        failed.error
     );
+    let error = failed
+        .error
+        .as_deref()
+        .expect("the unavailable accepted version must produce an explicit diagnostic");
+    assert!(error.contains("failed to materialize accepted historical artifact"));
+    assert!(error.contains(artifact.artifact_id.as_str()));
     assert!(
-        third_request
-            .messages
-            .iter()
-            .all(|message| message.content_parts.is_empty()),
-        "historical metadata must not reattach deleted content"
+        error.contains(
+            artifact
+                .version_id
+                .as_deref()
+                .expect("ingested artifact must have an accepted version")
+        )
+    );
+    assert!(error.contains("context preparation failed"));
+    assert_eq!(
+        capture_provider.snapshot_requests().len(),
+        1,
+        "an unavailable accepted version must not reach the provider"
     );
 }
 
@@ -22682,6 +23049,7 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 }
                 complete_recorded_cli_task_turn(
                     &processor,
+                    harness.cli_session.as_ref(),
                     &harness.cli_manager,
                     &harness.workspace_id,
                     &harness.runtime_id,
@@ -23200,6 +23568,7 @@ async fn collaborative_composer_dispatches_codex_and_claude_without_api_provider
 
         complete_recorded_cli_task_turn(
             &processor,
+            cli_session.as_ref(),
             &cli_manager,
             workspace_id.as_str(),
             runtime_id,
@@ -23263,12 +23632,21 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         ("codex", CLIAgentRuntimeKind::Codex, "gpt-5"),
         ("claude", CLIAgentRuntimeKind::Claude, "claude-sonnet"),
     ] {
+        let (tx, mut rx) = mpsc::channel(256);
         let session_manager = Arc::new(SessionManager::new());
+        let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+        session_manager
+            .set_connection_workspace(connection, Some(workspace_id.clone()))
+            .await;
         let cli_session = Arc::new(RecordingCliRuntimeSession::default());
         let cli_manager = test_cli_runtime_manager(cli_session.clone());
-        let summary_provider = Arc::new(CaptureSummaryProvider::new("released CLI summary"));
+        let summary_provider = Arc::new(
+            CaptureSummaryProvider::new("released CLI summary")
+                .with_native_attachments()
+                .with_valid_summary_completion(),
+        );
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "echo",
             summary_provider.clone(),
@@ -23276,12 +23654,12 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         provider_registry
             .insert("openai", summary_provider.clone())
             .expect("CLI test provider should register");
-        let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+        let mut processor = Arc::new(with_enabled_test_cli_runtime_catalog(
             MessageProcessor::new(
                 thread_manager,
-                provider_registry,
-                session_manager,
-                workspace_manager,
+                provider_registry.clone(),
+                session_manager.clone(),
+                workspace_manager.clone(),
                 crud_store.clone(),
                 test_gateway_secrets(),
                 test_summary_config(),
@@ -23296,6 +23674,13 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
             .await
             .expect("recording CLI runtimes should seed authoritative readiness");
+        sync_test_cli_runtime_identities(&processor)
+            .await
+            .expect("CLI author identities should be synchronized");
+        processor
+            .mark_cli_reasoning_model_ready_for_tests(workspace_id.as_str(), runtime_id, model)
+            .await
+            .expect("manual child effort needs authoritative runtime model capabilities");
         processor
             .agent_manager
             .set_context_controller(Some(Arc::new(
@@ -23317,8 +23702,114 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             history_marker.as_str(),
         )
         .await;
+        let historical_file = ingest_user_test_artifact_for_thread(
+            &processor,
+            workspace_id.as_str(),
+            Some(parent_thread_id.as_str()),
+            "accepted-history.txt",
+        )
+        .await;
+        let one_pixel_png = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,
+            192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+            96, 130,
+        ];
+        let historical_image = processor
+            .artifact_service
+            .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
+                workspace_id: workspace_id.clone(),
+                primary_thread_id: Some(parent_thread_id.clone()),
+                bytes: one_pixel_png.clone(),
+                display_name: "accepted-history.png".to_owned(),
+                kind: pioneer_protocol::ArtifactKind::Image,
+                mime_type: Some("image/png".to_owned()),
+                created_by_kind: pioneer_protocol::ArtifactCreatedByKind::User,
+                created_by_actor_id: Some("test-user".to_owned()),
+                binding: None,
+                metadata: Default::default(),
+            })
+            .await
+            .expect("historical image artifact ingest")
+            .artifact;
+        let runtime_cwd = std::env::current_dir().expect("test runtime working directory");
+        let historical_media_dir = tempfile::tempdir_in(&runtime_cwd)
+            .expect("historical local-media fixture directory inside runtime workspace");
+        let historical_local_image = historical_media_dir
+            .path()
+            .join(format!("historical-{runtime_id}.png"))
+            .to_string_lossy()
+            .into_owned();
+        let historical_local_file = historical_media_dir
+            .path()
+            .join(format!("historical-{runtime_id}.txt"))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(historical_local_image.as_str(), one_pixel_png)
+            .expect("historical local-image fixture");
+        std::fs::write(historical_local_file.as_str(), b"recorded local file")
+            .expect("historical local-file fixture");
+        let media_turn_id = format!("turn_native_parent_media_{runtime_id}");
+        seed_completed_task_parent_with_inputs(
+            &processor,
+            workspace_id.as_str(),
+            parent_thread_id.as_str(),
+            media_turn_id.as_str(),
+            "persisted historical media input",
+            vec![
+                UserInput::Text {
+                    text: "persisted historical media input".to_owned(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::LocalImage {
+                    path: historical_local_image.clone(),
+                },
+                UserInput::LocalFile {
+                    path: historical_local_file.clone(),
+                },
+            ],
+        )
+        .await;
+        crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace_id.clone(),
+                    thread_id: parent_thread_id.clone(),
+                    turn_id: media_turn_id,
+                    item: TurnItem::UserMessage {
+                        id: format!("historical_attachments_{runtime_id}"),
+                        text: String::new(),
+                        attachments: vec![
+                            UserMessageAttachment::LocalImage {
+                                path: historical_local_image.clone(),
+                            },
+                            UserMessageAttachment::LocalFile {
+                                path: historical_local_file.clone(),
+                            },
+                            UserMessageAttachment::Artifact {
+                                artifact: historical_file.clone(),
+                            },
+                            UserMessageAttachment::Artifact {
+                                artifact: historical_image.clone(),
+                            },
+                            UserMessageAttachment::McpTool {
+                                capability: pioneer_protocol::TurnMcpToolCapabilitySummary {
+                                    id: format!("mcp-tool:workspace:history:{runtime_id}"),
+                                    label: format!("history / {runtime_id}"),
+                                    server_name: "history".to_owned(),
+                                    raw_tool_name: runtime_id.to_owned(),
+                                    scope_kind: McpScopeKind::Workspace,
+                                },
+                            },
+                        ],
+                    },
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .expect("historical attachment event should persist");
         let input_marker = format!("execute native detached work with {runtime_id}");
-        let params = detached_cli_task_create_params(
+        let mut params = detached_cli_task_create_params(
             workspace_id.as_str(),
             parent_thread_id.as_str(),
             source_turn_id.as_str(),
@@ -23327,6 +23818,35 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             model,
             input_marker.as_str(),
         );
+        ensure_task_create_parent_turn_for_test(&processor, &params)
+            .await
+            .expect("parent Task authority should be seeded before changing the fixture cwd");
+        let runtime_cwd = runtime_cwd.to_string_lossy().into_owned();
+        assert!(
+            crud_store
+                .set_turn_execution_security_snapshot(
+                    source_turn_id.as_str(),
+                    &pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                        runtime_cwd.as_str(),
+                        1,
+                    ),
+                )
+                .await
+                .expect("parent execution security fixture update"),
+        );
+        params
+            .agent_spec
+            .as_mut()
+            .expect("detached Task agent spec")
+            .security_cap
+            .as_mut()
+            .expect("detached Task security cap")
+            .max_filesystem_entries = vec![
+            pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                pioneer_protocol::TurnFilesystemAccess::Write,
+                runtime_cwd,
+            ),
+        ];
         let native_turn_id = format!("native_task_turn_{runtime_id}");
         cli_session
             .set_next_native_turn_id(native_turn_id.clone())
@@ -23334,6 +23854,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         let response = create_task_for_test(&processor, params)
             .await
             .expect("native detached Task should be accepted");
+        let task_id = response.task.id.clone();
         let run = response
             .run
             .clone()
@@ -23354,6 +23875,28 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "{runtime_id} MCP lease must use the executing child identity, not the parent continuation"
         );
         let native_start = &starts[0];
+        if runtime_kind == CLIAgentRuntimeKind::Claude {
+            let provider_session_id = native_start.native_thread_id.as_str();
+            uuid::Uuid::parse_str(provider_session_id)
+                .expect("recording Claude session must use its durable provider UUID");
+            let verified = crud_store
+                .verify_claude_provider_session_binding(
+                    lineage.child_thread_id.as_str(),
+                    provider_session_id,
+                    Some(provider_session_id),
+                    1,
+                )
+                .await
+                .expect("recorded Claude initialization must verify its emitted UUID");
+            assert_eq!(
+                verified
+                    .provider_session
+                    .as_ref()
+                    .expect("verified Claude provider session")
+                    .provider_session_id,
+                provider_session_id,
+            );
+        }
         assert_eq!(native_start.model.as_deref(), Some(model));
         assert_eq!(native_start.effort, None);
         assert_eq!(
@@ -23371,12 +23914,56 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .contains(input_marker.as_str()),
             "{runtime_id} must receive the exact composer input"
         );
+        assert_eq!(
+            native_start
+                .input
+                .to_string()
+                .matches(input_marker.as_str())
+                .count(),
+            1,
+            "{runtime_id} must receive the current Task command exactly once"
+        );
         assert!(
-            !native_start
+            native_start
                 .input
                 .to_string()
                 .contains(history_marker.as_str()),
-            "{runtime_id} primary CLI must not receive Pioneer history or summaries"
+            "{runtime_id} must bootstrap the accepted parent history"
+        );
+        let initial_adapter_input = native_start.input.to_string();
+        assert!(initial_adapter_input.contains("accepted-history.txt"));
+        assert!(initial_adapter_input.contains("accepted-history.png"));
+        assert!(initial_adapter_input.contains("localImage"));
+        assert_eq!(
+            initial_adapter_input
+                .matches(historical_local_image.as_str())
+                .count(),
+            1,
+            "the persisted input and its UI copy must yield one historical image"
+        );
+        assert_eq!(
+            initial_adapter_input
+                .matches(historical_local_file.as_str())
+                .count(),
+            1,
+            "the persisted input and its UI copy must yield one historical file"
+        );
+        assert_eq!(
+            initial_adapter_input
+                .matches(format!("mcp-tool:workspace:history:{runtime_id}").as_str())
+                .count(),
+            1,
+            "historical MCP metadata must remain inert and appear exactly once"
+        );
+        assert!(
+            initial_adapter_input.contains("artifacts/workspaces"),
+            "historical artifacts must use their authorized materialized paths outside the project cwd"
+        );
+        let provider_input = native_start.input.to_string();
+        assert!(
+            provider_input.find(history_marker.as_str())
+                < provider_input.find(input_marker.as_str()),
+            "accepted parent history must precede the current Task command"
         );
 
         let native_child_actor = turn::Entity::find_by_id(lineage.child_turn_id.as_str())
@@ -23401,24 +23988,46 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .expect("native Task turn binding should load")
             .expect("native Task turn binding should exist");
         assert_eq!(binding.thread_id, lineage.child_thread_id);
-        assert_eq!(binding.continuation_thread_id, parent_thread_id);
+        assert_eq!(binding.continuation_thread_id, lineage.child_thread_id);
         assert_eq!(binding.runtime_id, runtime_id);
-        let parent_binding = crud_store
-            .get_cli_runtime_thread_binding(parent_thread_id.as_str())
-            .await
-            .expect("parent continuation binding should load")
-            .expect("parent continuation binding should exist");
+        let sent_basis = crate::cli_runtime::thread_binding::sent_context_basis_from_input_mapping(
+            binding.input_mapping_json.as_str(),
+        )
+        .expect("Task CLI input mapping must carry its prepared context proof")
+        .expect("non-empty parent Task basis must have a frozen continuity proof");
         assert_eq!(
-            parent_binding.native_thread_id,
+            sent_basis.completed.execution_thread_id,
+            lineage.child_thread_id
+        );
+        assert_eq!(
+            sent_basis.completed.manifest_owner_thread_id, parent_thread_id,
+            "the compiler must retain the accepted parent manifest owner instead of recapturing the child"
+        );
+        assert!(
+            sent_basis
+                .completed
+                .delivered_sources
+                .iter()
+                .any(|source| source.source_thread_id == parent_thread_id),
+            "the pre-serialization carrier must retain parent provenance while the adapter payload remains provider-only"
+        );
+        assert_eq!(sent_basis.pending_turn.turn_id, lineage.child_turn_id);
+        let child_binding = crud_store
+            .get_cli_runtime_thread_binding(lineage.child_thread_id.as_str())
+            .await
+            .expect("child continuation binding should load")
+            .expect("child continuation binding should exist");
+        assert_eq!(
+            child_binding.native_thread_id,
             native_start.native_thread_id
         );
         assert!(
             crud_store
-                .get_cli_runtime_thread_binding(lineage.child_thread_id.as_str())
+                .get_cli_runtime_thread_binding(parent_thread_id.as_str())
                 .await
-                .expect("child continuation lookup should succeed")
+                .expect("parent continuation lookup should succeed")
                 .is_none(),
-            "the hidden child must not own a second native conversation"
+            "the accepted child branch must not contaminate the parent provider conversation"
         );
         let security = crud_store
             .get_turn_execution_security_snapshot(lineage.child_turn_id.as_str())
@@ -23446,17 +24055,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             }
         );
 
-        let barrier = if runtime_id == "codex" {
-            CompletedHistoryDeliveryBarrier::Preparation
-        } else {
-            CompletedHistoryDeliveryBarrier::Summarizer
-        };
+        let barrier = CompletedHistoryDeliveryBarrier::Preparation;
         let background_context = "🧪".repeat(60_000);
         let result = format!(
             r#"<task_result>{{"summary":"{runtime_id} native result","data":{{"runtime":"{runtime_id}","context":"{background_context}"}}}}</task_result>"#
         );
         complete_recorded_cli_task_turn(
             &processor,
+            cli_session.as_ref(),
             &cli_manager,
             workspace_id.as_str(),
             runtime_id,
@@ -23467,14 +24073,792 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         )
         .await;
         assert_eq!(
-            wait_for_task_status(
-                crud_store.clone(),
-                response.task.id.as_str(),
-                TaskStatus::Completed,
-            )
-            .await,
+            wait_for_task_status(crud_store.clone(), task_id.as_str(), TaskStatus::Completed,)
+                .await,
             TaskStatus::Completed,
             "{runtime_id} native Task should reconcile through the normal Task result path"
+        );
+        open_persisted_child_for_test(
+            &processor,
+            connection,
+            &mut rx,
+            workspace_id.as_str(),
+            lineage.child_thread_id.as_str(),
+            format!("open-child-{runtime_id}").as_str(),
+        )
+        .await;
+
+        for followup_index in 1..=3 {
+            let followup_turn_id = format!("manual_{runtime_id}_followup_{followup_index}");
+            let followup_native_turn_id =
+                format!("native_manual_{runtime_id}_followup_{followup_index}");
+            let followup_marker = format!("MANUAL {runtime_id} CHILD FOLLOWUP {followup_index}");
+            if followup_index == 3 {
+                let cold_thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+                assert!(
+                    !cold_thread_manager
+                        .has_thread(lineage.child_thread_id.as_str())
+                        .await,
+                    "restart fixture must begin with an empty in-memory manager"
+                );
+                processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+                    MessageProcessor::new(
+                        cold_thread_manager.clone(),
+                        provider_registry.clone(),
+                        session_manager.clone(),
+                        workspace_manager.clone(),
+                        crud_store.clone(),
+                        test_gateway_secrets(),
+                        test_summary_config(),
+                        test_tool_loop_config(),
+                    )
+                    .with_cli_runtime_manager_for_tests(cli_manager.clone())
+                    .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+                        runtime_kind,
+                    )),
+                ));
+                processor
+                    .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+                    .await
+                    .expect("restarted recording CLI runtime should be ready");
+                processor
+                    .mark_cli_reasoning_model_ready_for_tests(
+                        workspace_id.as_str(),
+                        runtime_id,
+                        model,
+                    )
+                    .await
+                    .expect("restarted child effort needs the persisted model capabilities");
+                processor
+                    .agent_manager
+                    .set_context_controller(Some(Arc::new(
+                        crate::compaction::GatewayNativeContextController::new(Arc::downgrade(
+                            &processor,
+                        )),
+                    )))
+                    .await;
+                open_persisted_child_for_test(
+                    &processor,
+                    connection,
+                    &mut rx,
+                    workspace_id.as_str(),
+                    lineage.child_thread_id.as_str(),
+                    format!("reopen-child-{runtime_id}").as_str(),
+                )
+                .await;
+                assert!(
+                    processor
+                        .thread_manager
+                        .thread_get(lineage.child_thread_id.as_str())
+                        .await
+                        .is_some_and(|thread| thread.turns.is_empty()),
+                    "vacant cold seed must not retain persisted turns in memory"
+                );
+                if runtime_kind == CLIAgentRuntimeKind::Codex {
+                    cli_session
+                        .set_next_native_thread_id(format!(
+                            "rebootstrapped_{runtime_id}_provider_thread"
+                        ))
+                        .await;
+                }
+            }
+            cli_session
+                .set_next_native_turn_id(followup_native_turn_id.clone())
+                .await;
+            let request_id = generate_test_request_id("manual-child-followup", &followup_turn_id);
+            let context = processor
+                .session_manager
+                .connection_context(connection)
+                .await
+                .expect("manual child connection context must remain available");
+            Arc::clone(&processor)
+                .process_owned_request(
+                    context,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "turn/start",
+                        "params": {
+                            "thread_id": lineage.child_thread_id,
+                            "turn_id": followup_turn_id,
+                            "input": [{"type": "text", "text": followup_marker}],
+                            "mode": "Agent",
+                            "model": model,
+                            "model_provider": null,
+                            "execution_backend": {
+                                "type": "cliAgentRuntime",
+                                "runtime_id": runtime_id,
+                                "runtime_kind": runtime_kind,
+                            },
+                            "reasoning": {"effort": "high"},
+                            "permission_profile":
+                                pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+            let response = recv_response_by_id(&mut rx, &request_id).await;
+            let accepted: TurnStartResponse = serde_json::from_value(response.result)
+                .expect("manual child follow-up must be accepted as a foreground turn");
+            assert_eq!(accepted.turn.id, followup_turn_id);
+
+            let followup_starts =
+                wait_for_cli_runtime_turn_starts(&cli_session, followup_index + 1).await;
+            let followup_start = &followup_starts[followup_index];
+            assert_eq!(followup_start.model.as_deref(), Some(model));
+            assert_eq!(followup_start.effort.as_deref(), Some("high"));
+            let followup_input = followup_start.input.to_string();
+            assert!(followup_input.contains(followup_marker.as_str()));
+            if followup_index <= 2 {
+                assert_eq!(
+                    followup_start.native_thread_id, native_start.native_thread_id,
+                    "normal continuation must use the same provider conversation"
+                );
+                assert!(
+                    !followup_input.contains(history_marker.as_str())
+                        && !followup_input.contains(format!("{runtime_id} native result").as_str()),
+                    "a continuous provider session must not receive a duplicate full bootstrap"
+                );
+                assert_eq!(
+                    cli_session.thread_starts.lock().await.len(),
+                    if runtime_kind == CLIAgentRuntimeKind::Claude {
+                        followup_index + 1
+                    } else {
+                        1
+                    },
+                    "Codex resumes by RPC while Claude reopens the same durable provider UUID"
+                );
+            } else {
+                assert_ne!(
+                    followup_start.native_thread_id, native_start.native_thread_id,
+                    "stale history must not be layered over the mismatched provider branch"
+                );
+                let task_answer = followup_input
+                    .find(format!("{runtime_id} native result").as_str())
+                    .expect("stale provider recovery must bootstrap the accepted Task answer");
+                let own_answer = followup_input
+                    .find(format!("{runtime_id} manual answer 1").as_str())
+                    .expect("stale provider recovery must bootstrap the child own answer");
+                let second_own_answer = followup_input
+                    .find(format!("{runtime_id} manual answer 2").as_str())
+                    .expect("stale provider recovery must bootstrap every completed normal resume");
+                let current = followup_input
+                    .find(followup_marker.as_str())
+                    .expect("stale provider recovery must retain the current question");
+                assert!(
+                    task_answer < own_answer
+                        && own_answer < second_own_answer
+                        && second_own_answer < current
+                );
+                let native_answer = followup_input.find("released CLI summary").expect(
+                    "CLI recovery must include the intervening native answer from the same child",
+                );
+                assert!(second_own_answer < native_answer && native_answer < current);
+                assert!(
+                    !followup_input
+                        .contains("LATE PARENT APPEND MUST STAY OUT OF ACCEPTED CHILD BASIS"),
+                    "later parent appends must not move an existing child's accepted boundary"
+                );
+                assert_eq!(
+                    cli_session.thread_starts.lock().await.len(),
+                    if runtime_kind == CLIAgentRuntimeKind::Claude {
+                        4
+                    } else {
+                        2
+                    },
+                    "a cold-restored binding stale after the native middle turn must start an isolated provider conversation"
+                );
+            }
+
+            let provider_conversation = cli_session
+                .provider_conversation(followup_start.native_thread_id.as_str())
+                .await;
+            if followup_index <= 2 {
+                let initial = provider_conversation
+                    .iter()
+                    .position(|entry| entry.contains(input_marker.as_str()))
+                    .expect("provider conversation must retain the original Task command");
+                let task_answer = provider_conversation
+                    .iter()
+                    .position(|entry| {
+                        entry.contains(format!("{runtime_id} native result").as_str())
+                    })
+                    .expect("provider conversation must retain the Task answer");
+                let current = provider_conversation
+                    .iter()
+                    .position(|entry| entry.contains(followup_marker.as_str()))
+                    .expect("provider conversation must contain the current manual question");
+                assert!(initial < task_answer && task_answer < current);
+                if followup_index == 2 {
+                    let first_answer = provider_conversation
+                        .iter()
+                        .position(|entry| {
+                            entry.contains(format!("{runtime_id} manual answer 1").as_str())
+                        })
+                        .expect("second normal resume must retain the first accepted answer");
+                    assert!(task_answer < first_answer && first_answer < current);
+                }
+            } else {
+                let bootstrapped = provider_conversation.join("\n");
+                let initial = bootstrapped
+                    .find(input_marker.as_str())
+                    .expect("new provider session must receive the accepted Task command");
+                let task_answer = bootstrapped
+                    .find(format!("{runtime_id} native result").as_str())
+                    .expect("new provider session must receive the accepted Task answer");
+                let current = bootstrapped
+                    .find(followup_marker.as_str())
+                    .expect("new provider session must receive the current question");
+                assert!(initial < task_answer && task_answer < current);
+            }
+
+            complete_recorded_cli_task_turn(
+                &processor,
+                cli_session.as_ref(),
+                &cli_manager,
+                workspace_id.as_str(),
+                runtime_id,
+                lineage.child_thread_id.as_str(),
+                followup_start.native_thread_id.as_str(),
+                followup_native_turn_id.as_str(),
+                format!("{runtime_id} manual answer {followup_index}").as_str(),
+            )
+            .await;
+            if followup_index == 2 {
+                let continued_binding = crud_store
+                    .get_cli_runtime_thread_binding(lineage.child_thread_id.as_str())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let continued_basis =
+                    crate::cli_runtime::thread_binding::completed_context_basis_from_binding(
+                        &continued_binding,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(continued_basis.delivered_turns.iter().any(|turn| {
+                    turn.turn_id == followup_turn_id && turn.message_revision == 0
+                }));
+                assert!(
+                    !continued_basis.delivered_sources.is_empty(),
+                    "normal resume completion must retain exact accepted assistant/tool source versions"
+                );
+                seed_completed_task_parent_with_history(
+                    &processor,
+                    workspace_id.as_str(),
+                    parent_thread_id.as_str(),
+                    format!("late_parent_{runtime_id}").as_str(),
+                    "LATE PARENT APPEND MUST STAY OUT OF ACCEPTED CHILD BASIS",
+                )
+                .await;
+                let native_turn_id = format!("manual_{runtime_id}_native_middle");
+                let native_marker = "NATIVE QUESTION IN SAME CHILD";
+                let native_request_id =
+                    generate_test_request_id("manual-child-native-middle", &native_turn_id);
+                let context = processor
+                    .session_manager
+                    .connection_context(connection)
+                    .await
+                    .expect("native middle-turn connection context must remain available");
+                Arc::clone(&processor)
+                    .process_owned_request(
+                        context,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": native_request_id,
+                            "method": "turn/start",
+                            "params": {
+                                "thread_id": lineage.child_thread_id,
+                                "turn_id": native_turn_id,
+                                "input": [{"type": "text", "text": native_marker}],
+                                "mode": "Agent",
+                                "model": "test-model",
+                                "model_provider": "openai",
+                                "permission_profile": pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                            }
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                let native_response = recv_response_by_id(&mut rx, &native_request_id).await;
+                let accepted: TurnStartResponse = serde_json::from_value(native_response.result)
+                    .expect("native middle turn in the existing child must be accepted");
+                assert_eq!(accepted.turn.id, native_turn_id);
+                let native_status = wait_for_turn_status(
+                    crud_store.clone(),
+                    lineage.child_thread_id.as_str(),
+                    accepted.turn.id.as_str(),
+                    TurnStatus::Completed,
+                )
+                .await;
+                let native_persisted = crud_store
+                    .get_turn(lineage.child_thread_id.as_str(), accepted.turn.id.as_str())
+                    .await
+                    .expect("native middle turn should load")
+                    .expect("native middle turn should persist")
+                    .1;
+                assert_eq!(
+                    native_status,
+                    TurnStatus::Completed,
+                    "native middle turn should complete with accepted historical media: {:?}",
+                    native_persisted.error
+                );
+                let native_requests = summary_provider.snapshot_requests();
+                let native_request = native_requests
+                    .iter()
+                    .find(|request| {
+                        request.messages.len() > 1
+                            && request.messages.first().is_none_or(|message| {
+                                message.content != pioneer_compaction::summary::INSTRUCTIONS
+                                    && !message.content.starts_with(
+                                        "You are an internal turn preflight planner for Pioneer.",
+                                    )
+                            })
+                            && request
+                                .messages
+                                .iter()
+                                .any(|message| message.content.contains(native_marker))
+                    })
+                    .expect("native provider must receive the intervening child question");
+                let native_request_text = native_request
+                    .messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    native_request_text.contains(format!("{runtime_id} manual answer 1").as_str()),
+                    "native continuation must receive the preceding CLI answer; projection: {:?}",
+                    native_request
+                        .messages
+                        .iter()
+                        .map(|message| (
+                            message.content.chars().take(400).collect::<String>(),
+                            message.content_parts.len()
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    native_request_text.contains(format!("{runtime_id} manual answer 2").as_str()),
+                    "native continuation must receive every normal-resume CLI answer"
+                );
+                let native_image_parts = native_request.messages.iter().flat_map(|message| message.content_parts.iter()).filter(|part| {
+                    matches!(part, pioneer_provider::MessageContentPart::Image { image }
+                        if image.artifact.is_none()
+                            && matches!(&image.source, pioneer_provider::AttachmentDataSource::Bytes { .. }))
+                }).count();
+                assert!(
+                    native_image_parts == 1
+                        || (native_image_parts == 0
+                            && native_request_text.contains("## Goal and constraints")
+                            && native_request_text
+                                .contains(format!("historical-{runtime_id}.png").as_str())),
+                    "native request must deliver the image exactly once or cite it through an accepted summary, not rematerialize covered media"
+                );
+                let native_file_parts = native_request.messages.iter().flat_map(|message| message.content_parts.iter()).filter(|part| {
+                    matches!(part, pioneer_provider::MessageContentPart::File { file }
+                        if file.artifact.is_none()
+                            && matches!(&file.source, pioneer_provider::AttachmentDataSource::Bytes { .. }))
+                }).count();
+                assert!(
+                    native_file_parts == 1
+                        || (native_file_parts == 0
+                            && native_request_text.contains("## Goal and constraints")
+                            && native_request_text
+                                .contains(format!("historical-{runtime_id}.txt").as_str())),
+                    "native request must deliver the file exactly once or cite it through an accepted summary, not rematerialize covered media"
+                );
+                assert_eq!(
+                    native_request
+                        .messages
+                        .iter()
+                        .filter(|message| {
+                            message.content.contains(
+                                format!("mcp-tool:workspace:history:{runtime_id}").as_str(),
+                            )
+                        })
+                        .count(),
+                    1,
+                    "native request must retain inert historical MCP metadata exactly once"
+                );
+            }
+        }
+        // The persisted head is ordered by (created_at, id). Keep these
+        // synthetic same-second turns in that exact deterministic order so a
+        // stale bootstrap is caused by the inserted source, not a fixture tie.
+        let continuity_source_turn = format!("manual_{runtime_id}_z_source");
+        let continuity_v1 = format!("CONTINUITY SOURCE {runtime_id} V1");
+        let continuity_v2 = format!("CONTINUITY SOURCE {runtime_id} V2");
+        seed_completed_task_parent_with_history(
+            &processor,
+            workspace_id.as_str(),
+            lineage.child_thread_id.as_str(),
+            continuity_source_turn.as_str(),
+            continuity_v1.as_str(),
+        )
+        .await;
+        assert_eq!(
+            crud_store
+                .get_thread_model(lineage.child_thread_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .turns
+                .last()
+                .map(|turn| turn.id.as_str()),
+            Some(continuity_source_turn.as_str()),
+            "the inserted source must actually become the authoritative persisted head"
+        );
+
+        let during_edit_turn = format!("manual_{runtime_id}_zz_during_source_edit");
+        let during_edit_native_turn = format!("native_{runtime_id}_during_source_edit");
+        cli_session
+            .set_next_native_turn_id(during_edit_native_turn.clone())
+            .await;
+        let request_id = generate_test_request_id("continuity-during-edit", &during_edit_turn);
+        let context = processor
+            .session_manager
+            .connection_context(connection)
+            .await
+            .expect("continuity edit connection context");
+        Arc::clone(&processor)
+            .process_owned_request(
+                context,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "turn/start",
+                    "params": {
+                        "thread_id": lineage.child_thread_id,
+                        "turn_id": during_edit_turn,
+                        "input": [{"type": "text", "text": "QUESTION WHILE SOURCE CHANGES"}],
+                        "mode": "Agent",
+                        "model": model,
+                        "execution_backend": {
+                            "type": "cliAgentRuntime",
+                            "runtime_id": runtime_id,
+                            "runtime_kind": runtime_kind,
+                        },
+                        "reasoning": {"effort": "high"},
+                        "permission_profile": pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+        let _: TurnStartResponse = serde_json::from_value(response.result)
+            .expect("turn using source v1 should be accepted");
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 5).await;
+        let v1_start = &starts[4];
+        let v1_native_thread_id = v1_start.native_thread_id.clone();
+        assert!(v1_start.input.to_string().contains(continuity_v1.as_str()));
+        assert_eq!(
+            crud_store
+                .get_thread_model(lineage.child_thread_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .turns
+                .last()
+                .map(|turn| turn.id.as_str()),
+            Some(during_edit_turn.as_str()),
+            "the sent v1 turn must become the authoritative head before its source changes"
+        );
+
+        crud_store
+            .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
+                workspace_id: workspace_id.clone(),
+                thread_id: lineage.child_thread_id.clone(),
+                turn_id: continuity_source_turn,
+                expected_revision: 0,
+                input: vec![UserInput::Text {
+                    text: continuity_v2.clone(),
+                    text_elements: Vec::new(),
+                }],
+                mentions: Vec::new(),
+                changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                    authenticated_test_superuser().principal_id.clone(),
+                ),
+                changed_at_unix: chrono::Utc::now().timestamp(),
+            })
+            .await
+            .expect("directly sent source should be edited while provider turn is active");
+        complete_recorded_cli_task_turn(
+            &processor,
+            cli_session.as_ref(),
+            &cli_manager,
+            workspace_id.as_str(),
+            runtime_id,
+            lineage.child_thread_id.as_str(),
+            v1_native_thread_id.as_str(),
+            during_edit_native_turn.as_str(),
+            format!("{runtime_id} answer based on source v1").as_str(),
+        )
+        .await;
+
+        let corrected_turn = format!("manual_{runtime_id}_zzz_after_source_edit");
+        let corrected_native_turn = format!("native_{runtime_id}_after_source_edit");
+        cli_session
+            .set_next_native_turn_id(corrected_native_turn.clone())
+            .await;
+        let request_id = generate_test_request_id("continuity-after-edit", &corrected_turn);
+        let context = processor
+            .session_manager
+            .connection_context(connection)
+            .await
+            .expect("corrected bootstrap connection context");
+        Arc::clone(&processor)
+            .process_owned_request(
+                context,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "turn/start",
+                    "params": {
+                        "thread_id": lineage.child_thread_id,
+                        "turn_id": corrected_turn,
+                        "input": [{"type": "text", "text": "QUESTION AFTER SOURCE EDIT"}],
+                        "mode": "Agent",
+                        "model": model,
+                        "execution_backend": {
+                            "type": "cliAgentRuntime",
+                            "runtime_id": runtime_id,
+                            "runtime_kind": runtime_kind,
+                        },
+                        "reasoning": {"effort": "high"},
+                        "permission_profile": pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+        let _: TurnStartResponse = serde_json::from_value(response.result)
+            .expect("stale continuity should recover through bootstrap");
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, 6).await;
+        let corrected = &starts[5];
+        let corrected_input = corrected.input.to_string();
+        assert_ne!(corrected.native_thread_id, v1_native_thread_id);
+        assert!(corrected_input.contains(continuity_v2.as_str()));
+        assert!(!corrected_input.contains(continuity_v1.as_str()));
+        assert_eq!(
+            corrected_input
+                .matches("QUESTION AFTER SOURCE EDIT")
+                .count(),
+            1
+        );
+        let corrected_provider_history = cli_session
+            .provider_conversation(corrected.native_thread_id.as_str())
+            .await
+            .join("\n");
+        assert!(corrected_provider_history.contains(continuity_v2.as_str()));
+        assert!(!corrected_provider_history.contains(continuity_v1.as_str()));
+        complete_recorded_cli_task_turn(
+            &processor,
+            cli_session.as_ref(),
+            &cli_manager,
+            workspace_id.as_str(),
+            runtime_id,
+            lineage.child_thread_id.as_str(),
+            corrected.native_thread_id.as_str(),
+            corrected_native_turn.as_str(),
+            format!("{runtime_id} corrected continuity answer").as_str(),
+        )
+        .await;
+
+        // Message turns are execution-free. Admit one editable canonical
+        // source, then exercise its continuity through actual Agent CLI turns.
+        // The second Agent turn must resume normally; editing the older source
+        // must bootstrap the third through the dispatcher.
+        let post_bootstrap_source_turn = format!("manual_{runtime_id}_zzzz_source");
+        seed_completed_task_parent_with_history(
+            &processor,
+            workspace_id.as_str(),
+            lineage.child_thread_id.as_str(),
+            post_bootstrap_source_turn.as_str(),
+            format!("POST BOOTSTRAP {runtime_id} SOURCE V1").as_str(),
+        )
+        .await;
+        assert_eq!(
+            crud_store
+                .get_thread_model(lineage.child_thread_id.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .turns
+                .last()
+                .map(|turn| turn.id.as_str()),
+            Some(post_bootstrap_source_turn.as_str()),
+            "the editable Message source must be the persisted head before CLI bootstrap"
+        );
+        let mut post_bootstrap_provider = None;
+        for index in 1..=3 {
+            let turn_id = format!("manual_{runtime_id}_{}agent_{index}", "z".repeat(4 + index));
+            let native_turn_id = format!("native_{runtime_id}_post_bootstrap_{index}");
+            let marker = format!("POST BOOTSTRAP {runtime_id} QUESTION {index}");
+            if index == 3 && runtime_kind == CLIAgentRuntimeKind::Codex {
+                cli_session
+                    .set_next_native_thread_id(format!(
+                        "post_bootstrap_recovered_{runtime_id}_provider"
+                    ))
+                    .await;
+            }
+            cli_session
+                .set_next_native_turn_id(native_turn_id.clone())
+                .await;
+            let expected_starts = cli_session.turn_starts.lock().await.len() + 1;
+            let request_id =
+                generate_test_request_id("postmut", format!("{runtime_id}{index}").as_str());
+            let context = processor
+                .session_manager
+                .connection_context(connection)
+                .await
+                .expect("post-bootstrap mutation connection context");
+            Arc::clone(&processor)
+                .process_owned_request(
+                    context,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": "turn/start",
+                        "params": {
+                            "thread_id": lineage.child_thread_id,
+                            "turn_id": turn_id,
+                            "input": [{"type": "text", "text": marker}],
+                            "mode": "Agent",
+                            "model": model,
+                            "execution_backend": {
+                                "type": "cliAgentRuntime",
+                                "runtime_id": runtime_id,
+                                "runtime_kind": runtime_kind,
+                            },
+                            "reasoning": {"effort": "high"},
+                            "permission_profile": pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                        }
+                    })
+                    .to_string(),
+                )
+                .await;
+            let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+            let _: TurnStartResponse = serde_json::from_value(response.result)
+                .expect("post-bootstrap Agent turn should be accepted");
+            let starts = wait_for_cli_runtime_turn_starts(&cli_session, expected_starts).await;
+            let start = starts.last().unwrap();
+            if index == 1 {
+                post_bootstrap_provider = Some(start.native_thread_id.clone());
+                assert!(
+                    start
+                        .input
+                        .to_string()
+                        .contains(format!("POST BOOTSTRAP {runtime_id} SOURCE V1").as_str())
+                );
+            } else if index == 2 {
+                assert_eq!(
+                    Some(start.native_thread_id.as_str()),
+                    post_bootstrap_provider.as_deref(),
+                    "unchanged post-bootstrap guards should keep the provider conversation"
+                );
+            } else {
+                assert_ne!(
+                    Some(start.native_thread_id.as_str()),
+                    post_bootstrap_provider.as_deref(),
+                    "editing a non-latest delivered turn must select a fresh provider conversation"
+                );
+                let input = start.input.to_string();
+                assert!(input.contains(format!("POST BOOTSTRAP {runtime_id} SOURCE V2").as_str()));
+                assert!(!input.contains(format!("POST BOOTSTRAP {runtime_id} SOURCE V1").as_str()));
+                assert_eq!(input.matches(marker.as_str()).count(), 1);
+            }
+            complete_recorded_cli_task_turn(
+                &processor,
+                cli_session.as_ref(),
+                &cli_manager,
+                workspace_id.as_str(),
+                runtime_id,
+                lineage.child_thread_id.as_str(),
+                start.native_thread_id.as_str(),
+                native_turn_id.as_str(),
+                format!("{runtime_id} post-bootstrap answer {index}").as_str(),
+            )
+            .await;
+            if index == 2 {
+                crud_store
+                    .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: lineage.child_thread_id.clone(),
+                        turn_id: post_bootstrap_source_turn.clone(),
+                        expected_revision: 0,
+                        input: vec![UserInput::Text {
+                            text: format!("POST BOOTSTRAP {runtime_id} SOURCE V2"),
+                            text_elements: Vec::new(),
+                        }],
+                        mentions: Vec::new(),
+                        changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                            authenticated_test_superuser().principal_id.clone(),
+                        ),
+                        changed_at_unix: chrono::Utc::now().timestamp(),
+                    })
+                    .await
+                    .expect("non-latest post-bootstrap input should be editable");
+            }
+        }
+        assert!(
+            pioneer_crud::load_agent_turn_response(
+                &crud_store.database_connection(),
+                corrected_turn.as_str(),
+            )
+            .await
+            .expect("manual response association lookup should succeed")
+            .is_none(),
+            "a foreground follow-up must not be falsely associated with the completed Task execution"
+        );
+        let timeline_request_id =
+            generate_test_request_id("manual-child-author", corrected_turn.as_str());
+        processor
+            .process_request_for_connection(
+                connection,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": timeline_request_id,
+                    "method": "thread/timeline/page",
+                    "params": {
+                        "threadId": lineage.child_thread_id,
+                        "anchor": {"kind": "newest"},
+                        "limit": 50
+                    }
+                })
+                .to_string(),
+            )
+            .await;
+        let timeline_response = recv_response_by_id(&mut rx, &timeline_request_id).await;
+        let timeline_page: pioneer_protocol::ThreadTimelinePageResponse =
+            serde_json::from_value(timeline_response.result)
+                .expect("manual child timeline should decode");
+        let manual_author = timeline_page
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                pioneer_protocol::TimelineBlockKind::AssistantMessage { text, author, .. }
+                    if text.contains(format!("{runtime_id} manual answer 3").as_str()) =>
+                {
+                    author.as_ref()
+                }
+                _ => None,
+            });
+        assert_eq!(
+            manual_author.map(|author| author.nickname.as_str()),
+            Some(runtime_id),
+            "foreground CLI presentation must identify the actual runtime executor, not generic Agent"
+        );
+        assert_eq!(
+            manual_author.and_then(|author| author.avatar_revision.as_deref()),
+            Some(match runtime_kind {
+                CLIAgentRuntimeKind::Codex => pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
+                CLIAgentRuntimeKind::Claude => pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+            }),
+            "timeline projection must carry the explicit runtime-executor discriminator consumed by desktop"
         );
         let pending = crud_store
             .compaction_pending_history_checks()
@@ -23486,12 +24870,28 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .any(|check| check.turn_id == lineage.child_turn_id),
             "{runtime_id} delivery must not wait for background history preparation"
         );
+        let mut due_child_history_turn = None;
+        for check in pending
+            .iter()
+            .filter(|check| check.thread_id == lineage.child_thread_id)
+        {
+            if crud_store
+                .compaction_history_check_is_current(check.turn_id.as_str())
+                .await
+                .expect("due history currency should be readable")
+            {
+                due_child_history_turn = Some(check.turn_id.clone());
+                break;
+            }
+        }
+        let due_child_history_turn = due_child_history_turn
+            .expect("the due page must contain a current child history check");
         let before_delivery = processor
             .task_runtime
             .service()
             .list_deliveries(TaskDeliveriesParams {
                 workspace_id: workspace_id.clone(),
-                task_id: Some(response.task.id.clone()),
+                task_id: Some(task_id.clone()),
                 run_id: Some(run.id.clone()),
                 statuses: Vec::new(),
                 limit: Some(10),
@@ -23509,24 +24909,36 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         let summary_calls = summary_provider.call_count();
         match barrier {
             CompletedHistoryDeliveryBarrier::Preparation => {
-                processor.arm_completed_history_preparation_barrier(&lineage.child_turn_id)
+                processor.arm_completed_history_preparation_barrier(&due_child_history_turn)
             }
             CompletedHistoryDeliveryBarrier::Summarizer => {
                 summary_provider.pause_first.store(true, Ordering::SeqCst)
             }
         }
-        processor
-            .poll_completed_history_checks()
-            .await
-            .expect("CLI history worker should start before delivery");
         match barrier {
-            CompletedHistoryDeliveryBarrier::Preparation => timeout(
-                Duration::from_secs(10),
-                processor.wait_for_completed_history_preparation_barrier(),
-            )
-            .await
-            .expect("CLI worker must reach the preparation barrier"),
+            CompletedHistoryDeliveryBarrier::Preparation => {
+                let reached = timeout(Duration::from_secs(10), async {
+                    loop {
+                        processor.poll_completed_history_checks().await?;
+                        tokio::select! {
+                            _ = processor.wait_for_completed_history_preparation_barrier() => break Ok::<(), anyhow::Error>(()),
+                            _ = tokio::task::yield_now() => {}
+                        }
+                    }
+                })
+                .await;
+                if reached.is_err() {
+                    processor.release_completed_history_preparation_barrier();
+                }
+                reached
+                    .expect("CLI worker must reach the preparation barrier")
+                    .expect("CLI history worker should start before delivery");
+            }
             CompletedHistoryDeliveryBarrier::Summarizer => {
+                processor
+                    .poll_completed_history_checks()
+                    .await
+                    .expect("CLI history worker should start before delivery");
                 timeout(Duration::from_secs(10), async {
                     while summary_provider.call_count() == summary_calls {
                         tokio::task::yield_now().await;
@@ -23545,7 +24957,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             .service()
             .list_deliveries(TaskDeliveriesParams {
                 workspace_id: workspace_id.clone(),
-                task_id: Some(response.task.id.clone()),
+                task_id: Some(task_id.clone()),
                 run_id: Some(run.id.clone()),
                 statuses: Vec::new(),
                 limit: Some(10),
@@ -23611,14 +25023,14 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
 }
 
 #[test]
-fn detached_native_tasks_share_parent_continuation_and_run_fifo() {
+fn detached_native_tasks_use_isolated_child_continuations() {
     run_standard_stack_message_test(
-        "detached native Task FIFO continuation",
-        detached_native_tasks_share_parent_continuation_and_run_fifo_impl(),
+        "detached native Task child continuation isolation",
+        detached_native_tasks_use_isolated_child_continuations_impl(),
     );
 }
 
-async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
+async fn detached_native_tasks_use_isolated_child_continuations_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -23682,39 +25094,60 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
     cli_session
         .set_next_native_turn_id("native_fifo_turn_2")
         .await;
-    let second_processor = processor.clone();
-    let second_workspace_id = workspace_id.clone();
-    let second = tokio::spawn(async move {
-        create_task_for_test(
-            &second_processor,
-            detached_cli_task_create_params(
-                second_workspace_id.as_str(),
-                parent_thread_id,
-                parent_turn_id,
-                "codex",
-                CLIAgentRuntimeKind::Codex,
-                "gpt-5",
-                "second FIFO task",
-            ),
-        )
-        .await
-    });
-    sleep(Duration::from_millis(300)).await;
+    let second = create_task_for_test(
+        &processor,
+        detached_cli_task_create_params(
+            workspace_id.as_str(),
+            parent_thread_id,
+            parent_turn_id,
+            "codex",
+            CLIAgentRuntimeKind::Codex,
+            "gpt-5",
+            "second isolated task",
+        ),
+    )
+    .await
+    .expect("second isolated Task should start without sharing the first child session");
+    let second_run = second.run.clone().expect("second FIFO run should exist");
+    let second_lineage =
+        wait_for_child_lineage_for_run(crud_store.clone(), second_run.id.as_str()).await;
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 2).await;
+    assert_eq!(starts.len(), 2);
     assert_eq!(
-        cli_session.turn_starts.lock().await.len(),
-        1,
-        "the second Task must not overlap the active native continuation"
+        cli_session.thread_starts.lock().await.len(),
+        2,
+        "sibling Tasks must open isolated child provider conversations"
     );
+    let first_input = starts[0].input.to_string();
+    let second_input = starts[1].input.to_string();
+    assert_ne!(
+        starts[0].native_thread_id, starts[1].native_thread_id,
+        "sibling Tasks must own distinct provider conversations, not merely distinct requests"
+    );
+    assert!(first_input.contains("first FIFO task"));
+    assert!(!first_input.contains("second isolated task"));
+    assert!(second_input.contains("second isolated task"));
+    assert!(!second_input.contains("first FIFO task"));
+    for lineage in [&first_lineage, &second_lineage] {
+        let binding = crud_store
+            .get_cli_runtime_turn_binding(lineage.child_turn_id.as_str())
+            .await
+            .expect("FIFO turn binding should load")
+            .expect("FIFO turn binding should exist");
+        assert_eq!(binding.thread_id, lineage.child_thread_id);
+        assert_eq!(binding.continuation_thread_id, lineage.child_thread_id);
+    }
 
     complete_recorded_cli_task_turn(
         &processor,
+        cli_session.as_ref(),
         &cli_manager,
         workspace_id.as_str(),
         "codex",
-        parent_thread_id,
+        first_lineage.child_thread_id.as_str(),
         native_thread_id.as_str(),
         "native_fifo_turn_1",
-        r#"<task_result>{"summary":"first FIFO result","data":{"order":1}}</task_result>"#,
+        r#"<task_result>{"summary":"first isolated result","data":{"order":1}}</task_result>"#,
     )
     .await;
     assert_eq!(
@@ -23727,50 +25160,30 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
         TaskStatus::Completed
     );
 
-    let second = tokio::time::timeout(Duration::from_secs(10), second)
-        .await
-        .expect("second FIFO Task creation should unblock")
-        .expect("second FIFO Task creation task should not panic")
-        .expect("second FIFO Task should start");
-    let second_run = second.run.clone().expect("second FIFO run should exist");
-    let second_lineage =
-        wait_for_child_lineage_for_run(crud_store.clone(), second_run.id.as_str()).await;
-    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 2).await;
-    assert_eq!(starts.len(), 2);
-    assert_eq!(
-        starts[1].native_thread_id, native_thread_id,
-        "both Tasks must continue the same parent-owned native conversation"
-    );
-    assert_eq!(
-        cli_session.thread_starts.lock().await.len(),
-        1,
-        "FIFO continuation must create only one native thread"
-    );
-    assert!(
-        !cli_session.thread_resumes.lock().await.is_empty(),
-        "the second Task must resume the durable native thread"
-    );
-    for lineage in [&first_lineage, &second_lineage] {
-        let binding = crud_store
-            .get_cli_runtime_turn_binding(lineage.child_turn_id.as_str())
-            .await
-            .expect("FIFO turn binding should load")
-            .expect("FIFO turn binding should exist");
-        assert_eq!(binding.thread_id, lineage.child_thread_id);
-        assert_eq!(binding.continuation_thread_id, parent_thread_id);
-    }
-
     complete_recorded_cli_task_turn(
         &processor,
+        cli_session.as_ref(),
         &cli_manager,
         workspace_id.as_str(),
         "codex",
-        parent_thread_id,
-        native_thread_id.as_str(),
+        second_lineage.child_thread_id.as_str(),
+        starts[1].native_thread_id.as_str(),
         "native_fifo_turn_2",
         r#"<task_result>{"summary":"second FIFO result","data":{"order":2}}</task_result>"#,
     )
     .await;
+    let first_provider_history = cli_session
+        .provider_conversation(starts[0].native_thread_id.as_str())
+        .await
+        .join("\n");
+    let second_provider_history = cli_session
+        .provider_conversation(starts[1].native_thread_id.as_str())
+        .await
+        .join("\n");
+    assert!(first_provider_history.contains("first isolated result"));
+    assert!(!first_provider_history.contains("second FIFO result"));
+    assert!(second_provider_history.contains("second FIFO result"));
+    assert!(!second_provider_history.contains("first isolated result"));
     assert_eq!(
         wait_for_task_status(crud_store, second.task.id.as_str(), TaskStatus::Completed,).await,
         TaskStatus::Completed
@@ -23778,14 +25191,907 @@ async fn detached_native_tasks_share_parent_continuation_and_run_fifo_impl() {
 }
 
 #[test]
-fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation() {
+fn nested_cli_children_bootstrap_their_accepted_lineage_only() {
     run_standard_stack_message_test(
-        "detached native Task cancellation and continuation",
-        cancelling_detached_native_task_interrupts_runtime_and_releases_continuation_impl(),
+        "nested CLI child accepted-lineage bootstrap",
+        nested_cli_children_bootstrap_their_accepted_lineage_only_impl(),
     );
 }
 
-async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continuation_impl() {
+async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let session_manager = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    session_manager
+        .set_connection_workspace(connection, Some(workspace_id.clone()))
+        .await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+            CLIAgentRuntimeKind::Codex,
+        )),
+    ));
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("nested recording runtime should be ready");
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+
+    let root_thread_id = "thr_nested_cli_root";
+    let root_turn_id = "turn_nested_cli_root_basis";
+    let root_marker = "NESTED ROOT ACCEPTED BASIS";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        root_thread_id,
+        root_turn_id,
+        root_marker,
+    )
+    .await;
+
+    let mut parent_thread_id = root_thread_id.to_owned();
+    let mut parent_turn_id = root_turn_id.to_owned();
+    let mut lineages = Vec::new();
+    let mut output_markers = Vec::new();
+    for level in 1..=3 {
+        let command = format!("NESTED CHILD COMMAND LEVEL {level}");
+        let output = format!(
+            r#"<task_result>{{"summary":"NESTED CHILD OUTPUT LEVEL {level}","data":{{"level":{level}}}}}</task_result>"#
+        );
+        let native_turn_id = format!("native_nested_level_{level}");
+        cli_session
+            .set_next_native_turn_id(native_turn_id.clone())
+            .await;
+        let created = create_task_for_test(
+            &processor,
+            detached_cli_task_create_params(
+                workspace_id.as_str(),
+                parent_thread_id.as_str(),
+                parent_turn_id.as_str(),
+                "codex",
+                CLIAgentRuntimeKind::Codex,
+                "gpt-5",
+                command.as_str(),
+            ),
+        )
+        .await
+        .expect("nested child Task should start");
+        let run = created.run.clone().expect("nested child run should exist");
+        let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+        let starts = wait_for_cli_runtime_turn_starts(&cli_session, level).await;
+        let start = &starts[level - 1];
+        let input = start.input.to_string();
+        assert!(input.contains(root_marker));
+        for earlier in &output_markers {
+            assert!(
+                input.contains(earlier),
+                "nested bootstrap must contain every accepted ancestor output"
+            );
+        }
+        assert!(input.contains(command.as_str()));
+        complete_recorded_cli_task_turn(
+            &processor,
+            cli_session.as_ref(),
+            &cli_manager,
+            workspace_id.as_str(),
+            "codex",
+            parent_thread_id.as_str(),
+            start.native_thread_id.as_str(),
+            native_turn_id.as_str(),
+            output.as_str(),
+        )
+        .await;
+        assert_eq!(
+            wait_for_task_status(
+                crud_store.clone(),
+                created.task.id.as_str(),
+                TaskStatus::Completed,
+            )
+            .await,
+            TaskStatus::Completed
+        );
+        output_markers.push(format!("NESTED CHILD OUTPUT LEVEL {level}"));
+        parent_thread_id = lineage.child_thread_id.clone();
+        parent_turn_id = lineage.child_turn_id.clone();
+        lineages.push(lineage);
+    }
+
+    let late_parent_marker = "LATE ROOT APPEND AFTER CHILD BASIS";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        root_thread_id,
+        "turn_nested_cli_late_root",
+        late_parent_marker,
+    )
+    .await;
+    cli_session
+        .set_next_native_turn_id("native_nested_sibling")
+        .await;
+    let sibling_marker = "UNAUTHORIZED NESTED SIBLING COMMAND";
+    let sibling = create_task_for_test(
+        &processor,
+        detached_cli_task_create_params(
+            workspace_id.as_str(),
+            root_thread_id,
+            root_turn_id,
+            "codex",
+            CLIAgentRuntimeKind::Codex,
+            "gpt-5",
+            sibling_marker,
+        ),
+    )
+    .await
+    .expect("nested sibling fixture should start");
+    let sibling_run = sibling.run.expect("nested sibling run should exist");
+    let _sibling_lineage =
+        wait_for_child_lineage_for_run(crud_store.clone(), sibling_run.id.as_str()).await;
+    let _ = wait_for_cli_runtime_turn_starts(&cli_session, 4).await;
+
+    let deepest = lineages.last().expect("depth-three lineage should exist");
+    let binding = crud_store
+        .get_cli_runtime_thread_binding(deepest.child_thread_id.as_str())
+        .await
+        .expect("deepest child binding should load")
+        .expect("deepest child binding should exist");
+    let mut cursor: serde_json::Value =
+        serde_json::from_str(&binding.resume_cursor_json).expect("deepest cursor should decode");
+    cursor
+        .as_object_mut()
+        .expect("deepest cursor should be an object")
+        .remove("pioneerContext");
+    crud_store
+        .update_cli_runtime_thread_resume_cursor(
+            deepest.child_thread_id.as_str(),
+            binding.native_thread_id.as_str(),
+            serde_json::to_string(&cursor).unwrap(),
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await
+        .expect("pre-fix deepest cursor fixture should persist");
+    cli_session
+        .set_next_native_thread_id("native_nested_recovered_depth_three")
+        .await;
+    cli_session
+        .set_next_native_turn_id("native_nested_manual_followup")
+        .await;
+    open_persisted_child_for_test(
+        &processor,
+        connection,
+        &mut rx,
+        workspace_id.as_str(),
+        deepest.child_thread_id.as_str(),
+        "open-nested-depth-three",
+    )
+    .await;
+    let current_marker = "CURRENT DEPTH THREE FOLLOWUP";
+    let request_id = generate_test_request_id("nested-cli-followup", "depth-three");
+    processor
+        .process_request_for_connection(
+            connection,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "turn/start",
+                "params": {
+                    "thread_id": deepest.child_thread_id,
+                    "turn_id": "turn_nested_cli_manual_followup",
+                    "input": [{"type": "text", "text": current_marker}],
+                    "mode": "Agent",
+                    "model": "gpt-5",
+                    "execution_backend": {
+                        "type": "cliAgentRuntime",
+                        "runtime_id": "codex",
+                        "runtime_kind": "codex"
+                    },
+                    "permission_profile":
+                        pioneer_protocol::TurnPermissionProfileSelection::full_access()
+                }
+            })
+            .to_string(),
+        )
+        .await;
+    let response = recv_response_by_id(&mut rx, request_id.as_str()).await;
+    let accepted: TurnStartResponse =
+        serde_json::from_value(response.result).expect("nested follow-up should be accepted");
+    assert_eq!(accepted.turn.id, "turn_nested_cli_manual_followup");
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 5).await;
+    let recovered = &starts[4];
+    assert_eq!(
+        recovered.native_thread_id, "native_nested_recovered_depth_three",
+        "a pre-fix binding without a continuity proof must bootstrap an isolated provider conversation"
+    );
+    let input = recovered.input.to_string();
+    let mut previous = input
+        .find(root_marker)
+        .expect("root basis must be restored");
+    for marker in &output_markers {
+        let position = input
+            .find(marker)
+            .expect("each accepted nested output must be restored");
+        assert!(previous < position);
+        previous = position;
+    }
+    let current = input
+        .find(current_marker)
+        .expect("current question must be delivered once");
+    assert!(previous < current);
+    assert_eq!(input.match_indices(current_marker).count(), 1);
+    assert!(!input.contains(late_parent_marker));
+    assert!(!input.contains(sibling_marker));
+    let provider_history = cli_session
+        .provider_conversation(recovered.native_thread_id.as_str())
+        .await
+        .join("\n");
+    assert!(provider_history.contains(root_marker));
+    assert!(provider_history.contains(output_markers[2].as_str()));
+    assert!(provider_history.contains(current_marker));
+    assert!(!provider_history.contains(late_parent_marker));
+    assert!(!provider_history.contains(sibling_marker));
+}
+
+#[test]
+fn cli_continuity_receipt_revalidates_earlier_uncovered_sources() {
+    run_standard_stack_message_test(
+        "CLI continuity exact-current source validation",
+        cli_continuity_receipt_revalidates_earlier_uncovered_sources_impl(),
+    );
+}
+
+async fn cli_continuity_receipt_revalidates_earlier_uncovered_sources_impl() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        thread_manager,
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let thread_id = "thr_cli_receipt_exact_current";
+    let earlier_turn_id = "turn_cli_receipt_earlier";
+    let latest_turn_id = "turn_cli_receipt_latest";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        earlier_turn_id,
+        "EARLIER UNCOVERED RAW",
+    )
+    .await;
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        thread_id,
+        latest_turn_id,
+        "UNCHANGED LATEST TURN",
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &processor,
+        authenticated_test_superuser().as_ref(),
+        workspace_id.as_str(),
+        thread_id,
+        latest_turn_id,
+    )
+    .await;
+    let prepared = processor
+        .capture_current_context_basis_prepared(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            thread_id,
+            latest_turn_id,
+            None,
+        )
+        .await
+        .expect("continuity fixture should capture its canonical projection");
+    let now = chrono::Utc::now().fixed_offset();
+    crud_store
+        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+            thread_id: thread_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "provider-exact-current".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/pioneer-message-tests".to_owned()),
+            native_model: Some("gpt-5".to_owned()),
+            resume_cursor_json: r#"{"threadId":"provider-exact-current"}"#.to_owned(),
+            status: "active".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("continuity fixture binding should persist");
+    let sent_history_json = serde_json::to_string(&prepared.descriptor).unwrap();
+    let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+        &prepared.descriptor,
+    )
+    .await
+    .unwrap();
+    assert!(
+        direct_sources.iter().any(|source| {
+            source.thread == thread_id && source.source.scope.ends_with(earlier_turn_id)
+        }),
+        "the earlier editable Message must be part of the sent raw projection: {direct_sources:?}"
+    );
+    let sent_basis = crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis {
+        completed: crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+            thread_id,
+            thread_id,
+            sent_history_json.clone(),
+            &direct_sources,
+        ),
+        pending_turn: crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: latest_turn_id.to_owned(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+    };
+    let persisted_mapping =
+        crate::cli_runtime::thread_binding::persist_sent_context_basis_in_input_mapping(
+            r#"{"input":[]}"#,
+            &sent_basis,
+        )
+        .unwrap();
+    let sent_basis = crate::cli_runtime::thread_binding::sent_context_basis_from_input_mapping(
+        persisted_mapping.as_str(),
+    )
+    .unwrap()
+    .unwrap();
+    let confirmed = crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+        crud_store.as_ref(),
+        thread_id,
+        "provider-exact-current",
+        crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: latest_turn_id.to_owned(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+        sent_basis.clone(),
+        now,
+    )
+    .await
+    .expect("completed continuity receipt should persist");
+    let lookup_observer = crate::compaction::frozen::observe_continuity_source_lookups(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+    );
+    assert!(
+        crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &confirmed,
+            workspace_id.as_str(),
+            thread_id,
+            Some((latest_turn_id, 0, false)),
+        )
+        .await
+        .expect("unchanged continuity receipt should validate")
+    );
+    assert!(
+        lookup_observer.calls() <= 2,
+        "manifest sources and accumulated provider-turn sources must each use one bounded batch, not one lookup per message"
+    );
+    for head in [
+        Some(("another-turn", 0, false)),
+        Some((latest_turn_id, 1, false)),
+        Some((latest_turn_id, 0, true)),
+        None,
+    ] {
+        assert!(
+            !crate::cli_runtime::thread_binding::binding_has_current_context(
+                crud_store.as_ref(),
+                &confirmed,
+                workspace_id.as_str(),
+                thread_id,
+                head,
+            )
+            .await
+            .expect("a valid completed receipt should reject only the changed head condition")
+        );
+    }
+    let mut wrong_provider = confirmed.clone();
+    wrong_provider.native_thread_id = "provider-other-branch".to_owned();
+    assert!(
+        !crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &wrong_provider,
+            workspace_id.as_str(),
+            thread_id,
+            Some((latest_turn_id, 0, false)),
+        )
+        .await
+        .expect("provider mismatch should be stale, not malformed")
+    );
+
+    crud_store
+        .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: earlier_turn_id.to_owned(),
+            expected_revision: 0,
+            input: vec![UserInput::Text {
+                text: "EDITED EARLIER UNCOVERED RAW".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            mentions: Vec::new(),
+            changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+            changed_at_unix: chrono::Utc::now().timestamp(),
+        })
+        .await
+        .expect("earlier raw fixture should be editable");
+    let confirmed_after_intervening_edit =
+        crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+            crud_store.as_ref(),
+            thread_id,
+            "provider-exact-current",
+            crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                turn_id: latest_turn_id.to_owned(),
+                message_revision: 0,
+                message_deleted: false,
+            },
+            sent_basis,
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await
+        .expect("completion must retain the pre-send source versions after an intervening edit");
+    assert!(
+        !crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &confirmed_after_intervening_edit,
+            workspace_id.as_str(),
+            thread_id,
+            Some((latest_turn_id, 0, false)),
+        )
+        .await
+        .expect("an earlier directly used raw edit should require bootstrap")
+    );
+
+    // The base manifest deliberately excludes both provider turns. Their
+    // revisions must therefore be carried forward by ordinary resume receipts
+    // rather than being hidden by a fresh whole-history capture on completion.
+    let resumed_thread = "thr_cli_receipt_resumed_turns";
+    let first_resume_turn = "turn_cli_receipt_resume_one";
+    let second_resume_turn = "turn_cli_receipt_resume_two";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        resumed_thread,
+        first_resume_turn,
+        "FIRST NORMAL RESUME SOURCE",
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &processor,
+        authenticated_test_superuser().as_ref(),
+        workspace_id.as_str(),
+        resumed_thread,
+        first_resume_turn,
+    )
+    .await;
+    let empty_basis = processor
+        .capture_current_context_basis_prepared(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            resumed_thread,
+            first_resume_turn,
+            Some(first_resume_turn),
+        )
+        .await
+        .expect("empty pre-provider basis should be capturable");
+    crud_store
+        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+            thread_id: resumed_thread.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "provider-resumed-turns".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/pioneer-message-tests".to_owned()),
+            native_model: Some("gpt-5".to_owned()),
+            resume_cursor_json: r#"{"threadId":"provider-resumed-turns"}"#.to_owned(),
+            status: "active".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let first_sent = crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis {
+        completed: crate::cli_runtime::thread_binding::CliRuntimeContextBasis {
+            execution_thread_id: resumed_thread.to_owned(),
+            manifest_owner_thread_id: resumed_thread.to_owned(),
+            history_json: serde_json::to_string(&empty_basis.descriptor).unwrap(),
+            delivered_turns: Vec::new(),
+            delivered_sources: Vec::new(),
+        },
+        pending_turn: crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: first_resume_turn.to_owned(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+    };
+    let first_completed = crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+        crud_store.as_ref(),
+        resumed_thread,
+        "provider-resumed-turns",
+        crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: first_resume_turn.to_owned(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+        first_sent,
+        now,
+    )
+    .await
+    .unwrap();
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        resumed_thread,
+        second_resume_turn,
+        "SECOND NORMAL RESUME SOURCE",
+    )
+    .await;
+    let second_sent = crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis {
+        completed: crate::cli_runtime::thread_binding::completed_context_basis_from_binding(
+            &first_completed,
+        )
+        .unwrap()
+        .unwrap(),
+        pending_turn: crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: second_resume_turn.to_owned(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+    };
+    let second_completed =
+        crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+            crud_store.as_ref(),
+            resumed_thread,
+            "provider-resumed-turns",
+            crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                turn_id: second_resume_turn.to_owned(),
+                message_revision: 0,
+                message_deleted: false,
+            },
+            second_sent,
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(
+        crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &second_completed,
+            workspace_id.as_str(),
+            resumed_thread,
+            Some((second_resume_turn, 0, false)),
+        )
+        .await
+        .unwrap(),
+        "multiple ordinary resumes should retain the same provider conversation"
+    );
+    crud_store
+        .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
+            workspace_id: workspace_id.clone(),
+            thread_id: resumed_thread.to_owned(),
+            turn_id: first_resume_turn.to_owned(),
+            expected_revision: 0,
+            input: vec![UserInput::Text {
+                text: "EDITED FIRST NORMAL RESUME SOURCE".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            mentions: Vec::new(),
+            changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+            changed_at_unix: chrono::Utc::now().timestamp(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &second_completed,
+            workspace_id.as_str(),
+            resumed_thread,
+            Some((second_resume_turn, 0, false)),
+        )
+        .await
+        .unwrap(),
+        "editing a non-latest post-bootstrap input must stale the accumulated receipt"
+    );
+    let paged_thread = "thr_cli_receipt_paged_guards";
+    let first_paged_turn = "turn_cli_paged_guard_000".to_owned();
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        paged_thread,
+        first_paged_turn.as_str(),
+        "PAGED GUARD 000",
+    )
+    .await;
+    persist_test_execution_authorization_context_for_principal(
+        &processor,
+        authenticated_test_superuser().as_ref(),
+        workspace_id.as_str(),
+        paged_thread,
+        first_paged_turn.as_str(),
+    )
+    .await;
+    let paged_basis = processor
+        .capture_current_context_basis_prepared(
+            crud_store.as_ref(),
+            workspace_id.as_str(),
+            paged_thread,
+            first_paged_turn.as_str(),
+            Some(first_paged_turn.as_str()),
+        )
+        .await
+        .unwrap();
+    let mut paged_turns = vec![first_paged_turn];
+    for index in 1..=pioneer_crud::TURN_MESSAGE_GUARD_PAGE_ROWS + 1 {
+        let turn_id = format!("turn_cli_paged_guard_{index:03}");
+        seed_completed_task_parent_with_history(
+            &processor,
+            workspace_id.as_str(),
+            paged_thread,
+            turn_id.as_str(),
+            format!("PAGED GUARD {index:03}").as_str(),
+        )
+        .await;
+        paged_turns.push(turn_id);
+    }
+    crud_store
+        .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+            thread_id: paged_thread.to_owned(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "provider-paged-guards".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: Some("/tmp/pioneer-message-tests".to_owned()),
+            native_model: Some("gpt-5".to_owned()),
+            resume_cursor_json: r#"{"threadId":"provider-paged-guards"}"#.to_owned(),
+            status: "active".to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let paged_sent = crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis {
+        completed: crate::cli_runtime::thread_binding::CliRuntimeContextBasis {
+            execution_thread_id: paged_thread.to_owned(),
+            manifest_owner_thread_id: paged_thread.to_owned(),
+            history_json: serde_json::to_string(&paged_basis.descriptor).unwrap(),
+            delivered_turns: paged_turns[..paged_turns.len() - 1]
+                .iter()
+                .map(
+                    |turn_id| crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                        turn_id: turn_id.clone(),
+                        message_revision: 0,
+                        message_deleted: false,
+                    },
+                )
+                .collect(),
+            delivered_sources: Vec::new(),
+        },
+        pending_turn: crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: paged_turns.last().unwrap().clone(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+    };
+    let paged_completed = crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+        crud_store.as_ref(),
+        paged_thread,
+        "provider-paged-guards",
+        crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+            turn_id: paged_turns.last().unwrap().clone(),
+            message_revision: 0,
+            message_deleted: false,
+        },
+        paged_sent,
+        now,
+    )
+    .await
+    .unwrap();
+    let guard_observer = crate::cli_runtime::thread_binding::observe_turn_guard_lookups(
+        crud_store.as_ref(),
+        workspace_id.as_str(),
+    );
+    assert!(
+        crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &paged_completed,
+            workspace_id.as_str(),
+            paged_thread,
+            Some((paged_turns.last().unwrap(), 0, false)),
+        )
+        .await
+        .unwrap(),
+        "every guard across multiple bounded pages should validate"
+    );
+    let pages = guard_observer.pages();
+    assert!(
+        pages.len() > 1,
+        "guard validation must cross a page boundary"
+    );
+    assert!(pages.iter().all(|(rows, bytes)| {
+        *rows <= pioneer_crud::TURN_MESSAGE_GUARD_PAGE_ROWS
+            && *bytes <= pioneer_crud::TURN_MESSAGE_GUARD_PAGE_BYTES
+    }));
+    let last_non_head = &paged_turns[paged_turns.len() - 2];
+    crud_store
+        .delete_turn_message(pioneer_crud::DeleteTurnMessageRequest {
+            workspace_id: workspace_id.clone(),
+            thread_id: paged_thread.to_owned(),
+            turn_id: last_non_head.clone(),
+            expected_revision: 0,
+            changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+            changed_at_unix: chrono::Utc::now().timestamp(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !crate::cli_runtime::thread_binding::binding_has_current_context(
+            crud_store.as_ref(),
+            &paged_completed,
+            workspace_id.as_str(),
+            paged_thread,
+            Some((paged_turns.last().unwrap(), 0, false)),
+        )
+        .await
+        .unwrap(),
+        "an independent delete on the final guard page must stale a previously current receipt"
+    );
+}
+
+#[test]
+fn cli_task_bootstrap_honors_empty_parent_context_policy() {
+    run_standard_stack_message_test(
+        "CLI Task empty parent context policy",
+        cli_task_bootstrap_honors_empty_parent_context_policy_impl(),
+    );
+}
+
+async fn cli_task_bootstrap_honors_empty_parent_context_policy_impl() {
+    let session_manager = Arc::new(SessionManager::new());
+    let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
+        MessageProcessor::new(
+            thread_manager,
+            test_provider(),
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            test_summary_config(),
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(test_cli_runtime_manager(cli_session.clone()))
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+            CLIAgentRuntimeKind::Codex,
+        )),
+    ));
+    processor
+        .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())
+        .await
+        .expect("policy recording runtime should be ready");
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+    let parent_marker = "PARENT HISTORY EXCLUDED BY EMPTY POLICY";
+    seed_completed_task_parent_with_history(
+        &processor,
+        workspace_id.as_str(),
+        "thr_cli_empty_policy",
+        "turn_cli_empty_policy_parent",
+        parent_marker,
+    )
+    .await;
+    let current_marker = "CURRENT EMPTY-POLICY TASK COMMAND";
+    let mut params = detached_cli_task_create_params(
+        workspace_id.as_str(),
+        "thr_cli_empty_policy",
+        "turn_cli_empty_policy_parent",
+        "codex",
+        CLIAgentRuntimeKind::Codex,
+        "gpt-5",
+        current_marker,
+    );
+    params.metadata = None;
+    params.launch = Some(
+        exact_cli_task_launch_for_test(
+            &processor,
+            workspace_id.as_str(),
+            "cli_runtime:codex",
+            "gpt-5",
+            "codex",
+        )
+        .await
+        .expect("ordinary CLI Task should select the exact runtime launch"),
+    );
+    params
+        .agent_spec
+        .as_mut()
+        .expect("empty-policy Task should have an agent spec")
+        .context_policy = Some(pioneer_protocol::TaskAgentContextPolicy {
+        mode: pioneer_protocol::TaskAgentContextMode::Empty,
+        max_turns: None,
+        include_parent_summary: false,
+        include_artifacts: false,
+        custom_context: None,
+    });
+    cli_session
+        .set_next_native_turn_id("native_cli_empty_policy")
+        .await;
+    create_task_for_test(&processor, params)
+        .await
+        .expect("empty-policy CLI Task should start");
+    let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
+    let provider_input = starts[0].input.to_string();
+    assert!(provider_input.contains(current_marker));
+    let adapter_messages = serde_json::to_value(&starts[0].input).unwrap();
+    let adapter_messages = adapter_messages.as_array().unwrap();
+    assert_eq!(adapter_messages.len(), 2);
+    assert!(
+        !adapter_messages[0].to_string().contains(current_marker),
+        "the current command must not be replayed as accepted history"
+    );
+    assert!(
+        adapter_messages[1]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(
+                |text| text.contains(format!("RUN OBJECTIVE\n{current_marker}\n").as_str())
+            ),
+        "the current command belongs to the one Task execution message; title and goal metadata may repeat its text"
+    );
+    assert!(
+        !provider_input.contains(parent_marker),
+        "CLI bootstrap must preserve the accepted Empty policy instead of re-reading the parent"
+    );
+}
+
+#[test]
+fn cancelling_detached_native_task_interrupts_only_its_child_continuation() {
+    run_standard_stack_message_test(
+        "detached native Task cancellation and continuation",
+        cancelling_detached_native_task_interrupts_only_its_child_continuation_impl(),
+    );
+}
+
+async fn cancelling_detached_native_task_interrupts_only_its_child_continuation_impl() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
@@ -23925,16 +26231,18 @@ async fn cancelling_detached_native_task_interrupts_runtime_and_releases_continu
     let starts = wait_for_cli_runtime_turn_starts(&cli_session, 2).await;
     assert_eq!(starts.len(), 2);
     assert_eq!(
-        starts[1].native_thread_id, native_thread_id,
-        "the durable parent continuation must survive process/session cancellation"
+        cli_session.thread_starts.lock().await.len(),
+        2,
+        "a Task after cancellation must open its own child provider conversation"
     );
     complete_recorded_cli_task_turn(
         &processor,
+        cli_session.as_ref(),
         &cli_manager,
         workspace_id.as_str(),
         "claude",
         parent_thread_id,
-        native_thread_id.as_str(),
+        starts[1].native_thread_id.as_str(),
         "native_cancel_turn_2",
         r#"<task_result>{"summary":"after cancellation","data":{"ok":true}}</task_result>"#,
     )
@@ -35273,6 +37581,7 @@ async fn production_self_improvement_vertical_e2e_reaches_native_and_excludes_cl
 
         complete_recorded_cli_task_turn(
             &harness.processor,
+            harness.cli_session.as_ref(),
             &harness.cli_manager,
             harness.workspace_id.as_str(),
             runtime_id,

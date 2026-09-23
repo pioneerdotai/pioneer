@@ -810,6 +810,54 @@ impl MessageProcessor {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) async fn mark_cli_reasoning_model_ready_for_tests(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        model_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut snapshot = self
+            .provider_readiness
+            .snapshot(workspace_id)
+            .await
+            .context("test CLI readiness is missing")?;
+        let models = snapshot
+            .models
+            .get_mut(runtime_id)
+            .with_context(|| format!("test runtime `{runtime_id}` has no model snapshot"))?;
+        models
+            .result
+            .models
+            .push(pioneer_protocol::RuntimeModelInfo {
+                id: model_id.to_owned(),
+                name: Some(model_id.to_owned()),
+                description: None,
+                family: None,
+                is_custom: false,
+                active: Some(true),
+                effort_options: vec!["high".to_owned()],
+                input_modalities: vec!["text".to_owned()],
+                output_modalities: vec!["text".to_owned()],
+                supports_reasoning: Some(true),
+                supports_vision: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            });
+        let generation = self.provider_readiness.cli_generation(workspace_id).await;
+        self.provider_readiness
+            .replace_probe_results_if_generation(
+                workspace_id,
+                generation,
+                snapshot.runtimes,
+                snapshot.models,
+                snapshot.mcp_readiness,
+            )
+            .await
+            .context("test CLI reasoning model snapshot was superseded")?;
+        Ok(())
+    }
+
     async fn perform_provider_warmup(
         &self,
         workspace_id: &str,

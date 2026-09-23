@@ -1,5 +1,6 @@
 use super::*;
 use migration::{Migrator, MigratorTrait};
+use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::summary::{HEADINGS, SummaryInput};
 use pioneer_compaction::{
     CompactionMode, CompactionPlan, CompactionSettings, ModelBudget, ModelSelection, Transport,
@@ -2587,7 +2588,15 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .unwrap()
         .sources
         .iter()
-        .map(|source| (source.scope.clone(), source.id.clone()))
+        .cloned()
+        .map(|source| ScopedHistorySource {
+            thread: "thread".into(),
+            source: pioneer_compaction::SourceRef {
+                scope: source.scope,
+                id: source.id,
+                version: source.version,
+            },
+        })
         .collect();
     let logical_fence = f.store.compaction_history_read_fence().await.unwrap();
     let logical_tail = super::history::load_task_line_history_excluding(
@@ -2596,8 +2605,11 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         "thread",
         None,
         &logical_fence,
-        &covered_parent,
-        &std::collections::BTreeSet::new(),
+        super::history::HistoryCoverageSelection {
+            sources: &covered_parent,
+            item_aliases: &std::collections::BTreeSet::new(),
+            event_input_evidence: &std::collections::BTreeMap::new(),
+        },
     )
     .await
     .unwrap();
@@ -3218,7 +3230,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     )
     .await;
     let covered_own_import = covered_own_import
-        .expect("a published summary must replace its deleted accepted OWN import");
+        .expect("a published summary must replace its deleted accepted OWN import")
+        .messages;
     assert!(covered_own_import.iter().any(|message| {
         message.provenance.as_ref().is_some_and(|origin| {
             origin
@@ -3363,7 +3376,6 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             .unwrap(),
         CommitOutcome::Applied
     );
-
     // Production refresh recaptures the accepted Task basis for the current
     // execution and may replace it with the compatible WorkingContext K. K
     // remains inherited and therefore must not receive an OWN import record.
@@ -3617,7 +3629,11 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         covered_reads.calls, 0,
         "recapture must not load the covered deleted raw payload"
     );
-    for history_json in [&parent_projection_json, &execution_projection_json] {
+    let mut sent_summary_sources = Vec::new();
+    for (history_json, manifest_owner) in [
+        (&parent_projection_json, "thread"),
+        (&execution_projection_json, "context-c"),
+    ] {
         let restarted = super::frozen::restore_accepted_history_for_execution(
             &f.store,
             "ws",
@@ -3628,11 +3644,71 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         )
         .await
         .expect("restart must project the published summary before raw restore");
+        assert_eq!(
+            restarted
+                .direct_sources
+                .iter()
+                .map(|source| source.source.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![checkpoint.id.as_str()],
+            "the continuity carrier must name the summary actually restored, not its covered raw leaves"
+        );
+        assert!(
+            super::frozen::validate_frozen_history_authority(
+                &f.store,
+                "ws",
+                manifest_owner,
+                history_json,
+            )
+            .await
+            .expect("the accepted raw boundary and grants should remain independently valid")
+        );
+        let direct = restarted
+            .direct_sources
+            .iter()
+            .map(|source| (source.thread.clone(), source.source.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            super::frozen::validate_direct_history_sources_current(&f.store, "ws", &direct)
+                .await
+                .expect("the actually restored summary should be current")
+        );
+        sent_summary_sources = direct;
+        let restarted = restarted.messages;
         assert_eq!(restarted.len(), 1);
         let origin = restarted[0].provenance.as_ref().unwrap();
         assert_eq!(origin.sources[0].id, checkpoint.id);
         assert!(origin.inherited);
     }
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_checkpoint WHERE id=?",
+            [checkpoint.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        super::frozen::validate_frozen_history_authority(
+            &f.store,
+            "ws",
+            "thread",
+            &parent_projection_json,
+        )
+        .await
+        .expect("deleting the later summary must not rewrite the accepted Task boundary")
+    );
+    assert!(
+        !super::frozen::validate_direct_history_sources_current(
+            &f.store,
+            "ws",
+            &sent_summary_sources,
+        )
+        .await
+        .expect("the sent summary status should be checked directly"),
+        "an unavailable summary actually sent to the provider must stale continuity"
+    );
 }
 
 #[tokio::test]
@@ -4083,6 +4159,19 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             .sources[0]
             .id,
         checkpoint_ref.id
+    );
+    let covered_receipt_json = serde_json::to_string(&captured_after_edit.descriptor).unwrap();
+    assert!(
+        super::frozen::validate_frozen_history_current(
+            &f.store,
+            "ws",
+            "thread",
+            covered_receipt_json.as_str(),
+        )
+        .await
+        .expect(
+            "a continuity receipt must validate the independent published summary, not its edited covered leaf",
+        )
     );
     assert!(
         resolver
@@ -6127,7 +6216,8 @@ async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacemen
         &serde_json::to_string(&descriptor).unwrap(),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .messages;
     let text = restored
         .iter()
         .map(|message| message.content.clone())
@@ -6181,7 +6271,8 @@ async fn execution_restore_normalizes_covering_and_partial_checkpoint_replacemen
     )
     .await;
     let after_covered_delete = after_covered_delete
-        .expect("T(A+B) must replace deleted inherited A before payload restore");
+        .expect("T(A+B) must replace deleted inherited A before payload restore")
+        .messages;
     assert_eq!(
         after_covered_delete
             .iter()
@@ -7333,6 +7424,34 @@ async fn check_nested_task_basis(legacy: bool) {
             .unwrap()
             .history_json,
         h
+    );
+    let mut manual_turn = template.clone();
+    manual_turn.id = "child-manual-turn".into();
+    f.store
+        .materialize_turn_start(
+            &child,
+            SandboxMode::FullAccess,
+            &manual_turn,
+            &[UserInput::Text {
+                text: "manual child follow-up".into(),
+                text_elements: vec![],
+            }],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        super::frozen::execution_history_scopes(
+            &f.store,
+            "ws",
+            "child",
+            "child-manual-turn",
+            None,
+        )
+        .await
+        .unwrap(),
+        BTreeSet::from(["thread".into(), "child".into()]),
+        "a manual follow-up must inherit the child's accepted basis scopes without importing a newer parent transcript"
     );
     for sql in [
         "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('grand','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -9255,13 +9374,28 @@ async fn canonical_attachment_metadata_keeps_all_recorded_versions_without_repea
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(text.matches("unique user text").count(), 1);
+    let artifact_parts = history
+        .iter()
+        .flat_map(|message| message.content_parts.iter())
+        .filter_map(|part| match part {
+            pioneer_provider::MessageContentPart::Image { image }
+            | pioneer_provider::MessageContentPart::File { file: image } => image.artifact.as_ref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(artifact_parts.len(), 48);
     for index in 0..48 {
-        assert!(text.contains(&format!("recorded-version-{index}")));
+        let expected_version = format!("recorded-version-{index}");
+        assert!(artifact_parts.iter().any(|artifact| {
+            artifact.artifact_id == format!("historical-artifact-{index}")
+                && artifact.artifact_version_id.as_deref() == Some(expected_version.as_str())
+        }));
     }
     assert!(
         history
             .iter()
-            .all(|message| message.content_parts.is_empty())
+            .flat_map(|message| message.content_parts.iter())
+            .all(|part| matches!(part, pioneer_provider::MessageContentPart::Image { .. }))
     );
     let allowed = std::collections::BTreeSet::from(["thread".into()]);
     let frozen = super::frozen::capture(&f.store, "ws", "thread", &allowed, &history)
@@ -9272,6 +9406,1610 @@ async fn canonical_attachment_metadata_keeps_all_recorded_versions_without_repea
         .unwrap();
     assert_eq!(history, restored);
     assert_eq!(f.provider.count.borrow().clone(), 0);
+}
+
+#[tokio::test]
+async fn persisted_non_artifact_media_remains_typed_through_capture_and_restore() {
+    use pioneer_protocol::{
+        ArtifactKind, ArtifactRef, ArtifactStatus, ItemCompletedNotification, McpScopeKind,
+        TurnItem, TurnMcpToolCapabilitySummary, UserInput, UserMessageAttachment,
+    };
+    let f = fixture("unused", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at)
+           VALUES
+           ('media-image','turn',0,'image',NULL,'{"type":"image","url":"https://example.test/accepted.png"}',CURRENT_TIMESTAMP),
+           ('media-file','turn',1,'local_file',NULL,'{"type":"localFile","path":"/tmp/pioneer-message-tests/accepted.txt"}',CURRENT_TIMESTAMP),
+           ('media-audio','turn',2,'audio',NULL,'{"type":"audio","url":"https://example.test/accepted.wav"}',CURRENT_TIMESTAMP)"#,
+    )
+    .await
+    .unwrap();
+    let inputs = vec![
+        UserInput::Image {
+            url: "https://example.test/accepted.png".into(),
+        },
+        UserInput::LocalFile {
+            path: "/tmp/pioneer-message-tests/accepted.txt".into(),
+        },
+        UserInput::Audio {
+            url: "https://example.test/accepted.wav".into(),
+        },
+    ];
+    let attachments = vec![
+        UserMessageAttachment::Image {
+            url: "https://example.test/accepted.png".into(),
+        },
+        UserMessageAttachment::LocalFile {
+            path: "/tmp/pioneer-message-tests/accepted.txt".into(),
+        },
+        UserMessageAttachment::Artifact {
+            artifact: ArtifactRef {
+                artifact_id: "accepted-artifact".into(),
+                version_id: Some("accepted-version".into()),
+                display_name: "accepted-artifact.png".into(),
+                kind: ArtifactKind::Image,
+                mime_type: Some("image/png".into()),
+                size_bytes: Some(42),
+                sha256: None,
+                status: ArtifactStatus::Ready,
+                preview: None,
+            },
+        },
+        UserMessageAttachment::McpTool {
+            capability: TurnMcpToolCapabilitySummary {
+                id: "mcp-tool:workspace:test:read".into(),
+                label: "test / read".into(),
+                server_name: "test".into(),
+                raw_tool_name: "read".into(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        },
+    ];
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item: TurnItem::UserMessage {
+                    id: "media-input-copy".into(),
+                    text: String::new(),
+                    attachments: attachments.clone(),
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    assert!(
+        history
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .any(
+                |part| matches!(part, pioneer_provider::MessageContentPart::Image { image }
+            if matches!(&image.source, pioneer_provider::AttachmentDataSource::Url { url }
+                if url == "https://example.test/accepted.png"))
+            )
+    );
+    assert_eq!(
+        history
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(
+                |part| matches!(part, pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.is_none()
+                    && matches!(&image.source, pioneer_provider::AttachmentDataSource::Url { url }
+                        if url == "https://example.test/accepted.png"))
+            )
+            .count(),
+        1,
+        "the input row and its UserMessage copy must yield one ordinary image"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(
+                |part| matches!(part, pioneer_provider::MessageContentPart::File { file }
+                if file.artifact.is_none()
+                    && matches!(&file.source, pioneer_provider::AttachmentDataSource::Path { path }
+                        if path == "/tmp/pioneer-message-tests/accepted.txt"))
+            )
+            .count(),
+        1,
+        "the input row and its UserMessage copy must yield one ordinary file"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(
+                |part| matches!(part, pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.as_ref().is_some_and(|artifact| {
+                    artifact.artifact_id == "accepted-artifact"
+                        && artifact.artifact_version_id.as_deref() == Some("accepted-version")
+                }))
+            )
+            .count(),
+        1,
+        "ArtifactRef metadata must remain on its independent accepted version"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message.content.contains("mcp-tool:workspace:test:read"))
+            .count(),
+        1,
+        "capability history must survive as inert metadata exactly once"
+    );
+    assert!(
+        history
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .any(
+                |part| matches!(part, pioneer_provider::MessageContentPart::Audio { audio }
+            if matches!(&audio.source, pioneer_provider::AttachmentDataSource::Url { url }
+                if url == "https://example.test/accepted.wav"))
+            )
+    );
+    assert!(
+        history
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .any(
+                |part| matches!(part, pioneer_provider::MessageContentPart::File { file }
+            if matches!(&file.source, pioneer_provider::AttachmentDataSource::Path { path }
+                if path == "/tmp/pioneer-message-tests/accepted.txt"))
+            )
+    );
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let frozen = super::frozen::capture(&f.store, "ws", "thread", &allowed, &history)
+        .await
+        .unwrap();
+    let restored = super::frozen::restore(&f.store, "ws", &allowed, &frozen)
+        .await
+        .unwrap();
+    assert_eq!(restored, history);
+
+    // Simulate a reference-based manifest captured by the pre-typed renderer.
+    // Its immutable digest must still restore literally, while execution uses
+    // structured payloads to produce the typed, de-duplicated projection.
+    let mut legacy_input = super::history::legacy_input_message(&inputs).unwrap();
+    legacy_input.provenance = history
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .all(|source| source.scope.starts_with("input:"))
+            })
+        })
+        .and_then(|message| message.provenance.clone());
+    let mut legacy_copy = pioneer_provider::ChatMessage::user(format!(
+        "Historical attachment references (metadata only; content is not reattached):\n{}",
+        serde_json::to_string(&attachments).unwrap()
+    ));
+    legacy_copy.provenance = history
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .all(|source| source.scope.starts_with("event:"))
+            })
+        })
+        .and_then(|message| message.provenance.clone());
+    let legacy_messages = vec![legacy_input, legacy_copy];
+    assert!(
+        legacy_messages
+            .iter()
+            .all(|message| message.provenance.is_some())
+    );
+    let legacy = super::frozen::capture(&f.store, "ws", "thread", &allowed, &legacy_messages)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &legacy)
+            .await
+            .unwrap(),
+        legacy_messages,
+        "literal restore must preserve the old frozen wire representation"
+    );
+    let projected = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "child",
+        &allowed,
+        &serde_json::to_string(&legacy).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(projected.manifest_owner.as_deref(), Some("thread"));
+    assert_eq!(
+        projected
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(
+                |part| matches!(part, pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.is_none())
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        projected
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(
+                |part| matches!(part, pioneer_provider::MessageContentPart::File { file }
+                if file.artifact.is_none())
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        projected
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(
+                |part| matches!(part, pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.as_ref().is_some_and(|artifact| {
+                    artifact.artifact_version_id.as_deref() == Some("accepted-version")
+                }))
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        projected
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("mcp-tool:workspace:test:read"))
+            .count(),
+        1
+    );
+    let mut legacy_wire_messages = history.clone();
+    for message in &mut legacy_wire_messages {
+        message.provenance = None;
+    }
+    let legacy_array = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "thread",
+        &allowed,
+        &serde_json::to_string(&legacy_wire_messages).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(legacy_array.messages, legacy_wire_messages);
+    assert_eq!(legacy_array.manifest_owner, None);
+    assert!(legacy_array.direct_sources.is_empty());
+}
+
+#[tokio::test]
+async fn covered_input_rows_keep_their_mixed_ui_copy_suppressed_across_frozen_roundtrips() {
+    use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+    use pioneer_protocol::{
+        ArtifactKind, ArtifactRef, ArtifactStatus, ItemCompletedNotification, McpScopeKind,
+        ThreadMode, TurnItem, TurnMcpToolCapabilitySummary, UserInput, UserMessageAttachment,
+    };
+
+    let f = fixture("unused", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, template) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    db.execute_unprepared("DELETE FROM turn WHERE id='turn'")
+        .await
+        .unwrap();
+
+    let ordinary_image = "https://example.test/covered-input-row.png";
+    let unavailable_file = "/tmp/pioneer-covered-input-row-missing.txt";
+    let mut covered_turn = template.clone();
+    covered_turn.id = "covered-input-row-turn".into();
+    covered_turn.mode = ThreadMode::Agent;
+    f.store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &covered_turn,
+            &[
+                UserInput::Image {
+                    url: ordinary_image.into(),
+                },
+                UserInput::LocalFile {
+                    path: unavailable_file.into(),
+                },
+            ],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: covered_turn.id.clone(),
+                item: TurnItem::UserMessage {
+                    id: "covered-input-row-copy".into(),
+                    text: String::new(),
+                    attachments: vec![
+                        UserMessageAttachment::Image {
+                            url: ordinary_image.into(),
+                        },
+                        UserMessageAttachment::LocalFile {
+                            path: unavailable_file.into(),
+                        },
+                        UserMessageAttachment::Artifact {
+                            artifact: ArtifactRef {
+                                artifact_id: "input-row-artifact".into(),
+                                version_id: Some("input-row-accepted-version".into()),
+                                display_name: "accepted-input-row.png".into(),
+                                kind: ArtifactKind::Image,
+                                mime_type: Some("image/png".into()),
+                                size_bytes: Some(42),
+                                sha256: None,
+                                status: ArtifactStatus::Ready,
+                                preview: None,
+                            },
+                        },
+                        UserMessageAttachment::McpTool {
+                            capability: TurnMcpToolCapabilitySummary {
+                                id: "mcp-tool:workspace:input-row:read".into(),
+                                label: "input-row / read".into(),
+                                server_name: "input-row".into(),
+                                raw_tool_name: "read".into(),
+                                scope_kind: McpScopeKind::Workspace,
+                            },
+                        },
+                    ],
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+
+    let mut independent_turn = template;
+    independent_turn.id = "independent-input-row-turn".into();
+    independent_turn.mode = ThreadMode::Agent;
+    f.store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &independent_turn,
+            &[UserInput::Image {
+                url: ordinary_image.into(),
+            }],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: independent_turn.id.clone(),
+                item: TurnItem::UserMessage {
+                    id: "independent-input-row-copy".into(),
+                    text: String::new(),
+                    attachments: vec![UserMessageAttachment::Image {
+                        url: ordinary_image.into(),
+                    }],
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut accepted = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    for message in &mut accepted {
+        message.provenance.as_mut().unwrap().inherited = true;
+    }
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let descriptor = super::frozen::capture(&f.store, "ws", "thread", &allowed, &accepted)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &descriptor)
+            .await
+            .unwrap(),
+        accepted,
+        "literal restore must retain the original count, order and wire digest"
+    );
+
+    let covered_page = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "thread",
+            covered_turn.id.as_str(),
+            PagedSource::Input,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(covered_page.entries.len(), 2);
+    let covered_sources = covered_page
+        .entries
+        .iter()
+        .map(|row| row.reference.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        accepted.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                let sources = origin
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        (
+                            source.scope.as_str(),
+                            source.id.as_str(),
+                            source.version.as_str(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeSet<_>>();
+                sources
+                    == covered_sources
+                        .iter()
+                        .map(|source| {
+                            (
+                                source.scope.as_str(),
+                                source.id.as_str(),
+                                source.version.as_str(),
+                            )
+                        })
+                        .collect()
+            })
+        }),
+        "the authoritative canonical projection must be backed by the exact input rows"
+    );
+    let independent_page = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "thread",
+            independent_turn.id.as_str(),
+            PagedSource::Input,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(independent_page.entries.len(), 1);
+    let independent_source = &independent_page.entries[0].reference;
+    assert!(
+        accepted.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin.sources.len() == 1
+                    && origin.sources[0].scope == independent_source.scope
+                    && origin.sources[0].id == independent_source.id
+                    && origin.sources[0].version == independent_source.version
+            })
+        }),
+        "the independent same-URL input must retain its own input-row provenance"
+    );
+    let assertions = covered_page
+        .entries
+        .iter()
+        .map(|row| SourceAssertion {
+            revision: Some(
+                row.reference
+                    .version
+                    .strip_prefix("input-revision:")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            ),
+            kind: CanonicalSource::Input,
+            turn_id: covered_turn.id.clone(),
+            id: row.reference.id.clone(),
+            payload: row.payload.clone().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let owner = super::native::native_owner("ws", "thread");
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "fixture".into(),
+        model: "fixture".into(),
+        effort: None,
+    };
+    let version = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let operation = OperationSnapshot {
+        id: "covered-input-row-operation".into(),
+        owner: owner.clone(),
+        expected_checkpoint: None,
+        projection_version: version,
+        source_epochs: std::collections::BTreeMap::from([("thread".into(), version)]),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+            compact: vec![0],
+            retain: vec![],
+            coverage: covered_sources.clone(),
+            fingerprint: "covered-input-row-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit_for_turn(
+            "ws",
+            "thread",
+            &operation,
+            Some(independent_turn.id.as_str()),
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_bind_source_projection(&operation.id, &descriptor)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &operation.id,
+            &ModelBudget::new(None, None, None),
+            covered_sources.len() as u64,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &operation.id,
+            &covered_sources
+                .iter()
+                .enumerate()
+                .map(|(ordinal, source)| ManifestEntry {
+                    ordinal: ordinal as u64,
+                    unit: 0,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: source.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: "covered-input-row-checkpoint".into(),
+        operation_id: operation.id.clone(),
+        format_version: 1,
+        owner,
+        previous: None,
+        coverage: covered_sources.clone(),
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\ncovered input row summary\n"))
+            .collect(),
+        selection,
+        projection_version: version,
+    };
+    f.store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .compaction_apply(&checkpoint, None, &assertions)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let checkpoint_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let first = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "input-row-child",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        first
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("covered input row summary") })
+    );
+    assert!(first.direct_sources.contains(&ScopedHistorySource {
+        thread: "thread".into(),
+        source: checkpoint_source.clone(),
+    }));
+    assert!(covered_sources.iter().all(|source| {
+        !first.direct_sources.contains(&ScopedHistorySource {
+            thread: "thread".into(),
+            source: source.clone(),
+        })
+    }));
+    assert!(first.direct_sources.iter().any(|source| {
+        source.thread == "thread" && source.source.scope == format!("event:{}", covered_turn.id)
+    }));
+    assert!(first.direct_sources.iter().any(|source| {
+        source.thread == "thread" && source.source.scope == format!("input:{}", independent_turn.id)
+    }));
+
+    let mut roundtrip_allowed = allowed.clone();
+    roundtrip_allowed.extend([
+        "input-row-child".to_owned(),
+        "input-row-fallback".to_owned(),
+        "input-row-restart".to_owned(),
+        "input-row-restart-two".to_owned(),
+    ]);
+    let first_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &roundtrip_allowed,
+        &first.messages,
+    )
+    .await
+    .unwrap();
+    let second = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "input-row-restart",
+        &roundtrip_allowed,
+        &serde_json::to_string(&first_descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    let fallback = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        None,
+        "input-row-fallback",
+        &roundtrip_allowed,
+        &serde_json::to_string(&first_descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    for messages in [&first.messages, &second.messages, &fallback.messages] {
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content_parts)
+                .filter(|part| matches!(part,
+                    pioneer_provider::MessageContentPart::Image { image }
+                    if image.artifact.is_none()
+                        && matches!(&image.source,
+                            pioneer_provider::AttachmentDataSource::Url { url }
+                            if url == ordinary_image)))
+                .count(),
+            1,
+            "checkpoint projection must suppress C's ordinary image"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content_parts)
+                .filter(|part| matches!(part,
+                    pioneer_provider::MessageContentPart::File { file }
+                    if file.artifact.is_none()
+                        && matches!(&file.source,
+                            pioneer_provider::AttachmentDataSource::Path { path }
+                            if path == unavailable_file)))
+                .count(),
+            0,
+            "checkpoint projection must suppress C's ordinary file"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content_parts)
+                .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.as_ref().is_some_and(|artifact| {
+                    artifact.artifact_id == "input-row-artifact"
+                        && artifact.artifact_version_id.as_deref()
+                            == Some("input-row-accepted-version")
+                })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message
+                    .content
+                    .contains("mcp-tool:workspace:input-row:read"))
+                .count(),
+            1
+        );
+    }
+    assert!(fallback.direct_sources.contains(&ScopedHistorySource {
+        thread: "thread".into(),
+        source: checkpoint_source.clone(),
+    }));
+    assert!(covered_sources.iter().all(|source| {
+        !fallback.direct_sources.contains(&ScopedHistorySource {
+            thread: "thread".into(),
+            source: source.clone(),
+        })
+    }));
+    let second_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &roundtrip_allowed,
+        &second.messages,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &roundtrip_allowed, &second_descriptor)
+            .await
+            .unwrap(),
+        second.messages,
+        "recaptured projection must remain a literal immutable sequence"
+    );
+
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn_input SET payload=?, input_type='image' WHERE id=?",
+        [
+            serde_json::to_string(&UserInput::Image {
+                url: "https://example.test/edited-covered-input-row.png".into(),
+            })
+            .unwrap()
+            .into(),
+            covered_sources[0].id.clone().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    let edited_page = f
+        .store
+        .compaction_source_page(
+            "ws",
+            "thread",
+            covered_turn.id.as_str(),
+            PagedSource::Input,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        edited_page.entries.iter().any(|row| {
+            row.reference.id == covered_sources[0].id
+                && row.reference.version != covered_sources[0].version
+        }),
+        "the normal input trigger must record the covered EDIT as a new revision"
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM turn_input WHERE id=?",
+        [covered_sources[1].id.clone().into()],
+    ))
+    .await
+    .unwrap();
+
+    let after_mutation = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "input-row-restart-two",
+        &roundtrip_allowed,
+        &serde_json::to_string(&second_descriptor).unwrap(),
+    )
+    .await
+    .expect("covered input rows must not be read or exact-current validated after replacement");
+    assert!(
+        after_mutation
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("covered input row summary") })
+    );
+    assert_eq!(
+        after_mutation
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.is_none()
+                    && matches!(&image.source,
+                        pioneer_provider::AttachmentDataSource::Url { url }
+                        if url == ordinary_image)))
+            .count(),
+        1,
+        "only the independent turn may retain the same ordinary image"
+    );
+    assert_eq!(
+        after_mutation
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::File { file }
+                if file.artifact.is_none()
+                    && matches!(&file.source,
+                        pioneer_provider::AttachmentDataSource::Path { path }
+                        if path == unavailable_file)))
+            .count(),
+        0,
+        "the covered missing local file must not return for materialization"
+    );
+    assert_eq!(
+        after_mutation
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+            pioneer_provider::MessageContentPart::Image { image }
+            if image.artifact.as_ref().is_some_and(|artifact| {
+                artifact.artifact_id == "input-row-artifact"
+                    && artifact.artifact_version_id.as_deref()
+                        == Some("input-row-accepted-version")
+            })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        after_mutation
+            .messages
+            .iter()
+            .filter(|message| message
+                .content
+                .contains("mcp-tool:workspace:input-row:read"))
+            .count(),
+        1
+    );
+    assert!(
+        after_mutation
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: checkpoint_source,
+            })
+    );
+    assert!(covered_sources.iter().all(|source| {
+        !after_mutation
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: source.clone(),
+            })
+    }));
+}
+
+#[tokio::test]
+async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
+    use pioneer_crud::compaction::{CommitOutcome, SourceAssertion};
+    use pioneer_protocol::{
+        ArtifactKind, ArtifactRef, ArtifactStatus, ItemCompletedNotification, McpScopeKind,
+        ThreadMode, TurnItem, TurnMcpToolCapabilitySummary, UserInput, UserMessageAttachment,
+    };
+    let f = fixture("unused", vec![], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let thread = f.store.get_thread_model("thread").await.unwrap().unwrap();
+    let (_, template) = f.store.get_turn("thread", "turn").await.unwrap().unwrap();
+    db.execute_unprepared("DELETE FROM turn WHERE id='turn'")
+        .await
+        .unwrap();
+
+    let ordinary_image = "https://example.test/covered-event-input.png";
+    let unavailable_file = "/tmp/pioneer-covered-event-input-missing.png";
+    let input = vec![
+        UserInput::Image {
+            url: ordinary_image.into(),
+        },
+        UserInput::LocalFile {
+            path: unavailable_file.into(),
+        },
+    ];
+    let mut covered_turn = template.clone();
+    covered_turn.id = "covered-event-turn".into();
+    covered_turn.mode = ThreadMode::Message;
+    f.store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &covered_turn,
+            &input,
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let mixed_copy = vec![
+        UserMessageAttachment::Image {
+            url: ordinary_image.into(),
+        },
+        UserMessageAttachment::LocalFile {
+            path: unavailable_file.into(),
+        },
+        UserMessageAttachment::Artifact {
+            artifact: ArtifactRef {
+                artifact_id: "accepted-mixed-artifact".into(),
+                version_id: Some("accepted-mixed-version".into()),
+                display_name: "accepted.png".into(),
+                kind: ArtifactKind::Image,
+                mime_type: Some("image/png".into()),
+                size_bytes: Some(42),
+                sha256: None,
+                status: ArtifactStatus::Ready,
+                preview: None,
+            },
+        },
+        UserMessageAttachment::McpTool {
+            capability: TurnMcpToolCapabilitySummary {
+                id: "mcp-tool:workspace:covered:read".into(),
+                label: "covered / read".into(),
+                server_name: "covered".into(),
+                raw_tool_name: "read".into(),
+                scope_kind: McpScopeKind::Workspace,
+            },
+        },
+    ];
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: covered_turn.id.clone(),
+                item: TurnItem::UserMessage {
+                    id: "covered-input-copy".into(),
+                    text: String::new(),
+                    attachments: mixed_copy,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+
+    // Message-mode input is authoritative in TurnStarted/TurnMessageEdited.
+    // Remove the projection rows to exercise the event-input path rather than
+    // the already-covered input-row suppression path.
+    db.execute_unprepared("DELETE FROM turn_input WHERE turn_id='covered-event-turn'")
+        .await
+        .unwrap();
+
+    let mut independent_turn = template.clone();
+    independent_turn.id = "independent-event-turn".into();
+    independent_turn.mode = ThreadMode::Message;
+    f.store
+        .materialize_turn_start(
+            &thread,
+            pioneer_protocol::SandboxMode::FullAccess,
+            &independent_turn,
+            &[UserInput::Image {
+                url: ordinary_image.into(),
+            }],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    f.store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: independent_turn.id.clone(),
+                item: TurnItem::UserMessage {
+                    id: "independent-input-copy".into(),
+                    text: String::new(),
+                    attachments: vec![UserMessageAttachment::Image {
+                        url: ordinary_image.into(),
+                    }],
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    db.execute_unprepared("DELETE FROM turn_input WHERE turn_id='independent-event-turn'")
+        .await
+        .unwrap();
+
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut accepted = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    for message in &mut accepted {
+        message.provenance.as_mut().unwrap().inherited = true;
+    }
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+    let descriptor = super::frozen::capture(&f.store, "ws", "thread", &allowed, &accepted)
+        .await
+        .unwrap();
+
+    let covered_page = f
+        .store
+        .compaction_source_page("ws", "thread", "covered-event-turn", PagedSource::Event, 0)
+        .await
+        .unwrap();
+    let covered_input = covered_page
+        .entries
+        .iter()
+        .find(|row| row.projection_kind.as_deref() == Some("input"))
+        .unwrap();
+
+    // Preserve a descriptor with the exact pre-typed wire representation too.
+    let mut legacy_messages = Vec::new();
+    for row in &covered_page.entries {
+        if !matches!(row.projection_kind.as_deref(), Some("input" | "input_copy")) {
+            continue;
+        }
+        let payload = row.payload.as_ref().unwrap();
+        let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(payload).unwrap();
+        let Some(mut message) = super::history::legacy_event_message(event).unwrap() else {
+            continue;
+        };
+        message.provenance = accepted.iter().find_map(|accepted| {
+            accepted
+                .provenance
+                .as_ref()
+                .filter(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == row.reference.id)
+                })
+                .cloned()
+        });
+        assert!(message.provenance.is_some());
+        legacy_messages.push(message);
+    }
+    let legacy_descriptor = super::frozen::capture_legacy_event_references(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        &legacy_messages,
+    )
+    .await
+    .unwrap();
+    assert!(
+        f.store
+            .compaction_frozen_history_page("ws", "thread", &legacy_descriptor.manifest_id, 0,)
+            .await
+            .unwrap()
+            .iter()
+            .all(|reference| reference.event_input_role.is_none()),
+        "the upgrade fixture must use the pre-role manifest identity"
+    );
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &legacy_descriptor)
+            .await
+            .unwrap(),
+        legacy_messages,
+        "reference manifests with the old exact wire digest must restore literally"
+    );
+
+    let source = covered_input.reference.clone();
+    let assertion = SourceAssertion {
+        revision: Some(
+            source
+                .version
+                .strip_prefix("event-revision:")
+                .unwrap()
+                .parse()
+                .unwrap(),
+        ),
+        kind: CanonicalSource::Event,
+        turn_id: covered_turn.id.clone(),
+        id: source.id.clone(),
+        payload: covered_input.payload.clone().unwrap(),
+    };
+    let owner = super::native::native_owner("ws", "thread");
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "fixture".into(),
+        model: "fixture".into(),
+        effort: None,
+    };
+    let version = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let operation = OperationSnapshot {
+        id: "covered-event-input-operation".into(),
+        owner: owner.clone(),
+        expected_checkpoint: None,
+        projection_version: version,
+        source_epochs: std::collections::BTreeMap::from([("thread".into(), version)]),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![source.clone()],
+            fingerprint: "covered-event-input-plan".into(),
+        },
+    };
+    f.store
+        .compaction_admit_for_turn(
+            "ws",
+            "thread",
+            &operation,
+            Some(independent_turn.id.as_str()),
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_bind_source_projection(&operation.id, &descriptor)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 1, 0)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &operation.id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: source.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: "covered-event-input-checkpoint".into(),
+        operation_id: operation.id.clone(),
+        format_version: 1,
+        owner,
+        previous: None,
+        coverage: vec![source.clone()],
+        summary: HEADINGS
+            .iter()
+            .map(|heading| format!("{heading}\ncovered event input summary\n"))
+            .collect(),
+        selection,
+        projection_version: version,
+    };
+    f.store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .compaction_apply(&checkpoint, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &legacy_descriptor)
+            .await
+            .unwrap(),
+        legacy_messages,
+        "publishing a summary must not change literal frozen restore"
+    );
+
+    // Refresh the mutable projection cache to A@V2. The accepted descriptors
+    // and checkpoint still name A@V1, whose input relationship must now come
+    // from immutable frozen metadata rather than the last-decoded cache row.
+    let edited_payload = covered_input.payload.as_ref().unwrap().replace(
+        ordinary_image,
+        "https://example.test/edited-after-summary.png",
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn_event SET payload=? WHERE id=?",
+        [edited_payload.clone().into(), source.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let refreshed_page = f
+        .store
+        .compaction_source_page("ws", "thread", "covered-event-turn", PagedSource::Event, 0)
+        .await
+        .unwrap();
+    let refreshed_input = refreshed_page
+        .entries
+        .iter()
+        .find(|row| row.reference.id == source.id)
+        .unwrap();
+    assert_eq!(refreshed_input.reference.version, "event-revision:2");
+    let refreshed_event: pioneer_crud::CanonicalTurnEventPayload =
+        serde_json::from_str(&edited_payload).unwrap();
+    assert!(
+        f.store
+            .compaction_record_event_projection(
+                "ws",
+                "thread",
+                &refreshed_input.reference,
+                &refreshed_event,
+            )
+            .await
+            .unwrap()
+    );
+    let current_projection = super::history::historical_event_projections(
+        &f.store,
+        "ws",
+        "thread",
+        [refreshed_input.reference.clone()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(current_projection.len(), 1);
+    assert_eq!(current_projection[0].reference.version, "event-revision:2");
+    assert_eq!(current_projection[0].projection_kind, "input");
+    assert!(
+        super::history::historical_event_projections(&f.store, "ws", "thread", [source.clone()],)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the mutable cache must no longer be capable of proving A@V1"
+    );
+    let checkpoint_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    let graph = resolver
+        .resolve(&f.store, "ws", Some(&allowed), &checkpoint_source)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        graph
+            .event_input_evidence
+            .get(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: source.clone(),
+            })
+            .map(String::as_str),
+        Some("authoritative")
+    );
+    let restored_after_edit = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "edited-child",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        restored_after_edit
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("covered event input summary") })
+    );
+    assert_eq!(
+        restored_after_edit
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.is_none()
+                    && matches!(&image.source,
+                        pioneer_provider::AttachmentDataSource::Url { url }
+                        if url == ordinary_image)))
+            .count(),
+        1,
+        "refreshing A to V2 must not reattach C beside S(A@V1)"
+    );
+    assert_eq!(
+        restored_after_edit
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+            pioneer_provider::MessageContentPart::Image { image }
+            if image.artifact.as_ref().is_some_and(|artifact| {
+                artifact.artifact_version_id.as_deref()
+                    == Some("accepted-mixed-version")
+            })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        restored_after_edit
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("mcp-tool:workspace:covered:read"))
+            .count(),
+        1
+    );
+
+    assert!(
+        restored_after_edit
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: checkpoint_source.clone(),
+            })
+    );
+    assert!(
+        !restored_after_edit
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: source.clone(),
+            }),
+        "the covered raw input must not enter the provider continuity receipt"
+    );
+
+    // Freeze the selected S(A)+C projection twice. Each later execution must
+    // recover A's immutable input relationship from the admitted checkpoint,
+    // even though A itself is no longer a direct manifest reference.
+    let mut roundtrip_allowed = allowed.clone();
+    roundtrip_allowed.extend([
+        "edited-child".to_owned(),
+        "roundtrip-child".to_owned(),
+        "restart-child".to_owned(),
+    ]);
+    let projected_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &roundtrip_allowed,
+        &restored_after_edit.messages,
+    )
+    .await
+    .unwrap();
+    let projected_roundtrip = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "roundtrip-child",
+        &roundtrip_allowed,
+        &serde_json::to_string(&projected_descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        projected_roundtrip
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("covered event input summary") })
+    );
+    assert_eq!(
+        projected_roundtrip
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.is_none()
+                    && matches!(&image.source,
+                        pioneer_provider::AttachmentDataSource::Url { url }
+                        if url == ordinary_image)))
+            .count(),
+        1,
+        "a recaptured execution projection must not resurrect C's covered media"
+    );
+    assert!(
+        projected_roundtrip
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: checkpoint_source.clone(),
+            })
+    );
+    assert!(
+        !projected_roundtrip
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: source.clone(),
+            })
+    );
+    let restarted_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &roundtrip_allowed,
+        &projected_roundtrip.messages,
+    )
+    .await
+    .unwrap();
+
+    // The checkpoint is now the independent authority for A. Its raw body can
+    // disappear without making C re-attach A's ordinary media.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM turn_event WHERE id=?",
+        [source.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let prepared =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    let restored = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "child",
+        &allowed,
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    let restored_legacy = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "legacy-child",
+        &allowed,
+        &serde_json::to_string(&legacy_descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    let restored_after_restart = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "restart-child",
+        &roundtrip_allowed,
+        &serde_json::to_string(&restarted_descriptor).unwrap(),
+    )
+    .await
+    .unwrap();
+    for messages in [
+        &prepared.messages,
+        &restored.messages,
+        &restored_after_restart.messages,
+    ] {
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message.content.contains("covered event input summary") })
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content_parts)
+                .filter(|part| matches!(part,
+                    pioneer_provider::MessageContentPart::Image { image }
+                    if image.artifact.is_none()
+                        && matches!(&image.source,
+                            pioneer_provider::AttachmentDataSource::Url { url }
+                            if url == ordinary_image)))
+                .count(),
+            1,
+            "only the independent turn with the same URL may retain ordinary media"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content_parts)
+                .filter(|part| matches!(part,
+                    pioneer_provider::MessageContentPart::File { file }
+                    if file.artifact.is_none()
+                        && matches!(&file.source,
+                            pioneer_provider::AttachmentDataSource::Path { path }
+                            if path == unavailable_file)))
+                .count(),
+            0,
+            "covered unavailable media must not be returned for materialization"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .flat_map(|message| &message.content_parts)
+                .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.as_ref().is_some_and(|artifact| {
+                    artifact.artifact_id == "accepted-mixed-artifact"
+                        && artifact.artifact_version_id.as_deref()
+                            == Some("accepted-mixed-version")
+                })))
+                .count(),
+            1,
+            "the mixed copy must retain its exact accepted Artifact version"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.content.contains("mcp-tool:workspace:covered:read"))
+                .count(),
+            1,
+            "the mixed copy must retain inert capability history"
+        );
+    }
+    assert!(
+        restored_after_restart
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: checkpoint_source.clone(),
+            })
+    );
+    assert!(
+        !restored_after_restart
+            .direct_sources
+            .contains(&ScopedHistorySource {
+                thread: "thread".into(),
+                source: source.clone(),
+            }),
+        "checkpoint evidence must not reintroduce covered raw into the receipt"
+    );
+    assert!(
+        restored_legacy
+            .messages
+            .iter()
+            .any(|message| { message.content.contains("covered event input summary") })
+    );
+    assert_eq!(
+        restored_legacy
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+                pioneer_provider::MessageContentPart::Image { image }
+                if image.artifact.is_none()))
+            .count(),
+        0,
+        "old-wire execution projection must suppress the covered input copy media"
+    );
+    assert_eq!(
+        restored_legacy
+            .messages
+            .iter()
+            .flat_map(|message| &message.content_parts)
+            .filter(|part| matches!(part,
+            pioneer_provider::MessageContentPart::Image { image }
+            if image.artifact.as_ref().is_some_and(|artifact| {
+                artifact.artifact_version_id.as_deref()
+                    == Some("accepted-mixed-version")
+            })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        restored_legacy
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("mcp-tool:workspace:covered:read"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

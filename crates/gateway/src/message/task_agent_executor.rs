@@ -1869,7 +1869,7 @@ impl TaskAgentExecutor {
         };
         let frozen_parent_history = frozen_conversation_scope
             .as_ref()
-            .map(|(_, history)| history.as_slice());
+            .map(|(_, history, _)| history.as_slice());
 
         let child_input = if let Some(launch) = composer_launch.as_ref() {
             launch.input.clone()
@@ -2025,17 +2025,100 @@ impl TaskAgentExecutor {
                 // consume the native runtime worker's stack before preparation
                 // begins.
                 let prepare_processor = processor.clone();
-                let continuation_thread_id = parent.parent_thread_id.clone();
+                let continuation_thread_id = child_runtime.task_run_turn.thread_id.clone();
+                let context_thread_id = parent.parent_thread_id.clone();
                 let task_run_id = run.id.clone();
                 let execution_id = execution.id.clone();
-                let prepare_composer_history = frozen_conversation_scope.is_none();
+                let prepared_conversation_history =
+                    frozen_conversation_scope
+                        .as_ref()
+                        .map(|(_, history, basis)| {
+                            super::turn_handlers::PreparedCliRuntimeConversationHistory {
+                                messages: history.clone(),
+                                context_basis: basis.clone(),
+                            }
+                        });
                 let history_task = (*task).clone();
                 let history_agent_spec = agent_spec.clone();
                 let history_run = (*run).clone();
                 let history_parent = (*parent).clone();
                 let history_turn = child_runtime.task_run_turn.clone();
                 let history_thread = thread_outcome.started_notification.thread.clone();
-                let prepared = message_fresh_task(async move {
+                let prepared: anyhow::Result<
+                    super::turn_handlers::PreparedCliRuntimeNativeTurnStart,
+                > = message_fresh_task(async move {
+                    let conversation_history =
+                        if matches!(history_turn.kind, TaskRunTurnKind::Initial) {
+                            match prepared_conversation_history {
+                                Some(history) => history,
+                                None => {
+                                    let (_, messages, context_basis) =
+                                        load_task_execution_conversation_scope(
+                                            &prepare_processor,
+                                            &history_task,
+                                            &history_agent_spec,
+                                            &history_run,
+                                            &history_parent,
+                                            history_turn.kind,
+                                            history_turn.thread_id.as_str(),
+                                            history_turn.turn_id.as_str(),
+                                            history_thread.model.as_str(),
+                                            history_thread.model_provider.as_str(),
+                                        )
+                                        .await
+                                        .context("failed to prepare Task conversation history")?;
+                                    super::turn_handlers::PreparedCliRuntimeConversationHistory {
+                                        messages,
+                                        context_basis,
+                                    }
+                                }
+                            }
+                        } else {
+                            if prepared_conversation_history.is_none() {
+                                load_task_execution_conversation_scope(
+                                    &prepare_processor,
+                                    &history_task,
+                                    &history_agent_spec,
+                                    &history_run,
+                                    &history_parent,
+                                    history_turn.kind,
+                                    history_turn.thread_id.as_str(),
+                                    history_turn.turn_id.as_str(),
+                                    history_thread.model.as_str(),
+                                    history_thread.model_provider.as_str(),
+                                )
+                                .await
+                                .context("failed to prepare Task conversation history")?;
+                            }
+                            let prepared = prepare_processor
+                                .capture_current_context_basis_prepared(
+                                    prepare_processor.crud_store.as_ref(),
+                                    history_task.workspace_id.as_str(),
+                                    history_turn.thread_id.as_str(),
+                                    history_turn.turn_id.as_str(),
+                                    Some(history_turn.turn_id.as_str()),
+                                )
+                                .await
+                                .context("failed to prepare Task execution-branch history")?;
+                            let direct_sources =
+                                crate::compaction::frozen::frozen_history_direct_sources(
+                                    prepare_processor.crud_store.as_ref(),
+                                    history_task.workspace_id.as_str(),
+                                    &prepared.descriptor,
+                                )
+                                .await?;
+                            super::turn_handlers::PreparedCliRuntimeConversationHistory {
+                                messages: prepared.messages,
+                                context_basis: Some(
+                                    crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+                                        history_turn.thread_id.as_str(),
+                                        history_turn.thread_id.as_str(),
+                                        serde_json::to_string(&prepared.descriptor)?,
+                                        &direct_sources,
+                                    ),
+                                ),
+                            }
+                        };
                     let prepared = prepare_processor
                         .prepare_task_cli_runtime_turn(
                             TurnStartParams {
@@ -2052,38 +2135,14 @@ impl TaskAgentExecutor {
                             child_authorization_context,
                             child_authorization_revalidation,
                             continuation_thread_id.clone(),
-                            continuation_thread_id,
+                            context_thread_id,
                             task_run_id,
                             execution_id,
+                            conversation_history,
                             action_author,
                             turn_response,
                         )
                         .await?;
-                    // Keep context preparation on the same fresh-task boundary.
-                    // The child is durable; activation has not sent its command.
-                    if prepare_composer_history
-                        && let Err(error) = load_task_execution_conversation_scope(
-                            &prepare_processor,
-                            &history_task,
-                            &history_agent_spec,
-                            &history_run,
-                            &history_parent,
-                            history_turn.kind,
-                            history_turn.thread_id.as_str(),
-                            history_turn.turn_id.as_str(),
-                            history_thread.model.as_str(),
-                            history_thread.model_provider.as_str(),
-                        )
-                        .await
-                    {
-                        prepare_processor
-                            .abort_prepared_task_cli_runtime_turn(
-                                prepared,
-                                format!("failed to prepare Task conversation history: {error:#}"),
-                            )
-                            .await;
-                        return Err(error).context("failed to prepare Task conversation history");
-                    }
                     Ok(prepared)
                 })
                 .await
@@ -2545,7 +2604,7 @@ impl TaskAgentExecutor {
         .await?
         .into_iter()
         .collect();
-        let (hook_runtime_context, history) = close_admitted_task_turn_on_error(
+        let (hook_runtime_context, history, _) = close_admitted_task_turn_on_error(
             processor,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
@@ -2962,7 +3021,7 @@ impl TaskAgentExecutor {
                 &child_permission_profile,
                 frozen_conversation_scope
                     .as_ref()
-                    .map(|(_, history)| history.as_slice()),
+                    .map(|(_, history, _)| history.as_slice()),
             )
             .await?,
             agent_spec,
@@ -2996,6 +3055,54 @@ impl TaskAgentExecutor {
             .context("failed to resolve revision CLI execution authorization")?;
             let child_authorization_context = child_authorization.context;
             let child_authorization_revalidation = child_authorization.revalidation;
+            if frozen_conversation_scope.is_none() {
+                load_task_execution_conversation_scope(
+                    processor,
+                    task,
+                    agent_spec,
+                    run,
+                    &parent,
+                    child_runtime.task_run_turn.kind,
+                    child_runtime.task_run_turn.thread_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
+                    thread_outcome.started_notification.thread.model.as_str(),
+                    thread_outcome
+                        .started_notification
+                        .thread
+                        .model_provider
+                        .as_str(),
+                )
+                .await
+                .context("failed to prepare revision Task conversation history")?;
+            }
+            let prepared_history = processor
+                .capture_current_context_basis_prepared(
+                    processor.crud_store.as_ref(),
+                    task.workspace_id.as_str(),
+                    child_runtime.task_run_turn.thread_id.as_str(),
+                    child_runtime.task_run_turn.turn_id.as_str(),
+                    Some(child_runtime.task_run_turn.turn_id.as_str()),
+                )
+                .await
+                .context("failed to prepare revision Task execution-branch history")?;
+            let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+                processor.crud_store.as_ref(),
+                task.workspace_id.as_str(),
+                &prepared_history.descriptor,
+            )
+            .await?;
+            let conversation_history =
+                super::turn_handlers::PreparedCliRuntimeConversationHistory {
+                    messages: prepared_history.messages,
+                    context_basis: Some(
+                        crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+                            child_runtime.task_run_turn.thread_id.as_str(),
+                            child_runtime.task_run_turn.thread_id.as_str(),
+                            serde_json::to_string(&prepared_history.descriptor)?,
+                            &direct_sources,
+                        ),
+                    ),
+                };
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
@@ -3022,10 +3129,11 @@ impl TaskAgentExecutor {
                     child_security_snapshot,
                     child_authorization_context,
                     child_authorization_revalidation,
-                    parent.parent_thread_id.clone(),
+                    child_thread_id.clone(),
                     parent.parent_thread_id.clone(),
                     run.id.clone(),
                     execution.id.clone(),
+                    conversation_history,
                     action_author,
                     turn_response.clone(),
                 )
@@ -3539,7 +3647,7 @@ impl TaskAgentExecutor {
             load_execution_checkpoint_context_for_turn(processor, child_turn_id.as_str()).await,
         )
         .await?;
-        let (hook_runtime_context, history) = close_admitted_task_turn_on_error(
+        let (hook_runtime_context, history, _) = close_admitted_task_turn_on_error(
             processor,
             child_thread_id.as_str(),
             child_turn_id.as_str(),
@@ -5364,7 +5472,6 @@ impl TaskAgentExecutor {
             text_elements: Vec::new(),
         }];
         if let Some((runtime_id, runtime_kind)) = turn_settings.cli_runtime.clone() {
-            // Preserve accepted-basis validation; primary CLI owns its history.
             let _ = load_task_execution_conversation_scope(
                 processor,
                 task,
@@ -5382,6 +5489,34 @@ impl TaskAgentExecutor {
                     .as_str(),
             )
             .await?;
+            let prepared_history = processor
+                .capture_current_context_basis_prepared(
+                    processor.crud_store.as_ref(),
+                    task.workspace_id.as_str(),
+                    task_run_turn.thread_id.as_str(),
+                    task_run_turn.turn_id.as_str(),
+                    Some(task_run_turn.turn_id.as_str()),
+                )
+                .await
+                .context("failed to prepare reviewer execution-branch history")?;
+            let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+                processor.crud_store.as_ref(),
+                task.workspace_id.as_str(),
+                &prepared_history.descriptor,
+            )
+            .await?;
+            let conversation_history =
+                super::turn_handlers::PreparedCliRuntimeConversationHistory {
+                    messages: prepared_history.messages,
+                    context_basis: Some(
+                        crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+                            task_run_turn.thread_id.as_str(),
+                            task_run_turn.thread_id.as_str(),
+                            serde_json::to_string(&prepared_history.descriptor)?,
+                            &direct_sources,
+                        ),
+                    ),
+                };
             let prepared = processor
                 .prepare_task_cli_runtime_turn(
                     TurnStartParams {
@@ -5408,10 +5543,11 @@ impl TaskAgentExecutor {
                     reviewer_security_snapshot,
                     reviewer_authorization_context,
                     reviewer_authorization_revalidation,
-                    parent.parent_thread_id.clone(),
+                    task_run_turn.thread_id.clone(),
                     parent.parent_thread_id.clone(),
                     run.id.clone(),
                     reviewer_execution_id.clone(),
+                    conversation_history,
                     action_author,
                     turn_response.clone(),
                 )
@@ -5679,7 +5815,7 @@ impl TaskAgentExecutor {
         .await?
         .into_iter()
         .collect();
-        let (hook_runtime_context, history) = close_admitted_task_turn_on_error(
+        let (hook_runtime_context, history, _) = close_admitted_task_turn_on_error(
             processor,
             task_run_turn.thread_id.as_str(),
             task_run_turn.turn_id.as_str(),
@@ -6587,6 +6723,7 @@ async fn load_task_execution_conversation_scope(
 ) -> Result<(
     AgentTurnHookRuntimeContext,
     Vec<pioneer_provider::ChatMessage>,
+    Option<crate::cli_runtime::thread_binding::CliRuntimeContextBasis>,
 )> {
     let expected_hook_context = task_hook_runtime_context(task, parent, task_run_turn_kind);
     if let Some(snapshot) = processor
@@ -6597,12 +6734,22 @@ async fn load_task_execution_conversation_scope(
         if snapshot.workspace_id != task.workspace_id || snapshot.thread_id != execution_thread_id {
             bail!("task child runtime snapshot identity mismatch for turn `{execution_turn_id}`");
         }
-        return crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
-            processor.crud_store.as_ref(),
-            &snapshot,
-        )
-        .await
-        .context("failed to restore frozen Task conversation scope");
+        let (context, projection) =
+            crate::turn_runtime_snapshot::restored_conversation_scope_projection_from_snapshot(
+                processor.crud_store.as_ref(),
+                &snapshot,
+            )
+            .await
+            .context("failed to restore frozen Task conversation scope")?;
+        let basis = projection.manifest_owner.as_deref().and_then(|owner| {
+            frozen_context_basis(
+                execution_thread_id,
+                owner,
+                snapshot.history_json.as_str(),
+                &projection.direct_sources,
+            )
+        });
+        return Ok((context, projection.messages, basis));
     }
     let source_turn_id = task
         .metadata
@@ -6615,7 +6762,7 @@ async fn load_task_execution_conversation_scope(
         .get_task_run_conversation_snapshot(run.id.as_str())
         .await?
     {
-        let history = restore_task_run_conversation_snapshot(
+        let projection = restore_task_run_conversation_snapshot(
             processor.crud_store.as_ref(),
             &snapshot,
             task,
@@ -6624,7 +6771,11 @@ async fn load_task_execution_conversation_scope(
             execution_thread_id,
         )
         .await?;
-        return Ok((expected_hook_context, history));
+        return Ok((
+            expected_hook_context,
+            projection.messages,
+            frozen_task_context_basis(&snapshot, execution_thread_id, &projection.direct_sources),
+        ));
     }
     if let Some(retry_of_run_id) = run.retry_of_run_id.as_deref()
         && let Some(snapshot) = processor
@@ -6657,7 +6808,7 @@ async fn load_task_execution_conversation_scope(
                 },
             )
             .await?;
-        let history = restore_task_run_conversation_snapshot(
+        let projection = restore_task_run_conversation_snapshot(
             processor.crud_store.as_ref(),
             &persisted,
             task,
@@ -6666,7 +6817,11 @@ async fn load_task_execution_conversation_scope(
             execution_thread_id,
         )
         .await?;
-        return Ok((expected_hook_context, history));
+        return Ok((
+            expected_hook_context,
+            projection.messages,
+            frozen_task_context_basis(&persisted, execution_thread_id, &projection.direct_sources),
+        ));
     }
     let composer = task
         .metadata
@@ -6716,7 +6871,7 @@ async fn load_task_execution_conversation_scope(
         )
         .await
         .context("failed to freeze Task conversation sources")?;
-    let history = publish_prepared_task_snapshot(
+    let (history, accepted_history_json, direct_sources) = publish_prepared_task_snapshot(
         processor.crud_store.as_ref(),
         run.id.as_str(),
         task.id.as_str(),
@@ -6728,7 +6883,45 @@ async fn load_task_execution_conversation_scope(
         || async { Ok(()) },
     )
     .await?;
-    Ok((expected_hook_context, history))
+    Ok((
+        expected_hook_context,
+        history,
+        frozen_context_basis(
+            execution_thread_id,
+            parent.parent_thread_id.as_str(),
+            accepted_history_json.as_str(),
+            &direct_sources,
+        ),
+    ))
+}
+
+fn frozen_task_context_basis(
+    snapshot: &pioneer_crud::TaskRunConversationSnapshotRecord,
+    execution_thread_id: &str,
+    direct_sources: &[pioneer_agent::compaction::composition::ScopedHistorySource],
+) -> Option<crate::cli_runtime::thread_binding::CliRuntimeContextBasis> {
+    frozen_context_basis(
+        execution_thread_id,
+        snapshot.conversation_thread_id.as_str(),
+        snapshot.history_json.as_str(),
+        direct_sources,
+    )
+}
+
+fn frozen_context_basis(
+    execution_thread_id: &str,
+    manifest_owner_thread_id: &str,
+    history_json: &str,
+    direct_sources: &[pioneer_agent::compaction::composition::ScopedHistorySource],
+) -> Option<crate::cli_runtime::thread_binding::CliRuntimeContextBasis> {
+    (!history_json.trim_start().starts_with('[')).then(|| {
+        crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+            execution_thread_id,
+            manifest_owner_thread_id,
+            history_json.to_owned(),
+            direct_sources,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6742,7 +6935,11 @@ async fn publish_prepared_task_snapshot<B, F>(
     execution_thread_id: &str,
     prepared_history: crate::compaction::frozen::PreparedHistory,
     before_insert: B,
-) -> Result<Vec<pioneer_provider::ChatMessage>>
+) -> Result<(
+    Vec<pioneer_provider::ChatMessage>,
+    String,
+    Vec<pioneer_agent::compaction::composition::ScopedHistorySource>,
+)>
 where
     B: FnOnce() -> F,
     F: std::future::Future<Output = Result<()>>,
@@ -6762,7 +6959,7 @@ where
             },
         )
         .await?;
-    select_accepted_task_snapshot(
+    let history = select_accepted_task_snapshot(
         &persisted.history_json,
         &history_json,
         async {
@@ -6802,7 +6999,12 @@ where
             .await
         },
     )
-    .await
+    .await?;
+    let descriptor = serde_json::from_str(&persisted.history_json)?;
+    let direct_sources =
+        crate::compaction::frozen::frozen_history_direct_sources(store, workspace, &descriptor)
+            .await?;
+    Ok((history, persisted.history_json, direct_sources))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6947,7 +7149,7 @@ mod prepared_snapshot_tests {
         let descriptor = serde_json::to_string(&prepared.descriptor).unwrap();
         let expected = prepared.messages.clone();
         let restores = crate::compaction::frozen::observe_store_restores(&store, "own-ws");
-        let history = publish_prepared_task_snapshot(
+        let (history, accepted_json, direct_sources) = publish_prepared_task_snapshot(
             &store,
             "own-run",
             "own-task",
@@ -6961,6 +7163,8 @@ mod prepared_snapshot_tests {
         .await
         .unwrap();
         assert_eq!(history, expected);
+        assert_eq!(accepted_json, descriptor);
+        assert!(!direct_sources.is_empty());
         assert_eq!(restores.calls(), 0, "own accepted snapshot was restored");
         let persisted = store
             .get_task_run_conversation_snapshot("own-run")
@@ -7001,7 +7205,7 @@ mod prepared_snapshot_tests {
                 .await;
             published.send(result).unwrap();
         });
-        let history = publish_prepared_task_snapshot(
+        let (history, accepted_json, direct_sources) = publish_prepared_task_snapshot(
             &store,
             "race-run",
             "race-task",
@@ -7020,6 +7224,8 @@ mod prepared_snapshot_tests {
         .unwrap();
         competitor.await.unwrap();
         assert_eq!(history, expected_winner);
+        assert_eq!(accepted_json, winner_json);
+        assert!(!direct_sources.is_empty());
         assert_eq!(restores.calls(), 1, "concurrent winner was not restored");
         assert!(
             history
@@ -7043,7 +7249,7 @@ async fn restore_task_run_conversation_snapshot(
     parent: &TaskParentRuntimeContext,
     source_turn_id: Option<&str>,
     execution_thread_id: &str,
-) -> Result<Vec<pioneer_provider::ChatMessage>> {
+) -> Result<crate::compaction::frozen::RestoredAcceptedHistory> {
     restore_task_run_conversation_snapshot_fields(
         store,
         snapshot,
@@ -7065,7 +7271,7 @@ async fn restore_task_run_conversation_snapshot_fields(
     conversation_thread: &str,
     source_turn_id: Option<&str>,
     execution_thread_id: &str,
-) -> Result<Vec<pioneer_provider::ChatMessage>> {
+) -> Result<crate::compaction::frozen::RestoredAcceptedHistory> {
     ensure_task_run_snapshot_identity_fields(
         snapshot,
         task_id,

@@ -172,7 +172,8 @@ pub use repositories::thread::{
     thread_read_cursor_from_model,
 };
 pub use repositories::turn::{
-    NewTurnMessageRevision, PersistedTurnCollaboration, collaboration_from_model,
+    NewTurnMessageRevision, PersistedTurnCollaboration, TURN_MESSAGE_GUARD_PAGE_BYTES,
+    TURN_MESSAGE_GUARD_PAGE_ROWS, TurnMessageGuard, collaboration_from_model,
     find_turn_collaboration, find_turn_initiator, insert_turn_message_revision,
     list_turn_message_revisions, turn_message_revision_from_model,
 };
@@ -933,6 +934,7 @@ pub use crate::repositories::native_terminal_effect_outbox::NativeTerminalEffect
 pub use crate::repositories::turn_admission::NewTurnAdmission;
 pub use crate::repositories::turn_execution::{
     NewTurnExecution, TurnExecutionRecord, TurnExecutionStatus, TurnExecutorKind,
+    load_for_turns as load_turn_executions_for_turns,
 };
 pub use crate::repositories::turn_finalization::PrepareTurnFinalizationOutcome;
 
@@ -4854,6 +4856,28 @@ impl CrudStore {
     ) -> Result<Option<CliRuntimeThreadBindingRecord>> {
         let thread_id = thread_id.to_owned();
         cli_runtime_binding::find_thread_binding(&self.connection, thread_id.as_str()).await
+    }
+
+    pub async fn update_cli_runtime_thread_resume_cursor(
+        &self,
+        thread_id: &str,
+        expected_native_thread_id: &str,
+        resume_cursor_json: String,
+        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<CliRuntimeThreadBindingRecord> {
+        let thread_id = thread_id.to_owned();
+        let expected_native_thread_id = expected_native_thread_id.to_owned();
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::update_thread_resume_cursor(
+                &self.connection,
+                thread_id.as_str(),
+                expected_native_thread_id.as_str(),
+                resume_cursor_json.clone(),
+                updated_at,
+            )
+            .await
+        })
+        .await
     }
 
     pub async fn prepare_claude_provider_session_binding(
@@ -16948,6 +16972,15 @@ impl CrudStore {
                 Err(error) => Some(Err(error)),
             })
             .collect()
+    }
+
+    pub async fn get_turn_message_guards_by_thread_and_ids(
+        &self,
+        thread_id: &str,
+        turn_ids: &[String],
+    ) -> Result<Vec<TurnMessageGuard>> {
+        turn::find_turn_message_guards_by_thread_and_ids(&self.connection, thread_id, turn_ids)
+            .await
     }
 
     pub async fn complete_in_progress_turns_after_final_agent_message(
@@ -37759,6 +37792,7 @@ mod tests {
             .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                 thread_binding: new_binding("claude-thread"),
                 proposed_provider_session_id: first_id.to_owned(),
+                force_new: false,
             })
             .await
             .expect("prepare Claude identity");
@@ -37777,6 +37811,7 @@ mod tests {
             .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                 thread_binding: new_binding("claude-thread"),
                 proposed_provider_session_id: "01900000-0000-7000-8000-000000000099".to_owned(),
+                force_new: false,
             })
             .await
             .expect("idempotent duplicate prepare");
@@ -37831,11 +37866,37 @@ mod tests {
                 .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                     thread_binding: new_binding("claude-thread"),
                     proposed_provider_session_id: "01900000-0000-7000-8000-000000000098".to_owned(),
+                    force_new: false,
                 })
                 .await
                 .expect("prepare verified identity")
                 .mode,
             PreparedClaudeProviderSessionMode::Resume
+        );
+
+        let replacement_id = "01900000-0000-7000-8000-000000000097";
+        let replacement = reloaded
+            .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                thread_binding: new_binding("claude-thread"),
+                proposed_provider_session_id: replacement_id.to_owned(),
+                force_new: true,
+            })
+            .await
+            .expect("stale Claude context should rotate to a fresh durable provider session");
+        assert_eq!(replacement.mode, PreparedClaudeProviderSessionMode::New);
+        assert_eq!(replacement.binding.native_thread_id, replacement_id);
+        let replacement_provider = replacement
+            .binding
+            .provider_session
+            .expect("replacement provider metadata");
+        assert_eq!(replacement_provider.provider_session_id, replacement_id);
+        assert_eq!(
+            replacement_provider.lifecycle,
+            CliRuntimeProviderSessionLifecycle::Prepared
+        );
+        assert_eq!(
+            replacement_provider.last_verified_process_generation, None,
+            "a new provider conversation must not inherit verification from the stale process"
         );
 
         for (thread_id, emitted) in [
@@ -37854,6 +37915,7 @@ mod tests {
                 .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                     thread_binding: new_binding(thread_id),
                     proposed_provider_session_id: expected.to_owned(),
+                    force_new: false,
                 })
                 .await
                 .expect("prepare rejection fixture");
@@ -37879,6 +37941,7 @@ mod tests {
                     .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                         thread_binding: new_binding(thread_id),
                         proposed_provider_session_id: expected.to_owned(),
+                        force_new: false,
                     })
                     .await
                     .is_err(),
@@ -37891,6 +37954,7 @@ mod tests {
                 .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                     thread_binding: new_binding("claude-invalid-uuid"),
                     proposed_provider_session_id: String::new(),
+                    force_new: false,
                 })
                 .await
                 .is_err()
@@ -37905,10 +37969,27 @@ mod tests {
                 .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
                     thread_binding: new_binding("claude-legacy-without-real-id"),
                     proposed_provider_session_id: "01900000-0000-7000-8000-000000000012".to_owned(),
+                    force_new: false,
                 })
                 .await
                 .is_err(),
             "legacy synthetic binding must not be silently treated as durable continuity"
+        );
+        let recovered_legacy = reloaded
+            .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                thread_binding: new_binding("claude-legacy-without-real-id"),
+                proposed_provider_session_id: "01900000-0000-7000-8000-000000000013".to_owned(),
+                force_new: true,
+            })
+            .await
+            .expect("explicit history bootstrap should replace a legacy Claude binding");
+        assert_eq!(
+            recovered_legacy.mode,
+            PreparedClaudeProviderSessionMode::New
+        );
+        assert_eq!(
+            recovered_legacy.binding.native_thread_id,
+            "01900000-0000-7000-8000-000000000013"
         );
     }
 

@@ -331,12 +331,15 @@ fn runtime_section_default_max_chars(id: &PromptRuntimeSectionId) -> usize {
         | PromptRuntimeSectionId::BuiltIn(
             PromptRuntimeBuiltInSectionId::PioneerCliRuntimeContext,
         )
-        | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext)
         | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedSkills)
         | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::SelectedCapabilities)
         | PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::CurrentPermissions) => {
             DEFAULT_DYNAMIC_PROMPT_SECTION_MAX_CHARS
         }
+        // ThreadContext can contain an already-budgeted, atomic conversation
+        // projection. Its caller reserves that projection in the total prompt
+        // budget; a generic per-section cap could split a message/tool round.
+        PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext) => usize::MAX,
         PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::AgentsMd) => {
             DEFAULT_AGENTS_MD_PROMPT_SECTION_MAX_CHARS
         }
@@ -417,9 +420,21 @@ fn build_runtime_prompt_sections(
             continue;
         }
 
-        if let Some(section) =
-            build_runtime_prompt_section(input, diagnostics, &mut remaining_total_chars)
-        {
+        // Accepted conversation history is an atomic projection: truncating it
+        // can split an assistant/tool round. It also must not consume the
+        // bounded budget reserved for the remaining runtime metadata. Full
+        // request admission is owned by the caller that selected the history.
+        let is_atomic_thread_context = matches!(
+            input.id,
+            PromptRuntimeSectionId::BuiltIn(PromptRuntimeBuiltInSectionId::ThreadContext)
+        );
+        let mut atomic_budget = usize::MAX;
+        let section_budget = if is_atomic_thread_context {
+            &mut atomic_budget
+        } else {
+            &mut remaining_total_chars
+        };
+        if let Some(section) = build_runtime_prompt_section(input, diagnostics, section_budget) {
             sections.push(section);
         }
     }
