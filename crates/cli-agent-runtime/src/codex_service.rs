@@ -14,7 +14,6 @@ use tokio::{
     sync::Mutex,
 };
 
-const RELEASE: &str = "0.154.0";
 const MAX_SERVICE_BYTES: usize = CODEX_MAX_MATERIALIZED_FRAME_BYTES;
 const DISABLED_FEATURES: &[&str] = &[
     "shell_tool",
@@ -102,14 +101,7 @@ impl CodexService {
             "service input exceeds transport capacity"
         );
         let run = async {
-            let (version, success) = self.invoke(None, deadline, 4096).await?;
-            ensure!(
-                success && std::str::from_utf8(&version)?.trim() == format!("codex-cli {RELEASE}"),
-                "unsupported Codex service capability version"
-            );
-            let (output, success) = self
-                .invoke(Some(&request), deadline, MAX_SERVICE_BYTES)
-                .await?;
+            let (output, success) = self.invoke(&request, deadline, MAX_SERVICE_BYTES).await?;
             let completion =
                 decode_exec_completion(&output).context(ServiceStage("cli_exec_decode"))?;
             ensure!(success, "Codex service process failed");
@@ -124,7 +116,7 @@ impl CodexService {
     }
     async fn invoke(
         &self,
-        request: Option<&CodexServiceRequest>,
+        request: &CodexServiceRequest,
         deadline: Instant,
         cap: usize,
     ) -> Result<(Vec<u8>, bool)> {
@@ -133,15 +125,13 @@ impl CodexService {
             ensure!(owner.is_none(), "previous service attempt needs cleanup");
             ensure!(Instant::now() < deadline, "Codex service deadline exceeded");
             let directory = tempfile::tempdir().context(ServiceStage("cli_directory"))?;
-            if let Some(request) = request {
-                // Instructions and transcript never go into process arguments.
-                // The private file is removed together with the owned attempt.
-                std::fs::write(
-                    directory.path().join("instructions.txt"),
-                    &request.instructions,
-                )
-                .context(ServiceStage("cli_configuration"))?;
-            }
+            // Instructions and transcript never go into process arguments.
+            // The private file is removed together with the owned attempt.
+            std::fs::write(
+                directory.path().join("instructions.txt"),
+                &request.instructions,
+            )
+            .context(ServiceStage("cli_configuration"))?;
             let config = process_config(&self.config, directory.path(), request)
                 .context(ServiceStage("cli_configuration"))?;
             let mut process =
@@ -152,9 +142,7 @@ impl CodexService {
                 _directory: directory,
             });
             let write = async move {
-                stdin
-                    .write_all(request.map_or(&[][..], |r| r.input.as_bytes()))
-                    .await?;
+                stdin.write_all(request.input.as_bytes()).await?;
                 stdin.shutdown().await
             };
             let read = async {
@@ -203,54 +191,51 @@ fn profile() -> JsonValue {
 fn process_config(
     config: &CodexServiceConfig,
     cwd: &Path,
-    request: Option<&CodexServiceRequest>,
+    request: &CodexServiceRequest,
 ) -> Result<CLIAgentProcessSpawnConfig> {
     let mut process =
         CLIAgentProcessSpawnConfig::codex_app_server(&config.executable, &config.home_path)
             .with_cwd(cwd)
             .with_environment(&config.environment)
             .with_stderr_ring_lines(0);
-    process.args = vec!["--version".into()];
-    if let Some(request) = request {
-        process.args = [
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "--json",
-            "--model",
-            &request.model,
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        for (key, value) in profile().as_object().unwrap() {
-            process.args.extend([
-                "--config".into(),
-                format!("{key}={}", toml::Value::try_from(value)?),
-            ]);
-        }
+    process.args = [
+        "exec",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--json",
+        "--model",
+        &request.model,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for (key, value) in profile().as_object().unwrap() {
+        process.args.extend([
+            "--config".into(),
+            format!("{key}={}", toml::Value::try_from(value)?),
+        ]);
+    }
+    process.args.extend([
+        "--config".into(),
+        format!(
+            "model_instructions_file={}",
+            toml::Value::String(cwd.join("instructions.txt").to_string_lossy().into_owned())
+        ),
+    ]);
+    if let Some(effort) = &request.effort {
         process.args.extend([
             "--config".into(),
             format!(
-                "model_instructions_file={}",
-                toml::Value::String(cwd.join("instructions.txt").to_string_lossy().into_owned())
+                "model_reasoning_effort={}",
+                toml::Value::String(effort.clone())
             ),
         ]);
-        if let Some(effort) = &request.effort {
-            process.args.extend([
-                "--config".into(),
-                format!(
-                    "model_reasoning_effort={}",
-                    toml::Value::String(effort.clone())
-                ),
-            ]);
-        }
-        process.args.push("-".into());
     }
+    process.args.push("-".into());
     Ok(process)
 }
 
@@ -523,7 +508,7 @@ mod exec_tests {
 import json, os, pathlib, sys, time
 home=pathlib.Path(os.environ['CODEX_HOME'])
 if sys.argv[1:] == ['--version']:
-    print('codex-cli 0.154.0-canary' if (home/'unsupported').exists() else 'codex-cli 0.154.0');sys.exit(0)
+    raise AssertionError('summary service must not probe the CLI version')
 a=sys.argv[1:]
 assert a[0]=='exec' and a[-1]=='-'
 assert all(flag in a for flag in ['--ephemeral','--ignore-user-config','--ignore-rules','--skip-git-repo-check','--json'])
@@ -548,15 +533,6 @@ if (home/'bad-exit').exists(): sys.exit(1)
             home_path: home.to_string_lossy().into(),
             environment: SensitiveEnvironment::new(),
         }));
-        std::fs::write(home.join("unsupported"), "").unwrap();
-        assert!(
-            service
-                .summarize(request(), Duration::from_secs(5))
-                .await
-                .is_err()
-        );
-        assert!(!home.join("trace").exists());
-        std::fs::remove_file(home.join("unsupported")).unwrap();
         for _ in 0..2 {
             assert_eq!(
                 service

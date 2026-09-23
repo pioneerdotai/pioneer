@@ -144,10 +144,6 @@ fn service_diagnostic(error: &anyhow::Error) -> pioneer_compaction::runner::Fail
     let known = error
         .chain()
         .find_map(|cause| match cause.to_string().as_str() {
-            "unsupported Codex service capability version" => Some((
-                "cli_version_unsupported",
-                "Installed Codex version does not match the supported service protocol",
-            )),
             "Codex service isolation was not applied" => Some((
                 "cli_isolation_rejected",
                 "Codex config/read did not confirm the required isolated service profile",
