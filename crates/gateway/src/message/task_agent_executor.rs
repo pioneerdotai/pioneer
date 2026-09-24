@@ -2005,22 +2005,189 @@ impl TaskAgentExecutor {
         let turn_response =
             agent_turn_response_input(processor, child_turn_id.as_str(), execution.id.as_str())
                 .await?;
+        let materialize_actor = non_cli_action_author.actor.clone();
+        // LLDB shows that polling this workflow underneath start_run,
+        // start_or_recover_run and start_new_child_turn exhausts the Tokio
+        // worker's native stack before the first post-materialization query.
+        // Own every borrowed input and schedule the complete workflow as one
+        // task so its poll stack starts at the runtime boundary.
+        let workflow_processor = Arc::clone(processor);
+        let workflow_context = (*context).clone();
+        let workflow_task = (*task).clone();
+        let workflow_agent_spec = agent_spec.clone();
+        let workflow_run = (*run).clone();
+        let workflow_parent = (*parent).clone();
+        message_fresh_task(async move {
+            let processor = &workflow_processor;
+            let context = &workflow_context;
+            let task = &workflow_task;
+            let agent_spec = &workflow_agent_spec;
+            let run = &workflow_run;
+            let parent = &workflow_parent;
+            let turn_outcome = processor
+                .thread_manager
+                .agent_turn_start_with_permission_profile(
+                    TurnStartParams {
+                        input: child_input.clone(),
+                        model: Some(effective_model.model.clone()),
+                        model_provider: Some(effective_model.model_provider.clone()),
+                        mode: Some(child_mode),
+                        ..turn_params.clone()
+                    },
+                    child_permission_profile.clone(),
+                    non_cli_action_author,
+                )
+                .await
+                .context("failed to create hidden task turn")?;
+
+        if let Err(error) = processor
+            .validate_turn_artifact_user_inputs(
+                context.workspace_id.as_str(),
+                parent.root_thread_id.as_str(),
+                turn_outcome.materialization.input.as_slice(),
+            )
+            .await
+        {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to validate hidden task artifact input");
+        }
+
+        let turn_permission_profile = match processor
+            .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
+        {
+            Ok(permission_profile) => permission_profile,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to resolve hidden task permission profile");
+            }
+        };
+        let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
+            context.workspace_id.as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            turn_permission_profile.clone(),
+        );
+        let child_authority_json = child_authorization_context
+            .to_persisted_json()
+            .context("failed to encode hidden task authority envelope")?;
+        let child_turn_admission = match child_authorization_context
+            .durable_turn_admission_after_revalidation(
+                child_thread_id.as_str(),
+                child_turn_id.as_str(),
+                child_execution_backend.as_ref(),
+                &child_authorization_revalidation,
+            )
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(error).context("failed to reserve hidden task execution quota");
+            }
+        };
+        // Turn-start projection is one atomic CRUD operation, but its SeaORM
+        // future is intentionally large. Poll it from a fresh task so the
+        // scheduler -> TaskExecutor -> child-admission frames are not stacked
+        // underneath the projector. Abort-on-drop preserves cancellation and
+        // lets the transaction roll back if its caller disappears.
+        let materialize_store = processor.crud_store.clone();
+        let materialize_thread = turn_outcome.materialization.thread.clone();
+        let materialize_sandbox_mode = turn_outcome.materialization.sandbox_mode;
+        let materialize_turn = turn_outcome.materialization.turn.clone();
+        let materialize_input = turn_outcome.materialization.input.clone();
+        let materialize_reasoning_effort = reasoning_effort.clone();
+        let materialize_execution = super::turn_handlers::new_turn_execution(
+            processor.turn_execution_owner_id.as_ref(),
+            child_execution_backend.as_ref(),
+            &turn_outcome.materialization,
+        )?;
+        let materialize_response = turn_response.clone();
+        let materialize_security_snapshot = child_security_snapshot.clone();
+        let materialize_security_audits = processor.turn_security_audit_events_for_turn(
+            context.workspace_id.as_str(),
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            &child_security_snapshot,
+        );
+        let materialize_result = message_fresh_task(async move {
+            materialize_store
+                .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                    &materialize_thread,
+                    materialize_sandbox_mode,
+                    &materialize_turn,
+                    &materialize_input,
+                    materialize_reasoning_effort.as_deref(),
+                    pioneer_crud::TurnWorkOwner::Turn,
+                    materialize_actor,
+                    profile_selected_audit,
+                    child_authority_json.as_str(),
+                    None,
+                    Some(child_turn_admission),
+                    Some(materialize_execution),
+                    &materialize_security_snapshot,
+                    materialize_security_audits,
+                    None,
+                    Some(materialize_response),
+                )
+                .await
+        })
+        .await
+        .map_err(|error| anyhow!("hidden task turn projection task failed: {error}"))?;
+        if let Err(error) = materialize_result {
+            processor
+                .thread_manager
+                .rollback_turn_start(turn_outcome.rollback_context)
+                .await;
+            return Err(error).context("failed to persist hidden task turn");
+        }
+        // The execution lease revalidator proves the child against durable
+        // lineage. Turn, authority, security snapshot and response are already
+        // one atomic write; link the runtime before registering its live lease.
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            handle
+                .link_child_thread_with_runtime(
+                    child_runtime.lineage.clone(),
+                    binding,
+                    child_runtime.task_run_turn.clone(),
+                    now,
+                )
+                .await
+                .context("failed to link hidden task runtime"),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            register_resolved_task_child_execution_lease(processor, child_turn_id.as_str())
+            .await
+            .context("failed to register hidden task execution lease"),
+        )
+        .await?;
+        close_admitted_task_turn_on_error(
+            processor,
+            child_thread_id.as_str(),
+            child_turn_id.as_str(),
+            verify_durable_task_child_admission(processor, &child_runtime, &execution)
+                .await
+                .context("failed to verify hidden task child admission"),
+        )
+        .await?;
+
         if let Some((runtime_id, runtime_kind)) = cli_runtime_backend {
             let action_author = input_author;
             return message_future(async move {
-                // Child-scoped authorization is revalidated while CLI MCP and skill
-                // projections are committed. Persist the durable lineage first so
-                // those checks can prove that the hidden thread belongs to the
-                // parent's authorization root.
-                handle
-                    .link_child_thread_with_runtime(
-                        child_runtime.lineage.clone(),
-                        binding,
-                        child_runtime.task_run_turn.clone(),
-                        now,
-                    )
-                    .await
-                    .context("failed to link hidden task CLI runtime turn")?;
                 // The shared CLI preparation future is deliberately large. Run it
                 // from a fresh Tokio task so Task scheduler dispatch frames do not
                 // consume the native runtime worker's stack before preparation
@@ -2047,6 +2214,10 @@ impl TaskAgentExecutor {
                 let prepared: anyhow::Result<
                     super::turn_handlers::PreparedCliRuntimeNativeTurnStart,
                 > = message_fresh_task(async move {
+                    #[cfg(test)]
+                    prepare_processor.completed_history_preparation_barrier.wait_if_armed(
+                        "__task_cli_before_history__", &prepare_processor.cli_history_shutdown,
+                    ).await;
                     if !accepted_snapshot_exists {
                         load_task_execution_conversation_scope(
                             &prepare_processor,
@@ -2084,12 +2255,17 @@ impl TaskAgentExecutor {
                             execution_id,
                             action_author,
                             turn_response,
+                            Some(turn_outcome),
                         )
                         .await?;
                     Ok(prepared)
                 })
                 .await
-                .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))?;
+                .map_err(|error| anyhow!("task CLI runtime preparation task failed: {error}"))
+                .and_then(|result| result);
+                let prepared = close_admitted_task_turn_on_error(
+                    processor, &child_thread_id, &child_turn_id, prepared,
+                ).await;
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -2223,185 +2399,6 @@ impl TaskAgentExecutor {
             })
             .await;
         }
-        let materialize_actor = non_cli_action_author.actor.clone();
-        // LLDB shows that polling this workflow underneath start_run,
-        // start_or_recover_run and start_new_child_turn exhausts the Tokio
-        // worker's native stack before the first post-materialization query.
-        // Own every borrowed input and schedule the complete workflow as one
-        // task so its poll stack starts at the runtime boundary.
-        let workflow_processor = Arc::clone(processor);
-        let workflow_context = (*context).clone();
-        let workflow_task = (*task).clone();
-        let workflow_agent_spec = agent_spec.clone();
-        let workflow_run = (*run).clone();
-        let workflow_parent = (*parent).clone();
-        message_fresh_task(async move {
-            let processor = &workflow_processor;
-            let context = &workflow_context;
-            let task = &workflow_task;
-            let agent_spec = &workflow_agent_spec;
-            let run = &workflow_run;
-            let parent = &workflow_parent;
-            let turn_outcome = processor
-                .thread_manager
-                .agent_turn_start_with_permission_profile(
-                    TurnStartParams {
-                        input: child_input,
-                        model: Some(effective_model.model.clone()),
-                        model_provider: Some(effective_model.model_provider.clone()),
-                        mode: Some(child_mode),
-                        ..turn_params
-                    },
-                    child_permission_profile,
-                    non_cli_action_author,
-                )
-                .await
-                .context("failed to create hidden task turn")?;
-
-        if let Err(error) = processor
-            .validate_turn_artifact_user_inputs(
-                context.workspace_id.as_str(),
-                parent.root_thread_id.as_str(),
-                turn_outcome.materialization.input.as_slice(),
-            )
-            .await
-        {
-            processor
-                .thread_manager
-                .rollback_turn_start(turn_outcome.rollback_context)
-                .await;
-            return Err(error).context("failed to validate hidden task artifact input");
-        }
-
-        let turn_permission_profile = match processor
-            .materialized_turn_permission_profile(&turn_outcome.materialization.turn)
-        {
-            Ok(permission_profile) => permission_profile,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                return Err(error).context("failed to resolve hidden task permission profile");
-            }
-        };
-        let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
-            context.workspace_id.as_str(),
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            turn_permission_profile.clone(),
-        );
-        let child_authority_json = child_authorization_context
-            .to_persisted_json()
-            .context("failed to encode hidden task authority envelope")?;
-        let child_turn_admission = match child_authorization_context
-            .durable_turn_admission_after_revalidation(
-                child_thread_id.as_str(),
-                child_turn_id.as_str(),
-                child_execution_backend.as_ref(),
-                &child_authorization_revalidation,
-            )
-        {
-            Ok(admission) => admission,
-            Err(error) => {
-                processor
-                    .thread_manager
-                    .rollback_turn_start(turn_outcome.rollback_context)
-                    .await;
-                return Err(error).context("failed to reserve hidden task execution quota");
-            }
-        };
-        // Turn-start projection is one atomic CRUD operation, but its SeaORM
-        // future is intentionally large. Poll it from a fresh task so the
-        // scheduler -> TaskExecutor -> child-admission frames are not stacked
-        // underneath the projector. Abort-on-drop preserves cancellation and
-        // lets the transaction roll back if its caller disappears.
-        let materialize_store = processor.crud_store.clone();
-        let materialize_thread = turn_outcome.materialization.thread.clone();
-        let materialize_sandbox_mode = turn_outcome.materialization.sandbox_mode;
-        let materialize_turn = turn_outcome.materialization.turn.clone();
-        let materialize_input = turn_outcome.materialization.input.clone();
-        let materialize_reasoning_effort = reasoning_effort.clone();
-        let materialize_execution = super::turn_handlers::new_turn_execution(
-            processor.turn_execution_owner_id.as_ref(),
-            child_execution_backend.as_ref(),
-            &turn_outcome.materialization,
-        )?;
-        let materialize_response = turn_response;
-        let materialize_security_snapshot = child_security_snapshot.clone();
-        let materialize_security_audits = processor.turn_security_audit_events_for_turn(
-            context.workspace_id.as_str(),
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            &child_security_snapshot,
-        );
-        let materialize_result = message_fresh_task(async move {
-            materialize_store
-                .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
-                    &materialize_thread,
-                    materialize_sandbox_mode,
-                    &materialize_turn,
-                    &materialize_input,
-                    materialize_reasoning_effort.as_deref(),
-                    pioneer_crud::TurnWorkOwner::Turn,
-                    materialize_actor,
-                    profile_selected_audit,
-                    child_authority_json.as_str(),
-                    None,
-                    Some(child_turn_admission),
-                    Some(materialize_execution),
-                    &materialize_security_snapshot,
-                    materialize_security_audits,
-                    None,
-                    Some(materialize_response),
-                )
-                .await
-        })
-        .await
-        .map_err(|error| anyhow!("hidden task turn projection task failed: {error}"))?;
-        if let Err(error) = materialize_result {
-            processor
-                .thread_manager
-                .rollback_turn_start(turn_outcome.rollback_context)
-                .await;
-            return Err(error).context("failed to persist hidden task turn");
-        }
-        // The execution lease revalidator proves the child against durable
-        // lineage. Turn, authority, security snapshot and response are already
-        // one atomic write; link the runtime before registering its live lease.
-        close_admitted_task_turn_on_error(
-            processor,
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            handle
-                .link_child_thread_with_runtime(
-                    child_runtime.lineage.clone(),
-                    binding,
-                    child_runtime.task_run_turn.clone(),
-                    now,
-                )
-                .await
-                .context("failed to link hidden task runtime"),
-        )
-        .await?;
-        close_admitted_task_turn_on_error(
-            processor,
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            register_resolved_task_child_execution_lease(processor, child_turn_id.as_str())
-            .await
-            .context("failed to register hidden task execution lease"),
-        )
-        .await?;
-        close_admitted_task_turn_on_error(
-            processor,
-            child_thread_id.as_str(),
-            child_turn_id.as_str(),
-            verify_durable_task_child_admission(processor, &child_runtime, &execution)
-                .await
-                .context("failed to verify hidden task child admission"),
-        )
-        .await?;
 
         processor.ensure_hook_runtime_with_run_store().await;
         close_admitted_task_turn_on_error(
@@ -3050,6 +3047,7 @@ impl TaskAgentExecutor {
                     execution.id.clone(),
                     action_author,
                     turn_response.clone(),
+                    None,
                 )
                 .await
                 .context("failed to prepare revision CLI runtime turn")?;
@@ -5446,6 +5444,7 @@ impl TaskAgentExecutor {
                     reviewer_execution_id.clone(),
                     action_author,
                     turn_response.clone(),
+                    None,
                 )
                 .await
                 .context("failed to prepare reviewer CLI runtime turn")?;

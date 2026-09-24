@@ -27348,11 +27348,25 @@ impl CrudStore {
             return Err(error);
         }
 
-        if let Some(execution) = execution
-            && let Err(error) = turn_execution::insert_immutable(&transaction, execution).await
-        {
-            let _ = transaction.rollback().await;
-            return Err(error);
+        if let Some(execution) = execution {
+            let execution = match turn_execution::insert_immutable(&transaction, execution).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+            // TurnStarted was projected before the ownership receipt existed.
+            // Refresh within this same atomic admission so a visible CLI child
+            // already shows its queued state, even without a runtime binding.
+            if execution.executor_kind == TurnExecutorKind::CliRuntime {
+                self.project_cli_runtime_turn_binding_state(
+                    &transaction,
+                    &execution.turn_id,
+                    created_at,
+                )
+                .await?;
+            }
         }
 
         if let Some((turn_id, authority_envelope_json)) = authority_envelope

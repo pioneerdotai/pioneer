@@ -26427,6 +26427,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
         cli_session
             .set_next_native_turn_id(native_turn_id.clone())
             .await;
+        processor.arm_completed_history_preparation_barrier("__task_cli_before_history__");
         let response = create_task_for_test(&processor, params)
             .await
             .expect("native detached Task should be accepted");
@@ -26476,6 +26477,40 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "only this Composer TaskRun may follow its launch"
         );
         let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
+        timeout(
+            Duration::from_secs(10),
+            processor.wait_for_completed_history_preparation_barrier(),
+        )
+        .await
+        .expect("CLI child should reach preparation after publishing its durable input");
+        assert!(cli_session.turn_starts.lock().await.is_empty());
+        let queued_work = crud_store
+            .get_turn_work_projection(&lineage.child_turn_id)
+            .await
+            .unwrap()
+            .expect("a newly opened child must show work before history preparation");
+        assert_eq!(queued_work.state, "starting");
+        let child_user_block = thread_timeline_block::Entity::find()
+            .filter(thread_timeline_block::Column::ThreadId.eq(&lineage.child_thread_id))
+            .filter(thread_timeline_block::Column::TurnId.eq(&lineage.child_turn_id))
+            .filter(
+                thread_timeline_block::Column::BlockKind.eq(pioneer_crud::BLOCK_KIND_USER_MESSAGE),
+            )
+            .one(&crud_store.database_connection())
+            .await
+            .unwrap();
+        assert!(
+            child_user_block.is_some(),
+            "child input must be visible before preparation"
+        );
+        let inputs = crud_store
+            .get_turn_inputs(&lineage.child_turn_id)
+            .await
+            .expect("child input must be durable before preparation");
+        assert!(inputs.iter().any(
+            |input| matches!(input, UserInput::Text { text, .. } if text.contains(&input_marker))
+        ));
+        processor.release_completed_history_preparation_barrier();
         let starts = wait_for_cli_runtime_turn_starts(&cli_session, 1).await;
         assert_eq!(
             starts.len(),

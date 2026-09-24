@@ -721,6 +721,7 @@ pub(super) enum TurnStartSuccessResponse {
         execution_id: String,
         agent_author: Option<pioneer_protocol::TurnAuthorSnapshot>,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
+        admitted_outcome: Option<Box<crate::thread::TurnStartOutcome>>,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -3396,6 +3397,7 @@ impl MessageProcessor {
         execution_id: String,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
+        admitted_outcome: Option<crate::thread::TurnStartOutcome>,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let response = TurnStartSuccessResponse::Task {
@@ -3407,6 +3409,7 @@ impl MessageProcessor {
             execution_id,
             agent_author: Some(agent_author),
             agent_turn_response,
+            admitted_outcome: admitted_outcome.map(Box::new),
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
         self.turn_start_cli_runtime(
@@ -3902,7 +3905,7 @@ impl MessageProcessor {
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
         mut execution_authority: TurnExecutionAuthority,
-        success_response: TurnStartSuccessResponse,
+        mut success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
         message_future(async move {
             // A hidden Task CLI turn is still authored by the admitted agent.
@@ -3927,6 +3930,13 @@ impl MessageProcessor {
                     crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart
                 }
             };
+            let already_materialized = matches!(
+                &success_response,
+                TurnStartSuccessResponse::Task {
+                    admitted_outcome: Some(_),
+                    ..
+                }
+            );
             let response_turn_id = params.turn_id.clone();
             pioneer_observability::turn_startup::set_runtime(
                 &response_turn_id,
@@ -4366,8 +4376,19 @@ impl MessageProcessor {
             } else {
                 None
             };
-            let latest_parent_turn_id = match self.crud_store
-                .latest_turn_id_by_creation_order(continuation_thread_id.as_str()).await {
+            // An early-materialized independent child must not treat its own
+            // queued input as already delivered conversation history.
+            let latest_parent_turn = if already_materialized && continuation_thread_id == thread.id {
+                self.crud_store.turn_before_launch_and_intervening_by_creation_order(
+                    continuation_thread_id.as_str(), &response_turn_id, &response_turn_id,
+                ).await.and_then(|position| match position {
+                    Some((previous, false)) => Ok(previous),
+                    _ => anyhow::bail!("queued child conversation changed before CLI preparation"),
+                })
+            } else {
+                self.crud_store.latest_turn_id_by_creation_order(continuation_thread_id.as_str()).await
+            };
+            let latest_parent_turn_id = match latest_parent_turn {
                 Ok(id) => id,
                 Err(error) => {
                     send_turn_start_failure!(format!("failed to order CLI continuation turns: {error:#}"));
@@ -5189,7 +5210,13 @@ impl MessageProcessor {
                     return None;
                 }
             };
-            let outcome_result = if let Some(permission_profile) =
+            let admitted_outcome = match &mut success_response {
+                TurnStartSuccessResponse::Task { admitted_outcome, .. } => admitted_outcome.take(),
+                _ => None,
+            };
+            let outcome_result = if let Some(outcome) = admitted_outcome {
+                Ok(*outcome)
+            } else if let Some(permission_profile) =
                 success_response.task_permission_profile()
             {
                 if let Some(agent_author) = success_response.task_agent_author() {
@@ -5236,9 +5263,11 @@ impl MessageProcessor {
                 )
                 .await
             {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
+                if !already_materialized {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                }
                 send_turn_start_failure!(message);
                 return None;
             }
@@ -5250,9 +5279,11 @@ impl MessageProcessor {
                 ) {
                     Ok(attachments) => attachments,
                     Err(error) => {
-                        self.thread_manager
-                            .rollback_turn_start(outcome.rollback_context.clone())
-                            .await;
+                        if !already_materialized {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                        }
                         send_turn_start_failure!(format!(
                             "failed to snapshot selected skill presentation: {error:#}"
                         ));
@@ -5273,9 +5304,11 @@ impl MessageProcessor {
             {
                 Ok(effort) => effort,
                 Err(message) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
                     send_turn_start_failure!(message);
                     return None;
                 }
@@ -5329,18 +5362,22 @@ impl MessageProcessor {
                     )
                     .await
             {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
+                if !already_materialized {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                }
                 send_turn_start_failure!(message);
                 return None;
             }
             let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
                 Ok(event) => event,
                 Err(error) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
                     send_turn_start_failure!(format!(
                         "failed to resolve turn permission profile: {error:#}"
                     ));
@@ -5358,9 +5395,11 @@ impl MessageProcessor {
             {
                 Ok(snapshot) => snapshot,
                 Err(failure) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
                     send_turn_start_failure!(failure);
                     return None;
                 }
@@ -5394,9 +5433,11 @@ impl MessageProcessor {
                     ) {
                         Ok(authority) => authority,
                         Err(error) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
+                            if !already_materialized {
+                                self.thread_manager
+                                    .rollback_turn_start(outcome.rollback_context.clone())
+                                    .await;
+                            }
                             send_turn_start_failure!(format!(
                                 "failed to finalize root CLI Agent authority: {error:#}"
                             ));
@@ -5421,9 +5462,11 @@ impl MessageProcessor {
                     {
                         Ok(prepared) => Some(prepared),
                         Err(error) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
+                            if !already_materialized {
+                                self.thread_manager
+                                    .rollback_turn_start(outcome.rollback_context.clone())
+                                    .await;
+                            }
                             send_turn_start_failure!(format!(
                                 "failed to admit root CLI Agent execution: {error:#}"
                             ));
@@ -5440,7 +5483,11 @@ impl MessageProcessor {
             let execution_graph = prepared_root_execution
                 .as_ref()
                 .map(|prepared| prepared.graph.clone());
-            let materialization_result = {
+            let materialization_result = if already_materialized {
+                // The shared Task admission already committed input, authority,
+                // security and execution atomically before exposing the child.
+                Ok(Ok(None))
+            } else {
                 let crud_store = self.crud_store.clone();
                 let provider_registry = self.provider_registry.clone();
                 let execution_owner_id = self.turn_execution_owner_id.clone();
@@ -5477,9 +5524,11 @@ impl MessageProcessor {
             let graph_result = match materialization_result {
                 Ok(result) => result,
                 Err(error) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
 
                     send_turn_start_failure!(format!(
                         "failed to persist CLI runtime turn/start state and permission audit: {error:#}"

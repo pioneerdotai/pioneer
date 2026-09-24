@@ -1059,9 +1059,20 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
             .await?;
     let running_item_state =
         find_running_item_state(db, turn_model.id.as_str(), summary_updated_at).await?;
-    let cli_runtime_status = find_turn_binding(db, turn_model.id.as_str())
+    let mut cli_runtime_status = find_turn_binding(db, turn_model.id.as_str())
         .await?
         .map(|binding| binding.status);
+    // A child is visible before CLI history preparation creates its runtime
+    // binding. Its existing execution receipt owns that queued interval.
+    if cli_runtime_status.is_none()
+        && turn_model.status == "in_progress"
+        && let Some(execution) =
+            crate::repositories::turn_execution::find(db, &turn_model.id).await?
+        && execution.executor_kind == crate::TurnExecutorKind::CliRuntime
+        && execution.status == crate::TurnExecutionStatus::Starting
+    {
+        cli_runtime_status = Some("starting".to_owned());
+    }
     let presentation = turn_work_presentation(turn_model, has_final);
     let state = turn_work_state(
         turn_model.status.as_str(),
