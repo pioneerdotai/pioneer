@@ -3277,6 +3277,58 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         frozen_count(&store, "compaction_frozen_import_data").await,
         1
     );
+    // The import still matches, but its target is not stored yet when the
+    // message prefix diverges. Prefix preparation (including retry) must let
+    // the normal message-then-import append path complete the capture.
+    let mut divergent_messages = context_messages.clone();
+    divergent_messages[0].wire_sha256 = "d".repeat(64);
+    let divergent = descriptor("assembled-divergent", &divergent_messages);
+    store
+        .compaction_begin_frozen_history_with_imports("ws", "thread", &divergent, 1, &import_digest)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .compaction_share_frozen_prefix(
+                    "ws",
+                    "thread",
+                    &divergent.manifest_id,
+                    &divergent_messages,
+                    &imports,
+                )
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+    }
+    store
+        .compaction_append_frozen_history(
+            "ws",
+            "thread",
+            &divergent.manifest_id,
+            0,
+            &divergent_messages,
+        )
+        .await
+        .unwrap();
+    store
+        .compaction_append_frozen_imports("ws", "thread", &divergent.manifest_id, 0, &imports)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &divergent)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_import_page("ws", "thread", &divergent.manifest_id, 0)
+            .await
+            .unwrap(),
+        records
+    );
     // A new execution can adopt this metadata only through its exact TaskRun
     // snapshot; sharing a workspace or parent thread is insufficient.
     for statement in [

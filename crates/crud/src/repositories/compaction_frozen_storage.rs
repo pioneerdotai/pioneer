@@ -215,11 +215,19 @@ pub(crate) async fn prepare(
                 break;
             }
             for (_, text) in page {
-                if entries.get(matched) != Some(&text)
-                    || (kind == 1
-                        && !same_import_target(&store.connection, id, base, &text).await?)
-                {
+                if entries.get(matched) != Some(&text) {
                     break 'pages;
+                }
+                if kind == 1 {
+                    let proof: super::compaction_frozen_import::FrozenImportRecord =
+                        serde_json::from_str(&text)?;
+                    // The message tail is appended after prefix preparation.
+                    // Imports targeting it must follow the normal append path.
+                    if i64::try_from(proof.message_ordinal)? >= h.next_ordinal
+                        || !same_import_target(&store.connection, id, base, &text).await?
+                    {
+                        break 'pages;
+                    }
                 }
                 matched += 1;
                 if matched == entries.len() {
