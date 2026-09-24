@@ -4393,6 +4393,15 @@ impl MessageProcessor {
                     }
                 }
             } else { latest_parent_turn_id.clone() };
+            let previous_parent_id = match crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                self.crud_store.as_ref(), continuation_thread_id.as_str(), previous_parent_id,
+            ).await {
+                Ok(previous) => previous,
+                Err(error) => {
+                    send_turn_start_failure!(format!("failed to resolve CLI continuation before undispatched attempts: {error:#}"));
+                    return None;
+                }
+            };
             let previous_parent_turn = match previous_parent_id.as_deref() {
                 Some(id) => match self.crud_store.get_turn(continuation_thread_id.as_str(), id).await {
                     Ok(Some((_, turn))) => Some(turn),

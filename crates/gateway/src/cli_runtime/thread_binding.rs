@@ -337,6 +337,116 @@ struct CliRuntimeResumeCursor {
 
 const TURN_INPUT_CONTEXT_BASIS_FIELD: &str = "pioneerContextBasis";
 
+/// Resolve the provider frontier past attempts that stopped before dispatch.
+/// The caller holds the continuation lease. A durable CLI binding/attempt is
+/// written before provider start; its presence forbids skipping an uncertain RPC.
+pub(crate) async fn previous_delivered_parent_turn(
+    store: &CrudStore,
+    thread: &str,
+    mut previous: Option<String>,
+) -> Result<Option<String>> {
+    use pioneer_protocol::{TurnKind, TurnStatus};
+    // Terminal status alone is not proof of non-delivery. Failed/Interrupted
+    // are safe only with the same no-dispatch checks used for Blocked below.
+    let unsuccessful = |status| {
+        matches!(
+            status,
+            TurnStatus::Blocked | TurnStatus::Failed | TurnStatus::Interrupted
+        )
+    };
+    for _ in 0..16 {
+        let Some(id) = previous.as_deref() else {
+            return Ok(None);
+        };
+        let (_, turn) = store
+            .get_turn(thread, id)
+            .await?
+            .context("CLI predecessor missing")?;
+        if !unsuccessful(turn.status) || turn.message_revision != 0 || turn.message_deleted {
+            return Ok(previous);
+        }
+        let (execution_thread, execution_turn, launch) = if turn.turn_kind == TurnKind::TaskRun {
+            let run = store
+                .get_task_run(id)
+                .await?
+                .context("CLI predecessor TaskRun missing")?;
+            let task = store
+                .get_task_record(&run.task_id)
+                .await?
+                .context("CLI predecessor Task missing")?;
+            let Some(work) = task
+                .metadata
+                .as_ref()
+                .and_then(|m| m.composer_work.as_ref())
+            else {
+                return Ok(previous);
+            };
+            let Some(child) = store.get_latest_task_run_turn(id).await? else {
+                return Ok(previous);
+            };
+            if work.launch.thread_id != thread
+                || !run.status.is_terminal()
+                || run.attempt_number != 1
+                || child.kind != pioneer_protocol::TaskRunTurnKind::Initial
+                || child.sequence != 1
+            {
+                return Ok(previous);
+            }
+            let (_, launch) = store
+                .get_turn(thread, &work.launch.turn_id)
+                .await?
+                .context("CLI predecessor Composer launch missing")?;
+            let adjacent = store
+                .turn_before_launch_and_intervening_by_creation_order(thread, id, id)
+                .await?
+                .context("CLI predecessor order missing")?
+                .0;
+            if adjacent.as_deref() != Some(launch.id.as_str())
+                || launch.message_revision != 0
+                || launch.message_deleted
+            {
+                return Ok(previous);
+            }
+            (child.thread_id, child.turn_id, launch.id)
+        } else {
+            (thread.to_owned(), id.to_owned(), id.to_owned())
+        };
+        let (_, execution) = store
+            .get_turn(&execution_thread, &execution_turn)
+            .await?
+            .context("CLI predecessor execution missing")?;
+        if !unsuccessful(execution.status)
+            || execution.message_revision != 0
+            || execution.message_deleted
+            || !store
+                .get_turn_execution(&execution_turn)
+                .await?
+                .is_some_and(|e| {
+                    e.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                        && !e.status.is_active()
+                })
+            || store
+                .get_cli_runtime_turn_binding(&execution_turn)
+                .await?
+                .is_some()
+            || store
+                .latest_cli_runtime_turn_attempt(&execution_turn)
+                .await?
+                .is_some()
+        {
+            return Ok(previous);
+        }
+        // Reuse the bounded timestamp/bucket seek, not a scan of thread history.
+        // Later turns are expected here; only the immediate predecessor is needed.
+        previous = store
+            .turn_before_launch_and_intervening_by_creation_order(thread, &launch, id)
+            .await?
+            .context("CLI predecessor launch order missing")?
+            .0;
+    }
+    bail!("too many undispatched CLI attempts; continuation requires inspection")
+}
+
 pub(crate) fn provider_receipt_head_state(
     binding: &CliRuntimeThreadBindingRecord,
     previous: Option<(&str, u64, bool)>,

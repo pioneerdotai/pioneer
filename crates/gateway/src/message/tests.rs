@@ -26751,6 +26751,127 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             })
             .await
             .expect("older completed child turn mapping should have no new context carrier");
+        // Production legacy shape: terminal Composer attempts stopped before CLI
+        // dispatch. They must not hide the completed provider-owned frontier.
+        let db = crud_store.database_connection();
+        for (index, (status, task_status)) in [
+            ("blocked", "blocked"),
+            ("failed", "failed"),
+            ("interrupted", "cancelled"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let launch = format!("undispatched_launch_{index}");
+            let blocked_run = format!("undispatched_run_{index}");
+            let blocked_task = format!("undispatched_task_{index}");
+            let child = format!("undispatched_child_{index}");
+            let child_turn = format!("undispatched_turn_{index}");
+            for sql in [
+                format!(
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) SELECT '{launch}',thread_id,'completed','conversation','user',created_at,updated_at FROM turn WHERE id='{}'",
+                    run.id
+                ),
+                format!(
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) SELECT '{blocked_run}',thread_id,'{status}','task_run','system',created_at,updated_at FROM turn WHERE id='{}'",
+                    run.id
+                ),
+                format!(
+                    "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) SELECT '{child}',workspace_id,'',mode,model,model_provider,'active','task_run','internal',created_at,updated_at FROM thread WHERE id='{}'",
+                    lineage.child_thread_id
+                ),
+                format!(
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) SELECT '{child_turn}','{child}','{status}','conversation','system',created_at,updated_at FROM turn WHERE id='{}'",
+                    lineage.child_turn_id
+                ),
+                format!(
+                    "INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,executor_key,status,owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at) SELECT '{child_turn}','{child}',workspace_id,'cli_runtime',executor_key,'{status}',owner_id,owner_generation,lease_until,heartbeat_at,created_at,updated_at FROM turn_execution WHERE turn_id='{}'",
+                    lineage.child_turn_id
+                ),
+                format!(
+                    "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal,metadata_json) SELECT '{blocked_task}',workspace_id,owner_kind,owner_id,created_by_thread_id,'{launch}',executor_kind,'{task_status}',title,goal,json_set(metadata_json,'$.composerWork.launch.turn_id','{launch}') FROM task WHERE id='{task_id}'"
+                ),
+                format!(
+                    "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{blocked_run}','{blocked_task}','{blocked_run}',1,1,'{task_status}','agent')"
+                ),
+                format!(
+                    "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status) VALUES ('{child_turn}','{blocked_task}','{blocked_run}','{child}','{child_turn}','initial',0,1,'{status}')"
+                ),
+            ] {
+                db.execute_unprepared(&sql).await.unwrap();
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                        crud_store.as_ref(),
+                        &parent_thread_id,
+                        Some(blocked_run.clone()),
+                    )
+                    .await
+                    .unwrap(),
+                    Some(run.id.clone()),
+                    "undispatched attempts and retries retain the legacy frontier"
+                );
+            }
+            assert_eq!(
+                crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                    crud_store.as_ref(),
+                    &child,
+                    Some(child_turn.clone()),
+                )
+                .await
+                .unwrap(),
+                None,
+                "direct CLI attempts obey the same no-dispatch rule"
+            );
+            // Native work and a possibly dispatched CLI attempt cannot be skipped.
+            for (change, restore) in [
+                (
+                    format!(
+                        "UPDATE turn_execution SET status='running' WHERE turn_id='{child_turn}'"
+                    ),
+                    format!(
+                        "UPDATE turn_execution SET status='{status}' WHERE turn_id='{child_turn}'"
+                    ),
+                ),
+                (
+                    format!("UPDATE task_run SET status='running' WHERE id='{blocked_run}'"),
+                    format!("UPDATE task_run SET status='{task_status}' WHERE id='{blocked_run}'"),
+                ),
+                (
+                    format!(
+                        "UPDATE turn_execution SET executor_kind='native_agent' WHERE turn_id='{child_turn}'"
+                    ),
+                    format!(
+                        "UPDATE turn_execution SET executor_kind='cli_runtime' WHERE turn_id='{child_turn}'"
+                    ),
+                ),
+                (
+                    format!(
+                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting' FROM turn_cli_runtime_binding WHERE turn_id='{}'",
+                        lineage.child_turn_id
+                    ),
+                    format!("DELETE FROM turn_cli_runtime_binding WHERE turn_id='{child_turn}'"),
+                ),
+                (
+                    format!("UPDATE turn SET message_revision=1 WHERE id='{launch}'"),
+                    format!("UPDATE turn SET message_revision=0 WHERE id='{launch}'"),
+                ),
+            ] {
+                db.execute_unprepared(&change).await.unwrap();
+                assert_eq!(
+                    crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                        crud_store.as_ref(),
+                        &parent_thread_id,
+                        Some(blocked_run.clone()),
+                    )
+                    .await
+                    .unwrap(),
+                    Some(blocked_run.clone()),
+                );
+                db.execute_unprepared(&restore).await.unwrap();
+            }
+        }
         for composer_index in 2..=3 {
             let composer_turn_id = format!("composer_{runtime_id}_launch_{composer_index}");
             let composer_marker = format!("LATER PARENT COMPOSER {runtime_id} {composer_index}");
