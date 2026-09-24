@@ -1100,6 +1100,22 @@ impl CrudStore {
     pub async fn compaction_runner_state(&self, operation: &str) -> Result<Option<RunnerState>> {
         repositories::compaction::runner::compaction_runner_state(&self.connection, operation).await
     }
+    /// Reuse saved progress when a later request admits the same source plan.
+    pub async fn compaction_resume_deadline(
+        &self,
+        operation: &str,
+        execution_turn: &str,
+        deadline_ms: u64,
+    ) -> Result<bool> {
+        repositories::compaction::runner::compaction_resume_deadline(
+            self,
+            operation,
+            execution_turn,
+            deadline_ms,
+        )
+        .await
+    }
+
     /// Complete the state record after a control-plane terminal fence. No
     /// attempt can advance past that fence. Preparation reads one bounded row;
     /// the write revalidates its generation and durable terminal classification.

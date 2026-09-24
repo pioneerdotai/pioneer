@@ -1004,6 +1004,86 @@ pub(crate) async fn compaction_runner_state<C: ConnectionTrait>(
     row.map(|row| Ok(serde_json::from_str(&row.state)?))
         .transpose()
 }
+/// Resume only saved progress on a later admission of the identical plan.
+/// Preparation reads operation/state and its bounded manifest page; the short
+/// transaction rechecks snapshot, generation, checkpoint, head and Stop fences.
+/// This publishes no history. Source freshness can race this preliminary check:
+/// the existing runner revalidates before any next portion and at publication.
+pub(crate) async fn compaction_resume_deadline(
+    store: &CrudStore,
+    operation: &str,
+    execution_turn: &str,
+    deadline_ms: u64,
+) -> Result<bool> {
+    let Some(record) =
+        super::compaction::compaction_operation(&store.connection, operation).await?
+    else {
+        return Ok(false);
+    };
+    if record.status != "failed" || record.outcome.as_deref() != Some("deadline") {
+        return Ok(false);
+    }
+    let Some(state) = compaction_runner_state(&store.connection, operation).await? else {
+        return Ok(false);
+    };
+    if !state.can_resume_deadline() || deadline_ms <= state.deadline_ms {
+        return Ok(false);
+    }
+    if !compaction_manifest_sources_current(&store.connection, operation).await? {
+        return Ok(false);
+    }
+    let legacy_final = state.resume_phase.is_none()
+        && compaction_manifest_page(
+            &store.connection,
+            operation,
+            false,
+            state.cursor.unit,
+            state.cursor.source,
+        )
+        .await?
+        .is_empty();
+    let next = state.resume_deadline(deadline_ms, legacy_final)?;
+    let mut snapshot: pioneer_compaction::OperationSnapshot =
+        serde_json::from_str(&record.snapshot)?;
+    snapshot.admission.deadline_ms = deadline_ms;
+    let snapshot = serde_json::to_string(&snapshot)?;
+    let encoded = serde_json::to_string(&next)?;
+    ensure!(
+        encoded.len() <= SOURCE_PAGE_BYTES,
+        "runner state exceeds quantum"
+    );
+    store.run_serialized_write(|| async {
+        let tx = store.connection.begin().await?;
+        let changed = tx.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            r#"UPDATE compaction_operation SET status='running',outcome=NULL,
+                    deadline_ms=?2,snapshot=?3,execution_turn=?6
+               WHERE id=?1 AND status='failed' AND outcome='deadline' AND snapshot=?4
+               AND EXISTS (SELECT 1 FROM compaction_runner_state s WHERE s.operation_id=?1 AND s.generation=?5)
+               AND EXISTS (SELECT 1 FROM compaction_checkpoint p WHERE p.id=?7
+                   AND p.operation_id=?1 AND p.owner=compaction_operation.owner AND p.status IN ('candidate','retained'))
+               AND EXISTS (SELECT 1 FROM compaction_context c JOIN turn t ON t.thread_id=c.thread_id
+                   WHERE c.owner=compaction_operation.owner AND c.head IS compaction_operation.expected_head
+                   AND t.id=?6 AND t.message_deleted_at IS NULL AND t.status NOT IN ('interrupted','cancelled'))
+               AND NOT EXISTS (SELECT 1 FROM compaction_execution_stop x
+                   WHERE x.owner=compaction_operation.owner AND x.turn_id IN (compaction_operation.execution_turn,?6))
+               AND NOT EXISTS (SELECT 1 FROM turn t WHERE t.id=compaction_operation.execution_turn
+                   AND (t.message_deleted_at IS NOT NULL OR t.status IN ('interrupted','cancelled')))"#,
+            [operation.into(), i64::try_from(deadline_ms)?.into(), snapshot.clone().into(),
+             record.snapshot.clone().into(), i64::try_from(state.generation)?.into(),
+             execution_turn.into(), state.previous_checkpoint.clone().into()],
+        )).await?.rows_affected();
+        if changed == 0 { tx.rollback().await?; return Ok(false); }
+        compaction_runner_state::Entity::update_many()
+            .col_expr(compaction_runner_state::Column::Generation, Expr::val(i64::try_from(next.generation)?))
+            .col_expr(compaction_runner_state::Column::State, Expr::val(encoded.clone()))
+            .filter(compaction_runner_state::Column::OperationId.eq(operation))
+            .exec(&tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }).await
+}
+
 /// Complete the state record after a control-plane terminal fence. No
 /// attempt can advance past that fence. Preparation reads one bounded row;
 /// the write revalidates its generation and durable terminal classification.

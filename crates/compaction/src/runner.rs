@@ -97,6 +97,9 @@ pub struct RunnerState {
     pub cursor: SourceCursor,
     pub previous_checkpoint: Option<String>,
     pub phase: RunnerPhase,
+    /// Phase before a deadline fence; older records recover from their saved cursor.
+    #[serde(default)]
+    pub resume_phase: Option<RunnerPhase>,
     #[serde(default)]
     pub observation: Option<AttemptObservation>,
     #[serde(default)]
@@ -126,6 +129,7 @@ impl RunnerState {
         let target_tokens = model.summarizer_cap(goal)?;
         anyhow::ensure!(target_tokens > 0, "summarizer has no output capacity");
         Ok(Self {
+            resume_phase: None,
             observation: None,
             diagnostic: None,
             generation: 0,
@@ -317,7 +321,52 @@ impl RunnerState {
             return Ok(self.clone());
         }
         let mut next = self.next()?;
+        if kind == FailureKind::Deadline {
+            next.resume_phase = Some(match &self.phase {
+                RunnerPhase::Attempt { purpose, .. } => RunnerPhase::Ready { purpose: *purpose },
+                phase => phase.clone(),
+            });
+        }
         next.phase = RunnerPhase::Failed { kind };
+        Ok(next)
+    }
+    pub fn can_resume_deadline(&self) -> bool {
+        matches!(
+            self.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::Deadline
+            }
+        ) && self.cursor > SourceCursor::default()
+            && self.previous_checkpoint.is_some()
+            && (self.resume_phase.is_some() || self.corrections == 0)
+            && self
+                .observation
+                .as_ref()
+                .is_none_or(|o| o.failure.is_none())
+    }
+    /// A later admission supplies its existing request budget. Never extend the
+    /// interrupted request or reset provider retry/correction budgets.
+    pub fn resume_deadline(&self, deadline_ms: u64, legacy_final: bool) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.can_resume_deadline() && deadline_ms > self.deadline_ms,
+            "no resumable deadline progress"
+        );
+        let mut next = self.next()?;
+        next.deadline_ms = deadline_ms;
+        next.phase = next.resume_phase.take().unwrap_or_else(|| {
+            if legacy_final {
+                RunnerPhase::Candidate {
+                    checkpoint: self.previous_checkpoint.clone().unwrap(),
+                    final_portion: true,
+                }
+            } else {
+                RunnerPhase::Ready {
+                    purpose: AttemptPurpose::Portion,
+                }
+            }
+        });
+        next.observation = None;
+        next.diagnostic = None;
         Ok(next)
     }
     fn next(&self) -> anyhow::Result<Self> {
@@ -333,6 +382,50 @@ impl RunnerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deadline_resume_keeps_final_candidate_and_rejects_nonrecoverable_failures() {
+        let candidate = state()
+            .claim(1)
+            .unwrap()
+            .candidate(
+                1,
+                "saved".into(),
+                SourceCursor {
+                    unit: 1,
+                    ..Default::default()
+                },
+                true,
+                2,
+            )
+            .unwrap();
+        let failed = candidate.terminate(FailureKind::Deadline).unwrap();
+        let resumed = restart(&failed).resume_deadline(1_800_000, false).unwrap();
+        assert_eq!(resumed.phase, candidate.phase);
+        assert_eq!(resumed.cursor, candidate.cursor);
+        assert_eq!(resumed.attempts, candidate.attempts);
+        assert!(failed.resume_deadline(failed.deadline_ms, false).is_err());
+        assert!(
+            !state()
+                .terminate(FailureKind::Deadline)
+                .unwrap()
+                .can_resume_deadline()
+        );
+        for kind in [
+            FailureKind::Cancelled,
+            FailureKind::Permanent,
+            FailureKind::Transient,
+        ] {
+            assert!(!candidate.terminate(kind).unwrap().can_resume_deadline());
+        }
+        let mut legacy = serde_json::to_value(&failed).unwrap();
+        legacy.as_object_mut().unwrap().remove("resume_phase");
+        let legacy: RunnerState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.resume_deadline(1_800_000, true).unwrap().phase,
+            candidate.phase
+        );
+    }
+
     #[test]
     fn legacy_runner_json_defaults_missing_diagnostics() {
         let state = state();

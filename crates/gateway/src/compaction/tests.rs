@@ -1894,6 +1894,162 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
 }
 
 #[tokio::test]
+async fn later_admission_resumes_deadline_progress_without_replaying_saved_portions() {
+    for case in ["saved", "legacy", "edited", "stop"] {
+        let f = fixture(
+            &"漢字🌍".repeat(4000),
+            vec![Reply::Success, Reply::Hang],
+            true,
+            false,
+        )
+        .await;
+        f.store
+            .compaction_bind_execution_turn("operation", "turn")
+            .await
+            .unwrap();
+        let task = tokio::spawn({
+            let runner = f.runner.clone();
+            async move { runner.run(CancellationToken::new()).await }
+        });
+        f.provider.wait_calls(2).await;
+        f.clock.advance(900_000);
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            CompactionExit::Reconcile(FailureKind::Deadline)
+        ));
+        f.runner.reconcile(FailureKind::Deadline).await.unwrap();
+        let before = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.cursor > pioneer_compaction::runner::SourceCursor::default());
+        assert_eq!(before.attempts, 2);
+        if case == "legacy" {
+            f.store.database_connection().execute_raw(Statement::from_string(DbBackend::Sqlite,
+                "UPDATE compaction_runner_state SET state=json_remove(state,'$.resume_phase') WHERE operation_id='operation'"
+            )).await.unwrap();
+        }
+        if case == "edited" {
+            f.store
+                .database_connection()
+                .execute_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "UPDATE turn_event SET payload='{}' WHERE id='source'",
+                ))
+                .await
+                .unwrap();
+        }
+        if case == "stop" {
+            f.store.database_connection().execute_raw(Statement::from_string(DbBackend::Sqlite,
+                "INSERT INTO compaction_execution_stop(owner,turn_id) SELECT owner,execution_turn FROM compaction_operation WHERE id='operation'"
+            )).await.unwrap();
+        }
+        if matches!(case, "edited" | "stop") {
+            assert!(
+                !f.store
+                    .compaction_resume_deadline("operation", "turn", 1_800_000)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                f.store
+                    .compaction_runner_state("operation")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            continue;
+        }
+        // Operation and state must roll back together if the second write fails.
+        f.store.database_connection().execute_raw(Statement::from_string(DbBackend::Sqlite,
+            "CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'fixture'); END"
+        )).await.unwrap();
+        assert!(
+            f.store
+                .compaction_resume_deadline("operation", "turn", 1_800_000)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.store
+                .compaction_operation("operation")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "DROP TRIGGER reject_resume",
+            ))
+            .await
+            .unwrap();
+        let (one, two) = tokio::join!(
+            f.store
+                .compaction_resume_deadline("operation", "turn", 1_800_000),
+            f.store
+                .compaction_resume_deadline("operation", "turn", 1_800_000),
+        );
+        assert_ne!(
+            one.unwrap(),
+            two.unwrap(),
+            "only one admission may resume the state"
+        );
+        let after = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.previous_checkpoint, before.previous_checkpoint);
+        assert_eq!(
+            (after.attempts, after.retries, after.corrections),
+            (before.attempts, before.retries, before.corrections)
+        );
+        assert_eq!(after.deadline_ms, 1_800_000);
+        let snapshot = serde_json::from_str(
+            &f.store
+                .compaction_operation("operation")
+                .await
+                .unwrap()
+                .unwrap()
+                .snapshot,
+        )
+        .unwrap();
+        let runner = CompactionRunner::new(
+            f.store.clone(),
+            "ws".into(),
+            "thread".into(),
+            snapshot,
+            f.runner.summarizer.clone(),
+            f.runner.target.clone(),
+            f.observer.clone(),
+            f.clock.clone(),
+        );
+        assert!(matches!(
+            runner.run(CancellationToken::new()).await.unwrap(),
+            CompactionExit::Applied(_)
+        ));
+        let calls = f.provider.calls.lock().unwrap();
+        let interrupted: SummaryInput =
+            serde_json::from_str(&calls[1].messages[1].content).unwrap();
+        let resumed: SummaryInput = serde_json::from_str(&calls[2].messages[1].content).unwrap();
+        assert!(!resumed.previous_summary.is_empty());
+        assert_eq!(
+            serde_json::to_value(interrupted).unwrap(),
+            serde_json::to_value(resumed).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_target_rechecks_complete_request_before_checkpoint_publication() {
     use pioneer_agent::compaction::request::NativeRequestProjection;
     use pioneer_provider::{ChatMessage, CompiledPromptPayload};

@@ -99,7 +99,7 @@ pub(crate) async fn admit_operation(
     let existing = store
         .compaction_operation_for_plan(workspace, thread, &prepared.owner, &fingerprint)
         .await?;
-    let record = if let Some(record) = existing {
+    let mut record = if let Some(record) = existing {
         record
     } else {
         let mut admission = settings.admit(current, cli_override, now_ms)?;
@@ -131,6 +131,25 @@ pub(crate) async fn admit_operation(
             .compaction_admit_for_turn(workspace, thread, &snapshot, Some(&prepared.execution_turn))
             .await?
     };
+    // The old request remains failed. A later admission may reuse its saved
+    // portions under this request's unchanged budget; no background handoff or
+    // automatic extension of an active operation is introduced here.
+    if record.status == "failed" && record.outcome.as_deref() == Some("deadline") {
+        store.compaction_reconcile_runner_state(&record.id).await?;
+        let deadline = settings
+            .admit(current, cli_override, now_ms)?
+            .deadline_ms
+            .min(prepared.operation_deadline_ms.unwrap_or(u64::MAX));
+        if deadline > now_ms {
+            store
+                .compaction_resume_deadline(&record.id, &prepared.execution_turn, deadline)
+                .await?;
+            record = store
+                .compaction_operation(&record.id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("operation missing"))?;
+        }
+    }
     let snapshot: OperationSnapshot = serde_json::from_str(&record.snapshot)?;
     if record.status != "running" || snapshot.admission.deadline_ms <= now_ms {
         return Ok(snapshot);

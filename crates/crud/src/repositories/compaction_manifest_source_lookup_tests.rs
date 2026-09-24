@@ -2503,6 +2503,7 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
         .unwrap();
     }
     let state = RunnerState {
+        resume_phase: None,
         generation: 7,
         deadline_ms: 900_000,
         attempts: 1,
