@@ -790,12 +790,31 @@ fn ready_timeline_state_author(
     ready_agent_timeline_author(author)
 }
 
+/// Shared by semantic row admission and desktop author presentation. A direct
+/// CLI turn has a runtime identity, but no Task AgentExecution association.
+pub fn timeline_cli_runtime_execution_author(
+    author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
+) -> Option<&pioneer_protocol::TurnAuthorSnapshot> {
+    author.filter(|author| {
+        matches!(&author.actor, pioneer_protocol::PersistedActorRef::System)
+            && matches!(
+                author.avatar_revision.as_deref(),
+                Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION)
+                    | Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION)
+            )
+            && author.agent.is_none()
+    })
+}
+
 fn ready_agent_timeline_author(
     author: Option<&pioneer_protocol::TurnAuthorSnapshot>,
 ) -> Option<Option<&pioneer_protocol::TurnAuthorSnapshot>> {
     let Some(author) = author else {
         return Some(None);
     };
+    if timeline_cli_runtime_execution_author(Some(author)).is_some() {
+        return Some(Some(author));
+    }
     let pioneer_protocol::PersistedActorRef::AgentExecution(execution_id) = &author.actor else {
         return None;
     };
@@ -3898,6 +3917,20 @@ mod tests {
             agent: None,
         };
         assert!(ready_agent_timeline_author(Some(&principal_author)).is_none());
+        let mut runtime_author = TurnAuthorSnapshot {
+            actor: PersistedActorRef::System,
+            avatar_revision: Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned()),
+            ..principal_author.clone()
+        };
+        assert_eq!(
+            ready_agent_timeline_author(Some(&runtime_author)),
+            Some(Some(&runtime_author))
+        );
+        runtime_author.actor = principal_author.actor.clone();
+        assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
+        runtime_author.actor = PersistedActorRef::System;
+        runtime_author.avatar_revision = Some("unrelated-system-avatar".to_owned());
+        assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
 
         let execution_id =
             AgentExecutionId::new("E0000000000000000000A").expect("agent execution id");
@@ -3929,6 +3962,92 @@ mod tests {
             ..legacy_agent_author
         };
         assert!(ready_agent_timeline_author(Some(&mismatched_agent_author)).is_none());
+        runtime_author.avatar_revision =
+            Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned());
+        runtime_author.agent = mismatched_agent_author.agent;
+        assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
+    }
+
+    #[test]
+    fn direct_cli_answer_and_work_survive_author_hydration_and_reload() {
+        for avatar in [
+            pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
+            pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+        ] {
+            let author = TurnAuthorSnapshot {
+                actor: PersistedActorRef::System,
+                display_name: "CLI runtime".to_owned(),
+                nickname: "cli".to_owned(),
+                avatar_revision: Some(avatar.to_owned()),
+                agent: None,
+            };
+            let blocks = vec![
+                turn_work_block("thread_a", "block_work", "002"),
+                assistant_block("thread_a", "block_assistant", "003", "turn_a", None),
+            ];
+            let mut state = SemanticTimelineState::default();
+            apply_thread_timeline_page(
+                &mut state,
+                thread_page(blocks.clone()),
+                TopLevelPageMergeMode::Reset,
+            );
+            let initial = flatten_semantic_timeline(&state, "thread_a").unwrap();
+            assert_eq!(initial.rows.len(), 2);
+            let mut hydrated = blocks;
+            for block in &mut hydrated {
+                match &mut block.kind {
+                    TimelineBlockKind::TurnWork { work } => work.author = Some(author.clone()),
+                    TimelineBlockKind::AssistantMessage { author: target, .. } => {
+                        *target = Some(author.clone());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            for reload in [false, true] {
+                if reload {
+                    state = SemanticTimelineState::default();
+                }
+                apply_thread_timeline_page(
+                    &mut state,
+                    thread_page(hydrated.clone()),
+                    if reload {
+                        TopLevelPageMergeMode::Reset
+                    } else {
+                        TopLevelPageMergeMode::Merge
+                    },
+                );
+                let rows = flatten_semantic_timeline(&state, "thread_a").unwrap().rows;
+                assert_eq!(rows.len(), 2, "CLI author must not hide work or its answer");
+                for (row, initial) in rows.iter().zip(&initial.rows) {
+                    assert_eq!(row.id, initial.id);
+                    assert_eq!(row.author.as_ref(), Some(&author));
+                }
+                assert!(matches!(&rows[1].kind,
+                    SemanticTimelineRowKind::AssistantMessage { block }
+                    if matches!(&block.kind, TimelineBlockKind::AssistantMessage { text, .. }
+                        if text == "final **markdown**")));
+                let rendered = super::super::semantic_render::render_semantic_timeline_rows(
+                    &rows,
+                    Default::default(),
+                );
+                let render_rows = rendered
+                    .rows
+                    .into_iter()
+                    .map(super::super::presentation::TimelineRenderRow::Timeline)
+                    .collect::<Vec<_>>();
+                let groups = super::super::presentation::project_timeline_groups(
+                    &render_rows,
+                    &rendered.projection,
+                    None,
+                );
+                assert_eq!(groups.len(), 1);
+                assert_eq!(
+                    groups[0].author.as_ref(),
+                    Some(&author),
+                    "header and avatar must retain the CLI identity after grouping"
+                );
+            }
+        }
     }
 
     #[test]

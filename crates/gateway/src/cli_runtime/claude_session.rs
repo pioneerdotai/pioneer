@@ -1207,6 +1207,19 @@ fn claude_process_config_from_instance_with_managed_mcp(
                 .context("invalid Claude resume continuation")?
                 .append_process_args(&mut args);
         }
+        CliProviderContinuation::ClaudeFork {
+            source_session_id,
+            boundary_message_uuid,
+            provider_session_id,
+        } => {
+            ClaudeProviderSessionLaunch::fork(
+                *source_session_id,
+                *boundary_message_uuid,
+                *provider_session_id,
+            )
+            .context("invalid Claude bounded fork continuation")?
+            .append_process_args(&mut args);
+        }
         CliProviderContinuation::CodexRpcThread { .. } => {
             bail!("Claude process launch requires a typed Claude continuation");
         }
@@ -1993,6 +2006,9 @@ struct ClaudeStreamState {
     active_text_item_started: bool,
     active_reasoning_item_started: bool,
     emitted_final_text: bool,
+    /// Top-level transcript record UUID, distinct from message.id and the
+    /// synthetic native turn ID used by Pioneer's stream adapter.
+    last_assistant_record_uuid: Option<uuid::Uuid>,
     tool_items: HashMap<String, ClaudeToolItemState>,
     mcp_items: HashMap<String, ClaudeMcpToolItemState>,
     completed_mcp_permission_requests: HashSet<String>,
@@ -2221,6 +2237,7 @@ impl ClaudeStreamClient {
             state.active_text_item_started = false;
             state.active_reasoning_item_started = false;
             state.emitted_final_text = false;
+            state.last_assistant_record_uuid = None;
             state.tool_items.clear();
             state.mcp_items.clear();
             state.completed_mcp_permission_requests.clear();
@@ -2933,6 +2950,13 @@ impl ClaudeStreamClient {
     }
 
     async fn map_assistant_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
+        if let Some(record_uuid) = value
+            .get("uuid")
+            .and_then(JsonValue::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        {
+            self.state.lock().await.last_assistant_record_uuid = Some(record_uuid);
+        }
         let content = value
             .get("message")
             .and_then(|message| message.get("content"))
@@ -3415,11 +3439,20 @@ impl ClaudeStreamClient {
                 native: Some(native_event("result/error", value)),
             }));
         } else {
+            let boundary = state
+                .last_assistant_record_uuid
+                .map(|uuid| uuid.to_string());
             events.push(RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id),
                 native_turn_id: native_turn_id.clone(),
                 status: "completed".to_owned(),
-                native: Some(native_event("result/success", value)),
+                native: Some(native_event(
+                    "result/success",
+                    serde_json::json!({
+                        "result": value,
+                        "assistantRecordUuid": boundary,
+                    }),
+                )),
             }));
         }
         state.active_turn_id = None;
@@ -3428,6 +3461,7 @@ impl ClaudeStreamClient {
         state.active_text_item_started = false;
         state.active_reasoning_item_started = false;
         state.emitted_final_text = false;
+        state.last_assistant_record_uuid = None;
         state.tool_items.clear();
         events
     }
@@ -3502,7 +3536,11 @@ impl ClaudeStreamClient {
             RuntimeEvent::TurnCompleted(completed)
                 if state.observed_turn_id.as_deref() == Some(completed.native_turn_id.as_str()) =>
             {
-                let reconciliation_events = state.reconciliation_events.clone();
+                let mut reconciliation_events = state.reconciliation_events.clone();
+                // Keep the actual terminal evidence, including the transcript
+                // record UUID. A synthesized observation must not turn a
+                // completed Claude answer into a boundary-less completion.
+                reconciliation_events.push(event.clone());
                 state.last_turn_observation = Some(CLIAgentRuntimeTurnObservation {
                     status: CLIAgentRuntimeObservedTurnStatus::Completed,
                     message: None,
@@ -3955,7 +3993,7 @@ fn new_runtime_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection;
     use crate::cli_runtime::projector::{CLIRuntimeProjectorContext, project_cli_runtime_event};
@@ -4603,6 +4641,68 @@ done
         state.native_thread_id = Some(provider_session_id.to_string());
         state.active_turn_id = Some(native_turn_id.to_owned());
         state.observed_turn_id = Some(native_turn_id.to_owned());
+    }
+
+    pub(crate) async fn mapped_assistant_completion_for_gateway_test(
+        provider_session: uuid::Uuid,
+        native_turn_id: &str,
+        record_uuid: uuid::Uuid,
+    ) -> RuntimeEvent {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut child, _) = fake_claude_stream_client_with_mcp(
+            &temp.path().join("gateway-record.log"),
+            provider_session,
+            None,
+        )
+        .await;
+        bind_claude_mcp_test_turn(&client, provider_session, native_turn_id).await;
+        client.map_message(json!({
+            "type":"assistant", "session_id":provider_session, "uuid":record_uuid,
+            "message":{"id":"msg_api_id_not_a_record_uuid", "content":[{"type":"text","text":"answer"}]}
+        })).await;
+        let completion = client
+            .map_message(json!({
+                "type":"result", "session_id":provider_session, "subtype":"success",
+                "is_error":false, "result":"answer"
+            }))
+            .await
+            .into_iter()
+            .find(|event| matches!(event, RuntimeEvent::TurnCompleted(_)))
+            .expect("Claude stream mapper must emit a completed turn");
+        let _ = child.kill().await;
+        completion
+    }
+
+    #[tokio::test]
+    async fn assistant_record_uuid_reaches_completion_separately_from_api_message_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4();
+        let record = uuid::Uuid::new_v4();
+        let (client, mut child, _) =
+            fake_claude_stream_client_with_mcp(&temp.path().join("record.log"), session, None)
+                .await;
+        bind_claude_mcp_test_turn(&client, session, "synthetic-native-turn").await;
+        client.map_message(json!({
+            "type":"assistant", "session_id":session, "uuid":record,
+            "message":{"id":"msg_api_id_not_a_record_uuid", "content":[{"type":"text","text":"answer"}]}
+        })).await;
+        let completed = client
+            .map_message(json!({
+                "type":"result", "session_id":session, "subtype":"success", "is_error":false,
+                "result":"answer"
+            }))
+            .await;
+        let boundary = completed.iter().find_map(|event| match event {
+            RuntimeEvent::TurnCompleted(event) => event
+                .native
+                .as_ref()
+                .and_then(|native| native.payload_redacted.as_ref())
+                .and_then(|payload| payload.get("assistantRecordUuid"))
+                .and_then(JsonValue::as_str),
+            _ => None,
+        });
+        assert_eq!(boundary, Some(record.to_string().as_str()));
+        let _ = child.kill().await;
     }
 
     #[tokio::test]
@@ -5842,14 +5942,22 @@ done
                 native: None,
             }))
             .await;
-        client
-            .emit(RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some("claude-thread".to_owned()),
-                native_turn_id: "claude-turn".to_owned(),
-                status: "completed".to_owned(),
-                native: None,
+        let record_uuid = uuid::Uuid::new_v4();
+        client.map_message(json!({
+            "type":"assistant", "session_id":"claude-thread", "uuid":record_uuid,
+            "message":{"id":"msg_api_id_not_a_record_uuid", "content":[{"type":"text","text":"final answer"}]}
+        })).await;
+        for event in client
+            .map_message(json!({
+                "type":"result", "session_id":"claude-thread", "subtype":"success",
+                "is_error":false, "result":"final answer"
             }))
-            .await;
+            .await
+        {
+            if matches!(event, RuntimeEvent::TurnCompleted(_)) {
+                client.emit(event).await;
+            }
+        }
 
         let state = client.state.lock().await;
         let observation = state
@@ -5862,7 +5970,12 @@ done
         );
         assert!(matches!(
             observation.reconciliation_events.as_slice(),
-            [RuntimeEvent::ItemCompleted(item)] if item.native_item_id == "claude-final"
+            [RuntimeEvent::ItemCompleted(item), RuntimeEvent::TurnCompleted(completed)]
+                if item.native_item_id == "claude-final"
+                    && completed.native.as_ref()
+                        .and_then(|native| native.payload_redacted.as_ref())
+                        .and_then(|payload| payload.get("assistantRecordUuid"))
+                        .and_then(JsonValue::as_str) == Some(record_uuid.to_string().as_str())
         ));
         drop(state);
 

@@ -816,10 +816,15 @@ impl GatewayNativeContextController {
     pub(crate) fn new(processor: std::sync::Weak<crate::message::MessageProcessor>) -> Self {
         Self { processor }
     }
-    fn observer(&self, context: &NativeContext) -> Arc<dyn CompactionObserver> {
+    fn observer(
+        &self,
+        context: &NativeContext,
+        lifecycle_store: &CrudStore,
+    ) -> Arc<dyn CompactionObserver> {
         Arc::new(HubCompactionObserver {
             processor: self.processor.clone(),
             hub: context.events.clone(),
+            lifecycle_store: lifecycle_store.clone(),
             workspace: context.workspace_id.clone(),
             thread: context.thread_id.clone(),
             turn: context.turn_id.clone(),
@@ -865,6 +870,7 @@ impl pioneer_agent::compaction::controller::NativeContextController
             .processor
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("context owner stopped"))?;
+        let history_store = crate::message::ordinary_history_store(processor.crud_store.as_ref());
         let clock: Arc<dyn CompactionClock> = Arc::new(SystemCompactionClock::default());
         let deadline = clock
             .now_ms()
@@ -883,8 +889,7 @@ impl pioneer_agent::compaction::controller::NativeContextController
             ) => result?.ok_or_else(|| anyhow::anyhow!("native context owner unavailable"))?,
         };
         drop(startup_wait);
-        let refresh =
-            refresh_native_history(&processor, processor.crud_store.as_ref(), context, request);
+        let refresh = refresh_native_history(&processor, &history_store, context, request);
         let (request, projection) = tokio::select! { biased;
             _ = context.cancellation.cancelled() => anyhow::bail!("native context preparation cancelled"),
             _ = clock.sleep_until(deadline) => anyhow::bail!("native context preparation deadline exceeded"),
@@ -895,14 +900,14 @@ impl pioneer_agent::compaction::controller::NativeContextController
         context.cancellation = lease.cancellation();
         let settings = processor.compaction_settings_for_workspace(&context.workspace_id)?;
         let prepared = prepare_native_projection_with_prepared(
-            processor.crud_store.as_ref(),
+            &history_store,
             processor.provider_registry().as_ref(),
             &settings,
             &context,
             request,
             measurement,
             recovery,
-            self.observer(&context),
+            self.observer(&context, &history_store),
             clock,
             Some(AcceptedProjection::Prepared(projection)),
             Some(&processor),

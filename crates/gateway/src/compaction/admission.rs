@@ -39,7 +39,6 @@ pub(crate) async fn admit_operation(
     prepared: PreparedOperation,
     now_ms: u64,
 ) -> Result<OperationSnapshot> {
-    let store = store.with_maintenance_access();
     let selection = effective_selection(current, settings.selection.as_ref(), cli_override);
     let budget = summarizer.model_budget();
     // Fresh captures of the same accepted history have different storage IDs.

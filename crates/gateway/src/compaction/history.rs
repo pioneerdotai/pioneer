@@ -25,12 +25,12 @@ struct PayloadBatchStats {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
-pub(super) struct PayloadBatchStatsSnapshot {
-    pub calls: usize,
-    pub max_rows: usize,
-    pub max_returned_raw_bytes: usize,
-    pub current_raw_bytes: usize,
-    pub peak_concurrent_raw_bytes: usize,
+pub(crate) struct PayloadBatchStatsSnapshot {
+    pub(crate) calls: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) max_returned_raw_bytes: usize,
+    pub(crate) current_raw_bytes: usize,
+    pub(crate) peak_concurrent_raw_bytes: usize,
 }
 
 #[cfg(test)]
@@ -71,6 +71,135 @@ pub(super) async fn with_payload_batch_stats<F: std::future::Future>(
         peak_concurrent_raw_bytes: stats.peak_concurrent_raw_bytes.load(Ordering::SeqCst),
     };
     (output, snapshot)
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SelectedTurnLoadPauseState {
+    selected: std::sync::Mutex<BTreeSet<String>>,
+    payload_stats: std::sync::Mutex<Option<PayloadBatchStatsSnapshot>>,
+    reached: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    reached_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type SelectedTurnLoadKey = (usize, String, String);
+
+#[cfg(test)]
+static SELECTED_TURN_LOAD_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<SelectedTurnLoadKey, std::sync::Weak<SelectedTurnLoadPauseState>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) struct SelectedTurnLoadPause {
+    key: SelectedTurnLoadKey,
+    state: std::sync::Arc<SelectedTurnLoadPauseState>,
+}
+
+#[cfg(test)]
+impl SelectedTurnLoadPause {
+    pub(crate) async fn reached(&self) {
+        loop {
+            let notified = self.state.reached_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.reached_now() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn reached_now(&self) -> bool {
+        self.state.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn selected(&self) -> BTreeSet<String> {
+        self.state.selected.lock().unwrap().clone()
+    }
+
+    pub(crate) fn payload_stats(&self) -> Option<PayloadBatchStatsSnapshot> {
+        *self.state.payload_stats.lock().unwrap()
+    }
+
+    pub(crate) fn release(&self) {
+        self.state
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.release_notify.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+impl Drop for SelectedTurnLoadPause {
+    fn drop(&mut self) {
+        self.release();
+        SELECTED_TURN_LOAD_PAUSES.lock().unwrap().remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pause_selected_turn_load(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+) -> SelectedTurnLoadPause {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+        thread.to_owned(),
+    );
+    let state = std::sync::Arc::new(SelectedTurnLoadPauseState::default());
+    assert!(
+        SELECTED_TURN_LOAD_PAUSES
+            .lock()
+            .unwrap()
+            .insert(key.clone(), std::sync::Arc::downgrade(&state))
+            .is_none(),
+        "selected-turn loader pause already installed"
+    );
+    SelectedTurnLoadPause { key, state }
+}
+
+#[cfg(test)]
+async fn wait_if_selected_turn_load_paused(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turns: &BTreeSet<String>,
+) -> Option<std::sync::Arc<SelectedTurnLoadPauseState>> {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+        thread.to_owned(),
+    );
+    let state = SELECTED_TURN_LOAD_PAUSES
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(state) = state {
+        *state.selected.lock().unwrap() = turns.clone();
+        state
+            .reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.reached_notify.notify_waiters();
+        loop {
+            let notified = state.release_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if state.released.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
+        }
+        return Some(state);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -132,9 +261,14 @@ pub(crate) async fn source_payload(
     source: &mut SourceRecord,
 ) -> Result<String> {
     if let Some(payload) = source.payload.take() {
+        #[cfg(test)]
+        let _raw_payloads = observe_payload_batch(std::slice::from_ref(&payload));
         return Ok(payload);
     }
-    reference_payload(store, workspace, thread, &source.reference).await
+    let payload = reference_payload(store, workspace, thread, &source.reference).await?;
+    #[cfg(test)]
+    let _raw_payloads = observe_payload_batch(std::slice::from_ref(&payload));
+    Ok(payload)
 }
 
 async fn take_source_payload_batch(
@@ -644,6 +778,44 @@ pub(crate) async fn load_task_line_history(
     populate_logical_task_turns(store, workspace, thread, messages).await
 }
 
+/// Restore only accepted logical turns. The turn IDs are selected before
+/// event/item payloads are read. The metadata query is restricted to those
+/// IDs as well, so a late parent tail is not scanned for boundary subqueries.
+pub(crate) async fn load_task_line_history_turns(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turns: &BTreeSet<String>,
+    fence: &HistoryReadFence,
+) -> Result<Vec<ChatMessage>> {
+    #[cfg(test)]
+    let pause = wait_if_selected_turn_load_paused(store, workspace, thread, turns).await;
+    let load = load_line_history_inner(
+        store,
+        workspace,
+        thread,
+        None,
+        fence,
+        // The immutable accepted manifest has already selected these exact
+        // turns. A command that later delegated a Task is still an accepted
+        // source when its own input is edited; the broad causal-history
+        // suppression would otherwise hide its current canonical projection.
+        false,
+        HistorySelection::Turns(turns),
+    );
+    #[cfg(test)]
+    let messages = if let Some(pause) = pause {
+        let (messages, stats) = with_payload_batch_stats(load).await;
+        *pause.payload_stats.lock().unwrap() = Some(stats);
+        messages?
+    } else {
+        load.await?
+    };
+    #[cfg(not(test))]
+    let messages = load.await?;
+    populate_logical_task_turns(store, workspace, thread, messages).await
+}
+
 async fn populate_logical_task_turns(
     store: &CrudStore,
     workspace: &str,
@@ -761,6 +933,7 @@ pub(crate) async fn load_task_output_history(
 
 enum HistorySelection<'a> {
     All,
+    Turns(&'a BTreeSet<String>),
     AllExcept {
         covered: &'a BTreeSet<ScopedHistorySource>,
         covered_item_aliases: &'a BTreeSet<(String, String, String)>,
@@ -780,24 +953,32 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
-    let (selected, covered, covered_item_aliases, covered_event_input_evidence, through_turn) =
-        match selection {
-            HistorySelection::All => (None, None, None, None, None),
-            HistorySelection::AllExcept {
-                covered,
-                covered_item_aliases,
-                covered_event_input_evidence,
-            } => (
-                None,
-                Some(covered),
-                Some(covered_item_aliases),
-                Some(covered_event_input_evidence),
-                None,
-            ),
-            #[cfg(test)]
-            HistorySelection::Sources(sources) => (Some(sources), None, None, None, None),
-            HistorySelection::ThroughTurn(turn) => (None, None, None, None, Some(turn)),
-        };
+    let (
+        selected,
+        selected_turns,
+        covered,
+        covered_item_aliases,
+        covered_event_input_evidence,
+        through_turn,
+    ) = match selection {
+        HistorySelection::All => (None, None, None, None, None, None),
+        HistorySelection::Turns(turns) => (None, Some(turns), None, None, None, None),
+        HistorySelection::AllExcept {
+            covered,
+            covered_item_aliases,
+            covered_event_input_evidence,
+        } => (
+            None,
+            None,
+            Some(covered),
+            Some(covered_item_aliases),
+            Some(covered_event_input_evidence),
+            None,
+        ),
+        #[cfg(test)]
+        HistorySelection::Sources(sources) => (Some(sources), None, None, None, None, None),
+        HistorySelection::ThroughTurn(turn) => (None, None, None, None, None, Some(turn)),
+    };
     // `Sources` is test-only, so production builds otherwise have no `Some`
     // branch from which to infer the collection behind `selected`.
     let selected: Option<&BTreeSet<SourceRef>> = selected;
@@ -882,18 +1063,51 @@ async fn load_line_history_inner(
             .collect::<BTreeSet<_>>(),
     );
     let mut turns = Vec::new();
-    let mut after = String::new();
-    loop {
-        let page = store
-            .compaction_history_turn_page(workspace, thread, &after, fence)
-            .await?;
-        let Some(last) = page.last() else { break };
-        ensure!(last.id > after, "history turn page made no progress");
-        after = last.id.clone();
-        turns.extend(
-            page.into_iter()
-                .filter(|turn| Some(turn.id.as_str()) != excluded_turn),
-        );
+    if let Some(selected) = selected_turns {
+        let mut batch = Vec::new();
+        let mut bytes = 0_usize;
+        for id in selected {
+            ensure!(
+                id.len() <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+                "selected history turn ID exceeds metadata page bound"
+            );
+            if !batch.is_empty()
+                && (batch.len() == 64
+                    || bytes.saturating_add(id.len()) > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
+            {
+                turns.extend(
+                    store
+                        .compaction_history_selected_turn_page(workspace, thread, &batch, fence)
+                        .await?,
+                );
+                batch.clear();
+                bytes = 0;
+            }
+            bytes += id.len();
+            batch.push(id.clone());
+        }
+        if !batch.is_empty() {
+            turns.extend(
+                store
+                    .compaction_history_selected_turn_page(workspace, thread, &batch, fence)
+                    .await?,
+            );
+        }
+        turns.retain(|turn| Some(turn.id.as_str()) != excluded_turn);
+    } else {
+        let mut after = String::new();
+        loop {
+            let page = store
+                .compaction_history_turn_page(workspace, thread, &after, fence)
+                .await?;
+            let Some(last) = page.last() else { break };
+            ensure!(last.id > after, "history turn page made no progress");
+            after = last.id.clone();
+            turns.extend(
+                page.into_iter()
+                    .filter(|turn| Some(turn.id.as_str()) != excluded_turn),
+            );
+        }
     }
     // IDs do not encode chronology. In particular, a detached Task answer may
     // share its parent's creation second and sort before its source request.
@@ -931,6 +1145,9 @@ async fn load_line_history_inner(
             .filter_map(|source| source.scope.split_once(':').map(|(_, turn)| turn))
             .collect::<BTreeSet<_>>();
         turns.retain(|turn| source_turns.contains(turn.id.as_str()));
+    }
+    if let Some(selected_turns) = selected_turns {
+        turns.retain(|turn| selected_turns.contains(&turn.id));
     }
     let mut events_by_turn = Vec::with_capacity(turns.len());
     for turn in &turns {

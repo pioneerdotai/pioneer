@@ -35,6 +35,7 @@ use gpui_kit::*;
 use pioneer_client::conversation::reducer::ConversationViewState;
 use pioneer_client::conversation::reducer::ItemView;
 use pioneer_client::timeline::rows::UserMessagePresentation;
+pub(super) use pioneer_client::timeline::semantic::timeline_cli_runtime_execution_author;
 use pioneer_client::timeline::types::MemberSummary;
 use pioneer_client::timeline::types::PersistedActorRef;
 use pioneer_client::timeline::types::PrincipalId;
@@ -167,20 +168,6 @@ fn timeline_agent_label(author: Option<&TurnAuthorSnapshot>) -> Option<String> {
         (false, true) => Some(display_name.to_owned()),
         (false, false) => Some(format!("{display_name} · @{nickname}")),
     }
-}
-
-pub(super) fn timeline_cli_runtime_execution_author(
-    author: Option<&TurnAuthorSnapshot>,
-) -> Option<&TurnAuthorSnapshot> {
-    author.filter(|author| {
-        matches!(&author.actor, PersistedActorRef::System)
-            && matches!(
-                author.avatar_revision.as_deref(),
-                Some(pioneer_client::timeline::types::CODEX_AGENT_AVATAR_REVISION)
-                    | Some(pioneer_client::timeline::types::CLAUDE_AGENT_AVATAR_REVISION)
-            )
-            && author.agent.is_none()
-    })
 }
 
 pub(super) fn timeline_agent_execution_author(

@@ -12,6 +12,8 @@ pub(crate) use coverage::{CheckpointGraphResolver, observe_preparation_work};
 mod delivered;
 pub(crate) mod frozen;
 mod history;
+#[cfg(test)]
+pub(crate) use history::pause_selected_turn_load;
 mod native;
 mod origins;
 mod result_budget;
@@ -46,8 +48,8 @@ use pioneer_crud::{
     compaction::{CHECKPOINT_SOURCE_LIMIT, CanonicalFragment, CommitOutcome, SOURCE_PAGE_ROWS},
 };
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemHeartbeatSource,
-    ItemStartedNotification, SystemEventLevel, TurnItemType,
+    AgentDurableEvent, ItemCompletedNotification, ItemStartedNotification, SystemEventLevel,
+    TurnItemType,
 };
 use pioneer_runtime_events::ExecutionEventHub;
 use std::{
@@ -119,6 +121,7 @@ pub(crate) trait CompactionObserver: Send + Sync {
 pub(crate) struct HubCompactionObserver {
     pub hub: Arc<ExecutionEventHub>,
     pub processor: std::sync::Weak<crate::message::MessageProcessor>,
+    pub lifecycle_store: CrudStore,
     pub workspace: String,
     pub thread: String,
     pub turn: String,
@@ -179,6 +182,7 @@ impl CompactionObserver for HubCompactionObserver {
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("compaction lifecycle owner stopped"))?
             .publish_compaction_lifecycle(
+                &self.lifecycle_store,
                 operation,
                 state.generation,
                 AgentDurableEvent::ItemStarted {
@@ -194,21 +198,20 @@ impl CompactionObserver for HubCompactionObserver {
         Ok(())
     }
     fn heartbeat(&self, operation: &str) {
-        self.hub
-            .publish_progress(AgentProgressEvent::ItemHeartbeat {
-                workspace_id: self.workspace.clone(),
-                thread_id: self.thread.clone(),
-                turn_id: self.turn.clone(),
-                item_id: format!("compaction:{operation}"),
-                item_type: TurnItemType::SystemEvent,
-                source: ItemHeartbeatSource::OwnerLease,
-            });
+        self.hub.publish_heartbeat(
+            self.workspace.clone(),
+            self.thread.clone(),
+            self.turn.clone(),
+            format!("compaction:{operation}"),
+            TurnItemType::SystemEvent,
+        );
     }
     async fn terminal(&self, operation: &str, state: &RunnerState) -> Result<()> {
         self.processor
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("compaction lifecycle owner stopped"))?
             .publish_compaction_lifecycle(
+                &self.lifecycle_store,
                 operation,
                 state.generation,
                 AgentDurableEvent::ItemCompleted {
@@ -344,7 +347,7 @@ impl CompactionRunner {
         clock: Arc<dyn CompactionClock>,
     ) -> Self {
         Self {
-            store: store.with_maintenance_access(),
+            store,
             workspace,
             snapshot,
             summarizer,

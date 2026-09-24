@@ -115,6 +115,16 @@ pub enum SqliteWriteEvent {
 
 pub trait SqliteWriteObserver: Send + Sync + 'static {
     fn observe(&self, event: SqliteWriteEvent);
+
+    /// Test-only pause after `execute_raw` owns its writer permit. The Gateway
+    /// enables this feature only for tests; normal builds omit the hook.
+    #[cfg(feature = "test-support")]
+    fn pause_execute_raw_after_acquire_for_test(
+        &self,
+        _class: SqliteWriteClass,
+    ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -621,6 +631,15 @@ impl ConnectionTrait for SqliteWriteConnection {
 
     async fn execute_raw(&self, statement: Statement) -> Result<ExecResult, DbErr> {
         let permit = self.executor.acquire(self.class).await;
+        #[cfg(feature = "test-support")]
+        if let Some(pause) = self
+            .executor
+            .admission
+            .observer
+            .pause_execute_raw_after_acquire_for_test(self.class)
+        {
+            pause.await;
+        }
         let _startup_execute = pioneer_observability::turn_startup::current_stage(
             pioneer_observability::turn_startup::Stage::DbExecute,
         );

@@ -131,14 +131,14 @@ enum CLIRuntimeSuccessFinalizationPreparation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CLIRuntimeAuthoritativeTurnState {
+pub(crate) enum CLIRuntimeAuthoritativeTurnState {
     Active(CLIRuntimeActivityEvidence),
     Terminal,
     Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CLIRuntimeActivityEvidence {
+pub(crate) enum CLIRuntimeActivityEvidence {
     LivenessProbe,
     ObservedInProgress,
 }
@@ -1226,6 +1226,7 @@ impl MessageProcessor {
                 .existing_or_start_management(
                     key,
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        cwd: binding.native_cwd.as_ref().map(std::path::PathBuf::from),
                         env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                         ..Default::default()
                     },
@@ -1249,7 +1250,10 @@ impl MessageProcessor {
             let fork = match handle
                 .session()
                 .fork_thread(CLIAgentRuntimeThreadForkRequest {
+                    source_logical_thread_id: params.source_thread_id.clone(),
                     native_thread_id: binding.native_thread_id.clone(),
+                    last_turn_id: None,
+                    thread_source: None,
                 })
                 .await
             {
@@ -4086,7 +4090,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn persist_cli_runtime_canonical_event(
+    pub(crate) async fn persist_cli_runtime_canonical_event(
         &self,
         instance: &CliSessionInstanceId,
         runtime_kind: &str,
@@ -4108,6 +4112,22 @@ impl MessageProcessor {
                 native_turn_id.as_deref(),
             )
             .await;
+        let event_thread_id = if runtime_kind == "claude"
+            && matches!(event, RuntimeEvent::TurnCompleted(_))
+            && let Some(turn_id) = turn_id.as_deref()
+        {
+            match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+                Ok(Some(binding)) => binding.thread_id,
+                Ok(None) => key.thread_id.clone(),
+                Err(error) => {
+                    warn!(turn_id, error = %error,
+                        "failed to identify canonical CLI event execution thread");
+                    return;
+                }
+            }
+        } else {
+            key.thread_id.clone()
+        };
         let payload = if include_payload {
             let mut payload = serde_json::to_value(event)
                 .unwrap_or_else(|_| json!({ "event": "unserializable" }));
@@ -4116,10 +4136,20 @@ impl MessageProcessor {
             }
             payload
         } else {
+            let assistant_record_uuid = match event {
+                RuntimeEvent::TurnCompleted(completed) if runtime_kind == "claude" => completed
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.payload_redacted.as_ref())
+                    .and_then(|payload| payload.get("assistantRecordUuid"))
+                    .and_then(serde_json::Value::as_str),
+                _ => None,
+            };
             json!({
                 "sessionGeneration": instance.generation(),
                 "event": cli_runtime_event_log_label(event),
                 "nativeItemId": native_item_id,
+                "assistantRecordUuid": assistant_record_uuid,
             })
         };
         let payload_redacted_json = match serde_json::to_string(&payload) {
@@ -4142,7 +4172,7 @@ impl MessageProcessor {
                 runtime_id: key.runtime_id.clone(),
                 runtime_kind: runtime_kind.to_owned(),
                 workspace_id: Some(key.workspace_id.clone()),
-                thread_id: Some(key.thread_id.clone()),
+                thread_id: Some(event_thread_id),
                 turn_id,
                 native_thread_id,
                 native_turn_id,
@@ -5579,6 +5609,93 @@ impl MessageProcessor {
                 )
                 .await;
         }
+        // Persist the provider's transcript record before canonical completion.
+        // A failed write keeps the completion retryable; a process exit after
+        // this write leaves a harmless boundary record for that exact turn.
+        if turn_binding.runtime_kind == "claude"
+            && let RuntimeEvent::TurnCompleted(completed) = &event
+        {
+            let from_event = completed
+                .native
+                .as_ref()
+                .and_then(|native| native.payload_redacted.as_ref())
+                .and_then(|payload| payload.get("assistantRecordUuid"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let message_uuid = if let Some(value) = from_event {
+                Some(value)
+            } else {
+                match crate::cli_runtime::thread_binding::claude_terminal_record_uuid(
+                    self.crud_store.as_ref(),
+                    &turn_binding,
+                )
+                .await
+                {
+                    Ok(boundary) => boundary.map(|boundary| boundary.to_string()),
+                    Err(error) => {
+                        warn!(turn_id = turn_binding.turn_id.as_str(), error = %error,
+                            "failed to inspect durable Claude terminal evidence");
+                        return false;
+                    }
+                }
+            };
+            let Some(message_uuid) =
+                message_uuid.filter(|value| uuid::Uuid::parse_str(value).is_ok())
+            else {
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    "refused to complete Claude turn without a transcript record UUID"
+                );
+                return false;
+            };
+            use sha2::Digest;
+            let boundary_event_id = hex::encode(sha2::Sha256::digest(
+                format!(
+                    "claude-boundary:{}:{}:{}:{}",
+                    turn_binding.workspace_id,
+                    turn_binding.runtime_id,
+                    turn_binding.turn_id,
+                    turn_binding.native_thread_id
+                )
+                .as_bytes(),
+            ));
+            #[cfg(test)]
+            let injected_boundary_failure = self
+                .claude_boundary_write_failures
+                .lock()
+                .await
+                .remove(turn_binding.turn_id.as_str());
+            #[cfg(not(test))]
+            let injected_boundary_failure = false;
+            let boundary_write = if injected_boundary_failure {
+                Err(anyhow::anyhow!("injected Claude boundary write failure"))
+            } else {
+                self.crud_store
+                    .append_cli_runtime_native_event_if_absent(
+                        pioneer_crud::NewCliRuntimeNativeEvent {
+                            id: boundary_event_id[..24].to_owned(),
+                            runtime_id: turn_binding.runtime_id.clone(),
+                            runtime_kind: "claude".to_owned(),
+                            workspace_id: Some(turn_binding.workspace_id.clone()),
+                            thread_id: Some(turn_binding.thread_id.clone()),
+                            turn_id: Some(turn_binding.turn_id.clone()),
+                            native_thread_id: Some(turn_binding.native_thread_id.clone()),
+                            native_turn_id: turn_binding.native_turn_id.clone(),
+                            native_method: "claude/assistant_record_boundary".to_owned(),
+                            payload_redacted_json: serde_json::json!({"messageUuid": message_uuid})
+                                .to_string(),
+                            sequence: now_timestamp_millis(),
+                            created_at: chrono::Utc::now().fixed_offset(),
+                        },
+                    )
+                    .await
+            };
+            if let Err(error) = boundary_write {
+                warn!(turn_id = turn_binding.turn_id.as_str(), error = %error,
+                    "refused to complete Claude turn without durable fork boundary");
+                return false;
+            }
+        }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: key.workspace_id.clone(),
             thread_id: turn_binding.thread_id.clone(),
@@ -5627,6 +5744,7 @@ impl MessageProcessor {
                     turn_binding.native_thread_id.as_str(),
                     crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
                         turn_id: completed_turn.id,
+                        thread_id: Some(turn_binding.thread_id.clone()),
                         message_revision: completed_turn.message_revision,
                         message_deleted: completed_turn.message_deleted,
                     },
@@ -6027,6 +6145,9 @@ impl MessageProcessor {
         }
 
         for event in observation.reconciliation_events {
+            if matches!(event, RuntimeEvent::TurnCompleted(_)) {
+                continue;
+            }
             if let Err(error) = self
                 .apply_authoritative_cli_runtime_snapshot_event(
                     handle.instance(),
@@ -6835,7 +6956,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn reconcile_cli_runtime_turn_from_runtime(
+    pub(crate) async fn reconcile_cli_runtime_turn_from_runtime(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         workspace_id: &str,
@@ -6974,6 +7095,9 @@ impl MessageProcessor {
         }
 
         for event in observation.reconciliation_events.iter().cloned() {
+            if matches!(event, RuntimeEvent::TurnCompleted(_)) {
+                continue;
+            }
             self.apply_authoritative_cli_runtime_snapshot_event(handle.instance(), binding, event)
                 .await?;
         }
@@ -6989,12 +7113,20 @@ impl MessageProcessor {
 
         let terminal_event = match observation.status {
             CLIAgentRuntimeObservedTurnStatus::Completed => {
-                RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                let observed_completion =
+                    observation.reconciliation_events.iter().find_map(|event| {
+                        if let RuntimeEvent::TurnCompleted(completed) = event {
+                            Some(completed.clone())
+                        } else {
+                            None
+                        }
+                    });
+                RuntimeEvent::TurnCompleted(observed_completion.unwrap_or(RuntimeTurnCompleted {
                     native_thread_id: Some(binding.native_thread_id.clone()),
                     native_turn_id: native_turn_id.to_owned(),
                     status: "completed".to_owned(),
                     native: None,
-                })
+                }))
             }
             CLIAgentRuntimeObservedTurnStatus::Failed => {
                 RuntimeEvent::TurnFailed(RuntimeTurnFailed {
@@ -7115,6 +7247,7 @@ impl MessageProcessor {
                 turn_id: None,
                 native_thread_id: Some(binding.native_thread_id.clone()),
                 native_turn_id: Some(native_turn_id),
+                native_method: None,
                 limit: None,
             })
             .await?;
@@ -10282,7 +10415,11 @@ impl MessageProcessor {
         Ok(proxy_url)
     }
 
-    async fn cli_runtime_proxy_url(&self, workspace_id: &str, runtime_id: &str) -> Option<String> {
+    pub(crate) async fn cli_runtime_proxy_url(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Option<String> {
         match self
             .prepare_cli_runtime_proxy_url(workspace_id, runtime_id)
             .await

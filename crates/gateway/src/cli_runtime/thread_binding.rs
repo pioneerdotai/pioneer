@@ -24,7 +24,15 @@ pub(crate) struct ClaudeProviderSessionPrepareRequest {
     pub cwd: String,
     pub model: Option<String>,
     pub force_new: bool,
+    pub fork: Option<ClaudeProviderForkSource>,
     pub prepared_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeProviderForkSource {
+    pub source_session_id: Uuid,
+    pub source_turn_id: String,
+    pub boundary_message_uuid: Uuid,
 }
 
 /// Create or load the real Claude UUID before process allocation. This is the
@@ -44,7 +52,31 @@ pub(crate) async fn prepare_claude_provider_session(
             bail!("Claude provider session request `{label}` cannot be empty");
         }
     }
+    let requested_fork = request.fork.clone();
     let proposed_provider_session_id = Uuid::new_v4();
+    let (root, cursor) = if let Some(fork) = request.fork.as_ref() {
+        if request.force_new
+            || fork.source_session_id.is_nil()
+            || fork.boundary_message_uuid.is_nil()
+        {
+            bail!("Claude fork preparation has an invalid source or replacement mode");
+        }
+        (
+            Some(fork.source_session_id.to_string()),
+            serialize_cli_runtime_json(&serde_json::json!({
+                "forkSourceTurnId": fork.source_turn_id,
+                "forkBoundaryMessageUuid": fork.boundary_message_uuid,
+            }))?,
+        )
+    } else {
+        (
+            None,
+            serialize_cli_runtime_json(&serde_json::json!({
+                "provider": "claude",
+                "providerSessionId": "<redacted>"
+            }))?,
+        )
+    };
     let prepared = store
         .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
             thread_binding: NewCliRuntimeThreadBinding {
@@ -54,13 +86,10 @@ pub(crate) async fn prepare_claude_provider_session(
                 runtime_kind: "claude".to_owned(),
                 native_thread_id: proposed_provider_session_id.to_string(),
                 native_session_id: Some(proposed_provider_session_id.to_string()),
-                native_root_thread_id: None,
+                native_root_thread_id: root,
                 native_cwd: Some(request.cwd),
                 native_model: request.model,
-                resume_cursor_json: serialize_cli_runtime_json(&serde_json::json!({
-                    "provider": "claude",
-                    "providerSessionId": "<redacted>"
-                }))?,
+                resume_cursor_json: cursor,
                 status: "active".to_owned(),
                 created_at: request.prepared_at,
                 updated_at: request.prepared_at,
@@ -79,10 +108,54 @@ pub(crate) async fn prepare_claude_provider_session(
     if provider_session_id.is_nil() {
         bail!("durable Claude provider session identity cannot be nil");
     }
+    if let Some(expected) = requested_fork.as_ref() {
+        let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
+            prepared.binding.resume_cursor_json.as_str(),
+        )?;
+        anyhow::ensure!(
+            prepared.binding.native_root_thread_id.as_deref()
+                == Some(expected.source_session_id.to_string().as_str())
+                && cursor
+                    .provider_fields
+                    .get("forkSourceTurnId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected.source_turn_id.as_str())
+                && cursor
+                    .provider_fields
+                    .get("forkBoundaryMessageUuid")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected.boundary_message_uuid.to_string().as_str()),
+            "concurrent Claude session preparation changed the accepted fork source or boundary"
+        );
+    }
     Ok(match prepared.mode {
-        PreparedClaudeProviderSessionMode::New => CliProviderContinuation::ClaudeNew {
-            provider_session_id,
-        },
+        PreparedClaudeProviderSessionMode::New => {
+            let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
+                prepared.binding.resume_cursor_json.as_str(),
+            )?;
+            if let Some(boundary) = cursor
+                .provider_fields
+                .get("forkBoundaryMessageUuid")
+                .and_then(serde_json::Value::as_str)
+            {
+                CliProviderContinuation::ClaudeFork {
+                    source_session_id: Uuid::parse_str(
+                        prepared
+                            .binding
+                            .native_root_thread_id
+                            .as_deref()
+                            .context("Claude fork has no source session ID")?,
+                    )?,
+                    boundary_message_uuid: Uuid::parse_str(boundary)
+                        .context("Claude fork boundary is not a message UUID")?,
+                    provider_session_id,
+                }
+            } else {
+                CliProviderContinuation::ClaudeNew {
+                    provider_session_id,
+                }
+            }
+        }
         PreparedClaudeProviderSessionMode::Resume => CliProviderContinuation::ClaudeResume {
             provider_session_id,
         },
@@ -93,11 +166,15 @@ const CONTEXT_RECEIPT_VERSION: u32 = 4;
 
 #[cfg(test)]
 type TurnGuardLookupRegistry = std::sync::Mutex<
-    std::collections::HashMap<
-        (usize, String),
-        std::sync::Weak<std::sync::Mutex<Vec<(usize, usize)>>>,
-    >,
+    std::collections::HashMap<(usize, String), std::sync::Weak<TurnGuardLookupState>>,
 >;
+
+#[cfg(test)]
+#[derive(Default)]
+struct TurnGuardLookupState {
+    scans: std::sync::atomic::AtomicUsize,
+    pages: std::sync::Mutex<Vec<(usize, usize)>>,
+}
 
 #[cfg(test)]
 static TURN_GUARD_LOOKUPS: std::sync::LazyLock<TurnGuardLookupRegistry> =
@@ -106,13 +183,17 @@ static TURN_GUARD_LOOKUPS: std::sync::LazyLock<TurnGuardLookupRegistry> =
 #[cfg(test)]
 pub(crate) struct TurnGuardLookupObserver {
     key: (usize, String),
-    pages: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+    state: std::sync::Arc<TurnGuardLookupState>,
 }
 
 #[cfg(test)]
 impl TurnGuardLookupObserver {
     pub(crate) fn pages(&self) -> Vec<(usize, usize)> {
-        self.pages.lock().unwrap().clone()
+        self.state.pages.lock().unwrap().clone()
+    }
+
+    pub(crate) fn scans(&self) -> usize {
+        self.state.scans.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -132,22 +213,25 @@ pub(crate) fn observe_turn_guard_lookups(
         store.database_connection().runtime_identity(),
         workspace.to_owned(),
     );
-    let pages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let state = std::sync::Arc::new(TurnGuardLookupState::default());
     assert!(
         TURN_GUARD_LOOKUPS
             .lock()
             .unwrap()
-            .insert(key.clone(), std::sync::Arc::downgrade(&pages))
+            .insert(key.clone(), std::sync::Arc::downgrade(&state))
             .is_none(),
         "turn guard lookup observer already installed"
     );
-    TurnGuardLookupObserver { key, pages }
+    TurnGuardLookupObserver { key, state }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CliRuntimeDeliveredTurn {
     pub(crate) turn_id: String,
+    /// Receipts written before this field existed belonged to the basis owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_id: Option<String>,
     pub(crate) message_revision: u64,
     pub(crate) message_deleted: bool,
 }
@@ -216,6 +300,12 @@ struct CliRuntimeContextReceipt {
     accepted_turn_id: String,
     accepted_turn_revision: u64,
     accepted_turn_deleted: bool,
+    /// A start acknowledgement may carry the previous basis. It does not
+    /// advance this completed frontier until canonical completion is proved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation_head: Option<CliRuntimeDeliveredTurn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_owner_thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +336,663 @@ struct CliRuntimeResumeCursor {
 }
 
 const TURN_INPUT_CONTEXT_BASIS_FIELD: &str = "pioneerContextBasis";
+
+pub(crate) fn provider_receipt_head_state(
+    binding: &CliRuntimeThreadBindingRecord,
+    previous: Option<(&str, u64, bool)>,
+) -> Result<(bool, bool)> {
+    let cursor =
+        deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(binding.resume_cursor_json.as_str())
+            .context("CLI runtime resume cursor is malformed")?;
+    let conflicts = match (cursor.pioneer_context.as_ref(), previous) {
+        (Some(receipt), Some((turn_id, revision, deleted)))
+            if receipt.accepted_turn_id == turn_id =>
+        {
+            receipt.native_thread_id != binding.native_thread_id
+                || receipt.accepted_turn_revision != revision
+                || receipt.accepted_turn_deleted != deleted
+        }
+        _ => false,
+    };
+    let covers = matches!(
+        (cursor.pioneer_context.as_ref(), previous),
+        (Some(receipt), Some((turn_id, _, _)))
+            if receipt.version == CONTEXT_RECEIPT_VERSION
+                && receipt.accepted_turn_id == turn_id
+                && (receipt.completed_turn_id.as_deref() == Some(turn_id)
+                    || receipt.delivered_turns.iter().any(|delivered| delivered.turn_id == turn_id))
+                && receipt.context_owner_thread_id.as_deref() == Some(binding.thread_id.as_str())
+                && receipt.context_history_json.is_some()
+    );
+    Ok((conflicts, covers))
+}
+
+#[cfg(test)]
+pub(crate) fn provider_receipt_conflicts_with_head(
+    binding: &CliRuntimeThreadBindingRecord,
+    previous: Option<(&str, u64, bool)>,
+) -> Result<bool> {
+    Ok(provider_receipt_head_state(binding, previous)?.0)
+}
+
+/// A provider fork is already a complete conversation up to its source turn.
+/// Its first new Pioneer turn may fail preflight or be cancelled before any
+/// receipt exists. Keep the durable fork boundary as the proof for retry.
+pub(crate) fn binding_has_prepared_child_fork(
+    binding: &CliRuntimeThreadBindingRecord,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> Result<bool> {
+    if binding.runtime_kind != "codex"
+        || binding.status != "active"
+        || binding.thread_id != source.thread_id
+        || binding.workspace_id != source.workspace_id
+        || binding.runtime_id != source.runtime_id
+        || binding.runtime_kind != source.runtime_kind
+        || source.status != "completed"
+        || source.continuation_thread_id == source.thread_id
+    {
+        return Ok(false);
+    }
+    Ok(prepared_child_fork_source(binding)?
+        .as_ref()
+        .is_some_and(|(turn, boundary)| {
+            turn == &source.turn_id && Some(boundary.as_str()) == source.native_turn_id.as_deref()
+        })
+        && binding.native_root_thread_id.as_deref() == Some(source.native_thread_id.as_str())
+        && binding.native_thread_id != source.native_thread_id)
+}
+
+pub(crate) fn prepared_child_fork_source(
+    binding: &CliRuntimeThreadBindingRecord,
+) -> Result<Option<(String, String)>> {
+    let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
+        binding.resume_cursor_json.as_str(),
+    )?;
+    if binding.status != "active" || cursor.pioneer_context.is_some() {
+        return Ok(None);
+    }
+    Ok(
+        match (
+            cursor
+                .provider_fields
+                .get("forkSourceTurnId")
+                .and_then(serde_json::Value::as_str),
+            cursor
+                .provider_fields
+                .get("forkBoundaryTurnId")
+                .or_else(|| cursor.provider_fields.get("forkBoundaryMessageUuid"))
+                .and_then(serde_json::Value::as_str),
+        ) {
+            (Some(source), Some(boundary)) if !source.is_empty() && !boundary.is_empty() => {
+                Some((source.to_owned(), boundary.to_owned()))
+            }
+            _ => None,
+        },
+    )
+}
+
+pub(crate) struct PendingCodexForkIntent {
+    pub(crate) source_turn_id: String,
+    pub(crate) boundary_turn_id: String,
+    pub(crate) marker: String,
+}
+
+pub(crate) fn pending_codex_fork_intent(
+    binding: &CliRuntimeThreadBindingRecord,
+) -> Result<Option<PendingCodexForkIntent>> {
+    if binding.status != "fork_pending" {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        binding.runtime_kind == "codex",
+        "non-Codex fork intent is unsupported"
+    );
+    let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
+        binding.resume_cursor_json.as_str(),
+    )?;
+    let get = |name| {
+        cursor
+            .provider_fields
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .with_context(|| format!("pending Codex fork has no {name}"))
+    };
+    Ok(Some(PendingCodexForkIntent {
+        source_turn_id: get("forkSourceTurnId")?,
+        boundary_turn_id: get("forkBoundaryTurnId")?,
+        marker: get("forkMarker")?,
+    }))
+}
+
+pub(crate) fn confirmed_codex_fork_cursor(
+    pending: &CliRuntimeThreadBindingRecord,
+    fork_native_thread_id: &str,
+) -> Result<String> {
+    let mut cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
+        pending.resume_cursor_json.as_str(),
+    )?;
+    anyhow::ensure!(
+        pending_codex_fork_intent(pending)?.is_some(),
+        "Codex fork intent is no longer pending"
+    );
+    cursor.thread_id = Some(fork_native_thread_id.to_owned());
+    serialize_cli_runtime_json(&cursor)
+}
+
+pub(crate) async fn completed_context_basis_from_turn_binding(
+    store: &CrudStore,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> Result<Option<CliRuntimeContextBasis>> {
+    if source.status != "completed" || source.native_turn_id.is_none() {
+        return Ok(None);
+    }
+    let sent = sent_context_basis_from_input_mapping(source.input_mapping_json.as_str())?;
+    let (mut basis, pending_turn) = if let Some(sent) = sent {
+        if sent.pending_turn.turn_id != source.turn_id {
+            bail!("CLI fork source context belongs to a different turn");
+        }
+        (sent.completed, sent.pending_turn)
+    } else {
+        // The context receipt was introduced after existing CLI sessions and
+        // Task snapshots. Recover the immutable accepted history that the old
+        // execution actually used; never substitute today's mutable thread
+        // projection for that historical boundary.
+        let frozen = if let Some(snapshot) = store
+            .get_turn_runtime_snapshot(source.turn_id.as_str())
+            .await?
+        {
+            Some((snapshot.thread_id, snapshot.history_json))
+        } else if let Some(run_turn) = store
+            .get_task_run_turn_by_turn(source.thread_id.as_str(), source.turn_id.as_str())
+            .await?
+        {
+            store
+                .get_task_run_conversation_snapshot(run_turn.run_id.as_str())
+                .await?
+                .map(|snapshot| (snapshot.conversation_thread_id, snapshot.history_json))
+        } else {
+            None
+        };
+        let Some((manifest_owner, history_json)) = frozen else {
+            return Ok(None);
+        };
+        if history_json.trim_start().starts_with('[') {
+            return Ok(None);
+        }
+        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+            serde_json::from_str(history_json.as_str())?;
+        let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+            store,
+            source.workspace_id.as_str(),
+            &descriptor,
+        )
+        .await?;
+        let Some((_, turn)) = store
+            .get_turn(source.thread_id.as_str(), source.turn_id.as_str())
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Prior history snapshots do not contain the separately submitted
+        // current input. A legacy mapping proves that it was sent, while an
+        // unedited revision-zero Turn proves which immutable input it was.
+        // Any later edit/delete (or an earlier edit with no recorded sent
+        // revision) requires a fresh history bridge.
+        let mapping = match serde_json::from_str::<
+            pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
+        >(source.input_mapping_json.as_str())
+        {
+            Ok(mapping) => mapping,
+            Err(_) => return Ok(None),
+        };
+        if mapping.input.is_empty() || turn.message_revision != 0 || turn.message_deleted {
+            return Ok(None);
+        }
+        (
+            cli_runtime_context_basis(
+                source.thread_id.as_str(),
+                manifest_owner.as_str(),
+                history_json,
+                &direct_sources,
+            ),
+            CliRuntimeDeliveredTurn {
+                turn_id: source.turn_id.clone(),
+                thread_id: Some(source.thread_id.clone()),
+                message_revision: turn.message_revision,
+                message_deleted: turn.message_deleted,
+            },
+        )
+    };
+    if basis
+        .delivered_turns
+        .iter()
+        .all(|turn| turn.turn_id != source.turn_id)
+    {
+        basis.delivered_turns.push(pending_turn);
+    }
+    basis.delivered_sources.extend(
+        completed_turn_output_sources(
+            store,
+            source.workspace_id.as_str(),
+            source.thread_id.as_str(),
+            source.turn_id.as_str(),
+        )
+        .await?,
+    );
+    if source.continuation_thread_id != source.thread_id
+        && let Some(run_turn) = store
+            .get_task_run_turn_by_turn(source.thread_id.as_str(), source.turn_id.as_str())
+            .await?
+        && let Some(run) = store.get_task_run(run_turn.run_id.as_str()).await?
+        && let Some(task) = store.get_task_record(run.task_id.as_str()).await?
+        && let Some(work) = task
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.composer_work.as_ref())
+    {
+        // An older service turn sent its Composer launch separately from the
+        // frozen prior history. Recover guards for that delivered input and
+        // its occurrence too; otherwise an edit to either would be hidden by
+        // the newer completed child turn when reconstructing a legacy basis.
+        for parent_turn_id in [work.launch.turn_id.as_str(), run.id.as_str()] {
+            let (_, parent_turn) = store
+                .get_turn(source.continuation_thread_id.as_str(), parent_turn_id)
+                .await?
+                .with_context(|| format!("legacy Composer turn {parent_turn_id} is missing"))?;
+            if parent_turn.message_revision != 0 || parent_turn.message_deleted {
+                return Ok(None);
+            }
+            if basis.delivered_turns.iter().all(|turn| {
+                turn.turn_id != parent_turn_id
+                    || turn.thread_id.as_deref() != Some(source.continuation_thread_id.as_str())
+            }) {
+                basis.delivered_turns.push(CliRuntimeDeliveredTurn {
+                    turn_id: parent_turn_id.to_owned(),
+                    thread_id: Some(source.continuation_thread_id.clone()),
+                    message_revision: parent_turn.message_revision,
+                    message_deleted: parent_turn.message_deleted,
+                });
+            }
+            if parent_turn_id == work.launch.turn_id {
+                basis.delivered_sources.extend(
+                    completed_turn_output_sources(
+                        store,
+                        source.workspace_id.as_str(),
+                        source.continuation_thread_id.as_str(),
+                        parent_turn_id,
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
+    basis.delivered_sources.sort_by(|left, right| {
+        (&left.source_thread_id, &left.scope, &left.id, &left.version).cmp(&(
+            &right.source_thread_id,
+            &right.scope,
+            &right.id,
+            &right.version,
+        ))
+    });
+    basis.delivered_sources.dedup();
+    Ok(Some(basis))
+}
+
+pub(crate) async fn completed_context_basis_is_current(
+    store: &CrudStore,
+    workspace_id: &str,
+    basis: &CliRuntimeContextBasis,
+) -> Result<bool> {
+    if !crate::compaction::frozen::validate_frozen_history_authority(
+        store,
+        workspace_id,
+        basis.manifest_owner_thread_id.as_str(),
+        basis.history_json.as_str(),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    let authority: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(basis.history_json.as_str())?;
+    if authority.messages > 0 && basis.delivered_sources.is_empty() {
+        return Ok(false);
+    }
+    if !validate_delivered_turn_guards(
+        store,
+        workspace_id,
+        basis.execution_thread_id.as_str(),
+        basis.delivered_turns.as_slice(),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    let direct = basis
+        .delivered_sources
+        .iter()
+        .map(|source| {
+            (
+                source.source_thread_id.clone(),
+                pioneer_compaction::SourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::compaction::frozen::validate_direct_history_sources_current(store, workspace_id, &direct)
+        .await
+}
+
+async fn validate_delivered_turn_guards(
+    store: &CrudStore,
+    workspace_id: &str,
+    execution_thread_id: &str,
+    turns: &[CliRuntimeDeliveredTurn],
+) -> Result<bool> {
+    #[cfg(not(test))]
+    let _ = workspace_id;
+    #[cfg(test)]
+    let observer = TURN_GUARD_LOOKUPS
+        .lock()
+        .unwrap()
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace_id.to_owned(),
+        ))
+        .and_then(std::sync::Weak::upgrade);
+    #[cfg(test)]
+    if let Some(observer) = observer.as_ref() {
+        observer
+            .scans
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let mut by_thread = std::collections::BTreeMap::<&str, Vec<&CliRuntimeDeliveredTurn>>::new();
+    let mut unique = std::collections::BTreeSet::new();
+    for turn in turns {
+        let owner = turn.thread_id.as_deref().unwrap_or(execution_thread_id);
+        if !unique.insert((owner, turn.turn_id.as_str())) {
+            return Ok(false);
+        }
+        by_thread.entry(owner).or_default().push(turn);
+    }
+    for (owner, expected) in by_thread {
+        let ids = expected
+            .iter()
+            .map(|turn| turn.turn_id.clone())
+            .collect::<Vec<_>>();
+        let mut actual = std::collections::BTreeMap::new();
+        let mut start = 0usize;
+        while start < ids.len() {
+            let mut end = start;
+            let mut bytes = 2usize;
+            while end < ids.len() && end - start < pioneer_crud::TURN_MESSAGE_GUARD_PAGE_ROWS {
+                let encoded = serde_json::to_vec(&ids[end])?;
+                let separator = usize::from(end > start);
+                if end > start
+                    && bytes
+                        .saturating_add(separator)
+                        .saturating_add(encoded.len())
+                        > pioneer_crud::TURN_MESSAGE_GUARD_PAGE_BYTES
+                {
+                    break;
+                }
+                ensure_turn_guard_size(encoded.len())?;
+                bytes = bytes
+                    .saturating_add(separator)
+                    .saturating_add(encoded.len());
+                end += 1;
+            }
+            let page = store
+                .get_turn_message_guards_by_thread_and_ids(owner, &ids[start..end])
+                .await?;
+            #[cfg(test)]
+            if let Some(observer) = observer.as_ref() {
+                observer.pages.lock().unwrap().push((end - start, bytes));
+            }
+            for turn in page {
+                actual.insert(
+                    turn.id,
+                    (
+                        u64::try_from(turn.message_revision)
+                            .context("persisted turn message revision is negative")?,
+                        turn.message_deleted_at.is_some(),
+                    ),
+                );
+            }
+            start = end;
+        }
+        if actual.len() != expected.len()
+            || !expected.iter().all(|turn| {
+                actual.get(turn.turn_id.as_str())
+                    == Some(&(turn.message_revision, turn.message_deleted))
+            })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) async fn claude_assistant_record_boundary(
+    store: &CrudStore,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> Result<Option<Uuid>> {
+    if source.runtime_kind != "claude" || source.status != "completed" {
+        return Ok(None);
+    }
+    let event =
+        latest_claude_source_event(store, source, "claude/assistant_record_boundary").await?;
+    if let Some(event) = event {
+        return Ok(Some({
+            let value: serde_json::Value = serde_json::from_str(&event.payload_redacted_json)?;
+            Uuid::parse_str(
+                value
+                    .get("messageUuid")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Claude fork boundary event has no message UUID")?,
+            )
+            .context("Claude fork boundary is not a transcript record UUID")?
+        }));
+    }
+    // Before the dedicated boundary row existed, debug-enabled canonical
+    // events retained the adapter's result payload for this exact Pioneer and
+    // provider turn. Only its assistantRecordUuid is a transcript boundary;
+    // API message.id and synthetic native turn IDs are not substitutes.
+    if let Some(boundary) = claude_terminal_record_uuid(store, source).await? {
+        return Ok(Some(boundary));
+    }
+    // Earlier adapters retained the provider record UUID in a redacted final
+    // assistant item when native capture was enabled. Keep the exact turn and
+    // session filter, so a later parent answer cannot become this boundary.
+    let item = latest_claude_source_event(store, source, "item_completed").await?;
+    let Some(item) = item else { return Ok(None) };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&item.payload_redacted_json) else {
+        return Ok(None);
+    };
+    if value
+        .pointer("/native/method")
+        .and_then(serde_json::Value::as_str)
+        != Some("assistant/text")
+    {
+        return Ok(None);
+    }
+    value
+        .pointer("/native/payload_redacted/uuid")
+        .and_then(serde_json::Value::as_str)
+        .map(|raw| Uuid::parse_str(raw).context("legacy Claude assistant record UUID is malformed"))
+        .transpose()
+}
+
+/// Exact-turn terminal evidence is needed both before canonical completion and
+/// when restoring a legacy completed child. The Completed status fence belongs
+/// only to the caller that is about to fork from that child.
+pub(crate) async fn claude_terminal_record_uuid(
+    store: &CrudStore,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> Result<Option<Uuid>> {
+    fn find_boundary(value: &serde_json::Value) -> Option<&str> {
+        match value {
+            serde_json::Value::Object(fields) => fields
+                .get("assistantRecordUuid")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| fields.values().find_map(find_boundary)),
+            serde_json::Value::Array(values) => values.iter().find_map(find_boundary),
+            _ => None,
+        }
+    }
+    let Some(event) = latest_claude_source_event(store, source, "turn_completed").await? else {
+        return Ok(None);
+    };
+    // Older optional debug journals may contain a redacted or malformed
+    // terminal payload. They cannot prove a boundary, but must not prevent
+    // the exact-turn item evidence fallback below from being considered.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.payload_redacted_json) else {
+        return Ok(None);
+    };
+    find_boundary(&value)
+        .map(|boundary| {
+            Uuid::parse_str(boundary).context("Claude terminal boundary is not a transcript UUID")
+        })
+        .transpose()
+}
+
+async fn latest_claude_source_event(
+    store: &CrudStore,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    method: &str,
+) -> Result<Option<pioneer_crud::CliRuntimeNativeEventRecord>> {
+    // Older canonical journals used the provider continuation owner (parent)
+    // for a service child. The exact Pioneer turn and provider session filters
+    // keep that compatibility lookup bounded to this answer.
+    for thread in [
+        source.thread_id.as_str(),
+        source.continuation_thread_id.as_str(),
+    ] {
+        if let Some(event) = store
+            .latest_cli_runtime_native_event(pioneer_crud::CliRuntimeNativeEventListFilter {
+                runtime_id: Some(source.runtime_id.clone()),
+                thread_id: Some(thread.to_owned()),
+                turn_id: Some(source.turn_id.clone()),
+                native_thread_id: Some(source.native_thread_id.clone()),
+                native_turn_id: source.native_turn_id.clone(),
+                native_method: Some(method.to_owned()),
+                limit: Some(1),
+            })
+            .await?
+        {
+            return Ok(Some(event));
+        }
+        if source.thread_id == source.continuation_thread_id {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn binding_has_prepared_claude_fork(
+    store: &CrudStore,
+    binding: &CliRuntimeThreadBindingRecord,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> Result<bool> {
+    if binding.runtime_kind != "claude"
+        || source.runtime_kind != "claude"
+        || binding.workspace_id != source.workspace_id
+        || binding.runtime_id != source.runtime_id
+        || binding.thread_id != source.thread_id
+        || source.continuation_thread_id == source.thread_id
+        || binding.native_root_thread_id.as_deref() != Some(source.native_thread_id.as_str())
+        || binding.native_thread_id == source.native_thread_id
+    {
+        return Ok(false);
+    }
+    let Some((turn_id, boundary)) = prepared_child_fork_source(binding)? else {
+        return Ok(false);
+    };
+    Ok(turn_id == source.turn_id
+        && claude_assistant_record_boundary(store, source)
+            .await?
+            .is_some_and(|uuid| uuid.to_string() == boundary))
+}
+
+/// A service Task can append to the parent's CLI conversation without adding
+/// a new parent Turn. Its receipt records the exact parent head observed
+/// before that append, so a later Native parent Turn cannot be skipped.
+pub(crate) async fn service_child_context_basis_from_binding(
+    store: &CrudStore,
+    binding: &CliRuntimeThreadBindingRecord,
+    previous: Option<(&str, u64, bool)>,
+) -> Result<Option<CliRuntimeContextBasis>> {
+    let cursor =
+        deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(binding.resume_cursor_json.as_str())
+            .context("CLI runtime resume cursor is malformed")?;
+    let Some(receipt) = cursor.pioneer_context else {
+        return Ok(None);
+    };
+    let Some((turn_id, revision, deleted)) = previous else {
+        return Ok(None);
+    };
+    if receipt.version != CONTEXT_RECEIPT_VERSION
+        || receipt.native_thread_id != binding.native_thread_id
+        || receipt.continuation_head.as_ref()
+            != Some(&CliRuntimeDeliveredTurn {
+                turn_id: turn_id.to_owned(),
+                thread_id: None,
+                message_revision: revision,
+                message_deleted: deleted,
+            })
+    {
+        return Ok(None);
+    }
+    let Some(child_turn) = store
+        .get_cli_runtime_turn_binding(receipt.accepted_turn_id.as_str())
+        .await?
+    else {
+        return Ok(None);
+    };
+    if child_turn.thread_id == binding.thread_id
+        || child_turn.continuation_thread_id != binding.thread_id
+        || child_turn.workspace_id != binding.workspace_id
+        || child_turn.runtime_id != binding.runtime_id
+        || child_turn.runtime_kind != binding.runtime_kind
+        || child_turn.native_thread_id != binding.native_thread_id
+        || child_turn.native_turn_id.is_none()
+        || child_turn.status != "completed"
+    {
+        return Ok(None);
+    }
+    let Some((_, persisted_child_turn)) = store
+        .get_turn(child_turn.thread_id.as_str(), child_turn.turn_id.as_str())
+        .await?
+    else {
+        return Ok(None);
+    };
+    if persisted_child_turn.message_revision != receipt.accepted_turn_revision
+        || persisted_child_turn.message_deleted != receipt.accepted_turn_deleted
+    {
+        return Ok(None);
+    }
+    let Some(owner) = receipt.context_owner_thread_id.as_deref() else {
+        return Ok(None);
+    };
+    current_context_basis_for_receipt(
+        store,
+        binding,
+        binding.workspace_id.as_str(),
+        owner,
+        Some((
+            child_turn.turn_id.as_str(),
+            receipt.accepted_turn_revision,
+            receipt.accepted_turn_deleted,
+        )),
+        &receipt,
+    )
+    .await
+}
 
 pub(crate) fn completed_context_basis_from_binding(
     binding: &CliRuntimeThreadBindingRecord,
@@ -308,6 +1055,7 @@ pub(crate) fn sent_context_basis_from_input_mapping(
         .context("CLI runtime sent-context basis is malformed")
 }
 
+#[cfg(test)]
 pub(crate) async fn binding_has_current_context(
     store: &CrudStore,
     binding: &CliRuntimeThreadBindingRecord,
@@ -315,18 +1063,55 @@ pub(crate) async fn binding_has_current_context(
     execution_thread_id: &str,
     previous_turn: Option<(&str, u64, bool)>,
 ) -> Result<bool> {
+    Ok(current_context_basis_from_binding(
+        store,
+        binding,
+        workspace_id,
+        execution_thread_id,
+        previous_turn,
+    )
+    .await?
+    .is_some())
+}
+
+pub(crate) async fn current_context_basis_from_binding(
+    store: &CrudStore,
+    binding: &CliRuntimeThreadBindingRecord,
+    workspace_id: &str,
+    execution_thread_id: &str,
+    previous_turn: Option<(&str, u64, bool)>,
+) -> Result<Option<CliRuntimeContextBasis>> {
     // Decode before inspecting the Pioneer head. A missing head means the
     // conversation needs bootstrap, but it must never make a corrupt provider
     // cursor silently replaceable.
     let cursor =
         deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(&binding.resume_cursor_json)
             .context("CLI runtime resume cursor is malformed")?;
+    let Some(receipt) = cursor.pioneer_context else {
+        return Ok(None);
+    };
+    current_context_basis_for_receipt(
+        store,
+        binding,
+        workspace_id,
+        execution_thread_id,
+        previous_turn,
+        &receipt,
+    )
+    .await
+}
+
+async fn current_context_basis_for_receipt(
+    store: &CrudStore,
+    binding: &CliRuntimeThreadBindingRecord,
+    workspace_id: &str,
+    execution_thread_id: &str,
+    previous_turn: Option<(&str, u64, bool)>,
+    receipt: &CliRuntimeContextReceipt,
+) -> Result<Option<CliRuntimeContextBasis>> {
     let Some((previous_turn_id, previous_turn_revision, previous_turn_deleted)) = previous_turn
     else {
-        return Ok(false);
-    };
-    let Some(receipt) = cursor.pioneer_context else {
-        return Ok(false);
+        return Ok(None);
     };
     if !(receipt.version == CONTEXT_RECEIPT_VERSION
         && receipt.native_thread_id == binding.native_thread_id
@@ -334,7 +1119,25 @@ pub(crate) async fn binding_has_current_context(
         && receipt.accepted_turn_revision == previous_turn_revision
         && receipt.accepted_turn_deleted == previous_turn_deleted)
     {
-        return Ok(false);
+        return Ok(None);
+    }
+    if receipt.completed_turn_id.as_deref() != Some(previous_turn_id)
+        && !receipt.delivered_turns.iter().any(|turn| {
+            turn.turn_id == previous_turn_id
+                && turn.message_revision == previous_turn_revision
+                && turn.message_deleted == previous_turn_deleted
+        })
+    {
+        return Ok(None);
+    }
+    let Some(accepted) = store.get_cli_runtime_turn_binding(previous_turn_id).await? else {
+        return Ok(None);
+    };
+    if accepted.status != "completed"
+        || accepted.native_thread_id != binding.native_thread_id
+        || accepted.continuation_thread_id != binding.thread_id
+    {
+        return Ok(None);
     }
     let (Some(execution_owner), Some(history_json)) = (
         receipt.context_owner_thread_id.as_deref(),
@@ -343,122 +1146,27 @@ pub(crate) async fn binding_has_current_context(
         // The start acknowledgement is recovery metadata for the accepted
         // provider turn, not evidence that a later turn may resume the whole
         // canonical conversation without bootstrap.
-        return Ok(false);
+        return Ok(None);
     };
     if execution_owner != execution_thread_id {
-        return Ok(false);
+        return Ok(None);
     }
     let manifest_owner = receipt
         .context_manifest_owner_thread_id
         .as_deref()
         .unwrap_or(execution_owner);
-    if !crate::compaction::frozen::validate_frozen_history_authority(
-        store,
-        workspace_id,
-        manifest_owner,
-        history_json,
+    let basis = CliRuntimeContextBasis {
+        execution_thread_id: execution_owner.to_owned(),
+        manifest_owner_thread_id: manifest_owner.to_owned(),
+        history_json: history_json.to_owned(),
+        delivered_turns: receipt.delivered_turns.clone(),
+        delivered_sources: receipt.delivered_sources.clone(),
+    };
+    Ok(
+        completed_context_basis_is_current(store, workspace_id, &basis)
+            .await?
+            .then_some(basis),
     )
-    .await?
-    {
-        return Ok(false);
-    }
-    let authority: pioneer_compaction::frozen::FrozenHistoryRef =
-        serde_json::from_str(history_json)?;
-    if authority.messages > 0 && receipt.delivered_sources.is_empty() {
-        // Version 4 receipts must identify the actual restored projection.
-        // An authority manifest alone cannot prove which raw/checkpoint sources
-        // the provider saw.
-        return Ok(false);
-    }
-    if !receipt.delivered_turns.is_empty() {
-        let ids = receipt
-            .delivered_turns
-            .iter()
-            .map(|turn| turn.turn_id.clone())
-            .collect::<Vec<_>>();
-        let unique = ids.iter().collect::<std::collections::BTreeSet<_>>();
-        if unique.len() != ids.len() {
-            return Ok(false);
-        }
-        let mut actual = std::collections::BTreeMap::new();
-        let mut start = 0usize;
-        while start < ids.len() {
-            let mut end = start;
-            let mut bytes = 2usize;
-            while end < ids.len() && end - start < pioneer_crud::TURN_MESSAGE_GUARD_PAGE_ROWS {
-                let encoded = serde_json::to_vec(&ids[end])?;
-                let separator = usize::from(end > start);
-                if end > start
-                    && bytes
-                        .saturating_add(separator)
-                        .saturating_add(encoded.len())
-                        > pioneer_crud::TURN_MESSAGE_GUARD_PAGE_BYTES
-                {
-                    break;
-                }
-                ensure_turn_guard_size(encoded.len())?;
-                bytes = bytes
-                    .saturating_add(separator)
-                    .saturating_add(encoded.len());
-                end += 1;
-            }
-            let page = store
-                .get_turn_message_guards_by_thread_and_ids(execution_thread_id, &ids[start..end])
-                .await?;
-            #[cfg(test)]
-            if let Some(pages) = TURN_GUARD_LOOKUPS
-                .lock()
-                .unwrap()
-                .get(&(
-                    store.database_connection().runtime_identity(),
-                    workspace_id.to_owned(),
-                ))
-                .and_then(std::sync::Weak::upgrade)
-            {
-                pages.lock().unwrap().push((end - start, bytes));
-            }
-            for turn in page {
-                actual.insert(
-                    turn.id,
-                    (
-                        u64::try_from(turn.message_revision)
-                            .context("persisted turn message revision is negative")?,
-                        turn.message_deleted_at.is_some(),
-                    ),
-                );
-            }
-            start = end;
-        }
-        if actual.len() != receipt.delivered_turns.len() {
-            return Ok(false);
-        }
-        if !receipt.delivered_turns.iter().all(|expected| {
-            actual.get(expected.turn_id.as_str())
-                == Some(&(expected.message_revision, expected.message_deleted))
-        }) {
-            return Ok(false);
-        }
-    }
-    let delivered_sources = receipt
-        .delivered_sources
-        .iter()
-        .map(|source| {
-            (
-                source.source_thread_id.clone(),
-                pioneer_compaction::SourceRef {
-                    scope: source.scope.clone(),
-                    id: source.id.clone(),
-                    version: source.version.clone(),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    crate::compaction::frozen::validate_direct_history_sources_current(
-        store,
-        workspace_id,
-        delivered_sources.as_slice(),
-    )
-    .await
 }
 
 fn ensure_turn_guard_size(encoded_id_bytes: usize) -> Result<()> {
@@ -475,6 +1183,7 @@ pub(crate) async fn record_cli_runtime_context_receipt(
     accepted_turn_id: &str,
     accepted_turn_revision: u64,
     accepted_turn_deleted: bool,
+    continuation_head: Option<CliRuntimeDeliveredTurn>,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<CliRuntimeThreadBindingRecord> {
     let binding = store
@@ -490,22 +1199,39 @@ pub(crate) async fn record_cli_runtime_context_receipt(
                 "CLI runtime resume cursor is malformed; refusing to replace provider metadata",
             )?;
     cursor.thread_id = Some(native_thread_id.to_owned());
+    let completed = cursor.pioneer_context.take();
     cursor.pioneer_context = Some(CliRuntimeContextReceipt {
         version: CONTEXT_RECEIPT_VERSION,
         native_thread_id: native_thread_id.to_owned(),
         accepted_turn_id: accepted_turn_id.to_owned(),
         accepted_turn_revision,
         accepted_turn_deleted,
-        context_owner_thread_id: None,
-        context_history_json: None,
-        context_manifest_owner_thread_id: None,
-        delivered_turns: Vec::new(),
-        delivered_sources: Vec::new(),
+        completed_turn_id: completed
+            .as_ref()
+            .and_then(|receipt| receipt.completed_turn_id.clone()),
+        continuation_head,
+        context_owner_thread_id: completed
+            .as_ref()
+            .and_then(|receipt| receipt.context_owner_thread_id.clone()),
+        context_history_json: completed
+            .as_ref()
+            .and_then(|receipt| receipt.context_history_json.clone()),
+        context_manifest_owner_thread_id: completed
+            .as_ref()
+            .and_then(|receipt| receipt.context_manifest_owner_thread_id.clone()),
+        delivered_turns: completed
+            .as_ref()
+            .map(|receipt| receipt.delivered_turns.clone())
+            .unwrap_or_default(),
+        delivered_sources: completed
+            .map(|receipt| receipt.delivered_sources)
+            .unwrap_or_default(),
     });
     store
         .update_cli_runtime_thread_resume_cursor(
             thread_id,
             native_thread_id,
+            binding.resume_cursor_json.as_str(),
             serialize_cli_runtime_json(&cursor)?,
             updated_at,
         )
@@ -530,9 +1256,25 @@ pub(crate) async fn record_cli_runtime_completed_context(
     let mut cursor =
         deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(binding.resume_cursor_json.as_str())
             .context("CLI runtime resume cursor is malformed")?;
-    if sent_basis.completed.execution_thread_id != thread_id {
-        bail!("CLI runtime sent context belongs to another execution thread");
+    // A Task's service child may execute a turn in its parent's provider
+    // conversation. The captured history belongs to that execution child,
+    // while the provider binding belongs to the parent. Check the durable
+    // turn binding instead of assuming both Pioneer IDs are identical.
+    let turn_binding = store
+        .get_cli_runtime_turn_binding(accepted_turn.turn_id.as_str())
+        .await?
+        .context("CLI runtime accepted turn binding is missing")?;
+    if turn_binding.thread_id
+        != accepted_turn
+            .thread_id
+            .as_deref()
+            .unwrap_or(sent_basis.completed.execution_thread_id.as_str())
+        || turn_binding.continuation_thread_id != thread_id
+        || turn_binding.native_thread_id != native_thread_id
+    {
+        bail!("CLI runtime sent context does not match its durable turn binding");
     }
+    let execution_thread_id = turn_binding.thread_id.as_str();
     let authority: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&sent_basis.completed.history_json)
             .context("CLI runtime accepted context boundary is malformed")?;
@@ -554,7 +1296,7 @@ pub(crate) async fn record_cli_runtime_completed_context(
         completed_turn_output_sources(
             store,
             binding.workspace_id.as_str(),
-            thread_id,
+            execution_thread_id,
             accepted_turn.turn_id.as_str(),
         )
         .await?,
@@ -569,12 +1311,18 @@ pub(crate) async fn record_cli_runtime_completed_context(
     });
     delivered_sources.dedup();
     cursor.thread_id = Some(native_thread_id.to_owned());
+    let continuation_head = cursor
+        .pioneer_context
+        .as_ref()
+        .and_then(|receipt| receipt.continuation_head.clone());
     cursor.pioneer_context = Some(CliRuntimeContextReceipt {
         version: CONTEXT_RECEIPT_VERSION,
         native_thread_id: native_thread_id.to_owned(),
-        accepted_turn_id: accepted_turn.turn_id,
+        accepted_turn_id: accepted_turn.turn_id.clone(),
         accepted_turn_revision: accepted_turn.message_revision,
         accepted_turn_deleted: accepted_turn.message_deleted,
+        completed_turn_id: Some(accepted_turn.turn_id.clone()),
+        continuation_head,
         context_owner_thread_id: Some(sent_basis.completed.execution_thread_id),
         context_history_json: Some(sent_basis.completed.history_json),
         context_manifest_owner_thread_id: Some(sent_basis.completed.manifest_owner_thread_id),
@@ -585,6 +1333,7 @@ pub(crate) async fn record_cli_runtime_completed_context(
         .update_cli_runtime_thread_resume_cursor(
             thread_id,
             native_thread_id,
+            binding.resume_cursor_json.as_str(),
             serialize_cli_runtime_json(&cursor)?,
             updated_at,
         )
@@ -603,6 +1352,7 @@ async fn completed_turn_output_sources(
     let mut sources = Vec::new();
     let mut provider_items = std::collections::BTreeSet::new();
     for kind in [
+        pioneer_crud::compaction::PagedSource::Input,
         pioneer_crud::compaction::PagedSource::ProviderContext,
         pioneer_crud::compaction::PagedSource::Event,
     ] {
@@ -638,7 +1388,7 @@ async fn completed_turn_output_sources(
                                     | "update"
                             )
                     }
-                    pioneer_crud::compaction::PagedSource::Input => false,
+                    pioneer_crud::compaction::PagedSource::Input => true,
                 };
                 if delivered {
                     sources.push(CliRuntimeDeliveredSource {
@@ -909,7 +1659,10 @@ fn validate_existing_generic_binding(
             request.workspace_id
         );
     }
-    if existing.runtime_id != request.runtime_id || existing.runtime_kind != request.runtime_kind {
+    if request.resume_existing
+        && (existing.runtime_id != request.runtime_id
+            || existing.runtime_kind != request.runtime_kind)
+    {
         bail!(
             "CLI runtime binding for thread `{}` belongs to runtime `{}`/`{}` not `{}`/`{}`",
             request.thread_id,
@@ -940,7 +1693,9 @@ mod tests {
     use super::{
         CLIAgentRuntimeThreadBindingOpenMode, CLIAgentRuntimeThreadBindingOpenRequest,
         CLIAgentRuntimeThreadOpenClient, binding_has_current_context,
-        open_cli_runtime_thread_binding, record_cli_runtime_context_receipt,
+        binding_has_prepared_child_fork, open_cli_runtime_thread_binding,
+        prepared_child_fork_source, provider_receipt_conflicts_with_head,
+        record_cli_runtime_context_receipt,
     };
     use crate::cli_runtime::manager::{
         CLIAgentRuntimeThreadOpenParams, CLIAgentRuntimeThreadOpenSnapshot,
@@ -948,7 +1703,10 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use migration::{Migrator, MigratorTrait};
-    use pioneer_crud::{CrudStore, NewCliRuntimeThreadBinding};
+    use pioneer_crud::{
+        CliRuntimeThreadBindingRecord, CliRuntimeTurnBindingRecord, CrudStore,
+        NewCliRuntimeThreadBinding,
+    };
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
     use sea_orm::{Database, DatabaseConnection};
     use serde_json::json;
@@ -1055,6 +1813,38 @@ mod tests {
             .fixed_offset()
     }
 
+    #[test]
+    fn provider_receipt_detects_a_changed_head() {
+        let at = unix_to_datetime(100);
+        let binding = CliRuntimeThreadBindingRecord {
+            thread_id: "parent".into(),
+            workspace_id: "workspace".into(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "provider-parent".into(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: None,
+            native_model: None,
+            resume_cursor_json: r#"{"threadId":"provider-parent"}"#.into(),
+            status: "active".into(),
+            mcp: None,
+            provider_session: None,
+            created_at: at,
+            updated_at: at,
+        };
+        assert!(
+            !provider_receipt_conflicts_with_head(&binding, Some(("parent-turn", 1, false)),)
+                .unwrap()
+        );
+        let mut with_receipt = binding.clone();
+        with_receipt.resume_cursor_json = r#"{"threadId":"provider-parent","pioneerContext":{"version":4,"nativeThreadId":"provider-parent","acceptedTurnId":"parent-turn","acceptedTurnRevision":0,"acceptedTurnDeleted":false}}"#.into();
+        assert!(
+            provider_receipt_conflicts_with_head(&with_receipt, Some(("parent-turn", 1, false)),)
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn cli_runtime_binding_first_start_persists_thread_binding() {
         let (_connection, store) = setup_store().await;
@@ -1075,6 +1865,90 @@ mod tests {
         );
         assert_eq!(client.starts.lock().expect("starts lock").len(), 1);
         assert!(client.resumes.lock().expect("resumes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_child_fork_never_opens_an_empty_provider_thread() {
+        let (_connection, store) = setup_store().await;
+        let at = unix_to_datetime(100);
+        store
+            .upsert_cli_runtime_thread_binding(NewCliRuntimeThreadBinding {
+                thread_id: "child".into(),
+                workspace_id: "ws_cli_binding".into(),
+                runtime_id: "codex".into(),
+                runtime_kind: "codex".into(),
+                native_thread_id: "parent-provider-thread".into(),
+                native_session_id: None,
+                native_root_thread_id: Some("parent-provider-thread".into()),
+                native_cwd: Some("/tmp/project".into()),
+                native_model: Some("gpt-5".into()),
+                resume_cursor_json: r#"{"forkBoundaryTurnId":"completed-provider-turn"}"#.into(),
+                status: "fork_pending".into(),
+                created_at: at,
+                updated_at: at,
+            })
+            .await
+            .expect("persist fork fence");
+        let client = FakeCliRuntimeThreadClient::new();
+        let error = open_cli_runtime_thread_binding(&store, &client, open_request("child", 101))
+            .await
+            .expect_err("uncertain fork must remain fenced");
+        assert!(error.to_string().contains("fork_pending"));
+        assert!(client.starts.lock().unwrap().is_empty());
+        assert!(client.resumes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn confirmed_child_fork_remains_usable_before_its_first_new_turn() {
+        let at = unix_to_datetime(100);
+        let source = CliRuntimeTurnBindingRecord {
+            turn_id: "child-first-answer".into(),
+            thread_id: "child".into(),
+            continuation_thread_id: "parent".into(),
+            workspace_id: "workspace".into(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "provider-parent".into(),
+            native_turn_id: Some("provider-boundary".into()),
+            request_id: None,
+            status: "completed".into(),
+            model: None,
+            cwd: None,
+            sandbox_json: None,
+            approval_policy: None,
+            input_mapping_json: "{}".into(),
+            mcp: None,
+            native_goal_status: None,
+            native_goal_turn_id: None,
+            native_goal_observed_at: None,
+            created_at: at,
+            updated_at: at,
+        };
+        let binding = CliRuntimeThreadBindingRecord {
+            thread_id: "child".into(),
+            workspace_id: "workspace".into(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "provider-child".into(),
+            native_session_id: None,
+            native_root_thread_id: Some("provider-parent".into()),
+            native_cwd: None,
+            native_model: None,
+            resume_cursor_json: r#"{"threadId":"provider-child","forkSourceTurnId":"child-first-answer","forkBoundaryTurnId":"provider-boundary","forkMarker":"pioneer-cli-fork:nonce"}"#.into(),
+            status: "active".into(),
+            mcp: None,
+            provider_session: None,
+            created_at: at,
+            updated_at: at,
+        };
+        assert!(binding_has_prepared_child_fork(&binding, &source).unwrap());
+        assert_eq!(
+            prepared_child_fork_source(&binding).unwrap(),
+            Some(("child-first-answer".into(), "provider-boundary".into()))
+        );
+        let mut changed = source.clone();
+        changed.native_turn_id = Some("later-parent-turn".into());
+        assert!(!binding_has_prepared_child_fork(&binding, &changed).unwrap());
     }
 
     #[tokio::test]
@@ -1127,6 +2001,7 @@ mod tests {
             "turn-new",
             0,
             false,
+            None,
             unix_to_datetime(201),
         )
         .await
@@ -1374,7 +2249,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            "a pre-fix binding must bootstrap because native_thread_id alone is not evidence"
+            "the receipt validator alone cannot infer context from an old binding; the caller also checks the completed prior CLI turn"
         );
 
         let confirmed = record_cli_runtime_context_receipt(
@@ -1384,6 +2259,7 @@ mod tests {
             "turn-a",
             0,
             false,
+            None,
             unix_to_datetime(200),
         )
         .await

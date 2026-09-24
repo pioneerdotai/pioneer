@@ -46,6 +46,11 @@ static CLAUDE_MCP_CONFIG_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub enum ClaudeProviderSessionLaunch {
     New(uuid::Uuid),
     Resume(uuid::Uuid),
+    Fork {
+        source_session_id: uuid::Uuid,
+        boundary_message_uuid: uuid::Uuid,
+        provider_session_id: uuid::Uuid,
+    },
 }
 
 impl fmt::Debug for ClaudeProviderSessionLaunch {
@@ -54,6 +59,9 @@ impl fmt::Debug for ClaudeProviderSessionLaunch {
             Self::New(_) => formatter.write_str("ClaudeProviderSessionLaunch::New(<redacted>)"),
             Self::Resume(_) => {
                 formatter.write_str("ClaudeProviderSessionLaunch::Resume(<redacted>)")
+            }
+            Self::Fork { .. } => {
+                formatter.write_str("ClaudeProviderSessionLaunch::Fork(<redacted>)")
             }
         }
     }
@@ -72,6 +80,24 @@ impl ClaudeProviderSessionLaunch {
         Ok(Self::Resume(provider_session_id))
     }
 
+    pub fn fork(
+        source_session_id: uuid::Uuid,
+        boundary_message_uuid: uuid::Uuid,
+        provider_session_id: uuid::Uuid,
+    ) -> Result<Self, ClaudeProviderSessionLaunchError> {
+        validate_claude_provider_session_id(source_session_id)?;
+        validate_claude_provider_session_id(boundary_message_uuid)?;
+        validate_claude_provider_session_id(provider_session_id)?;
+        if source_session_id == provider_session_id {
+            return Err(ClaudeProviderSessionLaunchError);
+        }
+        Ok(Self::Fork {
+            source_session_id,
+            boundary_message_uuid,
+            provider_session_id,
+        })
+    }
+
     pub fn append_process_args(&self, args: &mut Vec<String>) {
         match self {
             Self::New(provider_session_id) => {
@@ -82,14 +108,32 @@ impl ClaudeProviderSessionLaunch {
                 args.push("--resume".to_owned());
                 args.push(provider_session_id.to_string());
             }
+            Self::Fork {
+                source_session_id,
+                boundary_message_uuid,
+                provider_session_id,
+            } => {
+                args.extend([
+                    "--resume".to_owned(),
+                    source_session_id.to_string(),
+                    "--fork-session".to_owned(),
+                    "--resume-session-at".to_owned(),
+                    boundary_message_uuid.to_string(),
+                    "--session-id".to_owned(),
+                    provider_session_id.to_string(),
+                ]);
+            }
         }
     }
 
     pub fn provider_session_id(&self) -> uuid::Uuid {
         match self {
-            Self::New(provider_session_id) | Self::Resume(provider_session_id) => {
-                *provider_session_id
-            }
+            Self::New(provider_session_id)
+            | Self::Resume(provider_session_id)
+            | Self::Fork {
+                provider_session_id,
+                ..
+            } => *provider_session_id,
         }
     }
 }
@@ -2194,6 +2238,32 @@ mod tests {
         assert!(!format!("{resume:?}").contains(provider_session_id.to_string().as_str()));
         assert!(ClaudeProviderSessionLaunch::new(uuid::Uuid::nil()).is_err());
         assert!(ClaudeProviderSessionLaunch::resume(uuid::Uuid::nil()).is_err());
+    }
+
+    #[test]
+    fn claude_bounded_fork_uses_transcript_record_uuid_and_preassigned_session() {
+        let source = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000041").unwrap();
+        let boundary = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000042").unwrap();
+        let branch = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000043").unwrap();
+        let launch = ClaudeProviderSessionLaunch::fork(source, boundary, branch).unwrap();
+        let mut args = Vec::new();
+        launch.append_process_args(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--resume".to_owned(),
+                source.to_string(),
+                "--fork-session".to_owned(),
+                "--resume-session-at".to_owned(),
+                boundary.to_string(),
+                "--session-id".to_owned(),
+                branch.to_string(),
+            ]
+        );
+        assert_eq!(launch.provider_session_id(), branch);
+        assert!(!format!("{launch:?}").contains(source.to_string().as_str()));
+        assert!(!format!("{launch:?}").contains(boundary.to_string().as_str()));
+        assert!(ClaudeProviderSessionLaunch::fork(source, boundary, source).is_err());
     }
 
     #[test]

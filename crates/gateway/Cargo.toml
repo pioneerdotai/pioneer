@@ -78,6 +78,7 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true
 pioneer-client-ffi.workspace = true
 pioneer-crud = { workspace = true, features = ["test-support"] }

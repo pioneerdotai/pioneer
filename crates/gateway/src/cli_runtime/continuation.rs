@@ -22,9 +22,20 @@ pub(crate) enum CliMcpSessionLaunch {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum CliProviderContinuation {
-    CodexRpcThread { native_thread_id: Option<String> },
-    ClaudeNew { provider_session_id: Uuid },
-    ClaudeResume { provider_session_id: Uuid },
+    CodexRpcThread {
+        native_thread_id: Option<String>,
+    },
+    ClaudeNew {
+        provider_session_id: Uuid,
+    },
+    ClaudeResume {
+        provider_session_id: Uuid,
+    },
+    ClaudeFork {
+        source_session_id: Uuid,
+        boundary_message_uuid: Uuid,
+        provider_session_id: Uuid,
+    },
 }
 
 impl fmt::Debug for CliProviderContinuation {
@@ -42,6 +53,10 @@ impl fmt::Debug for CliProviderContinuation {
                 .debug_struct("ClaudeResume")
                 .field("provider_session_id", &"<redacted>")
                 .finish(),
+            Self::ClaudeFork { .. } => formatter
+                .debug_struct("ClaudeFork")
+                .field("provider_session_id", &"<redacted>")
+                .finish(),
         }
     }
 }
@@ -54,6 +69,10 @@ impl CliProviderContinuation {
             }
             | Self::ClaudeResume {
                 provider_session_id,
+            }
+            | Self::ClaudeFork {
+                provider_session_id,
+                ..
             } => Some(*provider_session_id),
             Self::CodexRpcThread { .. } => None,
         }
@@ -115,6 +134,25 @@ impl CliSessionLaunchSpec {
             options,
             mcp,
             continuation: CliProviderContinuation::ClaudeResume {
+                provider_session_id,
+            },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+        }
+    }
+
+    pub(crate) fn claude_fork(
+        options: CLIAgentRuntimeSessionStartOptions,
+        mcp: CliMcpSessionLaunch,
+        source_session_id: Uuid,
+        boundary_message_uuid: Uuid,
+        provider_session_id: Uuid,
+    ) -> Self {
+        Self {
+            options,
+            mcp,
+            continuation: CliProviderContinuation::ClaudeFork {
+                source_session_id,
+                boundary_message_uuid,
                 provider_session_id,
             },
             native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
@@ -187,12 +225,20 @@ fn continuation_identity_changed(
             }
             | CliProviderContinuation::ClaudeResume {
                 provider_session_id: old,
+            }
+            | CliProviderContinuation::ClaudeFork {
+                provider_session_id: old,
+                ..
             },
             CliProviderContinuation::ClaudeNew {
                 provider_session_id: new,
             }
             | CliProviderContinuation::ClaudeResume {
                 provider_session_id: new,
+            }
+            | CliProviderContinuation::ClaudeFork {
+                provider_session_id: new,
+                ..
             },
         ) => old != new,
         _ => true,

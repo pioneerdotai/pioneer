@@ -8,7 +8,7 @@ use pioneer_compaction::{
 use pioneer_crud::compaction::{
     CanonicalSource, ManifestEntry, PagedSource, PublicationTestPause, arm_publication_test_hook,
 };
-use pioneer_protocol::ProviderFailureClass;
+use pioneer_protocol::{AgentProgressEvent, ProviderFailureClass};
 use pioneer_provider::{
     ChatRequest, ChatResponse, Provider, ProviderFailureClassification, ProviderTermination,
     StreamChunk,
@@ -21,6 +21,41 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+
+#[tokio::test]
+async fn compaction_observer_heartbeat_reaches_the_live_progress_lane() {
+    let lifecycle_store = CrudStore::new(Database::connect("sqlite::memory:").await.unwrap());
+    let hub = Arc::new(ExecutionEventHub::new());
+    let mut live = hub.subscribe_live();
+    let observer = HubCompactionObserver {
+        hub: hub.clone(),
+        processor: std::sync::Weak::new(),
+        lifecycle_store,
+        workspace: "heartbeat-workspace".into(),
+        thread: "heartbeat-thread".into(),
+        turn: "heartbeat-turn".into(),
+    };
+    CompactionObserver::heartbeat(&observer, "heartbeat-operation");
+    let event = tokio::time::timeout(Duration::from_secs(2), live.recv())
+        .await
+        .expect("compaction heartbeat must enter the live progress lane")
+        .expect("the live progress lane must remain open");
+    assert!(matches!(
+        event,
+        AgentProgressEvent::ItemHeartbeat {
+            workspace_id,
+            thread_id,
+            turn_id,
+            item_id,
+            item_type: TurnItemType::SystemEvent,
+            source: pioneer_protocol::ItemHeartbeatSource::OwnerLease,
+        } if workspace_id == "heartbeat-workspace"
+            && thread_id == "heartbeat-thread"
+            && turn_id == "heartbeat-turn"
+            && item_id == "compaction:heartbeat-operation"
+    ));
+    hub.shutdown_progress().await;
+}
 
 #[derive(Default)]
 struct HistoryReadObserver {
@@ -235,6 +270,103 @@ struct Fixture {
     clock: Arc<ManualClock>,
     observer: Arc<Observer>,
     payload: String,
+}
+
+#[tokio::test]
+async fn accepted_source_refresh_checks_unchanged_sources_in_bounded_batches() {
+    let f = fixture("short history", vec![], true, false).await;
+    for index in 0..24 {
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) \
+                 VALUES (?,'thread','turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+                [format!("batch-event-{index:02}").into(), (index + 2_i64).into()],
+            ))
+            .await
+            .unwrap();
+    }
+    let sources = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|entry| entry.reference.id.starts_with("batch-event-"))
+        .map(|entry| entry.reference)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(sources.len(), 24);
+    let groups = std::collections::BTreeMap::from([("thread".to_owned(), sources)]);
+    let unchanged = super::frozen::observe_continuity_source_lookups(&f.store, "ws");
+    assert!(
+        super::frozen::stale_direct_sources(&f.store, "ws", groups.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        unchanged.calls(),
+        1,
+        "unchanged references need one batch query"
+    );
+    drop(unchanged);
+
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE turn_event SET payload='{\"text\":\"edited\"}' WHERE id='batch-event-07'",
+        )
+        .await
+        .unwrap();
+    let changed = super::frozen::observe_continuity_source_lookups(&f.store, "ws");
+    let stale = super::frozen::stale_direct_sources(&f.store, "ws", groups)
+        .await
+        .unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale.iter().next().unwrap().1.id, "batch-event-07");
+    assert!(
+        changed.calls() <= 11,
+        "only the failed batch should be refined"
+    );
+}
+
+#[tokio::test]
+async fn completed_history_runner_preserves_its_owner_database_scope() {
+    let f = fixture("short history", vec![], true, false).await;
+    for (scoped, expected_read, expected_write) in [
+        (
+            f.store.with_interactive_writes(),
+            pioneer_sqlite::SqliteReadClass::Interactive,
+            pioneer_sqlite::SqliteWriteClass::Interactive,
+        ),
+        (
+            f.store.with_maintenance_access(),
+            pioneer_sqlite::SqliteReadClass::Maintenance,
+            pioneer_sqlite::SqliteWriteClass::Maintenance,
+        ),
+    ] {
+        let runner = CompactionRunner::new(
+            scoped,
+            "ws".into(),
+            "thread".into(),
+            f.runner.snapshot.clone(),
+            f.runner.summarizer.clone(),
+            f.runner.target.clone(),
+            f.observer.clone(),
+            f.clock.clone(),
+        );
+        assert_eq!(
+            runner.store.database_connection().read_class(),
+            expected_read
+        );
+        assert_eq!(
+            runner.store.database_connection().write_class(),
+            expected_write
+        );
+        assert_eq!(runner.store.compaction_head("owner").await.unwrap(), None);
+    }
 }
 
 #[test]
@@ -7326,6 +7458,7 @@ async fn check_nested_task_basis(legacy: bool) {
         )
         .await
         .unwrap();
+    let late_parent_body = format!("ancestor append after admission {}", "z".repeat(256_000));
     let mut later = template.clone();
     later.id = "later-root".into();
     f.store
@@ -7334,23 +7467,28 @@ async fn check_nested_task_basis(legacy: bool) {
             SandboxMode::FullAccess,
             &later,
             &[UserInput::Text {
-                text: "ancestor append after admission".into(),
+                text: late_parent_body.clone(),
                 text_elements: vec![],
             }],
             PersistedActorRef::System,
         )
         .await
         .unwrap();
-    let nested = super::frozen::capture_execution_basis_json(
-        &f.store,
-        "ws",
-        "child",
-        Some("child-turn"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let (nested, capture_payload_reads) =
+        super::history::with_payload_batch_stats(super::frozen::capture_execution_basis_json(
+            &f.store,
+            "ws",
+            "child",
+            Some("child-turn"),
+            None,
+            None,
+        ))
+        .await;
+    let nested = nested.unwrap();
+    assert!(
+        capture_payload_reads.max_returned_raw_bytes < late_parent_body.len(),
+        "accepted nested capture must select parent turns before reading later payloads"
+    );
     let scopes = super::frozen::accepted_history_scopes(&f.store, "ws", "child", &nested)
         .await
         .unwrap();
@@ -7360,10 +7498,15 @@ async fn check_nested_task_basis(legacy: bool) {
             .await
             .is_err()
     );
-    let history =
-        crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &scopes, &nested)
-            .await
-            .unwrap();
+    let (history, restore_payload_reads) = super::history::with_payload_batch_stats(
+        crate::turn_runtime_snapshot::restore_history_json(&f.store, "ws", &scopes, &nested),
+    )
+    .await;
+    let history = history.unwrap();
+    assert!(
+        restore_payload_reads.max_returned_raw_bytes < late_parent_body.len(),
+        "accepted nested restore must not read the later parent payload"
+    );
     let without_creator =
         super::frozen::capture_execution_basis_json(&f.store, "ws", "child", None, None, None)
             .await
@@ -11082,11 +11225,12 @@ async fn old_thread_summary_is_ignored_with_available_originals() {
     );
 }
 
-#[test]
-fn stopped_compaction_item_is_cancelled_with_the_same_lifecycle_identity() {
+#[tokio::test]
+async fn stopped_compaction_item_is_cancelled_with_the_same_lifecycle_identity() {
     let observer = HubCompactionObserver {
         hub: Arc::new(ExecutionEventHub::new()),
         processor: std::sync::Weak::new(),
+        lifecycle_store: CrudStore::new(Database::connect("sqlite::memory:").await.unwrap()),
         workspace: "ws".into(),
         thread: "thread".into(),
         turn: "turn".into(),

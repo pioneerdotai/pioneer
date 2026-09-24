@@ -986,6 +986,24 @@ impl CrudStore {
         )
         .await
     }
+    /// Metadata only for exact accepted turns; unrelated parent turns never
+    /// enter the boundary expressions or cross the reader pool.
+    pub async fn compaction_history_selected_turn_page(
+        &self,
+        workspace: &str,
+        thread: &str,
+        selected: &[String],
+        fence: &HistoryReadFence,
+    ) -> Result<Vec<HistoryTurnBoundary>> {
+        repositories::compaction::history::compaction_history_selected_turn_page(
+            &self.connection,
+            workspace,
+            thread,
+            selected,
+            fence,
+        )
+        .await
+    }
     /// Constant-size control-plane fence. The owning runtime awaits this write
     /// before cancelling service work. It survives worker loss without changing
     /// the completed user Turn or granting a new compaction attempt.

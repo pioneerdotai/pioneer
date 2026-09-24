@@ -1965,6 +1965,21 @@ async fn validate_direct_source_groups_current(
     workspace: &str,
     direct_sources: BTreeMap<String, BTreeSet<pioneer_compaction::SourceRef>>,
 ) -> Result<bool> {
+    for (source_thread, sources) in direct_source_batches(direct_sources)? {
+        if !source_batch_is_current(store, workspace, &source_thread, &sources).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Both the ordinary continuity guard and accepted-history refresh use these
+/// same row/byte quanta. The latter refines only failed quanta to identify the
+/// exact accepted turns that must be projected at current revisions.
+fn direct_source_batches(
+    direct_sources: BTreeMap<String, BTreeSet<pioneer_compaction::SourceRef>>,
+) -> Result<Vec<(String, Vec<pioneer_compaction::SourceRef>)>> {
+    let mut batches = Vec::new();
     for (source_thread, sources) in direct_sources {
         let sources = sources.into_iter().collect::<Vec<_>>();
         let mut start = 0;
@@ -1993,28 +2008,59 @@ async fn validate_direct_source_groups_current(
                     .saturating_add(encoded.len());
                 end += 1;
             }
-            if !store
-                .compaction_sources_current(workspace, &source_thread, &sources[start..end])
-                .await?
-            {
-                return Ok(false);
-            }
-            #[cfg(test)]
-            if let Some(calls) = CONTINUITY_SOURCE_LOOKUPS
-                .lock()
-                .unwrap()
-                .get(&(
-                    store.database_connection().runtime_identity(),
-                    workspace.to_owned(),
-                ))
-                .and_then(std::sync::Weak::upgrade)
-            {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
+            batches.push((source_thread.clone(), sources[start..end].to_vec()));
             start = end;
         }
     }
-    Ok(true)
+    Ok(batches)
+}
+
+async fn source_batch_is_current(
+    store: &CrudStore,
+    workspace: &str,
+    source_thread: &str,
+    sources: &[pioneer_compaction::SourceRef],
+) -> Result<bool> {
+    let current = store
+        .compaction_sources_current(workspace, source_thread, sources)
+        .await?;
+    #[cfg(test)]
+    if let Some(calls) = CONTINUITY_SOURCE_LOOKUPS
+        .lock()
+        .unwrap()
+        .get(&(
+            store.database_connection().runtime_identity(),
+            workspace.to_owned(),
+        ))
+        .and_then(std::sync::Weak::upgrade)
+    {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(current)
+}
+
+pub(super) async fn stale_direct_sources(
+    store: &CrudStore,
+    workspace: &str,
+    direct_sources: BTreeMap<String, BTreeSet<pioneer_compaction::SourceRef>>,
+) -> Result<BTreeSet<(String, pioneer_compaction::SourceRef)>> {
+    let mut stale = BTreeSet::new();
+    for (thread, batch) in direct_source_batches(direct_sources)? {
+        let mut pending = vec![batch];
+        while let Some(sources) = pending.pop() {
+            if source_batch_is_current(store, workspace, &thread, &sources).await? {
+                continue;
+            }
+            if sources.len() == 1 {
+                stale.insert((thread.clone(), sources.into_iter().next().unwrap()));
+                continue;
+            }
+            let middle = sources.len() / 2;
+            pending.push(sources[middle..].to_vec());
+            pending.push(sources[..middle].to_vec());
+        }
+    }
+    Ok(stale)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2190,6 +2236,24 @@ struct RetainedAcceptedImports {
 struct ProjectedAcceptedImports {
     target: ScopedHistorySource,
     import_ordinals: Vec<u64>,
+}
+
+fn accepted_source_turn<'a>(scopes: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut turns = scopes.filter_map(|scope| {
+        ["input:", "event:", "context:", "item:"]
+            .iter()
+            .find_map(|prefix| scope.strip_prefix(prefix))
+    });
+    let turn = turns.next()?;
+    turns.all(|other| other == turn).then(|| turn.to_owned())
+}
+
+fn accepted_reference_source_turn(reference: &FrozenMessageRef) -> Option<String> {
+    accepted_source_turn(reference.sources.iter().map(|source| source.scope.as_str()))
+}
+
+fn accepted_provenance_source_turn(origin: &MessageProvenance) -> Option<String> {
+    accepted_source_turn(origin.sources.iter().map(|source| source.scope.as_str()))
 }
 
 async fn restore_accepted_execution_basis_prepared(
@@ -2525,6 +2589,116 @@ async fn restore_accepted_execution_basis_prepared(
         .enumerate()
         .filter(|(ordinal, _)| !omitted.contains(ordinal))
         .collect::<Vec<_>>();
+    // An accepted inherited turn can have been edited after this immutable
+    // manifest was published. Its old revision is neither a current provider
+    // receipt nor necessarily still materializable. Replace only that turn's
+    // accepted whole-message group with its current canonical group. The
+    // manifest still determines membership and order; later parent turns are
+    // never discovered as members of this execution.
+    let mut inherited_sources = BTreeMap::<String, BTreeSet<pioneer_compaction::SourceRef>>::new();
+    let mut source_references =
+        BTreeMap::<(String, pioneer_compaction::SourceRef), Vec<usize>>::new();
+    for (ordinal, reference) in &retained {
+        // The accepted manifest may have been captured while this was an OWN
+        // message of its parent. Ownership is relative to the execution, not
+        // to the source manifest's original capture.
+        if reference.source_thread == execution_thread {
+            continue;
+        }
+        for source in &reference.sources {
+            inherited_sources
+                .entry(reference.source_thread.clone())
+                .or_default()
+                .insert(source.clone());
+            source_references
+                .entry((reference.source_thread.clone(), source.clone()))
+                .or_default()
+                .push(*ordinal);
+        }
+    }
+    let mut revised_turns = BTreeSet::<(String, String)>::new();
+    for source in stale_direct_sources(store, workspace, inherited_sources).await? {
+        for ordinal in source_references.get(&source).into_iter().flatten() {
+            let reference = &references[*ordinal];
+            let turn = accepted_reference_source_turn(reference)
+                .ok_or_else(|| anyhow::anyhow!("changed accepted source has no single turn"))?;
+            revised_turns.insert((reference.source_thread.clone(), turn));
+        }
+    }
+    let mut revised_messages = BTreeMap::<(String, String), Vec<ChatMessage>>::new();
+    for source_thread in revised_turns
+        .iter()
+        .map(|(thread, _)| thread.clone())
+        .collect::<BTreeSet<_>>()
+    {
+        let selected_turns = revised_turns
+            .iter()
+            .filter(|(thread, _)| thread == &source_thread)
+            .map(|(_, turn)| turn.clone())
+            .collect::<BTreeSet<_>>();
+        let fence = store.compaction_history_read_fence().await?;
+        for mut message in super::history::load_task_line_history_turns(
+            store,
+            workspace,
+            &source_thread,
+            &selected_turns,
+            &fence,
+        )
+        .await?
+        {
+            let Some(origin) = message.provenance.as_ref() else {
+                continue;
+            };
+            let Some(turn) = accepted_provenance_source_turn(origin) else {
+                continue;
+            };
+            let key = (source_thread.clone(), turn);
+            if revised_turns.contains(&key) {
+                // This is a parent-owned canonical turn, admitted as inherited
+                // work by the immutable child manifest. Keep its real source
+                // identity and new revision while expressing that execution
+                // relationship to the checkpoint projector.
+                if let Some(origin) = message.provenance.as_mut() {
+                    origin.inherited = true;
+                    origin.context_thread = Some(execution_thread.to_owned());
+                }
+                revised_messages.entry(key).or_default().push(message);
+            }
+        }
+    }
+    let mut revised_anchors = BTreeMap::<(String, String), usize>::new();
+    for (ordinal, reference) in &retained {
+        let Some(turn) = accepted_reference_source_turn(reference) else {
+            continue;
+        };
+        let key = (reference.source_thread.clone(), turn);
+        if revised_turns.contains(&key) {
+            ensure!(
+                reference.source_thread != execution_thread
+                    && reference.complete
+                    && !reference.protected_input,
+                "changed accepted source cannot replace a partial or protected round"
+            );
+            ensure!(
+                !accepted.contains_key(ordinal),
+                "changed accepted source cannot replace an imported output grant"
+            );
+            revised_anchors.entry(key).or_insert(*ordinal);
+        }
+    }
+    for (source_thread, turn) in &revised_turns {
+        let (_, current) = store
+            .get_turn(source_thread, turn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("changed accepted source turn disappeared"))?;
+        ensure!(
+            current.message_deleted
+                || revised_messages
+                    .get(&(source_thread.clone(), turn.clone()))
+                    .is_some_and(|messages| !messages.is_empty()),
+            "changed accepted source has no complete current projection"
+        );
+    }
     let mut direct_sources = BTreeSet::new();
     direct_sources.extend(projections.iter().map(|projection| ScopedHistorySource {
         thread: projection.source_thread.clone(),
@@ -2532,11 +2706,20 @@ async fn restore_accepted_execution_basis_prepared(
     }));
     let mut messages = Vec::with_capacity(retained.len().saturating_add(projections.len()));
     let mut original_ordinals = Vec::with_capacity(retained.len());
+    let proof_references = references
+        .iter()
+        .filter(|reference| {
+            accepted_reference_source_turn(reference).is_none_or(|turn| {
+                !revised_turns.contains(&(reference.source_thread.clone(), turn))
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut restore_state = FrozenExecutionRestoreState::from_references(
         store,
         workspace,
         allowed,
-        &references,
+        &proof_references,
         checkpoint_graphs,
     )
     .await?;
@@ -2545,6 +2728,14 @@ async fn restore_accepted_execution_basis_prepared(
         restore_state.extend_event_input_evidence(&projection.event_input_evidence);
     }
     restore_state.extend_input_coverage(externally_covered.iter());
+    let retained = retained
+        .into_iter()
+        .filter(|(_, reference)| {
+            accepted_reference_source_turn(reference).is_none_or(|turn| {
+                !revised_turns.contains(&(reference.source_thread.clone(), turn))
+            })
+        })
+        .collect::<Vec<_>>();
     for page in retained.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
         let page_references = page
             .iter()
@@ -2596,7 +2787,29 @@ async fn restore_accepted_execution_basis_prepared(
     let retained = original_ordinals
         .into_iter()
         .zip(messages)
+        .chain(revised_anchors.into_iter().flat_map(|(key, anchor)| {
+            revised_messages
+                .remove(&key)
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |message| (anchor, message))
+        }))
         .collect::<Vec<_>>();
+    let mut direct_sources = direct_sources;
+    for (_, message) in &retained {
+        if let Some(origin) = message.provenance.as_ref() {
+            direct_sources.extend(origin.sources.iter().cloned().map(|source| {
+                ScopedHistorySource {
+                    thread: origin.thread_id.clone(),
+                    source: SourceRef {
+                        scope: source.scope,
+                        id: source.id,
+                        version: source.version,
+                    },
+                }
+            }));
+        }
+    }
     let mut replacements = Vec::with_capacity(projections.len());
     for projection in projections {
         let message = super::checkpoint::checkpoint_message_with_resolver(

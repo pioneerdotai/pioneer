@@ -104,6 +104,7 @@ pub struct FrozenHistoryRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     #[test]
     fn logical_alias_extension_preserves_existing_frozen_digest_bytes() {
         let previous = format!(
@@ -121,5 +122,29 @@ mod tests {
         assert_eq!(restored, value);
         value.logical_turn_id = Some(String::new());
         assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn input_copy_reference_roundtrips_without_changing_manifest_digest_bytes() {
+        let persisted = format!(
+            r#"{{"source_thread":"thread","unit_id":"unit","sources":[{{"scope":"event:turn","id":"event","version":"event-revision:1"}}],"event_input_role":"input_copy","inherited":false,"complete":true,"protected_input":false,"wire_sha256":"{}","replay_source":null,"tool_call_id":null,"tool_name":null}}"#,
+            "a".repeat(64),
+        );
+        let before = Sha256::digest(persisted.as_bytes());
+        let restored: FrozenMessageRef = serde_json::from_str(&persisted).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(
+            restored.event_input_role,
+            Some(FrozenEventInputRole::InputCopy)
+        );
+        let encoded = serde_json::to_string(&restored).unwrap();
+        assert_eq!(encoded, persisted);
+        assert_eq!(Sha256::digest(encoded.as_bytes()), before);
+        let legacy_with_explicit_null = persisted.replace(
+            "\"tool_call_id\":null",
+            "\"tool_item_id\":null,\"tool_call_id\":null",
+        );
+        let legacy: FrozenMessageRef = serde_json::from_str(&legacy_with_explicit_null).unwrap();
+        assert_eq!(legacy, restored);
     }
 }

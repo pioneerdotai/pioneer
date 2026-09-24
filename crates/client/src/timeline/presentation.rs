@@ -647,7 +647,8 @@ pub fn project_timeline_groups(
                     matches!(
                         author.actor,
                         pioneer_protocol::PersistedActorRef::AgentExecution(_)
-                    )
+                    ) || super::semantic::timeline_cli_runtime_execution_author(Some(author))
+                        .is_some()
                 })
             };
             groups.push(TimelineGroup {

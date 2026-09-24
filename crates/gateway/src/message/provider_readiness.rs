@@ -817,6 +817,23 @@ impl MessageProcessor {
         runtime_id: &str,
         model_id: &str,
     ) -> anyhow::Result<()> {
+        self.mark_cli_reasoning_model_with_limit_ready_for_tests(
+            workspace_id,
+            runtime_id,
+            model_id,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn mark_cli_reasoning_model_with_limit_ready_for_tests(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        model_id: &str,
+        max_input_tokens: Option<u64>,
+    ) -> anyhow::Result<()> {
         let mut snapshot = self
             .provider_readiness
             .snapshot(workspace_id)
@@ -841,7 +858,7 @@ impl MessageProcessor {
                 output_modalities: vec!["text".to_owned()],
                 supports_reasoning: Some(true),
                 supports_vision: None,
-                max_input_tokens: None,
+                max_input_tokens,
                 max_output_tokens: None,
             });
         let generation = self.provider_readiness.cli_generation(workspace_id).await;

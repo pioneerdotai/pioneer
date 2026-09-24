@@ -44,6 +44,7 @@ pub(crate) async fn prepare_completed_history(
     let mut diagnostic = HistoryCheckDiagnostic::default();
     let result = prepare_completed_history_owned(
         processor,
+        &processor.crud_store.with_maintenance_access(),
         workspace,
         thread,
         turn,
@@ -52,10 +53,12 @@ pub(crate) async fn prepare_completed_history(
         cli_override,
         observer,
         cancellation,
+        super::ContextWorkPriority::Background,
         None,
         None,
         0,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         &mut diagnostic,
     )
     .await?;
@@ -69,6 +72,7 @@ pub(crate) async fn prepare_completed_history(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_completed_history_owned(
     processor: &crate::message::MessageProcessor,
+    scoped_store: &CrudStore,
     workspace: &str,
     thread: &str,
     turn: &str,
@@ -77,13 +81,17 @@ pub(crate) async fn prepare_completed_history_owned(
     cli_override: Option<&ModelSelection>,
     observer: Arc<dyn CompactionObserver>,
     cancellation: CancellationToken,
+    priority: super::ContextWorkPriority,
     original_deadline: Option<u64>,
     target_output_cap: Option<u32>,
     fixed_input_tokens: u64,
     suspending: Arc<std::sync::atomic::AtomicBool>,
+    accepted_projection: Option<super::frozen::PreparedHistory>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
-    let store = processor.crud_store.with_maintenance_access();
+    // The owner chooses the database class: foreground transfer is part of
+    // turn startup; the completed-turn worker passes a maintenance handle.
+    let store = scoped_store.clone();
     let clock: Arc<dyn CompactionClock> = Arc::new(SystemCompactionClock::default());
     let deadline = clock
         .now_ms()
@@ -92,12 +100,7 @@ pub(crate) async fn prepare_completed_history_owned(
     diagnostic.stage = "executor".into();
     let Some(lease) = processor
         .compaction_coordinator
-        .acquire(
-            workspace,
-            thread,
-            super::ContextWorkPriority::Background,
-            &cancellation,
-        )
+        .acquire(workspace, thread, priority, &cancellation)
         .await?
     else {
         diagnostic.code = "executor_busy".into();
@@ -128,17 +131,24 @@ pub(crate) async fn prepare_completed_history_owned(
         return Ok(HistoryCheckOutcome::Preparing);
     }
     let prepare = async {
-        ensure!(
-            store
-                .compaction_turn_is_completed(workspace, thread, turn)
-                .await?,
-            "completed history preparation requires a completed scoped turn"
-        );
+        if accepted_projection.is_none() {
+            ensure!(
+                store
+                    .compaction_turn_is_completed(workspace, thread, turn)
+                    .await?,
+                "completed history preparation requires a completed scoped turn"
+            );
+        }
         diagnostic.stage = "history_capture".into();
         let owner = super::native::native_owner(workspace, thread);
-        let prepared = processor
-            .capture_current_context_basis_prepared(&store, workspace, thread, turn, None)
-            .await?;
+        let prepared = match accepted_projection {
+            Some(prepared) => prepared,
+            None => {
+                processor
+                    .capture_current_context_basis_prepared(&store, workspace, thread, turn, None)
+                    .await?
+            }
+        };
         let super::frozen::PreparedHistory {
             descriptor,
             mut messages,

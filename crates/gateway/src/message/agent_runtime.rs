@@ -1193,11 +1193,12 @@ impl MessageProcessor {
         }
     }
 
-    /// Service compaction explicitly carries Maintenance access through both
-    /// lifecycle persistence and its reads. This path is chosen by its owning
-    /// runner, never inferred from an actor, item name or SQL statement.
+    /// The operation owner supplies the same scoped store used by its runner:
+    /// foreground preparation uses ordinary request access, while completed
+    /// history workers and reconciliation use Maintenance.
     pub(crate) async fn publish_compaction_lifecycle(
         self: &Arc<Self>,
+        lifecycle_store: &pioneer_crud::CrudStore,
         operation: &str,
         generation: u64,
         event: AgentDurableEvent,
@@ -1212,7 +1213,7 @@ impl MessageProcessor {
             _ => anyhow::bail!("invalid service compaction lifecycle event"),
         };
         let thread = canonical.thread_id().to_owned();
-        self.crud_store
+        lifecycle_store
             .compaction_materialize_lifecycle(
                 operation,
                 generation,

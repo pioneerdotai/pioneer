@@ -193,6 +193,109 @@ async fn history_capture_is_identical_before_and_after_transparent_compression()
 }
 
 #[tokio::test]
+async fn accepted_turn_metadata_is_selected_before_boundary_subqueries() {
+    let recorded = RecordedStatements::default();
+    let store = store_recording_statements(Some(recorded.clone())).await;
+    let db = store.database_connection();
+    db.execute_unprepared(
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
+         VALUES ('other-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    for index in 0..32 {
+        for thread in ["thread", "other-thread"] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+                 VALUES (?,?,'completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [format!("{thread}-tail-{index:02}").into(), thread.into()],
+            ))
+            .await
+            .unwrap();
+        }
+    }
+    for _ in 0..16 {
+        if store
+            .compaction_prepare_history_quantum("ws", "thread")
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert!(
+        store
+            .compaction_history_prepared("ws", "thread")
+            .await
+            .unwrap()
+    );
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    recorded.lock().unwrap().clear();
+    let page = store
+        .compaction_history_selected_turn_page("ws", "thread", &["turn".into()], &fence)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+        ["turn"]
+    );
+    let statement = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|statement| statement.sql.contains("input_high_water"))
+        .cloned()
+        .expect("selected metadata query must be recorded");
+    assert!(statement.sql.contains(" IN "), "{statement:?}");
+    let mut plan_statement = statement;
+    plan_statement.sql = format!("EXPLAIN QUERY PLAN {}", plan_statement.sql);
+    let plan = db
+        .query_all_raw(plan_statement)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "detail").unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.starts_with("SEARCH turn USING") && detail.contains("(id=?)")),
+        "selected turn metadata must use its exact ID lookup: {plan:#?}"
+    );
+    assert!(
+        store
+            .compaction_history_selected_turn_page("other", "thread", &["turn".into()], &fence)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_history_selected_turn_page(
+                "ws",
+                "thread",
+                &vec!["turn".to_owned(); 65],
+                &fence,
+            )
+            .await
+            .is_err(),
+        "the selected metadata query must stay below SQLite parameter limits"
+    );
+    assert!(
+        store
+            .compaction_history_selected_turn_page(
+                "ws",
+                "thread",
+                &["x".repeat(SOURCE_PAGE_BYTES + 1)],
+                &fence,
+            )
+            .await
+            .is_err(),
+        "metadata IDs must respect the same byte quantum as source pages"
+    );
+}
+
+#[tokio::test]
 async fn exact_tool_item_reads_preserve_legacy_rows_and_revisions_with_compression() {
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     for compressed in [false, true] {

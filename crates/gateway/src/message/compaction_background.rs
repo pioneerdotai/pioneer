@@ -41,7 +41,7 @@ impl CompletedHistoryPreparationBarrier {
         *self.turn.lock().expect("preparation barrier lock") = Some(turn.to_owned());
     }
 
-    async fn wait_if_armed(&self, turn: &str, cancel: &CancellationToken) {
+    pub(super) async fn wait_if_armed(&self, turn: &str, cancel: &CancellationToken) {
         let armed = {
             let mut target = self.turn.lock().expect("preparation barrier lock");
             if target.as_deref() == Some(turn) {
@@ -304,6 +304,7 @@ impl MessageProcessor {
                     let observer = crate::compaction::HubCompactionObserver {
                         hub: hub.clone(),
                         processor: Arc::downgrade(&processor),
+                        lifecycle_store: store.as_ref().clone(),
                         workspace: row.workspace_id,
                         thread: row.thread_id,
                         turn: row.turn_id,
@@ -447,6 +448,7 @@ impl MessageProcessor {
         let observer = Arc::new(crate::compaction::HubCompactionObserver {
             hub: hub.clone(),
             processor: Arc::downgrade(self),
+            lifecycle_store: self.crud_store.as_ref().clone(),
             workspace: row.workspace_id.clone(),
             thread: row.thread_id.clone(),
             turn: row.turn_id.clone(),
@@ -458,6 +460,7 @@ impl MessageProcessor {
                 .await;
             let work = crate::compaction::prepare_completed_history_owned(
                 self,
+                self.crud_store.as_ref(),
                 &row.workspace_id,
                 &row.thread_id,
                 &row.turn_id,
@@ -466,17 +469,32 @@ impl MessageProcessor {
                 captured.cli_override.as_ref(),
                 observer,
                 cancel.clone(),
+                crate::compaction::ContextWorkPriority::Background,
                 Some(captured.deadline_ms),
                 captured.target_output_cap,
                 captured.fixed_input_tokens,
                 suspending,
+                None,
                 diagnostic,
             );
             tokio::pin!(work);
-            loop {
+            'work: loop {
                 tokio::select! { biased;
-                    result = &mut work => break result,
-                    event = progress.recv() => if let Ok(event) = event { self.handle_progress_agent_event(event).await; },
+                    result = &mut work => break 'work result,
+                    event = progress.recv() => if let Ok(event) = event {
+                        // The progress handler may need the same DB contour as
+                        // the runner. Keep polling the runner while its
+                        // heartbeat is being committed, so neither can hold
+                        // the other behind a pending query.
+                        let update = self.handle_progress_agent_event(event);
+                        tokio::pin!(update);
+                        loop {
+                            tokio::select! { biased;
+                                result = &mut work => break 'work result,
+                                _ = &mut update => break,
+                            }
+                        }
+                    },
                 }
             }
         };

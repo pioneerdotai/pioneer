@@ -1598,6 +1598,234 @@ pub async fn find_latest_turn_for_thread<C: ConnectionTrait>(
         .context("failed to query latest turn for thread")
 }
 
+/// The shared history order is timestamp, durable creation sequence, legacy
+/// rowid, then ID. The existing (thread_id, created_at, id) index finds a
+/// timestamp bucket; only that bucket needs the sequence/rowid tie-breaker.
+/// This avoids ranking all turns merely to find one boundary.
+struct CliTurnOrderKey {
+    created_at: String,
+    sequence: i64,
+    rowid: i64,
+    id: String,
+}
+
+async fn cli_turn_order_key<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<CliTurnOrderKey>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT t.created_at AS created_at, COALESCE(c.sequence,0) AS sequence, \
+             t.rowid AS legacy_rowid, t.id AS id FROM turn t \
+             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+             WHERE t.thread_id=? AND t.id=?",
+            vec![thread_id.into(), turn_id.into()],
+        ))
+        .await?;
+    row.map(|row| {
+        Ok(CliTurnOrderKey {
+            created_at: row.try_get("", "created_at")?,
+            sequence: row.try_get("", "sequence")?,
+            rowid: row.try_get("", "legacy_rowid")?,
+            id: row.try_get("", "id")?,
+        })
+    })
+    .transpose()
+}
+
+async fn cli_bucket_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    timestamp: &str,
+    after: Option<&CliTurnOrderKey>,
+    descending: bool,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let relation = if after.is_some() {
+        "AND (COALESCE(c.sequence,0),t.rowid,t.id) > (?,?,?)"
+    } else {
+        ""
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT t.id AS id FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+         WHERE t.thread_id=? AND t.created_at=? {relation} \
+         ORDER BY COALESCE(c.sequence,0) {direction}, t.rowid {direction}, t.id {direction} LIMIT ?"
+    );
+    let mut values = vec![thread_id.into(), timestamp.into()];
+    if let Some(after) = after {
+        values.extend([
+            after.sequence.into(),
+            after.rowid.into(),
+            after.id.clone().into(),
+        ]);
+    }
+    values.push(i64::try_from(limit)?.into());
+    db.query_all_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?
+    .into_iter()
+    .map(|row| row.try_get::<String>("", "id").map_err(Into::into))
+    .collect()
+}
+
+async fn cli_adjacent_timestamp<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    timestamp: Option<&str>,
+    descending: bool,
+) -> Result<Option<String>> {
+    let relation = match (timestamp, descending) {
+        (Some(_), true) => "AND created_at < ?",
+        (Some(_), false) => "AND created_at > ?",
+        (None, _) => "",
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT created_at FROM turn WHERE thread_id=? {relation} \
+         ORDER BY created_at {direction} LIMIT 1"
+    );
+    let mut values = vec![thread_id.into()];
+    if let Some(timestamp) = timestamp {
+        values.push(timestamp.into());
+    }
+    db.query_one_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?
+    .map(|row| row.try_get::<String>("", "created_at").map_err(Into::into))
+    .transpose()
+}
+
+pub async fn latest_turn_id_by_creation_order<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let Some(timestamp) = cli_adjacent_timestamp(db, thread_id, None, true).await? else {
+        return Ok(None);
+    };
+    Ok(cli_bucket_ids(db, thread_id, &timestamp, None, true, 1)
+        .await?
+        .into_iter()
+        .next())
+}
+
+pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    launch_turn_id: &str,
+    allowed_task_run_turn_id: &str,
+) -> Result<Option<(Option<String>, bool)>> {
+    let Some(launch) = cli_turn_order_key(db, thread_id, launch_turn_id).await? else {
+        return Ok(None);
+    };
+    let previous_in_bucket = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT t.id AS id FROM turn t \
+             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+             WHERE t.thread_id=? AND t.created_at=? \
+               AND (COALESCE(c.sequence,0),t.rowid,t.id) < (?,?,?) \
+             ORDER BY COALESCE(c.sequence,0) DESC,t.rowid DESC,t.id DESC LIMIT 1",
+            vec![
+                thread_id.into(),
+                launch.created_at.clone().into(),
+                launch.sequence.into(),
+                launch.rowid.into(),
+                launch.id.clone().into(),
+            ],
+        ))
+        .await?;
+    let previous = if let Some(row) = previous_in_bucket {
+        Some(row.try_get::<String>("", "id")?)
+    } else if let Some(timestamp) =
+        cli_adjacent_timestamp(db, thread_id, Some(&launch.created_at), true).await?
+    {
+        cli_bucket_ids(db, thread_id, &timestamp, None, true, 1)
+            .await?
+            .into_iter()
+            .next()
+    } else {
+        None
+    };
+    let intervening = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT (EXISTS(SELECT 1 FROM turn t WHERE t.thread_id=? \
+                AND t.created_at>? AND t.id<>?) OR \
+              EXISTS(SELECT 1 FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+                WHERE t.thread_id=? AND t.created_at=? AND t.id<>? \
+                AND (COALESCE(c.sequence,0),t.rowid,t.id) > (?,?,?))) AS intervening",
+            vec![
+                thread_id.into(),
+                launch.created_at.clone().into(),
+                allowed_task_run_turn_id.into(),
+                thread_id.into(),
+                launch.created_at.into(),
+                allowed_task_run_turn_id.into(),
+                launch.sequence.into(),
+                launch.rowid.into(),
+                launch.id.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("CLI intervening-turn query returned no row"))?
+        .try_get::<i64>("", "intervening")?
+        != 0;
+    Ok(Some((previous, intervening)))
+}
+
+pub async fn turn_ids_after_by_creation_order<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    source_turn_id: &str,
+) -> Result<Vec<String>> {
+    const MAX_FORK_RETRY_ATTEMPTS: usize = 128;
+    let Some(source) = cli_turn_order_key(db, thread_id, source_turn_id).await? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = cli_bucket_ids(
+        db,
+        thread_id,
+        &source.created_at,
+        Some(&source),
+        false,
+        MAX_FORK_RETRY_ATTEMPTS + 1,
+    )
+    .await?;
+    let mut timestamp = source.created_at;
+    while rows.len() <= MAX_FORK_RETRY_ATTEMPTS {
+        let Some(next) = cli_adjacent_timestamp(db, thread_id, Some(&timestamp), false).await?
+        else {
+            break;
+        };
+        rows.extend(
+            cli_bucket_ids(
+                db,
+                thread_id,
+                &next,
+                None,
+                false,
+                MAX_FORK_RETRY_ATTEMPTS + 1 - rows.len(),
+            )
+            .await?,
+        );
+        timestamp = next;
+    }
+    anyhow::ensure!(
+        rows.len() <= MAX_FORK_RETRY_ATTEMPTS,
+        "CLI fork retry exceeds the bounded attempt scan"
+    );
+    Ok(rows)
+}
+
 pub async fn find_latest_conversation_turn_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -1704,6 +1932,140 @@ mod tests {
     use pioneer_protocol::ThreadMode;
     use sea_orm::{Database, DatabaseConnection, DbBackend};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn cli_predecessor_uses_history_timestamp_sequence_and_legacy_rowid() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1); \
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
+                 VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES \
+                 ('z','thread','completed','conversation','user','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('a','thread','completed','conversation','user','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('launch','thread','completed','conversation','user','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('backdated','thread','completed','conversation','user','2026-01-01T09:00:00Z',CURRENT_TIMESTAMP), \
+                 ('occurrence','thread','completed','task_run','system','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('future','thread','completed','conversation','user','2026-01-01T11:00:00Z',CURRENT_TIMESTAMP)",
+        ).await.unwrap();
+        assert_eq!(
+            turn_before_launch_and_intervening_by_creation_order(
+                &db,
+                "thread",
+                "launch",
+                "occurrence"
+            )
+            .await
+            .unwrap(),
+            Some((Some("a".to_owned()), true)),
+        );
+        // The range query that locates the next timestamp must seek through
+        // an existing thread/timestamp index even when unrelated tail turns
+        // grow. Only the selected second is tie-broken by sequence/rowid.
+        let plan = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "EXPLAIN QUERY PLAN SELECT created_at FROM turn WHERE thread_id=? \
+                 AND created_at>? ORDER BY created_at ASC LIMIT 1",
+                vec!["thread".into(), "2026-01-01T10:00:00Z".into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.starts_with("SEARCH turn USING COVERING INDEX ")
+                    && detail.contains("(thread_id=? AND created_at>?)")
+            }),
+            "CLI boundary timestamp query must seek rather than rank the full thread: {plan:#?}"
+        );
+        let bucket_plan = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "EXPLAIN QUERY PLAN SELECT t.id FROM turn t \
+                 LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+                 WHERE t.thread_id=? AND t.created_at=? \
+                 ORDER BY COALESCE(c.sequence,0),t.rowid,t.id LIMIT 1",
+                vec!["thread".into(), "2026-01-01T10:00:00Z".into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            bucket_plan.iter().any(|detail| {
+                detail.starts_with("SEARCH t USING")
+                    && detail.contains("(thread_id=? AND created_at=?)")
+            }),
+            "tie-breaking must be confined to the indexed timestamp bucket: {bucket_plan:#?}"
+        );
+        assert_eq!(
+            latest_turn_id_by_creation_order(&db, "thread")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("future")
+        );
+        assert_eq!(
+            turn_ids_after_by_creation_order(&db, "thread", "a")
+                .await
+                .unwrap(),
+            vec!["launch", "occurrence", "future"]
+        );
+        let store = crate::CrudStore::new(db.clone());
+        let history_fence = store.compaction_history_read_fence().await.unwrap();
+        let mut history_turns = store
+            .compaction_history_turn_page("ws", "thread", "", &history_fence)
+            .await
+            .unwrap();
+        history_turns.sort_by(|left, right| {
+            (
+                &left.created_at,
+                left.creation_order,
+                left.legacy_creation_order,
+                &left.id,
+            )
+                .cmp(&(
+                    &right.created_at,
+                    right.creation_order,
+                    right.legacy_creation_order,
+                    &right.id,
+                ))
+        });
+        let history_order = history_turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            history_order,
+            vec!["backdated", "z", "a", "launch", "occurrence", "future"]
+        );
+        let launch_index = history_order
+            .iter()
+            .position(|turn| *turn == "launch")
+            .unwrap();
+        assert_eq!(history_order[launch_index - 1], "a");
+        db.execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id IN ('z','a')")
+            .await
+            .unwrap();
+        // Legacy rows use rowid only after their shared timestamp and absent
+        // durable sequence have been accounted for.
+        assert_eq!(
+            turn_before_launch_and_intervening_by_creation_order(
+                &db,
+                "thread",
+                "launch",
+                "occurrence"
+            )
+            .await
+            .unwrap(),
+            Some((Some("a".to_owned()), true)),
+        );
+    }
 
     #[test]
     fn legacy_null_send_mode_is_chat_compatible_but_not_message_mutable() {

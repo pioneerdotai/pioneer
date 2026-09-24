@@ -4850,6 +4850,17 @@ impl CrudStore {
         .await
     }
 
+    pub async fn insert_cli_fork_intent_if_absent(
+        &self,
+        pending: NewCliRuntimeThreadBinding,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::insert_fork_intent_if_absent(&self.connection, pending.clone())
+                .await
+        })
+        .await
+    }
+
     pub async fn get_cli_runtime_thread_binding(
         &self,
         thread_id: &str,
@@ -4858,20 +4869,67 @@ impl CrudStore {
         cli_runtime_binding::find_thread_binding(&self.connection, thread_id.as_str()).await
     }
 
+    pub async fn discard_rejected_cli_fork_intent(
+        &self,
+        thread_id: &str,
+        runtime_id: &str,
+        source_native_thread_id: &str,
+        expected_cursor_json: &str,
+    ) -> Result<bool> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::discard_rejected_fork_intent(
+                &self.connection,
+                thread_id,
+                runtime_id,
+                source_native_thread_id,
+                expected_cursor_json,
+            )
+            .await
+        })
+        .await
+    }
+
+    pub async fn confirm_marked_cli_fork_intent(
+        &self,
+        pending: &CliRuntimeThreadBindingRecord,
+        fork_native_thread_id: &str,
+        native_cwd: Option<String>,
+        native_model: Option<String>,
+        resume_cursor_json: String,
+        updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
+    ) -> Result<CliRuntimeThreadBindingRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::confirm_marked_fork_intent(
+                &self.connection,
+                pending,
+                fork_native_thread_id,
+                native_cwd.clone(),
+                native_model.clone(),
+                resume_cursor_json.clone(),
+                updated_at,
+            )
+            .await
+        })
+        .await
+    }
+
     pub async fn update_cli_runtime_thread_resume_cursor(
         &self,
         thread_id: &str,
         expected_native_thread_id: &str,
+        expected_cursor_json: &str,
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
         let thread_id = thread_id.to_owned();
         let expected_native_thread_id = expected_native_thread_id.to_owned();
+        let expected_cursor_json = expected_cursor_json.to_owned();
         self.run_serialized_write(|| async {
             cli_runtime_binding::update_thread_resume_cursor(
                 &self.connection,
                 thread_id.as_str(),
                 expected_native_thread_id.as_str(),
+                expected_cursor_json.as_str(),
                 resume_cursor_json.clone(),
                 updated_at,
             )
@@ -6468,6 +6526,17 @@ impl CrudStore {
     ) -> Result<CliRuntimeNativeEventRecord> {
         self.run_serialized_write(|| async {
             cli_runtime_binding::append_native_event(&self.connection, event.clone()).await
+        })
+        .await
+    }
+
+    pub async fn append_cli_runtime_native_event_if_absent(
+        &self,
+        event: NewCliRuntimeNativeEvent,
+    ) -> Result<CliRuntimeNativeEventRecord> {
+        self.run_serialized_write(|| async {
+            cli_runtime_binding::append_native_event_if_absent(&self.connection, event.clone())
+                .await
         })
         .await
     }
@@ -20712,6 +20781,45 @@ impl CrudStore {
 
     pub async fn get_thread_sandbox_mode(&self, thread_id: &str) -> Result<Option<SandboxMode>> {
         policy::find_thread_sandbox_mode(&self.connection, thread_id).await
+    }
+
+    pub async fn latest_turn_id_by_creation_order(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<String>> {
+        // Timestamp seek and in-bucket tie-breaker must observe one reader
+        // snapshot; an intervening backdated insert cannot change the bucket.
+        let snapshot = self.connection.begin_read().await?;
+        repositories::turn::latest_turn_id_by_creation_order(&snapshot, thread_id).await
+    }
+
+    pub async fn turn_before_launch_and_intervening_by_creation_order(
+        &self,
+        thread_id: &str,
+        launch_turn_id: &str,
+        allowed_task_run_turn_id: &str,
+    ) -> Result<Option<(Option<String>, bool)>> {
+        let snapshot = self.connection.begin_read().await?;
+        repositories::turn::turn_before_launch_and_intervening_by_creation_order(
+            &snapshot,
+            thread_id,
+            launch_turn_id,
+            allowed_task_run_turn_id,
+        )
+        .await
+    }
+
+    pub async fn turn_ids_after_by_creation_order(
+        &self,
+        thread_id: &str,
+        source_turn_id: &str,
+    ) -> Result<Vec<String>> {
+        // Each bucket is metadata only; the scan stops at 129 IDs. The read
+        // snapshot keeps retry ordering stable while the bounded buckets are
+        // fetched without ever reserving the writer.
+        let snapshot = self.connection.begin_read().await?;
+        repositories::turn::turn_ids_after_by_creation_order(&snapshot, thread_id, source_turn_id)
+            .await
     }
 
     pub async fn get_thread_model(&self, thread_id: &str) -> Result<Option<Thread>> {
@@ -37257,6 +37365,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn marked_cli_fork_intent_is_insert_once_and_confirmed_once() {
+        let store = test_store_with_workspace("ws_marked_fork").await;
+        let now = unix_to_datetime(1_700_010_000);
+        let pending = NewCliRuntimeThreadBinding {
+            thread_id: "child_marked_fork".to_owned(),
+            workspace_id: "ws_marked_fork".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "source_provider".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: Some("source_provider".to_owned()),
+            native_cwd: Some("/tmp".to_owned()),
+            native_model: Some("gpt-5".to_owned()),
+            resume_cursor_json: r#"{"forkSourceTurnId":"child_first","forkBoundaryTurnId":"provider_turn","forkMarker":"pioneer-cli-fork:nonce"}"#.to_owned(),
+            status: "fork_pending".to_owned(),
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(
+            store
+                .insert_cli_fork_intent_if_absent(pending.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_cli_fork_intent_if_absent(pending.clone())
+                .await
+                .unwrap()
+        );
+        let durable = store
+            .get_cli_runtime_thread_binding("child_marked_fork")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.resume_cursor_json, pending.resume_cursor_json);
+        let committed = store.confirm_marked_cli_fork_intent(
+            &durable, "provider_fork", Some("/tmp".to_owned()), Some("gpt-5".to_owned()),
+            r#"{"threadId":"provider_fork","forkSourceTurnId":"child_first","forkBoundaryTurnId":"provider_turn","forkMarker":"pioneer-cli-fork:nonce"}"#.to_owned(), now,
+        ).await.unwrap();
+        assert_eq!(committed.status, "active");
+        assert_eq!(committed.native_thread_id, "provider_fork");
+        assert!(
+            store
+                .confirm_marked_cli_fork_intent(
+                    &durable,
+                    "duplicate_fork",
+                    None,
+                    None,
+                    "{}".to_owned(),
+                    now,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .discard_rejected_cli_fork_intent(
+                    "child_marked_fork",
+                    "codex",
+                    "source_provider",
+                    pending.resume_cursor_json.as_str(),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_cli_runtime_thread_resume_cursor(
+                    "child_marked_fork",
+                    "provider_fork",
+                    pending.resume_cursor_json.as_str(),
+                    "{}".to_owned(),
+                    now,
+                )
+                .await
+                .is_err(),
+            "a stale receipt writer must not erase the confirmed fork cursor"
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_thread_binding("child_marked_fork")
+                .await
+                .unwrap()
+                .unwrap()
+                .native_thread_id,
+            "provider_fork"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cli_fork_intents_have_one_winner_and_stale_cleanup_cannot_delete_it() {
+        let store = test_store_with_workspace("ws_fork_intent_race").await;
+        let now = unix_to_datetime(1_700_010_001);
+        let pending = NewCliRuntimeThreadBinding {
+            thread_id: "child_fork_race".to_owned(),
+            workspace_id: "ws_fork_intent_race".to_owned(),
+            runtime_id: "codex".to_owned(),
+            runtime_kind: "codex".to_owned(),
+            native_thread_id: "source".to_owned(),
+            native_session_id: None,
+            native_root_thread_id: Some("source".to_owned()),
+            native_cwd: None,
+            native_model: None,
+            resume_cursor_json: r#"{"forkSourceTurnId":"source_turn","forkBoundaryTurnId":"boundary","forkMarker":"pioneer-cli-fork:race-a"}"#.to_owned(),
+            status: "fork_pending".to_owned(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut other = pending.clone();
+        other.resume_cursor_json = r#"{"forkSourceTurnId":"source_turn","forkBoundaryTurnId":"boundary","forkMarker":"pioneer-cli-fork:race-b"}"#.to_owned();
+        let (first, second) = tokio::join!(
+            store.insert_cli_fork_intent_if_absent(pending.clone()),
+            store.insert_cli_fork_intent_if_absent(other.clone()),
+        );
+        assert_eq!(
+            usize::from(first.unwrap()) + usize::from(second.unwrap()),
+            1
+        );
+        let winner = store
+            .get_cli_runtime_thread_binding("child_fork_race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.status, "fork_pending");
+        let stale = if winner.resume_cursor_json == pending.resume_cursor_json {
+            other.resume_cursor_json.as_str()
+        } else {
+            pending.resume_cursor_json.as_str()
+        };
+        assert!(
+            !store
+                .discard_rejected_cli_fork_intent("child_fork_race", "codex", "source", stale,)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_cli_runtime_thread_binding("child_fork_race")
+                .await
+                .unwrap()
+                .unwrap()
+                .resume_cursor_json,
+            winner.resume_cursor_json
+        );
+        assert!(
+            store
+                .discard_rejected_cli_fork_intent(
+                    "child_fork_race",
+                    "codex",
+                    "source",
+                    winner.resume_cursor_json.as_str(),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .get_cli_runtime_thread_binding("child_fork_race")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn cli_runtime_thread_and_turn_bindings_upsert_idempotently() {
         let store = test_store_with_workspace("ws_cli_bind").await;
         let created_at = unix_to_datetime(1_700_010_000);
@@ -38551,6 +38825,55 @@ mod tests {
             .expect("latest native event should exist");
         assert_eq!(latest.sequence, 2);
         assert_eq!(latest.native_method, "item/completed");
+    }
+
+    #[tokio::test]
+    async fn claude_boundary_event_is_idempotent_under_concurrent_replay() {
+        let store = test_store_with_workspace("ws_boundary_replay").await;
+        let event = NewCliRuntimeNativeEvent {
+            id: "deterministic-boundary".to_owned(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            workspace_id: Some("ws_boundary_replay".to_owned()),
+            thread_id: Some("child".to_owned()),
+            turn_id: Some("answer".to_owned()),
+            native_thread_id: Some("session".to_owned()),
+            native_turn_id: Some("synthetic-provider-turn".to_owned()),
+            native_method: "claude/assistant_record_boundary".to_owned(),
+            payload_redacted_json:
+                serde_json::json!({"messageUuid":"01900000-0000-7000-8000-000000000001"})
+                    .to_string(),
+            sequence: 1,
+            created_at: unix_to_datetime(1_700_030_000),
+        };
+        let maintenance = store.with_maintenance_access();
+        let (first, second) = tokio::join!(
+            store.append_cli_runtime_native_event_if_absent(event.clone()),
+            maintenance.append_cli_runtime_native_event_if_absent(event.clone()),
+        );
+        assert_eq!(first.unwrap().id, event.id);
+        assert_eq!(second.unwrap().id, event.id);
+        let rows = store
+            .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                native_method: Some(event.native_method.clone()),
+                turn_id: event.turn_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        // This fixture uses one in-memory connection for migrations and CRUD.
+        // Physical read-only routing is covered by the separate scoped
+        // reader/writer test in cli_runtime_binding.
+        let mut conflicting = event;
+        conflicting.payload_redacted_json =
+            serde_json::json!({"messageUuid":"01900000-0000-7000-8000-000000000002"}).to_string();
+        assert!(
+            store
+                .append_cli_runtime_native_event_if_absent(conflicting)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

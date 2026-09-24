@@ -260,7 +260,6 @@ pub(crate) async fn compaction_materialize_lifecycle(
         )
         .build(sea_orm::DbBackend::Sqlite);
     store
-        .with_maintenance_access()
         .materialize_turn_event_with_projection_context_and_guard(
             event,
             timestamp_secs,

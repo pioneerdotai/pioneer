@@ -297,29 +297,56 @@ pub(crate) fn validate_cli_runtime_turn_input_frame(
     mapping: &CLIRuntimeTurnInputMapping,
     plan: &CompiledInstructionDeliveryPlan,
     max_input_tokens: Option<u64>,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
 ) -> Result<()> {
     // Include the turn envelope fields that accompany input at the adapter
     // boundary. Claude additionally performs an exact post-materialization
     // check after LocalImage paths have become base64 blocks.
-    let frame_bytes = serde_json::to_vec(&serde_json::json!({
+    let mut frame_bytes = serde_json::to_vec(&serde_json::json!({
         "input": &mapping.input,
         "elevatedInstructions": &plan.provider_instructions.text,
         "instructionFingerprint": &plan.provider_instructions.fingerprint,
     }))?
     .len();
+    let mut model_image_tokens = 0_u64;
+    if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
+        // Claude's stream-json adapter reads LocalImage paths into base64.
+        // Account for the materialized bytes before deciding whether a
+        // historical checkpoint can bring the request under the frame cap.
+        for item in &mapping.input {
+            if let CLIRuntimeTurnInputItem::LocalImage { path } = item {
+                let image_bytes = std::fs::metadata(path)?.len();
+                let encoded = image_bytes.div_ceil(3).saturating_mul(4);
+                frame_bytes =
+                    frame_bytes.saturating_add(usize::try_from(encoded).unwrap_or(usize::MAX));
+                if max_input_tokens.is_some() {
+                    let (width, height) = image::image_dimensions(path)?;
+                    model_image_tokens = model_image_tokens.saturating_add(
+                        pioneer_provider::attachments::image_tokens(
+                            "anthropic",
+                            "claude",
+                            width,
+                            height,
+                        )?,
+                    );
+                }
+            }
+        }
+    }
     anyhow::ensure!(
         frame_bytes <= MAX_CLI_TURN_INPUT_FRAME_BYTES,
-        "accepted CLI bootstrap requires {frame_bytes} bytes, exceeding the {}-byte request frame; compact the canonical conversation before retrying",
+        "CLI request requires {frame_bytes} bytes, exceeding the {}-byte request frame",
         MAX_CLI_TURN_INPUT_FRAME_BYTES
     );
     if let Some(max_input_tokens) = max_input_tokens {
         let mut admitted_text = plan.provider_instructions.text.clone();
         admitted_text.push('\n');
         admitted_text.push_str(std::str::from_utf8(&serde_json::to_vec(&mapping.input)?)?);
-        let estimated_tokens = pioneer_compaction::text_tokens(admitted_text.as_str());
+        let estimated_tokens = pioneer_compaction::text_tokens(admitted_text.as_str())
+            .saturating_add(model_image_tokens);
         anyhow::ensure!(
             estimated_tokens <= max_input_tokens,
-            "accepted CLI bootstrap requires approximately {estimated_tokens} input tokens, exceeding the selected model limit of {max_input_tokens}; compact the canonical conversation before retrying"
+            "CLI request requires approximately {estimated_tokens} input tokens, exceeding the selected model limit of {max_input_tokens}"
         );
     }
     Ok(())
@@ -683,10 +710,115 @@ mod tests {
             },
         )
         .unwrap();
-        let error = validate_cli_runtime_turn_input_frame(&mapping, &plan, Some(128)).unwrap_err();
+        let error = validate_cli_runtime_turn_input_frame(
+            &mapping,
+            &plan,
+            Some(128),
+            CLIAgentRuntimeKind::Codex,
+        )
+        .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("selected model limit of 128"));
-        assert!(error.contains("compact the canonical conversation"));
+    }
+
+    #[test]
+    fn claude_frame_preflight_counts_materialized_local_image_bytes() {
+        let root = temp_workspace("claude-image-frame");
+        let image = root.join("historical.png");
+        std::fs::write(&image, vec![0_u8; 6 * 1024 * 1024]).unwrap();
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "claude",
+                runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
+                model: Some("test-model"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::LocalImage {
+                path: image.to_string_lossy().into_owned(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        assert!(
+            validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Claude,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("request frame")
+        );
+        assert!(
+            validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Codex,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn claude_image_uses_visual_tokens_under_a_model_limit() {
+        let root = temp_workspace("claude-image-model-tokens");
+        let image = root.join("image.png");
+        let pixels = image::RgbImage::from_fn(1024, 1024, |x, y| {
+            let mut value = (u64::from(y) << 10) | u64::from(x);
+            value = value.wrapping_add(0x9e3779b97f4a7c15);
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+            value ^= value >> 31;
+            image::Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        pixels.save(&image).unwrap();
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "claude",
+                runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
+                model: Some("claude-sonnet-4"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::LocalImage {
+                path: image.to_string_lossy().into_owned(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        assert!(std::fs::metadata(&image).unwrap().len() > 1_000_000);
+        validate_cli_runtime_turn_input_frame(
+            &mapping,
+            &plan,
+            Some(20_000),
+            CLIAgentRuntimeKind::Claude,
+        )
+        .expect("visual token estimate should admit an ordinary image below the byte cap");
     }
 
     #[test]

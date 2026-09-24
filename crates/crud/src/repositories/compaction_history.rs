@@ -1706,6 +1706,40 @@ pub(crate) async fn compaction_history_turn_page<C: ConnectionTrait>(
     after: &str,
     fence: &HistoryReadFence,
 ) -> Result<Vec<HistoryTurnBoundary>> {
+    compaction_history_turn_page_inner(db, workspace, thread, after, fence, None).await
+}
+
+/// The accepted manifest already names exact turns. Restrict the metadata
+/// query before its per-turn input/event/context boundary subqueries run.
+pub(crate) async fn compaction_history_selected_turn_page<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    selected: &[String],
+    fence: &HistoryReadFence,
+) -> Result<Vec<HistoryTurnBoundary>> {
+    anyhow::ensure!(
+        selected.len() <= 64,
+        "selected history turn page exceeds row bound"
+    );
+    anyhow::ensure!(
+        selected.iter().map(String::len).sum::<usize>() <= SOURCE_PAGE_BYTES,
+        "selected history turn page exceeds byte bound"
+    );
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    compaction_history_turn_page_inner(db, workspace, thread, "", fence, Some(selected)).await
+}
+
+async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    after: &str,
+    fence: &HistoryReadFence,
+    selected: Option<&[String]>,
+) -> Result<Vec<HistoryTurnBoundary>> {
     // Preserve the scoped-reader contract: an unavailable/foreign thread has
     // no rows. Only an accessible, incompletely prepared history is an error.
     if thread::Entity::find_by_id(thread)
@@ -1731,7 +1765,7 @@ pub(crate) async fn compaction_history_turn_page<C: ConnectionTrait>(
             .is_some(),
         "compaction history preparation is required before capturing a read fence"
     );
-    Ok(turn::Entity::find()
+    let mut query = turn::Entity::find()
         .select_only()
         .join(
             JoinType::InnerJoin,
@@ -1926,7 +1960,11 @@ pub(crate) async fn compaction_history_turn_page<C: ConnectionTrait>(
                     Expr::col((turn::Entity, turn::Column::Id))
                         .lte(Expr::Value(fence.turn_id.clone().into())),
                 ),
-        )
+        );
+    if let Some(selected) = selected {
+        query = query.filter(turn::Column::Id.is_in(selected.iter().cloned()));
+    }
+    Ok(query
         .order_by(Expr::col((turn::Entity, turn::Column::Id)), Order::Asc)
         .limit(128)
         .into_model::<HistoryTurnBoundary>()

@@ -46,8 +46,9 @@ use pioneer_cli_agent_runtime::codex::{
     CodexThreadStartParams, CodexTurnStartParams, CodexTurnSteerParams,
     cleanup_codex_generation_overlay, codex_config_read_max_origins,
     codex_config_value_fingerprint, codex_generation_app_server_process_config,
-    recover_codex_stale_rollout_path, serialize_codex_managed_mcp_config,
-    stage_codex_generation_mcp_config, verify_codex_generation_mcp_config,
+    recover_codex_fork_source_rollout_path, recover_codex_stale_rollout_path,
+    serialize_codex_managed_mcp_config, stage_codex_generation_mcp_config,
+    verify_codex_generation_mcp_config,
 };
 use pioneer_cli_agent_runtime::codex_attestation::sha256_json;
 use pioneer_cli_agent_runtime::driver::JsonlRpcId;
@@ -1145,7 +1146,8 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 native_thread_id.clone()
             }
             CliProviderContinuation::ClaudeNew { .. }
-            | CliProviderContinuation::ClaudeResume { .. } => {
+            | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::ClaudeFork { .. } => {
                 bail!("Codex CLI runtime requires a typed Codex thread continuation")
             }
         };
@@ -2393,11 +2395,32 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
         &self,
         request: CLIAgentRuntimeThreadForkRequest,
     ) -> Result<CLIAgentRuntimeThreadForkResult> {
+        let persisted = self
+            .client
+            .thread_read_metadata(&request.native_thread_id, self.request_timeout)
+            .await
+            .context("failed to read Codex fork source metadata")?;
+        let overlay = self
+            .generation_overlay
+            .lock()
+            .expect("Codex generation overlay mutex should not be poisoned")
+            .clone()
+            .context("Codex generation overlay is unavailable for fork")?;
+        recover_codex_fork_source_rollout_path(
+            &overlay,
+            &request.source_logical_thread_id,
+            persisted
+                .rollout_path
+                .as_deref()
+                .context("Codex fork source has no rollout path")?,
+        )?;
         let snapshot = self
             .client
             .thread_fork(
                 CodexThreadForkParams {
                     thread_id: request.native_thread_id,
+                    last_turn_id: request.last_turn_id,
+                    thread_source: request.thread_source,
                 },
                 self.request_timeout,
             )
@@ -2409,6 +2432,30 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
             native_model: snapshot.model,
             raw: Some(snapshot.raw),
         })
+    }
+
+    async fn find_marked_fork(
+        &self,
+        source_thread_id: &str,
+        boundary_turn_id: &str,
+        marker: &str,
+    ) -> Result<Option<CLIAgentRuntimeThreadForkResult>> {
+        let found = self
+            .client
+            .find_marked_thread_fork(
+                source_thread_id,
+                boundary_turn_id,
+                marker,
+                self.request_timeout,
+            )
+            .await
+            .context("Codex marked fork reconciliation failed")?;
+        Ok(found.map(|snapshot| CLIAgentRuntimeThreadForkResult {
+            native_thread_id: snapshot.native_thread_id,
+            native_cwd: snapshot.cwd,
+            native_model: snapshot.model,
+            raw: Some(snapshot.raw),
+        }))
     }
 
     async fn steer_turn(
@@ -3628,6 +3675,12 @@ mod tests {
             .join("sessions")
             .join(relative_rollout.as_path());
         cleanup_codex_generation_overlay(&first_overlay).expect("clean stopped generation");
+        assert!(
+            stale_rollout.exists(),
+            "cleanup must preserve provider lineage paths"
+        );
+        std::fs::remove_file(first_overlay.effective_home_path.join("sessions"))
+            .expect("simulate cleanup by an older Pioneer version");
         assert!(!stale_rollout.exists());
 
         let second_identity = CodexGenerationOverlayIdentity::new(

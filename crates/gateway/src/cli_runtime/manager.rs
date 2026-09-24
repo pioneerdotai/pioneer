@@ -68,7 +68,10 @@ pub(crate) struct CLIAgentRuntimeThreadNameSetResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CLIAgentRuntimeThreadForkRequest {
+    pub source_logical_thread_id: String,
     pub native_thread_id: String,
+    pub last_turn_id: Option<String>,
+    pub thread_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -381,6 +384,15 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
     ) -> Result<CLIAgentRuntimeThreadForkResult> {
         let _ = request;
         bail!("CLI runtime session does not support thread fork");
+    }
+
+    async fn find_marked_fork(
+        &self,
+        _source_thread_id: &str,
+        _boundary_turn_id: &str,
+        _marker: &str,
+    ) -> Result<Option<CLIAgentRuntimeThreadForkResult>> {
+        bail!("CLI runtime session does not support fork reconciliation");
     }
 
     async fn steer_turn(
@@ -1067,6 +1079,10 @@ fn validate_replacement_continuation(
             }
             | CliProviderContinuation::ClaudeResume {
                 provider_session_id: old_id,
+            }
+            | CliProviderContinuation::ClaudeFork {
+                provider_session_id: old_id,
+                ..
             },
             CliProviderContinuation::ClaudeResume {
                 provider_session_id: new_id,
@@ -1074,12 +1090,14 @@ fn validate_replacement_continuation(
         ) if old_id == new_id => Ok(()),
         (
             CliProviderContinuation::ClaudeNew { .. }
-            | CliProviderContinuation::ClaudeResume { .. },
+            | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::ClaudeFork { .. },
             CliProviderContinuation::ClaudeNew { .. },
         ) => bail!("Claude process replacement requires spawn-time resume of the durable UUID"),
         (
             CliProviderContinuation::ClaudeNew { .. }
-            | CliProviderContinuation::ClaudeResume { .. },
+            | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::ClaudeFork { .. },
             CliProviderContinuation::ClaudeResume { .. },
         ) => bail!("Claude process replacement cannot change the durable provider UUID"),
         (

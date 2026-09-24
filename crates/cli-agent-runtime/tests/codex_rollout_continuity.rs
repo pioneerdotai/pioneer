@@ -99,6 +99,12 @@ async fn paginated_resume_survives_removed_generation_with_real_codex() -> Resul
     );
     assert_eq!(String::from_utf8(seed.stdout)?.trim(), "1");
     cleanup_codex_generation_overlay(&first)?;
+    assert!(
+        selected.exists(),
+        "retirement must preserve the source rollout alias"
+    );
+    // Reproduce the old cleanup behavior explicitly for the recovery scenario.
+    std::fs::remove_file(first.effective_home_path.join("sessions"))?;
     assert!(!selected.exists());
 
     let (spawn, second) =

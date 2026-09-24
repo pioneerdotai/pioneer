@@ -50,6 +50,16 @@ const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str =
     pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION;
 const NATIVE_HUMAN_INTERACTION_RUNTIME_KIND: &str = "native";
 const NATIVE_HUMAN_INTERACTION_REQUEST_KIND: &str = "native_permission";
+
+/// Turn-start history keeps its caller's read contour with ordinary writes.
+/// A surrounding Task correctness transition must not promote metadata
+/// registration, restore, or compaction to Critical.
+pub(crate) fn ordinary_history_store(store: &CrudStore) -> CrudStore {
+    match store.database_connection().read_class() {
+        SqliteReadClass::Interactive => store.with_interactive_writes(),
+        SqliteReadClass::Maintenance => store.with_maintenance_access(),
+    }
+}
 mod workspace_handlers;
 
 pub use summary::SummaryConfig;
@@ -545,6 +555,19 @@ pub struct MessageProcessor {
     completed_history_preparation_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
+    cli_history_shutdown: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    cli_transfer_capture_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    cli_transfer_test_deadline: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    cli_history_monitor_drops: Arc<AtomicU64>,
+    #[cfg(test)]
+    cli_history_monitor_cleanup_drops: Arc<AtomicU64>,
+    #[cfg(test)]
+    predispatch_cli_turn_read_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -1124,6 +1147,19 @@ impl MessageProcessor {
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
+            cli_history_shutdown: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            cli_transfer_capture_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_transfer_test_deadline: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            cli_history_monitor_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_history_monitor_cleanup_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -1454,6 +1490,7 @@ impl MessageProcessor {
     }
 
     pub async fn shutdown_cli_runtime_manager(&self) {
+        self.cli_history_shutdown.cancel();
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
             return;
         };
@@ -2936,6 +2973,7 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn shutdown_resilience_workers(&self) {
+        self.cli_history_shutdown.cancel();
         for worker in [
             &self.resilience_worker,
             &self.task_event_listener_worker,
@@ -4507,6 +4545,19 @@ impl MessageProcessor {
             compaction_coordinator: Arc::new(
                 crate::compaction::ContextCompactionCoordinator::default(),
             ),
+            cli_history_shutdown: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            cli_transfer_capture_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_transfer_test_deadline: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            cli_history_monitor_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_history_monitor_cleanup_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),

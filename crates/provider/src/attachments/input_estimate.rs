@@ -168,7 +168,7 @@ fn pdf_page_dimensions(
 /// Sources: https://developers.openai.com/api/docs/guides/images-vision
 /// https://platform.claude.com/docs/en/build-with-claude/vision
 /// https://ai.google.dev/gemini-api/docs/tokens
-fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Result<u64> {
+pub fn image_tokens(provider: &str, model: &str, width: u32, height: u32) -> Result<u64> {
     ensure!(width > 0 && height > 0, "image has empty dimensions");
     let model = model.to_ascii_lowercase();
     let family = model.rsplit('/').next().unwrap_or(&model);

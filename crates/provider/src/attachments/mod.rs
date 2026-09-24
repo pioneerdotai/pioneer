@@ -38,7 +38,7 @@ fn attachment_blocking_governor() -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
-pub use input_estimate::{MediaInputEstimate, PreparedInputBudget};
+pub use input_estimate::{MediaInputEstimate, PreparedInputBudget, image_tokens};
 pub use normalize::infer_mime_from_reference;
 pub use registry::{
     ArtifactExternalRefCacheBackend, ArtifactExternalRefLookupRequest,

@@ -29,19 +29,27 @@ call sites.
 
 - `Interactive` is the default for request work whose result a client is
   waiting for.
-- `Maintenance` must be selected explicitly for background scanning,
-  reconciliation, compression, migration/backfill, cleanup, indexing, and
-  periodic work. Use `CrudStore::with_maintenance_access()` so both reads and
-  writes are scoped correctly.
+- `Interactive` also applies to history checking, preparation and necessary
+  compaction that block the start of a user turn, including registration of
+  legacy history metadata needed by that operation. Its ordinary reads and
+  writes use the request's interactive scope.
+- `Maintenance` must be selected explicitly for post-turn history checks and
+  possible compression, independent background preparation, backfill,
+  reconciliation, cleanup, indexing, and periodic work. Use
+  `CrudStore::with_maintenance_access()` so both reads and writes are scoped
+  correctly.
 - `Critical` writes are reserved for narrowly defined control-plane or
   correctness work that must outrank ordinary writes. Background discovery
   that needs critical commits must use
   `with_maintenance_reads_and_critical_writes()`; it must not turn its reads
   interactive.
 
-Do not classify work from actor kind, repository method, SQL text at the call
-site, or an arbitrary timeout. Do not promote background work to interactive
-or critical to make a test or latency symptom disappear.
+Choose the scope at the operation boundary and pass its scoped handle through
+shared helpers and runners. Neither a helper named compaction nor a coordinator
+priority changes the database class. Do not classify work from actor kind,
+repository method, SQL text at the call site, or an arbitrary timeout. Do not
+promote background work to interactive or critical to make a test or latency
+symptom disappear.
 
 ## Never Hold Database Capacity During Other Work
 
@@ -76,10 +84,11 @@ invariant. Inside it, perform only the reads and writes required to validate and
 commit that write set. Never split an atomic domain transition merely to reduce
 writer hold time.
 
-For maintenance or bulk work that does not require whole-job atomicity:
+For background maintenance or foreground bulk work that does not require
+whole-job atomicity:
 
 1. discover or prepare a bounded batch;
-2. open a short maintenance transaction;
+2. open a short transaction in the operation's scoped class;
 3. revalidate any state that may have changed;
 4. apply the bounded write set and commit;
 5. release the writer before preparing, sleeping, yielding, or processing the
@@ -91,8 +100,9 @@ infinite retry loop or permanently block later rows; use an explicit terminal
 state such as quarantine when the domain contract permits it.
 
 `run_background_database_quantum` supplies maintenance scope and lock-race
-retry behavior. It does not reserve the writer for the entire operation and
-must not be changed to do so.
+retry behavior for background jobs. Foreground preparation uses its request
+scope and similarly bounded database quanta. Neither reserves the writer for
+the entire operation.
 
 ## Deadlines, Cancellation, and Backpressure
 

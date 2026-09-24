@@ -604,6 +604,14 @@ impl CodexJsonlRpcClientError {
     pub const fn is_method_not_found(&self) -> bool {
         matches!(self, Self::Native(error) if error.code == -32601)
     }
+
+    /// These failures happen before thread/fork can commit a provider thread.
+    /// Transport loss, timeout, decode errors and other server errors have an
+    /// unknown outcome and must retain the durable fork fence.
+    pub const fn proves_fork_not_created(&self) -> bool {
+        matches!(self, Self::Encode { .. } | Self::DuplicateRequestId { .. })
+            || matches!(self, Self::Native(error) if error.code == -32601 || error.code == -32602)
+    }
 }
 
 impl fmt::Display for CodexJsonlRpcClientError {
@@ -1017,6 +1025,8 @@ impl CodexAppServerClient {
     ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
         let params = serde_json::to_value(CodexThreadForkRequestParams {
             thread_id: params.thread_id,
+            last_turn_id: params.last_turn_id,
+            thread_source: params.thread_source,
             exclude_turns: true,
         })
         .map_err(|error| CodexJsonlRpcClientError::Encode {
@@ -1028,6 +1038,134 @@ impl CodexAppServerClient {
             .request_thread_open_value("thread/fork", Some(params), timeout)
             .await?;
         decode_codex_thread_open_response("thread/fork", result)
+    }
+
+    /// Reconcile an interrupted fork by its caller-supplied durable marker.
+    /// A source and boundary alone are ambiguous when another actor forks the
+    /// same conversation. `threadSource` is persisted by the app-server and
+    /// returned by `thread/list`, so only the exact intent can be adopted.
+    pub async fn find_marked_thread_fork(
+        &self,
+        source_thread_id: &str,
+        boundary_turn_id: &str,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<Option<CodexThreadOpenSnapshot>, CodexJsonlRpcClientError> {
+        let mut candidate: Option<(CodexThreadOpenSnapshot, bool)> = None;
+        // `archived: null` searches only live threads. A negative result is
+        // proof only after both disjoint provider partitions are exhausted.
+        for archived in [false, true] {
+            let mut cursor: Option<String> = None;
+            let mut cursors = HashSet::new();
+            let mut complete = false;
+            for _ in 0..100 {
+                let response = self
+                    .rpc
+                    .request_value(
+                        "thread/list",
+                        Some(json!({
+                            "cursor": cursor,
+                            "limit": 100,
+                            "archived": archived,
+                        })),
+                        timeout,
+                    )
+                    .await?;
+                let data = response
+                    .get("data")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| CodexJsonlRpcClientError::Decode {
+                        method: "thread/list".to_owned(),
+                        message: "fork reconciliation response omitted data".to_owned(),
+                    })?;
+                for thread in data {
+                    if thread.get("threadSource").and_then(JsonValue::as_str) != Some(marker) {
+                        continue;
+                    }
+                    if thread.get("forkedFromId").and_then(JsonValue::as_str)
+                        != Some(source_thread_id)
+                    {
+                        return Err(CodexJsonlRpcClientError::Decode {
+                            method: "thread/list".to_owned(),
+                            message: "marked fork has a different source thread".to_owned(),
+                        });
+                    }
+                    let id = thread
+                        .get("id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| CodexJsonlRpcClientError::Decode {
+                            method: "thread/list".to_owned(),
+                            message: "marked fork has no thread ID".to_owned(),
+                        })?;
+                    let turns = self
+                        .rpc
+                        .request_value(
+                            "thread/turns/list",
+                            Some(json!({
+                                "threadId": id,
+                                "limit": 1,
+                                "sortDirection": "desc",
+                                "itemsView": "notLoaded",
+                            })),
+                            timeout,
+                        )
+                        .await?;
+                    let last_turn = turns
+                        .get("data")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|turns| turns.first())
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(JsonValue::as_str);
+                    if last_turn != Some(boundary_turn_id) || candidate.is_some() {
+                        return Err(CodexJsonlRpcClientError::Decode {
+                            method: "thread/turns/list".to_owned(),
+                            message:
+                                "marked fork is ambiguous or does not end at the requested boundary"
+                                    .to_owned(),
+                        });
+                    }
+                    candidate = Some((
+                        decode_codex_thread_open_response(
+                            "thread/list",
+                            json!({"thread": thread}),
+                        )?,
+                        archived,
+                    ));
+                }
+                cursor = response
+                    .get("nextCursor")
+                    .and_then(JsonValue::as_str)
+                    .filter(|cursor| !cursor.is_empty())
+                    .map(str::to_owned);
+                let Some(next) = cursor.as_ref() else {
+                    complete = true;
+                    break;
+                };
+                if !cursors.insert(next.clone()) {
+                    return Err(CodexJsonlRpcClientError::Decode {
+                        method: "thread/list".to_owned(),
+                        message: "fork reconciliation pagination repeated a cursor".to_owned(),
+                    });
+                }
+            }
+            if !complete {
+                return Err(CodexJsonlRpcClientError::Decode {
+                    method: "thread/list".to_owned(),
+                    message: "fork reconciliation exceeded its bounded page limit".to_owned(),
+                });
+            }
+        }
+        match candidate {
+            Some((fork, true)) => Err(CodexJsonlRpcClientError::Decode {
+                method: "thread/list".to_owned(),
+                message: format!(
+                    "marked fork {} is archived; unarchive that provider thread before retrying reconciliation",
+                    fork.native_thread_id
+                ),
+            }),
+            Some((fork, false)) => Ok(Some(fork)),
+            None => Ok(None),
+        }
     }
 
     pub async fn review_start(
@@ -2003,13 +2141,67 @@ pub fn cleanup_codex_generation_overlay(
             "Codex generation overlay cleanup refused a replacement path",
         ));
     }
-    fs::remove_dir_all(overlay_path.as_path()).map_err(|error| {
+    // Forked histories retain references to their source's persisted path.
+    // Keep storage aliases and the ownership marker, but no process state.
+    let cleanup = || -> std::io::Result<()> {
+        for entry in fs::read_dir(&overlay_path)? {
+            let entry = entry?;
+            if matches!(
+                entry.file_name().to_str(),
+                Some("sessions" | "archived_sessions" | CODEX_GENERATION_OVERLAY_MARKER)
+            ) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    };
+    cleanup().map_err(|error| {
         CodexShadowHomeError::with_context(
             "remove Codex generation overlay",
             overlay_path.as_path(),
             error,
         )
     })
+}
+
+/// The caller must supply the authorized source's logical thread, not the
+/// destination child. Reuse the same exact-path recovery as ordinary resume.
+pub fn recover_codex_fork_source_rollout_path(
+    descriptor: &CodexGenerationOverlayDescriptor,
+    source_logical_thread_id: &str,
+    persisted_path: &Path,
+) -> Result<Option<PathBuf>, CodexShadowHomeError> {
+    if source_logical_thread_id.trim().is_empty() {
+        return Err(CodexShadowHomeError::new(
+            "Codex fork source identity is empty",
+        ));
+    }
+    let runtime_root = descriptor
+        .effective_home_path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| CodexShadowHomeError::new("Codex overlay has no runtime root"))?;
+    let mut source = descriptor.clone();
+    source.identity.logical_thread_id = source_logical_thread_id.to_owned();
+    source.effective_home_path = runtime_root
+        .join(codex_overlay_identity_component(
+            "thread",
+            source_logical_thread_id,
+        ))
+        .join(codex_overlay_identity_component(
+            "boot",
+            &source.identity.gateway_boot_id,
+        ))
+        .join(format!(
+            "generation-{:020}",
+            source.identity.process_generation
+        ));
+    recover_codex_stale_rollout_path(&source, persisted_path)
 }
 
 /// Resolves the selected rollout to durable storage. For a removed generation,
@@ -2448,7 +2640,7 @@ fn materialize_codex_generation_overlay(
 
     let marker_path = overlay_path.join(CODEX_GENERATION_OVERLAY_MARKER);
     let marker = if overlay_existed {
-        let marker =
+        let mut marker =
             read_codex_generation_overlay_marker(marker_path.as_path()).map_err(|error| {
                 CodexShadowHomeError::new(format!(
                     "stale or unmanaged Codex generation overlay `{}`: {error}",
@@ -2460,6 +2652,16 @@ fn materialize_codex_generation_overlay(
                 "stale Codex generation overlay identity at `{}`",
                 overlay_path.display()
             )));
+        }
+        if !overlay_path.join("config.toml").exists() {
+            // A retired storage-only generation is a new process if reused.
+            // Rotate ownership so its old cleanup cannot remove the replacement.
+            marker.materialization_nonce = codex_generation_overlay_nonce(&identity);
+            marker.mcp_artifact = None;
+            let serialized = serde_json::to_vec(&marker).map_err(|error| {
+                CodexShadowHomeError::new(format!("serialize Codex overlay marker failed: {error}"))
+            })?;
+            overwrite_codex_private_file(marker_path.as_path(), &serialized)?;
         }
         marker
     } else {
@@ -3740,12 +3942,18 @@ pub struct CodexThreadNameSetSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct CodexThreadForkParams {
     pub thread_id: String,
+    pub last_turn_id: Option<String>,
+    pub thread_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadForkRequestParams {
     pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_source: Option<String>,
     /// Fork the durable provider thread without echoing the copied rollout
     /// over JSONL. The fork still owns the complete provider-side history.
     pub exclude_turns: bool,
@@ -10506,6 +10714,8 @@ while read line; do :; done
                 .thread_fork(
                     CodexThreadForkParams {
                         thread_id: "codex-thread-existing".to_owned(),
+                        last_turn_id: Some("codex-turn-finished".to_owned()),
+                        thread_source: Some("pioneer-cli-fork:test".to_owned()),
                     },
                     Duration::from_secs(2),
                 )
@@ -10518,6 +10728,8 @@ while read line; do :; done
             request["params"],
             json!({
                 "threadId": "codex-thread-existing",
+                "lastTurnId": "codex-turn-finished",
+                "threadSource": "pioneer-cli-fork:test",
                 "excludeTurns": true
             })
         );
@@ -10538,6 +10750,184 @@ while read line; do :; done
             .expect("fork task should join")
             .expect("fork should succeed");
         assert_eq!(snapshot.native_thread_id, "codex-thread-fork");
+    }
+
+    #[tokio::test]
+    async fn marked_fork_recovery_requires_exact_marker_parent_and_inclusive_boundary() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let recovery = tokio::spawn(async move {
+            client
+                .find_marked_thread_fork(
+                    "source-thread",
+                    "completed-boundary",
+                    "pioneer-cli-fork:nonce",
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let listing = fake.read_message().await;
+        assert_eq!(listing["method"], json!("thread/list"));
+        assert!(listing["params"].get("parentThreadId").is_none());
+        fake.write_result_response(listing["id"].clone(), json!({
+            "data": [
+                {"id":"unrelated", "forkedFromId":"source-thread", "threadSource":"other"},
+                {"id":"recovered", "forkedFromId":"source-thread", "threadSource":"pioneer-cli-fork:nonce", "cwd":"/tmp"}
+            ],
+            "nextCursor": null
+        })).await;
+        let turns = fake.read_message().await;
+        assert_eq!(turns["method"], json!("thread/turns/list"));
+        assert_eq!(turns["params"]["threadId"], json!("recovered"));
+        assert_eq!(turns["params"]["itemsView"], json!("notLoaded"));
+        fake.write_result_response(
+            turns["id"].clone(),
+            json!({
+                "data": [{"id":"completed-boundary"}], "nextCursor": null
+            }),
+        )
+        .await;
+        let archived = fake.read_message().await;
+        assert_eq!(archived["method"], json!("thread/list"));
+        assert_eq!(archived["params"]["archived"], json!(true));
+        fake.write_result_response(
+            archived["id"].clone(),
+            json!({
+                "data": [], "nextCursor": null
+            }),
+        )
+        .await;
+        let found = recovery.await.unwrap().unwrap().unwrap();
+        assert_eq!(found.native_thread_id, "recovered");
+        assert_eq!(found.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn marked_fork_negative_proof_includes_archived_threads() {
+        for archived_fork in [false, true] {
+            let mut fake = FakeCodexAppServer::new();
+            let client = fake.client.clone();
+            let recovery = tokio::spawn(async move {
+                client
+                    .find_marked_thread_fork(
+                        "source-thread",
+                        "completed-boundary",
+                        "pioneer-cli-fork:nonce",
+                        Duration::from_secs(2),
+                    )
+                    .await
+            });
+            let active = fake.read_message().await;
+            assert_eq!(active["params"]["archived"], json!(false));
+            fake.write_result_response(active["id"].clone(), json!({"data":[],"nextCursor":null}))
+                .await;
+            let archived = fake.read_message().await;
+            assert_eq!(archived["params"]["archived"], json!(true));
+            fake.write_result_response(
+                archived["id"].clone(),
+                json!({
+                    "data": if archived_fork { json!([{
+                        "id":"archived-fork", "forkedFromId":"source-thread",
+                        "threadSource":"pioneer-cli-fork:nonce"
+                    }]) } else { json!([]) },
+                    "nextCursor":null
+                }),
+            )
+            .await;
+            if archived_fork {
+                let turns = fake.read_message().await;
+                assert_eq!(turns["method"], json!("thread/turns/list"));
+                fake.write_result_response(
+                    turns["id"].clone(),
+                    json!({
+                        "data":[{"id":"completed-boundary"}], "nextCursor":null
+                    }),
+                )
+                .await;
+                assert!(
+                    recovery
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("archived")
+                );
+            } else {
+                assert!(recovery.await.unwrap().unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_fork_incomplete_listing_is_not_negative_proof() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let recovery = tokio::spawn(async move {
+            client
+                .find_marked_thread_fork(
+                    "source-thread",
+                    "completed-boundary",
+                    "pioneer-cli-fork:nonce",
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let first = fake.read_message().await;
+        fake.write_result_response(first["id"].clone(), json!({"data":[],"nextCursor":"same"}))
+            .await;
+        let second = fake.read_message().await;
+        fake.write_result_response(second["id"].clone(), json!({"data":[],"nextCursor":"same"}))
+            .await;
+        assert!(
+            recovery
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cursor")
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_fork_ambiguous_marker_preserves_unknown_outcome() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let recovery = tokio::spawn(async move {
+            client
+                .find_marked_thread_fork(
+                    "source-thread",
+                    "completed-boundary",
+                    "pioneer-cli-fork:nonce",
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let listing = fake.read_message().await;
+        fake.write_result_response(listing["id"].clone(), json!({
+            "data":[
+                {"id":"fork-one","forkedFromId":"source-thread","threadSource":"pioneer-cli-fork:nonce"},
+                {"id":"fork-two","forkedFromId":"source-thread","threadSource":"pioneer-cli-fork:nonce"}
+            ], "nextCursor":null
+        })).await;
+        for id in ["fork-one", "fork-two"] {
+            let turns = fake.read_message().await;
+            assert_eq!(turns["params"]["threadId"], json!(id));
+            fake.write_result_response(
+                turns["id"].clone(),
+                json!({
+                    "data":[{"id":"completed-boundary"}], "nextCursor":null
+                }),
+            )
+            .await;
+        }
+        assert!(
+            recovery
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
     }
 
     #[tokio::test]
@@ -11996,6 +12386,15 @@ while read line; do :; done
         );
 
         cleanup_codex_generation_overlay(&first).expect("clean first overlay");
+        assert!(
+            persisted_generation_path.exists(),
+            "retirement must preserve fork source references"
+        );
+        for private in ["config.toml", "auth.json", "bootstrap", "sqlite"] {
+            assert!(!first.effective_home_path.join(private).exists());
+        }
+        // Simulate a generation removed by an older Pioneer version.
+        fs::remove_file(first.effective_home_path.join("sessions")).unwrap();
         assert!(!persisted_generation_path.exists());
         let (_, second) = codex_generation_app_server_process_config(
             &config,
@@ -12016,8 +12415,15 @@ while read line; do :; done
             fs::read_dir(&first.effective_home_path)
                 .expect("retired generation")
                 .map(|entry| entry.expect("entry").file_name())
-                .collect::<Vec<_>>(),
-            vec![std::ffi::OsString::from("sessions")],
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "sessions",
+                "archived_sessions",
+                CODEX_GENERATION_OVERLAY_MARKER
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect(),
             "recovery must not resurrect credentials, config, or MCP bootstrap"
         );
         assert_eq!(
@@ -12041,6 +12447,24 @@ while read line; do :; done
                 .to_string()
                 .contains("outside the logical thread overlay")
         );
+        fs::remove_file(first.effective_home_path.join("sessions")).unwrap();
+        assert_eq!(
+            recover_codex_fork_source_rollout_path(
+                &other_thread,
+                "thread-a",
+                &persisted_generation_path
+            )
+            .expect("an authorized child fork must repair its exact parent path"),
+            Some(fs::canonicalize(&shared_rollout).unwrap())
+        );
+        assert!(
+            recover_codex_fork_source_rollout_path(
+                &other_thread,
+                "wrong-parent",
+                &persisted_generation_path
+            )
+            .is_err()
+        );
 
         // Never redirect an existing alias or create storage for an absent
         // selected rollout. A missing file is not authority to choose another.
@@ -12054,6 +12478,13 @@ while read line; do :; done
         assert!(recover_codex_stale_rollout_path(&second, &persisted_generation_path).is_err());
         assert_eq!(fs::read_link(&alias).expect("preserved alias"), outside);
         fs::remove_file(&alias).expect("remove conflicting test alias");
+        fs::remove_file(first.effective_home_path.join("archived_sessions")).unwrap();
+        fs::remove_file(
+            first
+                .effective_home_path
+                .join(CODEX_GENERATION_OVERLAY_MARKER),
+        )
+        .unwrap();
         fs::remove_dir(&first.effective_home_path).expect("empty retired test directory");
         std::os::unix::fs::symlink(&outside, &first.effective_home_path)
             .expect("symlinked retired generation");
@@ -12305,6 +12736,12 @@ while read line; do :; done
         )
         .expect("initial materialization");
         cleanup_codex_generation_overlay(&descriptor).expect("clean initial overlay");
+        fs::remove_file(
+            descriptor
+                .effective_home_path
+                .join(CODEX_GENERATION_OVERLAY_MARKER),
+        )
+        .expect("simulate an unowned directory");
         fs::create_dir_all(descriptor.effective_home_path.as_path())
             .expect("create stale unmarked directory");
         let error =
