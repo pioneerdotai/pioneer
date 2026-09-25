@@ -388,7 +388,7 @@ pub(crate) async fn previous_delivered_parent_turn(
                 || !run.status.is_terminal()
                 || run.attempt_number != 1
                 || child.kind != pioneer_protocol::TaskRunTurnKind::Initial
-                || child.sequence != 1
+                || child.sequence != 0
             {
                 return Ok(previous);
             }

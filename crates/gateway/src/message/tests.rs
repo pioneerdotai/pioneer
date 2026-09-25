@@ -26830,7 +26830,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{blocked_run}','{blocked_task}','{blocked_run}',1,1,'{task_status}','agent')"
                 ),
                 format!(
-                    "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status) VALUES ('{child_turn}','{blocked_task}','{blocked_run}','{child}','{child_turn}','initial',0,1,'{status}')"
+                    "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status) VALUES ('{child_turn}','{blocked_task}','{blocked_run}','{child}','{child_turn}','initial',0,0,'{status}')"
                 ),
             ] {
                 db.execute_unprepared(&sql).await.unwrap();
@@ -26859,8 +26859,12 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 None,
                 "direct CLI attempts obey the same no-dispatch rule"
             );
-            // Native work and a possibly dispatched CLI attempt cannot be skipped.
+            // Later child turns, Native work and possibly dispatched CLI attempts cannot be skipped.
             for (change, restore) in [
+                (
+                    format!("UPDATE task_run_turn SET sequence=1 WHERE turn_id='{child_turn}'"),
+                    format!("UPDATE task_run_turn SET sequence=0 WHERE turn_id='{child_turn}'"),
+                ),
                 (
                     format!(
                         "UPDATE turn_execution SET status='running' WHERE turn_id='{child_turn}'"
