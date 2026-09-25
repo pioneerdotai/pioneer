@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 120
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_BUILD_JOBS: 2
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +43,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           components: rustfmt
+
+      - name: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.target }}
 
       - name: rustfmt-check
         if: matrix.os == 'ubuntu-latest'
