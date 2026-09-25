@@ -15,7 +15,7 @@ pub use selection::*;
 pub const FORMAT_VERSION: u32 = 1;
 pub const TAIL_TOKENS: u64 = 20_000;
 pub const ATTEMPT_MILLIS: u64 = 5 * 60 * 1_000;
-pub const OPERATION_MILLIS: u64 = 15 * 60 * 1_000;
+pub const OPERATION_MILLIS: u64 = 60 * 60 * 1_000;
 pub const RESULT_TOKENS: u64 = 8_192;
 pub const RESULT_BYTES: usize = 64 * 1_024;
 pub const PAGE_TOKENS: u64 = 4_096;

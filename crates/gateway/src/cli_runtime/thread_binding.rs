@@ -598,7 +598,157 @@ pub(crate) async fn completed_context_basis_from_turn_binding(
     if source.status != "completed" || source.native_turn_id.is_none() {
         return Ok(None);
     }
-    let sent = sent_context_basis_from_input_mapping(source.input_mapping_json.as_str())?;
+    let sent = sent_context_basis_from_input_mapping(&source.input_mapping_json)?;
+    context_basis_from_acknowledged_turn(store, source, sent).await
+}
+
+/// Resume an acknowledged, terminal provider attempt in its existing session.
+/// This is not a completed fork boundary and does not skip the failed input.
+pub(crate) async fn failed_context_basis_from_binding(
+    store: &CrudStore,
+    binding: &CliRuntimeThreadBindingRecord,
+    previous: Option<(&str, u64, bool)>,
+) -> Result<Option<CliRuntimeContextBasis>> {
+    let Some((previous_id, revision, deleted)) = previous else {
+        return Ok(None);
+    };
+    let cursor =
+        deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(&binding.resume_cursor_json)?;
+    let Some(receipt) = cursor.pioneer_context else {
+        return Ok(None);
+    };
+    if binding.status != "active"
+        || receipt.version != CONTEXT_RECEIPT_VERSION
+        || receipt.native_thread_id != binding.native_thread_id
+    {
+        return Ok(None);
+    }
+    let Some(source) = store
+        .get_cli_runtime_turn_binding(&receipt.accepted_turn_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if !matches!(source.status.as_str(), "blocked" | "failed" | "interrupted")
+        || source.native_turn_id.is_none()
+        || source.native_thread_id != binding.native_thread_id
+        || source.continuation_thread_id != binding.thread_id
+        || source.workspace_id != binding.workspace_id
+        || source.runtime_id != binding.runtime_id
+        || source.runtime_kind != binding.runtime_kind
+    {
+        return Ok(None);
+    }
+    let Some(attempt) = store
+        .latest_cli_runtime_turn_attempt(&source.turn_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if attempt.status.is_active()
+        || attempt.native_thread_id != source.native_thread_id
+        || attempt.native_turn_id != source.native_turn_id
+    {
+        return Ok(None);
+    }
+    if !store
+        .get_turn_execution(&source.turn_id)
+        .await?
+        .is_some_and(|execution| {
+            execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                && !execution.status.is_active()
+        })
+    {
+        return Ok(None);
+    }
+    if source.thread_id == binding.thread_id {
+        if source.turn_id != previous_id {
+            return Ok(None);
+        }
+    } else {
+        let Some(child) = store
+            .get_task_run_turn_by_turn(&source.thread_id, &source.turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if child.run_id != previous_id {
+            return Ok(None);
+        }
+        let Some(latest) = store.get_latest_task_run_turn(previous_id).await? else {
+            return Ok(None);
+        };
+        if latest.turn_id != source.turn_id {
+            return Ok(None);
+        }
+        let Some(task) = store.get_task_record(&child.task_id).await? else {
+            return Ok(None);
+        };
+        if !task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.composer_work.as_ref())
+            .is_some_and(|work| work.launch.thread_id == binding.thread_id)
+        {
+            return Ok(None);
+        }
+    }
+    let Some((_, turn)) = store.get_turn(&source.thread_id, &source.turn_id).await? else {
+        return Ok(None);
+    };
+    if !matches!(
+        turn.status,
+        pioneer_protocol::TurnStatus::Blocked
+            | pioneer_protocol::TurnStatus::Failed
+            | pioneer_protocol::TurnStatus::Interrupted
+    ) || turn.message_revision != receipt.accepted_turn_revision
+        || turn.message_deleted != receipt.accepted_turn_deleted
+    {
+        return Ok(None);
+    }
+    // Failed legacy starts without the durable sent mapping are not delivery evidence.
+    let Some(sent) = sent_context_basis_from_input_mapping(&source.input_mapping_json)? else {
+        return Ok(None);
+    };
+    if sent.pending_turn.message_revision != receipt.accepted_turn_revision
+        || sent.pending_turn.message_deleted != receipt.accepted_turn_deleted
+        || sent
+            .pending_turn
+            .thread_id
+            .as_deref()
+            .unwrap_or(&sent.completed.execution_thread_id)
+            != source.thread_id
+    {
+        return Ok(None);
+    }
+    let Some(basis) = context_basis_from_acknowledged_turn(store, &source, Some(sent)).await?
+    else {
+        return Ok(None);
+    };
+    if !basis.delivered_turns.iter().any(|turn| {
+        turn.turn_id == previous_id
+            && turn
+                .thread_id
+                .as_deref()
+                .unwrap_or(&basis.execution_thread_id)
+                == binding.thread_id
+            && turn.message_revision == revision
+            && turn.message_deleted == deleted
+    }) {
+        return Ok(None);
+    }
+    Ok(
+        completed_context_basis_is_current(store, &binding.workspace_id, &basis)
+            .await?
+            .then_some(basis),
+    )
+}
+
+async fn context_basis_from_acknowledged_turn(
+    store: &CrudStore,
+    source: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    sent: Option<CliRuntimeSentContextBasis>,
+) -> Result<Option<CliRuntimeContextBasis>> {
     let (mut basis, pending_turn) = if let Some(sent) = sent {
         if sent.pending_turn.turn_id != source.turn_id {
             bail!("CLI fork source context belongs to a different turn");

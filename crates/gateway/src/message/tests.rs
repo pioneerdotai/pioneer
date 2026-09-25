@@ -25199,6 +25199,46 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             .is_some(),
         "the accepted child projection must receive the published checkpoint"
     );
+    // A fitting prepared history succeeds without another checkpoint or
+    // provider call. The CLI caller must still validate its rebuilt wire frame.
+    let summary_calls = summary.snapshot_requests().len();
+    let deadline_ms = chrono::Utc::now().timestamp_millis() as u64 + 60_000;
+    let prepared = processor
+        .capture_cli_transfer_projection(
+            &workspace,
+            &child.child_thread_id,
+            &child.child_turn_id,
+            deadline_ms,
+        )
+        .await
+        .unwrap();
+    processor
+        .compact_cli_transfer_history(
+            &workspace,
+            &child.child_thread_id,
+            &child.child_turn_id,
+            "codex",
+            CLIAgentRuntimeKind::Codex,
+            "gpt-5",
+            None,
+            0,
+            deadline_ms,
+            prepared,
+        )
+        .await
+        .expect("Fits must not require a newly published checkpoint");
+    assert_eq!(summary.snapshot_requests().len(), summary_calls);
+    assert_eq!(
+        store
+            .compaction_head(&crate::compaction::native_owner(
+                &workspace,
+                &child.child_thread_id
+            ))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(checkpoint_id.as_str())
+    );
     assert!(
         sent.completed
             .delivered_sources
@@ -26729,6 +26769,125 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .await,
             TaskStatus::Completed,
             "{runtime_id} native Task should reconcile through the normal Task result path"
+        );
+        // A provider-side failure is resumable in the same session, but is
+        // never a completed fork boundary. Keep the actual sent history guards.
+        let failed_parent = crud_store
+            .get_cli_runtime_thread_binding(&parent_thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let db = crud_store.database_connection();
+        for table in [
+            "turn",
+            "turn_execution",
+            "turn_cli_runtime_binding",
+            "turn_cli_runtime_attempt",
+        ] {
+            let key = if table == "turn" { "id" } else { "turn_id" };
+            let status = if table == "turn_cli_runtime_attempt" {
+                "failed"
+            } else {
+                "blocked"
+            };
+            db.execute_unprepared(&format!(
+                "UPDATE {table} SET status='{status}' WHERE {key}='{}'",
+                lineage.child_turn_id,
+            ))
+            .await
+            .unwrap();
+        }
+        // Use the start acknowledgement, which has no completion for this child.
+        let failed_basis = crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
+            &crud_store,
+            &parent_binding,
+            Some((&run.id, 0, false)),
+        )
+        .await
+        .unwrap()
+        .expect("acknowledged failed Composer turn must retain its CLI session");
+        assert!(
+            failed_basis
+                .delivered_turns
+                .iter()
+                .any(|turn| turn.turn_id == lineage.child_turn_id)
+        );
+        let failed_source = crud_store
+            .get_cli_runtime_turn_binding(&lineage.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::cli_runtime::thread_binding::completed_context_basis_from_turn_binding(
+                &crud_store,
+                &failed_source,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "failed resume must not authorize a fork"
+        );
+        assert!(
+            crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
+                &crud_store,
+                &parent_binding,
+                Some((&run.id, 1, false)),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "edited parent input cannot reuse sent history"
+        );
+        let mut other_session = parent_binding.clone();
+        other_session.native_thread_id = "different-provider-session".into();
+        assert!(
+            crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
+                &crud_store,
+                &other_session,
+                Some((&run.id, 0, false)),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        db.execute_unprepared(&format!(
+            "UPDATE turn_cli_runtime_attempt SET status='running' WHERE turn_id='{}'",
+            lineage.child_turn_id,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
+                &crud_store,
+                &parent_binding,
+                Some((&run.id, 0, false)),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "an active provider attempt is not resumable"
+        );
+        for table in [
+            "turn",
+            "turn_execution",
+            "turn_cli_runtime_binding",
+            "turn_cli_runtime_attempt",
+        ] {
+            let key = if table == "turn" { "id" } else { "turn_id" };
+            db.execute_unprepared(&format!(
+                "UPDATE {table} SET status='completed' WHERE {key}='{}'",
+                lineage.child_turn_id,
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            crud_store
+                .get_cli_runtime_thread_binding(&parent_thread_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            failed_parent
         );
         // Pre-0.53.16 parent bindings had no Pioneer receipt. The completed
         // service child's frozen accepted snapshot and provider turn still

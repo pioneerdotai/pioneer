@@ -556,6 +556,25 @@ pub(crate) struct PreparedHistory {
     pub(crate) checkpoint_graphs: super::coverage::CheckpointGraphResolver,
 }
 
+impl PreparedHistory {
+    pub(crate) async fn project_accepted_checkpoints(
+        &mut self,
+        store: &CrudStore,
+        workspace: &str,
+        thread: &str,
+    ) -> Result<()> {
+        super::checkpoint::project_accepted_checkpoints_with_resolver(
+            store,
+            workspace,
+            thread,
+            &self.accepted_scopes,
+            &mut self.messages,
+            &mut self.checkpoint_graphs,
+        )
+        .await
+    }
+}
+
 pub(crate) async fn capture_execution_basis_prepared(
     store: &CrudStore,
     workspace: &str,
@@ -3007,10 +3026,44 @@ pub(crate) async fn frozen_history_direct_sources(
     workspace: &str,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ScopedHistorySource>> {
+    frozen_history_projection_sources(store, workspace, descriptor, None).await
+}
+
+/// Keep the immutable manifest as authority, but guard the representation
+/// actually sent: published summaries replace covered raw source guards.
+pub(crate) async fn frozen_history_projection_sources(
+    store: &CrudStore,
+    workspace: &str,
+    descriptor: &FrozenHistoryRef,
+    messages: Option<&[ChatMessage]>,
+) -> Result<Vec<ScopedHistorySource>> {
+    let projected = messages.map(|messages| {
+        messages
+            .iter()
+            .flat_map(|message| {
+                message.provenance.iter().flat_map(|origin| {
+                    origin.sources.iter().map(|reference| ScopedHistorySource {
+                        thread: origin.thread_id.clone(),
+                        source: source(reference),
+                    })
+                })
+            })
+            .collect::<BTreeSet<_>>()
+    });
     let (_, references) =
         frozen_manifest_references(store, workspace, None, descriptor, None).await?;
-    let mut sources = BTreeSet::new();
+    let mut sources = projected.clone().unwrap_or_default();
     for reference in references {
+        if projected.as_ref().is_some_and(|sources| {
+            !reference.sources.iter().all(|source| {
+                sources.contains(&ScopedHistorySource {
+                    thread: reference.source_thread.clone(),
+                    source: source.clone(),
+                })
+            })
+        }) {
+            continue;
+        }
         sources.extend(
             reference
                 .sources

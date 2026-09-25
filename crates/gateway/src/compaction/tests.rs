@@ -3715,6 +3715,45 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         "an inherited WorkingContext replacement must not carry OWN imports"
     );
 
+    // CLI must project the accepted raw snapshot before frame sizing, while
+    // retaining its immutable authority and guarding only the sent summary.
+    let mut cli_history = super::frozen::PreparedHistory {
+        descriptor: frozen.clone(),
+        messages: accepted.clone(),
+        accepted_scopes: allowed.clone(),
+        source_epochs: Default::default(),
+        expected_checkpoint: None,
+        checkpoint: None,
+        checkpoint_graphs: Default::default(),
+    };
+    cli_history
+        .project_accepted_checkpoints(&f.store, "ws", "context-c")
+        .await
+        .unwrap();
+    assert_eq!(cli_history.messages.len(), 1);
+    assert_eq!(
+        cli_history.messages[0].provenance.as_ref().unwrap().sources[0].id,
+        checkpoint.id
+    );
+    assert_eq!(
+        cli_history.descriptor, frozen,
+        "projection must not replace accepted authority"
+    );
+    let cli_sources = super::frozen::frozen_history_projection_sources(
+        &f.store,
+        "ws",
+        &cli_history.descriptor,
+        Some(&cli_history.messages),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cli_sources.len(), 1);
+    assert_eq!(
+        cli_sources[0].source.id, checkpoint.id,
+        "covered raw sources must not be recorded as sent"
+    );
+    assert_eq!(f.provider.calls.lock().unwrap().len(), summarizer_calls);
+
     // Re-projecting an already captured checkpoint is idempotent.
     let mut projected = restored.clone();
     super::checkpoint::project_accepted_checkpoints(

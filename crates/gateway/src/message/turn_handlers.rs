@@ -4596,6 +4596,24 @@ impl MessageProcessor {
                 }
                 }
             }
+            let failed_resume_basis = if previous_parent_turn.as_ref().is_some_and(|turn| {
+                matches!(turn.status, TurnStatus::Blocked | TurnStatus::Failed | TurnStatus::Interrupted)
+            })
+                && let Some(binding) = persisted_context_binding.as_ref()
+                && binding.runtime_id == runtime_id
+                && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+            {
+                match crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
+                    self.crud_store.as_ref(), binding, previous_turn,
+                ).await {
+                    Ok(basis) => basis,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to validate prior CLI attempt: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { None };
+            let failed_resume = failed_resume_basis.is_some();
             let modern_service_basis = if previous_composer_source
                 && let Some(binding) = persisted_context_binding.as_ref()
                 && binding.status == "active"
@@ -4630,7 +4648,7 @@ impl MessageProcessor {
                 }
             } else { None };
             let current_receipt = modern_own_basis.is_some();
-            let continuation_context_basis = if let Some(basis) = modern_service_basis.or(modern_own_basis) {
+            let continuation_context_basis = if let Some(basis) = failed_resume_basis.or(modern_service_basis).or(modern_own_basis) {
                 Some(basis)
             } else if let (Some(binding), Some(source)) = (
                 persisted_context_binding.as_ref(), previous_cli_turn_binding.as_ref(),
@@ -4959,7 +4977,7 @@ impl MessageProcessor {
             let service_child_continuation = modern_service_receipt;
             let bootstrap_provider_context = match persisted_context_binding.as_ref() {
                 _ if forked_child || prepared_child_fork => false,
-                _ if service_child_continuation => false,
+                _ if service_child_continuation || failed_resume => false,
                 Some(binding) if previous_composer_source
                     && continuation_context_basis.is_some()
                     && binding.status == "active" => false,
@@ -8413,7 +8431,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn capture_cli_transfer_projection(
+    pub(super) async fn capture_cli_transfer_projection(
         &self,
         workspace_id: &str,
         thread_id: &str,
@@ -8442,17 +8460,19 @@ impl MessageProcessor {
         tokio::select! { biased;
             result = &mut cancelled => Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
             _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
-            prepared = self.capture_current_context_basis_prepared(
-                &history_store,
-                workspace_id,
-                thread_id,
-                active_turn_id,
-                Some(active_turn_id),
-            ) => prepared,
+            prepared = async {
+                let mut prepared = self.capture_current_context_basis_prepared(
+                    &history_store, workspace_id, thread_id, active_turn_id, Some(active_turn_id),
+                ).await?;
+                // Use the shared projector before sizing or sending CLI history.
+                // The frozen descriptor remains the accepted authority boundary.
+                prepared.project_accepted_checkpoints(&history_store, workspace_id, thread_id).await?;
+                Ok(prepared)
+            } => prepared,
         }
     }
 
-    async fn compact_cli_transfer_history(
+    pub(super) async fn compact_cli_transfer_history(
         &self,
         workspace_id: &str,
         thread_id: &str,
@@ -8464,7 +8484,7 @@ impl MessageProcessor {
         attempt: u32,
         deadline_ms: u64,
         accepted: crate::compaction::frozen::PreparedHistory,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<()> {
         let cancellation = tokio_util::sync::CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
         let remaining_ms = deadline_ms.saturating_sub(
@@ -8673,7 +8693,7 @@ impl MessageProcessor {
             outcome.as_str(),
             diagnostic.code,
         );
-        Ok(diagnostic.checkpoint)
+        Ok(())
     }
 
     async fn compile_cli_runtime_delivery_plan_for_turn(
@@ -8727,10 +8747,11 @@ impl MessageProcessor {
                         history_deadline_ms,
                     )
                     .await?;
-                let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+                let direct_sources = crate::compaction::frozen::frozen_history_projection_sources(
                     self.crud_store.as_ref(),
                     outcome.started_notification.workspace_id.as_str(),
                     &accepted.descriptor,
+                    Some(&accepted.messages),
                 )
                 .await?;
                 let history = self
@@ -8941,26 +8962,24 @@ impl MessageProcessor {
                 )
                 .context("current CLI input, attachment, or launch instructions cannot fit in one request")?;
                 let compaction_thread_id = outcome.started_notification.thread_id.as_str();
-                let published_checkpoint = self
-                    .compact_cli_transfer_history(
-                        outcome.started_notification.workspace_id.as_str(),
-                        compaction_thread_id,
-                        outcome.started_notification.turn.id.as_str(),
-                        runtime_id,
-                        runtime_kind,
-                        outcome.materialization.thread.model.as_str(),
-                        max_input_tokens,
-                        3 - remaining_compactions,
-                        history_deadline_ms,
-                        accepted_projection
-                            .take()
-                            .context("CLI transfer projection was lost")?,
-                    )
-                    .await?;
-                anyhow::ensure!(
-                    published_checkpoint.is_some(),
-                    "CLI transfer preparation did not publish a checkpoint for the oversized history"
-                );
+                self.compact_cli_transfer_history(
+                    outcome.started_notification.workspace_id.as_str(),
+                    compaction_thread_id,
+                    outcome.started_notification.turn.id.as_str(),
+                    runtime_id,
+                    runtime_kind,
+                    outcome.materialization.thread.model.as_str(),
+                    max_input_tokens,
+                    3 - remaining_compactions,
+                    history_deadline_ms,
+                    accepted_projection
+                        .take()
+                        .context("CLI transfer projection was lost")?,
+                )
+                .await?;
+                // Fits can reuse an existing summary without publishing a new one.
+                // Rebuild and validate the actual CLI frame; the bounded retry
+                // budget still applies if its wire format needs more compression.
                 *input_mapping = original_input;
                 return Box::pin(self.compile_cli_runtime_delivery_plan_for_turn(
                     runtime_id,
