@@ -191,13 +191,6 @@ impl FilePolicyCapability {
         }
     }
 
-    pub(crate) fn open_target(&self) -> std::io::Result<File> {
-        if let Some(target) = &self.target {
-            return target.try_clone();
-        }
-        open_regular_file_at(self.anchor.as_ref(), self.relative_path.as_path())
-    }
-
     pub(crate) fn canonical_target(&self) -> Option<&CanonicalTarget> {
         self.canonical_target.as_ref()
     }

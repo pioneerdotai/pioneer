@@ -672,6 +672,8 @@ fn grep_files_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
         "engine",
         "output",
         "truncated",
+        "skipped_large_files",
+        "match_count",
         "message",
         "reason",
         "next_action",
@@ -699,27 +701,62 @@ fn grep_files_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
 }
 
 fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
+    let status = input
+        .raw_output_json
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("failed");
     let stdout = input
         .raw_output_json
         .get("stdout")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    let match_count = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
+    let match_count = input
+        .raw_output_json
+        .get("match_count")
+        .and_then(JsonValue::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or_else(|| {
+            stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        });
     let metadata = serde_json::json!({
         "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
         "engine": input.raw_output_json.get("engine").cloned().unwrap_or(JsonValue::Null),
         "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-        "exitCode": input.raw_output_json.get("exit_code").cloned().unwrap_or(JsonValue::Null),
         "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
         "matchCount": match_count,
         "resultHash": sha256_hex(input.raw_output_text.as_bytes()),
     });
+    let (title, lines) = match status {
+        "ok" => (
+            "grep_files completed",
+            vec![format!("{match_count} match line(s)")],
+        ),
+        "no_matches" => ("grep_files completed", vec!["No matches".to_owned()]),
+        "partial" => (
+            "grep_files incomplete",
+            vec![format!(
+                "{match_count} match line(s); results were truncated or files were skipped"
+            )],
+        ),
+        _ => (
+            "grep_files could not complete",
+            vec![
+                input
+                    .raw_output_json
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Search did not complete")
+                    .to_owned(),
+            ],
+        ),
+    };
     let summary = summary(
-        "grep_files completed",
-        vec![format!("{match_count} match line(s)")],
+        title,
+        lines,
         metadata.clone(),
         metadata
             .get("truncated")
@@ -1862,7 +1899,7 @@ mod tests {
 
         let grep_payload = serde_json::json!({
             "status": "ok",
-            "engine": "rg",
+            "engine": "fff",
             "path": "/workspace/src",
             "truncated": false,
             "stdout": "SECRET_DUPLICATE_STDOUT",
@@ -1885,6 +1922,32 @@ mod tests {
         assert!(grep_model.contains("/workspace/src/main.rs"));
         assert!(!grep_model.contains("SECRET_DUPLICATE_STDOUT"));
         assert!(!grep_model.contains("SECRET_INTERNAL_STDERR"));
+    }
+
+    #[test]
+    fn incomplete_grep_is_not_displayed_as_zero_matches() {
+        let payload = serde_json::json!({
+            "status": "needs_narrowing",
+            "reason": "timeout",
+            "message": "The search timed out",
+            "path": "/workspace"
+        });
+        let raw = payload.to_string();
+        let projected = project_tool_result(ToolProjectionInput {
+            call_id: "call_unavailable",
+            tool_name: "grep_files",
+            arguments: &serde_json::json!({"pattern": "needle", "glob": "*.rs"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: false,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("grep_files"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let display = serde_json::to_string(&projected.display).unwrap();
+        assert!(display.contains("could not complete"));
+        assert!(display.contains("The search timed out"));
+        assert!(!display.contains("0 match line"));
     }
 
     #[test]

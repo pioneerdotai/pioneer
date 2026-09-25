@@ -2,6 +2,7 @@
 mod computer_use;
 
 pub(crate) mod apply_patch;
+mod fff_grep;
 mod files;
 mod http;
 mod mcp;

@@ -1,32 +1,20 @@
 use crate::apply_patch::file_mutation::{
     AllowAllReadAccess, PaginatedReader, ReadError, ReadErrorCode, ReadRequest, SnapshotLimits,
 };
-use crate::context::{
-    ExecCommandArgs, FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload,
-};
+use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
 use crate::file_policy::FilePolicyCapability;
 use crate::registry::ToolHandler;
-use crate::{
-    FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation,
-    NativeSandboxPrepareOutcome, NativeSandboxRequest, NonoSandboxBackend, ProcessSpawnPlan,
-    WindowsRestrictedTokenBackend, build_process_spawn_plan, configure_nono_command,
-    configure_windows_restricted_token_command, prepare_native_sandbox_backend,
-};
+use crate::{FilePolicyChecker, FilePolicyDecision, FilePolicyDenyReason, FilePolicyOperation};
 use async_trait::async_trait;
-use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::File;
-use std::io::{self, ErrorKind};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+#[cfg(test)]
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -47,20 +35,6 @@ const BROAD_GREP_FILE_LIMIT: usize = 5_000;
 const DEFAULT_GREP_TIMEOUT_MS: u64 = 20_000;
 const HARD_MAX_GREP_TIMEOUT_MS: u64 = 120_000;
 const NATIVE_FILESYSTEM_MAX_CONCURRENCY: usize = 8;
-const DEFAULT_GREP_EXCLUDED_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    ".next",
-    "dist",
-    "build",
-    ".cache",
-    ".turbo",
-    ".parcel-cache",
-    ".venv",
-    "__pycache__",
-];
-
 static NATIVE_FILESYSTEM_CONCURRENCY: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn native_filesystem_concurrency() -> Arc<Semaphore> {
@@ -179,14 +153,11 @@ impl ToolHandler for ReadFileHandler {
             .max_lines
             .unwrap_or(DEFAULT_READ_MAX_LINES)
             .clamp(1, HARD_MAX_READ_LINES) as u32;
-        if args.start_byte.is_some() && args.start_line.is_some() {
-            return Err(ToolError::invalid_arguments(
-                "read_file accepts either start_line or start_byte, not both",
-            ));
-        }
-        let start_line = args.start_line.unwrap_or(1).max(1).saturating_sub(1) as u64;
-        let start_byte = args.start_byte;
-        let cursor = args.cursor;
+        let (start_line, start_byte, cursor) = match (args.start_line, args.start_byte) {
+            (Some(line), _) => (line.max(1).saturating_sub(1) as u64, None, None),
+            (None, Some(byte)) => (0, Some(byte), None),
+            (None, None) => (0, None, args.cursor),
+        };
         let requested_path = file_path.clone();
         let page = tokio::task::spawn_blocking(move || {
             let _filesystem_slot = filesystem_slot;
@@ -712,51 +683,17 @@ impl ToolHandler for GrepHandler {
     async fn handle(
         &self,
         invocation: ToolInvocation,
-        _trace: crate::events::ToolEventTrace,
+        trace: crate::events::ToolEventTrace,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let args = parse_json_args::<GrepArgs>(invocation.payload)?;
         let filesystem_slot = acquire_native_filesystem_slot(&invocation.cancellation).await?;
-        let base = args.path.as_deref().unwrap_or(".");
         let resolved = resolve_authorized_tool_path(
             invocation.execution_security_snapshot.as_ref(),
             invocation.workdir.as_path(),
             FilePolicyOperation::Read,
-            base,
+            args.path.as_deref().unwrap_or("."),
         )?;
-        let search_path = resolved.absolute;
-        #[cfg(unix)]
-        let (search_descriptor, command_search_path) = {
-            let target = resolved.capability.open_target().map_err(|error| {
-                ToolError::Rejected(format!(
-                    "grep_files could not retain the authorized search object: {error}"
-                ))
-            })?;
-            let target_is_directory = target
-                .metadata()
-                .map(|metadata| metadata.is_dir())
-                .map_err(|error| {
-                    ToolError::Rejected(format!(
-                        "grep_files could not inspect the authorized search object: {error}"
-                    ))
-                })?;
-            let (descriptor, path) = inherited_descriptor_path(target)?;
-            let command_path = if target_is_directory {
-                PathBuf::from(".")
-            } else {
-                path
-            };
-            (Some(descriptor), command_path)
-        };
-        #[cfg(not(unix))]
-        let (search_descriptor, command_search_path): (Option<File>, PathBuf) = (
-            Some(resolved.capability.open_target().map_err(|error| {
-                ToolError::Rejected(format!(
-                    "grep_files could not retain the authorized search object: {error}"
-                ))
-            })?),
-            search_path.clone(),
-        );
-
+        let search_path = resolved.absolute.clone();
         let max_results = args
             .max_results
             .unwrap_or(DEFAULT_GREP_RESULTS)
@@ -765,603 +702,88 @@ impl ToolHandler for GrepHandler {
             .max_output_bytes
             .unwrap_or(DEFAULT_GREP_MAX_OUTPUT_BYTES)
             .clamp(1, HARD_MAX_GREP_OUTPUT_BYTES);
-        let case_sensitive = args.case_sensitive.unwrap_or(true);
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_GREP_TIMEOUT_MS)
             .clamp(1, HARD_MAX_GREP_TIMEOUT_MS);
-        let workspace_root = resolved.cwd;
-        let is_broad_workspace_search = args.glob.is_none()
-            && (args.path.is_none()
-                || search_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| search_path.to_path_buf())
-                    == workspace_root);
-        if is_broad_workspace_search {
-            match count_rg_search_files(
-                command_search_path.as_path(),
+        let outcome = super::fff_grep::search(
+            super::fff_grep::SearchRequest {
+                path: search_path.clone(),
+                workdir: resolved.cwd,
+                turn_id: trace.turn_id().to_owned(),
+                pattern: args.pattern,
+                glob: args.glob,
+                case_sensitive: args.case_sensitive.unwrap_or(true),
+                max_results,
+                max_output_bytes,
+                timeout_ms,
+                broad_file_limit: BROAD_GREP_FILE_LIMIT,
+                cancellation: invocation.cancellation,
+            },
+            filesystem_slot,
+        )
+        .await?;
+        match outcome {
+            super::fff_grep::SearchOutcome::NeedsNarrowing {
+                reason,
+                message,
+                scanned_file_count,
+            } => Ok(needs_narrowing_output(
+                message,
+                search_path.as_path(),
                 invocation.workdir.as_path(),
-                invocation.execution_security_snapshot.as_ref(),
-                timeout_ms.min(3_000),
-                search_descriptor.as_ref(),
-            )
-            .await?
-            {
-                Some(file_count) if file_count > BROAD_GREP_FILE_LIMIT => {
-                    return Ok(needs_narrowing_output(
-                        "grep_files is too broad for this workspace. Narrow path or glob.",
-                        search_path.as_path(),
-                        invocation.workdir.as_path(),
-                        Some(file_count),
-                        max_results,
-                        max_output_bytes,
-                        "broad_workspace_search",
-                    ));
-                }
-                None => {
-                    // A broad search must never silently fall back to an
-                    // unbounded recursive shell scan.  Without the scoped
-                    // file enumerator we cannot prove the workspace stays
-                    // within the per-operation scan bound, so require the model to
-                    // narrow the request explicitly.
-                    return Ok(needs_narrowing_output(
-                        "grep_files cannot establish the workspace file-count limit; narrow path or glob.",
-                        search_path.as_path(),
-                        invocation.workdir.as_path(),
-                        None,
-                        max_results,
-                        max_output_bytes,
-                        "search_backend_unavailable",
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-
-        let rg_search = run_rg_search(
-            args.pattern.as_str(),
-            args.glob.as_deref(),
-            case_sensitive,
-            max_results,
-            command_search_path.as_path(),
-            invocation.workdir.as_path(),
-            invocation.execution_security_snapshot.as_ref(),
-            timeout_ms,
-            search_descriptor.as_ref(),
-        )
-        .await;
-        let (output, backend_note, used_fallback) = match rg_search {
-            Ok(Some(output)) => (output, None, false),
-            Err(ToolError::ExecutionFailed(message)) if message.contains("timed out") => {
-                return Ok(needs_narrowing_output(
-                    "grep_files timed out. Narrow path or glob.",
-                    search_path.as_path(),
-                    invocation.workdir.as_path(),
-                    None,
-                    max_results,
-                    max_output_bytes,
-                    "timeout",
-                ));
-            }
-            Err(error) => return Err(error),
-            Ok(None) => {
-                if args.glob.is_some() {
-                    // The portable grep fallback cannot reproduce ripgrep's
-                    // path-aware glob semantics. Do not silently return
-                    // matches outside the requested filter; fail closed and
-                    // let the model choose a truthful retry.
-                    return Ok(needs_narrowing_output(
-                        "grep_files cannot honor `glob` because the scoped search backend is unavailable",
-                        search_path.as_path(),
-                        invocation.workdir.as_path(),
-                        None,
-                        max_results,
-                        max_output_bytes,
-                        "glob_backend_unavailable",
-                    ));
-                }
-                let fallback = run_grep_fallback(
-                    args.pattern.as_str(),
-                    case_sensitive,
-                    command_search_path.as_path(),
-                    invocation.workdir.as_path(),
-                    invocation.execution_security_snapshot.as_ref(),
-                    timeout_ms,
-                    search_descriptor.as_ref(),
-                )
-                .await;
-                let output = match fallback {
-                    Ok(output) => output,
-                    Err(ToolError::ExecutionFailed(message)) if message.contains("timed out") => {
-                        return Ok(needs_narrowing_output(
-                            "grep_files timed out. Narrow path or glob.",
-                            search_path.as_path(),
-                            invocation.workdir.as_path(),
-                            None,
-                            max_results,
-                            max_output_bytes,
-                            "timeout",
-                        ));
-                    }
-                    Err(error) => return Err(error),
+                scanned_file_count,
+                max_results,
+                max_output_bytes,
+                reason,
+            )),
+            super::fff_grep::SearchOutcome::Complete {
+                output,
+                match_count,
+                truncated,
+                skipped_large_files,
+            } => {
+                let incomplete = truncated || skipped_large_files > 0;
+                let status = if incomplete {
+                    "partial"
+                } else if match_count == 0 {
+                    "no_matches"
+                } else {
+                    "ok"
                 };
-                let note = "note: rg is unavailable; used grep fallback".to_owned();
-                (output, Some(note), true)
-            }
-        };
-        drop(filesystem_slot);
-
-        let process_exit_code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let (truncated_stdout, output_truncated) =
-            truncate_lines_and_bytes(stdout.as_str(), max_results, max_output_bytes);
-        let output_truncated = output_truncated || output.output_limit_exceeded;
-        let exit_code = if output.output_limit_exceeded && !stdout.is_empty() {
-            // The process was deliberately stopped after producing bounded
-            // match output.  Treat that as a successful, truncated search;
-            // the original process exit status is retained for diagnostics.
-            0
-        } else {
-            process_exit_code
-        };
-
-        if exit_code == 0 {
-            let body = if truncated_stdout.trim().is_empty() {
-                "no matches".to_owned()
-            } else {
-                truncated_stdout
-            };
-            let body = prepend_note(backend_note.as_deref(), body);
-            let payload = serde_json::json!({
-                "status": "ok",
-                "engine": if used_fallback { "grep" } else { "rg" },
-                "path": display_workspace_path(invocation.workdir.as_path(), &search_path),
-                "exit_code": exit_code,
-                "process_exit_code": process_exit_code,
-                "truncated": output_truncated,
-                "output_limit_exceeded": output.output_limit_exceeded,
-                "max_results": max_results,
-                "max_output_bytes": max_output_bytes,
-                "stdout": stdout,
-                "stderr": stderr,
-                "output": body.clone(),
-            });
-            Ok(Box::new(FunctionToolOutput::with_payload(
-                body, true, payload,
-            )))
-        } else if exit_code == 1 {
-            let body = prepend_note(backend_note.as_deref(), "no matches".to_owned());
-            let payload = serde_json::json!({
-                "status": "no_matches",
-                "engine": if used_fallback { "grep" } else { "rg" },
-                "path": display_workspace_path(invocation.workdir.as_path(), &search_path),
-                "exit_code": exit_code,
-                "process_exit_code": process_exit_code,
-                "truncated": output.output_limit_exceeded,
-                "output_limit_exceeded": output.output_limit_exceeded,
-                "max_results": max_results,
-                "max_output_bytes": max_output_bytes,
-                "stdout": stdout,
-                "stderr": stderr,
-                "output": body.clone(),
-            });
-            Ok(Box::new(FunctionToolOutput::with_payload(
-                body, true, payload,
-            )))
-        } else {
-            let engine = if used_fallback { "grep" } else { "rg" };
-            let body = prepend_note(
-                backend_note.as_deref(),
-                format!(
-                    "{engine} failed (exit={exit_code})\npath={}\n{stderr}",
-                    display_workspace_path(invocation.workdir.as_path(), &search_path)
-                ),
-            );
-            let payload = serde_json::json!({
-                "status": "failed",
-                "engine": engine,
-                "path": display_workspace_path(invocation.workdir.as_path(), &search_path),
-                "exit_code": exit_code,
-                "process_exit_code": process_exit_code,
-                "truncated": output.output_limit_exceeded,
-                "output_limit_exceeded": output.output_limit_exceeded,
-                "max_results": max_results,
-                "max_output_bytes": max_output_bytes,
-                "stdout": stdout,
-                "stderr": stderr,
-                "output": body.clone(),
-            });
-            Ok(Box::new(FunctionToolOutput::with_payload(
-                body, false, payload,
-            )))
-        }
-    }
-}
-
-fn prepend_note(note: Option<&str>, body: String) -> String {
-    match note {
-        Some(note) if !note.is_empty() => format!("{note}\n{body}"),
-        _ => body,
-    }
-}
-
-fn truncate_lines_and_bytes(text: &str, max_lines: usize, max_bytes: usize) -> (String, bool) {
-    if max_lines == 0 || max_bytes == 0 {
-        return (String::new(), !text.is_empty());
-    }
-
-    let mut rendered = String::new();
-    let mut truncated = false;
-    for (index, line) in text.lines().enumerate() {
-        if index >= max_lines {
-            truncated = true;
-            break;
-        }
-        let next_line = if rendered.is_empty() {
-            line.to_owned()
-        } else {
-            format!("\n{line}")
-        };
-        if rendered.len().saturating_add(next_line.len()) > max_bytes {
-            truncated = true;
-            break;
-        }
-        rendered.push_str(next_line.as_str());
-    }
-
-    if truncated {
-        let suffix = format!(
-            "\n... [truncated to {} lines / {} bytes]",
-            max_lines, max_bytes
-        );
-        if rendered.len().saturating_add(suffix.len()) <= max_bytes {
-            rendered.push_str(suffix.as_str());
-        }
-    }
-
-    (rendered, truncated)
-}
-
-async fn run_rg_search(
-    pattern: &str,
-    glob: Option<&str>,
-    case_sensitive: bool,
-    max_results: usize,
-    search_path: &Path,
-    workdir: &Path,
-    snapshot: Option<&TurnExecutionSecuritySnapshot>,
-    timeout_ms: u64,
-    search_descriptor: Option<&File>,
-) -> Result<Option<BoundedCommandOutput>, ToolError> {
-    let mut command = Command::new("rg");
-    command.arg("--line-number");
-    command.arg("--no-heading");
-    command.arg("--color").arg("never");
-    append_default_rg_excludes(&mut command);
-    if !case_sensitive {
-        command.arg("-i");
-    }
-    if let Some(glob) = glob {
-        command.arg("-g").arg(glob);
-    }
-    command.arg("--max-count").arg(max_results.to_string());
-    // Keep model-controlled patterns in the positional pattern slot.  Without
-    // the separator, a pattern beginning with `-` can be parsed as an rg
-    // option rather than searched literally.
-    command.arg("--");
-    command.arg(pattern);
-    command.arg(command_path(workdir, search_path));
-    let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
-    configure_descriptor_search(&mut command, search_path, search_descriptor);
-
-    run_bounded_command(
-        command,
-        timeout_ms,
-        HARD_MAX_GREP_OUTPUT_BYTES,
-        "rg",
-        process_plan,
-    )
-    .await
-}
-
-async fn run_grep_fallback(
-    pattern: &str,
-    case_sensitive: bool,
-    search_path: &Path,
-    workdir: &Path,
-    snapshot: Option<&TurnExecutionSecuritySnapshot>,
-    timeout_ms: u64,
-    search_descriptor: Option<&File>,
-) -> Result<BoundedCommandOutput, ToolError> {
-    let mut command = Command::new("grep");
-    // Lower-case `-r` deliberately does not follow descendant symlinks.  The
-    // fallback must preserve the same workspace boundary as ripgrep; `-R`
-    // could follow a symlinked directory out of the workspace.
-    command.arg("-r");
-    command.arg("-n");
-    for excluded in DEFAULT_GREP_EXCLUDED_DIRS {
-        command.arg(format!("--exclude-dir={excluded}"));
-    }
-    if !case_sensitive {
-        command.arg("-i");
-    }
-    command.arg("--");
-    command.arg(pattern);
-    command.arg(command_path(workdir, search_path));
-    let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
-    configure_descriptor_search(&mut command, search_path, search_descriptor);
-
-    run_bounded_command(
-        command,
-        timeout_ms,
-        HARD_MAX_GREP_OUTPUT_BYTES,
-        "grep",
-        process_plan,
-    )
-    .await?
-    .ok_or_else(|| ToolError::execution_failed("grep executable is unavailable"))
-}
-
-async fn count_rg_search_files(
-    search_path: &Path,
-    workdir: &Path,
-    snapshot: Option<&TurnExecutionSecuritySnapshot>,
-    timeout_ms: u64,
-    search_descriptor: Option<&File>,
-) -> Result<Option<usize>, ToolError> {
-    let mut command = Command::new("rg");
-    command.arg("--files");
-    append_default_rg_excludes(&mut command);
-    command.arg("--");
-    command.arg(command_path(workdir, search_path));
-    let process_plan = prepare_scoped_search_command(&mut command, snapshot, workdir, timeout_ms)?;
-    configure_descriptor_search(&mut command, search_path, search_descriptor);
-
-    let Some(output) = run_bounded_command(
-        command,
-        timeout_ms,
-        HARD_MAX_GREP_OUTPUT_BYTES,
-        "rg --files",
-        process_plan,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    if output.output_limit_exceeded {
-        return Ok(Some(BROAD_GREP_FILE_LIMIT.saturating_add(1)));
-    }
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(Some(
-        stdout
-            .lines()
-            .take(BROAD_GREP_FILE_LIMIT.saturating_add(1))
-            .count(),
-    ))
-}
-
-#[derive(Debug)]
-struct BoundedCommandOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    output_limit_exceeded: bool,
-}
-
-fn prepare_scoped_search_command(
-    command: &mut Command,
-    snapshot: Option<&TurnExecutionSecuritySnapshot>,
-    workdir: &Path,
-    timeout_ms: u64,
-) -> Result<Option<ProcessSpawnPlan>, ToolError> {
-    let Some(snapshot) = snapshot else {
-        // Legacy direct handler tests may not carry a turn snapshot. Product
-        // agent execution rejects a missing snapshot before tool dispatch.
-        command.current_dir(workdir);
-        return Ok(None);
-    };
-
-    let std_command = command.as_std();
-    let program = std_command.get_program().to_string_lossy().into_owned();
-    let argv = std::iter::once(program)
-        .chain(
-            std_command
-                .get_args()
-                .map(|argument| argument.to_string_lossy().into_owned()),
-        )
-        .collect::<Vec<_>>();
-    let args = ExecCommandArgs {
-        command: Some(argv),
-        workdir: None,
-        timeout_ms: Some(timeout_ms),
-        max_output_tokens: None,
-        yield_time_ms: None,
-        tty: Some(false),
-    };
-    // Search helpers need no turn-projected variables (including the artifact
-    // output directory). Build their environment from the immutable process
-    // policy so host secrets and rg configuration cannot leak into an
-    // unapproved internal subprocess.
-    let process_plan =
-        build_process_spawn_plan(Some(snapshot), workdir, &args, &BTreeMap::new(), timeout_ms)?;
-    command.current_dir(process_plan.cwd.as_path());
-    if !process_plan.inherit_environment {
-        command.env_clear();
-    }
-    for key in &process_plan.removed_environment {
-        command.env_remove(key);
-    }
-    command.envs(process_plan.environment.iter());
-
-    match snapshot.backend.sandbox_backend {
-        None => {}
-        Some(SandboxBackendKind::Nono) => {
-            let backend = NonoSandboxBackend::new();
-            let request = NativeSandboxRequest {
-                snapshot,
-                process_plan: &process_plan,
-                workspace_roots: &[],
-                execution_label: "grep_files",
-            };
-            match prepare_native_sandbox_backend(&backend, &request)? {
-                NativeSandboxPrepareOutcome::Ready(_) => {
-                    configure_nono_command(command, snapshot, &process_plan)?;
-                }
-                NativeSandboxPrepareOutcome::Degraded { reason, .. }
-                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
-                    return Err(ToolError::Rejected(format!(
-                        "grep_files sandbox is unavailable: {reason}"
-                    )));
-                }
+                let body = if incomplete && output.is_empty() {
+                    match (truncated, skipped_large_files) {
+                        (true, 0) => "search incomplete: output limit reached".to_owned(),
+                        (true, count) => format!(
+                            "search incomplete: output limit reached; {count} oversized file(s) skipped"
+                        ),
+                        (false, count) => {
+                            format!("search incomplete: {count} oversized file(s) skipped")
+                        }
+                    }
+                } else if output.is_empty() {
+                    "no matches".to_owned()
+                } else {
+                    output.clone()
+                };
+                let payload = serde_json::json!({
+                    "status": status,
+                    "engine": "fff",
+                    "path": display_workspace_path(invocation.workdir.as_path(), &search_path),
+                    "truncated": incomplete,
+                    "max_results": max_results,
+                    "max_output_bytes": max_output_bytes,
+                    "match_count": match_count,
+                    "skipped_large_files": skipped_large_files,
+                    "stdout": output,
+                    "stderr": "",
+                    "output": body.clone(),
+                });
+                Ok(Box::new(FunctionToolOutput::with_payload(
+                    body, true, payload,
+                )))
             }
         }
-        Some(SandboxBackendKind::WindowsRestrictedToken) => {
-            let backend = WindowsRestrictedTokenBackend::new();
-            let request = NativeSandboxRequest {
-                snapshot,
-                process_plan: &process_plan,
-                workspace_roots: &[],
-                execution_label: "grep_files",
-            };
-            match prepare_native_sandbox_backend(&backend, &request)? {
-                NativeSandboxPrepareOutcome::Ready(_) => {
-                    configure_windows_restricted_token_command(command, snapshot, &process_plan)?;
-                }
-                NativeSandboxPrepareOutcome::Degraded { reason, .. }
-                | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
-                    return Err(ToolError::Rejected(format!(
-                        "grep_files sandbox is unavailable: {reason}"
-                    )));
-                }
-            }
-        }
-        Some(SandboxBackendKind::ProviderNative) => {
-            return Err(ToolError::Rejected(
-                "provider-native sandbox cannot protect Pioneer grep_files execution".to_owned(),
-            ));
-        }
-    }
-
-    Ok(Some(process_plan))
-}
-
-async fn run_bounded_command(
-    mut command: Command,
-    timeout_ms: u64,
-    max_output_bytes: usize,
-    executable_name: &str,
-    _process_plan: Option<ProcessSpawnPlan>,
-) -> Result<Option<BoundedCommandOutput>, ToolError> {
-    command.kill_on_drop(true);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(ToolError::execution_failed(format!(
-                "failed to execute {executable_name}: {error}"
-            )));
-        }
-    };
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ToolError::execution_failed(format!("{executable_name} did not provide stdout"))
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        ToolError::execution_failed(format!("{executable_name} did not provide stderr"))
-    })?;
-    let (limit_tx, mut limit_rx) = mpsc::unbounded_channel();
-    let stdout_task = tokio::spawn(read_bounded_stream(
-        stdout,
-        max_output_bytes,
-        limit_tx.clone(),
-    ));
-    let stderr_task = tokio::spawn(read_bounded_stream(stderr, max_output_bytes, limit_tx));
-
-    let result = timeout(Duration::from_millis(timeout_ms), async {
-        let (status, killed_for_limit) = tokio::select! {
-            status = child.wait() => {
-                (status.map_err(|error| ToolError::execution_failed(format!("failed waiting for {executable_name}: {error}")))?, false)
-            }
-            _ = limit_rx.recv() => {
-                let _ = child.kill().await;
-                let status = child.wait().await.map_err(|error| ToolError::execution_failed(format!("failed waiting for capped {executable_name}: {error}")))?;
-                (status, true)
-            }
-        };
-        let stdout = stdout_task
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!("{executable_name} stdout worker failed: {error}"))
-            })?
-            .map_err(|error| {
-                ToolError::execution_failed(format!("{executable_name} stdout read failed: {error}"))
-            })?;
-        let stderr = stderr_task
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!("{executable_name} stderr worker failed: {error}"))
-            })?
-            .map_err(|error| {
-                ToolError::execution_failed(format!("{executable_name} stderr read failed: {error}"))
-            })?;
-        Ok(BoundedCommandOutput {
-            status,
-            output_limit_exceeded: killed_for_limit || stdout.1 || stderr.1,
-            stdout: stdout.0,
-            stderr: stderr.0,
-        })
-    })
-    .await;
-
-    match result {
-        Ok(result) => result.map(Some),
-        Err(_) => {
-            // `kill_on_drop(true)` terminates the child when this future is
-            // cancelled by timeout.  The bounded readers retain at most the
-            // configured capture limit and finish once the pipes close.
-            Err(ToolError::execution_failed(format!(
-                "{executable_name} timed out after {timeout_ms}ms"
-            )))
-        }
-    }
-}
-
-async fn read_bounded_stream<R: AsyncRead + Unpin>(
-    mut reader: R,
-    max_output_bytes: usize,
-    limit_tx: mpsc::UnboundedSender<()>,
-) -> Result<(Vec<u8>, bool), std::io::Error> {
-    let mut output = Vec::with_capacity(max_output_bytes.min(8192));
-    let mut buffer = [0u8; 8192];
-    let mut total = 0usize;
-    let mut truncated = false;
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        let next_total = total.saturating_add(read);
-        if output.len() < max_output_bytes {
-            let take = (max_output_bytes - output.len()).min(read);
-            output.extend_from_slice(&buffer[..take]);
-        }
-        total = next_total;
-        if total > max_output_bytes && !truncated {
-            truncated = true;
-            let _ = limit_tx.send(());
-        }
-    }
-    Ok((output, truncated))
-}
-
-fn append_default_rg_excludes(command: &mut Command) {
-    for excluded in DEFAULT_GREP_EXCLUDED_DIRS {
-        command.arg("-g").arg(format!("!{excluded}/**"));
     }
 }
 
@@ -1403,77 +825,6 @@ fn needs_narrowing_output(
     });
     let body = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| message.to_owned());
     Box::new(FunctionToolOutput::with_payload(body, false, payload))
-}
-
-fn command_path(_workdir: &Path, path: &Path) -> PathBuf {
-    path.to_path_buf()
-}
-
-#[cfg(unix)]
-fn inherited_descriptor_path(file: File) -> Result<(File, PathBuf), ToolError> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-
-    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
-        return Err(ToolError::Rejected(format!(
-            "failed to duplicate authorized filesystem descriptor: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    let flags = unsafe { libc::fcntl(duplicate, libc::F_GETFD) };
-    if flags < 0 {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(duplicate);
-        }
-        return Err(ToolError::Rejected(format!(
-            "failed to inspect authorized filesystem descriptor: {error}"
-        )));
-    }
-    if unsafe { libc::fcntl(duplicate, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } != 0 {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(duplicate);
-        }
-        return Err(ToolError::Rejected(format!(
-            "failed to retain authorized filesystem descriptor for search: {error}"
-        )));
-    }
-    let path = PathBuf::from(format!("/dev/fd/{duplicate}"));
-    Ok((unsafe { File::from_raw_fd(duplicate) }, path))
-}
-
-#[cfg(unix)]
-fn configure_descriptor_search(
-    command: &mut Command,
-    search_path: &Path,
-    descriptor: Option<&File>,
-) {
-    use std::os::fd::AsRawFd;
-
-    if search_path != Path::new(".") {
-        return;
-    }
-    let Some(descriptor) = descriptor else {
-        return;
-    };
-    let fd = descriptor.as_raw_fd();
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fchdir(fd) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_descriptor_search(
-    _command: &mut Command,
-    _search_path: &Path,
-    _descriptor: Option<&File>,
-) {
 }
 
 fn display_workspace_path(_workdir: &Path, path: &Path) -> String {
@@ -1961,6 +1312,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_prefers_start_line_when_both_offsets_are_supplied() {
+        let root = tempfile::tempdir().expect("workspace root");
+        std::fs::write(root.path().join("lines.txt"), "alpha\nbeta\ngamma\n")
+            .expect("read fixture");
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let bus = crate::events::ToolEventBus::default();
+        let by_line = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": "lines.txt",
+                            "start_line": 2,
+                            "start_byte": 0,
+                            "cursor": "0",
+                            "max_lines": 1
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                bus.start_trace("turn_read_offsets", "call_both_offsets", "read_file"),
+            )
+            .await
+            .expect("start_line should take precedence over byte and cursor");
+        assert_eq!(by_line.raw_json()["text"], "beta\n");
+
+        let by_byte = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": "lines.txt",
+                            "start_byte": 11,
+                            "cursor": "",
+                            "max_lines": 1
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                bus.start_trace("turn_read_offsets", "call_byte_only", "read_file"),
+            )
+            .await
+            .expect("start_byte should take precedence over cursor");
+        assert_eq!(by_byte.raw_json()["text"], "gamma\n");
+
+        let first_page = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": "lines.txt",
+                            "max_lines": 1
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                bus.start_trace("turn_read_offsets", "call_first_page", "read_file"),
+            )
+            .await
+            .expect("first page should be readable");
+        assert_eq!(first_page.raw_json()["text"], "alpha\n");
+        let continuation = first_page.raw_json()["continuation"]
+            .as_str()
+            .expect("continuation")
+            .to_owned();
+        let next_page = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": "lines.txt",
+                            "cursor": continuation,
+                            "max_lines": 1
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                bus.start_trace("turn_read_offsets", "call_next_page", "read_file"),
+            )
+            .await
+            .expect("valid cursor should be used without explicit offsets");
+        assert_eq!(next_page.raw_json()["text"], "beta\n");
+
+        let invalid_cursor = ReadFileHandler
+            .handle(
+                invocation(
+                    "read_file",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "path": "lines.txt",
+                            "cursor": "0"
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                bus.start_trace("turn_read_offsets", "call_invalid_cursor", "read_file"),
+            )
+            .await;
+        assert!(invalid_cursor.is_err());
+    }
+
+    #[tokio::test]
     async fn repeated_small_file_operations_do_not_exhaust_the_turn() {
         let root = tempfile::tempdir().expect("workspace root");
         let file = root.path().join("small.txt");
@@ -2148,7 +1613,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn grep_files_returns_matches_through_native_sandbox_backend() {
+    async fn grep_files_uses_fff_for_restricted_turn() {
         let root = tempfile::tempdir().expect("workspace root");
         let search_dir = root.path().join("src");
         std::fs::create_dir_all(search_dir.as_path()).expect("search dir");
@@ -2190,9 +1655,10 @@ mod tests {
                 event_bus.start_trace(turn_id, "call_grep_files", "grep_files"),
             )
             .await
-            .expect("grep_files should execute inside the native sandbox");
+            .expect("grep_files should search with FFF");
 
         assert_eq!(output.raw_json()["status"], "ok");
+        assert_eq!(output.raw_json()["engine"], "fff");
         assert!(
             output.raw_json()["stdout"]
                 .as_str()
@@ -2222,6 +1688,220 @@ mod tests {
             read.raw_json()["text"],
             "alpha\npioneer-permission-marker\nomega\n"
         );
+    }
+
+    #[tokio::test]
+    async fn grep_files_fff_backend_honors_glob_and_exact_no_matches() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let source = root.path().join("main.rs");
+        std::fs::write(&source, "fn exact_marker() {}\n").expect("source fixture");
+        std::fs::write(
+            root.path().join("notes.txt"),
+            "exact_marker\nnotes_only_marker\n",
+        )
+        .expect("excluded fixture");
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let bus = crate::events::ToolEventBus::default();
+        let found = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "exact_marker",
+                            "path": root.path(),
+                            "glob": "*.rs",
+                        }),
+                    },
+                    root.path(),
+                    security.clone(),
+                ),
+                bus.start_trace("turn_fff", "call_match", "grep_files"),
+            )
+            .await
+            .expect("FFF search succeeds");
+        assert_eq!(found.raw_json()["status"], "ok");
+        assert_eq!(found.raw_json()["engine"], "fff");
+        assert!(
+            found.raw_json()["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("main.rs")
+        );
+        assert!(
+            !found.raw_json()["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("notes.txt")
+        );
+
+        let absent = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "notes_only_marker",
+                            "path": root.path(),
+                            "glob": "*.rs",
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                bus.start_trace("turn_fff", "call_no_match", "grep_files"),
+            )
+            .await
+            .expect("zero matches is a successful search");
+        assert_eq!(absent.raw_json()["status"], "no_matches");
+        assert_eq!(absent.raw_json()["stdout"], "");
+    }
+
+    #[tokio::test]
+    async fn grep_files_indexes_only_the_requested_file() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let selected = root.path().join("selected.rs");
+        std::fs::write(&selected, "selected_marker\n").expect("selected fixture");
+        std::fs::write(root.path().join("sibling.rs"), "sibling_marker\n")
+            .expect("sibling fixture");
+        let security = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.path().to_string_lossy(),
+            )],
+            1,
+        );
+        let output = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "selected_marker|sibling_marker",
+                            "path": selected,
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_single_file",
+                    "call_single_file",
+                    "grep_files",
+                ),
+            )
+            .await
+            .expect("FFF file search succeeds");
+        assert_eq!(output.raw_json()["status"], "ok");
+        assert_eq!(output.raw_json()["engine"], "fff");
+        let raw = output.raw_json();
+        let stdout = raw["stdout"].as_str().expect("stdout");
+        assert!(stdout.contains("selected_marker"));
+        assert!(!stdout.contains("sibling_marker"));
+    }
+
+    #[tokio::test]
+    async fn grep_files_fff_keeps_match_after_clipped_line_prefix() {
+        let root = tempfile::tempdir().expect("workspace root");
+        std::fs::write(
+            root.path().join("long.rs"),
+            format!("{}needle_at_tail\n", "x".repeat(600)),
+        )
+        .expect("long line fixture");
+        let security = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+        let output = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "needle_at_tail",
+                            "path": root.path(),
+                            "glob": "*.rs",
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn_long_grep",
+                    "call_long_grep",
+                    "grep_files",
+                ),
+            )
+            .await
+            .expect("FFF long-line search succeeds");
+        assert_eq!(output.raw_json()["status"], "ok");
+        assert!(
+            output.raw_json()["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("needle_at_tail")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_files_scoped_glob_does_not_read_symlink_escape() {
+        let root = tempfile::tempdir().expect("authorized root");
+        let outside = tempfile::tempdir().expect("outside root");
+        std::fs::write(root.path().join("inside.rs"), "inside_marker\n").expect("inside fixture");
+        std::fs::write(outside.path().join("secret.rs"), "outside_marker\n")
+            .expect("outside fixture");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape"))
+            .expect("escape symlink");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            root.path().join("escape_file.rs"),
+        )
+        .expect("file escape symlink");
+        let security = TurnExecutionSecuritySnapshot::read_only(
+            TurnPermissionProfileSnapshot::from_mode(
+                TurnPermissionMode::Supervised,
+                TurnPermissionProfileSource::Composer,
+            ),
+            root.path().to_string_lossy(),
+            vec![TurnFilesystemSandboxEntry::workspace_root(
+                TurnFilesystemAccess::Read,
+                root.path().to_string_lossy(),
+            )],
+            1,
+        );
+        let bus = crate::events::ToolEventBus::default();
+        let output = GrepHandler
+            .handle(
+                invocation(
+                    "grep_files",
+                    ToolPayload::Function {
+                        arguments: serde_json::json!({
+                            "pattern": "inside_marker|outside_marker",
+                            "path": root.path(),
+                            "glob": "*.rs",
+                        }),
+                    },
+                    root.path(),
+                    security,
+                ),
+                bus.start_trace("turn_scoped", "call_glob", "grep_files"),
+            )
+            .await
+            .expect("scoped search succeeds");
+        assert_eq!(output.raw_json()["status"], "ok");
+        let raw = output.raw_json();
+        let stdout = raw["stdout"].as_str().unwrap();
+        assert!(stdout.contains("inside_marker"));
+        assert!(!stdout.contains("outside_marker"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2283,40 +1963,5 @@ mod tests {
             .await
             .expect("a narrowing result must not disable later file operations");
         assert_eq!(read.raw_json()["text"], "still-readable\n");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn grep_helper_process_cannot_read_outside_native_sandbox() {
-        let root = tempfile::tempdir().expect("authorized root");
-        let outside = tempfile::tempdir().expect("outside root");
-        let secret = outside.path().join("secret.txt");
-        std::fs::write(secret.as_path(), "outside-secret").expect("outside secret");
-        let security = TurnExecutionSecuritySnapshot::read_only(
-            TurnPermissionProfileSnapshot::from_mode(
-                TurnPermissionMode::Supervised,
-                TurnPermissionProfileSource::Composer,
-            ),
-            root.path().to_string_lossy(),
-            vec![TurnFilesystemSandboxEntry::workspace_root(
-                TurnFilesystemAccess::Read,
-                root.path().to_string_lossy(),
-            )],
-            1,
-        );
-        let mut command = Command::new("/bin/cat");
-        command.arg(secret.as_path());
-        let process_plan =
-            prepare_scoped_search_command(&mut command, Some(&security), root.path(), 2_000)
-                .expect("native sandbox should prepare");
-
-        let output = run_bounded_command(command, 2_000, 16 * 1024, "sandbox probe", process_plan)
-            .await
-            .expect("sandbox probe should spawn")
-            .expect("shell is available");
-
-        assert!(!output.status.success());
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("outside-secret"));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("outside-secret"));
     }
 }
