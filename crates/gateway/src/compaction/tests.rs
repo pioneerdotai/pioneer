@@ -1039,7 +1039,7 @@ async fn fixture(
     store
         .compaction_activate_runner(
             "operation",
-            &RunnerState::new(900_000, &budget, 500, None).unwrap(),
+            &RunnerState::new(snapshot.admission.deadline_ms, &budget, 500, None).unwrap(),
         )
         .await
         .unwrap();
@@ -9048,6 +9048,622 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
         .is_err(),
         "an uncovered deleted accepted raw source must remain an error"
     );
+}
+
+async fn publish_projection_checkpoint(
+    f: &Fixture,
+    source_thread: &str,
+    id: &str,
+    inputs: &[(String, SourceRef)],
+    coverage_domain: pioneer_compaction::CoverageDomain,
+) -> Checkpoint {
+    let owner = super::native::native_owner("ws", source_thread);
+    let projection_version = f
+        .store
+        .compaction_projection_version("ws", source_thread)
+        .await
+        .unwrap();
+    let mut source_epochs = std::collections::BTreeMap::new();
+    for (thread, _) in inputs {
+        source_epochs.insert(
+            thread.clone(),
+            f.store
+                .compaction_projection_version("ws", thread)
+                .await
+                .unwrap(),
+        );
+    }
+    source_epochs
+        .entry(source_thread.to_owned())
+        .or_insert(projection_version);
+    let mut operation = f.runner.snapshot.clone();
+    operation.id = format!("{id}-operation");
+    operation.owner = owner.clone();
+    operation.expected_checkpoint = None;
+    operation.projection_version = projection_version;
+    operation.source_epochs = source_epochs;
+    operation.plan.coverage_domain = coverage_domain;
+    operation.plan.coverage = inputs.iter().map(|(_, source)| source.clone()).collect();
+    operation.plan.fingerprint = format!("{id}-plan");
+    f.store
+        .compaction_admit("ws", source_thread, &operation)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &operation.id,
+            &ModelBudget::new(None, None, None),
+            inputs.len() as u64,
+            0,
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(
+            &operation.id,
+            &inputs
+                .iter()
+                .enumerate()
+                .map(|(ordinal, (thread, source))| ManifestEntry {
+                    ordinal: ordinal as u64,
+                    unit: ordinal as u64,
+                    reference_only: false,
+                    thread_id: thread.clone(),
+                    source: source.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let checkpoint = Checkpoint {
+        id: id.into(),
+        operation_id: operation.id.clone(),
+        owner: owner.clone(),
+        previous: None,
+        coverage: operation.plan.coverage.clone(),
+        summary: format!("saved summary {id}"),
+        selection: operation.admission.selection.clone(),
+        projection_version,
+        format_version: pioneer_compaction::FORMAT_VERSION,
+    };
+    f.store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id=?",
+            [id.into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_context SET head=? WHERE owner=?",
+            [id.into(), owner.into()],
+        ))
+        .await
+        .unwrap();
+    checkpoint
+}
+
+struct ContainedCheckpointFixture {
+    fixture: Fixture,
+    allowed: std::collections::BTreeSet<String>,
+    initial: Vec<pioneer_provider::ChatMessage>,
+    raw_a: pioneer_provider::ChatMessage,
+    a: Checkpoint,
+    b: Checkpoint,
+}
+
+async fn insert_projection_event(f: &Fixture, thread: &str) -> SourceRef {
+    let turn = format!("{thread}-turn");
+    let source = format!("{thread}-source");
+    let db = f.store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES (?,'ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [thread.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [turn.clone().into(), thread.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,?,?,1,'fixture','{}',CURRENT_TIMESTAMP)",
+        [source.into(), thread.into(), turn.clone().into()],
+    ))
+    .await
+    .unwrap();
+    f.store
+        .compaction_source_page("ws", thread, &turn, PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone()
+}
+
+async fn contained_checkpoint_fixture(
+    b_thread: &str,
+    coverage_domain: pioneer_compaction::CoverageDomain,
+) -> ContainedCheckpointFixture {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+
+    let f = fixture("A source", vec![], true, false).await;
+    let db = f.store.database_connection();
+    let b_turn = format!("{b_thread}-turn");
+    let b_source_id = format!("{b_thread}-source");
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES (?,'ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [b_thread.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        [b_turn.clone().into(), b_thread.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,?,?,1,'fixture','{}',CURRENT_TIMESTAMP)",
+        [
+            b_source_id.clone().into(),
+            b_thread.into(),
+            b_turn.clone().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    let source_a = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let source_b = f
+        .store
+        .compaction_source_page("ws", b_thread, &b_turn, PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let a = publish_projection_checkpoint(
+        &f,
+        "thread",
+        &format!("summary-a-{b_thread}"),
+        &[("thread".into(), source_a.clone())],
+        coverage_domain,
+    )
+    .await;
+    let a_source = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let b = publish_projection_checkpoint(
+        &f,
+        b_thread,
+        &format!("summary-b-{b_thread}"),
+        &[
+            ("thread".into(), a_source),
+            (b_thread.into(), source_b.clone()),
+        ],
+        coverage_domain,
+    )
+    .await;
+    let inherited = coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext;
+    let provenance = |thread: &str, unit: &str, source: &SourceRef| MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: thread.into(),
+        context_thread: (!inherited).then(|| "child".into()),
+        unit_id: unit.into(),
+        sources: vec![MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        }],
+        complete: true,
+        protected_input: false,
+        inherited,
+    };
+    let mut raw_a = ChatMessage::assistant("raw A");
+    raw_a.provenance = Some(provenance("thread", "raw-a", &source_a));
+    let mut raw_b = ChatMessage::assistant("raw B tail covered only by B");
+    raw_b.provenance = Some(provenance(b_thread, "raw-b", &source_b));
+    let mut tail = ChatMessage::user("uncovered tail");
+    tail.provenance = Some(MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "child".into(),
+        context_thread: None,
+        unit_id: "tail".into(),
+        sources: vec![MessageSourceRef {
+            scope: "event:child-turn".into(),
+            id: "tail-source".into(),
+            version: "event-revision:1".into(),
+        }],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    ContainedCheckpointFixture {
+        fixture: f,
+        allowed: std::collections::BTreeSet::from([
+            "child".into(),
+            "thread".into(),
+            b_thread.into(),
+        ]),
+        initial: vec![raw_a.clone(), raw_b, tail],
+        raw_a,
+        a,
+        b,
+    }
+}
+
+#[tokio::test]
+async fn accepted_checkpoint_projection_deduplicates_nested_summaries_in_both_owner_orders() {
+    for b_thread in ["aaa-b-first", "zzz-b-last"] {
+        let scenario = contained_checkpoint_fixture(
+            b_thread,
+            pioneer_compaction::CoverageDomain::OwnContribution,
+        )
+        .await;
+        let mut projected = scenario.initial.clone();
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected[0].provenance.as_ref().unwrap().sources[0].id,
+            scenario.b.id
+        );
+        assert_eq!(projected[1].content, "uncovered tail");
+        assert!(projected.iter().all(|message| {
+            message.provenance.as_ref().unwrap().sources[0].id != scenario.a.id
+        }));
+
+        let once = projected.clone();
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected, once, "reprojection must be idempotent");
+
+        projected[0].content = "non-authoritative cached B".into();
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            projected, once,
+            "the candidate's saved body must replace caller-provided content"
+        );
+
+        let mut duplicate_b = projected[0].clone();
+        duplicate_b.content = "second non-authoritative cached B".into();
+        projected.insert(1, duplicate_b);
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            projected, once,
+            "duplicate references to the same checkpoint must normalize to one saved body"
+        );
+
+        projected[0].content = "non-authoritative containing B".into();
+        projected.insert(1, scenario.raw_a.clone());
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            projected, once,
+            "B must stay authoritative while absorbed A and covered raw rows are removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepted_working_context_projection_deduplicates_nested_summaries_in_both_owner_orders() {
+    for b_thread in ["aaa-working-b-first", "zzz-working-b-last"] {
+        let scenario = contained_checkpoint_fixture(
+            b_thread,
+            pioneer_compaction::CoverageDomain::WorkingContext,
+        )
+        .await;
+        let mut projected = scenario.initial.clone();
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.len(), 2);
+        let b_origin = projected[0].provenance.as_ref().unwrap();
+        assert_eq!(b_origin.sources[0].id, scenario.b.id);
+        assert!(b_origin.inherited);
+        assert_eq!(b_origin.context_thread.as_deref(), Some("child"));
+        assert_eq!(projected[1].content, "uncovered tail");
+        let once = projected.clone();
+
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            projected, once,
+            "WorkingContext reprojection must be idempotent"
+        );
+
+        projected[0].content = "non-authoritative cached WorkingContext B".into();
+        projected.insert(1, scenario.raw_a.clone());
+        super::checkpoint::project_accepted_checkpoints(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            projected, once,
+            "WorkingContext B must stay authoritative while A and covered raw are removed"
+        );
+        let b_origin = projected[0].provenance.as_ref().unwrap();
+        assert!(b_origin.inherited);
+        assert_eq!(b_origin.context_thread.as_deref(), Some("child"));
+    }
+}
+
+#[tokio::test]
+async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries() {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+
+    let mut scenario = contained_checkpoint_fixture(
+        "aaa-containing",
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    let partial_thread = "mmm-partial";
+    let independent_thread = "nnn-independent";
+    let partial_source = insert_projection_event(&scenario.fixture, partial_thread).await;
+    let independent_source = insert_projection_event(&scenario.fixture, independent_thread).await;
+    let a_source = scenario
+        .fixture
+        .store
+        .compaction_checkpoint_source("ws", "thread", &scenario.a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let partial = publish_projection_checkpoint(
+        &scenario.fixture,
+        partial_thread,
+        "summary-partial",
+        &[
+            ("thread".into(), a_source),
+            (partial_thread.into(), partial_source.clone()),
+        ],
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    let independent = publish_projection_checkpoint(
+        &scenario.fixture,
+        independent_thread,
+        "summary-independent",
+        &[(independent_thread.into(), independent_source.clone())],
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    let raw = |thread: &str, unit: &str, source: &SourceRef| {
+        let mut message = ChatMessage::assistant(unit);
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: None,
+            workspace_id: "ws".into(),
+            thread_id: thread.into(),
+            context_thread: Some("child".into()),
+            unit_id: unit.into(),
+            sources: vec![MessageSourceRef {
+                scope: source.scope.clone(),
+                id: source.id.clone(),
+                version: source.version.clone(),
+            }],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+        });
+        message
+    };
+    let tail = scenario.initial.pop().unwrap();
+    scenario
+        .initial
+        .push(raw(partial_thread, "partial-only-source", &partial_source));
+    scenario.initial.push(raw(
+        independent_thread,
+        "independent-source",
+        &independent_source,
+    ));
+    scenario.initial.push(tail);
+    scenario.allowed.insert(partial_thread.into());
+    scenario.allowed.insert(independent_thread.into());
+
+    super::checkpoint::project_accepted_checkpoints(
+        &scenario.fixture.store,
+        "ws",
+        "child",
+        &scenario.allowed,
+        &mut scenario.initial,
+    )
+    .await
+    .unwrap();
+    let summary_ids = scenario
+        .initial
+        .iter()
+        .filter_map(|message| {
+            message
+                .provenance
+                .as_ref()
+                .and_then(|origin| origin.sources.first())
+                .filter(|source| source.scope.starts_with("checkpoint:"))
+                .map(|source| source.id.as_str())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        summary_ids,
+        std::collections::BTreeSet::from([
+            scenario.b.id.as_str(),
+            partial.id.as_str(),
+            independent.id.as_str(),
+        ])
+    );
+    assert_eq!(scenario.initial.last().unwrap().content, "uncovered tail");
+}
+
+#[tokio::test]
+async fn absorbed_checkpoint_still_requires_its_exact_saved_revision() {
+    let scenario = contained_checkpoint_fixture(
+        "aaa-b-first",
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    let mut projected = scenario.initial.clone();
+    super::checkpoint::project_accepted_checkpoints(
+        &scenario.fixture.store,
+        "ws",
+        "child",
+        &scenario.allowed,
+        &mut projected,
+    )
+    .await
+    .unwrap();
+
+    let outside = insert_projection_event(&scenario.fixture, "child").await;
+    let a_source = scenario
+        .fixture
+        .store
+        .compaction_checkpoint_source("ws", "thread", &scenario.a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let outside_boundary = publish_projection_checkpoint(
+        &scenario.fixture,
+        "child",
+        "summary-outside-frozen-boundary",
+        &[("thread".into(), a_source), ("child".into(), outside)],
+        pioneer_compaction::CoverageDomain::OwnContribution,
+    )
+    .await;
+    let before_boundary_check = projected.clone();
+    assert_eq!(
+        super::checkpoint::project_compatible_checkpoint(
+            &scenario.fixture.store,
+            "ws",
+            "child",
+            &outside_boundary.owner,
+            &outside_boundary.id,
+            &scenario.allowed,
+            &mut projected,
+        )
+        .await
+        .unwrap(),
+        None,
+        "an existing containing summary must not widen the frozen boundary"
+    );
+    assert_eq!(projected, before_boundary_check);
+
+    let before_exact_version_check = projected.clone();
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    super::checkpoint::project_checkpoint_with_resolver(
+        &scenario.fixture.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child",
+            source_thread: "thread",
+            owner: &scenario.a.owner,
+            allowed: &scenario.allowed,
+            allow_historical_gaps: false,
+        },
+        &scenario.a.id,
+        &mut projected,
+        &mut resolver,
+    )
+    .await
+    .expect("A must be valid in its real foreign source context");
+    assert_eq!(projected, before_exact_version_check);
+
+    projected[0].provenance.as_mut().unwrap().sources[0].version = "wrong-revision".into();
+    let mut resolver = super::coverage::CheckpointGraphResolver::default();
+    let error = super::checkpoint::project_checkpoint_with_resolver(
+        &scenario.fixture.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child",
+            source_thread: "thread",
+            owner: &scenario.a.owner,
+            allowed: &scenario.allowed,
+            allow_historical_gaps: false,
+        },
+        &scenario.a.id,
+        &mut projected,
+        &mut resolver,
+    );
+    let error = error.await.unwrap_err();
+    assert_eq!(error.to_string(), "checkpoint source revision changed");
 }
 
 #[tokio::test]

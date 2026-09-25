@@ -418,6 +418,7 @@ async fn project_checkpoint_in_context(
             continue;
         }
         let mut leaves = BTreeSet::new();
+        let mut checkpoints = BTreeSet::new();
         for source in &origin.sources {
             if let Some(source_owner) = source.scope.strip_prefix("checkpoint:") {
                 let source_ref = SourceRef {
@@ -425,25 +426,27 @@ async fn project_checkpoint_in_context(
                     id: source.id.clone(),
                     version: source.version.clone(),
                 };
+                checkpoints.insert(source_ref.clone());
                 if !cached.contains_key(&source_ref) {
-                    cached.insert(
-                        source_ref.clone(),
-                        expand(
-                            store,
-                            &source.id,
-                            &ProjectionContext {
-                                workspace: context.workspace,
-                                context_thread: context.context_thread,
-                                source_thread: &origin.thread_id,
-                                owner: source_owner,
-                                allowed: context.allowed,
-                                allow_historical_gaps: false,
-                            },
-                            resolver,
-                        )
-                        .await?
-                        .leaves,
+                    let source_checkpoint = expand(
+                        store,
+                        &source.id,
+                        &ProjectionContext {
+                            workspace: context.workspace,
+                            context_thread: context.context_thread,
+                            source_thread: &origin.thread_id,
+                            owner: source_owner,
+                            allowed: context.allowed,
+                            allow_historical_gaps: false,
+                        },
+                        resolver,
+                    )
+                    .await?;
+                    ensure!(
+                        source_checkpoint.root == source_ref,
+                        "checkpoint source revision changed"
                     );
+                    cached.insert(source_ref.clone(), source_checkpoint.leaves);
                 }
                 leaves.extend(cached[&source_ref].iter().cloned());
             } else {
@@ -460,7 +463,7 @@ async fn project_checkpoint_in_context(
             }
         }
         represented.extend(leaves.iter().cloned());
-        leaves_by_message.insert(index, leaves);
+        leaves_by_message.insert(index, (leaves, checkpoints));
     }
     let mut represented_coverage = represented.clone();
     for (replay, source) in &expanded.replay_aliases {
@@ -483,7 +486,24 @@ async fn project_checkpoint_in_context(
     // version-free key is used only after admission to remove today's copy of
     // an already covered identity; an edit must not turn it into a new tail.
     let mut selected = BTreeSet::new();
-    for (index, leaves) in leaves_by_message {
+    let mut covered_by_other_checkpoint = false;
+    for (index, (leaves, checkpoints)) in leaves_by_message {
+        // This is the reciprocal of the replacement check below (and of the
+        // bidirectional checkpoint containment rule in composition.rs). Use
+        // exact saved leaves here: a source revision is part of historical
+        // checkpoint coverage, even though admitted current raw rows are
+        // removed by version-free identity below. The candidate's own message
+        // is deliberately excluded: all of its copies must be selected and
+        // replaced by the authoritative saved body.
+        let represents_candidate = checkpoints.contains(&expanded.root);
+        if !represents_candidate
+            && !checkpoints.is_empty()
+            && expanded.leaves.is_subset(&leaves)
+            && expanded.leaves != leaves
+        {
+            covered_by_other_checkpoint = true;
+            continue;
+        }
         let identities = leaves.iter().map(identity).collect::<BTreeSet<_>>();
         if identities.is_disjoint(&covered) {
             continue;
@@ -528,12 +548,14 @@ async fn project_checkpoint_in_context(
     let summary =
         checkpoint_message_from_expanded(store, context, head, &expanded, resolver).await?;
     let first = selected.first().copied().unwrap_or(0);
-    let mut projected = Vec::with_capacity(messages.len() + 1 - selected.len());
-    if messages.is_empty() {
+    let insert_summary = !covered_by_other_checkpoint;
+    let mut projected =
+        Vec::with_capacity(messages.len() + usize::from(insert_summary) - selected.len());
+    if messages.is_empty() && insert_summary {
         projected.push(summary.clone());
     }
     for (index, message) in messages.iter().enumerate() {
-        if index == first {
+        if index == first && insert_summary {
             projected.push(summary.clone());
         }
         if !selected.contains(&index) {
