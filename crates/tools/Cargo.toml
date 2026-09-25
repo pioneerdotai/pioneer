@@ -38,6 +38,9 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 scraper.workspace = true
 webclaw-core.workspace = true
 futures-util.workspace = true
+fff-search = "0.11.0"
+globset = "0.4"
+regex = "1"
 xa11y = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }

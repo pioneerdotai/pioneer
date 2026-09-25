@@ -297,7 +297,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "read_file",
-            "Read exact UTF-8 text without changing it. `path` may be relative to the turn cwd or an authorized absolute path. The result returns the resolved absolute path and one bounded text page; when `truncated` is true, pass its `continuation` back as `cursor` to read the next page.",
+            "Read exact UTF-8 text without changing it. `path` may be relative to the turn cwd or an authorized absolute path. To choose where to start, pass either `start_line` (1-based) or `start_byte` (0-based); omit the other. If both are passed, `start_line` takes precedence. An explicit offset also takes precedence over `cursor`. The result returns the resolved absolute path and one bounded text page; when `truncated` is true, omit both offsets and pass its exact `continuation` back as `cursor` to read the next page.",
             read_file_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -325,7 +325,7 @@ pub fn builtin_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         configured_builtin_spec(
             "grep_files",
-            "Search UTF-8 text under a scoped directory or file. `path` may be cwd-relative or an authorized absolute path; use the narrowest path and optional glob you can infer. Results use reusable absolute paths. If the result says `needs_narrowing`, follow its `next_action` and do not repeat the same broad search.",
+            "Search UTF-8 text under a scoped directory or file. `path` may be cwd-relative or an authorized absolute path; use the narrowest path and optional glob you can infer. Results use reusable absolute paths. `no_matches` means the search completed without matches; `partial` means some results were omitted. If the result says `needs_narrowing`, follow its `next_action` and do not repeat the same broad search.",
             grep_files_schema(),
             PayloadKind::Function,
             ExecutionClass::Shared,
@@ -496,11 +496,11 @@ fn read_file_schema() -> JsonValue {
         "type": "object",
         "properties": {
             "path": { "type": "string", "description": "Path relative to the turn cwd, or an authorized absolute file path." },
-            "start_line": { "type": "integer", "minimum": 1 },
-            "start_byte": { "type": "integer", "minimum": 0 },
+            "start_line": { "type": "integer", "minimum": 1, "description": "1-based line to start reading. Omit start_byte when using this; if both are supplied, start_line wins." },
+            "start_byte": { "type": "integer", "minimum": 0, "description": "0-based byte offset to start reading. Use only when start_line is omitted." },
             "max_lines": { "type": "integer", "minimum": 1 },
             "max_bytes": { "type": "integer", "minimum": 1 },
-            "cursor": { "type": "string", "minLength": 1, "maxLength": 16384, "description": "Opaque continuation returned by the preceding page of this same file." }
+            "cursor": { "type": "string", "minLength": 1, "maxLength": 16384, "description": "Exact opaque continuation from the preceding page. Used only when start_line and start_byte are omitted." }
         },
         "required": ["path"],
         "additionalProperties": false
