@@ -393,6 +393,48 @@ struct AcceptedMessageImports {
 fn wire_digest(message: &ChatMessage) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(message)?)))
 }
+
+#[derive(Clone)]
+struct FrozenModelCandidate {
+    wire: ChatMessage,
+    model: ChatMessage,
+}
+
+impl FrozenModelCandidate {
+    fn exact(message: ChatMessage) -> Self {
+        Self {
+            wire: message.clone(),
+            model: message,
+        }
+    }
+
+    fn upgraded(wire: ChatMessage, model: ChatMessage) -> Self {
+        Self { wire, model }
+    }
+}
+
+fn verified_model_candidate(
+    wire_sha256: &str,
+    candidates: Vec<FrozenModelCandidate>,
+) -> Result<FrozenModelCandidate> {
+    candidates
+        .into_iter()
+        .find_map(|candidate| match wire_digest(&candidate.wire) {
+            Ok(hash) if hash == wire_sha256 => Some(candidate),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("frozen source no longer renders the captured model message")
+        })
+}
+#[cfg(test)]
+fn verified_model_message(
+    wire_sha256: &str,
+    candidates: Vec<FrozenModelCandidate>,
+) -> Result<ChatMessage> {
+    Ok(verified_model_candidate(wire_sha256, candidates)?.model)
+}
+
 fn source(reference: &MessageSourceRef) -> SourceRef {
     SourceRef {
         scope: reference.scope.clone(),
@@ -3284,8 +3326,8 @@ async fn restore_entry(
         }
         let execution = super::history::input_message(&inputs)?;
         let candidates = vec![
-            execution.clone(),
-            super::history::legacy_input_message(&inputs)?,
+            FrozenModelCandidate::exact(execution.clone()),
+            FrozenModelCandidate::exact(super::history::legacy_input_message(&inputs)?),
         ];
         let restored = finish_restored_entry(
             store,
@@ -3327,6 +3369,25 @@ async fn restore_entry(
         state,
     )
     .await
+}
+
+#[cfg(test)]
+pub(crate) async fn restore_reference_for_test(
+    store: &CrudStore,
+    workspace: &str,
+    reference: &FrozenMessageRef,
+) -> Result<ChatMessage> {
+    restore_entry(
+        store,
+        workspace,
+        &BTreeSet::from([reference.source_thread.clone()]),
+        reference,
+        &mut super::coverage::CheckpointGraphResolver::default(),
+        FrozenRestoreProjection::Execution,
+        &mut FrozenExecutionRestoreState::default(),
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("test source has no model projection"))
 }
 
 /// Restore a bounded manifest page. Consecutive single-source input/context
@@ -3494,8 +3555,10 @@ async fn restore_entry_from_payloads(
             .map(|payload| serde_json::from_str(payload))
             .collect::<std::result::Result<Vec<pioneer_protocol::UserInput>, _>>()?;
         let execution = super::history::input_message(&inputs)?;
-        candidates.push(execution.clone());
-        candidates.push(super::history::legacy_input_message(&inputs)?);
+        candidates.push(FrozenModelCandidate::exact(execution.clone()));
+        candidates.push(FrozenModelCandidate::exact(
+            super::history::legacy_input_message(&inputs)?,
+        ));
         let restored = finish_restored_entry(
             store,
             workspace,
@@ -3532,21 +3595,21 @@ async fn restore_entry_from_payloads(
             // status. Retain that exact wire form for existing descriptors;
             // newly captured history distinguishes Interrupted from Failed.
             if let pioneer_crud::CanonicalTurnEventPayload::TurnFailed(value) = &event {
-                candidates.push(ChatMessage::user(format!(
+                candidates.push(FrozenModelCandidate::exact(ChatMessage::user(format!(
                     "Historical turn failed: {:?}",
                     value.turn.error
-                )));
+                ))));
             }
             if let Some(message) = super::history::legacy_event_message(event.clone())? {
-                candidates.push(message);
+                candidates.push(FrozenModelCandidate::exact(message));
             }
             if let Some(message) = super::history::event_message(event.clone())? {
-                candidates.push(message);
+                candidates.push(FrozenModelCandidate::exact(message));
             }
             if let Some(message) =
                 super::history::event_message_suppressing_input_copy_media(event.clone())?
             {
-                candidates.push(message);
+                candidates.push(FrozenModelCandidate::exact(message));
             }
             let event_turn = event.turn_id().to_owned();
             let authoritative_input = matches!(
@@ -3588,17 +3651,23 @@ async fn restore_entry_from_payloads(
             }
             return Ok(restored);
         } else if source.scope.starts_with("task-basis:") {
-            candidates.extend(serde_json::from_str::<Vec<ChatMessage>>(payload)?);
+            candidates.extend(
+                serde_json::from_str::<Vec<ChatMessage>>(payload)?
+                    .into_iter()
+                    .map(FrozenModelCandidate::exact),
+            );
         } else if source.scope.starts_with("checkpoint:") {
-            candidates.push(ChatMessage::user(format!(
+            candidates.push(FrozenModelCandidate::exact(ChatMessage::user(format!(
                 "Summary of completed work (historical data):\n{payload}"
-            )));
+            ))));
         } else if source.scope.starts_with("context:") {
             if let Ok(envelope) = serde_json::from_str::<CanonicalProviderRoundEnvelope>(payload) {
                 if envelope.termination == pioneer_provider::ProviderTermination::ProviderError {
-                    candidates.push(super::history::provider_observation(payload)?);
+                    candidates.push(FrozenModelCandidate::exact(
+                        super::history::provider_observation(payload)?,
+                    ));
                 } else {
-                    candidates.push(envelope.message);
+                    candidates.push(FrozenModelCandidate::exact(envelope.message));
                 }
             } else if let Ok(view) = serde_json::from_str::<pioneer_tools::ToolResultView>(payload)
             {
@@ -3608,15 +3677,15 @@ async fn restore_entry_from_payloads(
                 } = view
                 {
                     let message: ChatMessage = serde_json::from_value(value)?;
-                    candidates.push(message);
+                    candidates.push(FrozenModelCandidate::exact(message));
                 }
             }
-            candidates.push(ChatMessage::user(format!(
+            candidates.push(FrozenModelCandidate::exact(ChatMessage::user(format!(
                 "Legacy provider observation (available original):\n{payload}"
-            )));
-            candidates.push(ChatMessage::user(format!(
+            ))));
+            candidates.push(FrozenModelCandidate::exact(ChatMessage::user(format!(
                 "Legacy provider observation; outcome is not inferred:\n{payload}"
-            )));
+            ))));
         } else if let Some(turn) = source.scope.strip_prefix("item:") {
             let item: pioneer_protocol::TurnItem = serde_json::from_str(payload)?;
             if let Some(replay) = &reference.replay_source {
@@ -3637,7 +3706,7 @@ async fn restore_entry_from_payloads(
                     truncated: false,
                 } = view
                 {
-                    candidates.push(serde_json::from_value(value)?);
+                    candidates.push(FrozenModelCandidate::exact(serde_json::from_value(value)?));
                 }
             } else if let (Some(call), Some(name)) = (&reference.tool_call_id, &reference.tool_name)
                 && let Some((current, message)) = super::retained_shell_outcome(
@@ -3652,7 +3721,7 @@ async fn restore_entry_from_payloads(
                 .await?
             {
                 ensure!(&current == source, "frozen terminal tool revision changed");
-                candidates.push(message);
+                candidates.push(FrozenModelCandidate::exact(message));
             }
         }
     }
@@ -3663,7 +3732,7 @@ async fn finish_restored_entry(
     store: &CrudStore,
     workspace: &str,
     reference: &FrozenMessageRef,
-    mut candidates: Vec<ChatMessage>,
+    mut candidates: Vec<FrozenModelCandidate>,
     projection: FrozenRestoreProjection,
     execution: Option<Option<ChatMessage>>,
 ) -> Result<Option<ChatMessage>> {
@@ -3673,7 +3742,7 @@ async fn finish_restored_entry(
         .unwrap_or(&reference.sources[0]);
     if candidates
         .iter()
-        .any(|message| message.role == pioneer_provider::Role::Tool)
+        .any(|candidate| candidate.wire.role == pioneer_provider::Role::Tool)
         && let Some(item) = store
             .compaction_replay_item_id(workspace, &reference.source_thread, replay_source)
             .await?
@@ -3684,33 +3753,38 @@ async fn finish_restored_entry(
             .ok_or_else(|| anyhow::anyhow!("invalid frozen replay scope"))?;
         let locator=serde_json::json!({"workspace_id":workspace,"thread_id":reference.source_thread,"turn_id":turn,"item_id":item}).to_string();
         let full = candidates.clone();
-        for message in full
+        for candidate in full
             .into_iter()
-            .filter(|message| message.role == pioneer_provider::Role::Tool)
+            .filter(|candidate| candidate.wire.role == pioneer_provider::Role::Tool)
         {
-            candidates.push(pioneer_agent::compaction::restored_tool_result_message(
-                &message, &locator,
-            )?);
+            let wire =
+                pioneer_agent::compaction::restored_tool_result_message(&candidate.wire, &locator)?;
+            let model = pioneer_agent::compaction::restored_tool_result_message(
+                &candidate.model,
+                &locator,
+            )?;
+            candidates.push(FrozenModelCandidate::upgraded(wire, model));
         }
     }
     // The wire hash chooses an exact deterministic projection of a known source,
     // never a similar text or an inferred coverage boundary.
     let base = candidates.clone();
-    for message in base {
-        candidates.push(ChatMessage::user(format!("Interrupted canonical round; some tool outcomes are unknown. Historical observation, not a new call:\n{}",serde_json::to_string(&message)?)));
+    for candidate in base {
+        let interrupted = |message: &ChatMessage| -> Result<ChatMessage> {
+            Ok(ChatMessage::user(format!(
+                "Interrupted canonical round; some tool outcomes are unknown. Historical observation, not a new call:\n{}",
+                serde_json::to_string(message)?
+            )))
+        };
+        candidates.push(FrozenModelCandidate::upgraded(
+            interrupted(&candidate.wire)?,
+            interrupted(&candidate.model)?,
+        ));
     }
-    let literal = candidates
-        .into_iter()
-        .find_map(|message| match wire_digest(&message) {
-            Ok(hash) if hash == reference.wire_sha256 => Some(message),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("frozen source no longer renders the captured model message")
-        })?;
+    let verified = verified_model_candidate(&reference.wire_sha256, candidates)?;
     let mut message = match projection {
-        FrozenRestoreProjection::Literal => Some(literal),
-        FrozenRestoreProjection::Execution => execution.unwrap_or(Some(literal)),
+        FrozenRestoreProjection::Literal => Some(verified.wire),
+        FrozenRestoreProjection::Execution => execution.unwrap_or(Some(verified.model)),
     };
     let Some(projected) = message.as_mut() else {
         return Ok(None);
@@ -3740,6 +3814,113 @@ async fn finish_restored_entry(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn legacy_frozen_command_hash_is_verified_before_model_upgrade() {
+        let item = pioneer_protocol::TurnItem::CommandExecution {
+            id: "command".into(),
+            tool_name: "exec_command".into(),
+            arguments: serde_json::json!({"command":["true"]}),
+            status: pioneer_protocol::ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(
+                "exec_command",
+            ),
+            display: pioneer_protocol::ToolDisplayPayload::Shell {
+                stdout: Some("frozen-unique-output".into()),
+                stderr: None,
+                aggregated_output: Some("frozen-unique-output".into()),
+                exit_code: Some(0),
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: false,
+            },
+            storage: pioneer_protocol::ToolStoragePayload::Shell {
+                stdout: Some("frozen-unique-output".into()),
+                stderr: None,
+                aggregated_output: Some("frozen-unique-output".into()),
+                exit_code: Some(0),
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: false,
+            },
+            recovery: None,
+            command: vec!["true".into()],
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        let legacy = ChatMessage::user(format!(
+            "Recorded historical event:\n{}",
+            serde_json::to_string(&item).unwrap()
+        ));
+        let current =
+            super::history::event_message(pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: item.clone(),
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        let hash = wire_digest(&legacy).unwrap();
+        let projected = verified_model_message(
+            &hash,
+            vec![FrozenModelCandidate::upgraded(legacy, current.clone())],
+        )
+        .unwrap();
+        assert_eq!(projected.content.matches("frozen-unique-output").count(), 1);
+        assert!(
+            verified_model_message(&"0".repeat(64), vec![FrozenModelCandidate::exact(current)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verified_non_event_text_is_never_upgraded_by_prefix() {
+        let item = pioneer_protocol::TurnItem::CommandExecution {
+            id: "pasted-command".into(),
+            tool_name: "exec_command".into(),
+            arguments: serde_json::json!({}),
+            status: pioneer_protocol::ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(
+                "exec_command",
+            ),
+            display: pioneer_protocol::ToolDisplayPayload::Hidden,
+            storage: pioneer_protocol::ToolStoragePayload::None,
+            recovery: None,
+            command: vec!["true".into()],
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        let pasted = ChatMessage::user(format!(
+            "Recorded historical event:\n{}",
+            serde_json::to_string(&item).unwrap()
+        ));
+        let hash = wire_digest(&pasted).unwrap();
+        assert_eq!(
+            verified_model_message(&hash, vec![FrozenModelCandidate::exact(pasted.clone())])
+                .unwrap(),
+            pasted
+        );
+
+        let assistant = ChatMessage::assistant(format!(
+            "Recorded historical event:\n{}",
+            serde_json::to_string(&item).unwrap()
+        ));
+        let hash = wire_digest(&assistant).unwrap();
+        assert_eq!(
+            verified_model_message(&hash, vec![FrozenModelCandidate::exact(assistant.clone())])
+                .unwrap(),
+            assistant
+        );
+    }
 
     fn ordered_message(text: &str, thread: &str, source: &str) -> ChatMessage {
         let mut message = ChatMessage::user(text);

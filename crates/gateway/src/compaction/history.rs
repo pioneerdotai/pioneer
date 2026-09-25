@@ -1667,6 +1667,34 @@ pub(crate) fn provider_observation(payload: &str) -> Result<ChatMessage> {
     )))
 }
 
+pub(super) fn historical_item_json(item: &pioneer_protocol::TurnItem) -> Result<String> {
+    match item.historical_command_llm_projection() {
+        Some(projection) => Ok(serde_json::to_string(&projection)?),
+        None => Ok(serde_json::to_string(item)?),
+    }
+}
+
+/// Preserve the canonical event envelope while replacing only a command item
+/// in the model-facing copy. Both cold history and compaction use this renderer.
+pub(super) fn historical_command_event_json(event: &Event) -> Result<Option<String>> {
+    let item = match event {
+        Event::ItemCompleted(value) => &value.item,
+        Event::ItemUpdated(value) => &value.item,
+        _ => return Ok(None),
+    };
+    let Some(projection) = item.historical_command_llm_projection() else {
+        return Ok(None);
+    };
+    let mut value = serde_json::to_value(event)?;
+    let item = value
+        .get_mut("payload")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|payload| payload.get_mut("item"))
+        .ok_or_else(|| anyhow::anyhow!("historical command event lost its item payload"))?;
+    *item = serde_json::to_value(projection)?;
+    Ok(Some(serde_json::to_string(&value)?))
+}
+
 /// Current canonical event renderer. Frozen restore also retains explicit
 /// digest-checked compatibility candidates for older manifests.
 pub(crate) fn event_message(event: Event) -> Result<Option<ChatMessage>> {
@@ -1805,7 +1833,7 @@ fn event_message_with_input_copy_policy(
             )),
             item => ChatMessage::user(format!(
                 "Recorded historical event:\n{}",
-                serde_json::to_string(&item)?
+                historical_item_json(&item)?
             )),
         },
         Event::TurnCompleted(value) => {
@@ -1818,6 +1846,13 @@ fn event_message_with_input_copy_policy(
         Event::TurnBlocked(value) => {
             ChatMessage::user(format!("Historical turn blocked: {:?}", value.turn.error))
         }
+        event @ Event::ItemUpdated(_) => ChatMessage::user(format!(
+            "Recorded historical status; not a successful model response:\n{}",
+            match historical_command_event_json(&event)? {
+                Some(projected) => projected,
+                None => serde_json::to_string(&event)?,
+            }
+        )),
         other => ChatMessage::user(format!(
             "Recorded historical status; not a successful model response:\n{}",
             serde_json::to_string(&other)?
@@ -1828,6 +1863,147 @@ fn event_message_with_input_copy_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn completed_command_event(output: &str) -> Event {
+        Event::ItemCompleted(pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::CommandExecution {
+                id: "command".into(),
+                tool_name: "exec_command".into(),
+                arguments: serde_json::json!({"command":["printf","fixture"],"cwd":"/workspace"}),
+                status: pioneer_protocol::ToolCallStatus::Completed,
+                recovery_policy: None,
+                output_policy: pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name(
+                    "exec_command",
+                ),
+                display: pioneer_protocol::ToolDisplayPayload::Shell {
+                    stdout: Some(output.into()),
+                    stderr: None,
+                    aggregated_output: Some(output.into()),
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    timed_out: Some(false),
+                    truncated: false,
+                },
+                storage: pioneer_protocol::ToolStoragePayload::Shell {
+                    stdout: Some(output.into()),
+                    stderr: None,
+                    aggregated_output: Some(output.into()),
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    timed_out: Some(false),
+                    truncated: false,
+                },
+                recovery: None,
+                command: vec!["printf".into(), "fixture".into()],
+                cwd: Some("/workspace".into()),
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            },
+        })
+    }
+
+    #[test]
+    fn cold_history_projects_completed_command_output_once() {
+        let output = "cold-history-unique-output ".repeat(64);
+        let message = event_message(completed_command_event(&output))
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.content.matches(&output).count(), 1);
+        let payload = message
+            .content
+            .strip_prefix("Recorded historical event:\n")
+            .expect("historical event prefix");
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let object = value.as_object().expect("historical projection object");
+        assert!(!object.contains_key("outputPolicy"));
+        assert!(!object.contains_key("storage"));
+        assert!(!object.contains_key("display"));
+        assert_eq!(
+            value.pointer("/result/representations/0/exitCode"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            value.pointer("/result/outputs/0/sources/0"),
+            Some(&serde_json::json!("display"))
+        );
+    }
+
+    #[test]
+    fn command_event_has_distinct_legacy_and_model_renderers() {
+        let legacy = legacy_event_message(completed_command_event("legacy-output"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.content.matches("legacy-output").count(), 4);
+        let projected = event_message(completed_command_event("legacy-output"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.content.matches("legacy-output").count(), 1);
+    }
+
+    #[test]
+    fn updated_command_event_keeps_its_envelope_and_projects_output_once() {
+        let output = "updated-command-unique-output ".repeat(64);
+        let Event::ItemCompleted(completed) = completed_command_event(&output) else {
+            unreachable!()
+        };
+        let mut item = completed.item;
+        let pioneer_protocol::TurnItem::CommandExecution { storage, .. } = &mut item else {
+            unreachable!()
+        };
+        let pioneer_protocol::ToolStoragePayload::Shell { stderr, .. } = storage else {
+            unreachable!()
+        };
+        *stderr = Some("updated-storage-diagnostic".into());
+        let event = Event::ItemUpdated(pioneer_protocol::ItemUpdatedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item,
+        });
+        let legacy = legacy_event_message(event.clone()).unwrap().unwrap();
+        let current = event_message(event).unwrap().unwrap();
+        assert!(legacy.content.matches(&output).count() > 1);
+        assert_eq!(current.content.matches(&output).count(), 1);
+        assert_eq!(
+            current
+                .content
+                .matches("updated-storage-diagnostic")
+                .count(),
+            1
+        );
+        let json = current
+            .content
+            .strip_prefix("Recorded historical status; not a successful model response:\n")
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["kind"], "item_updated");
+        assert_eq!(value["payload"]["workspace_id"], "ws");
+        assert_eq!(value["payload"]["item"]["toolName"], "exec_command");
+        assert!(value["payload"]["item"].get("display").is_none());
+        assert!(value["payload"]["item"].get("storage").is_none());
+
+        let noncommand = Event::ItemUpdated(pioneer_protocol::ItemUpdatedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::AgentMessage {
+                id: "agent".into(),
+                text: "unchanged update".into(),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            },
+        });
+        assert_eq!(
+            event_message(noncommand.clone()).unwrap(),
+            legacy_event_message(noncommand).unwrap()
+        );
+    }
+
     #[test]
     fn malformed_or_failed_round_cannot_become_completed_inherited_work() {
         let envelope = CanonicalProviderRoundEnvelope {

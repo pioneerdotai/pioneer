@@ -351,8 +351,8 @@ mod tests {
     use super::*;
     use pioneer_cli_agent_runtime::process::SensitiveEnvironment;
     use pioneer_compaction::{
-        CompactionMode,
-        summary::{HEADINGS, SummaryInput, validate_summary},
+        CompactionMode, SourceRef,
+        summary::{HEADINGS, SummaryInput, SummaryPart, validate_summary},
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -403,6 +403,51 @@ mod tests {
             assert_eq!(diagnostic.code, code);
             assert_eq!(diagnostic.stage, "cli_exec_decode");
         }
+    }
+
+    #[test]
+    fn cli_summary_input_keeps_projected_command_output_once() {
+        let selection = ModelSelection {
+            transport: Transport::Claude,
+            instance: "fixture".into(),
+            model: "fixture-model".into(),
+            effort: None,
+        };
+        let summarizer = CliSummarizer {
+            selection: selection.clone(),
+            budget: ModelBudget::new(Some(128_000), None, None),
+            service: CliService::Claude(ClaudeService::new(ClaudeServiceConfig {
+                executable: "unused-fixture".into(),
+                config_dir: "unused-fixture".into(),
+                environment: SensitiveEnvironment::new(),
+            })),
+        };
+        let marker = "cli-summary-command-output ".repeat(32);
+        let request = SummaryRequest {
+            selection,
+            output_cap: 512,
+            input: SummaryInput {
+                mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+                previous_summary: String::new(),
+                compact_units: vec![SummaryPart {
+                    sources: vec![SourceRef {
+                        scope: "item:turn".into(),
+                        id: "command".into(),
+                        version: "item-revision:1".into(),
+                    }],
+                    unit: 0,
+                    part: 0,
+                    last_part: true,
+                    text: marker.clone(),
+                }],
+                reference_only: vec![],
+                target_tokens: 512,
+            },
+        };
+        let input = summarizer.input(&request).unwrap();
+        assert_eq!(input.matches(&marker).count(), 1);
+        assert!(summarizer.input_tokens(&request).unwrap() > 0);
     }
 
     #[tokio::test]

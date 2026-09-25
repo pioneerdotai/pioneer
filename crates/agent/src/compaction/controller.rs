@@ -382,4 +382,24 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn historical_text_projection_invalidates_legacy_token_measurement() {
+        let mut legacy = request();
+        legacy.messages[0].content = "duplicated historical command output".repeat(4);
+        let measurement = NativeUsageMeasurement {
+            receipt: receipt(&legacy),
+            input_tokens: 10_000,
+        };
+        let mut projected = legacy;
+        projected.messages[0].content = "deduplicated historical command output".into();
+        let projected_receipt = receipt(&projected);
+        assert_eq!(
+            projected_receipt
+                .calibrated_input(123, &[123], Some(&measurement))
+                .unwrap(),
+            123
+        );
+        assert_ne!(projected_receipt.messages, measurement.receipt.messages);
+    }
 }

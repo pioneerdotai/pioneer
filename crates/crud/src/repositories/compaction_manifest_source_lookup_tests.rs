@@ -2510,6 +2510,7 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
         retries: 0,
         corrections: 0,
         target_tokens: 100,
+        source_text_projection_version: 1,
         cursor: SourceCursor {
             unit: sources as u64,
             ..Default::default()

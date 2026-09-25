@@ -3498,6 +3498,926 @@ impl Default for ToolStoragePayload {
     }
 }
 
+/// Version of the bounded historical command representation supplied to models.
+/// Canonical `TurnItem` storage and the UI/storage projections remain unchanged.
+pub const HISTORICAL_COMMAND_LLM_PROJECTION_VERSION: u32 = 1;
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoricalCommandOutputSource {
+    Display,
+    Storage,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalCommandTextRange {
+    pub sources: Vec<HistoricalCommandOutputSource>,
+    pub start_byte: u64,
+    pub end_byte: u64,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalCommandOutput {
+    pub sources: Vec<HistoricalCommandOutputSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregated_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdout_sources: Vec<HistoricalCommandOutputSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stderr_sources: Vec<HistoricalCommandOutputSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdout_in_aggregated: Vec<HistoricalCommandTextRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stderr_in_aggregated: Vec<HistoricalCommandTextRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdout_in_stdout: Vec<HistoricalCommandTextRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stderr_in_stderr: Vec<HistoricalCommandTextRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<JsonValue>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalCommandRepresentation {
+    pub sources: Vec<HistoricalCommandOutputSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    pub aggregated_output_present: bool,
+    pub stdout_present: bool,
+    pub stderr_present: bool,
+    pub truncated: bool,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalCommandResult {
+    pub outputs: Vec<HistoricalCommandOutput>,
+    pub representations: Vec<HistoricalCommandRepresentation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_omitted_by_policy: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub llm_truncated: bool,
+}
+
+/// Purpose-built historical representation. Presentation/storage policy objects
+/// are not model context; only their bounded result and completion evidence are.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalCommandLlmProjection {
+    pub projection_version: u32,
+    pub id: String,
+    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "json_object_is_empty")]
+    pub arguments: JsonValue,
+    pub status: ToolCallStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ToolOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ToolRecoveryView>,
+    pub result: HistoricalCommandResult,
+}
+
+fn json_object_is_empty(value: &JsonValue) -> bool {
+    value.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+#[derive(Clone)]
+struct HistoricalShellView {
+    output: HistoricalCommandOutput,
+    comparison: HistoricalShellComparison,
+    representation: HistoricalCommandRepresentation,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct HistoricalShellComparison {
+    aggregated_output: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+fn nonempty(value: &Option<String>) -> Option<String> {
+    value.as_ref().filter(|value| !value.is_empty()).cloned()
+}
+
+fn shell_view(
+    source: HistoricalCommandOutputSource,
+    stdout: &Option<String>,
+    stderr: &Option<String>,
+    aggregated_output: &Option<String>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    timed_out: Option<bool>,
+    truncated: bool,
+) -> HistoricalShellView {
+    let aggregated_output = nonempty(aggregated_output);
+    let mut stdout = nonempty(stdout);
+    let mut stderr = nonempty(stderr);
+    let comparison = HistoricalShellComparison {
+        aggregated_output: aggregated_output.clone(),
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+    };
+    let mut stdout_in_aggregated = Vec::new();
+    let mut stderr_in_aggregated = Vec::new();
+    // Aggregated output is the ordered shell transcript. Keep stream fields only
+    // when they add bytes that are not already present in that transcript. A
+    // byte range preserves the stream identity without copying those bytes.
+    if let Some(aggregated) = aggregated_output.as_deref() {
+        if let Some((start_byte, value)) = stdout
+            .as_deref()
+            .and_then(|value| aggregated.find(value).map(|start| (start, value)))
+        {
+            stdout_in_aggregated.push(HistoricalCommandTextRange {
+                sources: vec![source.clone()],
+                start_byte: start_byte as u64,
+                end_byte: (start_byte + value.len()) as u64,
+            });
+            stdout = None;
+        }
+        if let Some((start_byte, value)) = stderr
+            .as_deref()
+            .and_then(|value| aggregated.find(value).map(|start| (start, value)))
+        {
+            stderr_in_aggregated.push(HistoricalCommandTextRange {
+                sources: vec![source.clone()],
+                start_byte: start_byte as u64,
+                end_byte: (start_byte + value.len()) as u64,
+            });
+            stderr = None;
+        }
+    }
+    HistoricalShellView {
+        output: HistoricalCommandOutput {
+            sources: vec![source.clone()],
+            aggregated_output,
+            stdout_sources: stdout
+                .is_some()
+                .then(|| source.clone())
+                .into_iter()
+                .collect(),
+            stdout,
+            stderr_sources: stderr
+                .is_some()
+                .then(|| source.clone())
+                .into_iter()
+                .collect(),
+            stderr,
+            stdout_in_aggregated,
+            stderr_in_aggregated,
+            stdout_in_stdout: Vec::new(),
+            stderr_in_stderr: Vec::new(),
+            structured: None,
+        },
+        comparison: comparison.clone(),
+        representation: HistoricalCommandRepresentation {
+            sources: vec![source],
+            exit_code,
+            duration_ms,
+            timed_out,
+            aggregated_output_present: comparison.aggregated_output.is_some(),
+            stdout_present: comparison.stdout.is_some(),
+            stderr_present: comparison.stderr.is_some(),
+            truncated,
+        },
+    }
+}
+
+fn output_text(output: &HistoricalCommandOutput) -> Option<&str> {
+    output
+        .aggregated_output
+        .as_deref()
+        .or(output.stdout.as_deref())
+        .or(output.stderr.as_deref())
+}
+
+fn output_covers_truncated(
+    complete: &HistoricalShellComparison,
+    partial: &HistoricalShellComparison,
+) -> bool {
+    let mut compared = false;
+    for (complete, partial) in [
+        (
+            complete.aggregated_output.as_deref(),
+            partial.aggregated_output.as_deref(),
+        ),
+        (complete.stdout.as_deref(), partial.stdout.as_deref()),
+        (complete.stderr.as_deref(), partial.stderr.as_deref()),
+    ] {
+        let Some(partial) = partial else { continue };
+        compared = true;
+        if !complete.is_some_and(|complete| complete.starts_with(partial)) {
+            return false;
+        }
+    }
+    compared
+}
+
+fn output_without_sources(
+    output: &HistoricalCommandOutput,
+) -> (
+    &Option<String>,
+    &Option<String>,
+    &Option<String>,
+    &Option<JsonValue>,
+) {
+    (
+        &output.aggregated_output,
+        &output.stdout,
+        &output.stderr,
+        &output.structured,
+    )
+}
+
+#[derive(Clone)]
+struct HistoricalShellComparisonCandidate {
+    comparison: HistoricalShellComparison,
+    complete: bool,
+}
+
+struct HistoricalCommandOutputCandidate {
+    output: HistoricalCommandOutput,
+    shell_comparisons: Vec<HistoricalShellComparisonCandidate>,
+}
+
+fn merge_output_metadata(
+    existing: &mut HistoricalCommandOutput,
+    candidate: &mut HistoricalCommandOutput,
+) {
+    existing.sources.append(&mut candidate.sources);
+    existing
+        .stdout_sources
+        .append(&mut candidate.stdout_sources);
+    existing
+        .stderr_sources
+        .append(&mut candidate.stderr_sources);
+    existing
+        .stdout_in_aggregated
+        .append(&mut candidate.stdout_in_aggregated);
+    existing
+        .stderr_in_aggregated
+        .append(&mut candidate.stderr_in_aggregated);
+    existing
+        .stdout_in_stdout
+        .append(&mut candidate.stdout_in_stdout);
+    existing
+        .stderr_in_stderr
+        .append(&mut candidate.stderr_in_stderr);
+}
+
+enum AbsorbedStreamLocation {
+    Aggregated(HistoricalCommandTextRange),
+    Standalone(HistoricalCommandTextRange),
+}
+
+fn absorbed_stream_location(
+    output: &HistoricalCommandOutput,
+    complete_stream: Option<&str>,
+    partial_stream: Option<&str>,
+    in_aggregated: &[HistoricalCommandTextRange],
+    standalone: Option<&str>,
+    sources: &[HistoricalCommandOutputSource],
+) -> Option<Option<AbsorbedStreamLocation>> {
+    let Some(partial) = partial_stream else {
+        return Some(None);
+    };
+    let complete = complete_stream?;
+    if !complete.starts_with(partial) {
+        return None;
+    }
+    if standalone == Some(complete) {
+        return Some(Some(AbsorbedStreamLocation::Standalone(
+            HistoricalCommandTextRange {
+                sources: sources.to_vec(),
+                start_byte: 0,
+                end_byte: partial.len() as u64,
+            },
+        )));
+    }
+    let aggregated = output.aggregated_output.as_deref()?;
+    let reference = in_aggregated.iter().find(|reference| {
+        aggregated.get(reference.start_byte as usize..reference.end_byte as usize) == Some(complete)
+    })?;
+    Some(Some(AbsorbedStreamLocation::Aggregated(
+        HistoricalCommandTextRange {
+            sources: sources.to_vec(),
+            start_byte: reference.start_byte,
+            end_byte: reference.start_byte + partial.len() as u64,
+        },
+    )))
+}
+
+fn merge_absorbed_output(
+    existing: &mut HistoricalCommandOutput,
+    candidate: &HistoricalCommandOutput,
+    complete: &HistoricalShellComparison,
+    partial: &HistoricalShellComparison,
+) -> bool {
+    let stdout = absorbed_stream_location(
+        existing,
+        complete.stdout.as_deref(),
+        partial.stdout.as_deref(),
+        &existing.stdout_in_aggregated,
+        existing.stdout.as_deref(),
+        &candidate.sources,
+    );
+    let stderr = absorbed_stream_location(
+        existing,
+        complete.stderr.as_deref(),
+        partial.stderr.as_deref(),
+        &existing.stderr_in_aggregated,
+        existing.stderr.as_deref(),
+        &candidate.sources,
+    );
+    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+        return false;
+    };
+    existing.sources.extend(candidate.sources.iter().cloned());
+    for (location, aggregated, standalone) in [
+        (
+            stdout,
+            &mut existing.stdout_in_aggregated,
+            &mut existing.stdout_in_stdout,
+        ),
+        (
+            stderr,
+            &mut existing.stderr_in_aggregated,
+            &mut existing.stderr_in_stderr,
+        ),
+    ] {
+        match location {
+            Some(AbsorbedStreamLocation::Aggregated(range)) => aggregated.push(range),
+            Some(AbsorbedStreamLocation::Standalone(range)) => standalone.push(range),
+            None => {}
+        }
+    }
+    true
+}
+
+fn direct_fields_are_compatible(
+    existing: &HistoricalCommandOutput,
+    candidate: &HistoricalCommandOutput,
+) -> bool {
+    existing.aggregated_output.is_some()
+        && existing.aggregated_output == candidate.aggregated_output
+        && existing
+            .stdout
+            .as_ref()
+            .zip(candidate.stdout.as_ref())
+            .is_none_or(|(existing, candidate)| existing == candidate)
+        && existing
+            .stderr
+            .as_ref()
+            .zip(candidate.stderr.as_ref())
+            .is_none_or(|(existing, candidate)| existing == candidate)
+        && existing.structured.is_none()
+        && candidate.structured.is_none()
+}
+
+fn merge_compatible_output_fields(
+    existing: &mut HistoricalCommandOutput,
+    candidate: &mut HistoricalCommandOutput,
+) {
+    if existing.stdout.is_none() {
+        existing.stdout = candidate.stdout.take();
+    }
+    if existing.stderr.is_none() {
+        existing.stderr = candidate.stderr.take();
+    }
+    merge_output_metadata(existing, candidate);
+}
+
+fn push_unique_output(
+    outputs: &mut Vec<HistoricalCommandOutputCandidate>,
+    mut candidate: HistoricalCommandOutput,
+    shell: Option<(HistoricalShellComparison, bool)>,
+) {
+    if candidate.aggregated_output.is_none()
+        && candidate.stdout.is_none()
+        && candidate.stderr.is_none()
+        && candidate.structured.is_none()
+    {
+        return;
+    }
+    if let Some((comparison, truncated)) = shell {
+        for existing in outputs.iter_mut() {
+            if let Some(equal) = existing
+                .shell_comparisons
+                .iter_mut()
+                .find(|existing| existing.comparison == comparison)
+            {
+                merge_output_metadata(&mut existing.output, &mut candidate);
+                equal.complete |= !truncated;
+                return;
+            }
+        }
+        if truncated {
+            for existing in outputs.iter_mut() {
+                let covering = existing
+                    .shell_comparisons
+                    .iter()
+                    .filter(|candidate| candidate.complete)
+                    .filter(|candidate| output_covers_truncated(&candidate.comparison, &comparison))
+                    .map(|candidate| candidate.comparison.clone())
+                    .collect::<Vec<_>>();
+                for covering in covering {
+                    if merge_absorbed_output(
+                        &mut existing.output,
+                        &candidate,
+                        &covering,
+                        &comparison,
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+        let comparison = HistoricalShellComparisonCandidate {
+            comparison,
+            complete: !truncated,
+        };
+        if let Some(existing) = outputs.iter_mut().find(|existing| {
+            output_without_sources(&existing.output) == output_without_sources(&candidate)
+                || direct_fields_are_compatible(&existing.output, &candidate)
+        }) {
+            merge_compatible_output_fields(&mut existing.output, &mut candidate);
+            existing.shell_comparisons.push(comparison);
+            return;
+        }
+        outputs.push(HistoricalCommandOutputCandidate {
+            output: candidate,
+            shell_comparisons: vec![comparison],
+        });
+        return;
+    }
+    if let Some(existing) = outputs.iter_mut().find(|existing| {
+        existing.shell_comparisons.is_empty()
+            && output_without_sources(&existing.output) == output_without_sources(&candidate)
+    }) {
+        merge_output_metadata(&mut existing.output, &mut candidate);
+        return;
+    }
+    outputs.push(HistoricalCommandOutputCandidate {
+        output: candidate,
+        shell_comparisons: Vec::new(),
+    });
+}
+
+fn push_representation(
+    representations: &mut Vec<HistoricalCommandRepresentation>,
+    mut candidate: HistoricalCommandRepresentation,
+) {
+    if let Some(existing) = representations.iter_mut().find(|existing| {
+        existing.exit_code == candidate.exit_code
+            && existing.duration_ms == candidate.duration_ms
+            && existing.timed_out == candidate.timed_out
+            && existing.aggregated_output_present == candidate.aggregated_output_present
+            && existing.stdout_present == candidate.stdout_present
+            && existing.stderr_present == candidate.stderr_present
+            && existing.truncated == candidate.truncated
+    }) {
+        existing.sources.append(&mut candidate.sources);
+    } else {
+        representations.push(candidate);
+    }
+}
+
+fn serialized_outputs_len(outputs: &[HistoricalCommandOutput]) -> usize {
+    serde_json::to_vec(outputs)
+        .expect("historical command outputs are serializable")
+        .len()
+}
+
+#[derive(Clone, Copy)]
+enum HistoricalOutputField {
+    Aggregated,
+    Stdout,
+    Stderr,
+}
+
+fn set_output_field(
+    output: &mut HistoricalCommandOutput,
+    field: HistoricalOutputField,
+    value: Option<String>,
+    original: &HistoricalCommandOutput,
+) {
+    match field {
+        HistoricalOutputField::Aggregated => {
+            let retained_bytes = value.as_ref().map_or(0, String::len) as u64;
+            output.aggregated_output = value;
+            output.stdout_in_aggregated = original
+                .stdout_in_aggregated
+                .iter()
+                .filter(|reference| reference.end_byte <= retained_bytes)
+                .cloned()
+                .collect();
+            output.stderr_in_aggregated = original
+                .stderr_in_aggregated
+                .iter()
+                .filter(|reference| reference.end_byte <= retained_bytes)
+                .cloned()
+                .collect();
+        }
+        HistoricalOutputField::Stdout => {
+            let retained_bytes = value.as_ref().map_or(0, String::len) as u64;
+            output.stdout_in_stdout = original
+                .stdout_in_stdout
+                .iter()
+                .filter(|reference| reference.end_byte <= retained_bytes)
+                .cloned()
+                .collect();
+            output.stdout_sources = value
+                .is_some()
+                .then(|| original.stdout_sources.clone())
+                .unwrap_or_default();
+            output.stdout = value;
+        }
+        HistoricalOutputField::Stderr => {
+            let retained_bytes = value.as_ref().map_or(0, String::len) as u64;
+            output.stderr_in_stderr = original
+                .stderr_in_stderr
+                .iter()
+                .filter(|reference| reference.end_byte <= retained_bytes)
+                .cloned()
+                .collect();
+            output.stderr_sources = value
+                .is_some()
+                .then(|| original.stderr_sources.clone())
+                .unwrap_or_default();
+            output.stderr = value;
+        }
+    }
+}
+
+fn fit_output_string(
+    outputs: &mut [HistoricalCommandOutput],
+    output_index: usize,
+    field: HistoricalOutputField,
+    value: &str,
+    max_bytes: usize,
+    original: &HistoricalCommandOutput,
+) -> bool {
+    set_output_field(
+        &mut outputs[output_index],
+        field,
+        Some(value.to_owned()),
+        original,
+    );
+    if serialized_outputs_len(outputs) <= max_bytes {
+        return false;
+    }
+
+    set_output_field(&mut outputs[output_index], field, None, original);
+    let boundaries = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(value.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let middle = (low + high) / 2;
+        let end = boundaries[middle];
+        set_output_field(
+            &mut outputs[output_index],
+            field,
+            (!value[..end].is_empty()).then(|| value[..end].to_owned()),
+            original,
+        );
+        if serialized_outputs_len(outputs) <= max_bytes {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let end = boundaries[low.saturating_sub(1)];
+    set_output_field(
+        &mut outputs[output_index],
+        field,
+        (!value[..end].is_empty()).then(|| value[..end].to_owned()),
+        original,
+    );
+    true
+}
+
+fn fit_structured_output(
+    outputs: &mut [HistoricalCommandOutput],
+    output_index: usize,
+    value: &JsonValue,
+    max_bytes: usize,
+) -> bool {
+    outputs[output_index].structured = Some(value.clone());
+    if serialized_outputs_len(outputs) <= max_bytes {
+        return false;
+    }
+    outputs[output_index].structured = None;
+    let encoded =
+        serde_json::to_string(value).expect("historical structured output is serializable");
+    let boundaries = encoded
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(encoded.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let middle = (low + high) / 2;
+        let end = boundaries[middle];
+        outputs[output_index].structured = Some(serde_json::json!({
+            "historicalProjectionTruncated": true,
+            "serializedPrefix": &encoded[..end],
+        }));
+        if serialized_outputs_len(outputs) <= max_bytes {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let end = boundaries[low.saturating_sub(1)];
+    outputs[output_index].structured = Some(serde_json::json!({
+        "historicalProjectionTruncated": true,
+        "serializedPrefix": &encoded[..end],
+    }));
+    if serialized_outputs_len(outputs) > max_bytes {
+        outputs[output_index].structured = None;
+    }
+    true
+}
+
+fn bound_historical_outputs(
+    outputs: Vec<HistoricalCommandOutput>,
+    max_bytes: usize,
+) -> (Vec<HistoricalCommandOutput>, bool) {
+    if serialized_outputs_len(&outputs) <= max_bytes {
+        return (outputs, false);
+    }
+    if max_bytes == 0 {
+        return (Vec::new(), true);
+    }
+    let originals = outputs;
+    let mut bounded = originals
+        .iter()
+        .map(|output| HistoricalCommandOutput {
+            sources: output.sources.clone(),
+            aggregated_output: None,
+            stdout: None,
+            stdout_sources: Vec::new(),
+            stderr: None,
+            stderr_sources: Vec::new(),
+            stdout_in_aggregated: Vec::new(),
+            stderr_in_aggregated: Vec::new(),
+            stdout_in_stdout: Vec::new(),
+            stderr_in_stderr: Vec::new(),
+            structured: None,
+        })
+        .collect::<Vec<_>>();
+    if serialized_outputs_len(&bounded) > max_bytes {
+        return (Vec::new(), true);
+    }
+    for (index, original) in originals.iter().enumerate() {
+        for (field, value) in [
+            (
+                HistoricalOutputField::Aggregated,
+                original.aggregated_output.as_deref(),
+            ),
+            (HistoricalOutputField::Stdout, original.stdout.as_deref()),
+            (HistoricalOutputField::Stderr, original.stderr.as_deref()),
+        ] {
+            if let Some(value) = value
+                && fit_output_string(&mut bounded, index, field, value, max_bytes, original)
+            {
+                return (bounded, true);
+            }
+        }
+        if let Some(value) = &original.structured
+            && fit_structured_output(&mut bounded, index, value, max_bytes)
+        {
+            return (bounded, true);
+        }
+    }
+    (bounded, true)
+}
+
+fn deduplicated_command_arguments(
+    arguments: &JsonValue,
+    command: &[String],
+    cwd: Option<&str>,
+) -> JsonValue {
+    let mut arguments = arguments.clone();
+    let Some(object) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    if !command.is_empty()
+        && object
+            .get("command")
+            .is_some_and(|value| value == &serde_json::json!(command))
+    {
+        object.remove("command");
+    }
+    if let Some(cwd) = cwd
+        && object.get("cwd").and_then(JsonValue::as_str) == Some(cwd)
+    {
+        object.remove("cwd");
+    }
+    arguments
+}
+
+impl TurnItem {
+    /// Returns `None` for non-command items, which retain their existing model
+    /// rendering. Command output is deduplicated without mutating canonical data.
+    pub fn historical_command_llm_projection(&self) -> Option<HistoricalCommandLlmProjection> {
+        let Self::CommandExecution {
+            id,
+            tool_name,
+            arguments,
+            status,
+            output_policy,
+            display,
+            storage,
+            recovery,
+            command,
+            cwd,
+            success,
+            outcome,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let mut shell_views = Vec::new();
+        let mut structured = Vec::new();
+        let mut omitted = false;
+        let allow_full_result = matches!(
+            output_policy.llm,
+            LlmOutputPolicy::Full { .. } | LlmOutputPolicy::Structured { .. }
+        );
+        for (source, shell, other) in [
+            (
+                HistoricalCommandOutputSource::Display,
+                match display {
+                    ToolDisplayPayload::Shell {
+                        stdout,
+                        stderr,
+                        aggregated_output,
+                        exit_code,
+                        duration_ms,
+                        timed_out,
+                        truncated,
+                    } => Some((
+                        stdout,
+                        stderr,
+                        aggregated_output,
+                        *exit_code,
+                        *duration_ms,
+                        *timed_out,
+                        *truncated,
+                    )),
+                    _ => None,
+                },
+                match display {
+                    ToolDisplayPayload::Summary(value) => Some((
+                        serde_json::to_value(value).expect("serializable tool summary"),
+                        true,
+                    )),
+                    ToolDisplayPayload::Progress { stage, metadata } => Some((
+                        serde_json::json!({"stage":stage,"metadata":metadata}),
+                        false,
+                    )),
+                    ToolDisplayPayload::Hidden | ToolDisplayPayload::Shell { .. } => None,
+                },
+            ),
+            (
+                HistoricalCommandOutputSource::Storage,
+                match storage {
+                    ToolStoragePayload::Shell {
+                        stdout,
+                        stderr,
+                        aggregated_output,
+                        exit_code,
+                        duration_ms,
+                        timed_out,
+                        truncated,
+                    } => Some((
+                        stdout,
+                        stderr,
+                        aggregated_output,
+                        *exit_code,
+                        *duration_ms,
+                        *timed_out,
+                        *truncated,
+                    )),
+                    _ => None,
+                },
+                match storage {
+                    ToolStoragePayload::Summary(value) => Some((
+                        serde_json::to_value(value).expect("serializable tool summary"),
+                        true,
+                    )),
+                    ToolStoragePayload::Metadata { metadata } => {
+                        Some((serde_json::json!({"metadata":metadata}), true))
+                    }
+                    ToolStoragePayload::None | ToolStoragePayload::Shell { .. } => None,
+                },
+            ),
+        ] {
+            if let Some((stdout, stderr, aggregate, exit, duration, timeout, truncated)) = shell {
+                let view = shell_view(
+                    source, stdout, stderr, aggregate, exit, duration, timeout, truncated,
+                );
+                omitted |= !allow_full_result && output_text(&view.output).is_some();
+                shell_views.push(view);
+            } else if let Some((value, summary_safe)) = other {
+                if allow_full_result || summary_safe {
+                    structured.push(HistoricalCommandOutput {
+                        sources: vec![source],
+                        aggregated_output: None,
+                        stdout: None,
+                        stdout_sources: Vec::new(),
+                        stderr: None,
+                        stderr_sources: Vec::new(),
+                        stdout_in_aggregated: Vec::new(),
+                        stderr_in_aggregated: Vec::new(),
+                        stdout_in_stdout: Vec::new(),
+                        stderr_in_stderr: Vec::new(),
+                        structured: Some(value),
+                    });
+                } else {
+                    omitted = true;
+                }
+            }
+        }
+        shell_views.sort_by_key(|view| {
+            (
+                view.representation.truncated,
+                std::cmp::Reverse(output_text(&view.output).map_or(0, str::len)),
+            )
+        });
+        let mut outputs = Vec::new();
+        let mut representations = Vec::new();
+        for view in shell_views {
+            if allow_full_result {
+                push_unique_output(
+                    &mut outputs,
+                    view.output,
+                    Some((view.comparison, view.representation.truncated)),
+                );
+            }
+            push_representation(&mut representations, view.representation);
+        }
+        for output in structured {
+            push_unique_output(&mut outputs, output, None);
+        }
+        let outputs = outputs
+            .into_iter()
+            .map(|candidate| candidate.output)
+            .collect();
+        let max_bytes = match output_policy.llm {
+            LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
+                Some(max_bytes)
+            }
+            LlmOutputPolicy::SummaryOnly => None,
+        };
+        let (outputs, llm_truncated) = match max_bytes {
+            Some(max_bytes) => bound_historical_outputs(outputs, max_bytes),
+            None => (outputs, false),
+        };
+        Some(HistoricalCommandLlmProjection {
+            projection_version: HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+            id: id.clone(),
+            tool_name: tool_name.clone(),
+            arguments: deduplicated_command_arguments(arguments, command, cwd.as_deref()),
+            status: *status,
+            command: command.clone(),
+            cwd: cwd.clone(),
+            success: *success,
+            outcome: outcome.clone(),
+            recovery: recovery.clone(),
+            result: HistoricalCommandResult {
+                outputs,
+                representations,
+                output_omitted_by_policy: omitted,
+                llm_truncated,
+            },
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolRecoveryView {
@@ -6938,6 +7858,916 @@ mod tests {
             max_wall_clock_secs: 240,
             no_progress_limit: 3,
         }
+    }
+
+    fn command_item(display: ToolDisplayPayload, storage: ToolStoragePayload) -> TurnItem {
+        TurnItem::CommandExecution {
+            id: "command-1".into(),
+            tool_name: "exec_command".into(),
+            arguments: json!({
+                "nativeItemId": "command-1",
+                "command": ["sh", "-c", "fixture"],
+                "cwd": "/workspace",
+                "sandbox": "full_access"
+            }),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display,
+            storage,
+            recovery: None,
+            command: vec!["sh".into(), "-c".into(), "fixture".into()],
+            cwd: Some("/workspace".into()),
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        }
+    }
+
+    fn shell_payload(
+        output: &str,
+        stderr: Option<&str>,
+        exit_code: i32,
+        timed_out: bool,
+        truncated: bool,
+    ) -> (ToolDisplayPayload, ToolStoragePayload) {
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some(output.into()),
+            stderr: stderr.map(str::to_owned),
+            aggregated_output: Some(output.into()),
+            exit_code: Some(exit_code),
+            duration_ms: Some(42),
+            timed_out: Some(timed_out),
+            truncated,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some(output.into()),
+            stderr: stderr.map(str::to_owned),
+            aggregated_output: Some(output.into()),
+            exit_code: Some(exit_code),
+            duration_ms: Some(42),
+            timed_out: Some(timed_out),
+            truncated,
+        };
+        (display, storage)
+    }
+
+    #[test]
+    fn historical_command_projection_emits_equal_output_once() {
+        let unique = "long unique command output ".repeat(128);
+        let (display, storage) = shell_payload(&unique, None, 0, false, false);
+        let projection = command_item(display, storage)
+            .historical_command_llm_projection()
+            .expect("command projection");
+        assert_eq!(projection.result.outputs.len(), 1);
+        assert_eq!(
+            projection.result.outputs[0].aggregated_output.as_deref(),
+            Some(unique.as_str())
+        );
+        assert_eq!(projection.result.outputs[0].stdout, None);
+        assert_eq!(projection.result.outputs[0].sources.len(), 2);
+        assert_eq!(projection.result.outputs[0].stdout_in_aggregated.len(), 2);
+        assert!(
+            projection.result.outputs[0]
+                .stdout_in_aggregated
+                .iter()
+                .any(|reference| { reference.sources == [HistoricalCommandOutputSource::Display] })
+        );
+        assert!(
+            projection.result.outputs[0]
+                .stdout_in_aggregated
+                .iter()
+                .any(|reference| { reference.sources == [HistoricalCommandOutputSource::Storage] })
+        );
+        assert_eq!(projection.result.representations.len(), 1);
+        assert_eq!(projection.result.representations[0].sources.len(), 2);
+        assert_eq!(
+            projection.arguments,
+            json!({"nativeItemId":"command-1","sandbox":"full_access"})
+        );
+        let encoded = serde_json::to_string(&projection).unwrap();
+        assert_eq!(encoded.matches(&unique).count(), 1);
+    }
+
+    #[test]
+    fn historical_command_projection_prefers_complete_superset_and_keeps_incomplete_evidence() {
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some("prefix".into()),
+            stderr: Some("display-only diagnostic".into()),
+            aggregated_output: Some("prefix".into()),
+            exit_code: None,
+            duration_ms: Some(10),
+            timed_out: Some(true),
+            truncated: true,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some("prefix and complete tail".into()),
+            stderr: Some("diagnostic-only".into()),
+            aggregated_output: Some("prefix and complete tail".into()),
+            exit_code: Some(124),
+            duration_ms: Some(20),
+            timed_out: Some(true),
+            truncated: false,
+        };
+        let mut item = command_item(display, storage);
+        let TurnItem::CommandExecution {
+            success,
+            outcome,
+            recovery,
+            status,
+            ..
+        } = &mut item
+        else {
+            unreachable!()
+        };
+        *success = Some(false);
+        *status = ToolCallStatus::Failed;
+        *outcome = Some(ToolOutcome {
+            status: ToolOutcomeStatus::FatalError,
+            error_class: Some(ToolErrorClass::Timeout),
+            should_retry: false,
+            retry_hint: None,
+            incomplete: true,
+            incomplete_reason: Some("deadline reached".into()),
+        });
+        *recovery = Some(ToolRecoveryView {
+            error_class: Some("timeout".into()),
+            retry_hint: None,
+            incomplete_reason: Some("command interrupted".into()),
+            diagnostic_summary: Some("timed out".into()),
+            diagnostic_excerpt: None,
+            output_fingerprint: None,
+            content_fingerprint: None,
+            was_truncated: true,
+            continuation: None,
+        });
+        let projection = item.historical_command_llm_projection().unwrap();
+        assert_eq!(projection.result.outputs.len(), 2);
+        let complete = projection
+            .result
+            .outputs
+            .iter()
+            .find(|value| value.aggregated_output.as_deref() == Some("prefix and complete tail"))
+            .unwrap();
+        assert_eq!(
+            complete.aggregated_output.as_deref(),
+            Some("prefix and complete tail")
+        );
+        assert_eq!(complete.stdout, None);
+        assert_eq!(complete.stderr.as_deref(), Some("diagnostic-only"));
+        assert!(
+            projection
+                .result
+                .outputs
+                .iter()
+                .any(|value| { value.stderr.as_deref() == Some("display-only diagnostic") })
+        );
+        assert!(
+            projection
+                .result
+                .representations
+                .iter()
+                .any(|value| value.truncated)
+        );
+        assert!(
+            projection
+                .result
+                .representations
+                .iter()
+                .any(|value| !value.truncated)
+        );
+        assert!(
+            projection
+                .outcome
+                .as_ref()
+                .is_some_and(|value| value.incomplete)
+        );
+        assert_eq!(projection.status, ToolCallStatus::Failed);
+        assert_eq!(projection.success, Some(false));
+    }
+
+    #[test]
+    fn historical_command_projection_keeps_distinct_outputs_and_empty_failure_meaning() {
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some("display-only".into()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: Some(2),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: None,
+            stderr: Some("storage-only".into()),
+            aggregated_output: None,
+            exit_code: Some(2),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let projection = command_item(display, storage)
+            .historical_command_llm_projection()
+            .unwrap();
+        assert_eq!(projection.result.outputs.len(), 2);
+        assert!(
+            projection
+                .result
+                .outputs
+                .iter()
+                .any(|value| value.stdout.as_deref() == Some("display-only"))
+        );
+        assert!(
+            projection
+                .result
+                .outputs
+                .iter()
+                .any(|value| value.stderr.as_deref() == Some("storage-only"))
+        );
+
+        let (display, storage) = shell_payload("", None, 137, false, false);
+        let mut item = command_item(display, storage);
+        let TurnItem::CommandExecution {
+            success, status, ..
+        } = &mut item
+        else {
+            unreachable!()
+        };
+        *success = Some(false);
+        *status = ToolCallStatus::Failed;
+        let projection = item.historical_command_llm_projection().unwrap();
+        assert!(projection.result.outputs.is_empty());
+        assert_eq!(projection.result.representations[0].exit_code, Some(137));
+        assert_eq!(projection.success, Some(false));
+    }
+
+    #[test]
+    fn historical_command_projection_does_not_merge_cross_stream_complete_outputs() {
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some("abcdefgh".into()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: Some(0),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some("x".into()),
+            stderr: Some("abcdefgh".into()),
+            aggregated_output: None,
+            exit_code: Some(0),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let projection = command_item(display, storage)
+            .historical_command_llm_projection()
+            .unwrap();
+        assert_eq!(projection.result.outputs.len(), 2);
+        assert!(projection.result.outputs.iter().any(|output| {
+            output.stdout.as_deref() == Some("abcdefgh") && output.stderr.is_none()
+        }));
+        assert!(projection.result.outputs.iter().any(|output| {
+            output.stdout.as_deref() == Some("x") && output.stderr.as_deref() == Some("abcdefgh")
+        }));
+    }
+
+    #[test]
+    fn historical_command_projection_shares_aggregate_but_preserves_stream_identity() {
+        for display_owns_stdout in [true, false] {
+            let display = ToolDisplayPayload::Shell {
+                stdout: display_owns_stdout.then(|| "error".into()),
+                stderr: (!display_owns_stdout).then(|| "error".into()),
+                aggregated_output: Some("error".into()),
+                exit_code: Some(1),
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: false,
+            };
+            let storage = ToolStoragePayload::Shell {
+                stdout: (!display_owns_stdout).then(|| "error".into()),
+                stderr: display_owns_stdout.then(|| "error".into()),
+                aggregated_output: Some("error".into()),
+                exit_code: Some(1),
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: false,
+            };
+            let projection = command_item(display, storage)
+                .historical_command_llm_projection()
+                .unwrap();
+            assert_eq!(projection.result.outputs.len(), 1);
+            let output = &projection.result.outputs[0];
+            assert_eq!(output.aggregated_output.as_deref(), Some("error"));
+            assert!(output.stdout.is_none());
+            assert!(output.stderr.is_none());
+            let stdout_source = if display_owns_stdout {
+                HistoricalCommandOutputSource::Display
+            } else {
+                HistoricalCommandOutputSource::Storage
+            };
+            let stderr_source = if display_owns_stdout {
+                HistoricalCommandOutputSource::Storage
+            } else {
+                HistoricalCommandOutputSource::Display
+            };
+            assert_eq!(output.stdout_in_aggregated.len(), 1);
+            assert_eq!(output.stdout_in_aggregated[0].sources, [stdout_source]);
+            assert_eq!(output.stdout_in_aggregated[0].start_byte, 0);
+            assert_eq!(output.stdout_in_aggregated[0].end_byte, 5);
+            assert_eq!(output.stderr_in_aggregated.len(), 1);
+            assert_eq!(output.stderr_in_aggregated[0].sources, [stderr_source]);
+            assert_eq!(output.stderr_in_aggregated[0].start_byte, 0);
+            assert_eq!(output.stderr_in_aggregated[0].end_byte, 5);
+            assert_eq!(
+                serde_json::to_string(&projection)
+                    .unwrap()
+                    .matches("error")
+                    .count(),
+                1
+            );
+            assert!(
+                projection
+                    .result
+                    .representations
+                    .iter()
+                    .any(|representation| {
+                        representation.stdout_present && !representation.stderr_present
+                    })
+            );
+            assert!(
+                projection
+                    .result
+                    .representations
+                    .iter()
+                    .any(|representation| {
+                        !representation.stdout_present && representation.stderr_present
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn historical_command_projection_does_not_cross_stream_absorb_truncated_output() {
+        for full_is_display in [true, false] {
+            let display = ToolDisplayPayload::Shell {
+                stdout: full_is_display.then(|| "error plus tail".into()),
+                stderr: (!full_is_display).then(|| "error".into()),
+                aggregated_output: Some(if full_is_display {
+                    "error plus tail".into()
+                } else {
+                    "error".into()
+                }),
+                exit_code: full_is_display.then_some(0),
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: !full_is_display,
+            };
+            let storage = ToolStoragePayload::Shell {
+                stdout: (!full_is_display).then(|| "error plus tail".into()),
+                stderr: full_is_display.then(|| "error".into()),
+                aggregated_output: Some(if full_is_display {
+                    "error".into()
+                } else {
+                    "error plus tail".into()
+                }),
+                exit_code: (!full_is_display).then_some(0),
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: full_is_display,
+            };
+            let projection = command_item(display, storage)
+                .historical_command_llm_projection()
+                .unwrap();
+            assert_eq!(projection.result.outputs.len(), 2);
+            let full = projection
+                .result
+                .outputs
+                .iter()
+                .find(|output| output.aggregated_output.as_deref() == Some("error plus tail"))
+                .unwrap();
+            let partial = projection
+                .result
+                .outputs
+                .iter()
+                .find(|output| output.aggregated_output.as_deref() == Some("error"))
+                .unwrap();
+            let full_source = if full_is_display {
+                HistoricalCommandOutputSource::Display
+            } else {
+                HistoricalCommandOutputSource::Storage
+            };
+            let partial_source = if full_is_display {
+                HistoricalCommandOutputSource::Storage
+            } else {
+                HistoricalCommandOutputSource::Display
+            };
+            assert_eq!(full.stdout_in_aggregated.len(), 1);
+            assert_eq!(full.stdout_in_aggregated[0].sources, [full_source]);
+            assert!(full.stderr_in_aggregated.is_empty());
+            assert_eq!(partial.stderr_in_aggregated.len(), 1);
+            assert_eq!(partial.stderr_in_aggregated[0].sources, [partial_source]);
+            assert!(partial.stdout_in_aggregated.is_empty());
+            assert!(
+                projection
+                    .result
+                    .representations
+                    .iter()
+                    .any(|representation| {
+                        !representation.truncated
+                            && representation.stdout_present
+                            && !representation.stderr_present
+                    })
+            );
+            assert!(
+                projection
+                    .result
+                    .representations
+                    .iter()
+                    .any(|representation| {
+                        representation.truncated
+                            && !representation.stdout_present
+                            && representation.stderr_present
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn historical_command_projection_binds_absorbed_streams_to_saved_text() {
+        for full_is_display in [true, false] {
+            for stderr_stream in [false, true] {
+                let full = ToolDisplayPayload::Shell {
+                    stdout: (!stderr_stream).then(|| "prefix tail".into()),
+                    stderr: stderr_stream.then(|| "prefix tail".into()),
+                    aggregated_output: Some("prefix tail".into()),
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    timed_out: Some(false),
+                    truncated: false,
+                };
+                let partial = ToolStoragePayload::Shell {
+                    stdout: (!stderr_stream).then(|| "prefix".into()),
+                    stderr: stderr_stream.then(|| "prefix".into()),
+                    aggregated_output: None,
+                    exit_code: None,
+                    duration_ms: None,
+                    timed_out: Some(false),
+                    truncated: true,
+                };
+                let display = if full_is_display {
+                    full
+                } else {
+                    ToolDisplayPayload::Shell {
+                        stdout: (!stderr_stream).then(|| "prefix".into()),
+                        stderr: stderr_stream.then(|| "prefix".into()),
+                        aggregated_output: None,
+                        exit_code: None,
+                        duration_ms: None,
+                        timed_out: Some(false),
+                        truncated: true,
+                    }
+                };
+                let storage = if full_is_display {
+                    partial
+                } else {
+                    ToolStoragePayload::Shell {
+                        stdout: (!stderr_stream).then(|| "prefix tail".into()),
+                        stderr: stderr_stream.then(|| "prefix tail".into()),
+                        aggregated_output: Some("prefix tail".into()),
+                        exit_code: Some(0),
+                        duration_ms: None,
+                        timed_out: Some(false),
+                        truncated: false,
+                    }
+                };
+                let projection = command_item(display, storage)
+                    .historical_command_llm_projection()
+                    .unwrap();
+                assert_eq!(projection.result.outputs.len(), 1);
+                let output = &projection.result.outputs[0];
+                assert_eq!(output.aggregated_output.as_deref(), Some("prefix tail"));
+                assert!(output.stdout.is_none() && output.stderr.is_none());
+                assert!(output.stdout_sources.is_empty() && output.stderr_sources.is_empty());
+                let ranges = if stderr_stream {
+                    &output.stderr_in_aggregated
+                } else {
+                    &output.stdout_in_aggregated
+                };
+                assert_eq!(ranges.len(), 2);
+                let partial_source = if full_is_display {
+                    HistoricalCommandOutputSource::Storage
+                } else {
+                    HistoricalCommandOutputSource::Display
+                };
+                assert!(ranges.iter().any(|range| {
+                    range.sources.as_slice() == std::slice::from_ref(&partial_source)
+                        && range.start_byte == 0
+                        && range.end_byte == 6
+                }));
+                assert_eq!(
+                    serde_json::to_string(&projection)
+                        .unwrap()
+                        .matches("prefix tail")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn historical_command_projection_only_absorbs_compatible_truncated_streams() {
+        let truncated = ToolDisplayPayload::Shell {
+            stdout: Some("prefix".into()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: Some(true),
+            truncated: true,
+        };
+        let complete = ToolStoragePayload::Shell {
+            stdout: Some("prefix and tail".into()),
+            stderr: Some("complete diagnostic".into()),
+            aggregated_output: None,
+            exit_code: Some(124),
+            duration_ms: None,
+            timed_out: Some(true),
+            truncated: false,
+        };
+        let projection = command_item(truncated.clone(), complete.clone())
+            .historical_command_llm_projection()
+            .unwrap();
+        assert_eq!(projection.result.outputs.len(), 1);
+        assert_eq!(projection.result.outputs[0].sources.len(), 2);
+        assert_eq!(
+            projection.result.outputs[0].stderr.as_deref(),
+            Some("complete diagnostic")
+        );
+        assert!(
+            projection
+                .result
+                .representations
+                .iter()
+                .any(|representation| representation.truncated)
+        );
+
+        let ToolDisplayPayload::Shell {
+            stdout,
+            exit_code,
+            duration_ms,
+            timed_out,
+            truncated,
+            ..
+        } = truncated
+        else {
+            unreachable!()
+        };
+        let incompatible = ToolDisplayPayload::Shell {
+            stdout,
+            stderr: Some("truncated-only diagnostic".into()),
+            aggregated_output: None,
+            exit_code,
+            duration_ms,
+            timed_out,
+            truncated,
+        };
+        let projection = command_item(incompatible, complete)
+            .historical_command_llm_projection()
+            .unwrap();
+        assert_eq!(projection.result.outputs.len(), 2);
+        assert!(
+            projection
+                .result
+                .outputs
+                .iter()
+                .any(|output| { output.stderr.as_deref() == Some("truncated-only diagnostic") })
+        );
+    }
+
+    #[test]
+    fn historical_command_projection_keeps_distinct_truncated_prefixes_in_both_directions() {
+        for (display_stdout, storage_stdout) in [
+            (
+                "shared prefix",
+                "shared prefix with display-independent tail",
+            ),
+            (
+                "shared prefix with storage-independent tail",
+                "shared prefix",
+            ),
+        ] {
+            let display = ToolDisplayPayload::Shell {
+                stdout: Some(display_stdout.into()),
+                stderr: None,
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: true,
+            };
+            let storage = ToolStoragePayload::Shell {
+                stdout: Some(storage_stdout.into()),
+                stderr: None,
+                aggregated_output: None,
+                exit_code: None,
+                duration_ms: None,
+                timed_out: Some(false),
+                truncated: true,
+            };
+            let projection = command_item(display, storage)
+                .historical_command_llm_projection()
+                .unwrap();
+            assert_eq!(projection.result.outputs.len(), 2);
+            assert!(projection.result.outputs.iter().any(|output| {
+                output.stdout.as_deref() == Some(display_stdout)
+                    && output.sources == [HistoricalCommandOutputSource::Display]
+            }));
+            assert!(projection.result.outputs.iter().any(|output| {
+                output.stdout.as_deref() == Some(storage_stdout)
+                    && output.sources == [HistoricalCommandOutputSource::Storage]
+            }));
+        }
+    }
+
+    #[test]
+    fn historical_command_projection_merges_equal_truncated_output_only_by_exact_equality() {
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some("same truncated bytes".into()),
+            stderr: Some("same diagnostic".into()),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: true,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some("same truncated bytes".into()),
+            stderr: Some("same diagnostic".into()),
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: true,
+        };
+        let projection = command_item(display, storage)
+            .historical_command_llm_projection()
+            .unwrap();
+        assert_eq!(projection.result.outputs.len(), 1);
+        assert_eq!(projection.result.outputs[0].sources.len(), 2);
+    }
+
+    #[test]
+    fn historical_command_projection_complete_display_absorbs_covered_truncated_storage() {
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some("prefix and complete tail".into()),
+            stderr: Some("complete diagnostic".into()),
+            aggregated_output: None,
+            exit_code: Some(0),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some("prefix".into()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: true,
+        };
+        let projection = command_item(display, storage)
+            .historical_command_llm_projection()
+            .unwrap();
+        assert_eq!(projection.result.outputs.len(), 1);
+        assert_eq!(projection.result.outputs[0].sources.len(), 2);
+        assert_eq!(
+            projection.result.outputs[0].stdout.as_deref(),
+            Some("prefix and complete tail")
+        );
+        assert_eq!(
+            projection.result.outputs[0].stderr.as_deref(),
+            Some("complete diagnostic")
+        );
+        assert_eq!(
+            projection.result.outputs[0].stdout_sources,
+            [HistoricalCommandOutputSource::Display]
+        );
+        assert_eq!(projection.result.outputs[0].stdout_in_stdout.len(), 1);
+        assert_eq!(
+            projection.result.outputs[0].stdout_in_stdout[0].sources,
+            [HistoricalCommandOutputSource::Storage]
+        );
+        assert_eq!(projection.result.outputs[0].stdout_in_stdout[0].end_byte, 6);
+    }
+
+    #[test]
+    fn historical_command_projection_keeps_only_utf8_safe_absorbed_ranges_after_bounding() {
+        let full = format!("🦀данные {}", "tail ".repeat(100));
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some(full.clone()),
+            stderr: None,
+            aggregated_output: Some(full.clone()),
+            exit_code: Some(0),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some("🦀данные".into()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: true,
+        };
+        let mut item = command_item(display, storage);
+        let unbounded = item.historical_command_llm_projection().unwrap();
+        let length = serde_json::to_vec(&unbounded.result.outputs).unwrap().len();
+        let TurnItem::CommandExecution { output_policy, .. } = &mut item else {
+            unreachable!()
+        };
+        output_policy.llm = LlmOutputPolicy::Full {
+            max_bytes: length - 20,
+        };
+        let projection = item.historical_command_llm_projection().unwrap();
+        assert!(projection.result.llm_truncated);
+        assert!(
+            serde_json::to_vec(&projection.result.outputs)
+                .unwrap()
+                .len()
+                <= length - 20
+        );
+        assert!(projection.result.outputs.iter().any(|output| {
+            output
+                .stdout_in_aggregated
+                .iter()
+                .any(|range| range.sources == [HistoricalCommandOutputSource::Storage])
+        }));
+        for output in &projection.result.outputs {
+            assert!(output.stdout.is_some() || output.stdout_sources.is_empty());
+            assert!(output.stderr.is_some() || output.stderr_sources.is_empty());
+            if let Some(text) = output.aggregated_output.as_deref() {
+                for range in &output.stdout_in_aggregated {
+                    let referred = text
+                        .get(range.start_byte as usize..range.end_byte as usize)
+                        .expect("range remains inside a UTF-8 boundary");
+                    match range.sources.as_slice() {
+                        [HistoricalCommandOutputSource::Storage] => {
+                            assert_eq!(referred, "🦀данные")
+                        }
+                        [HistoricalCommandOutputSource::Display] => assert_eq!(referred, full),
+                        _ => panic!("unexpected source marker"),
+                    }
+                }
+            } else {
+                assert!(output.stdout_in_aggregated.is_empty());
+            }
+        }
+        serde_json::to_string(&projection).unwrap();
+
+        let display = ToolDisplayPayload::Shell {
+            stdout: Some(full.clone()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: Some(0),
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: false,
+        };
+        let storage = ToolStoragePayload::Shell {
+            stdout: Some("🦀данные".into()),
+            stderr: None,
+            aggregated_output: None,
+            exit_code: None,
+            duration_ms: None,
+            timed_out: Some(false),
+            truncated: true,
+        };
+        let mut standalone = command_item(display, storage);
+        let length = serde_json::to_vec(
+            &standalone
+                .historical_command_llm_projection()
+                .unwrap()
+                .result
+                .outputs,
+        )
+        .unwrap()
+        .len();
+        let TurnItem::CommandExecution { output_policy, .. } = &mut standalone else {
+            unreachable!()
+        };
+        output_policy.llm = LlmOutputPolicy::Full {
+            max_bytes: length - 20,
+        };
+        let projection = standalone.historical_command_llm_projection().unwrap();
+        assert!(projection.result.llm_truncated);
+        assert!(projection.result.outputs.iter().any(|output| {
+            output
+                .stdout_in_stdout
+                .iter()
+                .any(|range| range.sources == [HistoricalCommandOutputSource::Storage])
+        }));
+        for output in &projection.result.outputs {
+            if let Some(stdout) = output.stdout.as_deref() {
+                for range in &output.stdout_in_stdout {
+                    let referred = stdout
+                        .get(range.start_byte as usize..range.end_byte as usize)
+                        .expect("standalone range remains inside a UTF-8 boundary");
+                    assert_eq!(referred, "🦀данные");
+                    assert_eq!(range.sources, [HistoricalCommandOutputSource::Storage]);
+                }
+            } else {
+                assert!(output.stdout_sources.is_empty());
+                assert!(output.stdout_in_stdout.is_empty());
+            }
+        }
+        serde_json::to_string(&projection).unwrap();
+    }
+
+    #[test]
+    fn historical_command_projection_applies_llm_policy_and_serialized_limit() {
+        let unicode = "🦀данные\n".repeat(128);
+        for policy in [
+            LlmOutputPolicy::Full { max_bytes: 192 },
+            LlmOutputPolicy::Structured { max_bytes: 192 },
+        ] {
+            let (display, storage) = shell_payload(&unicode, None, 0, false, false);
+            let mut item = command_item(display, storage);
+            let TurnItem::CommandExecution { output_policy, .. } = &mut item else {
+                unreachable!()
+            };
+            output_policy.llm = policy;
+            let projection = item.historical_command_llm_projection().unwrap();
+            assert!(projection.result.llm_truncated);
+            assert!(!projection.result.outputs.is_empty());
+            assert!(
+                serde_json::to_vec(&projection.result.outputs)
+                    .unwrap()
+                    .len()
+                    <= 192
+            );
+            serde_json::to_string(&projection).expect("bounded Unicode projection remains JSON");
+        }
+
+        let (display, storage) = shell_payload("omitted shell", None, 9, true, false);
+        let mut item = command_item(display, storage);
+        let TurnItem::CommandExecution { output_policy, .. } = &mut item else {
+            unreachable!()
+        };
+        output_policy.llm = LlmOutputPolicy::SummaryOnly;
+        let projection = item.historical_command_llm_projection().unwrap();
+        assert!(projection.result.outputs.is_empty());
+        assert!(projection.result.output_omitted_by_policy);
+        assert_eq!(projection.result.representations[0].exit_code, Some(9));
+        assert_eq!(projection.result.representations[0].timed_out, Some(true));
+    }
+
+    #[test]
+    fn historical_command_projection_bounds_structured_and_zero_limits() {
+        let summary = ToolOutputSummary {
+            title: "structured".into(),
+            lines: vec!["界".repeat(1024)],
+            metadata: ToolMetadata::default(),
+            truncated: false,
+        };
+        for max_bytes in [160, 0] {
+            let mut item = command_item(
+                ToolDisplayPayload::Summary(summary.clone()),
+                ToolStoragePayload::Summary(summary.clone()),
+            );
+            let TurnItem::CommandExecution { output_policy, .. } = &mut item else {
+                unreachable!()
+            };
+            output_policy.llm = LlmOutputPolicy::Structured { max_bytes };
+            let projection = item.historical_command_llm_projection().unwrap();
+            assert!(projection.result.llm_truncated);
+            assert!(
+                serde_json::to_vec(&projection.result.outputs)
+                    .unwrap()
+                    .len()
+                    <= max_bytes.max(2)
+            );
+            if max_bytes == 0 {
+                assert!(projection.result.outputs.is_empty());
+            }
+        }
+
+        let mut item = command_item(
+            ToolDisplayPayload::Summary(summary.clone()),
+            ToolStoragePayload::Summary(summary),
+        );
+        let TurnItem::CommandExecution { output_policy, .. } = &mut item else {
+            unreachable!()
+        };
+        output_policy.llm = LlmOutputPolicy::SummaryOnly;
+        let projection = item.historical_command_llm_projection().unwrap();
+        assert_eq!(projection.result.outputs.len(), 1);
+        assert!(!projection.result.llm_truncated);
     }
 
     fn sample_tool_items() -> Vec<TurnItem> {

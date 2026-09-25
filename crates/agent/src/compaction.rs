@@ -309,6 +309,24 @@ mod tests {
         assert!(service.summarize(changed).await.is_err());
         assert_eq!(provider.calls.lock().unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn native_summary_request_keeps_projected_command_output_once() {
+        let provider = fake(ProviderTermination::Complete, false);
+        let service = NativeSummarizer::new(
+            provider.clone(),
+            selection(),
+            ModelBudget::new(Some(128_000), None, Some(16_384)),
+        )
+        .unwrap();
+        let mut request = request();
+        let marker = "api-summary-command-output ".repeat(32);
+        request.input.compact_units[0].text = marker.clone();
+        service.summarize(request).await.unwrap();
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].messages[1].content.matches(&marker).count(), 1);
+    }
     #[tokio::test]
     async fn native_summary_preserves_refusal_limit_and_retry_after_classification() {
         for termination in [

@@ -3351,6 +3351,7 @@ struct CountingDelayedProvider {
 }
 
 struct CaptureSummaryProvider {
+    name: String,
     pause_first: std::sync::atomic::AtomicBool,
     first_delay_ms: std::sync::atomic::AtomicUsize,
     release_first: Notify,
@@ -3705,6 +3706,7 @@ impl CountingDelayedProvider {
 impl CaptureSummaryProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
+            name: "capture-summary".into(),
             pause_first: std::sync::atomic::AtomicBool::new(false),
             first_delay_ms: std::sync::atomic::AtomicUsize::new(0),
             release_first: Notify::new(),
@@ -3729,6 +3731,11 @@ impl CaptureSummaryProvider {
 
     fn with_summary_marker(mut self, marker: impl Into<String>) -> Self {
         self.summary_marker = Some(marker.into());
+        self
+    }
+
+    fn named(mut self, name: &str) -> Self {
+        self.name = name.to_owned();
         self
     }
 
@@ -3828,7 +3835,7 @@ impl ConcurrentComposerHistoryProvider {
 #[async_trait::async_trait]
 impl Provider for CaptureSummaryProvider {
     fn name(&self) -> &str {
-        "capture-summary"
+        &self.name
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -66608,6 +66615,383 @@ async fn seed_phase_13_compaction_thread(
             .await
             .expect("turn completion should materialize");
     }
+}
+
+fn phase_13_command_item(output: &str, diagnostic: &str) -> TurnItem {
+    TurnItem::CommandExecution {
+        id: "historical-command".into(),
+        tool_name: "exec_command".into(),
+        arguments: serde_json::json!({"command":["printf","fixture"],"cwd":"/workspace"}),
+        status: pioneer_protocol::ToolCallStatus::Completed,
+        recovery_policy: None,
+        output_policy: pioneer_protocol::ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+        display: pioneer_protocol::ToolDisplayPayload::Shell {
+            stdout: Some(output.into()),
+            stderr: None,
+            aggregated_output: Some(output.into()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            timed_out: Some(false),
+            truncated: false,
+        },
+        storage: pioneer_protocol::ToolStoragePayload::Shell {
+            stdout: Some(output.into()),
+            stderr: Some(diagnostic.into()),
+            aggregated_output: Some(output.into()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            timed_out: Some(false),
+            truncated: false,
+        },
+        recovery: None,
+        command: vec!["printf".into(), "fixture".into()],
+        cwd: Some("/workspace".into()),
+        success: Some(true),
+        outcome: None,
+        observation: None,
+    }
+}
+
+async fn seed_phase_13_completed_command(
+    processor: &MessageProcessor,
+    crud_store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    item: TurnItem,
+) {
+    ensure_test_superuser_execution_authority(crud_store).await;
+    let timestamp = phase_13_now_secs();
+    let thread_record = phase_13_test_thread(workspace, thread, timestamp);
+    let started = phase_13_turn(turn, TurnStatus::InProgress);
+    crud_store
+        .materialize_turn_start(
+            &thread_record,
+            SandboxMode::FullAccess,
+            &started,
+            &[UserInput::Text {
+                text: "completed command request".into(),
+                text_elements: Vec::new(),
+            }],
+            pioneer_protocol::PersistedActorRef::Principal(
+                authenticated_test_superuser().principal_id.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item,
+            },
+            timestamp + 1,
+        )
+        .await
+        .unwrap();
+    crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn: phase_13_turn(turn, TurnStatus::Completed),
+            },
+            timestamp + 2,
+        )
+        .await
+        .unwrap();
+    persist_test_execution_authorization_context_for_principal(
+        processor,
+        authenticated_test_superuser().as_ref(),
+        workspace,
+        thread,
+        turn,
+    )
+    .await;
+}
+
+struct HistoricalCommandBackgroundObserver;
+
+#[async_trait::async_trait]
+impl crate::compaction::CompactionObserver for HistoricalCommandBackgroundObserver {
+    async fn started(
+        &self,
+        _: &str,
+        _: &pioneer_compaction::runner::RunnerState,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn heartbeat(&self, _: &str) {}
+
+    async fn terminal(
+        &self,
+        _: &str,
+        _: &pioneer_compaction::runner::RunnerState,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn completed_command_history_fits_real_background_preflight_after_projection() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_compaction::{CompactionSettings, ModelBudget, ModelSelection, Transport};
+
+    let summary = pioneer_compaction::summary::HEADINGS
+        .iter()
+        .map(|heading| format!("{heading}\nState.\n"))
+        .collect::<String>();
+    let provider = Arc::new(CaptureSummaryProvider::new(summary).named("openai"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread = "historical-command-background-fit";
+    let turn = "historical-command-background-fit-turn";
+    let diagnostic_marker = "background-storage-only-diagnostic";
+    let limits = pioneer_provider::catalog::model_catalog()
+        .unwrap()
+        .limits("openai", "gpt-4");
+    let budget = ModelBudget::new(
+        Some(limits.context_window),
+        limits.max_input,
+        limits.max_output,
+    );
+    let mut repeats = 256;
+    let (output, item, legacy_message) = loop {
+        let output = "background-boundary-output ".repeat(repeats);
+        let item = phase_13_command_item(&output, diagnostic_marker);
+        let event =
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(ItemCompletedNotification {
+                workspace_id: harness.workspace_id.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: item.clone(),
+            });
+        let legacy_message = crate::compaction::legacy_event_message(event.clone())
+            .unwrap()
+            .unwrap();
+        let projected_message = crate::compaction::event_message(event).unwrap().unwrap();
+        let request = |message| ChatRequest {
+            model: "gpt-4".into(),
+            messages: vec![
+                pioneer_provider::ChatMessage::user("completed command request"),
+                message,
+            ],
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let legacy = NativeRequestProjection::full(
+            request(legacy_message.clone()),
+            vec![],
+            budget.clone(),
+            false,
+        )
+        .unwrap();
+        let projected = NativeRequestProjection::full(
+            request(projected_message),
+            vec![],
+            budget.clone(),
+            false,
+        )
+        .unwrap();
+        let projected_with_margin =
+            pioneer_compaction::padded_input(projected.estimated_input_tokens.saturating_add(512))
+                .saturating_add(projected.output_reserve);
+        if !legacy.fits && projected.fits && projected_with_margin < budget.context {
+            break (output, item, legacy_message);
+        }
+        repeats += 256;
+        assert!(
+            repeats <= 32_768,
+            "could not construct background boundary fixture"
+        );
+    };
+    seed_phase_13_completed_command(
+        &harness.processor,
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn,
+        item,
+    )
+    .await;
+    let observation = crate::compaction::observe_completed_history_preflight(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn,
+    );
+    let current = ModelSelection {
+        transport: Transport::Api,
+        instance: "openai".into(),
+        model: "gpt-4".into(),
+        effort: None,
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "gpt-4".into(),
+            effort: None,
+        }),
+    };
+    let mut diagnostic = pioneer_crud::compaction::HistoryCheckDiagnostic::default();
+    let outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        &harness.workspace_id,
+        thread,
+        turn,
+        &current,
+        &settings,
+        None,
+        Arc::new(HistoricalCommandBackgroundObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        Some(512),
+        0,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut diagnostic,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, pioneer_crud::compaction::HistoryCheckOutcome::Fits);
+    assert_eq!(provider.call_count(), 0);
+    let snapshot = observation.snapshot().expect("background request observed");
+    assert!(snapshot.fits);
+    assert_eq!(snapshot.fixed_input_tokens, 0);
+    assert_eq!(
+        snapshot.estimated_input_tokens,
+        diagnostic.estimated_input_tokens.unwrap()
+    );
+    assert_eq!(snapshot.output_reserve, diagnostic.output_reserve.unwrap());
+    assert_eq!(
+        snapshot
+            .request
+            .messages
+            .iter()
+            .map(|message| message.content.matches(&output).count())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .request
+            .messages
+            .iter()
+            .map(|message| message.content.matches(diagnostic_marker).count())
+            .sum::<usize>(),
+        1
+    );
+    let mut legacy_request = snapshot.request.clone();
+    let command = legacy_request
+        .messages
+        .iter_mut()
+        .find(|message| message.content.contains("background-boundary-output"))
+        .unwrap();
+    command.content = legacy_message.content;
+    let legacy = NativeRequestProjection::full(legacy_request, vec![], budget, false).unwrap();
+    assert!(
+        !legacy.fits,
+        "legacy duplicated background history would fit"
+    );
+}
+
+#[tokio::test]
+async fn genuinely_large_command_history_compacts_through_real_background_preflight() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+
+    let summary = pioneer_compaction::summary::HEADINGS
+        .iter()
+        .map(|heading| format!("{heading}\nState.\n"))
+        .collect::<String>();
+    let provider = Arc::new(CaptureSummaryProvider::new(summary).named("openai"));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let thread = "historical-command-background-large";
+    let turn = "historical-command-background-large-turn";
+    let marker = "background-large-command-marker";
+    let output = format!("{marker}\n{}", "large command body ".repeat(30_000));
+    seed_phase_13_completed_command(
+        &harness.processor,
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn,
+        phase_13_command_item(&output, "background-large-diagnostic"),
+    )
+    .await;
+    let observation = crate::compaction::observe_completed_history_preflight(
+        &harness.crud_store,
+        &harness.workspace_id,
+        thread,
+        turn,
+    );
+    let current = ModelSelection {
+        transport: Transport::Api,
+        instance: "openai".into(),
+        model: "gpt-4".into(),
+        effort: None,
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "gpt-4".into(),
+            effort: None,
+        }),
+    };
+    let mut diagnostic = pioneer_crud::compaction::HistoryCheckDiagnostic::default();
+    let outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        &harness.workspace_id,
+        thread,
+        turn,
+        &current,
+        &settings,
+        None,
+        Arc::new(HistoricalCommandBackgroundObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        Some(512),
+        0,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut diagnostic,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        pioneer_crud::compaction::HistoryCheckOutcome::Compacted
+    );
+    let snapshot = observation.snapshot().expect("background request observed");
+    assert!(!snapshot.fits);
+    assert_eq!(
+        snapshot.estimated_input_tokens,
+        diagnostic.estimated_input_tokens.unwrap()
+    );
+    assert!(provider.call_count() > 0);
+    let mut compacted = String::new();
+    for request in provider.snapshot_requests() {
+        let input: pioneer_compaction::summary::SummaryInput =
+            serde_json::from_str(&request.messages[1].content).unwrap();
+        for unit in input.compact_units {
+            compacted.push_str(&unit.text);
+        }
+    }
+    assert_eq!(compacted.matches(marker).count(), 1);
 }
 
 #[tokio::test]

@@ -94,6 +94,10 @@ pub struct RunnerState {
     pub retries: u8,
     pub corrections: u8,
     pub target_tokens: u64,
+    /// Text representation used by persisted character cursors. Version zero
+    /// is the legacy canonical payload and is retained for pre-upgrade runs.
+    #[serde(default)]
+    pub source_text_projection_version: u32,
     pub cursor: SourceCursor,
     pub previous_checkpoint: Option<String>,
     pub phase: RunnerPhase,
@@ -138,6 +142,7 @@ impl RunnerState {
             retries: 0,
             corrections: 0,
             target_tokens,
+            source_text_projection_version: 1,
             cursor: SourceCursor::default(),
             previous_checkpoint,
             phase: RunnerPhase::Ready {

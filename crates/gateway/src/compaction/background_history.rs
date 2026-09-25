@@ -10,6 +10,104 @@ use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome, Mani
 use pioneer_provider::ChatRequest;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+pub(super) fn completed_history_request_projection(
+    request: ChatRequest,
+    budget: ModelBudget,
+) -> Result<pioneer_agent::compaction::request::EvaluatedRequest> {
+    NativeRequestProjection::full(request, vec![], budget, false)
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CompletedHistoryPreflightSnapshot {
+    pub request: ChatRequest,
+    pub estimated_input_tokens: u64,
+    pub fixed_input_tokens: u64,
+    pub output_reserve: u64,
+    pub fits: bool,
+}
+
+#[cfg(test)]
+static COMPLETED_HISTORY_PREFLIGHT_OBSERVERS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (usize, String, String, String),
+            std::sync::Weak<std::sync::Mutex<Option<CompletedHistoryPreflightSnapshot>>>,
+        >,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) struct CompletedHistoryPreflightObserver {
+    key: (usize, String, String, String),
+    state: Arc<std::sync::Mutex<Option<CompletedHistoryPreflightSnapshot>>>,
+}
+
+#[cfg(test)]
+impl CompletedHistoryPreflightObserver {
+    pub(crate) fn snapshot(&self) -> Option<CompletedHistoryPreflightSnapshot> {
+        self.state.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompletedHistoryPreflightObserver {
+    fn drop(&mut self) {
+        COMPLETED_HISTORY_PREFLIGHT_OBSERVERS
+            .lock()
+            .unwrap()
+            .remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_completed_history_preflight(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> CompletedHistoryPreflightObserver {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+        thread.to_owned(),
+        turn.to_owned(),
+    );
+    let state = Arc::new(std::sync::Mutex::new(None));
+    assert!(
+        COMPLETED_HISTORY_PREFLIGHT_OBSERVERS
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::downgrade(&state))
+            .is_none()
+    );
+    CompletedHistoryPreflightObserver { key, state }
+}
+
+#[cfg(test)]
+fn observe_completed_history_request(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    snapshot: CompletedHistoryPreflightSnapshot,
+) {
+    let key = (
+        store.database_connection().runtime_identity(),
+        workspace.to_owned(),
+        thread.to_owned(),
+        turn.to_owned(),
+    );
+    let observer = COMPLETED_HISTORY_PREFLIGHT_OBSERVERS
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(observer) = observer {
+        *observer.lock().unwrap() = Some(snapshot);
+    }
+}
 #[derive(Debug)]
 pub(crate) struct HistoryCheckDeadline;
 impl std::fmt::Display for HistoryCheckDeadline {
@@ -227,7 +325,7 @@ pub(crate) async fn prepare_completed_history_owned(
             compiled_prompt: None,
         };
         diagnostic.stage = "budget".into();
-        let full = NativeRequestProjection::full(request, vec![], budget.clone(), false)?;
+        let full = completed_history_request_projection(request, budget.clone())?;
         diagnostic.estimated_input_tokens = Some(
             full.estimated_input_tokens
                 .saturating_add(fixed_input_tokens),
@@ -238,12 +336,27 @@ pub(crate) async fn prepare_completed_history_owned(
         diagnostic.context_tokens = Some(budget.context);
         diagnostic.input_limit = budget.input_limit;
         diagnostic.output_reserve = Some(full.output_reserve);
-        if budget.fits(
+        let fits = budget.fits(
             full.estimated_input_tokens
                 .saturating_add(fixed_input_tokens),
             full.output_reserve,
             false,
-        ) {
+        );
+        #[cfg(test)]
+        observe_completed_history_request(
+            &store,
+            workspace,
+            thread,
+            turn,
+            CompletedHistoryPreflightSnapshot {
+                request: full.request.clone(),
+                estimated_input_tokens: full.estimated_input_tokens,
+                fixed_input_tokens,
+                output_reserve: full.output_reserve,
+                fits,
+            },
+        );
+        if fits {
             diagnostic.code = "history_fits".into();
             return Ok(None);
         }

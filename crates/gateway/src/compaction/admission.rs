@@ -73,6 +73,7 @@ pub(crate) async fn admit_operation(
         &projection_identity,
         &prepared.plan.fingerprint,
         &prepared.target_identity,
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
         selection,
         &budget,
         prepared.target_tokens,
@@ -228,6 +229,11 @@ pub(crate) async fn admit_operation(
         prepared.target_tokens,
         prepared.summary_basis,
     )?;
+    ensure!(
+        initial.source_text_projection_version
+            == pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+        "runner and historical command projections disagree"
+    );
     store
         .compaction_activate_runner(&snapshot.id, &initial)
         .await?;

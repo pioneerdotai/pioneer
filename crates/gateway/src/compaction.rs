@@ -22,12 +22,20 @@ mod service;
 pub(crate) mod test_support;
 mod tool_outcomes;
 pub(crate) use admission::{PreparedOperation, admit_operation};
-#[cfg(test)]
-pub(crate) use background_history::prepare_completed_history;
 pub(crate) use background_history::{HistoryCheckDeadline, prepare_completed_history_owned};
 #[cfg(test)]
-pub(crate) use history::load_line_history;
+pub(crate) use background_history::{
+    observe_completed_history_preflight, prepare_completed_history,
+};
 pub(crate) use history::provider_observation;
+#[cfg(test)]
+pub(crate) use history::{event_message, load_line_history};
+#[cfg(test)]
+pub(crate) fn legacy_event_message(
+    event: pioneer_crud::CanonicalTurnEventPayload,
+) -> anyhow::Result<Option<pioneer_provider::ChatMessage>> {
+    history::legacy_event_message(event)
+}
 #[cfg(test)]
 pub(crate) use native::observe_prepared_transfers;
 pub(crate) use native::{GatewayNativeContextController, native_owner};
@@ -239,12 +247,52 @@ pub(crate) enum CompactionExit {
 struct Portion {
     request: SummaryRequest,
     cursor: SourceCursor,
+    source_text_projection_version: u32,
     completed: Vec<SourceRef>,
     final_portion: bool,
 }
 
 const RUNNER_FRAGMENT_CHARACTERS: u64 = 16_384;
 const RUNNER_INDEX_STRIDE: u64 = 1_024;
+
+fn historical_source_model_payload(
+    source: &SourceRef,
+    payload: String,
+    projection_version: u32,
+) -> Result<String> {
+    if projection_version == 0 {
+        return Ok(payload);
+    }
+    ensure!(
+        projection_version == pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+        "unsupported historical source text projection"
+    );
+    if source.scope.starts_with("item:") {
+        let Ok(item) = serde_json::from_str::<pioneer_protocol::TurnItem>(&payload) else {
+            return Ok(payload);
+        };
+        return match item.historical_command_llm_projection() {
+            Some(projection) => Ok(serde_json::to_string(&projection)?),
+            None => Ok(payload),
+        };
+    }
+    if source.scope.starts_with("event:") {
+        let Ok(event) = serde_json::from_str::<pioneer_crud::CanonicalTurnEventPayload>(&payload)
+        else {
+            return Ok(payload);
+        };
+        return Ok(history::historical_command_event_json(&event)?.unwrap_or(payload));
+    }
+    Ok(payload)
+}
+
+fn source_text_projection_for_cursor(state: &RunnerState) -> u32 {
+    if state.source_text_projection_version == 0 && state.cursor.character == 0 {
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+    } else {
+        state.source_text_projection_version
+    }
+}
 
 struct IndexedPayload {
     text: String,
@@ -309,6 +357,7 @@ impl IndexedPayload {
 struct ActivePayload {
     thread: String,
     source: SourceRef,
+    projection_version: u32,
     payload: Arc<IndexedPayload>,
 }
 
@@ -361,17 +410,35 @@ impl CompactionRunner {
         }
     }
 
+    #[cfg(test)]
     async fn active_payload_fragment(
         &self,
         thread: &str,
         source: &SourceRef,
         character_offset: u64,
     ) -> Result<CanonicalFragment> {
+        self.active_payload_fragment_with_projection(
+            thread,
+            source,
+            character_offset,
+            pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+        )
+        .await
+    }
+
+    async fn active_payload_fragment_with_projection(
+        &self,
+        thread: &str,
+        source: &SourceRef,
+        character_offset: u64,
+        projection_version: u32,
+    ) -> Result<CanonicalFragment> {
         let cached = {
             let mut cache = self.active_payload.lock().await;
             if let Some(active) = cache.as_ref()
                 && active.thread == thread
                 && active.source == *source
+                && active.projection_version == projection_version
             {
                 Some(active.payload.clone())
             } else {
@@ -404,11 +471,14 @@ impl CompactionRunner {
                 #[cfg(test)]
                 self.active_payload_loads
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Index construction happens after the reader has been released.
+                // Projection and index construction happen after the reader has
+                // been released. The cache is revision- and representation-keyed.
+                let text = historical_source_model_payload(source, text, projection_version)?;
                 let payload = Arc::new(IndexedPayload::new(text));
                 *self.active_payload.lock().await = Some(ActivePayload {
                     thread: thread.to_owned(),
                     source: source.clone(),
+                    projection_version,
                     payload: payload.clone(),
                 });
                 payload
@@ -417,7 +487,18 @@ impl CompactionRunner {
         payload.fragment(source, character_offset)
     }
 
+    #[cfg(test)]
     async fn reference_excerpts(&self) -> Result<&Vec<ReferenceExcerpt>> {
+        self.reference_excerpts_with_projection(
+            pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+        )
+        .await
+    }
+
+    async fn reference_excerpts_with_projection(
+        &self,
+        projection_version: u32,
+    ) -> Result<&Vec<ReferenceExcerpt>> {
         self.reference_excerpts
             .get_or_try_init(|| async {
                 let entries = self
@@ -442,6 +523,11 @@ impl CompactionRunner {
                         )
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("reference source unavailable or stale"))?;
+                    let payload = historical_source_model_payload(
+                        &entry.source,
+                        payload,
+                        projection_version,
+                    )?;
                     let mut characters = payload.chars();
                     let excerpt = characters
                         .by_ref()
@@ -778,13 +864,15 @@ impl CompactionRunner {
                                 projection_version: self.snapshot.projection_version,
                                 format_version: 1,
                             };
-                            let next = state.candidate(
+                            let mut next = state.candidate(
                                 state.attempts,
                                 checkpoint.id.clone(),
                                 portion.cursor,
                                 portion.final_portion,
                                 self.clock.now_ms(),
                             )?;
+                            next.source_text_projection_version =
+                                portion.source_text_projection_version;
                             state = self.persist(&state, next, Some(&checkpoint)).await?;
                         }
                     }
@@ -947,13 +1035,23 @@ impl CompactionRunner {
             return Ok(Portion {
                 request,
                 cursor: state.cursor,
+                source_text_projection_version: state.source_text_projection_version,
                 completed: vec![],
                 final_portion: true,
             });
         }
         // Build bounded reference-only excerpts before materializing the active
         // full payload. They are reused across portions and retries.
-        let reference_excerpts = self.reference_excerpts().await?;
+        let source_text_projection_version = source_text_projection_for_cursor(state);
+        let finish_legacy_source_before_upgrade =
+            state.source_text_projection_version == 0 && state.cursor.character > 0;
+        // Reference-only excerpts carry no cursor or coverage, so they can use
+        // the current projection even while a legacy active source drains.
+        let reference_excerpts = self
+            .reference_excerpts_with_projection(
+                pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+            )
+            .await?;
         let mut reference_scopes = BTreeMap::<&str, Vec<SourceRef>>::new();
         for excerpt in reference_excerpts {
             reference_scopes
@@ -997,7 +1095,12 @@ impl CompactionRunner {
         // Reference-only bodies are optional context. They never acquire coverage.
         // Reserve a source fragment before adding them, so they cannot starve work.
         let initial = self
-            .active_payload_fragment(&first.thread_id, &first.source, state.cursor.character)
+            .active_payload_fragment_with_projection(
+                &first.thread_id,
+                &first.source,
+                state.cursor.character,
+                source_text_projection_version,
+            )
             .await?;
         let reserve_part = SummaryPart {
             sources: vec![first.source.clone()],
@@ -1035,7 +1138,12 @@ impl CompactionRunner {
                 )
                 .await?;
             let fragment = self
-                .active_payload_fragment(&entry.thread_id, &entry.source, cursor.character)
+                .active_payload_fragment_with_projection(
+                    &entry.thread_id,
+                    &entry.source,
+                    cursor.character,
+                    source_text_projection_version,
+                )
                 .await?;
             let next = page.get(1);
             let source_index = if entry.unit == cursor.unit {
@@ -1062,6 +1170,7 @@ impl CompactionRunner {
                     return Ok(Portion {
                         request,
                         cursor,
+                        source_text_projection_version,
                         completed,
                         final_portion: false,
                     });
@@ -1099,6 +1208,7 @@ impl CompactionRunner {
                         source: source_index,
                         character,
                     },
+                    source_text_projection_version,
                     completed,
                     final_portion: false,
                 });
@@ -1138,10 +1248,20 @@ impl CompactionRunner {
                         character: 0,
                     },
                 };
+                if finish_legacy_source_before_upgrade {
+                    return Ok(Portion {
+                        request,
+                        cursor,
+                        source_text_projection_version,
+                        completed,
+                        final_portion: next.is_none(),
+                    });
+                }
                 if finishes_unit {
                     boundary = Some(Portion {
                         request: request.clone(),
                         cursor,
+                        source_text_projection_version,
                         completed: completed.clone(),
                         final_portion: next.is_none(),
                     });
@@ -1150,6 +1270,7 @@ impl CompactionRunner {
                     return Ok(Portion {
                         request,
                         cursor,
+                        source_text_projection_version,
                         completed,
                         final_portion: true,
                     });
@@ -1166,6 +1287,7 @@ impl CompactionRunner {
         Ok(Portion {
             request,
             cursor,
+            source_text_projection_version,
             completed,
             final_portion: false,
         })

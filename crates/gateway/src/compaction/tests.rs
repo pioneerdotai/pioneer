@@ -396,6 +396,601 @@ fn indexed_runner_payload_keeps_unicode_character_cursor_stable() {
     assert_eq!(rebuilt, text);
 }
 
+fn historical_command_fixture(output: &str) -> pioneer_protocol::TurnItem {
+    use pioneer_protocol::{
+        ToolCallStatus, ToolDisplayPayload, ToolOutputPolicySnapshot, ToolStoragePayload, TurnItem,
+    };
+    TurnItem::CommandExecution {
+        id: "historical-command".into(),
+        tool_name: "exec_command".into(),
+        arguments: serde_json::json!({"command":["printf","fixture"],"cwd":"/workspace"}),
+        status: ToolCallStatus::Completed,
+        recovery_policy: None,
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+        display: ToolDisplayPayload::Shell {
+            stdout: Some(output.into()),
+            stderr: None,
+            aggregated_output: Some(output.into()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            timed_out: Some(false),
+            truncated: false,
+        },
+        storage: ToolStoragePayload::Shell {
+            stdout: Some(output.into()),
+            stderr: None,
+            aggregated_output: Some(output.into()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            timed_out: Some(false),
+            truncated: false,
+        },
+        recovery: None,
+        command: vec!["printf".into(), "fixture".into()],
+        cwd: Some("/workspace".into()),
+        success: Some(true),
+        outcome: None,
+        observation: None,
+    }
+}
+
+#[test]
+fn compaction_source_projection_normalizes_item_and_event_before_fragmenting() {
+    let unique = "summarizer-unique-output ".repeat(512);
+    let item = historical_command_fixture(&unique);
+    let item_source = SourceRef {
+        scope: "item:turn".into(),
+        id: "item-source".into(),
+        version: "item-revision:1".into(),
+    };
+    let item_raw = serde_json::to_string(&item).unwrap();
+    let item_model = historical_source_model_payload(
+        &item_source,
+        item_raw.clone(),
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+    )
+    .unwrap();
+    assert_eq!(item_model.matches(&unique).count(), 1);
+    assert_eq!(
+        historical_source_model_payload(&item_source, item_raw.clone(), 0).unwrap(),
+        item_raw
+    );
+
+    let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item,
+        },
+    );
+    let event_source = SourceRef {
+        scope: "event:turn".into(),
+        id: "event-source".into(),
+        version: "event-revision:1".into(),
+    };
+    let event_model = historical_source_model_payload(
+        &event_source,
+        serde_json::to_string(&event).unwrap(),
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+    )
+    .unwrap();
+    assert_eq!(event_model.matches(&unique).count(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event_model).unwrap()["payload"]["workspace_id"],
+        "ws"
+    );
+
+    let mut updated_item = historical_command_fixture(&unique);
+    let pioneer_protocol::TurnItem::CommandExecution { storage, .. } = &mut updated_item else {
+        unreachable!()
+    };
+    let pioneer_protocol::ToolStoragePayload::Shell { stderr, .. } = storage else {
+        unreachable!()
+    };
+    *stderr = Some("updated-source-storage-diagnostic".into());
+    let updated = pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(
+        pioneer_protocol::ItemUpdatedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: updated_item,
+        },
+    );
+    let updated_raw = serde_json::to_string(&updated).unwrap();
+    let updated_model = historical_source_model_payload(
+        &event_source,
+        updated_raw.clone(),
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+    )
+    .unwrap();
+    assert_eq!(updated_model.matches(&unique).count(), 1);
+    assert_eq!(
+        updated_model
+            .matches("updated-source-storage-diagnostic")
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&updated_model).unwrap()["kind"],
+        "item_updated"
+    );
+    assert_eq!(
+        historical_source_model_payload(&event_source, updated_raw.clone(), 0).unwrap(),
+        updated_raw
+    );
+}
+
+#[test]
+fn durable_character_cursor_remains_bound_to_its_text_projection() {
+    let source = SourceRef {
+        scope: "item:turn".into(),
+        id: "item-source".into(),
+        version: "item-revision:1".into(),
+    };
+    let raw = serde_json::to_string(&historical_command_fixture(&"cursor-output ".repeat(2_000)))
+        .unwrap();
+    let current = historical_source_model_payload(
+        &source,
+        raw.clone(),
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+    )
+    .unwrap();
+    assert_ne!(raw.len(), current.len());
+
+    let mut legacy_json = serde_json::to_value(
+        RunnerState::new(900_000, &ModelBudget::new(None, None, None), 500, None).unwrap(),
+    )
+    .unwrap();
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("source_text_projection_version");
+    legacy_json["cursor"]["character"] = serde_json::json!(37);
+    let legacy: RunnerState = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy.source_text_projection_version, 0);
+    assert_eq!(source_text_projection_for_cursor(&legacy), 0);
+    let legacy_text = historical_source_model_payload(
+        &source,
+        raw.clone(),
+        legacy.source_text_projection_version,
+    )
+    .unwrap();
+    let expected = IndexedPayload::new(raw)
+        .fragment(&source, legacy.cursor.character)
+        .unwrap();
+    assert_eq!(
+        IndexedPayload::new(legacy_text)
+            .fragment(&source, legacy.cursor.character)
+            .unwrap()
+            .text,
+        expected.text
+    );
+    let retry = legacy.claim(0).unwrap();
+    let retry_after_restart: RunnerState =
+        serde_json::from_str(&serde_json::to_string(&retry).unwrap()).unwrap();
+    assert_eq!(retry_after_restart.cursor, legacy.cursor);
+    assert_eq!(retry_after_restart.source_text_projection_version, 0);
+    let mut legacy_boundary = legacy.clone();
+    legacy_boundary.cursor.character = 0;
+    assert_eq!(
+        source_text_projection_for_cursor(&legacy_boundary),
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+    );
+
+    let fresh = RunnerState::new(900_000, &ModelBudget::new(None, None, None), 500, None).unwrap();
+    assert_eq!(
+        fresh.source_text_projection_version,
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+    );
+    let restarted: RunnerState =
+        serde_json::from_str(&serde_json::to_string(&fresh).unwrap()).unwrap();
+    assert_eq!(
+        restarted.source_text_projection_version,
+        fresh.source_text_projection_version
+    );
+    let indexed = IndexedPayload::new(current.clone());
+    let mut rebuilt = String::new();
+    let mut cursor = 0;
+    loop {
+        let fragment = indexed.fragment(&source, cursor).unwrap();
+        rebuilt.push_str(&fragment.text);
+        let Some(next) = fragment.next_character else {
+            break;
+        };
+        cursor = next;
+    }
+    assert_eq!(rebuilt, current);
+}
+
+#[test]
+fn native_preflight_counts_the_projected_history_that_will_be_sent() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_provider::ChatMessage;
+
+    let item = historical_command_fixture(&"token-fixture-output ".repeat(4_000));
+    let legacy = ChatMessage::user(format!(
+        "Recorded historical event:\n{}",
+        serde_json::to_string(&item).unwrap()
+    ));
+    let projected = ChatMessage::user(format!(
+        "Recorded historical event:\n{}",
+        super::history::historical_item_json(&item).unwrap()
+    ));
+    let request = |message| ChatRequest {
+        model: "fixture".into(),
+        messages: vec![message, ChatMessage::user("current input")],
+        temperature: None,
+        max_tokens: Some(128),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let measuring = ModelBudget::new(Some(1_000_000), None, Some(128));
+    let old =
+        NativeRequestProjection::full(request(legacy), vec![], measuring.clone(), false).unwrap();
+    let new = NativeRequestProjection::full(request(projected), vec![], measuring, false).unwrap();
+    assert!(old.estimated_input_tokens > new.estimated_input_tokens);
+    let context = pioneer_compaction::padded_input(new.estimated_input_tokens)
+        .saturating_add(new.output_reserve);
+    let selected = ModelBudget::new(Some(context), None, Some(128));
+    let old = super::background_history::completed_history_request_projection(
+        old.request,
+        selected.clone(),
+    )
+    .unwrap();
+    let new =
+        super::background_history::completed_history_request_projection(new.request, selected)
+            .unwrap();
+    assert!(
+        !old.fits,
+        "legacy duplicated history must exceed this fixture budget"
+    );
+    assert!(
+        new.fits,
+        "projected history must fit the same fixture budget"
+    );
+}
+
+#[tokio::test]
+async fn canonical_command_history_fits_real_foreground_preflight_after_projection() {
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_provider::{ChatMessage, ProviderRegistry};
+
+    super::load_test_catalog();
+    let limits = pioneer_provider::catalog::model_catalog()
+        .unwrap()
+        .limits("openai", "gpt-4");
+    let budget = ModelBudget::new(
+        Some(limits.context_window),
+        limits.max_input,
+        limits.max_output,
+    );
+    let request = |message| ChatRequest {
+        model: "gpt-4".into(),
+        messages: vec![message, ChatMessage::user("current foreground input")],
+        temperature: None,
+        max_tokens: Some(512),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    for updated in [false, true] {
+        let command_event = |item| {
+            if updated {
+                pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(
+                    pioneer_protocol::ItemUpdatedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        item,
+                    },
+                )
+            } else {
+                pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        item,
+                    },
+                )
+            }
+        };
+        let mut repeats = 256;
+        let (unique, diagnostic, item, legacy, projected) = loop {
+            let unique = "canonical-preflight-output ".repeat(repeats);
+            let diagnostic = "storage-only-preflight-diagnostic".to_owned();
+            let mut item = historical_command_fixture(&unique);
+            let pioneer_protocol::TurnItem::CommandExecution { storage, .. } = &mut item else {
+                unreachable!()
+            };
+            let pioneer_protocol::ToolStoragePayload::Shell { stderr, .. } = storage else {
+                unreachable!()
+            };
+            *stderr = Some(diagnostic.clone());
+            let event = command_event(item.clone());
+            let legacy = super::history::legacy_event_message(event.clone())
+                .unwrap()
+                .unwrap();
+            let projected = super::history::event_message(event).unwrap().unwrap();
+            let old = NativeRequestProjection::full(
+                request(legacy.clone()),
+                vec![],
+                budget.clone(),
+                false,
+            )
+            .unwrap();
+            let new = NativeRequestProjection::full(
+                request(projected.clone()),
+                vec![],
+                budget.clone(),
+                false,
+            )
+            .unwrap();
+            if !old.fits && new.fits {
+                break (unique, diagnostic, item, old, new);
+            }
+            repeats += 256;
+            assert!(repeats <= 32_768, "could not construct a boundary fixture");
+        };
+        assert!(!legacy.fits);
+        assert!(projected.fits);
+        let canonical = command_event(item);
+        let f = fixture_with_canonical_payload(
+            serde_json::to_string(&canonical).unwrap(),
+            vec![],
+            true,
+            false,
+        )
+        .await;
+        let fence = f.store.compaction_history_read_fence().await.unwrap();
+        let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+            .await
+            .unwrap();
+        let command = history
+            .iter()
+            .find(|message| message.content.contains("canonical-preflight-output"))
+            .expect("canonical command entered cold history");
+        assert_eq!(command.content.matches(&unique).count(), 1);
+        assert_eq!(command.content.matches(&diagnostic).count(), 1);
+
+        let providers = ProviderRegistry::new(|_| "fixture-key".into());
+        providers
+            .insert("summary-fixture", f.provider.clone())
+            .unwrap();
+        providers
+            .insert("main-fixture", Arc::new(SmallWindowMain))
+            .unwrap();
+        let context = NativeContext {
+            overflow_recovery: false,
+            recovery_deadline_ms: None,
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            conversation_thread_id: None,
+            provider_instance: "main-fixture".into(),
+            provider: providers
+                .get_or_create_for_workspace("ws", "main-fixture")
+                .unwrap(),
+            events: Arc::new(ExecutionEventHub::new()),
+            cancellation: CancellationToken::new(),
+        };
+        let actual_request = ChatRequest {
+            model: "gpt-4".into(),
+            messages: history
+                .into_iter()
+                .chain(std::iter::once(ChatMessage::user(
+                    "current foreground input",
+                )))
+                .collect(),
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let prepared = super::native::prepare_native_projection(
+            &f.store,
+            &providers,
+            &CompactionSettings {
+                selection: Some(ModelSelection {
+                    transport: Transport::Api,
+                    instance: "summary-fixture".into(),
+                    model: "fixture-model".into(),
+                    effort: None,
+                }),
+            },
+            &context,
+            actual_request,
+            None,
+            false,
+            f.observer.clone(),
+            f.clock.clone(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*f.provider.count.borrow(), 0);
+        assert_eq!(
+            prepared
+                .request
+                .messages
+                .iter()
+                .map(|message| message.content.matches(&unique).count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            prepared
+                .request
+                .messages
+                .iter()
+                .map(|message| message.content.matches(&diagnostic).count())
+                .sum::<usize>(),
+            1
+        );
+        let evaluated =
+            NativeRequestProjection::full(prepared.request.clone(), vec![], budget.clone(), false)
+                .unwrap();
+        assert!(evaluated.fits);
+        assert_eq!(
+            prepared.history_check.target_output_cap as u64,
+            evaluated.output_reserve
+        );
+        assert_eq!(
+            prepared.history_check.fixed_input_tokens,
+            evaluated.fixed_input_tokens
+        );
+        context.events.shutdown_progress().await;
+    }
+}
+
+#[tokio::test]
+async fn genuinely_large_command_history_compacts_through_real_foreground_preflight() {
+    use pioneer_agent::compaction::controller::NativeContext;
+    use pioneer_provider::{ChatMessage, ProviderRegistry};
+
+    let marker = "foreground-large-command-marker";
+    let unique = format!("{marker}\n{}", "large command body ".repeat(30_000));
+    let canonical = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: historical_command_fixture(&unique),
+        },
+    );
+    let f = fixture_with_canonical_payload(
+        serde_json::to_string(&canonical).unwrap(),
+        vec![],
+        true,
+        false,
+    )
+    .await;
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let history = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+        .await
+        .unwrap();
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let context = NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        conversation_thread_id: None,
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let prepared = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &CompactionSettings {
+            selection: Some(ModelSelection {
+                transport: Transport::Api,
+                instance: "summary-fixture".into(),
+                model: "fixture-model".into(),
+                effort: None,
+            }),
+        },
+        &context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: history
+                .into_iter()
+                .chain(std::iter::once(ChatMessage::user("current input")))
+                .collect(),
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(f.provider.count.borrow().clone() > 0);
+    assert!(prepared.receipt.identity.checkpoint.is_some());
+    let calls = f.provider.calls.lock().unwrap();
+    let mut compacted = String::new();
+    for call in calls.iter() {
+        let input: SummaryInput = serde_json::from_str(&call.messages[1].content).unwrap();
+        for unit in input.compact_units {
+            compacted.push_str(&unit.text);
+        }
+    }
+    assert_eq!(compacted.matches(marker).count(), 1);
+    drop(calls);
+    context.events.shutdown_progress().await;
+}
+
+#[test]
+fn ordinary_active_api_tool_result_is_not_rewritten_by_history_projection() {
+    use pioneer_agent::compaction::request::NativeRequestProjection;
+    use pioneer_provider::{ChatMessage, ProviderToolCall};
+    let result = ChatMessage::tool_result(
+        "call",
+        "exec_command",
+        "active-api-output\nactive-api-output",
+    );
+    let request = ChatRequest {
+        model: "fixture".into(),
+        messages: vec![
+            ChatMessage::assistant_tool_calls(
+                None::<String>,
+                vec![ProviderToolCall {
+                    id: "call".into(),
+                    name: "exec_command".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            result.clone(),
+        ],
+        temperature: None,
+        max_tokens: Some(128),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let evaluated = NativeRequestProjection::full(
+        request,
+        vec![],
+        ModelBudget::new(Some(16_384), None, Some(128)),
+        false,
+    )
+    .unwrap();
+    assert_eq!(evaluated.request.messages[1], result);
+}
+
 #[tokio::test]
 async fn runner_keeps_large_compressed_active_payload_while_loading_reference_only_excerpt() {
     let f = fixture(&"漢🌍".repeat(40_000), vec![], true, false).await;
@@ -486,6 +1081,382 @@ async fn runner_keeps_large_compressed_active_payload_while_loading_reference_on
         f.runner.active_payload_loads.load(Ordering::SeqCst),
         1,
         "the active compressed object was materialized more than once"
+    );
+}
+
+#[tokio::test]
+async fn reference_only_command_event_uses_the_same_deduplicated_projection() {
+    for updated in [false, true] {
+        let f = fixture("active", vec![], true, false).await;
+        let unique = "reference-only-unique-output ".repeat(64);
+        let diagnostic = "reference-only-storage-diagnostic";
+        let mut item = historical_command_fixture(&unique);
+        let pioneer_protocol::TurnItem::CommandExecution { storage, .. } = &mut item else {
+            unreachable!()
+        };
+        let pioneer_protocol::ToolStoragePayload::Shell { stderr, .. } = storage else {
+            unreachable!()
+        };
+        *stderr = Some(diagnostic.into());
+        let event = if updated {
+            pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(
+                pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item,
+                },
+            )
+        } else {
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item,
+                },
+            )
+        };
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES('command-reference','thread','turn',2,?,?,CURRENT_TIMESTAMP)",
+        [
+            (if updated { pioneer_protocol::constants::events::ITEM_UPDATED } else { pioneer_protocol::constants::events::ITEM_COMPLETED }).into(),
+            serde_json::to_string(&event).unwrap().into(),
+        ],
+    )).await.unwrap();
+        let page = f
+            .store
+            .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+            .await
+            .unwrap();
+        assert!(page.next_sequence >= 2);
+        let reference = page
+            .entries
+            .iter()
+            .find(|entry| entry.reference.id == "command-reference")
+            .unwrap()
+            .reference
+            .clone();
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,0,1,'thread',?,?,?)",
+        [reference.scope.into(), reference.id.into(), reference.version.into()],
+    )).await.unwrap();
+        let excerpts = f.runner.reference_excerpts().await.unwrap();
+        let excerpt = excerpts
+            .iter()
+            .find(|excerpt| excerpt.text.contains("reference-only-unique-output"))
+            .unwrap();
+        assert_eq!(excerpt.text.matches(&unique).count(), 1);
+        assert_eq!(excerpt.text.matches(diagnostic).count(), 1);
+
+        assert!(matches!(
+            f.runner.run(CancellationToken::new()).await.unwrap(),
+            CompactionExit::Applied(_)
+        ));
+        let calls = f.provider.calls.lock().unwrap();
+        let request_excerpt = calls
+            .iter()
+            .flat_map(|call| {
+                let input: SummaryInput = serde_json::from_str(&call.messages[1].content).unwrap();
+                input.reference_only
+            })
+            .find(|material| material.source.id == "command-reference")
+            .expect("inserted reference-only command reached the summarizer request");
+        assert_eq!(request_excerpt.text.matches(&unique).count(), 1);
+        assert_eq!(request_excerpt.text.matches(diagnostic).count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn frozen_command_upgrade_is_bound_to_canonical_event_not_message_text() {
+    use pioneer_provider::{MessageProvenance, MessageSourceRef};
+
+    async fn restore_model(
+        store: &CrudStore,
+        workspace: &str,
+        allowed: &std::collections::BTreeSet<String>,
+        descriptor: &pioneer_compaction::frozen::FrozenHistoryRef,
+    ) -> Result<Vec<pioneer_provider::ChatMessage>> {
+        Ok(super::frozen::restore_accepted_history_for_execution(
+            store,
+            workspace,
+            None,
+            "thread",
+            allowed,
+            &serde_json::to_string(descriptor)?,
+        )
+        .await?
+        .messages)
+    }
+
+    let f = fixture("unused", vec![], true, false).await;
+    // The runner fixture owns an unprojected synthetic event in `turn`.
+    // Materialize these canonical events in a fresh turn so their authoritative
+    // projection has no unrelated predecessor to wait for.
+    f.store
+        .database_connection()
+        .execute_unprepared(
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+             VALUES('frozen-command-turn','thread','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        )
+        .await
+        .unwrap();
+    let unique = "frozen-command-output ".repeat(128);
+    let notification = pioneer_protocol::ItemCompletedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "frozen-command-turn".into(),
+        item: historical_command_fixture(&unique),
+    };
+    f.store
+        .materialize_item_completed(notification.clone(), chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    let source = f
+        .store
+        .compaction_source_page("ws", "thread", "frozen-command-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.source_type == pioneer_protocol::constants::events::ITEM_COMPLETED
+                && entry.reference.id != "source"
+        })
+        .expect("materialized command event source")
+        .reference;
+    let provenance = || MessageProvenance {
+        logical_turn_id: Some("frozen-command-turn".into()),
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "frozen-command".into(),
+        sources: vec![MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        }],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    };
+    let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification);
+    let mut legacy = super::history::legacy_event_message(event.clone())
+        .unwrap()
+        .unwrap();
+    legacy.provenance = Some(provenance());
+    let mut current = super::history::event_message(event).unwrap().unwrap();
+    current.provenance = Some(provenance());
+    let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
+
+    let legacy_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        std::slice::from_ref(&legacy),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &legacy_descriptor)
+            .await
+            .unwrap(),
+        vec![legacy],
+        "literal restore must retain the authenticated legacy command wire"
+    );
+    let restored = restore_model(&f.store, "ws", &allowed, &legacy_descriptor)
+        .await
+        .unwrap();
+    assert_eq!(restored, vec![current.clone()]);
+    assert_eq!(restored[0].content.matches(&unique).count(), 1);
+    let mut corrupted = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &legacy_descriptor.manifest_id, 0)
+        .await
+        .unwrap()
+        .remove(0);
+    corrupted.wire_sha256 = "0".repeat(64);
+    assert!(
+        super::frozen::restore_reference_for_test(&f.store, "ws", &corrupted)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no longer renders")
+    );
+
+    let current_descriptor =
+        super::frozen::capture(&f.store, "ws", "thread", &allowed, &[current.clone()])
+            .await
+            .unwrap();
+    assert_eq!(
+        restore_model(&f.store, "ws", &allowed, &current_descriptor)
+            .await
+            .unwrap(),
+        vec![current]
+    );
+
+    let mut updated_item = historical_command_fixture("frozen-updated-unique-output");
+    let pioneer_protocol::TurnItem::CommandExecution { storage, .. } = &mut updated_item else {
+        unreachable!()
+    };
+    let pioneer_protocol::ToolStoragePayload::Shell { stderr, .. } = storage else {
+        unreachable!()
+    };
+    *stderr = Some("frozen-updated-storage-diagnostic".into());
+    let update = pioneer_protocol::ItemUpdatedNotification {
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        turn_id: "frozen-command-turn".into(),
+        item: updated_item,
+    };
+    f.store
+        .materialize_item_updated(update.clone(), chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    let updated_source = f
+        .store
+        .compaction_source_page("ws", "thread", "frozen-command-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.source_type == pioneer_protocol::constants::events::ITEM_UPDATED)
+        .expect("materialized updated command source")
+        .reference;
+    let updated_event = pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(update);
+    let mut updated_legacy = super::history::legacy_event_message(updated_event.clone())
+        .unwrap()
+        .unwrap();
+    let mut updated_current = super::history::event_message(updated_event)
+        .unwrap()
+        .unwrap();
+    let mut updated_provenance = provenance();
+    updated_provenance.sources = vec![MessageSourceRef {
+        scope: updated_source.scope,
+        id: updated_source.id,
+        version: updated_source.version,
+    }];
+    updated_legacy.provenance = Some(updated_provenance.clone());
+    updated_current.provenance = Some(updated_provenance);
+    let updated_legacy_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        std::slice::from_ref(&updated_legacy),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &updated_legacy_descriptor)
+            .await
+            .unwrap(),
+        vec![updated_legacy],
+        "literal restore must retain the authenticated legacy ItemUpdated wire"
+    );
+    let updated_restored = restore_model(&f.store, "ws", &allowed, &updated_legacy_descriptor)
+        .await
+        .unwrap();
+    assert_eq!(updated_restored, vec![updated_current.clone()]);
+    assert_eq!(
+        updated_restored[0]
+            .content
+            .matches("frozen-updated-unique-output")
+            .count(),
+        1
+    );
+    assert_eq!(
+        updated_restored[0]
+            .content
+            .matches("frozen-updated-storage-diagnostic")
+            .count(),
+        1
+    );
+    let mut corrupted_update = f
+        .store
+        .compaction_frozen_history_page("ws", "thread", &updated_legacy_descriptor.manifest_id, 0)
+        .await
+        .unwrap()
+        .remove(0);
+    corrupted_update.wire_sha256 = "0".repeat(64);
+    assert!(
+        super::frozen::restore_reference_for_test(&f.store, "ws", &corrupted_update)
+            .await
+            .is_err()
+    );
+    let updated_current_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        std::slice::from_ref(&updated_current),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restore_model(&f.store, "ws", &allowed, &updated_current_descriptor)
+            .await
+            .unwrap(),
+        vec![updated_current]
+    );
+
+    let pasted_item = historical_command_fixture("pasted-user-output");
+    let pasted_text = format!(
+        "Recorded historical event:\n{}",
+        serde_json::to_string(&pasted_item).unwrap()
+    );
+    let input = pioneer_protocol::UserInput::Text {
+        text: pasted_text.clone(),
+        text_elements: vec![],
+    };
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES('pasted-input','turn',99,'text',?,?,CURRENT_TIMESTAMP)",
+        [pasted_text.into(), serde_json::to_string(&input).unwrap().into()],
+    )).await.unwrap();
+    let input_source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Input, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.reference.id == "pasted-input")
+        .unwrap()
+        .reference;
+    let mut input_message = super::history::input_message(&[input]).unwrap();
+    input_message.provenance = Some(MessageProvenance {
+        logical_turn_id: Some("turn".into()),
+        workspace_id: "ws".into(),
+        thread_id: "thread".into(),
+        context_thread: None,
+        unit_id: "pasted-input".into(),
+        sources: vec![MessageSourceRef {
+            scope: input_source.scope,
+            id: input_source.id,
+            version: input_source.version,
+        }],
+        complete: true,
+        protected_input: true,
+        inherited: false,
+    });
+    let descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &allowed,
+        std::slice::from_ref(&input_message),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restore_model(&f.store, "ws", &allowed, &descriptor)
+            .await
+            .unwrap(),
+        vec![input_message]
     );
 }
 
@@ -965,6 +1936,31 @@ async fn fixture(
     target_fits: bool,
     observer_fails: bool,
 ) -> Fixture {
+    fixture_with_canonical_payload(
+        serde_json::json!({"text":text}).to_string(),
+        replies,
+        target_fits,
+        observer_fails,
+    )
+    .await
+}
+
+async fn fixture_with_canonical_payload(
+    payload: String,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+) -> Fixture {
+    fixture_with_canonical_payloads(vec![payload], replies, target_fits, observer_fails).await
+}
+
+async fn fixture_with_canonical_payloads(
+    payloads: Vec<String>,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+) -> Fixture {
+    assert!(!payloads.is_empty());
     super::load_test_catalog();
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -981,15 +1977,23 @@ async fn fixture(
             .await
             .unwrap();
     }
-    let payload = serde_json::json!({"text":text}).to_string();
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('source','thread','turn',1,'fixture',?,CURRENT_TIMESTAMP)",[payload.clone().into()])).await.unwrap();
-    let source = store
+    for (index, payload) in payloads.iter().enumerate() {
+        let id = if index == 0 {
+            "source".to_owned()
+        } else {
+            format!("source-{index}")
+        };
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",[id.into(), i64::try_from(index + 1).unwrap().into(), payload.clone().into()])).await.unwrap();
+    }
+    let sources = store
         .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
         .await
         .unwrap()
-        .entries[0]
-        .reference
-        .clone();
+        .entries
+        .into_iter()
+        .map(|entry| entry.reference)
+        .collect::<Vec<_>>();
+    assert_eq!(sources.len(), payloads.len());
     let selection = ModelSelection {
         transport: Transport::Api,
         instance: "fixture-instance".into(),
@@ -1020,20 +2024,27 @@ async fn fixture(
         .unwrap();
     let budget = ModelBudget::new(Some(4096), None, None);
     store
-        .compaction_prepare_runner("operation", &budget, 1, 0)
+        .compaction_prepare_runner(
+            "operation",
+            &budget,
+            u64::try_from(sources.len()).unwrap(),
+            0,
+        )
         .await
         .unwrap();
+    let manifest = sources
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| ManifestEntry {
+            ordinal: u64::try_from(index).unwrap(),
+            unit: 0,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source,
+        })
+        .collect::<Vec<_>>();
     store
-        .compaction_append_manifest(
-            "operation",
-            &[ManifestEntry {
-                ordinal: 0,
-                unit: 0,
-                reference_only: false,
-                thread_id: "thread".into(),
-                source,
-            }],
-        )
+        .compaction_append_manifest("operation", &manifest)
         .await
         .unwrap();
     store
@@ -1069,7 +2080,7 @@ async fn fixture(
         provider,
         clock,
         observer,
-        payload,
+        payload: payloads[0].clone(),
     }
 }
 
@@ -1457,6 +2468,328 @@ async fn compaction_runner_portions_cover_huge_source_once_and_reuse_committed_r
             .unwrap()
             .iter()
             .all(|id| id == "operation")
+    );
+}
+
+#[tokio::test]
+async fn compaction_runner_sends_projected_command_event_and_preserves_canonical_payload() {
+    for updated in [false, true] {
+        let unique = "runner-command-output ".repeat(4_000);
+        let diagnostic = "runner-storage-only-diagnostic";
+        let mut item = historical_command_fixture(&unique);
+        let pioneer_protocol::TurnItem::CommandExecution { storage, .. } = &mut item else {
+            unreachable!()
+        };
+        let pioneer_protocol::ToolStoragePayload::Shell { stderr, .. } = storage else {
+            unreachable!()
+        };
+        *stderr = Some(diagnostic.into());
+        let canonical = if updated {
+            pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(
+                pioneer_protocol::ItemUpdatedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item,
+                },
+            )
+        } else {
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item,
+                },
+            )
+        };
+        let raw = serde_json::to_string(&canonical).unwrap();
+        let f = fixture_with_canonical_payload(raw.clone(), vec![], true, true).await;
+        let fence = f.store.compaction_history_read_fence().await.unwrap();
+        let cold = super::history::load_line_history(&f.store, "ws", "thread", None, &fence)
+            .await
+            .unwrap();
+        let command = cold
+            .iter()
+            .find(|message| message.content.contains(&unique))
+            .unwrap();
+        assert_eq!(command.content.matches(&unique).count(), 1);
+        assert_eq!(command.content.matches(diagnostic).count(), 1);
+        let source = f
+            .store
+            .compaction_manifest_page("operation", false, 0, 0)
+            .await
+            .unwrap()
+            .remove(0)
+            .source;
+        let expected = historical_source_model_payload(
+            &source,
+            raw.clone(),
+            pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            f.runner.run(CancellationToken::new()).await.unwrap(),
+            CompactionExit::Applied(_)
+        ));
+        let mut sent = String::new();
+        for call in f.provider.calls.lock().unwrap().iter() {
+            let input: SummaryInput = serde_json::from_str(&call.messages[1].content).unwrap();
+            for unit in input.compact_units {
+                sent.push_str(&unit.text);
+            }
+        }
+        assert_eq!(sent, expected);
+        assert_eq!(sent.matches(&unique).count(), 1);
+        assert_eq!(sent.matches(diagnostic).count(), 1);
+        assert!(f.provider.calls.lock().unwrap().len() > 1);
+
+        let stored = f
+            .store
+            .compaction_reference_payload("ws", "thread", &source)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, raw, "model projection mutated canonical storage");
+    }
+}
+
+#[tokio::test]
+async fn compaction_runner_durably_finishes_legacy_cursor_before_projecting_next_source() {
+    let first_unique = "legacy-cursor-output ".repeat(100);
+    let second_unique = "projected-next-source-output ".repeat(4_000);
+    let canonical = |item| {
+        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item,
+            },
+        ))
+        .unwrap()
+    };
+    let first_raw = canonical(historical_command_fixture(&first_unique));
+    let second_raw = canonical(historical_command_fixture(&second_unique));
+    let f = fixture_with_canonical_payloads(
+        vec![first_raw.clone(), second_raw.clone()],
+        vec![Reply::Transient, Reply::Success, Reply::Hang],
+        true,
+        false,
+    )
+    .await;
+    let manifest = f
+        .store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(manifest.len(), 2);
+    let first_source = manifest[0].source.clone();
+    let second_source = manifest[1].source.clone();
+    let second_projected = historical_source_model_payload(
+        &second_source,
+        second_raw.clone(),
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION,
+    )
+    .unwrap();
+    let legacy_offset = 73_u64;
+    let mut legacy_state = serde_json::to_value(
+        f.store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    legacy_state
+        .as_object_mut()
+        .unwrap()
+        .remove("source_text_projection_version");
+    legacy_state["cursor"]["character"] = serde_json::json!(legacy_offset);
+    let encoded_legacy_state = serde_json::to_string(&legacy_state).unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_runner_state SET state=? WHERE operation_id='operation'",
+            [encoded_legacy_state.into()],
+        ))
+        .await
+        .unwrap();
+
+    let first_run = tokio::spawn({
+        let runner = f.runner.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    wait_backoff(&f.store).await;
+    let after_transient = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_transient.cursor.character, legacy_offset);
+    assert_eq!(after_transient.cursor.source, 0);
+    assert_eq!(after_transient.source_text_projection_version, 0);
+    assert!(after_transient.previous_checkpoint.is_none());
+    let first_retry_at = match after_transient.phase {
+        RunnerPhase::Backoff { not_before_ms, .. } => not_before_ms,
+        phase => panic!("expected durable retry backoff, got {phase:?}"),
+    };
+    first_run.abort();
+    assert!(first_run.await.unwrap_err().is_cancelled());
+    f.clock.advance(first_retry_at);
+
+    let restarted = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        f.runner.snapshot.clone(),
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    let second_run = tokio::spawn({
+        let runner = restarted.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    f.provider.wait_calls(3).await;
+    let after_first_checkpoint = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &after_first_checkpoint.phase,
+        RunnerPhase::Attempt { .. }
+    ));
+    assert_eq!(after_first_checkpoint.cursor.unit, 0);
+    assert_eq!(after_first_checkpoint.cursor.source, 1);
+    assert_eq!(after_first_checkpoint.cursor.character, 0);
+    assert_eq!(after_first_checkpoint.source_text_projection_version, 0);
+    assert!(after_first_checkpoint.previous_checkpoint.is_some());
+    second_run.abort();
+    assert!(second_run.await.unwrap_err().is_cancelled());
+
+    let resumed = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        f.runner.snapshot.clone(),
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    let third_run = tokio::spawn({
+        let runner = resumed.clone();
+        async move { runner.run(CancellationToken::new()).await }
+    });
+    wait_backoff(&f.store).await;
+    let before_interrupted_retry = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before_interrupted_retry.cursor,
+        after_first_checkpoint.cursor
+    );
+    assert_eq!(before_interrupted_retry.source_text_projection_version, 0);
+    assert_eq!(
+        before_interrupted_retry.previous_checkpoint,
+        after_first_checkpoint.previous_checkpoint
+    );
+    let interrupted_retry_at = match before_interrupted_retry.phase {
+        RunnerPhase::Backoff { not_before_ms, .. } => not_before_ms,
+        phase => panic!("expected interrupted-attempt backoff, got {phase:?}"),
+    };
+    f.clock.advance(interrupted_retry_at);
+    let CompactionExit::Applied(head) = third_run.await.unwrap().unwrap() else {
+        panic!("resumed legacy cursor operation was not applied")
+    };
+
+    let calls = f.provider.calls.lock().unwrap();
+    assert!(calls.len() > 4, "second source must span multiple portions");
+    let inputs = calls
+        .iter()
+        .map(|call| serde_json::from_str::<SummaryInput>(&call.messages[1].content).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(&inputs[0]).unwrap(),
+        serde_json::to_value(&inputs[1]).unwrap(),
+        "transient retry changed the legacy-offset request"
+    );
+    assert_eq!(
+        serde_json::to_value(&inputs[2]).unwrap(),
+        serde_json::to_value(&inputs[3]).unwrap(),
+        "restart changed an unaccepted projected-source request"
+    );
+    assert_eq!(inputs[1].compact_units[0].part, legacy_offset);
+    assert_eq!(inputs[1].compact_units[0].sources, [first_source.clone()]);
+    assert_eq!(inputs[2].compact_units[0].part, 0);
+    assert_eq!(inputs[2].compact_units[0].sources, [second_source.clone()]);
+    let mut accepted_text = String::new();
+    for input in std::iter::once(&inputs[1]).chain(inputs[3..].iter()) {
+        for part in &input.compact_units {
+            accepted_text.push_str(&part.text);
+        }
+    }
+    let expected_first = first_raw
+        .chars()
+        .skip(usize::try_from(legacy_offset).unwrap())
+        .collect::<String>();
+    assert_eq!(accepted_text, format!("{expected_first}{second_projected}"));
+    assert_eq!(accepted_text.matches(&second_unique).count(), 1);
+    drop(calls);
+
+    let final_state = f
+        .store
+        .compaction_runner_state("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_state.source_text_projection_version,
+        pioneer_protocol::HISTORICAL_COMMAND_LLM_PROJECTION_VERSION
+    );
+    assert!(matches!(final_state.phase, RunnerPhase::Applied { .. }));
+    let reference = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &head)
+        .await
+        .unwrap()
+        .unwrap();
+    let leaves = super::coverage::checkpoint_leaves(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &reference,
+    )
+    .await
+    .unwrap();
+    assert_eq!(leaves.len(), 2);
+    assert!(leaves.iter().any(|leaf| leaf.source == first_source));
+    assert!(leaves.iter().any(|leaf| leaf.source == second_source));
+    assert_eq!(
+        f.store
+            .compaction_reference_payload("ws", "thread", &first_source)
+            .await
+            .unwrap()
+            .unwrap(),
+        first_raw
+    );
+    assert_eq!(
+        f.store
+            .compaction_reference_payload("ws", "thread", &second_source)
+            .await
+            .unwrap()
+            .unwrap(),
+        second_raw
     );
 }
 #[tokio::test]
