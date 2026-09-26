@@ -42,6 +42,7 @@ pub struct KeystoreEncryptionReport {
 pub struct SecretKindCounts {
     pub provider_api_key: usize,
     pub provider_proxy: usize,
+    pub provider_base_url: usize,
     pub cli_runtime_proxy: usize,
     pub model_catalog_proxy: usize,
     pub mcp_secret: usize,
@@ -250,6 +251,9 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
             }
             Some(SecretKind::ProviderProxy) => {
                 counts.provider_proxy = counts.provider_proxy.saturating_add(1)
+            }
+            Some(SecretKind::ProviderBaseUrl) => {
+                counts.provider_base_url = counts.provider_base_url.saturating_add(1)
             }
             Some(SecretKind::CliRuntimeProxy) => {
                 counts.cli_runtime_proxy = counts.cli_runtime_proxy.saturating_add(1)

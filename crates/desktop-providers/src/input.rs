@@ -44,6 +44,22 @@ impl ProviderInput {
             .proxy_url
             .as_deref()
     }
+    pub(crate) fn provider_base_url(&self, id: &str) -> Option<&str> {
+        self.catalog
+            .as_ref()?
+            .providers()
+            .iter()
+            .find(|row| pioneer_client::providers::catalog::canonical_provider_id(row.id()) == id)?
+            .provider()
+            .base_url
+            .as_deref()
+    }
+    pub(crate) fn provider_default_base_url(&self, id: &str) -> Option<&'static str> {
+        pioneer_client::providers::catalog::default_provider_base_url(id)
+    }
+    pub(crate) fn provider_supports_base_url_override(&self, id: &str) -> bool {
+        pioneer_client::providers::catalog::provider_supports_base_url_override(id)
+    }
     pub(crate) fn cli_runtimes(&self) -> Vec<RuntimeSummary> {
         self.runtimes
             .iter()
@@ -93,4 +109,19 @@ impl ProviderInput {
     pub(crate) fn clear_cli_runtime_draft(&mut self) {
         self.draft = None;
     }
+}
+
+pub(crate) fn provider_base_url_field_visible(
+    configured: Option<&str>,
+    supports_override: bool,
+) -> bool {
+    supports_override || configured.is_some_and(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn provider_base_url_placeholder(default: Option<&str>, generic: &str) -> String {
+    default
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(generic)
+        .to_owned()
 }

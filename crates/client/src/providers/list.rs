@@ -35,6 +35,20 @@ pub fn provider_proxy_urls_from_list(providers: &[ProviderSummary]) -> HashMap<S
         .collect()
 }
 
+pub fn provider_base_urls_from_list(providers: &[ProviderSummary]) -> HashMap<String, String> {
+    providers
+        .iter()
+        .filter_map(|provider| {
+            provider.base_url.as_ref().map(|base_url| {
+                (
+                    catalog::canonical_provider_id(provider.name.as_str()),
+                    base_url.clone(),
+                )
+            })
+        })
+        .collect()
+}
+
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum ProviderListRefreshUnavailable {
@@ -604,12 +618,14 @@ mod tests {
                 capabilities: Default::default(),
                 api_key_configured: true,
                 proxy_url: None,
+                base_url: None,
             },
             ProviderSummary {
                 name: "lm_studio".to_owned(),
                 capabilities: Default::default(),
                 api_key_configured: true,
                 proxy_url: None,
+                base_url: None,
             },
         ];
 
@@ -679,6 +695,7 @@ mod tests {
                 capabilities: Default::default(),
                 api_key_configured: true,
                 proxy_url: None,
+                base_url: None,
             }],
         });
         assert!(state.loading_providers());
@@ -758,6 +775,7 @@ mod tests {
                 capabilities: Default::default(),
                 api_key_configured: true,
                 proxy_url: None,
+                base_url: None,
             }],
         });
         state.apply_cli_runtime_list_success(CLIRuntimeListResponse {
@@ -859,6 +877,7 @@ mod tests {
                     },
                     api_key_configured: true,
                     proxy_url: None,
+                    base_url: None,
                 },
                 ProviderSummary {
                     name: "local".to_owned(),
@@ -868,6 +887,7 @@ mod tests {
                     },
                     api_key_configured: false,
                     proxy_url: None,
+                    base_url: None,
                 },
             ],
         });
@@ -911,12 +931,14 @@ mod tests {
                     },
                     api_key_configured: true,
                     proxy_url: None,
+                    base_url: None,
                 },
                 ProviderSummary {
                     name: "anthropic".to_owned(),
                     capabilities: Default::default(),
                     api_key_configured: true,
                     proxy_url: None,
+                    base_url: None,
                 },
             ],
         });
@@ -983,6 +1005,7 @@ mod tests {
                     },
                     api_key_configured: false,
                     proxy_url: None,
+                    base_url: None,
                 },
                 ProviderSummary {
                     name: "remote-transcription".to_owned(),
@@ -993,6 +1016,7 @@ mod tests {
                     },
                     api_key_configured: true,
                     proxy_url: None,
+                    base_url: None,
                 },
                 ProviderSummary {
                     name: "openai".to_owned(),
@@ -1003,6 +1027,7 @@ mod tests {
                     },
                     api_key_configured: true,
                     proxy_url: None,
+                    base_url: None,
                 },
             ],
         });
@@ -1094,6 +1119,7 @@ mod tests {
                 },
                 api_key_configured: true,
                 proxy_url: None,
+                base_url: None,
             },
             ProviderSummary {
                 name: "local".to_owned(),
@@ -1104,6 +1130,7 @@ mod tests {
                 },
                 api_key_configured: false,
                 proxy_url: None,
+                base_url: None,
             },
         ];
 

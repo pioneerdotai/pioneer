@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use sha2::{Digest, Sha256};
 
-use crate::factory::create_provider_with_timeout_policy_and_proxy_and_authority;
+use crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority;
 use crate::traits::{Provider, ProviderWarmupOutcome};
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
@@ -317,6 +317,7 @@ pub struct ProviderRegistry {
     authority_scope_locks: [Mutex<()>; AUTHORITY_SCOPE_LOCK_COUNT],
     key_resolver: Box<dyn Fn(Option<&str>, &str) -> Result<String> + Send + Sync>,
     proxy_resolver: Box<dyn Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync>,
+    base_url_resolver: Box<dyn Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync>,
     timeout_policy: ProviderTimeoutPolicy,
     limits: ProviderRegistryLimits,
 }
@@ -400,9 +401,40 @@ impl ProviderRegistry {
         )
     }
 
+    pub fn new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+        key_resolver: impl Fn(Option<&str>, &str) -> Result<String> + Send + Sync + 'static,
+        proxy_resolver: impl Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync + 'static,
+        base_url_resolver: impl Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync + 'static,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
+        Self::new_scoped_fallible_with_timeout_policy_proxy_base_url_and_limits(
+            key_resolver,
+            proxy_resolver,
+            base_url_resolver,
+            timeout_policy,
+            ProviderRegistryLimits::default(),
+        )
+    }
+
     pub fn new_scoped_fallible_with_timeout_policy_proxy_and_limits(
         key_resolver: impl Fn(Option<&str>, &str) -> Result<String> + Send + Sync + 'static,
         proxy_resolver: impl Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync + 'static,
+        timeout_policy: ProviderTimeoutPolicy,
+        limits: ProviderRegistryLimits,
+    ) -> Self {
+        Self::new_scoped_fallible_with_timeout_policy_proxy_base_url_and_limits(
+            key_resolver,
+            proxy_resolver,
+            |_, _| Ok(None),
+            timeout_policy,
+            limits,
+        )
+    }
+
+    pub fn new_scoped_fallible_with_timeout_policy_proxy_base_url_and_limits(
+        key_resolver: impl Fn(Option<&str>, &str) -> Result<String> + Send + Sync + 'static,
+        proxy_resolver: impl Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync + 'static,
+        base_url_resolver: impl Fn(Option<&str>, &str) -> Result<Option<String>> + Send + Sync + 'static,
         timeout_policy: ProviderTimeoutPolicy,
         limits: ProviderRegistryLimits,
     ) -> Self {
@@ -412,6 +444,7 @@ impl ProviderRegistry {
             authority_scope_locks: std::array::from_fn(|_| Mutex::new(())),
             key_resolver: Box::new(key_resolver),
             proxy_resolver: Box::new(proxy_resolver),
+            base_url_resolver: Box::new(base_url_resolver),
             timeout_policy,
             limits: limits.normalized(),
         }
@@ -438,7 +471,7 @@ impl ProviderRegistry {
         let _scope = self.lock_authority_scope(Some(workspace_id), provider_name.as_str());
         let fingerprint = self
             .resolve_authority(Some(workspace_id), provider_name.as_str())?
-            .2;
+            .3;
         let mut cache = self
             .cache
             .write()
@@ -462,6 +495,23 @@ impl ProviderRegistry {
         api_key: Option<&str>,
         proxy_url: Option<&str>,
     ) -> Result<()> {
+        self.validate_candidate_workspace_authority_with_base_url(
+            workspace_id,
+            provider_name,
+            api_key,
+            proxy_url,
+            None,
+        )
+    }
+
+    pub fn validate_candidate_workspace_authority_with_base_url(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+        api_key: Option<&str>,
+        proxy_url: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<()> {
         let provider_name = normalize_provider_name(provider_name);
         if self
             .injected
@@ -476,12 +526,14 @@ impl ProviderRegistry {
             provider_name.as_str(),
             api_key.unwrap_or_default(),
             proxy_url,
+            base_url,
         );
-        create_provider_with_timeout_policy_and_proxy_and_authority(
+        create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
             provider_name.as_str(),
             api_key.unwrap_or_default(),
             self.timeout_policy,
             proxy_url,
+            base_url,
             authority_fingerprint.as_str(),
         )?;
         Ok(())
@@ -501,7 +553,7 @@ impl ProviderRegistry {
         // injected-provider locks. The scope gate is deliberately retained so
         // the matching invalidation cannot return before this authority is
         // either published or discarded.
-        let (api_key, proxy_url, authority_fingerprint) =
+        let (api_key, proxy_url, base_url, authority_fingerprint) =
             self.resolve_authority(workspace_id, provider_name.as_str())?;
         let key = ProviderCacheKey::new(
             workspace_id,
@@ -544,13 +596,16 @@ impl ProviderRegistry {
             .cloned();
         let provider: Arc<dyn Provider> = match injected {
             Some(provider) => provider,
-            None => Arc::from(create_provider_with_timeout_policy_and_proxy_and_authority(
-                provider_name.as_str(),
-                &api_key,
-                self.timeout_policy,
-                proxy_url.as_deref(),
-                authority_fingerprint.as_str(),
-            )?),
+            None => Arc::from(
+                create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                    provider_name.as_str(),
+                    &api_key,
+                    self.timeout_policy,
+                    proxy_url.as_deref(),
+                    base_url.as_deref(),
+                    authority_fingerprint.as_str(),
+                )?,
+            ),
         };
 
         let mut cache = self
@@ -616,16 +671,23 @@ impl ProviderRegistry {
         &self,
         workspace_id: Option<&str>,
         provider_name: &str,
-    ) -> Result<(String, Option<String>, ProviderAuthorityFingerprint)> {
+    ) -> Result<(
+        String,
+        Option<String>,
+        Option<String>,
+        ProviderAuthorityFingerprint,
+    )> {
         let api_key = (self.key_resolver)(workspace_id, provider_name)?;
         let proxy_url = (self.proxy_resolver)(workspace_id, provider_name)?;
+        let base_url = (self.base_url_resolver)(workspace_id, provider_name)?;
         let authority_fingerprint = Self::authority_fingerprint(
             workspace_id,
             provider_name,
             api_key.as_str(),
             proxy_url.as_deref(),
+            base_url.as_deref(),
         );
-        Ok((api_key, proxy_url, authority_fingerprint))
+        Ok((api_key, proxy_url, base_url, authority_fingerprint))
     }
 
     fn authority_fingerprint(
@@ -633,6 +695,7 @@ impl ProviderRegistry {
         provider_name: &str,
         api_key: &str,
         proxy_url: Option<&str>,
+        base_url: Option<&str>,
     ) -> ProviderAuthorityFingerprint {
         let mut digest = Sha256::new();
         digest.update(PROVIDER_AUTHORITY_FINGERPRINT_VERSION.as_bytes());
@@ -644,13 +707,15 @@ impl ProviderRegistry {
         digest.update(api_key.as_bytes());
         digest.update([0]);
         digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
+        digest.update([0]);
+        digest.update(base_url.unwrap_or("<default>").as_bytes());
         ProviderAuthorityFingerprint(hex::encode(digest.finalize()))
     }
 
     pub fn insert(&self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Result<()> {
         let name = normalize_provider_name(name.into().as_str());
         let _scopes = self.lock_all_authority_scopes();
-        let (_, _, authority_fingerprint) = self.resolve_authority(None, name.as_str())?;
+        let (_, _, _, authority_fingerprint) = self.resolve_authority(None, name.as_str())?;
         let mut injected = self
             .injected
             .write()
@@ -1529,5 +1594,30 @@ mod tests {
         assert!(!cache_debug.contains(SECRET));
         assert!(!cache_debug.contains("proxy-password"));
         assert!(!cache_debug.contains(PROXY));
+    }
+
+    #[test]
+    fn cache_identity_incorporates_custom_base_url() {
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("sk-key".to_owned()),
+            |_, _| Ok(None),
+            |workspace, _| match workspace {
+                Some("ws_custom") => Ok(Some("https://custom.api.com/v1".to_owned())),
+                _ => Ok(None),
+            },
+            ProviderTimeoutPolicy::default(),
+        );
+
+        let fp_default = registry
+            .authority_fingerprint_for_workspace("ws_default", "openai")
+            .expect("default fingerprint");
+        let fp_custom = registry
+            .authority_fingerprint_for_workspace("ws_custom", "openai")
+            .expect("custom fingerprint");
+
+        assert_ne!(
+            fp_default, fp_custom,
+            "custom base_url must yield a different authority fingerprint"
+        );
     }
 }

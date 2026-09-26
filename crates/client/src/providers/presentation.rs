@@ -409,6 +409,7 @@ mod tests {
             capabilities: Default::default(),
             api_key_configured: true,
             proxy_url: None,
+            base_url: None,
         }
     }
 

@@ -62,6 +62,8 @@ impl ProviderCatalogView {
         api_key: Option<String>,
         proxy_url: Option<String>,
         clear_proxy: bool,
+        base_url: Option<String>,
+        clear_base_url: bool,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(workspace_id) = self.active_workspace_id().map(str::to_owned) else {
@@ -74,6 +76,8 @@ impl ProviderCatalogView {
                 api_key,
                 proxy_url,
                 clear_proxy,
+                base_url,
+                clear_base_url,
             }),
             cx,
         )

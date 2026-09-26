@@ -298,6 +298,7 @@ pub use provider::{
     ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
     ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
     ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata, ReasoningCapabilitySource,
+    default_provider_base_url, provider_supports_base_url_override,
 };
 pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, PublicErrorStage};
 pub use settings::{

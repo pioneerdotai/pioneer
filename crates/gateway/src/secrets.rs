@@ -134,6 +134,18 @@ impl GatewaySecrets {
             .context("failed to read workspace provider proxy from keystore")
     }
 
+    pub(crate) fn get_workspace_provider_base_url(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>> {
+        let id = SecretId::workspace_provider_base_url(workspace_id, provider)
+            .context("invalid workspace provider base url id")?;
+        self.store
+            .get_string(&id)
+            .context("failed to read workspace provider base url from keystore")
+    }
+
     pub(crate) fn get_workspace_cli_runtime_proxy(
         &self,
         workspace_id: &str,
@@ -287,6 +299,42 @@ impl GatewaySecrets {
         Ok(normalized_provider)
     }
 
+    pub(crate) fn set_workspace_provider_base_url(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+        base_url: &str,
+    ) -> Result<String> {
+        if base_url.trim().is_empty() {
+            bail!("provider base URL must not be empty");
+        }
+
+        let id = SecretId::workspace_provider_base_url(workspace_id, provider)
+            .context("invalid workspace provider base url id")?;
+        let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
+            .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let now = current_unix_i64()?;
+        let created_at = self
+            .existing_provider_base_url_meta(&id)?
+            .and_then(|entry| entry.created_at_unix)
+            .unwrap_or(now);
+
+        self.store
+            .put_string(
+                &id,
+                base_url.trim(),
+                SecretMeta {
+                    kind: SecretKind::ProviderBaseUrl,
+                    label: Some(normalized_provider.clone()),
+                    created_at_unix: created_at,
+                    updated_at_unix: now,
+                },
+            )
+            .context("failed to write workspace provider base url to keystore")?;
+
+        Ok(normalized_provider)
+    }
+
     pub(crate) fn set_workspace_cli_runtime_proxy(
         &self,
         workspace_id: &str,
@@ -363,6 +411,22 @@ impl GatewaySecrets {
             .store
             .delete(&id)
             .context("failed to delete workspace provider proxy from keystore")?;
+        Ok((normalized_provider, deleted))
+    }
+
+    pub(crate) fn delete_workspace_provider_base_url(
+        &self,
+        workspace_id: &str,
+        provider: &str,
+    ) -> Result<(String, bool)> {
+        let id = SecretId::workspace_provider_base_url(workspace_id, provider)
+            .context("invalid workspace provider base url id")?;
+        let normalized_provider = Self::provider_name_from_workspace_provider_id(&id)
+            .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+        let deleted = self
+            .store
+            .delete(&id)
+            .context("failed to delete workspace provider base url from keystore")?;
         Ok((normalized_provider, deleted))
     }
 
@@ -452,6 +516,36 @@ impl GatewaySecrets {
         Ok(proxies)
     }
 
+    pub(crate) fn list_workspace_provider_base_urls(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let prefix = Self::workspace_provider_base_url_user_prefix(workspace_id)?;
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ProviderBaseUrl))
+            .context("failed to list provider base urls from keystore")?;
+
+        let mut base_urls = Vec::new();
+        for entry in entries {
+            if !entry.id.user().starts_with(prefix.as_str()) {
+                continue;
+            }
+            let Some(base_url) = self
+                .store
+                .get_string(&entry.id)
+                .context("failed to read provider base url from keystore")?
+            else {
+                continue;
+            };
+            let provider_name = Self::provider_name_from_workspace_provider_id(&entry.id)
+                .unwrap_or_else(|| entry.label.unwrap_or_else(|| entry.id.user().to_owned()));
+            base_urls.push((provider_name, base_url));
+        }
+        base_urls.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(base_urls)
+    }
+
     #[cfg(test)]
     pub(crate) fn resolve_provider_api_key(&self, provider_name: &str) -> String {
         if is_local_provider(provider_name) {
@@ -486,6 +580,26 @@ impl GatewaySecrets {
                     provider = provider_name,
                     error = %format!("{error:#}"),
                     "failed to resolve workspace provider proxy from keystore"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_workspace_provider_base_url(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+    ) -> Option<String> {
+        match self.get_workspace_provider_base_url(workspace_id, provider_name) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    workspace_id,
+                    provider = provider_name,
+                    error = %format!("{error:#}"),
+                    "failed to resolve workspace provider base url from keystore"
                 );
                 None
             }
@@ -600,6 +714,18 @@ impl GatewaySecrets {
 
         let id = SecretId::workspace_provider_proxy(workspace_id, SENTINEL_PROVIDER)
             .context("invalid provider proxy workspace id")?;
+        Ok(id
+            .user()
+            .strip_suffix(SENTINEL_PROVIDER)
+            .unwrap_or(id.user())
+            .to_owned())
+    }
+
+    fn workspace_provider_base_url_user_prefix(workspace_id: &str) -> Result<String> {
+        const SENTINEL_PROVIDER: &str = "validation";
+
+        let id = SecretId::workspace_provider_base_url(workspace_id, SENTINEL_PROVIDER)
+            .context("invalid provider base url workspace id")?;
         Ok(id
             .user()
             .strip_suffix(SENTINEL_PROVIDER)
@@ -917,6 +1043,14 @@ impl GatewaySecrets {
         Ok(entries.into_iter().find(|entry| entry.id == *id))
     }
 
+    fn existing_provider_base_url_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
+        let entries = self
+            .store
+            .list(SecretFilter::Kind(SecretKind::ProviderBaseUrl))
+            .context("failed to read provider base url metadata from keystore")?;
+        Ok(entries.into_iter().find(|entry| entry.id == *id))
+    }
+
     fn existing_cli_runtime_proxy_meta(&self, id: &SecretId) -> Result<Option<SecretEntryMeta>> {
         let entries = self
             .store
@@ -1142,6 +1276,51 @@ mod tests {
             secrets
                 .get_workspace_provider_proxy("ws_default", "openrouter")
                 .expect("read deleted proxy"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_base_url_methods_write_list_read_resolve_and_delete() {
+        let secrets = GatewaySecrets::new(Arc::new(MemorySecretStore::new()));
+
+        let normalized = secrets
+            .set_workspace_provider_base_url(
+                "ws_default",
+                "  OpenAI  ",
+                "https://api.example.com/v1",
+            )
+            .expect("set provider base url");
+        assert_eq!(normalized, "openai");
+
+        assert_eq!(
+            secrets
+                .get_workspace_provider_base_url("ws_default", "openai")
+                .expect("read base url"),
+            Some("https://api.example.com/v1".to_owned())
+        );
+        assert_eq!(
+            secrets
+                .resolve_workspace_provider_base_url("ws_default", "openai")
+                .as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(
+            secrets
+                .list_workspace_provider_base_urls("ws_default")
+                .expect("list provider base urls"),
+            vec![("openai".to_owned(), "https://api.example.com/v1".to_owned())]
+        );
+
+        let (normalized, deleted) = secrets
+            .delete_workspace_provider_base_url("ws_default", "OpenAI")
+            .expect("delete provider base url");
+        assert_eq!(normalized, "openai");
+        assert!(deleted);
+        assert_eq!(
+            secrets
+                .get_workspace_provider_base_url("ws_default", "openai")
+                .expect("read deleted base url"),
             None
         );
     }
