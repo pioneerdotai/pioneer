@@ -660,6 +660,128 @@ mod render_tests {
         GatewayVoiceInputRuntimePhase,
     };
     use std::{rc::Rc, sync::Arc};
+
+    struct ScrollTestHost {
+        page: gpui_kit::Entity<SettingsScreenView>,
+        height: f32,
+    }
+
+    impl gpui_kit::Render for ScrollTestHost {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::{prelude::*, *};
+            gpui_kit::component::v_flex()
+                .w(px(900.))
+                .h(px(self.height))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .debug_selector(|| "settings-test-viewport".into())
+                        // Match ScreenHostView's non-flex, full-size wrapper.
+                        .child(div().size_full().child(self.page.clone())),
+                )
+                .child(
+                    div()
+                        .h_8()
+                        .flex_shrink_0()
+                        .debug_selector(|| "settings-test-footer".into()),
+                )
+        }
+    }
+
+    #[gpui_kit::test]
+    fn settings_pages_scroll_within_the_screen_above_the_footer(cx: &mut TestAppContext) {
+        use gpui_kit::{ScrollDelta, ScrollWheelEvent, point, px};
+        cx.update(gpui_kit::init);
+        for route in [
+            SettingsContentView::General,
+            SettingsContentView::Account,
+            SettingsContentView::Memory,
+            SettingsContentView::SelfImprovement,
+        ] {
+            let config = SettingsConfig {
+                client: pioneer_client::catalog_test_support::settings_model_picker_client(),
+                bindings: Arc::new(Registrar(Arc::new(std::sync::atomic::AtomicUsize::new(0)))),
+                platform: Rc::new(Native),
+                photos: Rc::new(Native),
+                avatars: Rc::new(Native),
+            };
+            let (host, window_cx) = cx.add_window_view(|window, cx| {
+                let page = SettingsScreenView::new(config, route, None, window, cx);
+                page.update(cx, |page, cx| {
+                    page.gateway.settings_workspace_id = page.workspace_id.clone();
+                    page.gateway.settings = Some(GatewaySettingsSnapshot {
+                        general: Default::default(),
+                        memory: Default::default(),
+                        self_improvement:
+                            pioneer_client::settings::types::GatewaySelfImprovementSettings {
+                                enabled: true,
+                                ..Default::default()
+                            },
+                        self_improvement_status: None,
+                        thread_episodic: Default::default(),
+                        cli_runtimes: Default::default(),
+                        remote_access: Default::default(),
+                        voice_input: Default::default(),
+                    });
+                    // A long device error also needs a reachable Retry action.
+                    page.gateway.auth_sessions.loading = false;
+                    page.gateway.auth_sessions.error = Some("Device connection error\n".repeat(40));
+                    for child in page.remote.iter().chain(page.voice.iter()) {
+                        child.update(cx, |child, _| {
+                            child.gateway.settings = page.gateway.settings.clone();
+                        });
+                    }
+                });
+                ScrollTestHost { page, height: 600. }
+            });
+            for height in [600., 300.] {
+                host.update(window_cx, |host, cx| {
+                    host.height = height;
+                    cx.notify();
+                });
+                window_cx.update(|window, cx| window.draw(cx).clear(cx));
+                let viewport = window_cx.debug_bounds("settings-test-viewport").unwrap();
+                let footer = window_cx.debug_bounds("settings-test-footer").unwrap();
+                let scroll = |window_cx: &mut gpui_kit::VisualTestContext, delta| {
+                    window_cx.simulate_event(ScrollWheelEvent {
+                        position: viewport.center(),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+                        ..Default::default()
+                    });
+                    window_cx.update(|window, cx| window.draw(cx).clear(cx));
+                };
+                scroll(window_cx, 10000.);
+                let before = window_cx.debug_bounds("settings-page-content").unwrap();
+                scroll(window_cx, -10000.);
+                let after = window_cx.debug_bounds("settings-page-content").unwrap();
+                if height == 300. || before.size.height > viewport.size.height {
+                    assert!(after.top() < before.top(), "{route:?} does not scroll");
+                } else {
+                    assert_eq!(after, before, "{route:?} scrolls without overflowing");
+                }
+                assert_eq!(viewport.bottom(), footer.top());
+                assert!(
+                    (after.bottom() - viewport.bottom()).abs() <= px(1.),
+                    "{route:?} cannot reveal the end of the page above the footer: before={before:?}, after={after:?}, viewport={viewport:?}"
+                );
+                assert_eq!(
+                    window_cx.debug_bounds("settings-test-footer").unwrap(),
+                    footer
+                );
+                assert_eq!(
+                    window_cx.debug_bounds("scrollbar-overlay").unwrap(),
+                    viewport,
+                    "{route:?} scrollbar must follow the viewport edge"
+                );
+            }
+        }
+    }
     struct Publications {
         client: Arc<pioneer_client::core::ClientCore>,
         next: std::cell::Cell<usize>,

@@ -1,5 +1,7 @@
 use crate::screen::SettingsScreenView;
-use gpui_kit::component::{avatar::Avatar, button::*, theme::ActiveTheme, *};
+use gpui_kit::component::{
+    avatar::Avatar, button::*, scroll::ScrollableElement, theme::ActiveTheme, *,
+};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::authorization::{CurrentPrincipalPresentation, current_principal_presentation};
 
@@ -33,10 +35,11 @@ impl SettingsScreenView {
         let devices = self.render_auth_sessions_content(desktop.clone(), cx);
 
         v_flex()
+            .overflow_y_scrollbar()
             .id("settings-account-scroll")
-            .flex_1()
+            .debug_selector(|| "settings-page-content".to_string())
+            .size_full()
             .min_h_0()
-            .overflow_y_scroll()
             .p_6()
             .bg(cx.theme().background)
             .child(

@@ -10,6 +10,7 @@ use gpui_kit::component::{
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
     popover::{Popover, PopoverState},
+    scroll::ScrollableElement,
     switch::Switch,
     theme::ActiveTheme,
     *,
@@ -144,8 +145,10 @@ impl SettingsScreenView {
         };
 
         v_flex()
+            .overflow_y_scrollbar()
             .id("settings-scroll")
-            .flex_1()
+            .debug_selector(|| "settings-page-content".to_string())
+            .size_full()
             .min_h_0()
             .p_6()
             .bg(cx.theme().background)
@@ -193,10 +196,11 @@ impl SettingsScreenView {
         };
 
         v_flex()
+            .overflow_y_scrollbar()
             .id("settings-memory-scroll")
-            .flex_1()
+            .debug_selector(|| "settings-page-content".to_string())
+            .size_full()
             .min_h_0()
-            .overflow_y_scroll()
             .p_6()
             .bg(cx.theme().background)
             .child(
@@ -245,10 +249,11 @@ impl SettingsScreenView {
         };
 
         v_flex()
+            .overflow_y_scrollbar()
             .id("settings-self-improvement-scroll")
-            .flex_1()
+            .debug_selector(|| "settings-page-content".to_string())
+            .size_full()
             .min_h_0()
-            .overflow_y_scroll()
             .p_6()
             .bg(cx.theme().background)
             .child(
