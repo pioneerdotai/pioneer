@@ -407,11 +407,23 @@ impl ProviderReplayState {
 
 /// Runtime-only provenance. Provider wire serializers never emit this field,
 /// and deserializing a provider response cannot manufacture trusted sources.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MessageSourceRef {
     pub scope: String,
     pub id: String,
     pub version: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageSourceAlias {
+    pub represented_thread_id: String,
+    pub represented_source: MessageSourceRef,
+    pub thread_id: String,
+    pub source: MessageSourceRef,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MessageSourceIdentity {
+    pub thread_id: String,
+    pub source: MessageSourceRef,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageProvenance {
@@ -428,6 +440,15 @@ pub struct MessageProvenance {
     pub context_thread: Option<String>,
     pub unit_id: String,
     pub sources: Vec<MessageSourceRef>,
+    /// Exact canonical inputs represented by this message without contributing
+    /// another provider-wire payload. Trusted Gateway metadata is the only
+    /// authority allowed to establish these aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_aliases: Vec<MessageSourceAlias>,
+    /// Exact copies whose competing historical owners make suppression unsafe.
+    /// This is evidence only, never a represented source or access grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambiguous_input_aliases: Vec<MessageSourceIdentity>,
     pub complete: bool,
     pub protected_input: bool,
     pub inherited: bool,
@@ -1563,6 +1584,8 @@ mod provenance_tests {
                 id: "source".into(),
                 version: "input-revision:1".into(),
             }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
             complete: true,
             protected_input: true,
             inherited: false,

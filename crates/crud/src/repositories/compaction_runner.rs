@@ -1,6 +1,6 @@
 use super::compaction::{
     CHECKPOINT_SOURCE_LIMIT, SOURCE_PAGE_BYTES, SOURCE_PAGE_ROWS, checkpoint_identity,
-    sqlite_specific_sql,
+    compaction_checkpoint_edges, sqlite_specific_sql,
 };
 use crate::CrudStore;
 use anyhow::{Result, ensure};
@@ -1869,6 +1869,11 @@ WHERE o.id=?1
     // Explicitly end the read snapshot before queuing for the writer. This
     // also releases the maintenance-read permit carried by the scoped store.
     snapshot.commit().await?;
+    // Stale candidates do not publish. Validate the graph only after exact
+    // source preflight, with the read snapshot released.
+    if identity_current && sources_current {
+        validate_publication_checkpoint_graph(store, checkpoint).await?;
+    }
     Ok(PreparedRunnerPublication {
         database_id,
         operation: operation.to_owned(),
@@ -1882,6 +1887,128 @@ WHERE o.id=?1
         identity_current,
         sources_current,
     })
+}
+
+/// Match the read-time alias policy before publication. An exact input copy
+/// claimed by different leaves is not suppressed after the graphs meet;
+/// provider/tool replay conflicts are never interchangeable. Every edge is
+/// read through its bounded repository page and no source payload is opened.
+pub(super) async fn validate_publication_checkpoint_graph(
+    store: &CrudStore,
+    candidate: &str,
+) -> Result<()> {
+    let mut pending = vec![(candidate.to_owned(), false)];
+    let mut visited = std::collections::BTreeSet::new();
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut done = std::collections::BTreeSet::new();
+    let mut leaves = std::collections::BTreeSet::new();
+    let mut aliases = pioneer_compaction::frozen::ReplayAliasGraph::default();
+    let mut root = None;
+    while let Some((id, exiting)) = pending.pop() {
+        if exiting {
+            visiting.remove(&id);
+            done.insert(id);
+            continue;
+        }
+        if done.contains(&id) {
+            continue;
+        }
+        ensure!(visiting.insert(id.clone()), "cyclic checkpoint coverage");
+        visited.insert(id.clone());
+        ensure!(
+            visited.len() <= 65_536,
+            "checkpoint historical coverage exceeds supported quantum"
+        );
+        pending.push((id.clone(), true));
+        let edges = compaction_checkpoint_edges(&store.connection, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("candidate checkpoint graph is unavailable"))?;
+        ensure!(
+            edges.format_version == pioneer_compaction::FORMAT_VERSION,
+            "checkpoint historical format changed"
+        );
+        if let Some((workspace, _, _)) = &root {
+            ensure!(
+                &edges.workspace_id == workspace,
+                "checkpoint historical workspace changed"
+            );
+        } else {
+            root = Some((
+                edges.workspace_id.clone(),
+                edges.owner.clone(),
+                edges.thread_id.clone(),
+            ));
+        }
+        for alias in edges.replay_aliases {
+            aliases.insert(
+                pioneer_compaction::frozen::ScopedReplaySource {
+                    thread: alias.replay.source_thread,
+                    source: alias.replay.source,
+                },
+                pioneer_compaction::frozen::ScopedReplaySource {
+                    thread: alias.covered.source_thread,
+                    source: alias.covered.source,
+                },
+                alias.tool_item_id.as_deref(),
+            )?;
+        }
+        if let Some(previous) = edges.previous {
+            let previous_edges = compaction_checkpoint_edges(&store.connection, &previous)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
+            ensure!(
+                previous_edges.owner == edges.owner
+                    && previous_edges.thread_id == edges.thread_id
+                    && previous_edges.workspace_id == edges.workspace_id
+                    && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
+                "previous checkpoint changed historical ownership"
+            );
+            pending.push((previous, false));
+        }
+        for covered in edges.coverage {
+            if covered.source.scope.starts_with("checkpoint:") {
+                ensure!(
+                    store
+                        .compaction_checkpoint_source(
+                            &edges.workspace_id,
+                            &covered.source_thread,
+                            &covered.source.id,
+                        )
+                        .await?
+                        .as_ref()
+                        == Some(&covered.source),
+                    "checkpoint coverage node is not a published exact source"
+                );
+                let child = compaction_checkpoint_edges(&store.connection, &covered.source.id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint coverage node disappeared"))?;
+                ensure!(
+                    child.workspace_id == edges.workspace_id
+                        && child.thread_id == covered.source_thread
+                        && child.format_version == pioneer_compaction::FORMAT_VERSION
+                        && covered.source.scope == format!("checkpoint:{}", child.owner)
+                        && covered.source.version == child.identity_sha256,
+                    "checkpoint coverage owner or identity changed"
+                );
+                pending.push((covered.source.id, false));
+            } else {
+                leaves.insert((covered.source_thread, covered.source));
+            }
+        }
+    }
+    ensure!(!leaves.is_empty(), "checkpoint has no historical coverage");
+    aliases.validate_targets(
+        &leaves
+            .into_iter()
+            .map(
+                |(thread, source)| pioneer_compaction::frozen::ScopedReplaySource {
+                    thread,
+                    source,
+                },
+            )
+            .collect(),
+    )?;
+    Ok(())
 }
 
 async fn compaction_runner_coverage_exact<C: ConnectionTrait>(

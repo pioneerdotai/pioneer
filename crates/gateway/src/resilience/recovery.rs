@@ -4262,6 +4262,8 @@ fn retained_history_origins(
             id: source.id.clone(),
             version: source.version.clone(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: false,

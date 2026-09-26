@@ -293,6 +293,7 @@ pub(crate) async fn prepare_completed_history_owned(
             &mut checkpoint_graphs,
         )
         .await?;
+        super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
         super::origins::validate_message_origins(&store, workspace, &messages).await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
@@ -439,6 +440,21 @@ pub(crate) async fn prepare_completed_history_owned(
             .iter()
             .flat_map(|index| layout.units[*index].sources.clone())
             .collect();
+        super::admission::fit_checkpoint_replay_aliases(
+            &store,
+            workspace,
+            thread,
+            Some(&descriptor),
+            &layout,
+            &mut plan,
+            &budget,
+            full.output_reserve,
+            fixed,
+            goal,
+            false,
+            basis.as_deref(),
+        )
+        .await?;
         let indexes: BTreeSet<_> = plan
             .compact
             .iter()

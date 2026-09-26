@@ -1703,6 +1703,9 @@ async fn frozen_command_upgrade_is_bound_to_canonical_event_not_message_text() {
         .expect("materialized command event source")
         .reference;
     let provenance = || MessageProvenance {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+
         logical_turn_id: Some("frozen-command-turn".into()),
         workspace_id: "ws".into(),
         thread_id: "thread".into(),
@@ -1904,6 +1907,9 @@ async fn frozen_command_upgrade_is_bound_to_canonical_event_not_message_text() {
         .reference;
     let mut input_message = super::history::input_message(&[input]).unwrap();
     input_message.provenance = Some(MessageProvenance {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+
         logical_turn_id: Some("turn".into()),
         workspace_id: "ws".into(),
         thread_id: "thread".into(),
@@ -2162,6 +2168,8 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
             id: "legacy-forbidden".into(),
             version: "item-revision:1".into(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
     });
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
     let held_writer = store.database_connection().begin().await.unwrap();
@@ -2213,6 +2221,8 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
             id: "restore-input".into(),
             version: "input-revision:1".into(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
     });
     let descriptor = super::frozen::capture(
         &store,
@@ -4164,6 +4174,8 @@ async fn compaction_small_window_reduces_saved_tool_text_without_losing_call_or_
             id: source.id.clone(),
             version: source.version.clone(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
     });
     let request = ChatRequest {
         model: "small".into(),
@@ -5042,6 +5054,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         None,
         &logical_fence,
         super::history::HistoryCoverageSelection {
+            exact_replay_aliases: &std::collections::BTreeSet::new(),
             sources: &covered_parent,
             item_aliases: &std::collections::BTreeSet::new(),
             event_input_evidence: &std::collections::BTreeMap::new(),
@@ -7334,6 +7347,8 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
             id: source.id,
             version: source.version,
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: false,
@@ -9124,6 +9139,14 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         .await
         .unwrap()
         .unwrap();
+    let input_source = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Input, 0)
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
     let provenance = |source: &SourceRef| MessageProvenance {
         logical_turn_id: None,
         workspace_id: "ws".into(),
@@ -9135,6 +9158,8 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
             id: source.id.clone(),
             version: source.version.clone(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: false,
@@ -9143,13 +9168,32 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
     captured_assistant.provenance = Some(provenance(&assistant_source));
     let mut captured_tool = replay_message;
     captured_tool.provenance = Some(provenance(&item_source));
+    let mut captured_input = ChatMessage::user("independent new round");
+    let input_origin = captured_input.provenance.insert(provenance(&input_source));
+    input_origin.unit_id = "covered-input-unit".into();
+    input_origin.source_aliases = (0..255)
+        .map(|index| pioneer_provider::MessageSourceAlias {
+            represented_thread_id: "thread".into(),
+            represented_source: input_origin.sources[0].clone(),
+            thread_id: format!("historical-tool-alias-thread-{index}"),
+            source: MessageSourceRef {
+                scope: format!("input:historical-tool-alias-turn-{index}"),
+                id: format!("historical-tool-alias-{index}"),
+                version: "input-revision:1".into(),
+            },
+        })
+        .collect();
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
     let projection = super::frozen::capture(
         &f.store,
         "ws",
         "thread",
         &allowed,
-        &[captured_assistant, captured_tool],
+        &[
+            captured_input.clone(),
+            captured_assistant.clone(),
+            captured_tool.clone(),
+        ],
     )
     .await
     .unwrap();
@@ -9159,7 +9203,11 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
     operation.owner = super::native::native_owner("ws", "thread");
     operation.expected_checkpoint = None;
     operation.plan.fingerprint = "tool-alias-plan".into();
-    operation.plan.coverage = vec![assistant_source.clone(), item_source.clone()];
+    operation.plan.coverage = vec![
+        input_source.clone(),
+        assistant_source.clone(),
+        item_source.clone(),
+    ];
     operation.projection_version = f
         .store
         .compaction_projection_version("ws", "thread")
@@ -9176,7 +9224,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         .await
         .unwrap();
     f.store
-        .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 2, 0)
+        .compaction_prepare_runner(&operation.id, &ModelBudget::new(None, None, None), 3, 0)
         .await
         .unwrap();
     f.store
@@ -9188,11 +9236,18 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
                     unit: 0,
                     reference_only: false,
                     thread_id: "thread".into(),
-                    source: assistant_source.clone(),
+                    source: input_source.clone(),
                 },
                 ManifestEntry {
                     ordinal: 1,
-                    unit: 0,
+                    unit: 1,
+                    reference_only: false,
+                    thread_id: "thread".into(),
+                    source: assistant_source.clone(),
+                },
+                ManifestEntry {
+                    ordinal: 2,
+                    unit: 1,
                     reference_only: false,
                     thread_id: "thread".into(),
                     source: item_source.clone(),
@@ -9206,7 +9261,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         operation_id: operation.id.clone(),
         owner: operation.owner.clone(),
         previous: None,
-        coverage: vec![assistant_source, item_source],
+        coverage: vec![input_source, assistant_source, item_source],
         summary: "tool work is complete".into(),
         selection: operation.admission.selection.clone(),
         projection_version: operation.projection_version,
@@ -9243,8 +9298,86 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(edges.replay_aliases.len(), 1);
-    assert_eq!(edges.replay_aliases[0].replay.source, replay_source);
+    assert_eq!(edges.replay_aliases.len(), 256);
+    assert!(
+        edges
+            .replay_aliases
+            .iter()
+            .any(|alias| alias.replay.source == replay_source)
+    );
+    assert_eq!(edges.coverage.len(), 3);
+    assert!(edges.replay_aliases.iter().any(|alias| {
+        alias.replay.source.id == "historical-tool-alias-0"
+            && alias.replay.source.version == "input-revision:1"
+    }));
+    assert!(!edges.coverage.iter().any(|covered| {
+        covered.source.id.starts_with("historical-tool-alias-") || covered.source == replay_source
+    }));
+    let mut overfull_input = captured_input;
+    let overfull_origin = overfull_input.provenance.as_mut().unwrap();
+    overfull_origin
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: "thread".into(),
+            represented_source: overfull_origin.sources[0].clone(),
+            thread_id: "historical-tool-alias-thread-255".into(),
+            source: MessageSourceRef {
+                scope: "input:historical-tool-alias-turn-255".into(),
+                id: "historical-tool-alias-255".into(),
+                version: "input-revision:1".into(),
+            },
+        });
+    let overfull_messages = vec![overfull_input, captured_assistant, captured_tool];
+    let overfull_projection =
+        super::frozen::capture(&f.store, "ws", "thread", &allowed, &overfull_messages)
+            .await
+            .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &allowed, &overfull_projection)
+            .await
+            .unwrap(),
+        overfull_messages
+    );
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "thread",
+        &overfull_messages,
+        &[1, 1, 1],
+    )
+    .unwrap();
+    assert_eq!(layout.units.len(), 2);
+    assert_eq!(layout.units[1].sources.len(), 2, "tool round stays atomic");
+    let mut overfull_plan = CompactionPlan {
+        mode: CompactionMode::Normal,
+        coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
+        compact: vec![0, 1],
+        retain: vec![],
+        coverage: layout
+            .units
+            .iter()
+            .flat_map(|unit| unit.sources.clone())
+            .collect(),
+        fingerprint: "tool-and-input-overflow".into(),
+    };
+    super::admission::fit_checkpoint_replay_aliases(
+        &f.store,
+        "ws",
+        "thread",
+        Some(&overfull_projection),
+        &layout,
+        &mut overfull_plan,
+        &ModelBudget::new(Some(4096), None, Some(512)),
+        512,
+        0,
+        128,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(overfull_plan.compact, vec![1]);
+    assert_eq!(overfull_plan.retain, vec![0]);
+    assert_eq!(overfull_plan.coverage.len(), 2);
 
     let mut replay_projection = ChatMessage::assistant("saved replay transport row");
     replay_projection.provenance = Some(MessageProvenance {
@@ -9258,6 +9391,8 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
             id: replay_source.id.clone(),
             version: replay_source.version.clone(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: false,
@@ -9445,7 +9580,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         prepared
             .messages
             .iter()
-            .any(|message| message.content == "independent new round")
+            .any(|message| message.content == "new round with reused item id")
     );
     let second_assistant_position = prepared
         .messages
@@ -9518,7 +9653,7 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         prepared_without_replay_row
             .messages
             .iter()
-            .any(|message| message.content == "independent new round")
+            .any(|message| message.content == "new round with reused item id")
     );
     let second_assistant_position = prepared_without_replay_row
         .messages
@@ -11435,6 +11570,8 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
                 id: reference.id.clone(),
                 version: reference.version.clone(),
             }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
             inherited: false,
             complete: true,
             protected_input: false,
@@ -11485,6 +11622,9 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
         serde_json::to_string(&item).unwrap()
     ));
     legacy.provenance = Some(pioneer_provider::MessageProvenance {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+
         logical_turn_id: None,
         workspace_id: "ws".into(),
         thread_id: "thread".into(),
@@ -11614,6 +11754,10 @@ async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_fr
         .reference;
     let legacy_wire = ChatMessage::assistant(" \n\t");
     let reference = FrozenMessageRef {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        publication_aliases: None,
+
         logical_turn_id: None,
         source_thread: "thread".into(),
         context_thread: None,
@@ -13031,6 +13175,9 @@ async fn contained_checkpoint_fixture(
     .await;
     let inherited = coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext;
     let provenance = |thread: &str, unit: &str, source: &SourceRef| MessageProvenance {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+
         logical_turn_id: None,
         workspace_id: "ws".into(),
         thread_id: thread.into(),
@@ -13051,6 +13198,9 @@ async fn contained_checkpoint_fixture(
     raw_b.provenance = Some(provenance(b_thread, "raw-b", &source_b));
     let mut tail = ChatMessage::user("uncovered tail");
     tail.provenance = Some(MessageProvenance {
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+
         logical_turn_id: None,
         workspace_id: "ws".into(),
         thread_id: "child".into(),
@@ -13336,6 +13486,9 @@ async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries(
     let raw = |thread: &str, unit: &str, source: &SourceRef| {
         let mut message = ChatMessage::assistant(unit);
         message.provenance = Some(MessageProvenance {
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+
             logical_turn_id: None,
             workspace_id: "ws".into(),
             thread_id: thread.into(),
@@ -13568,6 +13721,8 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
                 version: s.version.clone(),
             })
             .collect(),
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: false,
@@ -13584,6 +13739,8 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
             id: "h-source".into(),
             version: "event-revision:1".into(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: true,
@@ -13748,6 +13905,8 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
                 version: r.version.clone(),
             })
             .collect(),
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         inherited: false,
         protected_input: false,
@@ -13855,6 +14014,8 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
             id: "accepted-h".into(),
             version: "event-revision:1".into(),
         }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         inherited: true,
         protected_input: false,
@@ -16818,4 +16979,5018 @@ async fn completed_task_output_excludes_later_turns_before_decoding_and_survives
             .is_err()
     );
     assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn accepted_task_policy_uses_composed_exact_source_order() {
+    let f = fixture("unused", vec![], true, false).await;
+    for sql in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('policy-parent','ws','','agent','fixture','fixture','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('policy-child','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('policy-child','policy-parent','policy-parent',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('policy-parent-create','policy-parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('policy-a-turn','policy-child','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('policy-c-turn','policy-parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('policy-a','policy-a-turn',0,'text','old A','{"type":"text","text":"old A"}',CURRENT_TIMESTAMP)"#,
+        r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('policy-c','policy-c-turn',0,'text','later C','{"type":"text","text":"later C"}',CURRENT_TIMESTAMP)"#,
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(sql)
+            .await
+            .unwrap();
+    }
+    for thread in ["policy-child", "policy-parent"] {
+        super::history::prepare_history(&f.store, "ws", thread)
+            .await
+            .unwrap();
+    }
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut a =
+        super::history::load_task_line_history(&f.store, "ws", "policy-child", None, &fence)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin.sources.iter().any(|source| source.id == "policy-a")
+                })
+            })
+            .unwrap();
+    let mut c =
+        super::history::load_task_line_history(&f.store, "ws", "policy-parent", None, &fence)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin.sources.iter().any(|source| source.id == "policy-c")
+                })
+            })
+            .unwrap();
+    for message in [&mut a, &mut c] {
+        let origin = message.provenance.as_mut().unwrap();
+        origin.context_thread = Some("policy-child".into());
+        origin.inherited = true;
+    }
+    let allowed = ["policy-parent", "policy-child"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    let accepted = super::frozen::capture(
+        &f.store,
+        "ws",
+        "policy-parent",
+        &allowed,
+        &[a.clone(), c.clone()],
+    )
+    .await
+    .unwrap();
+    for (suffix, turn) in [("one", "policy-basis-one"), ("two", "policy-basis-two")] {
+        let task = format!("policy-task-{suffix}");
+        let run = format!("policy-run-{suffix}");
+        for sql in [
+            format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('{turn}','policy-child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('{task}','ws','thread','policy-parent','policy-parent','policy-parent-create','agent','running','Policy','Check composition')"
+            ),
+            format!(
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{run}','{task}','{run}',1,1,'running','agent')"
+            ),
+            format!(
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('{run}-turn','{task}','{run}','policy-child','{turn}','initial',0,1,'completed',CURRENT_TIMESTAMP)"
+            ),
+        ] {
+            f.store
+                .database_connection()
+                .execute_unprepared(&sql)
+                .await
+                .unwrap();
+        }
+        f.store.database_connection().execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES (?,?, 'ws','policy-parent','policy-parent-create',?,CURRENT_TIMESTAMP)",
+            [run.into(), task.into(), serde_json::to_string(&accepted).unwrap().into()],
+        )).await.unwrap();
+    }
+    for mode in [
+        pioneer_protocol::TaskAgentContextMode::LastNTurns,
+        pioneer_protocol::TaskAgentContextMode::InheritParent,
+    ] {
+        let policy = pioneer_protocol::TaskAgentContextPolicy {
+            mode,
+            max_turns: Some(1),
+            ..super::frozen::default_task_context_policy()
+        };
+        let first = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "policy-child",
+            Some("policy-basis-one"),
+            None,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.messages.len(), 1);
+        assert_eq!(
+            first.messages[0].provenance.as_ref().unwrap().sources[0].id,
+            "policy-c"
+        );
+        let repeated = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "policy-child",
+            Some("policy-basis-one"),
+            None,
+            Some(&policy),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated.messages, first.messages);
+        let roundtrip = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("policy-child"),
+            "policy-child",
+            &allowed,
+            &serde_json::to_string(&first.descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(roundtrip, first.messages);
+    }
+    // A later independent source in A's physical turn survives composition;
+    // unlike the exact duplicate A, it really moves that turn to the tail.
+    f.store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "policy-child".into(),
+                turn_id: "policy-a-turn".into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: "policy-a-followup".into(),
+                    text: "new A follow-up".into(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let followup_source = f
+        .store
+        .compaction_source_page("ws", "policy-child", "policy-a-turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|row| row.item_id.as_deref() == Some("policy-a-followup"))
+        .expect("canonical follow-up event")
+        .reference;
+    let mut policy = super::frozen::default_task_context_policy();
+    policy.max_turns = Some(1);
+    let with_followup = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "policy-child",
+        Some("policy-basis-two"),
+        None,
+        Some(&policy),
+    )
+    .await
+    .unwrap();
+    assert!(with_followup.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources.iter().any(|source| {
+                source.scope == followup_source.scope
+                    && source.id == followup_source.id
+                    && source.version == followup_source.version
+            })
+        })
+    }));
+    assert_eq!(
+        with_followup
+            .messages
+            .iter()
+            .filter(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin.sources.iter().any(|source| source.id == "policy-a")
+                })
+            })
+            .count(),
+        1,
+        "the exact A duplicate still has one representation"
+    );
+    assert!(with_followup.messages.iter().all(|message| {
+        message
+            .provenance
+            .as_ref()
+            .is_none_or(|origin| origin.sources.iter().all(|source| source.id != "policy-c"))
+    }));
+    assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn accepted_execution_keeps_conflicting_admitted_and_external_input_proofs() {
+    use pioneer_provider::MessageSourceAlias;
+
+    async fn publish(
+        f: &Fixture,
+        allowed: &std::collections::BTreeSet<String>,
+        owner_thread: &str,
+        id: &str,
+        basis_turn: Option<&str>,
+        messages: &[pioneer_provider::ChatMessage],
+        covered: &[(&str, SourceRef)],
+    ) {
+        let descriptor = super::frozen::capture(&f.store, "ws", owner_thread, allowed, messages)
+            .await
+            .unwrap();
+        let epoch = f
+            .store
+            .compaction_projection_version("ws", owner_thread)
+            .await
+            .unwrap();
+        let owner = super::native::native_owner("ws", owner_thread);
+        let selection = ModelSelection {
+            transport: Transport::Api,
+            instance: "fixture".into(),
+            model: "fixture".into(),
+            effort: None,
+        };
+        let mut source_epochs = std::collections::BTreeMap::new();
+        for source_thread in allowed {
+            source_epochs.insert(
+                source_thread.clone(),
+                f.store
+                    .compaction_projection_version("ws", source_thread)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let operation = OperationSnapshot {
+            id: format!("operation-{id}"),
+            owner: owner.clone(),
+            expected_checkpoint: None,
+            projection_version: epoch,
+            source_epochs,
+            admission: CompactionSettings::default()
+                .admit(&selection, None, 0)
+                .unwrap(),
+            plan: CompactionPlan {
+                mode: CompactionMode::Normal,
+                coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+                compact: (0..covered.len()).collect(),
+                retain: vec![],
+                coverage: covered.iter().map(|(_, source)| source.clone()).collect(),
+                fingerprint: format!("plan-{id}"),
+            },
+        };
+        let manifest = covered
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (thread_id, source))| ManifestEntry {
+                ordinal: ordinal as u64,
+                unit: ordinal as u64,
+                reference_only: false,
+                thread_id: (*thread_id).into(),
+                source: source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let budget = ModelBudget::new(None, None, None);
+        let initial = prepare_task_input_checkpoint_runner(
+            f,
+            owner_thread,
+            basis_turn,
+            &operation,
+            &descriptor,
+            &budget,
+            covered.len() as u64,
+            0,
+            &manifest,
+            1_000,
+        )
+        .await;
+        let attempt = initial.claim(1).unwrap();
+        assert!(
+            f.store
+                .compaction_runner_transition(&operation.id, initial.generation, &attempt, None)
+                .await
+                .unwrap()
+        );
+        let checkpoint = Checkpoint {
+            id: id.into(),
+            operation_id: operation.id.clone(),
+            owner,
+            previous: None,
+            coverage: covered.iter().map(|(_, source)| source.clone()).collect(),
+            summary: HEADINGS
+                .iter()
+                .map(|heading| format!("{heading}\n{id}.\n"))
+                .collect(),
+            selection,
+            projection_version: epoch,
+            format_version: pioneer_compaction::FORMAT_VERSION,
+        };
+        let candidate = attempt
+            .candidate(
+                1,
+                checkpoint.id.clone(),
+                SourceCursor {
+                    unit: covered.len() as u64,
+                    ..Default::default()
+                },
+                true,
+                2,
+            )
+            .unwrap();
+        assert!(
+            f.store
+                .compaction_runner_transition(
+                    &operation.id,
+                    attempt.generation,
+                    &candidate,
+                    Some(&checkpoint),
+                )
+                .await
+                .unwrap()
+        );
+        let ready = candidate.candidate_checked(true).unwrap();
+        assert!(
+            f.store
+                .compaction_runner_transition(&operation.id, candidate.generation, &ready, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            f.store
+                .compaction_apply_runner(&operation.id, &ready, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        assert!(
+            f.store
+                .compaction_checkpoint_edges(id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    for reverse in [false, true] {
+        let f = fixture("unused", vec![], true, false).await;
+        f.store
+            .database_connection()
+            .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+            .await
+            .unwrap();
+        let a_thread = if reverse { "z-alias-a" } else { "a-alias-a" };
+        let c_thread = if reverse { "a-alias-c" } else { "z-alias-c" };
+        for thread in ["parent", "execution", a_thread, c_thread, "copy-source"] {
+            f.store.database_connection().execute_unprepared(&format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{thread}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            )).await.unwrap();
+        }
+        for (thread, id, text) in [
+            (a_thread, "alias-a-input", "same question"),
+            (c_thread, "alias-c-input", "independent C"),
+            ("copy-source", "alias-b-input", "same question"),
+        ] {
+            f.store.database_connection().execute_unprepared(&format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn-{id}','{thread}','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('{id}','turn-{id}',0,'text','{text}','{{\"type\":\"text\",\"text\":\"{text}\"}}',CURRENT_TIMESTAMP)"
+            )).await.unwrap();
+            super::history::prepare_history(&f.store, "ws", thread)
+                .await
+                .unwrap();
+        }
+        let allowed = ["parent", "execution", a_thread, c_thread, "copy-source"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut raw = Vec::new();
+        for (thread, id) in [
+            (a_thread, "alias-a-input"),
+            (c_thread, "alias-c-input"),
+            ("copy-source", "alias-b-input"),
+        ] {
+            let fence = f.store.compaction_history_read_fence().await.unwrap();
+            let mut line =
+                super::history::load_task_line_history(&f.store, "ws", thread, None, &fence)
+                    .await
+                    .unwrap();
+            let mut message =
+                line.drain(..)
+                    .find(|message| {
+                        message.provenance.as_ref().is_some_and(|origin| {
+                            origin.sources.iter().any(|source| source.id == id)
+                        })
+                    })
+                    .unwrap();
+            let origin = message.provenance.as_mut().unwrap();
+            origin.context_thread = Some("execution".into());
+            origin.inherited = true;
+            raw.push(message);
+        }
+        let source = |message: &pioneer_provider::ChatMessage| {
+            let source = &message.provenance.as_ref().unwrap().sources[0];
+            SourceRef {
+                scope: source.scope.clone(),
+                id: source.id.clone(),
+                version: source.version.clone(),
+            }
+        };
+        let raw_snapshot = super::frozen::capture(&f.store, "ws", "parent", &allowed, &raw)
+            .await
+            .unwrap();
+        for sql in [
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('parent-alias-turn','parent','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('execution-alias-turn','execution','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('execution','parent','parent',1,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('policy-alias-turn','execution','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('alias-policy-task','ws','thread','parent','parent','parent-alias-turn','agent','running','Alias policy','Check selection')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('alias-policy-run','alias-policy-task','alias-policy-run',1,1,'running','agent')",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('alias-policy-run-turn','alias-policy-task','alias-policy-run','execution','policy-alias-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+        ] {
+            f.store
+                .database_connection()
+                .execute_unprepared(sql)
+                .await
+                .unwrap();
+        }
+        save_task_input_snapshot(
+            &f,
+            "alias-policy-run",
+            "alias-policy-task",
+            "parent",
+            "parent-alias-turn",
+            &raw_snapshot,
+        )
+        .await;
+        let b = raw[2].provenance.as_ref().unwrap();
+        let mut s_a_input = raw[0].clone();
+        let represented_a = s_a_input.provenance.as_ref().unwrap().sources[0].clone();
+        s_a_input
+            .provenance
+            .as_mut()
+            .unwrap()
+            .source_aliases
+            .push(MessageSourceAlias {
+                represented_thread_id: a_thread.into(),
+                represented_source: represented_a,
+                thread_id: "copy-source".into(),
+                source: b.sources[0].clone(),
+            });
+        publish(
+            &f,
+            &allowed,
+            a_thread,
+            "checkpoint-alias-a",
+            Some("turn-alias-a-input"),
+            &[s_a_input],
+            &[(a_thread, source(&raw[0]))],
+        )
+        .await;
+        let unique = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("parent"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&raw_snapshot).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert!(unique.iter().all(|message| {
+            message.provenance.as_ref().is_none_or(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .all(|source| source.id != "alias-b-input")
+            })
+        }));
+        let s_a = super::checkpoint::checkpoint_message_with_resolver(
+            &f.store,
+            super::checkpoint::ProjectionContext {
+                workspace: "ws",
+                context_thread: "execution",
+                source_thread: a_thread,
+                owner: &super::native::native_owner("ws", a_thread),
+                allowed: &allowed,
+                allow_historical_gaps: true,
+            },
+            "checkpoint-alias-a",
+            &mut super::coverage::CheckpointGraphResolver::default(),
+        )
+        .await
+        .unwrap();
+        if !reverse {
+            // The delivery acknowledgement is a turn, but its authorized
+            // output is a checkpoint (not a turn). Policy selection must see
+            // the replacement before deciding whether inherited C survives.
+            for sql in [
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('execution-output-policy','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('execution-output-policy','parent','parent',1,CURRENT_TIMESTAMP)",
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('output-policy-turn','execution-output-policy','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('output-policy-delivery-turn','execution-output-policy','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('output-policy-task','ws','thread','parent','parent','parent-alias-turn','agent','running','Output policy','Check selection')",
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('output-policy-run','output-policy-task','output-policy-run',1,1,'running','agent')",
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('output-policy-run-turn','output-policy-task','output-policy-run','execution-output-policy','output-policy-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            ] {
+                f.store
+                    .database_connection()
+                    .execute_unprepared(sql)
+                    .await
+                    .unwrap();
+            }
+            let mut output_allowed = allowed.clone();
+            output_allowed.insert("execution-output-policy".into());
+            let mut c_only = raw[1].clone();
+            c_only.provenance.as_mut().unwrap().context_thread =
+                Some("execution-output-policy".into());
+            let accepted_c =
+                super::frozen::capture(&f.store, "ws", "parent", &output_allowed, &[c_only])
+                    .await
+                    .unwrap();
+            save_task_input_snapshot(
+                &f,
+                "output-policy-run",
+                "output-policy-task",
+                "parent",
+                "parent-alias-turn",
+                &accepted_c,
+            )
+            .await;
+            f.store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "execution-output-policy".into(),
+                        turn_id: "output-policy-delivery-turn".into(),
+                        item: pioneer_protocol::TurnItem::AgentMessage {
+                            id: "output-policy-ack".into(),
+                            text: "Delivered output acknowledgement".into(),
+                            phase: Default::default(),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .unwrap();
+            let acknowledgement = f
+                .store
+                .compaction_source_page(
+                    "ws",
+                    "execution-output-policy",
+                    "output-policy-delivery-turn",
+                    PagedSource::Event,
+                    0,
+                )
+                .await
+                .unwrap()
+                .entries[0]
+                .reference
+                .clone();
+            let mut output_checkpoint = s_a.clone();
+            output_checkpoint
+                .provenance
+                .as_mut()
+                .unwrap()
+                .context_thread = None;
+            let output_history = super::frozen::capture(
+                &f.store,
+                "ws",
+                a_thread,
+                &output_allowed,
+                &[output_checkpoint],
+            )
+            .await
+            .unwrap();
+            let output = pioneer_crud::compaction::TaskDeliveryOutputSnapshot {
+                delivery_id: "output-policy-delivery".into(),
+                candidate_id: "output-policy-candidate".into(),
+                output: pioneer_crud::compaction::TaskOutputSnapshot {
+                    task_run_turn_id: "output-policy-output-turn".into(),
+                    task_id: "output-policy-task".into(),
+                    run_id: "output-policy-run".into(),
+                    source_thread: a_thread.into(),
+                    source_turn: "turn-alias-a-input".into(),
+                    history: output_history,
+                },
+            };
+            let fence = f.store.compaction_history_read_fence().await.unwrap();
+            let mut epochs = std::collections::BTreeMap::new();
+            for source_thread in &output_allowed {
+                epochs.insert(
+                    source_thread.clone(),
+                    f.store
+                        .compaction_projection_version("ws", source_thread)
+                        .await
+                        .unwrap(),
+                );
+            }
+            let authorized = super::delivered::AuthorizedOutputSet {
+                workspace: "ws".into(),
+                destination: "execution-output-policy".into(),
+                checkpoint: None,
+                fence,
+                authorization_revision: 0,
+                source_epochs: epochs,
+                branches: vec![super::delivered::AuthorizedOutputBranch {
+                    snapshot: output,
+                    acknowledgement: acknowledgement.clone(),
+                    acknowledgements: vec![acknowledgement],
+                    source_threads: std::collections::BTreeSet::from([
+                        a_thread.into(),
+                        "copy-source".into(),
+                    ]),
+                }],
+            };
+            for mode in [
+                pioneer_protocol::TaskAgentContextMode::LastNTurns,
+                pioneer_protocol::TaskAgentContextMode::InheritParent,
+            ] {
+                let policy = pioneer_protocol::TaskAgentContextPolicy {
+                    mode,
+                    max_turns: Some(1),
+                    ..super::frozen::default_task_context_policy()
+                };
+                let prepared = super::frozen::capture_execution_basis_prepared_with_outputs(
+                    &f.store,
+                    "ws",
+                    "execution-output-policy",
+                    Some("output-policy-turn"),
+                    None,
+                    Some(&policy),
+                    Some(&authorized),
+                )
+                .await
+                .unwrap();
+                let ids = prepared
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.provenance.as_ref().unwrap().sources)
+                    .map(|source| source.id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    ids,
+                    std::collections::BTreeSet::from(["alias-c-input", "checkpoint-alias-a",])
+                );
+                let repeated = super::frozen::capture_execution_basis_prepared_with_outputs(
+                    &f.store,
+                    "ws",
+                    "execution-output-policy",
+                    Some("output-policy-turn"),
+                    None,
+                    Some(&policy),
+                    Some(&authorized),
+                )
+                .await
+                .unwrap();
+                assert_eq!(repeated.messages, prepared.messages);
+                let roundtrip = super::frozen::restore_accepted_history_for_execution(
+                    &f.store,
+                    "ws",
+                    Some("execution-output-policy"),
+                    "execution-output-policy",
+                    &output_allowed,
+                    &serde_json::to_string(&prepared.descriptor).unwrap(),
+                )
+                .await
+                .unwrap()
+                .messages;
+                assert_eq!(roundtrip, prepared.messages);
+            }
+        }
+        let accepted_snapshot = super::frozen::capture(
+            &f.store,
+            "ws",
+            "parent",
+            &allowed,
+            &[s_a, raw[1].clone(), raw[2].clone()],
+        )
+        .await
+        .unwrap();
+        for sql in [
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('alias-conflict-task','ws','thread','parent','parent','parent-alias-turn','agent','running','Alias conflict','Check aliases')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('alias-conflict-run','alias-conflict-task','alias-conflict-run',1,1,'running','agent')",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('alias-conflict-run-turn','alias-conflict-task','alias-conflict-run','execution','execution-alias-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+        ] {
+            f.store
+                .database_connection()
+                .execute_unprepared(sql)
+                .await
+                .unwrap();
+        }
+        save_task_input_snapshot(
+            &f,
+            "alias-conflict-run",
+            "alias-conflict-task",
+            "parent",
+            "parent-alias-turn",
+            &accepted_snapshot,
+        )
+        .await;
+        // This Task run accepted raw A/C/B before S_A was published. Selection
+        // must retain its last B even though restore can now substitute S_A.
+        let mut last_turn = super::frozen::default_task_context_policy();
+        last_turn.mode = pioneer_protocol::TaskAgentContextMode::LastNTurns;
+        last_turn.max_turns = Some(1);
+        last_turn.include_parent_summary = false;
+        let tail = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("policy-alias-turn"),
+            None,
+            Some(&last_turn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tail.messages.len(), 1);
+        assert!(tail.messages[0].provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "alias-b-input")
+        }));
+        let repeated_tail = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("policy-alias-turn"),
+            None,
+            Some(&last_turn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated_tail.messages, tail.messages);
+        let tail_roundtrip = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("execution"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&tail.descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(tail_roundtrip, tail.messages);
+        last_turn.include_parent_summary = true;
+        let represented = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("policy-alias-turn"),
+            None,
+            Some(&last_turn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(represented.messages.len(), 1);
+        assert_eq!(
+            represented.messages[0].provenance.as_ref().unwrap().sources[0].id,
+            "checkpoint-alias-a",
+            "omitting last-turn B must not backfill older turn C"
+        );
+        let represented_again = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("policy-alias-turn"),
+            None,
+            Some(&last_turn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(represented_again.messages, represented.messages);
+        let represented_roundtrip = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("execution"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&represented.descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(represented_roundtrip, represented.messages);
+        last_turn.mode = pioneer_protocol::TaskAgentContextMode::InheritParent;
+        let inherited_tail = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("policy-alias-turn"),
+            None,
+            Some(&last_turn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inherited_tail.messages, represented.messages);
+        let inherited_roundtrip = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("execution"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&inherited_tail.descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert_eq!(inherited_roundtrip, inherited_tail.messages);
+        let mut s_ac_c = raw[1].clone();
+        let represented_c = s_ac_c.provenance.as_ref().unwrap().sources[0].clone();
+        s_ac_c
+            .provenance
+            .as_mut()
+            .unwrap()
+            .source_aliases
+            .push(MessageSourceAlias {
+                represented_thread_id: c_thread.into(),
+                represented_source: represented_c,
+                thread_id: "copy-source".into(),
+                source: b.sources[0].clone(),
+            });
+        publish(
+            &f,
+            &allowed,
+            "execution",
+            "checkpoint-alias-ac",
+            Some("execution-alias-turn"),
+            &[raw[0].clone(), s_ac_c],
+            &[(a_thread, source(&raw[0])), (c_thread, source(&raw[1]))],
+        )
+        .await;
+        let edges = f
+            .store
+            .compaction_checkpoint_edges("checkpoint-alias-ac")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edges.coverage.len(), 2);
+        assert!(
+            edges
+                .coverage
+                .iter()
+                .all(|source| source.source.id != "alias-b-input")
+        );
+        let restored = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("parent"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&raw_snapshot).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        let b_visible = |messages: &[pioneer_provider::ChatMessage]| {
+            messages.iter().any(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "alias-b-input")
+                })
+            })
+        };
+        assert!(b_visible(&restored));
+        assert!(restored.iter().all(|message| {
+            message.provenance.as_ref().is_none_or(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .all(|source| source.id != "checkpoint-alias-a")
+            })
+        }));
+        let survivor = restored
+            .iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "checkpoint-alias-ac")
+                })
+            })
+            .unwrap();
+        let survivor_origin = survivor.provenance.as_ref().unwrap();
+        for represented in ["alias-a-input", "alias-c-input"] {
+            assert!(survivor_origin.source_aliases.iter().any(|alias| {
+                alias.thread_id == "copy-source"
+                    && alias.source.id == "alias-b-input"
+                    && alias.source.version == b.sources[0].version
+                    && alias.represented_source.id == represented
+            }));
+        }
+        assert!(restored.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin.ambiguous_input_aliases.iter().any(|marker| {
+                    marker.thread_id == "copy-source"
+                        && marker.source.id == "alias-b-input"
+                        && marker.source.version == b.sources[0].version
+                })
+            })
+        }));
+        let roundtrip = super::frozen::capture(&f.store, "ws", "execution", &allowed, &restored)
+            .await
+            .unwrap();
+        let again = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("execution"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&roundtrip).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert!(b_visible(&again));
+        let prepared = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("execution-alias-turn"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(b_visible(&prepared.messages));
+        let external_summary = prepared
+            .messages
+            .iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "checkpoint-alias-ac")
+                })
+            })
+            .unwrap();
+        let external_origin = external_summary.provenance.as_ref().unwrap();
+        for represented in ["alias-a-input", "alias-c-input"] {
+            assert!(external_origin.source_aliases.iter().any(|alias| {
+                alias.source.id == "alias-b-input"
+                    && alias.source.version == b.sources[0].version
+                    && alias.represented_source.id == represented
+            }));
+        }
+        let prepared_again = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            "execution",
+            Some("execution-alias-turn"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared_again.messages, prepared.messages);
+        let prepared_roundtrip = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("execution"),
+            "execution",
+            &allowed,
+            &serde_json::to_string(&prepared.descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert!(b_visible(&prepared_roundtrip));
+        assert!(prepared_roundtrip.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin.ambiguous_input_aliases.iter().any(|marker| {
+                    marker.thread_id == "copy-source"
+                        && marker.source.id == "alias-b-input"
+                        && marker.source.version == b.sources[0].version
+                })
+            })
+        }));
+        if !reverse {
+            // Use a separate accepted execution without the conflicting S_AC
+            // head. The old frozen basis still names B, but a selected S_A
+            // proves that its payload need not be read after deletion.
+            for sql in [
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('execution-policy-deleted','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('execution-policy-deleted','parent','parent',1,CURRENT_TIMESTAMP)",
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('policy-deleted-turn','execution-policy-deleted','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('alias-deleted-task','ws','thread','parent','parent','parent-alias-turn','agent','running','Alias deletion','Check selection')",
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('alias-deleted-run','alias-deleted-task','alias-deleted-run',1,1,'running','agent')",
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('alias-deleted-run-turn','alias-deleted-task','alias-deleted-run','execution-policy-deleted','policy-deleted-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            ] {
+                f.store
+                    .database_connection()
+                    .execute_unprepared(sql)
+                    .await
+                    .unwrap();
+            }
+            f.store
+                .materialize_item_completed(
+                    pioneer_protocol::ItemCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "copy-source".into(),
+                        turn_id: "turn-alias-b-input".into(),
+                        item: pioneer_protocol::TurnItem::AgentMessage {
+                            id: "alias-b-assistant-context".into(),
+                            text: "Independent assistant context".into(),
+                            phase: Default::default(),
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .unwrap();
+            super::history::prepare_history(&f.store, "ws", "copy-source")
+                .await
+                .unwrap();
+            let assistant_source = f
+                .store
+                .compaction_source_page(
+                    "ws",
+                    "copy-source",
+                    "turn-alias-b-input",
+                    PagedSource::Event,
+                    0,
+                )
+                .await
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|row| row.item_id.as_deref() == Some("alias-b-assistant-context"))
+                .expect("canonical assistant event")
+                .reference;
+            let fence = f.store.compaction_history_read_fence().await.unwrap();
+            let mut event =
+                super::history::load_task_line_history(&f.store, "ws", "copy-source", None, &fence)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|message| {
+                        message.provenance.as_ref().is_some_and(|origin| {
+                            origin.sources.iter().any(|source| {
+                                source.scope == assistant_source.scope
+                                    && source.id == assistant_source.id
+                                    && source.version == assistant_source.version
+                            })
+                        })
+                    })
+                    .expect("canonical assistant event must be available");
+            event.provenance.as_mut().unwrap().context_thread =
+                Some("execution-policy-deleted".into());
+            let mut deleted_basis = raw.clone();
+            deleted_basis.push(event);
+            for message in &mut deleted_basis {
+                message.provenance.as_mut().unwrap().context_thread =
+                    Some("execution-policy-deleted".into());
+            }
+            let mut deleted_allowed = allowed.clone();
+            deleted_allowed.insert("execution-policy-deleted".into());
+            let deleted_snapshot =
+                super::frozen::capture(&f.store, "ws", "parent", &deleted_allowed, &deleted_basis)
+                    .await
+                    .unwrap();
+            save_task_input_snapshot(
+                &f,
+                "alias-deleted-run",
+                "alias-deleted-task",
+                "parent",
+                "parent-alias-turn",
+                &deleted_snapshot,
+            )
+            .await;
+            f.store
+                .database_connection()
+                .execute_unprepared("DELETE FROM turn_input WHERE id='alias-b-input'")
+                .await
+                .unwrap();
+            for mode in [
+                pioneer_protocol::TaskAgentContextMode::LastNTurns,
+                pioneer_protocol::TaskAgentContextMode::InheritParent,
+            ] {
+                let mut selected_summary = super::frozen::default_task_context_policy();
+                selected_summary.mode = mode;
+                selected_summary.max_turns = Some(1);
+                let without_deleted_payload = super::frozen::capture_execution_basis_prepared(
+                    &f.store,
+                    "ws",
+                    "execution-policy-deleted",
+                    Some("policy-deleted-turn"),
+                    None,
+                    Some(&selected_summary),
+                )
+                .await
+                .expect("selected S_A must avoid hydrating deleted alias B beside an event");
+                let source_ids = without_deleted_payload
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.provenance.as_ref().unwrap().sources)
+                    .map(|source| source.id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    source_ids,
+                    std::collections::BTreeSet::from([
+                        "checkpoint-alias-a",
+                        assistant_source.id.as_str(),
+                    ])
+                );
+                let repeated = super::frozen::capture_execution_basis_prepared(
+                    &f.store,
+                    "ws",
+                    "execution-policy-deleted",
+                    Some("policy-deleted-turn"),
+                    None,
+                    Some(&selected_summary),
+                )
+                .await
+                .unwrap();
+                assert_eq!(repeated.messages, without_deleted_payload.messages);
+                let restored = super::frozen::restore_accepted_history_for_execution(
+                    &f.store,
+                    "ws",
+                    Some("execution-policy-deleted"),
+                    "execution-policy-deleted",
+                    &deleted_allowed,
+                    &serde_json::to_string(&without_deleted_payload.descriptor).unwrap(),
+                )
+                .await
+                .unwrap()
+                .messages;
+                assert_eq!(restored, without_deleted_payload.messages);
+            }
+        }
+        assert!(f.provider.calls.lock().unwrap().is_empty());
+    }
+}
+
+fn task_input_launch_metadata(thread: &str, turn: &str, text: &str) -> String {
+    let launch = pioneer_protocol::TurnStartParams {
+        agent_delegation_routes: Vec::new(),
+        thread_id: thread.into(),
+        turn_id: turn.into(),
+        input: vec![pioneer_protocol::UserInput::Text {
+            text: text.into(),
+            text_elements: Vec::new(),
+        }],
+        capabilities: Vec::new(),
+        model: None,
+        model_provider: None,
+        sandbox_policy: None,
+        mode: None,
+        agent_launch: None,
+        reply_to_turn_id: None,
+        mentioned_principal_ids: Vec::new(),
+        execution_backend: None,
+        reasoning: None,
+        permission_profile: None,
+        cli_runtime_options: None,
+    };
+    serde_json::to_string(&pioneer_protocol::TaskMetadata {
+        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(launch)),
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+async fn save_task_input_snapshot(
+    f: &Fixture,
+    run: &str,
+    task: &str,
+    parent_thread: &str,
+    source_turn: &str,
+    descriptor: &pioneer_compaction::frozen::FrozenHistoryRef,
+) {
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES (?,?,'ws',?,?,?,CURRENT_TIMESTAMP)",
+            [
+                run.into(),
+                task.into(),
+                parent_thread.into(),
+                source_turn.into(),
+                serde_json::to_string(descriptor).unwrap().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+}
+
+/// Keep the two ambiguity controls off the positive launch-copy run. Their
+/// additional canonical inputs remain in storage throughout the checkpoint
+/// publication and replay assertions that follow.
+async fn prepare_ambiguous_task_input_fixture(f: &Fixture) {
+    for statement in [
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('ambiguity-parent-turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('ambiguity-original','ambiguity-parent-turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('ambiguity-child-thread','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('ambiguity-child-turn','ambiguity-child-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('ambiguity-base-copy','ambiguity-child-turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('ambiguity-child-thread','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('ambiguity-task','ws','thread','thread','thread','ambiguity-parent-turn','agent','running','Ambiguous launch','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('ambiguity-run','ambiguity-task','ambiguity-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('ambiguity-run-turn','ambiguity-task','ambiguity-run','ambiguity-child-thread','ambiguity-child-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task SET metadata_json=? WHERE id='ambiguity-task'",
+            [
+                task_input_launch_metadata("thread", "ambiguity-parent-turn", "same question")
+                    .into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let accepted = super::history::load_task_line_history_turns(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["ambiguity-parent-turn".into()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    let descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &accepted,
+    )
+    .await
+    .unwrap();
+    save_task_input_snapshot(
+        f,
+        "ambiguity-run",
+        "ambiguity-task",
+        "thread",
+        "ambiguity-parent-turn",
+        &descriptor,
+    )
+    .await;
+    super::history::prepare_history(&f.store, "ws", "ambiguity-child-thread")
+        .await
+        .unwrap();
+}
+
+/// Exercise the same admitted, frozen, manifest-backed runner path in each
+/// Task-input checkpoint case. Callers keep their coverage, whole units,
+/// reference-only entries and budgets explicit.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_task_input_checkpoint_runner(
+    f: &Fixture,
+    execution_thread: &str,
+    execution_turn: Option<&str>,
+    operation: &OperationSnapshot,
+    projection: &pioneer_compaction::frozen::FrozenHistoryRef,
+    budget: &ModelBudget,
+    input_tokens: u64,
+    reference_tokens: u64,
+    manifest: &[ManifestEntry],
+    runner_tokens: u64,
+) -> RunnerState {
+    f.store
+        .compaction_admit_for_turn("ws", execution_thread, operation, execution_turn)
+        .await
+        .unwrap();
+    f.store
+        .compaction_bind_source_projection(&operation.id, projection)
+        .await
+        .unwrap_or_else(|error| panic!("bind projection for {}: {error:#}", operation.id));
+    f.store
+        .compaction_prepare_runner(&operation.id, budget, input_tokens, reference_tokens)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_manifest(&operation.id, manifest)
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_manifest_sources_current(&operation.id)
+            .await
+            .unwrap(),
+        "Task-input checkpoint manifest must be current before activation"
+    );
+    let initial =
+        RunnerState::new(operation.admission.deadline_ms, budget, runner_tokens, None).unwrap();
+    f.store
+        .compaction_activate_runner(&operation.id, &initial)
+        .await
+        .unwrap();
+    initial
+}
+
+#[tokio::test]
+async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distinct_inputs() {
+    use pioneer_provider::{ProviderRegistry, Role};
+
+    let f = fixture("unused", vec![], true, false).await;
+    for statement in [
+        "DELETE FROM turn_event WHERE id='source'",
+        "UPDATE turn SET status='completed' WHERE id='turn'",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('original-input','turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('multi-input-turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('original-sibling','multi-input-turn',0,'text','second input','{\"type\":\"text\",\"text\":\"second input\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('original-sibling-two','multi-input-turn',1,'text','third input','{\"type\":\"text\",\"text\":\"third input\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('independent-turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('independent-input','independent-turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child-thread','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn','child-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('copy-input','child-turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-changed-turn','child-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('changed-input','child-changed-turn',0,'text','additional constraints only','{\"type\":\"text\",\"text\":\"additional constraints only\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('child-thread','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('copy-task','ws','thread','thread','thread','turn','agent','running','Copy task','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('copy-run','copy-task','copy-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('copy-run-turn','copy-task','copy-run','child-thread','child-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child-thread-two','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn-two','child-thread-two','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('copy-input-two','child-turn-two',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('child-thread-two','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('copy-task-two','ws','thread','thread','thread','turn','agent','running','Copy task two','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('copy-run-two','copy-task-two','copy-run-two',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('copy-run-turn-two','copy-task-two','copy-run-two','child-thread-two','child-turn-two','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child-thread-three','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn-three','child-thread-three','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('copy-input-three','child-turn-three',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('child-thread-three','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('copy-task-three','ws','thread','thread','thread','turn','agent','running','Copy task three','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('copy-run-three','copy-task-three','copy-run-three',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('copy-run-turn-three','copy-task-three','copy-run-three','child-thread-three','child-turn-three','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('child-thread-mismatch','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('child-turn-mismatch','child-thread-mismatch','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('copy-input-mismatch','child-turn-mismatch',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('child-thread-mismatch','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('copy-task-mismatch','ws','thread','thread','thread','turn','agent','running','Different launch','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('copy-run-mismatch','copy-task-mismatch','copy-run-mismatch',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('copy-run-turn-mismatch','copy-task-mismatch','copy-run-mismatch','child-thread-mismatch','child-turn-mismatch','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    let composer_metadata = task_input_launch_metadata("thread", "turn", "same question");
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task SET metadata_json=? WHERE id IN ('copy-task','copy-task-two','copy-task-three')",
+            [composer_metadata.clone().into()],
+        ))
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let mut parent =
+        super::frozen::capture_execution_basis_prepared(&f.store, "ws", "thread", None, None, None)
+            .await
+            .unwrap();
+    // The ordinary causal view excludes an unfinished Task command. This
+    // fixture models an already accepted source turn, whose canonical input
+    // remains available to the frozen Task-run basis.
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let accepted_turn = super::history::load_task_line_history_turns(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["turn".to_owned()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    let original = accepted_turn
+        .into_iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .expect("accepted source turn retains its canonical input");
+    if !parent.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "original-input")
+        })
+    }) {
+        parent.messages.insert(0, original);
+        parent.descriptor = super::frozen::capture(
+            &f.store,
+            "ws",
+            "thread",
+            &std::collections::BTreeSet::from(["thread".to_owned()]),
+            &parent.messages,
+        )
+        .await
+        .unwrap();
+    }
+    let mut alias_scope_message = parent
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .unwrap()
+        .clone();
+    let alias_scope_origin = alias_scope_message.provenance.as_mut().unwrap();
+    alias_scope_origin
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: alias_scope_origin.thread_id.clone(),
+            represented_source: alias_scope_origin.sources[0].clone(),
+            thread_id: "alias-only-intermediate".into(),
+            source: pioneer_provider::MessageSourceRef {
+                scope: "input:intermediate-turn".into(),
+                id: "intermediate-copy".into(),
+                version: "input-revision:1".into(),
+            },
+        });
+    let alias_scope_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["thread".to_owned()]),
+        &[alias_scope_message.clone()],
+    )
+    .await
+    .unwrap();
+    let alias_scope_json = serde_json::to_string(&alias_scope_descriptor).unwrap();
+    let alias_scopes =
+        super::frozen::accepted_history_scopes(&f.store, "ws", "thread", &alias_scope_json)
+            .await
+            .unwrap();
+    assert!(!alias_scopes.contains("alias-only-intermediate"));
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &alias_scopes, &alias_scope_descriptor,)
+            .await
+            .unwrap(),
+        vec![alias_scope_message]
+    );
+    for (run, task) in [
+        ("copy-run", "copy-task"),
+        ("copy-run-three", "copy-task-three"),
+        ("copy-run-two", "copy-task-two"),
+        ("copy-run-mismatch", "copy-task-mismatch"),
+    ] {
+        save_task_input_snapshot(&f, run, task, "thread", "turn", &parent.descriptor).await;
+    }
+    super::history::prepare_history(&f.store, "ws", "child-thread")
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "child-thread-two")
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "child-thread-three")
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "child-thread-mismatch")
+        .await
+        .unwrap();
+
+    let fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut copy_without_original =
+        super::history::load_task_line_history(&f.store, "ws", "child-thread", None, &fence)
+            .await
+            .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut copy_without_original)
+        .await
+        .unwrap();
+    assert!(copy_without_original.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "copy-input")
+        })
+    }));
+    let mismatched_launch = task_input_launch_metadata("thread", "turn", "different launch input");
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task SET metadata_json=? WHERE id='copy-task-mismatch'",
+            [mismatched_launch.into()],
+        ))
+        .await
+        .unwrap();
+    let mismatch_copy = super::history::load_task_line_history(
+        &f.store,
+        "ws",
+        "child-thread-mismatch",
+        None,
+        &fence,
+    )
+    .await
+    .unwrap();
+    let mut unproven_current = parent.messages.clone();
+    unproven_current.extend(mismatch_copy);
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut unproven_current)
+        .await
+        .unwrap();
+    assert!(unproven_current.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "copy-input-mismatch")
+        })
+    }));
+    let copy_three =
+        super::history::load_task_line_history(&f.store, "ws", "child-thread-three", None, &fence)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "copy-input-three")
+                })
+            })
+            .unwrap();
+    let mut alias_boundary = parent
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .unwrap()
+        .clone();
+    let boundary_origin = alias_boundary.provenance.as_mut().unwrap();
+    boundary_origin.inherited = true;
+    let boundary_source = boundary_origin.sources[0].clone();
+    let aliases_per_source = pioneer_compaction::REPLAY_ALIAS_LIMIT / 2;
+    boundary_origin.source_aliases = (0..aliases_per_source)
+        .map(|index| pioneer_provider::MessageSourceAlias {
+            represented_thread_id: boundary_origin.thread_id.clone(),
+            represented_source: boundary_source.clone(),
+            thread_id: format!("historical-copy-thread-{index}"),
+            source: pioneer_provider::MessageSourceRef {
+                scope: format!("input:historical-copy-turn-{index}"),
+                id: format!("historical-copy-{index}"),
+                version: "input-revision:1".into(),
+            },
+        })
+        .collect();
+    let mut boundary_copy = copy_three.clone();
+    let boundary_copy_origin = boundary_copy.provenance.as_mut().unwrap();
+    let boundary_copy_source = boundary_copy_origin.sources[0].clone();
+    boundary_copy_origin.source_aliases = (aliases_per_source
+        ..pioneer_compaction::REPLAY_ALIAS_LIMIT)
+        .map(|index| pioneer_provider::MessageSourceAlias {
+            represented_thread_id: boundary_copy_origin.thread_id.clone(),
+            represented_source: boundary_copy_source.clone(),
+            thread_id: format!("historical-copy-thread-{index}"),
+            source: pioneer_provider::MessageSourceRef {
+                scope: format!("input:historical-copy-turn-{index}"),
+                id: format!("historical-copy-{index}"),
+                version: "input-revision:1".into(),
+            },
+        })
+        .collect();
+    let mut bounded_alias_history = vec![alias_boundary.clone(), boundary_copy];
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut bounded_alias_history)
+        .await
+        .unwrap();
+    assert_eq!(bounded_alias_history.len(), 2);
+    assert_eq!(
+        bounded_alias_history
+            .iter()
+            .map(|message| message.provenance.as_ref().unwrap().source_aliases.len())
+            .sum::<usize>(),
+        pioneer_compaction::REPLAY_ALIAS_LIMIT
+    );
+    let alias_boundary_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread-three".into()]),
+        &bounded_alias_history,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(
+            &f.store,
+            "ws",
+            &std::collections::BTreeSet::from(["thread".into(), "child-thread-three".into()]),
+            &alias_boundary_descriptor,
+        )
+        .await
+        .unwrap(),
+        bounded_alias_history
+    );
+    let boundary_represented = SourceRef {
+        scope: boundary_source.scope.clone(),
+        id: boundary_source.id.clone(),
+        version: boundary_source.version.clone(),
+    };
+    let boundary_second_source = copy_three.provenance.as_ref().unwrap().sources[0].clone();
+    let boundary_second = SourceRef {
+        scope: boundary_second_source.scope,
+        id: boundary_second_source.id,
+        version: boundary_second_source.version,
+    };
+    let mut boundary_operation = f.runner.snapshot.clone();
+    boundary_operation.id = "input-alias-boundary-operation".into();
+    boundary_operation.owner = super::native::native_owner("ws", "child-thread-three");
+    boundary_operation.expected_checkpoint = None;
+    boundary_operation.plan.fingerprint = "input-alias-boundary-plan".into();
+    boundary_operation.plan.coverage = vec![boundary_represented.clone(), boundary_second.clone()];
+    boundary_operation.plan.coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
+    boundary_operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "child-thread-three")
+        .await
+        .unwrap();
+    boundary_operation.source_epochs = std::collections::BTreeMap::from([
+        (
+            "thread".into(),
+            f.store
+                .compaction_projection_version("ws", "thread")
+                .await
+                .unwrap(),
+        ),
+        (
+            "child-thread-three".into(),
+            f.store
+                .compaction_projection_version("ws", "child-thread-three")
+                .await
+                .unwrap(),
+        ),
+    ]);
+    let boundary_budget = ModelBudget::new(Some(4096), None, Some(512));
+    let boundary_manifest = [
+        ManifestEntry {
+            ordinal: 0,
+            unit: 0,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: boundary_represented,
+        },
+        ManifestEntry {
+            ordinal: 1,
+            unit: 1,
+            reference_only: false,
+            thread_id: "child-thread-three".into(),
+            source: boundary_second,
+        },
+    ];
+    prepare_task_input_checkpoint_runner(
+        &f,
+        "child-thread-three",
+        Some("child-turn-three"),
+        &boundary_operation,
+        &alias_boundary_descriptor,
+        &boundary_budget,
+        2,
+        0,
+        &boundary_manifest,
+        512,
+    )
+    .await;
+    let boundary_summarizer = Arc::new(
+        pioneer_agent::compaction::NativeSummarizer::new(
+            f.provider.clone(),
+            boundary_operation.admission.selection.clone(),
+            boundary_budget,
+        )
+        .unwrap(),
+    );
+    let boundary_runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "child-thread-three".into(),
+        boundary_operation.clone(),
+        boundary_summarizer,
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let CompactionExit::Applied(boundary_checkpoint) =
+        boundary_runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("alias boundary checkpoint was not published")
+    };
+    let boundary_edges = f
+        .store
+        .compaction_checkpoint_edges(&boundary_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        boundary_edges.replay_aliases.len(),
+        pioneer_compaction::REPLAY_ALIAS_LIMIT
+    );
+    f.provider.calls.lock().unwrap().clear();
+    let mut aliases_above_limit = bounded_alias_history.clone();
+    let above_origin = aliases_above_limit[0].provenance.as_mut().unwrap();
+    above_origin
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: above_origin.thread_id.clone(),
+            represented_source: above_origin.sources[0].clone(),
+            thread_id: "historical-copy-thread-overflow".into(),
+            source: pioneer_provider::MessageSourceRef {
+                scope: "input:historical-copy-turn-overflow".into(),
+                id: "historical-copy-overflow".into(),
+                version: "input-revision:1".into(),
+            },
+        });
+    let above_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread-three".into()]),
+        &aliases_above_limit,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(
+            &f.store,
+            "ws",
+            &std::collections::BTreeSet::from(["thread".into(), "child-thread-three".into()]),
+            &above_descriptor,
+        )
+        .await
+        .unwrap(),
+        aliases_above_limit
+    );
+    let above_layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "child-thread-three",
+        &aliases_above_limit,
+        &[1, 1],
+    )
+    .unwrap();
+    let mut above_plan = pioneer_compaction::CompactionPlan {
+        mode: CompactionMode::Normal,
+        coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+        compact: vec![0, 1],
+        retain: vec![],
+        coverage: above_layout
+            .units
+            .iter()
+            .flat_map(|unit| unit.sources.clone())
+            .collect(),
+        fingerprint: "above-alias-boundary".into(),
+    };
+    super::admission::fit_checkpoint_replay_aliases(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        Some(&above_descriptor),
+        &above_layout,
+        &mut above_plan,
+        &ModelBudget::new(Some(4096), None, Some(512)),
+        512,
+        0,
+        128,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(above_plan.compact.len(), 1);
+    assert_eq!(above_plan.retain.len(), 1);
+    let mut composite_delivery = copy_without_original
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "copy-input")
+            })
+        })
+        .unwrap()
+        .clone();
+    let changed_delivery = copy_without_original
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "changed-input")
+            })
+        })
+        .unwrap();
+    composite_delivery.content = "same question\n\nadditional constraints only".into();
+    composite_delivery
+        .provenance
+        .as_mut()
+        .unwrap()
+        .sources
+        .extend(
+            changed_delivery
+                .provenance
+                .as_ref()
+                .unwrap()
+                .sources
+                .clone(),
+        );
+    let composite_wire = composite_delivery.clone();
+    let mut composite_history = parent.messages.clone();
+    composite_history.push(composite_delivery);
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut composite_history)
+        .await
+        .unwrap();
+    assert!(composite_history.contains(&composite_wire));
+    assert!(composite_history.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "original-input")
+        })
+    }));
+    let mut different_runs = parent.messages.clone();
+    different_runs.extend(copy_without_original.clone());
+    different_runs.extend(
+        super::history::load_task_line_history(&f.store, "ws", "child-thread-two", None, &fence)
+            .await
+            .unwrap(),
+    );
+    let live_proofs = f
+        .store
+        .compaction_task_input_copy_aliases(
+            "ws",
+            &["copy-input".to_owned(), "copy-input-two".to_owned()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live_proofs.len(),
+        2,
+        "both launch copies need durable proof"
+    );
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut different_runs)
+        .await
+        .unwrap();
+    let run_representative = different_runs
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .unwrap();
+    let run_aliases = &run_representative
+        .provenance
+        .as_ref()
+        .unwrap()
+        .source_aliases;
+    assert!(
+        run_aliases
+            .iter()
+            .any(|alias| alias.source.id == "copy-input")
+    );
+    assert!(
+        run_aliases
+            .iter()
+            .any(|alias| alias.source.id == "copy-input-two")
+    );
+    assert!(!different_runs.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| matches!(source.id.as_str(), "copy-input" | "copy-input-two"))
+        })
+    }));
+
+    let different_launch = task_input_launch_metadata("thread", "turn", "initially different task");
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE task SET metadata_json=? WHERE id='copy-task-two'",
+            [different_launch.into()],
+        ))
+        .await
+        .unwrap();
+    f.store
+        .replace_turn_input_projection_for_test(
+            "child-turn-two",
+            &[pioneer_protocol::UserInput::Text {
+                text: "initially different task".into(),
+                text_elements: vec![],
+            }],
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+    f.store
+        .replace_turn_input_projection_for_test(
+            "child-turn-two",
+            &[pioneer_protocol::UserInput::Text {
+                text: "same question".into(),
+                text_elements: vec![],
+            }],
+            2,
+            2,
+        )
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "child-thread-two")
+        .await
+        .unwrap();
+    let replacement_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut edited_to_match = parent.messages.clone();
+    edited_to_match.extend(
+        super::history::load_task_line_history(
+            &f.store,
+            "ws",
+            "child-thread-two",
+            None,
+            &replacement_fence,
+        )
+        .await
+        .unwrap(),
+    );
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut edited_to_match)
+        .await
+        .unwrap();
+    assert_eq!(
+        edited_to_match
+            .iter()
+            .filter(|message| message.content == "same question")
+            .count(),
+        3,
+        "a replaced child source that later matches the parent remains independent"
+    );
+
+    let mut parent_question = parent
+        .messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .unwrap()
+        .clone();
+    parent_question.provenance.as_mut().unwrap().logical_turn_id =
+        Some("parent-logical-turn".into());
+    let mut child_question = copy_without_original
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "copy-input")
+            })
+        })
+        .unwrap()
+        .clone();
+    let child_origin = child_question.provenance.as_mut().unwrap();
+    child_origin.logical_turn_id = Some("child-logical-turn".into());
+    let mut child_answer = pioneer_provider::ChatMessage::assistant("child answer retained");
+    let mut answer_origin = child_origin.clone();
+    answer_origin.sources = vec![pioneer_provider::MessageSourceRef {
+        scope: "event:child-turn".into(),
+        id: "child-answer-event".into(),
+        version: "event-revision:1".into(),
+    }];
+    answer_origin.source_aliases.clear();
+    answer_origin.protected_input = false;
+    child_answer.provenance = Some(answer_origin);
+    let policy = pioneer_protocol::TaskAgentContextPolicy {
+        mode: pioneer_protocol::TaskAgentContextMode::LastNTurns,
+        max_turns: Some(1),
+        include_parent_summary: true,
+        include_artifacts: false,
+        custom_context: None,
+    };
+    let mut last_one = vec![
+        parent_question.clone(),
+        child_question.clone(),
+        child_answer.clone(),
+    ];
+    super::frozen::select_task_history(&mut last_one, &policy).unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut last_one)
+        .await
+        .unwrap();
+    assert_eq!(last_one, vec![child_question.clone(), child_answer.clone()]);
+    let mut both_selected = vec![parent_question, child_question, child_answer.clone()];
+    let mut both_policy = policy;
+    both_policy.max_turns = Some(2);
+    super::frozen::select_task_history(&mut both_selected, &both_policy).unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut both_selected)
+        .await
+        .unwrap();
+    assert_eq!(
+        both_selected
+            .iter()
+            .filter(|message| message.content == "same question")
+            .count(),
+        1
+    );
+    assert!(both_selected.contains(&child_answer));
+
+    let prepared = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        Some("child-turn"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let user = prepared
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .collect::<Vec<_>>();
+    let represented = user
+        .iter()
+        .flat_map(|message| &message.provenance.as_ref().unwrap().sources)
+        .map(|source| source.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(represented.contains("original-input"));
+    assert!(!represented.contains("copy-input"));
+    assert!(represented.contains("original-sibling"));
+    assert!(represented.contains("independent-input"));
+    assert!(represented.contains("changed-input"));
+    let original = user
+        .iter()
+        .find(|message| message.provenance.as_ref().unwrap().sources[0].id == "original-input")
+        .unwrap();
+    assert_eq!(original.content, "same question");
+    assert!(
+        original
+            .provenance
+            .as_ref()
+            .unwrap()
+            .source_aliases
+            .iter()
+            .any(|alias| {
+                alias.represented_thread_id == "thread"
+                    && alias.represented_source.id == "original-input"
+                    && alias.represented_source.version == "input-revision:1"
+                    && alias.thread_id == "child-thread"
+                    && alias.source.id == "copy-input"
+                    && alias.source.version == "input-revision:1"
+            })
+    );
+    assert_eq!(
+        user.iter()
+            .filter(|message| message.content == "same question")
+            .count(),
+        2,
+        "the independent repeated user message must remain"
+    );
+    let providers = ProviderRegistry::new(|_| "fixture-key".into());
+    providers
+        .insert("summary-fixture", f.provider.clone())
+        .unwrap();
+    providers
+        .insert("main-fixture", Arc::new(SmallWindowMain))
+        .unwrap();
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-fixture".into(),
+            model: "summary-model".into(),
+            effort: None,
+        }),
+    };
+    let context = pioneer_agent::compaction::controller::NativeContext {
+        overflow_recovery: false,
+        recovery_deadline_ms: None,
+        workspace_id: "ws".into(),
+        thread_id: "child-thread".into(),
+        turn_id: "child-turn".into(),
+        conversation_thread_id: Some("thread".into()),
+        provider_instance: "main-fixture".into(),
+        provider: providers
+            .get_or_create_for_workspace("ws", "main-fixture")
+            .unwrap(),
+        events: Arc::new(ExecutionEventHub::new()),
+        cancellation: CancellationToken::new(),
+    };
+    let ordinary = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: parent
+                .messages
+                .iter()
+                .cloned()
+                .chain(copy_without_original.iter().cloned())
+                .collect(),
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        Some(prepared.descriptor.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let ordinary_sources = ordinary
+        .request
+        .messages
+        .iter()
+        .flat_map(|message| message.provenance.iter())
+        .flat_map(|origin| origin.sources.iter())
+        .map(|source| source.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(!ordinary_sources.contains("copy-input"));
+    assert!(ordinary_sources.contains("original-input"));
+    assert!(ordinary_sources.contains("independent-input"));
+    assert_eq!(
+        ordinary
+            .request
+            .messages
+            .iter()
+            .filter(|message| message.content == "same question")
+            .count(),
+        2
+    );
+
+    // Each independently accepted branch fits one checkpoint quantum. Their
+    // combined history is still a valid ordinary request and frozen snapshot.
+    let large_branches = ["original-input", "original-sibling"]
+        .into_iter()
+        .enumerate()
+        .map(|(branch, id)| {
+            let mut message = parent
+                .messages
+                .iter()
+                .find(|message| {
+                    message
+                        .provenance
+                        .as_ref()
+                        .is_some_and(|origin| origin.sources.iter().any(|source| source.id == id))
+                })
+                .unwrap()
+                .clone();
+            let origin = message.provenance.as_mut().unwrap();
+            origin.inherited = true;
+            origin.source_aliases = (0..129)
+                .map(|index| pioneer_provider::MessageSourceAlias {
+                    represented_thread_id: origin.thread_id.clone(),
+                    represented_source: origin.sources[0].clone(),
+                    thread_id: format!("accepted-alias-thread-{branch}-{index}"),
+                    source: pioneer_provider::MessageSourceRef {
+                        scope: format!("input:accepted-alias-turn-{branch}-{index}"),
+                        id: format!("accepted-alias-{branch}-{index}"),
+                        version: "input-revision:1".into(),
+                    },
+                })
+                .collect();
+            message
+        })
+        .collect::<Vec<_>>();
+    let accepted_threads =
+        std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]);
+    let first_branch = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread",
+        &accepted_threads,
+        &large_branches[..1],
+    )
+    .await
+    .unwrap();
+    let second_branch = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread",
+        &accepted_threads,
+        &large_branches[1..],
+    )
+    .await
+    .unwrap();
+    let first_restored = super::frozen::restore(&f.store, "ws", &accepted_threads, &first_branch)
+        .await
+        .unwrap();
+    let second_restored = super::frozen::restore(&f.store, "ws", &accepted_threads, &second_branch)
+        .await
+        .unwrap();
+    let no_checkpoints = std::collections::BTreeMap::new();
+    let composed = pioneer_agent::compaction::composition::compose_context(
+        "ws",
+        "child-thread",
+        &[
+            pioneer_agent::compaction::composition::AcceptedContextBranch {
+                thread: "thread",
+                messages: &first_restored,
+                checkpoints: &no_checkpoints,
+            },
+            pioneer_agent::compaction::composition::AcceptedContextBranch {
+                thread: "thread",
+                messages: &second_restored,
+                checkpoints: &no_checkpoints,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        composed
+            .iter()
+            .map(|message| message.provenance.as_ref().unwrap().source_aliases.len())
+            .sum::<usize>(),
+        258
+    );
+    let combined_descriptor =
+        super::frozen::capture(&f.store, "ws", "child-thread", &accepted_threads, &composed)
+            .await
+            .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &accepted_threads, &combined_descriptor)
+            .await
+            .unwrap(),
+        composed
+    );
+    let combined_request = super::native::prepare_native_projection(
+        &f.store,
+        &providers,
+        &settings,
+        &context,
+        ChatRequest {
+            model: "gpt-4".into(),
+            messages: composed.clone(),
+            temperature: None,
+            max_tokens: Some(512),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        },
+        None,
+        false,
+        f.observer.clone(),
+        f.clock.clone(),
+        Some(combined_descriptor),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(combined_request.request.messages.len(), 2);
+    assert_eq!(
+        combined_request
+            .request
+            .messages
+            .iter()
+            .map(|message| message.provenance.as_ref().unwrap().source_aliases.len())
+            .sum::<usize>(),
+        258
+    );
+
+    let restored = super::frozen::restore(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".to_owned(), "child-thread".to_owned()]),
+        &prepared.descriptor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored, prepared.messages);
+    let frozen_references = f
+        .store
+        .compaction_frozen_history_page("ws", "child-thread", &prepared.descriptor.manifest_id, 0)
+        .await
+        .unwrap();
+    let frozen_original = frozen_references
+        .iter()
+        .find(|reference| reference.sources[0].id == "original-input")
+        .unwrap();
+    assert!(frozen_original.source_aliases.iter().any(|alias| {
+        alias.represented_thread == "thread"
+            && alias.represented_source.id == "original-input"
+            && alias.source_thread == "child-thread"
+            && alias.source.id == "copy-input"
+    }));
+    assert!(
+        !frozen_references.iter().any(|reference| {
+            reference
+                .sources
+                .iter()
+                .any(|source| source.id == "copy-input")
+        }),
+        "compact/reference payload manifests must not materialize the alias"
+    );
+    let restored_original = restored
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .unwrap();
+    assert_eq!(restored_original.provenance, original.provenance);
+
+    let mut renormalized = restored.clone();
+    let mut assistant = pioneer_provider::ChatMessage::assistant_tool_calls(
+        Some("child answer"),
+        vec![pioneer_provider::ProviderToolCall {
+            id: "child-call".into(),
+            name: "child_tool".into(),
+            arguments: "{}".into(),
+        }],
+    );
+    let mut assistant_origin = original.provenance.clone().unwrap();
+    assistant_origin.thread_id = "child-thread".into();
+    assistant_origin.unit_id = "child-turn:round".into();
+    assistant_origin.sources = vec![pioneer_provider::MessageSourceRef {
+        scope: "event:child-turn".into(),
+        id: "child-assistant".into(),
+        version: "event-revision:1".into(),
+    }];
+    assistant_origin.source_aliases.clear();
+    assistant_origin.protected_input = false;
+    assistant.provenance = Some(assistant_origin.clone());
+    assistant.reasoning_content = Some("preserved reasoning".into());
+    let mut tool =
+        pioneer_provider::ChatMessage::tool_result("child-call", "child_tool", "preserved result");
+    assistant_origin.sources[0].id = "child-tool-result".into();
+    tool.provenance = Some(assistant_origin);
+    renormalized.extend([assistant.clone(), tool.clone()]);
+    let expected_round = vec![assistant, tool];
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut renormalized)
+        .await
+        .unwrap();
+    assert_eq!(&renormalized[renormalized.len() - 2..], expected_round);
+    let round_tokens = renormalized
+        .iter()
+        .map(|message| pioneer_compaction::text_tokens(&message.content))
+        .collect::<Vec<_>>();
+    let round_layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "child-thread",
+        &renormalized,
+        &round_tokens,
+    )
+    .unwrap();
+    assert!(
+        round_layout
+            .message_indexes
+            .iter()
+            .any(|indexes| { indexes == &vec![renormalized.len() - 2, renormalized.len() - 1] })
+    );
+    renormalized.truncate(restored.len());
+    assert_eq!(renormalized, restored, "normalization must be idempotent");
+
+    let mut protected = parent.messages.clone();
+    protected.extend(copy_without_original.clone());
+    let original_message = protected
+        .iter_mut()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "original-input")
+            })
+        })
+        .unwrap();
+    let original_origin = original_message.provenance.as_mut().unwrap();
+    let original_source = original_origin.sources[0].clone();
+    original_origin
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: original_origin.thread_id.clone(),
+            represented_source: original_source.clone(),
+            thread_id: "alias-only-thread".into(),
+            source: pioneer_provider::MessageSourceRef {
+                scope: "input:alias-turn".into(),
+                id: "prior-copy".into(),
+                version: "input-revision:1".into(),
+            },
+        });
+    let mut changed_version = pioneer_provider::ChatMessage::user("changed prior copy");
+    let mut changed_version_origin = original_origin.clone();
+    changed_version_origin.thread_id = "alias-only-thread".into();
+    changed_version_origin.unit_id = "alias-turn:user-input".into();
+    changed_version_origin.sources = vec![pioneer_provider::MessageSourceRef {
+        scope: "input:alias-turn".into(),
+        id: "prior-copy".into(),
+        version: "input-revision:2".into(),
+    }];
+    changed_version_origin.source_aliases.clear();
+    changed_version.provenance = Some(changed_version_origin);
+    protected.push(changed_version.clone());
+    let protected_copy_before = protected
+        .iter_mut()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "copy-input")
+            })
+        })
+        .unwrap();
+    protected_copy_before
+        .content_parts
+        .push(pioneer_provider::MessageContentPart::image(
+            pioneer_provider::MessageAttachment::from_url(
+                "https://example.invalid/unique.png",
+                "image/png",
+            ),
+        ));
+    protected_copy_before
+        .content_parts
+        .push(pioneer_provider::MessageContentPart::file(
+            pioneer_provider::MessageAttachment::from_url(
+                "https://example.invalid/context.txt",
+                "text/plain",
+            ),
+        ));
+    protected_copy_before
+        .provenance
+        .as_mut()
+        .unwrap()
+        .protected_input = true;
+    let protected_wire = protected_copy_before.clone();
+    let request_with = |messages| ChatRequest {
+        model: "fixture-model".into(),
+        messages,
+        temperature: None,
+        max_tokens: Some(1),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let media_for = |messages: &[pioneer_provider::ChatMessage]| {
+        let message = messages
+            .iter()
+            .position(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "copy-input")
+                })
+            })
+            .unwrap();
+        vec![
+            pioneer_agent::compaction::request::MediaEstimate {
+                message,
+                part: 0,
+                input_tokens: 64,
+            },
+            pioneer_agent::compaction::request::MediaEstimate {
+                message,
+                part: 1,
+                input_tokens: 32,
+            },
+        ]
+    };
+    let measuring_budget = ModelBudget::new(None, None, Some(1));
+    let duplicated_projection = pioneer_agent::compaction::request::NativeRequestProjection::full(
+        request_with(protected.clone()),
+        media_for(&protected),
+        measuring_budget.clone(),
+        false,
+    )
+    .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut protected)
+        .await
+        .unwrap();
+    let protected_copy = protected
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "copy-input")
+            })
+        })
+        .unwrap();
+    assert!(protected_copy.provenance.as_ref().unwrap().protected_input);
+    assert_eq!(protected_copy.content, protected_wire.content);
+    assert_eq!(protected_copy.content_parts, protected_wire.content_parts);
+    assert_eq!(
+        protected_copy.reasoning_content,
+        protected_wire.reasoning_content
+    );
+    assert!(
+        protected_copy
+            .provenance
+            .as_ref()
+            .unwrap()
+            .source_aliases
+            .iter()
+            .any(|alias| {
+                alias.represented_thread_id == "child-thread"
+                    && alias.represented_source.id == "copy-input"
+                    && alias.thread_id == "thread"
+                    && alias.source.id == "original-input"
+            })
+    );
+    assert!(
+        protected_copy
+            .provenance
+            .as_ref()
+            .unwrap()
+            .source_aliases
+            .iter()
+            .any(|alias| {
+                alias.represented_source.id == "copy-input"
+                    && alias.source.id == "prior-copy"
+                    && alias.source.version == "input-revision:1"
+            }),
+        "aliases already proven for the previous representative must move to the protected one"
+    );
+    assert!(protected.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources == changed_version.provenance.as_ref().unwrap().sources
+        }) && message.content == changed_version.content
+    }));
+    assert!(!protected.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "original-input")
+        })
+    }));
+    let protected_once = protected.clone();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut protected)
+        .await
+        .unwrap();
+    assert_eq!(
+        protected, protected_once,
+        "transferred exact aliases must be idempotent"
+    );
+    let normalized_projection = pioneer_agent::compaction::request::NativeRequestProjection::full(
+        request_with(protected.clone()),
+        media_for(&protected),
+        measuring_budget,
+        false,
+    )
+    .unwrap();
+    assert!(
+        normalized_projection.estimated_input_tokens < duplicated_projection.estimated_input_tokens
+    );
+    let reserve = 1;
+    let threshold =
+        pioneer_compaction::padded_input(normalized_projection.estimated_input_tokens) + reserve;
+    let budget = ModelBudget::new(Some(threshold), None, Some(reserve));
+    assert!(
+        pioneer_agent::compaction::request::NativeRequestProjection::full(
+            request_with(protected.clone()),
+            media_for(&protected),
+            budget.clone(),
+            false,
+        )
+        .unwrap()
+        .fits
+    );
+    assert!(
+        !pioneer_agent::compaction::request::NativeRequestProjection::full(
+            request_with(duplicated_projection.request.messages.clone(),),
+            media_for(&duplicated_projection.request.messages),
+            budget,
+            false,
+        )
+        .unwrap()
+        .fits
+    );
+
+    let tokens = restored
+        .iter()
+        .map(|message| pioneer_compaction::text_tokens(&message.content))
+        .collect::<Vec<_>>();
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "child-thread",
+        &restored,
+        &tokens,
+    )
+    .unwrap();
+    assert!(
+        !layout
+            .units
+            .iter()
+            .any(|unit| { unit.sources.iter().any(|source| source.id == "copy-input") })
+    );
+    assert_eq!(
+        layout.units.iter().map(|unit| unit.tokens).sum::<u64>(),
+        tokens.iter().sum::<u64>(),
+        "budgeting must use the same normalized representation"
+    );
+
+    let ambiguous_fixture = fixture("unused", vec![], true, false).await;
+    prepare_ambiguous_task_input_fixture(&ambiguous_fixture).await;
+    ambiguous_fixture.store.database_connection().execute_unprepared(
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('ambiguous-copy','ambiguity-child-turn',1,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    super::history::prepare_history(&ambiguous_fixture.store, "ws", "ambiguity-child-thread")
+        .await
+        .unwrap();
+    let fence = ambiguous_fixture
+        .store
+        .compaction_history_read_fence()
+        .await
+        .unwrap();
+    let mut ambiguous_copies = super::history::load_task_line_history_turns(
+        &ambiguous_fixture.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["ambiguity-parent-turn".into()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    ambiguous_copies.extend(
+        super::history::load_task_line_history(
+            &ambiguous_fixture.store,
+            "ws",
+            "ambiguity-child-thread",
+            None,
+            &fence,
+        )
+        .await
+        .unwrap(),
+    );
+    super::history::normalize_task_input_copies(
+        &ambiguous_fixture.store,
+        "ws",
+        &mut ambiguous_copies,
+    )
+    .await
+    .unwrap();
+    let ambiguous_copy_sources = ambiguous_copies
+        .iter()
+        .flat_map(|message| {
+            message
+                .provenance
+                .iter()
+                .flat_map(|origin| origin.sources.iter())
+        })
+        .map(|source| source.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(ambiguous_copy_sources.contains("ambiguity-base-copy"));
+    assert!(ambiguous_copy_sources.contains("ambiguous-copy"));
+
+    ambiguous_fixture.store.database_connection().execute_unprepared(
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('ambiguous-original','ambiguity-parent-turn',1,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    super::history::prepare_history(&ambiguous_fixture.store, "ws", "thread")
+        .await
+        .unwrap();
+    let fence = ambiguous_fixture
+        .store
+        .compaction_history_read_fence()
+        .await
+        .unwrap();
+    let mut ambiguous = super::history::load_task_line_history_turns(
+        &ambiguous_fixture.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["ambiguity-parent-turn".into()]),
+        &fence,
+    )
+    .await
+    .unwrap();
+    ambiguous.extend(
+        super::history::load_task_line_history(
+            &ambiguous_fixture.store,
+            "ws",
+            "ambiguity-child-thread",
+            None,
+            &fence,
+        )
+        .await
+        .unwrap(),
+    );
+    super::history::normalize_task_input_copies(&ambiguous_fixture.store, "ws", &mut ambiguous)
+        .await
+        .unwrap();
+    assert!(
+        ambiguous.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "ambiguity-base-copy")
+            })
+        }),
+        "ambiguous source input identity must preserve the copy"
+    );
+
+    // The independent ambiguity run remains intact. The following checkpoint
+    // scenario still uses the original unambiguous launch-copy run.
+    let prepared = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        Some("child-turn"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let represented_source = original.provenance.as_ref().unwrap().sources[0].clone();
+    let represented_source = SourceRef {
+        scope: represented_source.scope,
+        id: represented_source.id,
+        version: represented_source.version,
+    };
+    let copy_alias = original
+        .provenance
+        .as_ref()
+        .unwrap()
+        .source_aliases
+        .iter()
+        .find(|alias| alias.source.id == "copy-input")
+        .unwrap()
+        .clone();
+    // Freeze the separate A and B representations before publishing the
+    // checkpoint. Accepted execution may later suppress B by exact graph
+    // evidence, even if B's canonical row is no longer available.
+    let mut copy_v1_message = copy_without_original
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "copy-input" && source.version == "input-revision:1")
+            })
+        })
+        .unwrap()
+        .clone();
+    copy_v1_message.provenance.as_mut().unwrap().inherited = true;
+    let mut snapshot_a = (*original).clone();
+    snapshot_a
+        .provenance
+        .as_mut()
+        .unwrap()
+        .source_aliases
+        .clear();
+    let copy_v1_messages = vec![snapshot_a, copy_v1_message];
+    let copy_v1_basis = super::frozen::capture(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+        &copy_v1_messages,
+    )
+    .await
+    .unwrap();
+    let copy_v1_nested_basis = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread",
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+        &copy_v1_messages,
+    )
+    .await
+    .unwrap();
+    // A separate accepted Task basis freezes A and B before the child head
+    // exists. Its immutable descriptor is used again after B is replaced.
+    for statement in [
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('external-basis-turn','child-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('external-basis-task','ws','thread','thread','thread','turn','agent','running','External basis','same question')",
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('external-basis-run','external-basis-task','external-basis-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('external-basis-run-turn','external-basis-task','external-basis-run','child-thread','external-basis-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    save_task_input_snapshot(
+        &f,
+        "external-basis-run",
+        "external-basis-task",
+        "thread",
+        "turn",
+        &copy_v1_basis,
+    )
+    .await;
+    let reference_source = prepared
+        .messages
+        .iter()
+        .flat_map(|message| message.provenance.iter())
+        .flat_map(|origin| origin.sources.iter())
+        .find(|source| source.id == "changed-input")
+        .unwrap();
+    let reference_source = SourceRef {
+        scope: reference_source.scope.clone(),
+        id: reference_source.id.clone(),
+        version: reference_source.version.clone(),
+    };
+    let mut operation = f.runner.snapshot.clone();
+    operation.id = "input-alias-operation".into();
+    operation.owner = super::native::native_owner("ws", "child-thread");
+    operation.expected_checkpoint = None;
+    operation.plan.fingerprint = "input-alias-plan".into();
+    operation.plan.coverage = vec![represented_source.clone()];
+    operation.plan.coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
+    operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "child-thread")
+        .await
+        .unwrap();
+    operation.source_epochs = prepared.source_epochs.clone();
+    let runner_budget = ModelBudget::new(Some(4096), None, Some(512));
+    let manifest = [
+        ManifestEntry {
+            ordinal: 0,
+            unit: 0,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: represented_source.clone(),
+        },
+        ManifestEntry {
+            ordinal: 1,
+            unit: 0,
+            reference_only: true,
+            thread_id: "child-thread".into(),
+            source: reference_source,
+        },
+    ];
+    prepare_task_input_checkpoint_runner(
+        &f,
+        "child-thread",
+        Some("child-turn"),
+        &operation,
+        &prepared.descriptor,
+        &runner_budget,
+        1,
+        1,
+        &manifest,
+        512,
+    )
+    .await;
+    assert!(
+        f.store
+            .compaction_manifest_sources_current(&operation.id)
+            .await
+            .unwrap(),
+        "the WorkingContext manifest must be valid against its bound accepted basis"
+    );
+    let summarizer = Arc::new(
+        pioneer_agent::compaction::NativeSummarizer::new(
+            f.provider.clone(),
+            operation.admission.selection.clone(),
+            runner_budget,
+        )
+        .unwrap(),
+    );
+    let runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "child-thread".into(),
+        operation,
+        summarizer,
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let CompactionExit::Applied(checkpoint_id) =
+        runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("input alias compaction did not publish its checkpoint")
+    };
+    let calls = f.provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let compact_wire = calls[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<String>();
+    assert_eq!(compact_wire.matches("same question").count(), 1);
+    assert!(compact_wire.contains("additional constraints only"));
+    drop(calls);
+    let checkpoint = f
+        .store
+        .compaction_checkpoint(&checkpoint_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay_edges = f
+        .store
+        .compaction_checkpoint_edges(&checkpoint_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        replay_edges
+            .replay_aliases
+            .iter()
+            .any(|edge| edge.replay.source.id == "copy-input")
+    );
+    let exact_capture = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        Some("child-turn"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!exact_capture.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "copy-input" && source.version == "input-revision:1")
+        })
+    }));
+    f.store
+        .replace_turn_input_projection_for_test(
+            "child-turn",
+            &[pioneer_protocol::UserInput::Text {
+                text: "edited later question".into(),
+                text_elements: vec![],
+            }],
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "child-thread")
+        .await
+        .unwrap();
+    let external_capture = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        Some("external-basis-turn"),
+        None,
+        None,
+    )
+    .await
+    .expect("head alias must precede hydration of removed B");
+    assert!(!external_capture.messages.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "copy-input")
+        })
+    }));
+    let external_again = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        Some("external-basis-turn"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(external_again.messages, external_capture.messages);
+    let alias_allowed = std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]);
+    let (recovered, payload_reads) = super::history::with_payload_batch_stats(
+        super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("thread"),
+            "child-thread",
+            &alias_allowed,
+            &serde_json::to_string(&copy_v1_basis).unwrap(),
+        ),
+    )
+    .await;
+    let recovered = recovered
+        .expect("accepted exact alias must avoid removed B payload")
+        .messages;
+    assert!(recovered.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == checkpoint_id)
+        })
+    }));
+    assert!(!recovered.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "copy-input")
+        })
+    }));
+    assert_eq!(
+        payload_reads.calls, 0,
+        "removed B payload must not be hydrated"
+    );
+    let recovered_again = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("thread"),
+        "child-thread",
+        &alias_allowed,
+        &serde_json::to_string(&copy_v1_basis).unwrap(),
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert_eq!(recovered_again, recovered);
+    let recaptured =
+        super::frozen::capture(&f.store, "ws", "child-thread", &alias_allowed, &recovered)
+            .await
+            .unwrap();
+    let roundtrip = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("child-thread"),
+        "child-thread",
+        &alias_allowed,
+        &serde_json::to_string(&recaptured).unwrap(),
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert_eq!(roundtrip, recovered);
+    assert!(
+        super::frozen::restore(&f.store, "ws", &alias_allowed, &copy_v1_basis,)
+            .await
+            .is_err(),
+        "literal restore remains exact-current"
+    );
+    let changed_capture = super::frozen::capture_execution_basis_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        Some("child-turn"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let changed_copy_message = changed_capture
+        .messages
+        .iter()
+        .find(|message| message.content == "edited later question")
+        .expect("the saved launch-copy alias must not hide a replacement input")
+        .clone();
+    let changed_copy_source = changed_copy_message.provenance.as_ref().unwrap().sources[0].clone();
+    assert_ne!(changed_copy_source.id, "copy-input");
+    assert_eq!(changed_copy_source.version, "input-revision:1");
+    let mut accepted_v2_message = changed_copy_message.clone();
+    accepted_v2_message.provenance.as_mut().unwrap().inherited = true;
+    let copy_v2_basis = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread",
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+        &[(*original).clone(), accepted_v2_message],
+    )
+    .await
+    .unwrap();
+    for (suffix, basis) in [("v1", &copy_v1_nested_basis), ("v2", &copy_v2_basis)] {
+        let nested_thread = format!("nested-{suffix}");
+        let nested_turn = format!("nested-{suffix}-turn");
+        let nested_task = format!("nested-{suffix}-task");
+        let nested_run = format!("nested-{suffix}-run");
+        let nested_run_turn = format!("nested-{suffix}-run-turn");
+        for statement in [
+            format!(
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('{nested_thread}','ws','','agent','fixture','fixture','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('{nested_turn}','{nested_thread}','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('{nested_thread}','child-thread','thread',2,CURRENT_TIMESTAMP)"
+            ),
+            format!(
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('{nested_task}','ws','thread','child-thread','child-thread','child-turn','agent','running','Nested','Nested')"
+            ),
+            format!(
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{nested_run}','{nested_task}','{nested_run}',1,1,'running','agent')"
+            ),
+            format!(
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('{nested_run_turn}','{nested_task}','{nested_run}','{nested_thread}','{nested_turn}','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
+            ),
+        ] {
+            f.store
+                .database_connection()
+                .execute_unprepared(&statement)
+                .await
+                .unwrap();
+        }
+        save_task_input_snapshot(
+            &f,
+            &nested_run,
+            &nested_task,
+            "child-thread",
+            "child-turn",
+            basis,
+        )
+        .await;
+        super::history::prepare_history(&f.store, "ws", &nested_thread)
+            .await
+            .unwrap();
+        let nested = super::frozen::capture_execution_basis_prepared(
+            &f.store,
+            "ws",
+            &nested_thread,
+            Some(&nested_turn),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let has_source = |id: &str, version: &str| {
+            nested.messages.iter().any(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == id && source.version == version)
+                })
+            })
+        };
+        if suffix == "v1" {
+            assert!(!has_source("copy-input", "input-revision:1"));
+        } else {
+            assert!(has_source(
+                changed_copy_source.id.as_str(),
+                changed_copy_source.version.as_str()
+            ));
+        }
+    }
+    let edges = f
+        .store
+        .compaction_checkpoint_edges(&checkpoint.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edges.coverage.len(), 1);
+    assert_eq!(edges.coverage[0].source, represented_source);
+    assert_eq!(edges.replay_aliases.len(), 1);
+    assert_eq!(edges.replay_aliases[0].replay.source.id, "copy-input");
+    assert_eq!(
+        edges.replay_aliases[0].replay.source.version,
+        copy_alias.source.version
+    );
+    assert_eq!(edges.replay_aliases[0].replay.source_thread, "child-thread");
+    let replay_source = copy_alias.source.clone();
+    let mut replay = pioneer_provider::ChatMessage::user("same question");
+    replay.provenance = Some(pioneer_provider::MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: "ws".into(),
+        thread_id: "child-thread".into(),
+        context_thread: None,
+        unit_id: "child-turn:user-input".into(),
+        sources: vec![replay_source.clone()],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    });
+    let mut replay = vec![replay];
+    super::checkpoint::project_checkpoint(
+        &f.store,
+        "ws",
+        "child-thread",
+        &checkpoint.owner,
+        &checkpoint.id,
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+        &mut replay,
+    )
+    .await
+    .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut replay)
+        .await
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(
+        replay[0].provenance.as_ref().unwrap().sources[0].id,
+        checkpoint.id
+    );
+    let edited_source = changed_copy_message.provenance.as_ref().unwrap().sources[0].clone();
+    let mut edited = vec![changed_copy_message];
+    super::checkpoint::project_checkpoint(
+        &f.store,
+        "ws",
+        "child-thread",
+        &checkpoint.owner,
+        &checkpoint.id,
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+        &mut edited,
+    )
+    .await
+    .unwrap();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut edited)
+        .await
+        .unwrap();
+    assert!(edited.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.thread_id == "child-thread" && origin.sources == vec![edited_source.clone()]
+        }) && message.content == "edited later question"
+    }));
+
+    let mut composite = (*original).clone();
+    let sibling_source = parent
+        .messages
+        .iter()
+        .flat_map(|message| message.provenance.iter())
+        .flat_map(|origin| origin.sources.iter())
+        .find(|source| source.id == "original-sibling")
+        .unwrap()
+        .clone();
+    composite
+        .provenance
+        .as_mut()
+        .unwrap()
+        .sources
+        .push(sibling_source.clone());
+    let affected = std::collections::BTreeSet::from([
+        pioneer_agent::compaction::composition::ScopedHistorySource {
+            thread: "thread".into(),
+            source: represented_source.clone(),
+        },
+    ]);
+    let split = super::compatible::split_raw_overlap(
+        &f.store,
+        "ws",
+        &std::collections::BTreeSet::from(["thread".into()]),
+        &[composite],
+        &affected,
+    )
+    .await
+    .unwrap();
+    assert_eq!(split.len(), 2);
+    assert!(split.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources == vec![original.provenance.as_ref().unwrap().sources[0].clone()]
+                && origin.source_aliases == vec![copy_alias.clone()]
+        })
+    }));
+    assert!(split.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources == vec![sibling_source.clone()] && origin.source_aliases.is_empty()
+        })
+    }));
+    let mut split_and_copy = split;
+    split_and_copy.push(
+        copy_without_original
+            .iter()
+            .find(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "copy-input")
+                })
+            })
+            .unwrap()
+            .clone(),
+    );
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut split_and_copy)
+        .await
+        .unwrap();
+    assert_eq!(split_and_copy.len(), 2);
+    let normalized_split = split_and_copy.clone();
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut split_and_copy)
+        .await
+        .unwrap();
+    assert_eq!(split_and_copy, normalized_split);
+    let split_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread",
+        &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+        &split_and_copy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(
+            &f.store,
+            "ws",
+            &std::collections::BTreeSet::from(["thread".into(), "child-thread".into()]),
+            &split_descriptor,
+        )
+        .await
+        .unwrap(),
+        split_and_copy
+    );
+
+    // S_A was published before this exact copy proof existed. Replacing raw A
+    // with S_A must retain B -> A as frozen metadata, not as another source or
+    // an edit to the already published checkpoint.
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('late-copy-thread','ws','','agent','fixture','fixture','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('late-copy-turn','late-copy-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('late-copy-input','late-copy-turn',0,'text','same question','{\"type\":\"text\",\"text\":\"same question\"}',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    super::history::prepare_history(&f.store, "ws", "late-copy-thread")
+        .await
+        .unwrap();
+    let late_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let late_copy = super::history::load_task_line_history(
+        &f.store,
+        "ws",
+        "late-copy-thread",
+        None,
+        &late_fence,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "late-copy-input")
+        })
+    })
+    .unwrap();
+    let mut late_raw = alias_boundary.clone();
+    let late_origin = late_raw.provenance.as_mut().unwrap();
+    late_origin.source_aliases = vec![pioneer_provider::MessageSourceAlias {
+        represented_thread_id: late_origin.thread_id.clone(),
+        represented_source: late_origin.sources[0].clone(),
+        thread_id: "late-copy-thread".into(),
+        source: late_copy.provenance.as_ref().unwrap().sources[0].clone(),
+    }];
+    let late_allowed =
+        std::collections::BTreeSet::from(["thread".into(), "child-thread-three".into()]);
+    let mut late_resolver = super::coverage::CheckpointGraphResolver::default();
+    let summary = super::checkpoint::checkpoint_message_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child-thread-three",
+            source_thread: "child-thread-three",
+            owner: &boundary_operation.owner,
+            allowed: &late_allowed,
+            allow_historical_gaps: true,
+        },
+        &boundary_checkpoint,
+        &mut late_resolver,
+    )
+    .await
+    .unwrap();
+    let summary_source = summary.provenance.as_ref().unwrap().sources[0].clone();
+    let summary_ref = SourceRef {
+        scope: summary_source.scope.clone(),
+        id: summary_source.id.clone(),
+        version: summary_source.version.clone(),
+    };
+    let summary_graph = late_resolver
+        .resolve(&f.store, "ws", Some(&late_allowed), &summary_ref)
+        .await
+        .unwrap()
+        .unwrap();
+    let closures = std::collections::BTreeMap::from([(
+        pioneer_agent::compaction::composition::ScopedHistorySource {
+            thread: "child-thread-three".into(),
+            source: summary_ref,
+        },
+        summary_graph.leaves.clone(),
+    )]);
+    let empty_closures = std::collections::BTreeMap::new();
+    let mut projected_raw = vec![late_raw.clone(), bounded_alias_history[1].clone()];
+    super::checkpoint::project_checkpoint_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child-thread-three",
+            source_thread: "child-thread-three",
+            owner: &boundary_operation.owner,
+            allowed: &late_allowed,
+            allow_historical_gaps: true,
+        },
+        &boundary_checkpoint,
+        &mut projected_raw,
+        &mut late_resolver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(projected_raw.len(), 1);
+    assert!(
+        projected_raw[0]
+            .provenance
+            .as_ref()
+            .unwrap()
+            .source_aliases
+            .iter()
+            .any(|alias| alias.source.id == "late-copy-input")
+    );
+    let mut late_descriptors = Vec::new();
+    for reverse in [false, true] {
+        let raw_branch = [late_raw.clone()];
+        let summary_branch = [summary.clone()];
+        let branches = if reverse {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &summary_branch,
+                    checkpoints: &closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "thread",
+                    messages: &raw_branch,
+                    checkpoints: &empty_closures,
+                },
+            ]
+        } else {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "thread",
+                    messages: &raw_branch,
+                    checkpoints: &empty_closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &summary_branch,
+                    checkpoints: &closures,
+                },
+            ]
+        };
+        let composed = pioneer_agent::compaction::composition::compose_context(
+            "ws",
+            "child-thread-three",
+            &branches,
+        )
+        .unwrap();
+        assert_eq!(composed.len(), 1);
+        assert!(
+            composed[0]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .source_aliases
+                .iter()
+                .any(|alias| {
+                    alias.represented_thread_id == "thread"
+                        && alias.represented_source.id == "original-input"
+                        && alias.represented_source.version == boundary_source.version
+                        && alias.thread_id == "late-copy-thread"
+                        && alias.source.id == "late-copy-input"
+                        && alias.source.version
+                            == late_copy.provenance.as_ref().unwrap().sources[0].version
+                })
+        );
+        let descriptor = super::frozen::capture(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &late_allowed,
+            &composed,
+        )
+        .await
+        .unwrap();
+        let restored = super::frozen::restore(&f.store, "ws", &late_allowed, &descriptor)
+            .await
+            .unwrap();
+        assert_eq!(restored, composed);
+        late_descriptors.push(descriptor.clone());
+        let recaptured = super::frozen::capture(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &late_allowed,
+            &restored,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recaptured.identity_sha256, descriptor.identity_sha256);
+        let mut with_copy = restored.clone();
+        with_copy.push(late_copy.clone());
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut with_copy)
+            .await
+            .unwrap();
+        assert_eq!(with_copy, restored);
+    }
+    let mut carried_operation = boundary_operation.clone();
+    carried_operation.id = "checkpoint-carried-input-alias".into();
+    carried_operation.expected_checkpoint = Some(boundary_checkpoint.clone());
+    carried_operation.plan.fingerprint = carried_operation.id.clone();
+    carried_operation.plan.coverage = vec![SourceRef {
+        scope: summary_source.scope.clone(),
+        id: summary_source.id.clone(),
+        version: summary_source.version.clone(),
+    }];
+    carried_operation.source_epochs = std::collections::BTreeMap::from([
+        (
+            "thread".into(),
+            f.store
+                .compaction_projection_version("ws", "thread")
+                .await
+                .unwrap(),
+        ),
+        (
+            "child-thread-three".into(),
+            f.store
+                .compaction_projection_version("ws", "child-thread-three")
+                .await
+                .unwrap(),
+        ),
+    ]);
+    carried_operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "child-thread-three")
+        .await
+        .unwrap();
+    let carried_budget = ModelBudget::new(Some(4096), None, Some(512));
+    let carried_manifest = [ManifestEntry {
+        ordinal: 0,
+        unit: 0,
+        reference_only: false,
+        thread_id: "child-thread-three".into(),
+        source: carried_operation.plan.coverage[0].clone(),
+    }];
+    prepare_task_input_checkpoint_runner(
+        &f,
+        "child-thread-three",
+        Some("child-turn-three"),
+        &carried_operation,
+        &late_descriptors[0],
+        &carried_budget,
+        1,
+        0,
+        &carried_manifest,
+        512,
+    )
+    .await;
+    f.provider.calls.lock().unwrap().clear();
+    let carried_summarizer = Arc::new(
+        pioneer_agent::compaction::NativeSummarizer::new(
+            f.provider.clone(),
+            carried_operation.admission.selection.clone(),
+            carried_budget,
+        )
+        .unwrap(),
+    );
+    let carried_runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "child-thread-three".into(),
+        carried_operation,
+        carried_summarizer,
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let CompactionExit::Applied(carried_checkpoint) =
+        carried_runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("checkpoint carrying a saved exact input alias was not published")
+    };
+    let carried_edges = f
+        .store
+        .compaction_checkpoint_edges(&carried_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(carried_edges.coverage.len(), 1);
+    assert!(carried_edges.replay_aliases.iter().any(|alias| {
+        alias.replay.source.id == "late-copy-input"
+            && alias.covered.source.id == "original-input"
+            && alias.tool_item_id.is_none()
+    }));
+    let calls = f.provider.calls.lock().unwrap();
+    assert!(!calls.is_empty());
+    assert!(calls.iter().all(|request| {
+        let input: pioneer_compaction::summary::SummaryInput =
+            serde_json::from_str(&request.messages[1].content).unwrap();
+        let compact = input.compact_units.iter();
+        let reference = input.reference_only.iter();
+        compact
+            .clone()
+            .flat_map(|part| &part.sources)
+            .chain(reference.clone().map(|part| &part.source))
+            .all(|source| source.id != "late-copy-input")
+            && compact
+                .map(|part| part.text.matches("same question").count())
+                .chain(reference.map(|part| part.text.matches("same question").count()))
+                .sum::<usize>()
+                <= 1
+    }));
+    drop(calls);
+    for statement in [
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('conflict-c-turn','child-thread-three','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload,created_at) VALUES ('conflict-c-input','conflict-c-turn',0,'text','independent C','{\"type\":\"text\",\"text\":\"independent C\"}',CURRENT_TIMESTAMP)",
+    ] {
+        f.store
+            .database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    super::history::prepare_history(&f.store, "ws", "child-thread-three")
+        .await
+        .unwrap();
+    let conflict_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut c_message = super::history::load_task_line_history(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        None,
+        &conflict_fence,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "conflict-c-input")
+        })
+    })
+    .unwrap();
+    let c_origin = c_message.provenance.as_mut().unwrap();
+    c_origin
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: c_origin.thread_id.clone(),
+            represented_source: c_origin.sources[0].clone(),
+            thread_id: "late-copy-thread".into(),
+            source: late_copy.provenance.as_ref().unwrap().sources[0].clone(),
+        });
+    let c_source = SourceRef {
+        scope: c_origin.sources[0].scope.clone(),
+        id: c_origin.sources[0].id.clone(),
+        version: c_origin.sources[0].version.clone(),
+    };
+    let c_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &late_allowed,
+        &[c_message.clone()],
+    )
+    .await
+    .unwrap();
+    let mut conflict_operation = boundary_operation.clone();
+    conflict_operation.id = "independent-conflicting-input-alias".into();
+    conflict_operation.owner = "independent-input-alias-owner".into();
+    conflict_operation.expected_checkpoint = None;
+    conflict_operation.plan.fingerprint = conflict_operation.id.clone();
+    conflict_operation.plan.coverage = vec![c_source.clone()];
+    conflict_operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "child-thread-three")
+        .await
+        .unwrap();
+    conflict_operation.source_epochs = std::collections::BTreeMap::from([
+        (
+            "thread".into(),
+            f.store
+                .compaction_projection_version("ws", "thread")
+                .await
+                .unwrap(),
+        ),
+        (
+            "child-thread-three".into(),
+            conflict_operation.projection_version,
+        ),
+    ]);
+    let conflict_budget = ModelBudget::new(Some(4096), None, Some(512));
+    let conflict_manifest = [ManifestEntry {
+        ordinal: 0,
+        unit: 0,
+        reference_only: false,
+        thread_id: "child-thread-three".into(),
+        source: c_source.clone(),
+    }];
+    prepare_task_input_checkpoint_runner(
+        &f,
+        "child-thread-three",
+        Some("child-turn-three"),
+        &conflict_operation,
+        &c_descriptor,
+        &conflict_budget,
+        1,
+        0,
+        &conflict_manifest,
+        512,
+    )
+    .await;
+    let conflict_summarizer = Arc::new(
+        pioneer_agent::compaction::NativeSummarizer::new(
+            f.provider.clone(),
+            conflict_operation.admission.selection.clone(),
+            conflict_budget,
+        )
+        .unwrap(),
+    );
+    let conflict_runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "child-thread-three".into(),
+        conflict_operation,
+        conflict_summarizer,
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let CompactionExit::Applied(independent_checkpoint) =
+        conflict_runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("independent exact input-alias checkpoint was not published")
+    };
+    let independent_root = f
+        .store
+        .compaction_checkpoint_source("ws", "child-thread-three", &independent_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut independent_resolver = super::coverage::CheckpointGraphResolver::default();
+    let independent_graph = independent_resolver
+        .resolve(&f.store, "ws", Some(&late_allowed), &independent_root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        independent_graph
+            .leaves
+            .iter()
+            .any(|leaf| leaf.source.id == "conflict-c-input")
+    );
+    assert!(
+        !independent_graph
+            .leaves
+            .iter()
+            .any(|leaf| leaf.source.id == "original-input")
+    );
+    let independent_summary = super::checkpoint::checkpoint_message_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child-thread-three",
+            source_thread: "child-thread-three",
+            owner: "independent-input-alias-owner",
+            allowed: &late_allowed,
+            allow_historical_gaps: true,
+        },
+        &independent_checkpoint,
+        &mut independent_resolver,
+    )
+    .await
+    .unwrap();
+    // Projection is deliberately sequential in ordinary/background history.
+    // Neither independently valid checkpoint may consume B before both exact
+    // claims are visible to normalization, regardless of projection order.
+    let sequential_allowed = std::collections::BTreeSet::from([
+        "thread".into(),
+        "child-thread-three".into(),
+        "late-copy-thread".into(),
+    ]);
+    let mut accepted_copy = late_copy.clone();
+    let accepted_origin = accepted_copy.provenance.as_mut().unwrap();
+    accepted_origin.context_thread = Some("child-thread-three".into());
+    accepted_origin.inherited = true;
+    for order in [
+        [
+            (&carried_checkpoint, boundary_operation.owner.as_str()),
+            (&independent_checkpoint, "independent-input-alias-owner"),
+        ],
+        [
+            (&independent_checkpoint, "independent-input-alias-owner"),
+            (&carried_checkpoint, boundary_operation.owner.as_str()),
+        ],
+    ] {
+        let mut projected = vec![
+            late_raw.clone(),
+            bounded_alias_history[1].clone(),
+            c_message.clone(),
+            accepted_copy.clone(),
+        ];
+        let mut resolver = super::coverage::CheckpointGraphResolver::default();
+        for (checkpoint, owner) in order {
+            super::checkpoint::project_checkpoint_with_resolver(
+                &f.store,
+                super::checkpoint::ProjectionContext {
+                    workspace: "ws",
+                    context_thread: "child-thread-three",
+                    source_thread: "child-thread-three",
+                    owner,
+                    allowed: &sequential_allowed,
+                    allow_historical_gaps: true,
+                },
+                checkpoint,
+                &mut projected,
+                &mut resolver,
+            )
+            .await
+            .unwrap();
+            assert!(projected.iter().any(|message| {
+                message.provenance.as_ref().is_some_and(|origin| {
+                    origin
+                        .sources
+                        .iter()
+                        .any(|source| source.id == "late-copy-input")
+                })
+            }));
+        }
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut projected)
+            .await
+            .unwrap();
+        assert_eq!(projected.len(), 3);
+        let again = projected.clone();
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut projected)
+            .await
+            .unwrap();
+        assert_eq!(projected, again);
+        let descriptor = super::frozen::capture(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &sequential_allowed,
+            &projected,
+        )
+        .await
+        .unwrap();
+        let accepted = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("child-thread-three"),
+            "child-thread-three",
+            &sequential_allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert!(accepted.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "late-copy-input")
+            })
+        }));
+    }
+    let mut a_without_alias = late_raw.clone();
+    a_without_alias
+        .provenance
+        .as_mut()
+        .unwrap()
+        .source_aliases
+        .clear();
+    let independent_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &late_allowed,
+        &[a_without_alias.clone(), c_message.clone()],
+    )
+    .await
+    .unwrap();
+    let mut nested_operation = boundary_operation.clone();
+    nested_operation.id = "nested-conflicting-input-alias".into();
+    nested_operation.owner = "independent-ac-input-alias-owner".into();
+    nested_operation.expected_checkpoint = None;
+    nested_operation.plan.fingerprint = nested_operation.id.clone();
+    nested_operation.plan.coverage = vec![represented_source.clone(), c_source.clone()];
+    nested_operation.plan.compact = vec![0, 1];
+    nested_operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "child-thread-three")
+        .await
+        .unwrap();
+    nested_operation.source_epochs = std::collections::BTreeMap::from([
+        (
+            "thread".into(),
+            f.store
+                .compaction_projection_version("ws", "thread")
+                .await
+                .unwrap(),
+        ),
+        (
+            "child-thread-three".into(),
+            nested_operation.projection_version,
+        ),
+    ]);
+    let nested_budget = ModelBudget::new(Some(4096), None, Some(512));
+    let nested_manifest = [
+        ManifestEntry {
+            ordinal: 0,
+            unit: 0,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: represented_source.clone(),
+        },
+        ManifestEntry {
+            ordinal: 1,
+            unit: 1,
+            reference_only: false,
+            thread_id: "child-thread-three".into(),
+            source: c_source.clone(),
+        },
+    ];
+    prepare_task_input_checkpoint_runner(
+        &f,
+        "child-thread-three",
+        Some("child-turn-three"),
+        &nested_operation,
+        &independent_descriptor,
+        &nested_budget,
+        2,
+        0,
+        &nested_manifest,
+        512,
+    )
+    .await;
+    assert!(
+        f.store
+            .compaction_manifest_sources_current(&nested_operation.id)
+            .await
+            .unwrap(),
+        "independent S_AC must have a valid accepted WorkingContext basis"
+    );
+    let nested_summarizer = Arc::new(
+        pioneer_agent::compaction::NativeSummarizer::new(
+            f.provider.clone(),
+            nested_operation.admission.selection.clone(),
+            nested_budget,
+        )
+        .unwrap(),
+    );
+    let nested_runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "child-thread-three".into(),
+        nested_operation,
+        nested_summarizer,
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let CompactionExit::Applied(conflict_checkpoint) =
+        nested_runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("independent input-alias graphs could not be published together")
+    };
+    let conflict_root = f
+        .store
+        .compaction_checkpoint_source("ws", "child-thread-three", &conflict_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut conflict_resolver = super::coverage::CheckpointGraphResolver::default();
+    let conflict_graph = conflict_resolver
+        .resolve(&f.store, "ws", Some(&late_allowed), &conflict_root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        conflict_graph
+            .leaves
+            .iter()
+            .any(|leaf| leaf.source.id == "original-input")
+    );
+    assert!(
+        conflict_graph
+            .leaves
+            .iter()
+            .any(|leaf| leaf.source.id == "conflict-c-input")
+    );
+    assert!(
+        conflict_graph
+            .replay_aliases
+            .iter()
+            .any(|(copy, represented)| {
+                copy.source.id == "late-copy-input" && represented.source.id == "conflict-c-input"
+            })
+    );
+    assert!(
+        !conflict_graph
+            .leaves
+            .iter()
+            .any(|leaf| leaf.source.id == "late-copy-input")
+    );
+    let conflict_summary = super::checkpoint::checkpoint_message_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child-thread-three",
+            source_thread: "child-thread-three",
+            owner: "independent-ac-input-alias-owner",
+            allowed: &late_allowed,
+            allow_historical_gaps: true,
+        },
+        &conflict_checkpoint,
+        &mut conflict_resolver,
+    )
+    .await
+    .unwrap();
+    for order in [
+        [
+            (&carried_checkpoint, boundary_operation.owner.as_str()),
+            (&conflict_checkpoint, "independent-ac-input-alias-owner"),
+        ],
+        [
+            (&conflict_checkpoint, "independent-ac-input-alias-owner"),
+            (&carried_checkpoint, boundary_operation.owner.as_str()),
+        ],
+    ] {
+        let mut projected = vec![
+            a_without_alias.clone(),
+            c_message.clone(),
+            accepted_copy.clone(),
+        ];
+        let mut resolver = super::coverage::CheckpointGraphResolver::default();
+        for (checkpoint, owner) in order {
+            super::checkpoint::project_checkpoint_with_resolver(
+                &f.store,
+                super::checkpoint::ProjectionContext {
+                    workspace: "ws",
+                    context_thread: "child-thread-three",
+                    source_thread: "child-thread-three",
+                    owner,
+                    allowed: &sequential_allowed,
+                    allow_historical_gaps: true,
+                },
+                checkpoint,
+                &mut projected,
+                &mut resolver,
+            )
+            .await
+            .unwrap();
+        }
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut projected)
+            .await
+            .unwrap();
+        assert!(projected.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "late-copy-input")
+            })
+        }));
+        let repeated = projected.clone();
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut projected)
+            .await
+            .unwrap();
+        assert_eq!(projected, repeated);
+        let descriptor = super::frozen::capture(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &sequential_allowed,
+            &projected,
+        )
+        .await
+        .unwrap();
+        let restored = super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("child-thread-three"),
+            "child-thread-three",
+            &sequential_allowed,
+            &serde_json::to_string(&descriptor).unwrap(),
+        )
+        .await
+        .unwrap()
+        .messages;
+        assert!(restored.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "late-copy-input")
+            })
+        }));
+    }
+    let mut raw_conflict = vec![
+        conflict_summary.clone(),
+        late_raw.clone(),
+        accepted_copy.clone(),
+    ];
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut raw_conflict)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_conflict.len(),
+        3,
+        "a raw A→B proof cannot override ambiguous checkpoint claims"
+    );
+    let carried_root = f
+        .store
+        .compaction_checkpoint_source("ws", "child-thread-three", &carried_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut carried_resolver = super::coverage::CheckpointGraphResolver::default();
+    let carried_graph = carried_resolver
+        .resolve(&f.store, "ws", Some(&late_allowed), &carried_root)
+        .await
+        .unwrap()
+        .unwrap();
+    let carried_summary = super::checkpoint::checkpoint_message_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child-thread-three",
+            source_thread: "child-thread-three",
+            owner: &boundary_operation.owner,
+            allowed: &late_allowed,
+            allow_historical_gaps: true,
+        },
+        &carried_checkpoint,
+        &mut carried_resolver,
+    )
+    .await
+    .unwrap();
+    let mut old_a = carried_summary.clone();
+    let mut old_ac = conflict_summary.clone();
+    for summary in [&mut old_a, &mut old_ac] {
+        let origin = summary.provenance.as_mut().unwrap();
+        origin.source_aliases.clear();
+        origin.ambiguous_input_aliases.clear();
+    }
+    let old_frozen = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &sequential_allowed,
+        &[old_a, old_ac, accepted_copy.clone()],
+    )
+    .await
+    .unwrap();
+    // Literal restoration deliberately has no newly inferred provenance.
+    // The production projection and composition paths must recover evidence
+    // from each immutable checkpoint graph before one absorbs the other.
+    let literal_graphs = super::frozen::restore(&f.store, "ws", &sequential_allowed, &old_frozen)
+        .await
+        .unwrap();
+    assert!(literal_graphs[..2].iter().all(|message| {
+        let origin = message.provenance.as_ref().unwrap();
+        origin.source_aliases.is_empty() && origin.ambiguous_input_aliases.is_empty()
+    }));
+    for reverse in [false, true] {
+        let mut projected = literal_graphs.clone();
+        let mut resolver = super::coverage::CheckpointGraphResolver::default();
+        let order = if reverse {
+            [
+                (&conflict_checkpoint, "independent-ac-input-alias-owner"),
+                (&carried_checkpoint, boundary_operation.owner.as_str()),
+            ]
+        } else {
+            [
+                (&carried_checkpoint, boundary_operation.owner.as_str()),
+                (&conflict_checkpoint, "independent-ac-input-alias-owner"),
+            ]
+        };
+        for (checkpoint, owner) in order {
+            super::checkpoint::project_checkpoint_with_resolver(
+                &f.store,
+                super::checkpoint::ProjectionContext {
+                    workspace: "ws",
+                    context_thread: "child-thread-three",
+                    source_thread: "child-thread-three",
+                    owner,
+                    allowed: &sequential_allowed,
+                    allow_historical_gaps: true,
+                },
+                checkpoint,
+                &mut projected,
+                &mut resolver,
+            )
+            .await
+            .unwrap();
+        }
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut projected)
+            .await
+            .unwrap();
+        assert!(projected.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "late-copy-input")
+            })
+        }));
+        let inherited = if reverse {
+            &literal_graphs[1..2]
+        } else {
+            &literal_graphs[0..1]
+        };
+        let own = if reverse {
+            &literal_graphs[0..1]
+        } else {
+            &literal_graphs[1..2]
+        };
+        let mut composed = super::frozen::compose_frozen_basis(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &sequential_allowed,
+            inherited,
+            own,
+        )
+        .await
+        .unwrap();
+        composed.push(accepted_copy.clone());
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut composed)
+            .await
+            .unwrap();
+        assert!(composed.iter().any(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.id == "late-copy-input")
+            })
+        }));
+    }
+    let mut hydrated_graphs = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("child-thread-three"),
+        "child-thread-three",
+        &sequential_allowed,
+        &serde_json::to_string(&old_frozen).unwrap(),
+    )
+    .await
+    .unwrap()
+    .messages;
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut hydrated_graphs)
+        .await
+        .unwrap();
+    assert!(hydrated_graphs.len() >= 2);
+    assert!(hydrated_graphs.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "late-copy-input")
+        })
+    }));
+    assert!(hydrated_graphs.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == conflict_checkpoint)
+                && origin.source_aliases.iter().any(|alias| {
+                    alias.source.id == "late-copy-input"
+                        && alias.represented_source.id == "conflict-c-input"
+                })
+        })
+    }));
+    let absorbed_closures = std::collections::BTreeMap::from([
+        (
+            pioneer_agent::compaction::composition::ScopedHistorySource {
+                thread: "child-thread-three".into(),
+                source: carried_root.clone(),
+            },
+            carried_graph.leaves.clone(),
+        ),
+        (
+            pioneer_agent::compaction::composition::ScopedHistorySource {
+                thread: "child-thread-three".into(),
+                source: conflict_root.clone(),
+            },
+            conflict_graph.leaves.clone(),
+        ),
+    ]);
+    for reverse in [false, true] {
+        let earlier = [carried_summary.clone()];
+        let later = [conflict_summary.clone()];
+        let branches = if reverse {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &later,
+                    checkpoints: &absorbed_closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &earlier,
+                    checkpoints: &absorbed_closures,
+                },
+            ]
+        } else {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &earlier,
+                    checkpoints: &absorbed_closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &later,
+                    checkpoints: &absorbed_closures,
+                },
+            ]
+        };
+        let composed = pioneer_agent::compaction::composition::compose_context(
+            "ws",
+            "child-thread-three",
+            &branches,
+        )
+        .unwrap();
+        // The carried checkpoint also owns child-turn-three. S_AC overlaps it
+        // on A but cannot absorb that additional leaf.
+        assert_eq!(composed.len(), 2);
+        assert!(composed.iter().any(|message| {
+            message
+                .provenance
+                .as_ref()
+                .is_some_and(|origin| origin.sources[0].id == conflict_checkpoint)
+        }));
+        let claim_owners = composed
+            .iter()
+            .flat_map(|message| message.provenance.iter())
+            .flat_map(|origin| &origin.source_aliases)
+            .filter(|alias| alias.source.id == "late-copy-input")
+            .map(|alias| alias.represented_source.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            claim_owners,
+            std::collections::BTreeSet::from(["original-input", "conflict-c-input"])
+        );
+        let mut with_copy = composed;
+        with_copy.push(accepted_copy.clone());
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut with_copy)
+            .await
+            .unwrap();
+        assert_eq!(with_copy.len(), 3);
+    }
+    let checkpoint_closures = std::collections::BTreeMap::from([
+        (
+            pioneer_agent::compaction::composition::ScopedHistorySource {
+                thread: "child-thread-three".into(),
+                source: carried_root,
+            },
+            carried_graph.leaves.clone(),
+        ),
+        (
+            pioneer_agent::compaction::composition::ScopedHistorySource {
+                thread: "child-thread-three".into(),
+                source: independent_root.clone(),
+            },
+            independent_graph.leaves.clone(),
+        ),
+    ]);
+    for reverse in [false, true] {
+        let earlier = [carried_summary.clone()];
+        let later = [independent_summary.clone()];
+        let branches = if reverse {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &later,
+                    checkpoints: &checkpoint_closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &earlier,
+                    checkpoints: &checkpoint_closures,
+                },
+            ]
+        } else {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &earlier,
+                    checkpoints: &checkpoint_closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &later,
+                    checkpoints: &checkpoint_closures,
+                },
+            ]
+        };
+        let composed = pioneer_agent::compaction::composition::compose_context(
+            "ws",
+            "child-thread-three",
+            &branches,
+        )
+        .unwrap();
+        assert_eq!(composed.len(), 2);
+        let descriptor = super::frozen::capture(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &late_allowed,
+            &composed,
+        )
+        .await
+        .unwrap();
+        let restored = super::frozen::restore(&f.store, "ws", &late_allowed, &descriptor)
+            .await
+            .unwrap();
+        assert_eq!(restored, composed);
+        let mut with_copy = restored;
+        with_copy.push(late_copy.clone());
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut with_copy)
+            .await
+            .unwrap();
+        assert_eq!(with_copy.len(), 3, "conflicting B remains visible");
+        let mut projected = composed;
+        super::checkpoint::project_checkpoint_with_resolver(
+            &f.store,
+            super::checkpoint::ProjectionContext {
+                workspace: "ws",
+                context_thread: "child-thread-three",
+                source_thread: "child-thread-three",
+                owner: "independent-ac-input-alias-owner",
+                allowed: &late_allowed,
+                allow_historical_gaps: true,
+            },
+            &conflict_checkpoint,
+            &mut projected,
+            &mut conflict_resolver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert!(projected.iter().any(|message| {
+            message
+                .provenance
+                .as_ref()
+                .is_some_and(|origin| origin.sources[0].id == carried_checkpoint)
+        }));
+        assert!(projected.iter().any(|message| {
+            message
+                .provenance
+                .as_ref()
+                .is_some_and(|origin| origin.sources[0].id == conflict_checkpoint)
+        }));
+    }
+    let accepted_conflict = super::frozen::restore_accepted_history_for_execution(
+        &f.store,
+        "ws",
+        Some("child-thread-three"),
+        "child-thread-three",
+        &sequential_allowed,
+        &serde_json::to_string(&old_frozen).unwrap(),
+    )
+    .await
+    .unwrap()
+    .messages;
+    assert!(accepted_conflict.iter().any(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "late-copy-input")
+        })
+    }));
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_input SET text=?,payload=? WHERE id='late-copy-input'",
+            [
+                "edited independent question".into(),
+                serde_json::to_string(&pioneer_protocol::UserInput::Text {
+                    text: "edited independent question".into(),
+                    text_elements: vec![],
+                })
+                .unwrap()
+                .into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "late-copy-thread")
+        .await
+        .unwrap();
+    let edited_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let edited_copy = super::history::load_task_line_history(
+        &f.store,
+        "ws",
+        "late-copy-thread",
+        None,
+        &edited_fence,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "late-copy-input")
+        })
+    })
+    .unwrap();
+    assert_ne!(
+        edited_copy.provenance.as_ref().unwrap().sources[0].version,
+        late_copy.provenance.as_ref().unwrap().sources[0].version
+    );
+    let restored_carrier =
+        super::frozen::restore(&f.store, "ws", &late_allowed, &late_descriptors[0])
+            .await
+            .unwrap();
+    let mut edited_view = restored_carrier.clone();
+    edited_view.push(edited_copy.clone());
+    super::history::normalize_task_input_copies(&f.store, "ws", &mut edited_view)
+        .await
+        .unwrap();
+    assert_eq!(edited_view.len(), 2);
+    for (copy, expected) in [(late_copy.clone(), 1), (edited_copy.clone(), 2)] {
+        let mut conflict_view = vec![conflict_summary.clone(), copy];
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut conflict_view)
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict_view.len(),
+            expected,
+            "S_AC alone has one exact B@v1 claim; B@v2 remains independent"
+        );
+    }
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_input SET text=?,payload=? WHERE id='original-input'",
+            [
+                "edited independent question".into(),
+                serde_json::to_string(&pioneer_protocol::UserInput::Text {
+                    text: "edited independent question".into(),
+                    text_elements: vec![],
+                })
+                .unwrap()
+                .into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    super::history::prepare_history(&f.store, "ws", "thread")
+        .await
+        .unwrap();
+    let newer_fence = f.store.compaction_history_read_fence().await.unwrap();
+    let mut newer_a = super::history::load_task_line_history_turns(
+        &f.store,
+        "ws",
+        "thread",
+        &std::collections::BTreeSet::from(["turn".to_owned()]),
+        &newer_fence,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|message| {
+        message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.id == "original-input")
+        })
+    })
+    .unwrap();
+    let newer_origin = newer_a.provenance.as_mut().unwrap();
+    assert_ne!(newer_origin.sources[0].version, boundary_source.version);
+    newer_origin.inherited = true;
+    newer_origin.source_aliases = vec![pioneer_provider::MessageSourceAlias {
+        represented_thread_id: "thread".into(),
+        represented_source: newer_origin.sources[0].clone(),
+        thread_id: "late-copy-thread".into(),
+        source: edited_copy.provenance.as_ref().unwrap().sources[0].clone(),
+    }];
+    let newer_raw = [newer_a];
+    let old_summary = [carried_summary.clone()];
+    let no_checkpoints = std::collections::BTreeMap::new();
+    for reverse in [false, true] {
+        let branches = if reverse {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &old_summary,
+                    checkpoints: &checkpoint_closures,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "thread",
+                    messages: &newer_raw,
+                    checkpoints: &no_checkpoints,
+                },
+            ]
+        } else {
+            [
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "thread",
+                    messages: &newer_raw,
+                    checkpoints: &no_checkpoints,
+                },
+                pioneer_agent::compaction::composition::AcceptedContextBranch {
+                    thread: "child-thread-three",
+                    messages: &old_summary,
+                    checkpoints: &checkpoint_closures,
+                },
+            ]
+        };
+        let mut composed = pioneer_agent::compaction::composition::compose_context(
+            "ws",
+            "child-thread-three",
+            &branches,
+        )
+        .unwrap();
+        assert_eq!(composed.len(), 1);
+        let aliases = &composed[0].provenance.as_ref().unwrap().source_aliases;
+        assert!(aliases.iter().any(|alias| {
+            alias.represented_thread_id == "thread"
+                && alias.represented_source.id == "original-input"
+                && alias.represented_source.version == boundary_source.version
+                && alias.thread_id == "late-copy-thread"
+                && alias.source.id == "late-copy-input"
+                && alias.source.version == late_copy.provenance.as_ref().unwrap().sources[0].version
+        }));
+        assert!(!aliases.iter().any(|alias| {
+            alias.represented_source.id == "original-input"
+                && alias.represented_source.version
+                    == newer_raw[0].provenance.as_ref().unwrap().sources[0].version
+                && alias.source.id == edited_copy.provenance.as_ref().unwrap().sources[0].id
+                && alias.source.version
+                    == edited_copy.provenance.as_ref().unwrap().sources[0].version
+        }));
+        composed.push(edited_copy.clone());
+        super::history::normalize_task_input_copies(&f.store, "ws", &mut composed)
+            .await
+            .unwrap();
+        assert_eq!(composed.len(), 2, "B@v2 is not an alias of S_A@v1");
+        let descriptor = super::frozen::capture(
+            &f.store,
+            "ws",
+            "child-thread-three",
+            &sequential_allowed,
+            &composed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            super::frozen::restore(&f.store, "ws", &sequential_allowed, &descriptor)
+                .await
+                .unwrap(),
+            composed
+        );
+    }
+    let conflict_descriptor = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &late_allowed,
+        &[conflict_summary],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::frozen::restore(&f.store, "ws", &late_allowed, &conflict_descriptor)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_input WHERE id='late-copy-input'")
+        .await
+        .unwrap();
+    for descriptor in late_descriptors {
+        let restored = super::frozen::restore(&f.store, "ws", &late_allowed, &descriptor)
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(
+            restored[0]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .source_aliases
+                .iter()
+                .any(|alias| {
+                    alias.represented_thread_id == "thread"
+                        && alias.represented_source.id == "original-input"
+                        && alias.represented_source.version == boundary_source.version
+                        && alias.thread_id == "late-copy-thread"
+                        && alias.source.id == "late-copy-input"
+                        && alias.source.version
+                            == late_copy.provenance.as_ref().unwrap().sources[0].version
+                })
+        );
+    }
+    assert!(
+        super::frozen::restore_accepted_history_for_execution(
+            &f.store,
+            "ws",
+            Some("child-thread-three"),
+            "child-thread-three",
+            &sequential_allowed,
+            &serde_json::to_string(&old_frozen).unwrap(),
+        )
+        .await
+        .is_err(),
+        "conflicting checkpoint proofs cannot hide a removed B payload"
+    );
+
+    // The old checkpoint already publishes 256 exact input aliases. A new
+    // compaction must publish only this one additional proof, while the graph
+    // reader still sees all 257 after following the covered checkpoint.
+    let boundary_root = f
+        .store
+        .compaction_checkpoint_source("ws", "child-thread-three", &boundary_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut nested_resolver = super::coverage::CheckpointGraphResolver::default();
+    let mut nested_summary = super::checkpoint::checkpoint_message_with_resolver(
+        &f.store,
+        super::checkpoint::ProjectionContext {
+            workspace: "ws",
+            context_thread: "child-thread-three",
+            source_thread: "child-thread-three",
+            owner: &boundary_operation.owner,
+            allowed: &late_allowed,
+            allow_historical_gaps: true,
+        },
+        &boundary_checkpoint,
+        &mut nested_resolver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        nested_summary
+            .provenance
+            .as_ref()
+            .unwrap()
+            .source_aliases
+            .len(),
+        pioneer_compaction::REPLAY_ALIAS_LIMIT
+    );
+    nested_summary
+        .provenance
+        .as_mut()
+        .unwrap()
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: "thread".into(),
+            represented_source: boundary_source.clone(),
+            thread_id: "nested-copy-thread".into(),
+            source: pioneer_provider::MessageSourceRef {
+                scope: "input:nested-copy-turn".into(),
+                id: "nested-copy-257".into(),
+                version: "input-revision:1".into(),
+            },
+        });
+    let nested_projection = super::frozen::capture(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        &late_allowed,
+        &[nested_summary.clone()],
+    )
+    .await
+    .unwrap();
+    let saved = f
+        .store
+        .compaction_frozen_history_page(
+            "ws",
+            "child-thread-three",
+            &nested_projection.manifest_id,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].source_aliases.len(), 257);
+    assert_eq!(
+        saved[0]
+            .publication_aliases
+            .as_ref()
+            .unwrap()
+            .source_aliases
+            .len(),
+        1
+    );
+    let nested_layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "child-thread-three",
+        &[nested_summary.clone()],
+        &[1],
+    )
+    .unwrap();
+    let mut nested_plan = CompactionPlan {
+        mode: CompactionMode::Normal,
+        coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+        compact: vec![0],
+        retain: vec![],
+        coverage: vec![boundary_root.clone()],
+        fingerprint: "nested-alias-257-plan".into(),
+    };
+    let nested_budget = ModelBudget::new(Some(4096), None, Some(512));
+    super::admission::fit_checkpoint_replay_aliases(
+        &f.store,
+        "ws",
+        "child-thread-three",
+        Some(&nested_projection),
+        &nested_layout,
+        &mut nested_plan,
+        &nested_budget,
+        512,
+        0,
+        128,
+        false,
+        Some(&boundary_checkpoint),
+    )
+    .await
+    .unwrap();
+    assert_eq!(nested_plan.compact, vec![0]);
+    let mut nested_operation = boundary_operation.clone();
+    nested_operation.id = "nested-alias-257-operation".into();
+    nested_operation.owner = "nested-alias-257-owner".into();
+    nested_operation.expected_checkpoint = None;
+    nested_operation.plan = nested_plan;
+    nested_operation.projection_version = f
+        .store
+        .compaction_projection_version("ws", "child-thread-three")
+        .await
+        .unwrap();
+    nested_operation.source_epochs = std::collections::BTreeMap::from([
+        (
+            "thread".into(),
+            f.store
+                .compaction_projection_version("ws", "thread")
+                .await
+                .unwrap(),
+        ),
+        (
+            "child-thread-three".into(),
+            nested_operation.projection_version,
+        ),
+    ]);
+    let nested_manifest = [ManifestEntry {
+        ordinal: 0,
+        unit: 0,
+        reference_only: false,
+        thread_id: "child-thread-three".into(),
+        source: boundary_root.clone(),
+    }];
+    prepare_task_input_checkpoint_runner(
+        &f,
+        "child-thread-three",
+        Some("child-turn-three"),
+        &nested_operation,
+        &nested_projection,
+        &nested_budget,
+        1,
+        0,
+        &nested_manifest,
+        512,
+    )
+    .await;
+    assert!(
+        f.store
+            .compaction_manifest_sources_current(&nested_operation.id)
+            .await
+            .unwrap()
+    );
+    f.provider.calls.lock().unwrap().clear();
+    let nested_summarizer = Arc::new(
+        pioneer_agent::compaction::NativeSummarizer::new(
+            f.provider.clone(),
+            nested_operation.admission.selection.clone(),
+            nested_budget,
+        )
+        .unwrap(),
+    );
+    let nested_runner = CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "child-thread-three".into(),
+        nested_operation,
+        nested_summarizer,
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    );
+    let CompactionExit::Applied(nested_checkpoint) =
+        nested_runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("nested alias checkpoint was not published")
+    };
+    let direct = f
+        .store
+        .compaction_checkpoint_edges(&nested_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(direct.replay_aliases.len(), 1);
+    assert_eq!(direct.replay_aliases[0].replay.source.id, "nested-copy-257");
+    assert_eq!(direct.coverage.len(), 1);
+    assert_eq!(direct.coverage[0].source, boundary_root);
+    let root = f
+        .store
+        .compaction_checkpoint_source("ws", "child-thread-three", &nested_checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut restarted = super::coverage::CheckpointGraphResolver::default();
+    let graph = restarted
+        .resolve(&f.store, "ws", Some(&late_allowed), &root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(graph.replay_aliases.len(), 257);
+    assert!(
+        graph
+            .replay_aliases
+            .keys()
+            .any(|copy| copy.source.id == "nested-copy-257")
+    );
+    let calls = f.provider.calls.lock().unwrap();
+    assert!(!calls.is_empty());
+    for call in calls.iter() {
+        let input: pioneer_compaction::summary::SummaryInput =
+            serde_json::from_str(&call.messages[1].content).unwrap();
+        assert!(input.compact_units.iter().all(|unit| {
+            !unit.text.contains("nested-copy-257") && !unit.text.contains("historical-copy-0")
+        }));
+        assert!(input.reference_only.iter().all(|unit| {
+            !unit.text.contains("nested-copy-257") && !unit.text.contains("historical-copy-0")
+        }));
+    }
 }

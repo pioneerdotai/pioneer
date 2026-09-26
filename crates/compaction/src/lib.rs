@@ -13,6 +13,9 @@ pub use history::*;
 pub use selection::*;
 
 pub const FORMAT_VERSION: u32 = 1;
+/// Maximum exact replay aliases published by one checkpoint. Accepted frozen
+/// histories may contain more, because only selected coverage contributes.
+pub const REPLAY_ALIAS_LIMIT: usize = 256;
 pub const TAIL_TOKENS: u64 = 20_000;
 pub const ATTEMPT_MILLIS: u64 = 5 * 60 * 1_000;
 pub const OPERATION_MILLIS: u64 = 60 * 60 * 1_000;

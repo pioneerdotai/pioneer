@@ -1120,7 +1120,7 @@ pub async fn update_turn_status<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn replace_turn_input<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

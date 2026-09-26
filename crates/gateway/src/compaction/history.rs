@@ -2,14 +2,15 @@
 //! capacity before decoding. A shared fence can freeze several related lines.
 use super::*;
 
-use pioneer_agent::compaction::composition::ScopedHistorySource;
+use pioneer_agent::compaction::composition::{ExactInputClaims, ScopedHistorySource};
 use pioneer_crud::{
     CanonicalTurnEventPayload as Event,
     compaction::{HistoryReadFence, PagedSource, SourceRecord},
 };
 use pioneer_provider::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
-    MessageAttachment, MessageContentPart, MessageProvenance, MessageSourceRef, Role,
+    MessageAttachment, MessageContentPart, MessageProvenance, MessageSourceAlias, MessageSourceRef,
+    Role,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -465,6 +466,8 @@ fn origin(
                 version: source.version,
             })
             .collect(),
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
         complete: true,
         protected_input: false,
         inherited: false,
@@ -858,6 +861,7 @@ async fn populate_logical_task_turns(
 /// its new body nor turns it into a new tail entry.
 pub(crate) struct HistoryCoverageSelection<'a> {
     pub(crate) sources: &'a BTreeSet<ScopedHistorySource>,
+    pub(crate) exact_replay_aliases: &'a BTreeSet<ScopedHistorySource>,
     pub(crate) item_aliases: &'a BTreeSet<(String, String, String)>,
     pub(crate) event_input_evidence: &'a BTreeMap<ScopedHistorySource, String>,
 }
@@ -879,12 +883,473 @@ pub(crate) async fn load_task_line_history_excluding(
         true,
         HistorySelection::AllExcept {
             covered: coverage.sources,
+            exact_replay_aliases: coverage.exact_replay_aliases,
             covered_item_aliases: coverage.item_aliases,
             covered_event_input_evidence: coverage.event_input_evidence,
         },
     )
     .await?;
     populate_logical_task_turns(store, workspace, thread, messages).await
+}
+
+/// Collapse only exact Task-launch copies of canonical user inputs. The
+/// durable run/snapshot/lineage relationship narrows candidate pairs; equal
+/// payload then identifies the copied input inside those two concrete turns.
+/// Alias source refs remain attached to the one wire representation so frozen
+/// replay and later checkpoints can suppress the copy without loading it.
+pub(crate) async fn normalize_task_input_copies(
+    store: &CrudStore,
+    workspace: &str,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<()> {
+    // A raw representative may already have been replaced by a published
+    // summary. Its exact input-leaf proof is carried by the summary's frozen
+    // provenance, not by the checkpoint source itself. Validate that leaf
+    // against the published graph before suppressing a visible copy.
+    let mut checkpoint_evidence = ExactInputClaims::default();
+    let mut graphs = super::coverage::CheckpointGraphResolver::default();
+    for message in messages.iter() {
+        let Some(origin) = &message.provenance else {
+            continue;
+        };
+        checkpoint_evidence.ambiguous.extend(
+            origin
+                .ambiguous_input_aliases
+                .iter()
+                .map(|alias| (alias.thread_id.clone(), alias.source.clone())),
+        );
+        if origin.sources.len() != 1 {
+            continue;
+        }
+        let checkpoint = &origin.sources[0];
+        if !checkpoint.scope.starts_with("checkpoint:") {
+            continue;
+        }
+        let root = SourceRef {
+            scope: checkpoint.scope.clone(),
+            id: checkpoint.id.clone(),
+            version: checkpoint.version.clone(),
+        };
+        ensure!(
+            store
+                .compaction_checkpoint_source(workspace, &origin.thread_id, &root.id)
+                .await?
+                .as_ref()
+                == Some(&root),
+            "checkpoint alias carrier is not a published exact source"
+        );
+        let graph = graphs
+            .resolve(store, workspace, None, &root)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint alias carrier is unavailable"))?;
+        let mut graph_aliases = Vec::new();
+        let mut graph_conflicts = Vec::new();
+        super::checkpoint::append_graph_input_evidence(
+            &graph,
+            &mut graph_aliases,
+            &mut graph_conflicts,
+        );
+        checkpoint_evidence.ambiguous.extend(
+            graph_conflicts
+                .into_iter()
+                .map(|conflict| (conflict.thread_id, conflict.source)),
+        );
+        for alias in graph_aliases {
+            if alias.source.scope.starts_with("input:")
+                && alias.represented_source.scope.starts_with("input:")
+            {
+                checkpoint_evidence.add_alias(&alias);
+            }
+        }
+        for alias in &origin.source_aliases {
+            let represented = (
+                alias.represented_thread_id.clone(),
+                alias.represented_source.clone(),
+            );
+            ensure!(
+                graph.leaves.contains(
+                    &pioneer_agent::compaction::composition::ScopedHistorySource {
+                        thread: represented.0.clone(),
+                        source: SourceRef {
+                            scope: represented.1.scope.clone(),
+                            id: represented.1.id.clone(),
+                            version: represented.1.version.clone(),
+                        },
+                    }
+                ) && represented.1.scope.starts_with("input:")
+                    && alias.source.scope.starts_with("input:"),
+                "checkpoint input alias is outside its exact leaf closure"
+            );
+            checkpoint_evidence.add_alias(alias);
+        }
+    }
+    for message in messages.iter() {
+        let Some(origin) = &message.provenance else {
+            continue;
+        };
+        if origin
+            .sources
+            .iter()
+            .all(|source| source.scope.starts_with("input:"))
+        {
+            for alias in &origin.source_aliases {
+                if alias.represented_thread_id == origin.thread_id
+                    && origin.sources.contains(&alias.represented_source)
+                    && alias.source.scope.starts_with("input:")
+                {
+                    if checkpoint_evidence
+                        .owners
+                        .contains_key(&(alias.thread_id.clone(), alias.source.clone()))
+                    {
+                        checkpoint_evidence.add_alias(alias);
+                    }
+                }
+            }
+        }
+    }
+    // A conflict is sticky for this selected view. Do not let a later raw
+    // alias or live launch lookup turn one of the competing claims back into
+    // a unique suppression proof after checkpoint projection has finished.
+    checkpoint_evidence.mark_competing_owners();
+    checkpoint_evidence
+        .owners
+        .retain(|copy, _| !checkpoint_evidence.ambiguous.contains(copy));
+    if !checkpoint_evidence.owners.is_empty() {
+        messages.retain(|message| {
+            let Some(origin) = &message.provenance else {
+                return true;
+            };
+            if message.role != Role::User
+                || origin.protected_input
+                || !origin.complete
+                || origin.sources.len() != 1
+                || !origin.source_aliases.is_empty()
+                || !origin.sources[0].scope.starts_with("input:")
+                || !message.content_parts.is_empty()
+                || message.reasoning_content.is_some()
+                || message.tool_call_id.is_some()
+                || message.name.is_some()
+                || message.tool_calls.is_some()
+                || message.provider_replay_state.is_some()
+            {
+                return true;
+            }
+            checkpoint_evidence
+                .owners
+                .get(&(origin.thread_id.clone(), origin.sources[0].clone()))
+                .is_none_or(|claims| claims.len() != 1)
+        });
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct ExactInput {
+        thread: String,
+        source: MessageSourceRef,
+    }
+
+    #[derive(Clone)]
+    struct RepresentedInput {
+        message: usize,
+        protected: bool,
+        splittable: bool,
+    }
+
+    fn alias_key(alias: &MessageSourceAlias) -> (ExactInput, ExactInput) {
+        (
+            ExactInput {
+                thread: alias.represented_thread_id.clone(),
+                source: alias.represented_source.clone(),
+            },
+            ExactInput {
+                thread: alias.thread_id.clone(),
+                source: alias.source.clone(),
+            },
+        )
+    }
+
+    fn alias(represented: &ExactInput, source: &ExactInput) -> MessageSourceAlias {
+        MessageSourceAlias {
+            represented_thread_id: represented.thread.clone(),
+            represented_source: represented.source.clone(),
+            thread_id: source.thread.clone(),
+            source: source.source.clone(),
+        }
+    }
+
+    let mut represented = BTreeMap::<ExactInput, RepresentedInput>::new();
+    let mut aliases_by_represented = BTreeMap::<ExactInput, BTreeSet<ExactInput>>::new();
+    let mut alias_claims = BTreeMap::<ExactInput, BTreeSet<ExactInput>>::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let Some(origin) = &message.provenance else {
+            continue;
+        };
+        if message.role != Role::User
+            || !origin
+                .sources
+                .iter()
+                .all(|source| source.scope.starts_with("input:"))
+        {
+            continue;
+        }
+        for reference in &origin.sources {
+            let identity = ExactInput {
+                thread: origin.thread_id.clone(),
+                source: reference.clone(),
+            };
+            ensure!(
+                represented
+                    .insert(
+                        identity,
+                        RepresentedInput {
+                            message: message_index,
+                            protected: origin.protected_input,
+                            splittable: origin.sources.len() == 1,
+                        },
+                    )
+                    .is_none(),
+                "canonical input occurs in multiple messages"
+            );
+        }
+        for existing in &origin.source_aliases {
+            let (represented_source, alias_source) = alias_key(existing);
+            ensure!(
+                represented_source.thread == origin.thread_id
+                    && origin.sources.contains(&represented_source.source),
+                "input alias does not identify a source represented by its message"
+            );
+            if represented_source != alias_source {
+                aliases_by_represented
+                    .entry(represented_source.clone())
+                    .or_default()
+                    .insert(alias_source.clone());
+                alias_claims
+                    .entry(alias_source)
+                    .or_default()
+                    .insert(represented_source);
+            }
+        }
+    }
+    let input_ids = represented
+        .keys()
+        .map(|input| input.source.id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for page in input_ids.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+        candidates.extend(
+            store
+                .compaction_task_input_copy_aliases(workspace, page)
+                .await?,
+        );
+    }
+    let mut originals_by_copy = BTreeMap::<ExactInput, BTreeSet<ExactInput>>::new();
+    for candidate in candidates {
+        let original = ExactInput {
+            thread: candidate.original_thread_id,
+            source: MessageSourceRef {
+                scope: format!("input:{}", candidate.original_turn_id),
+                id: candidate.original_id,
+                version: format!("input-revision:{}", candidate.original_revision),
+            },
+        };
+        let copy = ExactInput {
+            thread: candidate.copy_thread_id,
+            source: MessageSourceRef {
+                scope: format!("input:{}", candidate.copy_turn_id),
+                id: candidate.copy_id,
+                version: format!("input-revision:{}", candidate.copy_revision),
+            },
+        };
+        originals_by_copy.entry(copy).or_default().insert(original);
+    }
+    originals_by_copy.retain(|copy, _| {
+        !checkpoint_evidence
+            .ambiguous
+            .contains(&(copy.thread.clone(), copy.source.clone()))
+    });
+    for (alias_source, claims) in &alias_claims {
+        if checkpoint_evidence
+            .ambiguous
+            .contains(&(alias_source.thread.clone(), alias_source.source.clone()))
+        {
+            continue;
+        }
+        if claims.len() == 1 {
+            let represented_source = claims.iter().next().expect("one alias owner");
+            // A saved exact alias is already the durable proof. Prefer it over
+            // a later live lookup (which may no longer have either payload).
+            originals_by_copy.insert(
+                alias_source.clone(),
+                BTreeSet::from([represented_source.clone()]),
+            );
+        } else {
+            // Conflicting saved owners are not repaired from a live payload
+            // comparison: preserving both representations is the safe result.
+            originals_by_copy.remove(alias_source);
+        }
+    }
+
+    let mut parent = represented
+        .keys()
+        .map(|id| (id.clone(), id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    fn root(parent: &mut BTreeMap<ExactInput, ExactInput>, id: &ExactInput) -> ExactInput {
+        let mut current = id.clone();
+        while parent[&current] != current {
+            current = parent[&current].clone();
+        }
+        let root = current.clone();
+        let mut current = id.clone();
+        while parent[&current] != current {
+            let next = parent[&current].clone();
+            parent.insert(current.clone(), root.clone());
+            current = next;
+        }
+        root
+    }
+    for (copy, originals) in originals_by_copy {
+        if originals.len() != 1 || !represented.contains_key(&copy) {
+            continue;
+        }
+        let original = originals.into_iter().next().expect("one original");
+        if !represented.contains_key(&original) {
+            continue;
+        }
+        let left = root(&mut parent, &original);
+        let right = root(&mut parent, &copy);
+        if left != right {
+            parent.insert(right, left);
+        }
+    }
+    let mut groups = BTreeMap::<ExactInput, Vec<ExactInput>>::new();
+    for id in represented.keys() {
+        let root = root(&mut parent, id);
+        groups.entry(root).or_default().push(id.clone());
+    }
+    let groups = groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect::<Vec<_>>();
+    let mut representative = BTreeMap::<ExactInput, ExactInput>::new();
+    let mut replay_aliases = alias_claims
+        .values()
+        .filter(|claims| claims.len() == 1)
+        .count();
+    // An accepted history may already contain more aliases than one future
+    // checkpoint can cover. Preserve those exact proofs and simply decline
+    // additional copy elimination in this view.
+    for mut group in groups {
+        group.sort_by_key(|id| represented[id].message);
+        let protected = group
+            .iter()
+            .filter(|id| represented[*id].protected)
+            .cloned()
+            .collect::<Vec<_>>();
+        // Never remove more than one protected/current input. If several are
+        // protected, their relationship is not safe to normalize in this view.
+        if protected.len() > 1 {
+            continue;
+        }
+        let keep = protected
+            .first()
+            .cloned()
+            .unwrap_or_else(|| group[0].clone());
+        let eligible = group
+            .into_iter()
+            .filter(|id| id == &keep || represented[id].splittable)
+            .collect::<Vec<_>>();
+        let additional_aliases = eligible
+            .iter()
+            .filter(|id| {
+                *id != &keep && alias_claims.get(*id).is_none_or(|claims| claims.len() != 1)
+            })
+            .count();
+        if additional_aliases > 0
+            && replay_aliases.saturating_add(additional_aliases)
+                > pioneer_compaction::REPLAY_ALIAS_LIMIT
+        {
+            // Keep every payload in this group when its exact replay proof
+            // would exceed the checkpoint/frozen-history quantum.
+            continue;
+        }
+        replay_aliases += additional_aliases;
+        for id in eligible {
+            if id == keep || represented[&id].splittable {
+                representative.insert(id, keep.clone());
+            }
+        }
+    }
+    let mut aliases = BTreeMap::<ExactInput, BTreeSet<ExactInput>>::new();
+    let mut dropped_messages = BTreeSet::new();
+    for (id, keep) in &representative {
+        if id != keep {
+            dropped_messages.insert(represented[id].message);
+            aliases.entry(keep.clone()).or_default().insert(id.clone());
+            if let Some(previous) = aliases_by_represented.get(id) {
+                for previous in previous {
+                    if alias_claims
+                        .get(previous)
+                        .is_some_and(|claims| claims.len() == 1)
+                    {
+                        aliases
+                            .entry(keep.clone())
+                            .or_default()
+                            .insert(previous.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut normalized = Vec::with_capacity(messages.len());
+    for (message_index, message) in messages.iter().enumerate() {
+        if dropped_messages.contains(&message_index) {
+            continue;
+        }
+        let mut message = message.clone();
+        if let Some(origin) = message.provenance.as_mut()
+            && message.role == Role::User
+            && origin
+                .sources
+                .iter()
+                .all(|source| source.scope.starts_with("input:"))
+        {
+            let represented_sources = origin
+                .sources
+                .iter()
+                .cloned()
+                .map(|source| ExactInput {
+                    thread: origin.thread_id.clone(),
+                    source,
+                })
+                .collect::<BTreeSet<_>>();
+            let mut normalized_aliases = BTreeSet::<(ExactInput, ExactInput)>::new();
+            for existing in &origin.source_aliases {
+                let pair = alias_key(existing);
+                if represented_sources.contains(&pair.0)
+                    && pair.0 != pair.1
+                    && alias_claims
+                        .get(&pair.1)
+                        .is_none_or(|claims| claims.len() == 1)
+                {
+                    normalized_aliases.insert(pair);
+                }
+            }
+            for represented_source in &represented_sources {
+                for alias_source in aliases.remove(represented_source).unwrap_or_default() {
+                    if represented_source != &alias_source {
+                        normalized_aliases.insert((represented_source.clone(), alias_source));
+                    }
+                }
+            }
+            origin.source_aliases = normalized_aliases
+                .into_iter()
+                .map(|(represented, source)| alias(&represented, &source))
+                .collect();
+        }
+        normalized.push(message);
+    }
+    *messages = normalized;
+    Ok(())
 }
 
 /// Reconstruct only the supplied exact canonical leaves. Later unrelated rows
@@ -936,6 +1401,7 @@ enum HistorySelection<'a> {
     Turns(&'a BTreeSet<String>),
     AllExcept {
         covered: &'a BTreeSet<ScopedHistorySource>,
+        exact_replay_aliases: &'a BTreeSet<ScopedHistorySource>,
         covered_item_aliases: &'a BTreeSet<(String, String, String)>,
         covered_event_input_evidence: &'a BTreeMap<ScopedHistorySource, String>,
     },
@@ -957,27 +1423,30 @@ async fn load_line_history_inner(
         selected,
         selected_turns,
         covered,
+        exact_replay_aliases,
         covered_item_aliases,
         covered_event_input_evidence,
         through_turn,
     ) = match selection {
-        HistorySelection::All => (None, None, None, None, None, None),
-        HistorySelection::Turns(turns) => (None, Some(turns), None, None, None, None),
+        HistorySelection::All => (None, None, None, None, None, None, None),
+        HistorySelection::Turns(turns) => (None, Some(turns), None, None, None, None, None),
         HistorySelection::AllExcept {
             covered,
+            exact_replay_aliases,
             covered_item_aliases,
             covered_event_input_evidence,
         } => (
             None,
             None,
             Some(covered),
+            Some(exact_replay_aliases),
             Some(covered_item_aliases),
             Some(covered_event_input_evidence),
             None,
         ),
         #[cfg(test)]
-        HistorySelection::Sources(sources) => (Some(sources), None, None, None, None, None),
-        HistorySelection::ThroughTurn(turn) => (None, None, None, None, None, Some(turn)),
+        HistorySelection::Sources(sources) => (Some(sources), None, None, None, None, None, None),
+        HistorySelection::ThroughTurn(turn) => (None, None, None, None, None, None, Some(turn)),
     };
     // `Sources` is test-only, so production builds otherwise have no `Some`
     // branch from which to infer the collection behind `selected`.
@@ -1005,6 +1474,12 @@ async fn load_line_history_inner(
         covered_identities
             .as_ref()
             .is_some_and(|covered| covered.contains(&(source.scope.clone(), source.id.clone())))
+            || exact_replay_aliases.is_some_and(|aliases| {
+                aliases.contains(&ScopedHistorySource {
+                    thread: thread.to_owned(),
+                    source: source.clone(),
+                })
+            })
     };
     // A checkpoint may replace an event-input while leaving its UI copy in the
     // uncovered tail. Preserve the exact, captured relationship before raw

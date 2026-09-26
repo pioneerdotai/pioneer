@@ -34,6 +34,10 @@ async fn split_inputs(
         let mut projection = super::history::input_message(&[serde_json::from_str(&payload)?])?;
         let mut provenance: MessageProvenance = origin.clone();
         provenance.sources = vec![reference.clone()];
+        provenance.source_aliases.retain(|alias| {
+            alias.represented_thread_id == origin.thread_id
+                && alias.represented_source == *reference
+        });
         provenance.unit_id = format!("canonical-input:{}", reference.id);
         projection.provenance = Some(provenance);
         result.push(projection);

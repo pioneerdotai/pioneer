@@ -1,10 +1,138 @@
 //! Admission/resume uses bounded metadata and source reads; model projection
 //! runs only after each database read has released its capacity.
 use super::*;
-use pioneer_compaction::{CompactionPlan, CompactionSettings, ModelSelection, effective_selection};
+use pioneer_agent::compaction::history::NativeHistoryLayout;
+use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenReplayEdge};
+use pioneer_compaction::{
+    CompactionPlan, CompactionSettings, ModelBudget, ModelSelection, SourceRef,
+    coverage_domain_for, effective_selection,
+};
 use pioneer_crud::compaction::{ManifestEntry, SOURCE_PAGE_BYTES};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+/// Limit only aliases that would be published by this checkpoint. Frozen
+/// histories can combine independently accepted branches with many more exact
+/// aliases; retained and reference-only sources do not enter checkpoint edges.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fit_checkpoint_replay_aliases(
+    store: &CrudStore,
+    workspace: &str,
+    owner_thread: &str,
+    descriptor: Option<&FrozenHistoryRef>,
+    layout: &NativeHistoryLayout,
+    plan: &mut CompactionPlan,
+    budget: &ModelBudget,
+    reserve: u64,
+    fixed_input: u64,
+    summary_goal: u64,
+    recovery: bool,
+    required_checkpoint: Option<&str>,
+) -> Result<()> {
+    let Some(descriptor) = descriptor else {
+        return Ok(());
+    };
+    ensure!(
+        store
+            .compaction_frozen_history_owner(workspace, descriptor)
+            .await?
+            .as_deref()
+            == Some(owner_thread),
+        "compaction source projection owner changed"
+    );
+    let mut edges_by_source =
+        std::collections::BTreeMap::<SourceRef, BTreeSet<FrozenReplayEdge>>::new();
+    let mut ordinal = 0_u64;
+    while ordinal < descriptor.messages {
+        let page = store
+            .compaction_frozen_history_page(
+                workspace,
+                owner_thread,
+                &descriptor.manifest_id,
+                ordinal,
+            )
+            .await?;
+        ensure!(
+            !page.is_empty(),
+            "compaction source projection lost a reference page"
+        );
+        for reference in page {
+            reference.validate()?;
+            for source in &reference.sources {
+                if layout.source_threads.get(source).map(String::as_str)
+                    != Some(reference.source_thread.as_str())
+                {
+                    continue;
+                }
+                edges_by_source
+                    .entry(source.clone())
+                    .or_default()
+                    .extend(reference.publication_edges_for(source));
+            }
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
+            ensure!(
+                ordinal <= descriptor.messages,
+                "compaction source projection count mismatch"
+            );
+        }
+    }
+    let selected_edges = |compact: &[usize]| {
+        compact
+            .iter()
+            .flat_map(|index| &layout.units[*index].sources)
+            .filter_map(|source| edges_by_source.get(source))
+            .flat_map(BTreeSet::iter)
+            .collect::<BTreeSet<_>>()
+            .len()
+    };
+    while selected_edges(&plan.compact) > pioneer_compaction::REPLAY_ALIAS_LIMIT {
+        let mut choice = None;
+        for index in plan.compact.iter().copied() {
+            let unit = &layout.units[index];
+            if unit.sources.iter().any(|source| {
+                source.scope.starts_with("checkpoint:")
+                    && required_checkpoint == Some(source.id.as_str())
+            }) {
+                continue;
+            }
+            let remaining = plan
+                .compact
+                .iter()
+                .copied()
+                .filter(|other| *other != index)
+                .collect::<Vec<_>>();
+            let remaining_aliases = selected_edges(&remaining);
+            if remaining_aliases >= selected_edges(&plan.compact) || remaining.is_empty() {
+                continue;
+            }
+            let retained_tokens = plan.retain.iter().chain(std::iter::once(&index)).fold(
+                fixed_input.saturating_add(summary_goal),
+                |total, retained| total.saturating_add(layout.units[*retained].tokens),
+            );
+            if budget.fits(retained_tokens, reserve, recovery) {
+                let candidate = (remaining_aliases, unit.tokens, index);
+                if choice.is_none_or(|best| candidate < best) {
+                    choice = Some(candidate);
+                }
+            }
+        }
+        let (_, _, index) = choice.ok_or_else(|| {
+            anyhow::anyhow!("no fitting whole-round plan within checkpoint replay alias limit")
+        })?;
+        plan.compact.retain(|selected| *selected != index);
+        plan.retain.push(index);
+        plan.retain.sort_unstable();
+    }
+    plan.coverage_domain = coverage_domain_for(&layout.units, &plan.compact);
+    plan.coverage = plan
+        .compact
+        .iter()
+        .flat_map(|index| layout.units[*index].sources.clone())
+        .collect();
+    Ok(())
+}
 
 #[derive(Clone)]
 pub(crate) struct PreparedOperation {

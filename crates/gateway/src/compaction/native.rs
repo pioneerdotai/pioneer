@@ -442,6 +442,8 @@ async fn prepare_native_projection_with_prepared(
             &mut checkpoint_graphs,
         )
         .await?;
+        super::history::normalize_task_input_copies(&store, workspace, &mut request.messages)
+            .await?;
         super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
@@ -617,6 +619,21 @@ async fn prepare_native_projection_with_prepared(
             .iter()
             .flat_map(|i| layout.units[*i].sources.clone())
             .collect();
+        super::admission::fit_checkpoint_replay_aliases(
+            &store,
+            workspace,
+            thread,
+            source_projection.as_ref(),
+            &layout,
+            &mut plan,
+            &budget,
+            full.output_reserve,
+            fixed,
+            goal,
+            recovery,
+            basis.as_deref(),
+        )
+        .await?;
         let indexes: BTreeSet<_> = plan
             .compact
             .iter()
@@ -739,6 +756,8 @@ async fn prepare_native_projection_with_prepared(
                 id: source.id,
                 version: source.version,
             }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
             complete: true,
             protected_input: false,
             inherited: checkpoint_is_working_context,

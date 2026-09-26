@@ -7012,6 +7012,8 @@ mod prepared_snapshot_tests {
                 id: source.id,
                 version: source.version,
             }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
         });
         let messages = vec![message];
         let descriptor = crate::compaction::frozen::capture(
@@ -7185,6 +7187,9 @@ mod prepared_snapshot_tests {
             serde_json::to_string(&item).unwrap()
         ));
         technical.provenance = Some(MessageProvenance {
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+
             logical_turn_id: None,
             workspace_id: "race-legacy-ws".into(),
             thread_id: "parent".into(),
@@ -7208,6 +7213,10 @@ mod prepared_snapshot_tests {
             .map(|message| {
                 let origin = message.provenance.as_ref().unwrap();
                 let reference = pioneer_compaction::frozen::FrozenMessageRef {
+                    source_aliases: vec![],
+                    ambiguous_input_aliases: vec![],
+                    publication_aliases: None,
+
                     logical_turn_id: origin.logical_turn_id.clone(),
                     source_thread: origin.thread_id.clone(),
                     context_thread: origin.context_thread.clone(),

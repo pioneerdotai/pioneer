@@ -18,7 +18,7 @@ pub use frozen_import::{
 };
 pub use history::{
     AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
-    event_projection_metadata,
+    TaskInputCopyAlias, event_projection_metadata,
 };
 use pioneer_compaction::{
     Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef,
@@ -57,9 +57,9 @@ pub struct CheckpointEdges {
     pub previous: Option<String>,
     pub format_version: u32,
     pub coverage: Vec<HistoricalSourceRef>,
-    /// Alternate provider-context rows that represented a covered tool item
-    /// in the immutable input manifest. These are historical aliases used only
-    /// to suppress duplicate replay; they are not additional coverage/grants.
+    /// Alternate canonical rows represented by a covered source in the
+    /// immutable input manifest. These include provider replay rows and exact
+    /// Task input copies. They suppress duplicates only; they are not grants.
     pub replay_aliases: Vec<HistoricalReplayAlias>,
     /// Event-input relationships captured in the immutable source projection
     /// of the operation that published this checkpoint.
@@ -115,7 +115,7 @@ pub struct CheckpointMetadata {
 
 pub const SOURCE_PAGE_ROWS: u64 = 128;
 pub const SOURCE_PAGE_BYTES: usize = 256 * 1024;
-pub const CHECKPOINT_SOURCE_LIMIT: usize = 256;
+pub const CHECKPOINT_SOURCE_LIMIT: usize = pioneer_compaction::REPLAY_ALIAS_LIMIT;
 
 // Kept only for correlated SQLite json_each snapshot validation and the two
 // MATERIALIZED event quanta. These queries preserve one atomic validation or a
@@ -1604,7 +1604,7 @@ pub(crate) async fn compaction_checkpoint_edges(
             .into_iter()
             .map(|alias| HistoricalReplayAlias {
                 covered: HistoricalSourceRef {
-                    source_thread: alias.source_thread.clone(),
+                    source_thread: alias.covered_thread,
                     source: SourceRef {
                         scope: alias.covered_scope,
                         id: alias.covered_id,
@@ -1612,7 +1612,7 @@ pub(crate) async fn compaction_checkpoint_edges(
                     },
                 },
                 replay: HistoricalSourceRef {
-                    source_thread: alias.source_thread,
+                    source_thread: alias.replay_thread,
                     source: SourceRef {
                         scope: alias.replay_scope,
                         id: alias.replay_id,
@@ -1661,7 +1661,8 @@ struct HistoricalCoverageRow {
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct HistoricalReplayAliasRow {
-    source_thread: String,
+    covered_thread: String,
+    replay_thread: String,
     covered_scope: String,
     covered_id: String,
     covered_version: String,
@@ -1761,22 +1762,28 @@ async fn checkpoint_projection_metadata(
             // Decode only after the bounded query has released its reader reservation.
             let reference: FrozenMessageRef = serde_json::from_str(&json)?;
             reference.validate()?;
-            if let Some(replay) = reference.replay_source.as_ref() {
-                for covered in &reference.sources {
-                    if ownership.get(covered).is_some_and(|threads| {
+            let selected_sources = reference
+                .sources
+                .iter()
+                .filter(|source| {
+                    ownership.get(*source).is_some_and(|threads| {
                         threads.len() == 1 && threads.contains(&reference.source_thread)
-                    }) {
-                        aliases.insert(HistoricalReplayAliasRow {
-                            source_thread: reference.source_thread.clone(),
-                            covered_scope: covered.scope.clone(),
-                            covered_id: covered.id.clone(),
-                            covered_version: covered.version.clone(),
-                            replay_scope: replay.scope.clone(),
-                            replay_id: replay.id.clone(),
-                            replay_version: replay.version.clone(),
-                            tool_item_id: reference.tool_item_id.clone(),
-                        });
-                    }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for source in selected_sources {
+                for edge in reference.publication_edges_for(source) {
+                    aliases.insert(HistoricalReplayAliasRow {
+                        covered_thread: edge.covered_thread,
+                        replay_thread: edge.replay_thread,
+                        covered_scope: edge.covered.scope,
+                        covered_id: edge.covered.id,
+                        covered_version: edge.covered.version,
+                        replay_scope: edge.replay.scope,
+                        replay_id: edge.replay.id,
+                        replay_version: edge.replay.version,
+                        tool_item_id: edge.tool_item_id,
+                    });
                 }
             }
             if reference.sources.len() == 1
@@ -1826,10 +1833,10 @@ async fn checkpoint_projection_metadata(
     }
     let mut aliases = aliases.into_iter().collect::<Vec<_>>();
     aliases.sort_by(|left, right| {
-        (&left.replay_scope, &left.replay_id, &left.source_thread).cmp(&(
+        (&left.replay_scope, &left.replay_id, &left.replay_thread).cmp(&(
             &right.replay_scope,
             &right.replay_id,
-            &right.source_thread,
+            &right.replay_thread,
         ))
     });
     let mut evidence = evidence.into_iter().collect::<Vec<_>>();
@@ -2283,6 +2290,22 @@ pub(crate) async fn compaction_apply(
     expected_head: Option<&str>,
     assertions: &[SourceAssertion],
 ) -> Result<CommitOutcome> {
+    // The legacy assertion writer has no frozen projection or manifest. Its
+    // exact source assertions are the publication proof. If an operation did
+    // bind a frozen projection, require its graph to be readable as the runner
+    // publication path does; otherwise the legacy CAS remains unchanged.
+    let has_projection = store
+        .connection
+        .query_one_raw(sqlite_specific_sql(
+            "SELECT 1 FROM compaction_operation_projection WHERE operation_id=? LIMIT 1",
+            [checkpoint.operation_id.clone().into()],
+        ))
+        .await?
+        .is_some();
+    if has_projection {
+        super::compaction_runner::validate_publication_checkpoint_graph(store, &checkpoint.id)
+            .await?;
+    }
     ensure!(
         assertions.len() <= CHECKPOINT_SOURCE_LIMIT
             && assertions.iter().map(|s| s.payload.len()).sum::<usize>() <= SOURCE_PAGE_BYTES,
@@ -2319,6 +2342,11 @@ pub(crate) async fn compaction_apply(
             let status: String = op.ok_or_else(|| anyhow::anyhow!("operation missing"))?;
             if status == "completed" { txn.rollback().await?; return Ok(CommitOutcome::AlreadyApplied); }
             if status != "running" { txn.rollback().await?; return Ok(CommitOutcome::Cancelled); }
+            let projection_still_matches = txn.query_one_raw(sqlite_specific_sql(
+                "SELECT 1 FROM compaction_operation_projection WHERE operation_id=? LIMIT 1",
+                [checkpoint.operation_id.clone().into()],
+            )).await?.is_some() == has_projection;
+            if !projection_still_matches { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
             let stopped = compaction_operation::Entity::find()
             .select_only()
             .join(JoinType::InnerJoin, compaction_operation::Entity::belongs_to(compaction_context::Entity)

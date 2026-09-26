@@ -5,7 +5,7 @@ use crate::compaction::{
     DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
     HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
     PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
-    TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
+    TaskDeliveryOutputSnapshot, TaskInputCopyAlias, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -947,6 +947,21 @@ impl CrudStore {
     ) -> Result<Option<String>> {
         repositories::compaction::history::compaction_task_delivery_command(
             self, workspace, thread, source,
+        )
+        .await
+    }
+    /// Resolve exact original/copy input pairs through the durable Task run
+    /// relationship. The supplied copy IDs bound the result page; ambiguity
+    /// counts are computed inside each exact source/initial turn.
+    pub async fn compaction_task_input_copy_aliases(
+        &self,
+        workspace: &str,
+        input_ids: &[String],
+    ) -> Result<Vec<TaskInputCopyAlias>> {
+        repositories::compaction::history::compaction_task_input_copy_aliases(
+            &self.connection,
+            workspace,
+            input_ids,
         )
         .await
     }

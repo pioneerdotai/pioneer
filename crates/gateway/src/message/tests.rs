@@ -73208,6 +73208,484 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
 async fn completed_cli_history_uses_general_api_without_primary_cli_or_new_turns() {
     check_completed_history(false, false, false, false, false).await;
 }
+
+#[tokio::test]
+async fn background_history_preflight_budgets_task_input_copy_once_near_threshold() {
+    use pioneer_compaction::{CompactionSettings, ModelSelection, Transport};
+    use pioneer_crud::compaction::{HistoryCheckDiagnostic, HistoryCheckOutcome};
+
+    struct SilentObserver;
+    #[async_trait::async_trait]
+    impl crate::compaction::CompactionObserver for SilentObserver {
+        async fn started(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn heartbeat(&self, _: &str) {}
+        async fn terminal(
+            &self,
+            _: &str,
+            _: &pioneer_compaction::runner::RunnerState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let summary = [
+        "Goal and constraints",
+        "Decisions and rationale",
+        "Completed work and results",
+        "Failed attempts and unknowns",
+        "Current work and next step",
+        "Source references",
+    ]
+    .into_iter()
+    .map(|heading| format!("## {heading}\nretained background fact"))
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    let provider = Arc::new(CaptureSummaryProvider::new(summary));
+    let harness =
+        setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let workspace = harness.workspace_id.as_str();
+    let timestamp = phase_13_now_secs();
+    let marker = "background-task-input-copy-marker";
+
+    let parent_thread = phase_13_test_thread(workspace, "background-parent", timestamp);
+    harness
+        .crud_store
+        .materialize_turn_start(
+            &parent_thread,
+            SandboxMode::FullAccess,
+            &phase_13_turn("background-parent-turn", TurnStatus::InProgress),
+            &[UserInput::Text {
+                text: marker.into(),
+                text_elements: vec![],
+            }],
+            pioneer_protocol::PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    harness
+        .crud_store
+        .materialize_turn_completed(
+            TurnCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: "background-parent".into(),
+                turn: phase_13_turn("background-parent-turn", TurnStatus::Completed),
+            },
+            timestamp + 1,
+        )
+        .await
+        .unwrap();
+    let parent_basis = crate::compaction::frozen::capture_execution_basis_json(
+        &harness.crud_store,
+        workspace,
+        "background-parent",
+        Some("background-parent-turn"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let child_thread = phase_13_test_thread(workspace, "background-child", timestamp + 2);
+    for (index, turn_id) in ["background-copy-turn", "background-independent-turn"]
+        .into_iter()
+        .enumerate()
+    {
+        harness
+            .crud_store
+            .materialize_turn_start(
+                &child_thread,
+                SandboxMode::FullAccess,
+                &phase_13_turn(turn_id, TurnStatus::InProgress),
+                &[UserInput::Text {
+                    text: marker.into(),
+                    text_elements: vec![],
+                }],
+                pioneer_protocol::PersistedActorRef::Principal(
+                    authenticated_test_superuser().principal_id.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        harness
+            .crud_store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: "background-child".into(),
+                    turn_id: turn_id.into(),
+                    item: TurnItem::AgentMessage {
+                        id: format!("background-answer-{index}"),
+                        text: format!(
+                            "background answer {index} {}",
+                            "retained ".repeat(if index == 0 { 60_000 } else { 80 })
+                        ),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                timestamp + 3 + index as i64 * 2,
+            )
+            .await
+            .unwrap();
+        harness
+            .crud_store
+            .materialize_turn_completed(
+                TurnCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: "background-child".into(),
+                    turn: phase_13_turn(turn_id, TurnStatus::Completed),
+                },
+                timestamp + 4 + index as i64 * 2,
+            )
+            .await
+            .unwrap();
+        persist_test_execution_authorization_context_for_principal(
+            &harness.processor,
+            authenticated_test_superuser().as_ref(),
+            workspace,
+            "background-parent",
+            turn_id,
+        )
+        .await;
+    }
+    let original_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&parent_basis).unwrap();
+    let mut accepted_parent = crate::compaction::frozen::restore(
+        &harness.crud_store,
+        workspace,
+        &std::collections::BTreeSet::from(["background-parent".to_owned()]),
+        &original_descriptor,
+    )
+    .await
+    .unwrap();
+    let copy_source = harness
+        .crud_store
+        .compaction_source_page(
+            workspace,
+            "background-child",
+            "background-copy-turn",
+            pioneer_crud::compaction::PagedSource::Input,
+            0,
+        )
+        .await
+        .unwrap()
+        .entries[0]
+        .reference
+        .clone();
+    let original = accepted_parent
+        .iter_mut()
+        .find(|message| message.content == marker)
+        .unwrap();
+    let origin = original.provenance.as_mut().unwrap();
+    let represented_source = origin.sources[0].clone();
+    origin.source_aliases = (0..257)
+        .map(|index| pioneer_provider::MessageSourceAlias {
+            represented_thread_id: "background-parent".into(),
+            represented_source: represented_source.clone(),
+            thread_id: format!("prior-background-alias-thread-{index}"),
+            source: pioneer_provider::MessageSourceRef {
+                scope: format!("input:prior-background-alias-turn-{index}"),
+                id: format!("prior-background-alias-{index}"),
+                version: "input-revision:1".into(),
+            },
+        })
+        .collect();
+    origin
+        .source_aliases
+        .push(pioneer_provider::MessageSourceAlias {
+            represented_thread_id: "background-parent".into(),
+            represented_source,
+            thread_id: "background-child".into(),
+            source: pioneer_provider::MessageSourceRef {
+                scope: copy_source.scope,
+                id: copy_source.id,
+                version: copy_source.version,
+            },
+        });
+    let parent_basis = serde_json::to_string(
+        &crate::compaction::frozen::capture(
+            &harness.crud_store,
+            workspace,
+            "background-parent",
+            &std::collections::BTreeSet::from(["background-parent".to_owned()]),
+            &accepted_parent,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let db = harness.crud_store.database_connection();
+    db.execute_unprepared(
+        "UPDATE thread SET access_class='internal',origin_kind='task_run' WHERE id='background-child'",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared(
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('background-child','background-parent','background-parent',1,CURRENT_TIMESTAMP)",
+    )
+    .await
+    .unwrap();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('background-task',?,'thread','background-parent','background-parent','background-parent-turn','agent','running','Background','Background')",
+        [workspace.into()],
+    ))
+    .await
+    .unwrap();
+    let composer_metadata = serde_json::to_string(&pioneer_protocol::TaskMetadata {
+        composer_work: Some(pioneer_protocol::TaskComposerWork::v1(
+            pioneer_protocol::TurnStartParams {
+                agent_delegation_routes: Vec::new(),
+                thread_id: "background-parent".into(),
+                turn_id: "background-parent-turn".into(),
+                input: vec![pioneer_protocol::UserInput::Text {
+                    text: marker.into(),
+                    text_elements: Vec::new(),
+                }],
+                capabilities: Vec::new(),
+                model: None,
+                model_provider: None,
+                sandbox_policy: None,
+                mode: None,
+                agent_launch: None,
+                reply_to_turn_id: None,
+                mentioned_principal_ids: Vec::new(),
+                execution_backend: None,
+                reasoning: None,
+                permission_profile: None,
+                cli_runtime_options: None,
+            },
+        )),
+        ..Default::default()
+    })
+    .unwrap();
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE task SET metadata_json=? WHERE id='background-task'",
+        [composer_metadata.into()],
+    ))
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('background-run','background-task','background-run',1,1,'running','agent')",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('background-run-turn','background-task','background-run','background-child','background-copy-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        db.execute_unprepared(statement).await.unwrap();
+    }
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)",
+        [workspace.into(), parent_basis.clone().into()],
+    ))
+    .await
+    .unwrap();
+
+    let current = ModelSelection {
+        transport: Transport::Claude,
+        instance: "fixture-cli".into(),
+        model: "unknown-cli-model".into(),
+        effort: None,
+    };
+    let settings = CompactionSettings {
+        selection: Some(ModelSelection {
+            transport: Transport::Api,
+            instance: "summary-capture".into(),
+            model: "test-model".into(),
+            effort: None,
+        }),
+    };
+    let mut baseline = HistoryCheckDiagnostic::default();
+    let baseline_outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        workspace,
+        "background-child",
+        "background-independent-turn",
+        &current,
+        &settings,
+        None,
+        Arc::new(SilentObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        Some(512),
+        0,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut baseline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(baseline_outcome, HistoryCheckOutcome::Fits);
+    assert_eq!(provider.call_count(), 0);
+    let reserve = baseline.output_reserve.unwrap();
+    let budget = pioneer_compaction::ModelBudget::new(
+        baseline.context_tokens,
+        baseline.input_limit,
+        Some(reserve),
+    );
+    let parent_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&parent_basis).unwrap();
+    let mut expected_messages = crate::compaction::frozen::restore(
+        &harness.crud_store,
+        workspace,
+        &std::collections::BTreeSet::from(["background-parent".to_owned()]),
+        &parent_descriptor,
+    )
+    .await
+    .unwrap();
+    let fence = harness
+        .crud_store
+        .compaction_history_read_fence()
+        .await
+        .unwrap();
+    let child_messages = crate::compaction::load_task_line_history(
+        &harness.crud_store,
+        workspace,
+        "background-child",
+        None,
+        &fence,
+    )
+    .await
+    .unwrap();
+    let launch_copy = child_messages
+        .iter()
+        .find(|message| {
+            message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.scope == "input:background-copy-turn")
+            })
+        })
+        .unwrap()
+        .clone();
+    expected_messages.extend(child_messages.into_iter().filter(|message| {
+        !message.provenance.as_ref().is_some_and(|origin| {
+            origin
+                .sources
+                .iter()
+                .any(|source| source.scope == "input:background-copy-turn")
+        })
+    }));
+    let expected_request = ChatRequest {
+        model: current.model.clone(),
+        messages: expected_messages.clone(),
+        temperature: None,
+        max_tokens: Some(512),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let expected_projection = pioneer_agent::compaction::request::NativeRequestProjection::full(
+        expected_request.clone(),
+        vec![],
+        budget.clone(),
+        false,
+    )
+    .unwrap();
+    let mut duplicated_request = expected_request;
+    duplicated_request.messages.push(launch_copy);
+    let duplicated_projection = pioneer_agent::compaction::request::NativeRequestProjection::full(
+        duplicated_request,
+        vec![],
+        budget.clone(),
+        false,
+    )
+    .unwrap();
+    let estimate = expected_projection.estimated_input_tokens;
+    assert_eq!(baseline.estimated_input_tokens, Some(estimate));
+    assert!(duplicated_projection.estimated_input_tokens > estimate);
+    assert_eq!(
+        expected_messages
+            .iter()
+            .filter(|message| message.content == marker)
+            .count(),
+        2
+    );
+    let available = std::cmp::min(
+        baseline.context_tokens.unwrap().saturating_sub(reserve),
+        baseline.input_limit.unwrap_or(u64::MAX),
+    );
+    let raw_boundary = (available as u128 * 100 / 105).min(u64::MAX as u128) as u64;
+    let fitting_fixed = raw_boundary.saturating_sub(estimate);
+    assert!(budget.fits(estimate + fitting_fixed, reserve, false));
+    assert!(!budget.fits(
+        duplicated_projection.estimated_input_tokens + fitting_fixed,
+        reserve,
+        false
+    ));
+    let mut fitting = HistoryCheckDiagnostic::default();
+    let fitting_outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        workspace,
+        "background-child",
+        "background-independent-turn",
+        &current,
+        &settings,
+        None,
+        Arc::new(SilentObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        Some(512),
+        fitting_fixed,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut fitting,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fitting_outcome, HistoryCheckOutcome::Fits);
+    assert_eq!(
+        fitting.estimated_input_tokens,
+        Some(estimate + fitting_fixed)
+    );
+    assert_eq!(provider.call_count(), 0);
+    let fixed = fitting_fixed.saturating_add(1);
+    assert!(!budget.fits(estimate + fixed, reserve, false));
+    let mut overflowing = HistoryCheckDiagnostic::default();
+    let outcome = crate::compaction::prepare_completed_history_owned(
+        &harness.processor,
+        &harness.crud_store.with_maintenance_access(),
+        workspace,
+        "background-child",
+        "background-independent-turn",
+        &current,
+        &settings,
+        None,
+        Arc::new(SilentObserver),
+        tokio_util::sync::CancellationToken::new(),
+        crate::compaction::ContextWorkPriority::Background,
+        None,
+        Some(512),
+        fixed,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        &mut overflowing,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, HistoryCheckOutcome::Compacted);
+    assert_eq!(overflowing.estimated_input_tokens, Some(estimate + fixed));
+    let requests = provider.snapshot_requests();
+    assert_eq!(requests.len(), 1);
+    let input: pioneer_compaction::summary::SummaryInput =
+        serde_json::from_str(&requests[0].messages[1].content).unwrap();
+    let wire = serde_json::to_string(&input).unwrap();
+    assert_eq!(wire.matches(marker).count(), 2);
+}
+
 #[tokio::test]
 async fn durable_completed_cli_owner_prepares_history_and_publishes_lifecycle() {
     check_completed_history(true, false, false, false, false).await;

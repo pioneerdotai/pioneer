@@ -194,6 +194,11 @@ pub(crate) struct ResolvedCheckpointGraph {
     /// Saved transport aliases for covered tool results. They participate in
     /// projection/filtering only, never in coverage or access grants.
     pub(crate) replay_aliases: BTreeMap<ScopedHistorySource, ScopedHistorySource>,
+    pub(crate) input_replay_aliases: BTreeSet<ScopedHistorySource>,
+    /// Conflicting exact input claims are not suppression evidence. Retaining
+    /// their identities also prevents a sidecar on another accepted branch
+    /// from making one of those claims appear unique again.
+    pub(crate) ambiguous_input_aliases: BTreeSet<ScopedHistorySource>,
     pub(crate) replay_item_aliases: BTreeSet<(String, String, String)>,
     pub(crate) event_input_evidence: BTreeMap<ScopedHistorySource, String>,
     /// Exact checkpoint identities in this closure. Summary and operation
@@ -278,6 +283,8 @@ impl CheckpointGraphResolver {
             .leaves
             .len()
             .saturating_add(graph.replay_aliases.len())
+            .saturating_add(graph.input_replay_aliases.len())
+            .saturating_add(graph.ambiguous_input_aliases.len())
             .saturating_add(graph.replay_item_aliases.len())
             .saturating_add(graph.event_input_evidence.len())
             .saturating_add(graph.checkpoints.len())
@@ -456,7 +463,7 @@ impl CheckpointGraphResolver {
     ) -> Result<Option<Arc<ResolvedCheckpointGraph>>> {
         self.observe_closure_build(store, workspace);
         let mut leaves = BTreeSet::new();
-        let mut replay_aliases = BTreeMap::new();
+        let mut aliases = pioneer_compaction::frozen::ReplayAliasGraph::default();
         let mut replay_item_aliases = BTreeSet::new();
         let mut event_input_evidence = BTreeMap::new();
         let mut checkpoints = BTreeSet::new();
@@ -518,17 +525,15 @@ impl CheckpointGraphResolver {
                         item,
                     ));
                 }
-                let replay = ScopedHistorySource {
+                let replay = pioneer_compaction::frozen::ScopedReplaySource {
                     thread: alias.replay.source_thread,
                     source: alias.replay.source,
                 };
-                let covered = ScopedHistorySource {
+                let covered = pioneer_compaction::frozen::ScopedReplaySource {
                     thread: alias.covered.source_thread,
                     source: alias.covered.source,
                 };
-                if let Some(previous) = replay_aliases.insert(replay, covered.clone()) {
-                    ensure!(previous == covered, "checkpoint replay alias is ambiguous");
-                }
+                aliases.insert(replay, covered, alias.tool_item_id.as_deref())?;
             }
             for evidence in edges.event_input_evidence {
                 let source = ScopedHistorySource {
@@ -567,9 +572,47 @@ impl CheckpointGraphResolver {
             );
         }
         ensure!(!leaves.is_empty(), "checkpoint has no historical coverage");
+        aliases.validate_targets(
+            &leaves
+                .iter()
+                .map(|leaf| pioneer_compaction::frozen::ScopedReplaySource {
+                    thread: leaf.thread.clone(),
+                    source: leaf.source.clone(),
+                })
+                .collect(),
+        )?;
+        let (replay_aliases, ambiguous_input_aliases, input_replay_aliases) = aliases.into_parts();
         Ok(Some(Arc::new(ResolvedCheckpointGraph {
             leaves,
-            replay_aliases,
+            replay_aliases: replay_aliases
+                .into_iter()
+                .map(|(replay, covered)| {
+                    (
+                        ScopedHistorySource {
+                            thread: replay.thread,
+                            source: replay.source,
+                        },
+                        ScopedHistorySource {
+                            thread: covered.thread,
+                            source: covered.source,
+                        },
+                    )
+                })
+                .collect(),
+            ambiguous_input_aliases: ambiguous_input_aliases
+                .into_iter()
+                .map(|replay| ScopedHistorySource {
+                    thread: replay.thread,
+                    source: replay.source,
+                })
+                .collect(),
+            input_replay_aliases: input_replay_aliases
+                .into_iter()
+                .map(|replay| ScopedHistorySource {
+                    thread: replay.thread,
+                    source: replay.source,
+                })
+                .collect(),
             replay_item_aliases,
             event_input_evidence,
             checkpoints,
@@ -964,6 +1007,8 @@ mod cache_tests {
                 },
             }]),
             replay_aliases: BTreeMap::new(),
+            input_replay_aliases: BTreeSet::new(),
+            ambiguous_input_aliases: BTreeSet::new(),
             replay_item_aliases: (0..item_aliases)
                 .map(|index| ("thread".into(), "turn".into(), format!("item-{id}-{index}")))
                 .collect(),

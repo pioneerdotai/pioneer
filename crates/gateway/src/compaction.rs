@@ -29,7 +29,7 @@ pub(crate) use background_history::{
 };
 pub(crate) use history::provider_observation;
 #[cfg(test)]
-pub(crate) use history::{event_message, load_line_history};
+pub(crate) use history::{event_message, load_line_history, load_task_line_history};
 #[cfg(test)]
 pub(crate) fn legacy_event_message(
     event: pioneer_crud::CanonicalTurnEventPayload,

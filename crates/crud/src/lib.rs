@@ -187,7 +187,7 @@ pub use repositories::user_notification_outbox::{
     insert_task_notification_idempotent, list_user_notifications_for_recipient,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactBindingSummary, ArtifactProjectionKind,
     ArtifactProjectionStatus, ArtifactRole, ArtifactStatus, ArtifactSummary, GatewayId,
@@ -11778,6 +11778,47 @@ impl CrudStore {
             None,
             actor,
         )
+        .await
+    }
+
+    /// Test-support entry point for exercising the same projection replacement
+    /// that a canonical message edit uses. New input IDs are generated and the
+    /// durable message revision advances atomically.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn replace_turn_input_projection_for_test(
+        &self,
+        turn_id: &str,
+        input: &[UserInput],
+        message_revision: i64,
+        changed_at_unix: i64,
+    ) -> Result<()> {
+        let turn_id = turn_id.to_owned();
+        let input = input.to_vec();
+        self.run_serialized_write(|| {
+            let turn_id = turn_id.clone();
+            let input = input.clone();
+            async move {
+                let transaction = self.connection.begin().await?;
+                turn::replace_turn_input(
+                    &transaction,
+                    turn_id.as_str(),
+                    input.as_slice(),
+                    unix_to_datetime(changed_at_unix),
+                )
+                .await?;
+                let updated = pioneer_entity::turn::Entity::update_many()
+                    .col_expr(
+                        pioneer_entity::turn::Column::MessageRevision,
+                        Expr::value(message_revision),
+                    )
+                    .filter(pioneer_entity::turn::Column::Id.eq(turn_id))
+                    .exec(&transaction)
+                    .await?;
+                ensure!(updated.rows_affected == 1, "replacement Turn is missing");
+                transaction.commit().await?;
+                Ok(())
+            }
+        })
         .await
     }
 

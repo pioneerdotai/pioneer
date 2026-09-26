@@ -1,7 +1,9 @@
 //! Materialize a published checkpoint from exact request-source coverage. This
 //! never guesses that a count, timestamp, or equal text represents a source.
 use super::*;
-use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+use pioneer_provider::{
+    ChatMessage, MessageProvenance, MessageSourceAlias, MessageSourceIdentity, MessageSourceRef,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_CHECKPOINT_ANCESTRY: usize = 65_536;
@@ -293,6 +295,7 @@ pub(super) async fn project_accepted_checkpoints_with_boundary_evidence(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Expanded {
     root: SourceRef,
     leaves: BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
@@ -300,6 +303,8 @@ struct Expanded {
         pioneer_agent::compaction::composition::ScopedHistorySource,
         pioneer_agent::compaction::composition::ScopedHistorySource,
     >,
+    input_replay_aliases: BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
+    ambiguous_input_aliases: BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
     emergency_inputs: BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
     coverage_domain: pioneer_compaction::CoverageDomain,
 }
@@ -333,6 +338,8 @@ async fn expand(
         root,
         leaves,
         replay_aliases: graph.replay_aliases.clone(),
+        input_replay_aliases: graph.input_replay_aliases.clone(),
+        ambiguous_input_aliases: graph.ambiguous_input_aliases.clone(),
         emergency_inputs: prepared.emergency_inputs,
         coverage_domain: prepared.coverage_domain,
     })
@@ -391,11 +398,148 @@ async fn checkpoint_message_from_expanded(
             id: source.id,
             version: source.version,
         }],
+        source_aliases: expanded
+            .replay_aliases
+            .iter()
+            .filter(|(replay, _)| expanded.input_replay_aliases.contains(*replay))
+            .map(|(replay, represented)| MessageSourceAlias {
+                represented_thread_id: represented.thread.clone(),
+                represented_source: MessageSourceRef {
+                    scope: represented.source.scope.clone(),
+                    id: represented.source.id.clone(),
+                    version: represented.source.version.clone(),
+                },
+                thread_id: replay.thread.clone(),
+                source: MessageSourceRef {
+                    scope: replay.source.scope.clone(),
+                    id: replay.source.id.clone(),
+                    version: replay.source.version.clone(),
+                },
+            })
+            .collect(),
+        ambiguous_input_aliases: expanded
+            .ambiguous_input_aliases
+            .iter()
+            .map(|replay| MessageSourceIdentity {
+                thread_id: replay.thread.clone(),
+                source: MessageSourceRef {
+                    scope: replay.source.scope.clone(),
+                    id: replay.source.id.clone(),
+                    version: replay.source.version.clone(),
+                },
+            })
+            .collect(),
         complete: true,
         protected_input: false,
         inherited: expanded.coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext,
     });
     Ok(summary)
+}
+
+/// A replacement summary may carry suppression proof for an exact input leaf
+/// that it covers. The represented source stays that leaf, never the summary
+/// source; conflicting claims are retained as independent inputs.
+pub(super) struct InputAliasEvidence {
+    pub aliases: Vec<MessageSourceAlias>,
+    pub ambiguous: Vec<MessageSourceIdentity>,
+}
+
+pub(super) fn append_graph_input_evidence(
+    graph: &super::coverage::ResolvedCheckpointGraph,
+    aliases: &mut Vec<MessageSourceAlias>,
+    ambiguous: &mut Vec<MessageSourceIdentity>,
+) {
+    aliases.extend(
+        graph
+            .replay_aliases
+            .iter()
+            .filter_map(|(copy, represented)| {
+                graph
+                    .input_replay_aliases
+                    .contains(copy)
+                    .then(|| MessageSourceAlias {
+                        represented_thread_id: represented.thread.clone(),
+                        represented_source: MessageSourceRef {
+                            scope: represented.source.scope.clone(),
+                            id: represented.source.id.clone(),
+                            version: represented.source.version.clone(),
+                        },
+                        thread_id: copy.thread.clone(),
+                        source: MessageSourceRef {
+                            scope: copy.source.scope.clone(),
+                            id: copy.source.id.clone(),
+                            version: copy.source.version.clone(),
+                        },
+                    })
+            }),
+    );
+    ambiguous.extend(
+        graph
+            .ambiguous_input_aliases
+            .iter()
+            .map(|copy| MessageSourceIdentity {
+                thread_id: copy.thread.clone(),
+                source: MessageSourceRef {
+                    scope: copy.source.scope.clone(),
+                    id: copy.source.id.clone(),
+                    version: copy.source.version.clone(),
+                },
+            }),
+    );
+}
+
+/// Add immutable graph evidence to a selected checkpoint message. This is a
+/// context-preparation copy; neither the published summary nor its frozen
+/// literal representation is rewritten.
+pub(super) fn merge_graph_input_evidence(
+    origin: &mut MessageProvenance,
+    graph: &super::coverage::ResolvedCheckpointGraph,
+) {
+    let mut aliases = origin.source_aliases.clone();
+    let mut ambiguous = origin.ambiguous_input_aliases.clone();
+    append_graph_input_evidence(graph, &mut aliases, &mut ambiguous);
+    let evidence = transferred_input_evidence(&graph.leaves, &aliases, &ambiguous);
+    origin.source_aliases = evidence.aliases;
+    origin.ambiguous_input_aliases = evidence.ambiguous;
+}
+
+pub(super) fn transferred_input_evidence<'a>(
+    leaves: &BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
+    aliases: impl IntoIterator<Item = &'a pioneer_provider::MessageSourceAlias>,
+    ambiguous: impl IntoIterator<Item = &'a MessageSourceIdentity>,
+) -> InputAliasEvidence {
+    use pioneer_agent::compaction::composition::ScopedHistorySource;
+    let mut claims = pioneer_agent::compaction::composition::ExactInputClaims::default();
+    claims.ambiguous = ambiguous
+        .into_iter()
+        .map(|alias| (alias.thread_id.clone(), alias.source.clone()))
+        .collect::<BTreeSet<_>>();
+    for alias in aliases {
+        let represented = ScopedHistorySource {
+            thread: alias.represented_thread_id.clone(),
+            source: SourceRef {
+                scope: alias.represented_source.scope.clone(),
+                id: alias.represented_source.id.clone(),
+                version: alias.represented_source.version.clone(),
+            },
+        };
+        if represented.source.scope.starts_with("input:")
+            && alias.source.scope.starts_with("input:")
+        {
+            if !leaves.contains(&represented) {
+                claims
+                    .ambiguous
+                    .insert((alias.thread_id.clone(), alias.source.clone()));
+                continue;
+            }
+            claims.add_alias(alias);
+        }
+    }
+    claims.mark_competing_owners();
+    InputAliasEvidence {
+        aliases: claims.aliases(),
+        ambiguous: claims.conflicts(),
+    }
 }
 
 /// Request origin locators and accepted scopes have already been resolved. A
@@ -472,8 +616,16 @@ pub(super) async fn project_checkpoint_in_context_with_boundary(
     let covered = expanded
         .leaves
         .iter()
-        .chain(expanded.replay_aliases.keys())
         .map(identity)
+        .collect::<BTreeSet<_>>();
+    // Input-copy replay participates in boundary admission, but it cannot
+    // remove a raw input until *all* selected checkpoint claims have been
+    // compared by the shared history normalizer. Tool replay stays atomic.
+    let removable_replay_aliases = expanded
+        .replay_aliases
+        .keys()
+        .filter(|replay| !expanded.input_replay_aliases.contains(*replay))
+        .cloned()
         .collect::<BTreeSet<_>>();
     let emergency_inputs = expanded
         .emergency_inputs
@@ -530,8 +682,11 @@ pub(super) async fn project_checkpoint_in_context_with_boundary(
                 covered_by_other_checkpoint = true;
                 continue;
             }
-            let identities = leaves.iter().map(identity).collect::<BTreeSet<_>>();
-            if identities.is_disjoint(&covered) || !identities.is_subset(&covered) {
+            let covered_leaf =
+                |leaf: &pioneer_agent::compaction::composition::ScopedHistorySource| {
+                    covered.contains(&identity(leaf)) || removable_replay_aliases.contains(leaf)
+                };
+            if !leaves.iter().any(covered_leaf) || !leaves.iter().all(covered_leaf) {
                 continue;
             }
             let origin = candidate_messages[*index]
@@ -572,8 +727,71 @@ pub(super) async fn project_checkpoint_in_context_with_boundary(
     // The immutable boundary proves exact historical coverage. Model removal
     // uses indexes in today's list, which may contain earlier summaries.
     let (selected, covered_by_other_checkpoint) = select(messages, &current_leaves)?;
-    let summary =
+    let mut summary =
         checkpoint_message_from_expanded(store, context, head, &expanded, resolver).await?;
+    let summary_origin = summary.provenance.as_ref().expect("checkpoint origin");
+    let mut aliases = summary_origin.source_aliases.clone();
+    let mut ambiguous = summary_origin.ambiguous_input_aliases.clone();
+    for index in &selected {
+        if let Some(origin) = &messages[*index].provenance {
+            let mut origin = origin.clone();
+            for source in origin.sources.clone() {
+                if source.scope.starts_with("checkpoint:") {
+                    let source_ref = SourceRef {
+                        scope: source.scope,
+                        id: source.id,
+                        version: source.version,
+                    };
+                    let graph = resolver
+                        .resolve(store, context.workspace, Some(context.allowed), &source_ref)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("selected checkpoint graph is unavailable")
+                        })?;
+                    merge_graph_input_evidence(&mut origin, &graph);
+                }
+            }
+            aliases.extend(origin.source_aliases);
+            ambiguous.extend(origin.ambiguous_input_aliases);
+        }
+    }
+    let evidence = transferred_input_evidence(&expanded.leaves, &aliases, &ambiguous);
+    let origin = summary.provenance.as_mut().expect("checkpoint origin");
+    origin.source_aliases = evidence.aliases;
+    origin.ambiguous_input_aliases = evidence.ambiguous;
+    // main's larger-summary suppression must retain the absorbed input proof,
+    // just as replacing a smaller selected checkpoint does.
+    if covered_by_other_checkpoint {
+        for (index, (leaves, checkpoints)) in &current_leaves {
+            if !checkpoints.contains(&expanded.root)
+                && !checkpoints.is_empty()
+                && expanded.leaves.is_subset(leaves)
+                && expanded.leaves != *leaves
+            {
+                let origin = messages[*index]
+                    .provenance
+                    .as_mut()
+                    .expect("checkpoint origin");
+                let retained = transferred_input_evidence(
+                    leaves,
+                    origin
+                        .source_aliases
+                        .iter()
+                        .chain(summary.provenance.as_ref().unwrap().source_aliases.iter()),
+                    origin.ambiguous_input_aliases.iter().chain(
+                        summary
+                            .provenance
+                            .as_ref()
+                            .unwrap()
+                            .ambiguous_input_aliases
+                            .iter(),
+                    ),
+                );
+                origin.source_aliases = retained.aliases;
+                origin.ambiguous_input_aliases = retained.ambiguous;
+            }
+        }
+    }
     let first = selected.first().copied().unwrap_or(0);
     let insert_summary = !covered_by_other_checkpoint;
     let mut projected =
@@ -611,10 +829,7 @@ async fn checkpoint_message_leaves(
 )> {
     let mut represented = BTreeSet::new();
     let mut leaves_by_message = BTreeMap::new();
-    let mut cached = BTreeMap::<
-        SourceRef,
-        BTreeSet<pioneer_agent::compaction::composition::ScopedHistorySource>,
-    >::new();
+    let mut cached = BTreeMap::<SourceRef, Expanded>::new();
     for (index, message) in messages.iter().enumerate() {
         let Some(origin) = &message.provenance else {
             continue;
@@ -664,9 +879,9 @@ async fn checkpoint_message_leaves(
                         source_checkpoint.root == source_ref,
                         "checkpoint source revision changed"
                     );
-                    cached.insert(source_ref.clone(), source_checkpoint.leaves);
+                    cached.insert(source_ref.clone(), source_checkpoint);
                 }
-                leaves.extend(cached[&source_ref].iter().cloned());
+                leaves.extend(cached[&source_ref].leaves.iter().cloned());
             } else {
                 leaves.insert(
                     pioneer_agent::compaction::composition::ScopedHistorySource {

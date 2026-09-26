@@ -670,6 +670,14 @@ async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply
     let store = store().await;
     let first = source(&store, "source-a", 1, "original one").await;
     let cp = candidate(&store, "op-a", None, &first).await;
+    assert!(
+        store
+            .compaction_manifest_page("op-a", false, 0, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "legacy assertion publication has no manifest"
+    );
     source(&store, "source-b", 2, "appended after snapshot").await;
     assert_eq!(
         store
@@ -1932,6 +1940,9 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
                 version: "event-revision:1".into(),
             }],
             event_input_role: None,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            publication_aliases: None,
             inherited: false,
             complete: true,
             protected_input: false,
@@ -2972,6 +2983,9 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         unit_id: "child-unit".into(),
         sources: vec![own_source.clone()],
         event_input_role: None,
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        publication_aliases: None,
         inherited: false,
         complete: true,
         protected_input: false,
@@ -4439,6 +4453,9 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             unit_id: "portion-output-unit".into(),
             sources: vec![k_source.clone()],
             event_input_role: None,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            publication_aliases: None,
             inherited: false,
             complete: true,
             protected_input: false,
@@ -4664,6 +4681,9 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             unit_id: "portion-target-unit".into(),
             sources: vec![t_source.clone()],
             event_input_role: None,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            publication_aliases: None,
             inherited: false,
             complete: true,
             protected_input: false,
@@ -6204,6 +6224,9 @@ fn shared_refs(count: usize) -> Vec<pioneer_compaction::frozen::FrozenMessageRef
                 version: "event-revision:1".into(),
             }],
             event_input_role: None,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            publication_aliases: None,
             inherited: false,
             complete: true,
             protected_input: false,
